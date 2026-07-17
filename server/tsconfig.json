@@ -1,0 +1,12 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "paths": {
+      "@fps/shared": ["../shared/src/index.ts"],
+      "@fps/shared/*": ["../shared/src/*"]
+    }
+  },
+  "include": ["src"]
+}
