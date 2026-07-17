@@ -105,8 +105,12 @@ Behavioral invariants (S2, uses S3 helpers):
   can't move/shoot; buy allowed) → `live` (buy allowed for ROUNDS.buyTime s) → ends on elimination
   (one team has 0 alive), time (winner = more alive; tie ⇒ CT), or forfeit (a team has 0 connected)
   → `roundEnd` (ROUNDS.roundEndTime s) → next freeze. After ROUNDS.halftimeAfter rounds: swap all
-  teams + `halftime` event. Match ends at ROUNDS.winRounds wins or ROUNDS.maxRounds played
-  (tie ⇒ CT) → `matchEnd` → 6s later: full reset to `warmup` (money=ECONOMY.start, scores 0).
+  teams + `halftime` event (carries the full new roster). Match ends at ROUNDS.winRounds wins or
+  ROUNDS.maxRounds played (tie ⇒ CT) → `matchEnd` → 6s later: full reset to `warmup`
+  (money=ECONOMY.start, scores 0).
+- **Movement/damage invariant (frozen):** player bodies are stepped and damage is applied ONLY in
+  `warmup` and `live`; in `freeze`/`roundEnd`/`matchEnd` inputs are acknowledged (ack advances) but
+  bodies and hp never change — this is what lets clients gate prediction on phase.
 - **Movement:** queue inputs per player; consume ≤ NET.maxInputPerTick per tick, each applied with
   stepBody(TICK_DT). Inputs older than the queue cap are dropped. Speedhack guard: a player sending
   >90 inputs/s is disconnected (return them via removePlayer; S1 handles the socket).
@@ -229,8 +233,9 @@ export class Predictor {
   constructor(solids: AABB[]);
   reset(x: number, y: number, z: number): void;
   pushInput(p: PendingInput, speedMul: number): void; // local stepBody(TICK_DT) + store
-  reconcile(x: number, y: number, z: number, height: number, ackSeq: number, speedMul: number): void;
-  // set authoritative state, replay stored inputs with seq > ackSeq; snap if error > 1m
+  reconcile(x: number, y: number, z: number, height: number, vy: number, ackSeq: number, speedMul: number): void;
+  // set authoritative state (INCLUDING vy from YouSnap.vy so gravity replays correctly mid-jump),
+  // replay stored inputs with seq > ackSeq; snap if error > 1m
   body(): BodyState;   // live reference, read-only by convention
 }
 ```

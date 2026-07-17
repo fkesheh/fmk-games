@@ -19,7 +19,7 @@ Match end → back to warmup with reset money/scores. Warmup: free respawn, no s
 - Start $800: pistol-only round 1, always.
 - Round 1 loser can afford SMG+utility-less round 2 ($1900+), winner rifles round 2 ($3250+).
 - A team on a 3-loss streak still reaches $1900·n but caps usefulness: full rifle buy ($2700)
-  requires a win or 2 saved rounds — losing streaks force eco decisions, not death spirals (max $16000).
+  requires a win or a saved round — losing streaks force eco decisions, not death spirals (max $16000).
 - Sniper ($4750) is a luxury: affordable only after a win + a save, or a long win streak.
 - Kill reward ($300) means ~6 kills ≈ one round loss stipend — aggression pays but never replaces winning.
 
