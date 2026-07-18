@@ -17,7 +17,7 @@ export const PLAYER = {
   eyeOffset: 0.18, // eye = feet + height - eyeOffset
   speedRun: 4.8, // m/s at moveMul 1.0
   crouchSpeedMul: 0.45,
-  jumpVel: 5.4, // m/s vertical
+  jumpVel: 5.9, // m/s vertical (~0.87m apex — clears 0.8 docks, not 1.2 crates)
   gravity: 20, // m/s^2
   stepUp: 0.42, // max ledge auto-step height
   maxHp: 100,
@@ -125,6 +125,7 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
 
 export const BASE_FOV = 75; // degrees, unscoped
 export const WEAPON_ORDER: WeaponId[] = ['knife', 'pistol', 'smg', 'shotgun', 'rifle', 'sniper'];
+export const MULTIKILL_WINDOW = 4; // s between kills to keep a streak alive
 
 // Deterministic per-shot spread seed. Implementations MUST use this so client
 // crosshair bloom and server shots agree statistically.

@@ -56,6 +56,7 @@ interface FpsState {
 interface FpsApi {
   state(): FpsState;
   joinQuick(name: string): void;
+  createPublic(name: string, mapId: MapId): void;
   createPrivate(name: string, mapId: MapId): void;
   joinPrivate(name: string, code: string): void;
   debug: {
@@ -64,6 +65,7 @@ interface FpsApi {
     press(btn: DebugButton, down: boolean): void;
     reload(): void;
     buy(w: WeaponId): void;
+    scoreboard(down: boolean): void;
   };
 }
 
@@ -120,6 +122,7 @@ function boot(): void {
   let game: ClientGame | null = null;
   const menus = new Menus(must<HTMLElement>('#menu'), {
     onQuickJoin: (name) => game?.joinQuick(name),
+    onCreatePublic: (name, mapId) => game?.createPublic(name, mapId),
     onCreatePrivate: (name, mapId) => game?.createPrivate(name, mapId),
     onJoinPrivate: (name, code) => game?.joinPrivate(name, code),
     onListRooms: () => game?.listRooms() ?? Promise.resolve([]),
@@ -214,6 +217,7 @@ function boot(): void {
       };
     },
     joinQuick: (name) => g.joinQuick(name),
+    createPublic: (name, mapId) => g.createPublic(name, mapId),
     createPrivate: (name, mapId) => g.createPrivate(name, mapId),
     joinPrivate: (name, code) => g.joinPrivate(name, code),
     debug: {
@@ -222,6 +226,7 @@ function boot(): void {
       press: (btn, down) => g.debugSetButton(btn, down),
       reload: () => g.reload(),
       buy: (w) => g.buy(w),
+      scoreboard: (down) => g.scoreboard(down),
     },
   };
 

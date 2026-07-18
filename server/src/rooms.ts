@@ -57,6 +57,9 @@ export class Lobby {
         case 'quick_join':
           this.quickJoin(sess, msg.name);
           break;
+        case 'create_public':
+          this.createPublic(sess, msg.name, msg.mapId);
+          break;
         case 'create_private':
           this.createPrivate(sess, msg.name, msg.mapId);
           break;
@@ -173,6 +176,16 @@ export class Lobby {
       // random map pick: server-side generation uses rng(Date.now()) — RULE 7
       room = this.createRoom(rngPick(rng(Date.now()), MAP_LIST).id, 'public');
     }
+    this.leaveRoom(sess.id);
+    this.joinRoom(sess, room, name);
+  }
+
+  private createPublic(sess: Session, name: string, mapId: MapId): void {
+    if (this.rooms.size >= MAX_ROOMS) {
+      this.sendError(sess, 'rooms_full', 'server is at capacity, try again later');
+      return;
+    }
+    const room = this.createRoom(mapId, 'public'); // listed by list_rooms, no code
     this.leaveRoom(sess.id);
     this.joinRoom(sess, room, name);
   }

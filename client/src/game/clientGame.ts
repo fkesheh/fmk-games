@@ -17,6 +17,7 @@
 //   debugSetMove(x, z): void             — overrides move axes (0,0 releases)
 //   debugSetButton(btn, down): void      — sets/clears an INPUT_* held bit
 //   debugInfo(): { pos; players; pingMs } — e2e state probe (pos = predicted feet)
+//   scoreboard(down): void               — e2e-only mirror of the Tab edge
 // Reverse direction: main.ts dispatches ONE 'fps:gesture' window Event on the
 // first pointerdown/keydown; we listen for it and resume the AudioEngine here
 // (browsers gate AudioContext creation on a user gesture).
@@ -33,8 +34,10 @@ import {
   TICK_RATE,
   WEAPONS,
   WEAPON_ORDER,
+  raycastSolids,
 } from '@fps/shared';
 import type {
+  AABB,
   GameEvent,
   MapId,
   PlayerId,
@@ -84,6 +87,13 @@ const SHOT_SFX: Record<WeaponId, SfxKind> = {
 // indoor maps (ceilinged) get the low hum; everything else gets wind
 const INDOOR_MAPS: ReadonlySet<MapId> = new Set(['office', 'bunker']);
 
+// multikill banner titles by streak count (5+ = ACE, handled at the call site)
+const MULTIKILL_LABELS: Record<number, string> = {
+  2: 'DOUBLE KILL',
+  3: 'TRIPLE KILL',
+  4: 'QUAD KILL',
+};
+
 const PRIMARIES: readonly WeaponId[] = ['smg', 'shotgun', 'rifle', 'sniper'];
 
 function wrapPi(a: number): number {
@@ -102,6 +112,7 @@ interface World {
   models: PlayerModels;
   viewmodel: ViewModel;
   effects: Effects;
+  solids: AABB[]; // map collision — decal wall raycasts on 'shot' events
   mapName: string;
 }
 
@@ -156,6 +167,7 @@ export class ClientGame {
   // reused per-frame scratch — zero allocation in the rAF hot path
   private readonly camPos: Vec3 = { x: 0, y: 0, z: 0 };
   private readonly fxPoint: Vec3 = { x: 0, y: 0, z: 0 };
+  private readonly decalDir: Vec3 = { x: 0, y: 0, z: 0 }; // shot-event wall raycast
   private readonly hudState: HudState = {
     hp: 100, alive: true, money: 0, canBuy: false,
     weapon: 'pistol', weaponName: '', mag: -1, reserve: -1,
@@ -189,6 +201,10 @@ export class ClientGame {
 
   joinQuick(name: string): void {
     this.startJoin((c) => c.send({ t: 'quick_join', name }));
+  }
+
+  createPublic(name: string, mapId: MapId): void {
+    this.startJoin((c) => c.send({ t: 'create_public', name, mapId }));
   }
 
   createPrivate(name: string, mapId: MapId): void {
@@ -304,6 +320,20 @@ export class ClientGame {
     return { pos: [b.x, b.y, b.z], players: this.syncOut.length, pingMs: this.conn?.pingMs() ?? 0 };
   }
 
+  /** E2E-only mirror of the Tab edge (window.__fps.debug.scoreboard). */
+  scoreboard(down: boolean): void {
+    if (down) {
+      const s = this.state;
+      const roster = this.rosterArray();
+      // roster money only refreshes on joins/halftime — patch ours live
+      const me = s.youId !== null ? s.roster.get(s.youId) : undefined;
+      if (me !== undefined && s.latestYou !== null) me.money = s.latestYou.money;
+      this.menus.showScoreboard(roster, s.youId ?? '', s.scoreT, s.scoreCT);
+    } else {
+      this.menus.hideScoreboard();
+    }
+  }
+
   // ---- join / connection plumbing ----------------------------------------------
 
   private startJoin(sendJoin: (conn: Connection) => void): void {
@@ -392,6 +422,7 @@ export class ClientGame {
       models: new PlayerModels(rig.scene),
       viewmodel: new ViewModel(rig.camera),
       effects: new Effects(rig.scene),
+      solids: built.solids,
       mapName: map.name,
     };
     this.input.start();
@@ -613,6 +644,27 @@ export class ClientGame {
         if (w === null) break;
         w.effects.tracer(ev.from, ev.to);
         w.effects.impact(ev.to);
+        // wall decal: `to` is a player hit point or the wall endpoint — decals
+        // are for walls only (no floating splats on flesh hits), so raycast the
+        // map solids along the shot; a wall at <= |to-from| + eps owns the mark
+        const d = this.decalDir;
+        d.x = ev.to.x - ev.from.x;
+        d.y = ev.to.y - ev.from.y;
+        d.z = ev.to.z - ev.from.z;
+        const shotLen = Math.hypot(d.x, d.y, d.z);
+        if (shotLen > 1e-6) {
+          d.x /= shotLen;
+          d.y /= shotLen;
+          d.z /= shotLen;
+          const wallT = raycastSolids(ev.from, d, w.solids, shotLen + 0.05);
+          if (wallT >= 0) {
+            const p = this.fxPoint;
+            p.x = ev.from.x + d.x * wallT;
+            p.y = ev.from.y + d.y * wallT;
+            p.z = ev.from.z + d.z * wallT;
+            w.effects.decal(p);
+          }
+        }
         this.audio.sfx(SHOT_SFX[ev.weapon], { dist: this.distFromCamera(ev.from) });
         // self: viewmodel/shake/bloom already fired on the local input edge —
         // re-firing here would double the kick a full RTT + tick late
@@ -635,6 +687,13 @@ export class ClientGame {
         } else {
           this.audio.sfx('death');
         }
+        break;
+      }
+      case 'multikill': {
+        const name = s.roster.get(ev.playerId)?.name ?? ev.playerId;
+        const label = ev.count >= 5 ? 'ACE' : MULTIKILL_LABELS[ev.count] ?? 'MULTI KILL';
+        this.hud.banner(`${label} — ${name}`, '');
+        this.audio.sfx('multikill');
         break;
       }
       case 'hit': {
@@ -1000,16 +1059,7 @@ export class ClientGame {
           break;
         }
         case 'scoreboard': {
-          if (e.down) {
-            const s = this.state;
-            const roster = this.rosterArray();
-            // roster money only refreshes on joins/halftime — patch ours live
-            const me = s.youId !== null ? s.roster.get(s.youId) : undefined;
-            if (me !== undefined && s.latestYou !== null) me.money = s.latestYou.money;
-            this.menus.showScoreboard(roster, s.youId ?? '', s.scoreT, s.scoreCT);
-          } else {
-            this.menus.hideScoreboard();
-          }
+          this.scoreboard(e.down);
           break;
         }
         case 'menu': {

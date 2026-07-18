@@ -32,6 +32,9 @@ export function parseC2S(raw: unknown): C2S | null {
     case 'create_private':
       if (!str(raw.name, 16) || !MAP_IDS.includes(raw.mapId as MapId)) return null;
       return { t: 'create_private', name: raw.name.trim().slice(0, 16) || 'Player', mapId: raw.mapId as MapId };
+    case 'create_public':
+      if (!str(raw.name, 16) || !MAP_IDS.includes(raw.mapId as MapId)) return null;
+      return { t: 'create_public', name: raw.name.trim().slice(0, 16) || 'Player', mapId: raw.mapId as MapId };
     case 'join_private':
       if (!str(raw.name, 16) || !str(raw.code, 8)) return null;
       return { t: 'join_private', name: raw.name.trim().slice(0, 16) || 'Player', code: raw.code.toUpperCase() };

@@ -9,7 +9,7 @@ import { rng } from '@fps/shared';
 
 export type SfxKind = 'shot_knife' | 'shot_pistol' | 'shot_smg' | 'shot_shotgun' | 'shot_rifle'
   | 'shot_sniper' | 'reload' | 'hit' | 'headshot' | 'death' | 'footstep'
-  | 'round_start' | 'round_end' | 'buy' | 'deny' | 'win' | 'lose' | 'click';
+  | 'round_start' | 'round_end' | 'buy' | 'deny' | 'win' | 'lose' | 'click' | 'multikill';
 
 // ---- tuning constants -------------------------------------------------------
 const MASTER_GAIN = 0.5;
@@ -127,9 +127,12 @@ export class AudioEngine {
           this.burst(ctx, nbuf, master, { type: 'lowpass', f0: 300, t0, dur: 0.1, peak: 0.25 * g0 });
           break;
         case 'footstep': { // soft noise tap 40ms, two alternating variants
+          // level note: filtered noise keeps only ~15% RMS of a same-peak osc,
+          // so the burst peak must sit well above the beep levels to read at
+          // all — and above the ambient bed (0.14) out to the 45m cutoff
           this.stepFlip = !this.stepFlip;
           const f = this.stepFlip ? 620 : 480;
-          this.burst(ctx, nbuf, master, { type: 'lowpass', f0: f, t0, dur: 0.04, peak: (this.stepFlip ? 0.13 : 0.11) * g0 });
+          this.burst(ctx, nbuf, master, { type: 'lowpass', f0: f, t0, dur: 0.04, peak: (this.stepFlip ? 0.55 : 0.5) * g0 });
           break;
         }
         // ---- round / match stingers ----------------------------------------
@@ -139,6 +142,12 @@ export class AudioEngine {
           break;
         case 'round_end': // low resolve note
           this.beep(ctx, master, { type: 'triangle', f0: 220, t0, dur: 0.5, peak: 0.3 * g0 });
+          break;
+        case 'multikill': // heroic sting: ascending fifth A4→E5 on sawtooth (brassy —
+          // deliberately not the triangle chime of the round stingers), octave sheen on the top note
+          this.beep(ctx, master, { type: 'sawtooth', f0: 440, t0, dur: 0.11, peak: 0.26 * g0 });
+          this.beep(ctx, master, { type: 'sawtooth', f0: 659.25, t0: t0 + 0.1, dur: 0.28, peak: 0.3 * g0 });
+          this.beep(ctx, master, { type: 'sawtooth', f0: 1318.5, t0: t0 + 0.1, dur: 0.28, peak: 0.1 * g0 });
           break;
         case 'buy': // cash blip 1kHz
           this.beep(ctx, master, { type: 'sine', f0: 1000, t0, dur: 0.06, peak: 0.28 * g0 });

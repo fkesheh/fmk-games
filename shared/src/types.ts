@@ -28,6 +28,7 @@ export const INPUT_ALT = 1 << 3; // right mouse: sniper scope
 export type C2S =
   | { t: 'list_rooms' }
   | { t: 'quick_join'; name: string }
+  | { t: 'create_public'; name: string; mapId: MapId }
   | { t: 'create_private'; name: string; mapId: MapId }
   | { t: 'join_private'; name: string; code: string }
   | { t: 'leave' }
@@ -62,6 +63,7 @@ export interface RosterEntry {
   team: Team;
   kills: number;
   deaths: number;
+  headshots: number; // kills that were headshots (scoreboard HS column)
   money: number | null; // populated only for the receiving player, null otherwise
   connected: boolean;
 }
@@ -101,6 +103,7 @@ export type RoundEndReason = 'elimination' | 'time' | 'forfeit';
 export type GameEvent =
   | { t: 'shot'; shooterId: PlayerId; weapon: WeaponId; from: Vec3; to: Vec3 } // broadcast to ALL players in the room; from = shooter eye, to = hit point or wall end (drives tracers, muzzle flash, shot sounds)
   | { t: 'kill'; killerId: PlayerId | null; victimId: PlayerId; weapon: WeaponId; headshot: boolean }
+  | { t: 'multikill'; playerId: PlayerId; count: number } // broadcast; count = 2,3,4,5+ (5+ = ace) — kills within MULTIKILL_WINDOW of the previous one
   | { t: 'hit'; victimId: PlayerId; dmg: number; headshot: boolean; killed: boolean } // to shooter only
   | { t: 'dmg_taken'; fromId: PlayerId | null; dmg: number; yaw: number } // to victim only; yaw = world yaw towards shooter
   | { t: 'round_start'; round: number; scoreT: number; scoreCT: number; freezeUntil: number } // serverTime ms

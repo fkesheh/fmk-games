@@ -134,6 +134,11 @@ Behavioral invariants (S2, uses S3 helpers):
   resets to knife+pistol. At every freeze (round start), ALL owned weapons of every player refill to
   default mag+reserve for free. Survivors keep their primary into the next round. Warmup deaths
   change nothing (owned list persists).
+- **Stats (frozen):** every kill with headshot=true increments the killer's `headshots` (roster).
+  Multikill streak: a kill within MULTIKILL_WINDOW seconds of the killer's previous kill increments
+  the streak (dying or the window lapsing resets it); on reaching streak 2/3/4/5+ broadcast
+  `multikill` with count = min(streak, 5). Kills/deaths/headshots persist across matches (only
+  money/scores/round reset); the multikill streak resets every freeze.
 - **Low-population abort (frozen):** if connected players < MIN_PLAYERS_FOR_MATCH at any point in
   freeze/live/roundEnd, immediately abort to warmup: scores reset to 0, money to ECONOMY.start,
   round to 0. Forfeit (one team has 0 connected but MIN is still met) is checked in freeze AND live
@@ -187,6 +192,7 @@ export class Lobby {
 ```
 - quick_join: first public room with players < MAX_PLAYERS (prefer warmup), else create (random map
   via rng(Date.now()) — server-side only exception to the seeded-rng rule).
+- create_public: new PUBLIC room on the requested map (appears in list_rooms), then join it.
 - create_private: new room, code = 5 chars [A-Z0-9] via same rng; join_private validates code (error
   msg `{t:'error', code:'no_room'}`). Room full ⇒ `{t:'error', code:'room_full'}`.
 - Empty private room ⇒ closed immediately. Empty public room ⇒ closed after 30s.
@@ -317,10 +323,14 @@ export class Effects {
   constructor(scene: THREE.Scene);
   tracer(from: Vec3, to: Vec3): void;   // 60ms fading line (tracer color)
   impact(p: Vec3): void;                // 6-10 dust/spark particles (concrete color + muzzle spark)
+  decal(p: Vec3): void;                 // bullet mark: small dark splat quad at the hit point,
+  // camera-facing, offset slightly along (camera - p) so it doesn't z-fight; pooled 64, fade out
+  // after 45s, oldest recycled. Spawned for wall hits only (NOT on player hits).
   blood(p: Vec3): void;                 // 5-8 blood particles
   death(p: Vec3, team: Team): void;     // 12 team-colored burst particles
   update(dt: number): void;             // advances pools; zero allocation after warmup
   clear(): void;
+  dispose(): void;                      // teardown: dispose non-cached materials/geometries
 }
 ```
 Pooled: ≤ 64 tracers, ≤ 256 particles total. `THREE.Points` + small quad meshes; reuse.
@@ -329,7 +339,7 @@ Pooled: ≤ 64 tracers, ≤ 256 particles total. `THREE.Points` + small quad mes
 ```ts
 export type SfxKind = 'shot_knife' | 'shot_pistol' | 'shot_smg' | 'shot_shotgun' | 'shot_rifle'
   | 'shot_sniper' | 'reload' | 'hit' | 'headshot' | 'death' | 'footstep'
-  | 'round_start' | 'round_end' | 'buy' | 'deny' | 'win' | 'lose' | 'click';
+  | 'round_start' | 'round_end' | 'buy' | 'deny' | 'win' | 'lose' | 'click' | 'multikill';
 export class AudioEngine {
   constructor();
   resume(): void;  // creates/unlocks AudioContext on first user gesture; all calls safe before that (no-op)
@@ -365,6 +375,7 @@ overlay = black vignette + thin cross + circle when scoped. Layout/colors per UX
 ```ts
 export interface MenuCallbacks {
   onQuickJoin(name: string): void;
+  onCreatePublic(name: string, mapId: MapId): void;
   onCreatePrivate(name: string, mapId: MapId): void;
   onJoinPrivate(name: string, code: string): void;
   onListRooms(): Promise<RoomInfo[]>;
@@ -374,12 +385,14 @@ export interface MenuCallbacks {
 }
 export class Menus {
   constructor(root: HTMLElement, cb: MenuCallbacks);
-  showMain(errorText?: string): void; // name field, Quick Join, Create Private (+map select),
-  // Join Private (+code), public room list with refresh. Out-of-room only (Esc in-room = showPause).
+  showMain(errorText?: string): void; // name field, Quick Join, ONE map picker grid (6 maps) with
+  // two buttons: Create Public (listed) + Create Private (code), Join Private (+code), public room
+  // list with refresh. Out-of-room only (Esc in-room = showPause).
   showInRoom(roomLabel: string, code: string | null): void; // small top-left chip while playing
   showBuy(money: number, owned: WeaponId[], canBuy: boolean): void;
   hideBuy(): void;
   showScoreboard(roster: RosterEntry[], you: PlayerId, scoreT: number, scoreCT: number): void;
+  // columns: NAME, K, D, HS (headshots), $ (own row only)
   hideScoreboard(): void;
   showMatchEnd(winner: Team, scoreT: number, scoreCT: number, youTeam: Team | null, roster: RosterEntry[]): void;
   // includes top-3 players by kills from roster
@@ -408,7 +421,8 @@ export class ClientState {
 ```ts
 export class ClientGame {
   constructor(opts: { canvas: HTMLCanvasElement; hud: Hud; menus: Menus; state: ClientState });
-  joinQuick(name: string): void; createPrivate(name: string, mapId: MapId): void;
+  joinQuick(name: string): void; createPublic(name: string, mapId: MapId): void;
+  createPrivate(name: string, mapId: MapId): void;
   joinPrivate(name: string, code: string): void; listRooms(): Promise<RoomInfo[]>; leave(): void;
   frame(nowMs: number): void;  // rAF: input->send at TICK_RATE, prediction, interp, scene update,
   // models/viewmodel/effects/hud update, audio listener
@@ -429,6 +443,7 @@ window.__fps = {
   state(): unknown; // JSON-safe: { phase, roomId, code, mapId, team, hp, alive, pos:[x,y,z],
   // players, rosterSize, ping, money, mag, reserve, round, scoreT, scoreCT, weapon }
   joinQuick(name: string): void;
+  createPublic(name: string, mapId: MapId): void;
   createPrivate(name: string, mapId: MapId): void;
   joinPrivate(name: string, code: string): void;
   debug: {
@@ -436,6 +451,7 @@ window.__fps = {
     setMove(x: number, z: number): void;
     press(btn: 'fire' | 'jump' | 'crouch' | 'alt', down: boolean): void;
     reload(): void; buy(w: WeaponId): void;
+    scoreboard(down: boolean): void; // e2e-only mirror of the Tab edge
   };
 };
 declare global { interface Window { __fps?: ... } }
@@ -443,14 +459,18 @@ declare global { interface Window { __fps?: ... } }
 
 ## Per-asset visual spec (model sheets — silhouettes + parts + storytelling)
 
-**Soldier** (`playerModels.ts`, 12–18 prims, ~1.8u tall): blocky humanoid; torso box (team uniform:
-CT = ctBlue chest/ctDark limbs; T = tAmber chest/tBrown limbs); head box (skin) + helmet (slightly
-wider box, team dark, covers the top of the head); two arm pivots at shoulders angled forward
-holding weapon (right arm bent); two leg pivots at hips; weapon = makeWeaponModel(current) scaled
-0.9 in hands; nameplate sprite 0.35u above head (name text, team color on translucent ink bg).
-Walk: legs/arms swing ±25° sin(phase), phase from distance travelled; idle: subtle torso breathe;
-crouch: legs scaleY 0.6, torso -0.35u; death: whole group rotates to lying over 0.4s, sinks 1u
-after 2s.
+**Soldier** (`playerModels.ts`, 20–28 prims, ~1.8u tall): blocky humanoid, more realistic
+proportions (not a cube-stack): torso box slightly tapered (two stacked boxes, chest wider than
+waist) in team uniform (CT ctBlue chest/ctDark limbs; T tAmber chest/tBrown limbs); a vest plate
+box on the chest (team dark); head box (skin) + helmet with a brim (slightly wider box + thin brim
+slab, team dark); TWO-SEGMENT arms (upper arm + forearm pivot at elbow) angled forward holding the
+weapon two-handed (right at grip, left at forend); two-segment legs (thigh + shin pivots) with
+boot boxes (ink); weapon = makeWeaponModel(current) scaled 0.9 in hands; nameplate sprite 0.35u
+above head (name text, team color on translucent ink bg). Walk: thighs/shins counter-swing ±25°
+sin(phase), arms counter-swing subtly, phase from distance travelled; idle: subtle torso breathe;
+AIM POSE: the arms+weapon pivot group pitches with the player's pitch (±0.6 rad clamp) so you can
+read where someone aims; crouch: legs bend (thigh forward, shin down), torso -0.35u; death: whole
+group rotates to lying over 0.4s, sinks 1u after 2s.
 
 **Weapons** (`viewModel.ts` `makeWeaponModel`, 6–12 prims each, metalDark/charcoal bodies):
 - knife: 0.5u blade (steel box, tapered tip via scaled cone) + woodDark grip; held tilted.
@@ -503,8 +523,8 @@ cover (box or prop-height ≥0.9) at least every 8m along each route; longest op
 
 ## Non-functional budgets
 
-- 60 FPS on a 2020 laptop at 1080p with 10 players: draw calls ≤ 500 at peak (map+deco ≤ 30 baked,
-  soldier ≤ 18, weapon ≤ 12, fx pooled), shadow map 2048 one cascade, particles pooled, zero
+- 60 FPS on a 2020 laptop at 1080p with 10 players: draw calls ≤ 550 at peak (map+deco ≤ 30 baked,
+  soldier ≤ 28, weapon ≤ 12, fx pooled), shadow map 2048 one cascade, particles pooled, zero
   per-frame allocations in render/tick hot paths.
 - Server: one room tick ≤ 2ms at 10 players; JSON snapshots OK at this scale.
 - Cold load: client bundle ≤ 1.5MB gz (three is most of it — no other heavy deps).

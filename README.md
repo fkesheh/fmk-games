@@ -8,12 +8,16 @@ synthesized, all colors from one frozen palette).
 
 - **Round-based team elimination** (T vs CT, up to 5v5): freeze-time buys → live round →
   halftime side swap → first to 6 rounds wins. CS-style economy: kill/round rewards, save/buy
-  decisions.
+  decisions. Stats: per-player headshots (scoreboard HS column) and multikill announcements
+  (double/triple/quad/ace).
 - **6 weapons**: knife, P9 pistol (issued), K90 SMG, M870 shotgun, AK-4 rifle, AWM sniper
   (right-click scope) — distinct damage/range/spread/price profiles.
 - **6 maps**: Dustbowl (dusk desert), Crossfire (industrial yard), Office (indoor cubicles),
   Frostbite (snow valley), Urbana (old town), Bunker (underground CQB with skylights).
-- **Public rooms** (quick join + room list) and **private rooms** (5-char share code, pick the map).
+- **Public rooms** (quick join + room list + create-public with map picker) and **private rooms**
+  (5-char share code, pick the map).
+- **Feel**: client prediction + lag-compensated hits, tracers, bullet-hole decals, hit markers,
+  directional damage indicators, screen shake, footsteps and shots audible by distance.
 - **Server-authoritative physics**: movement, collision, and lag-compensated hitscan all run
   server-side at 30Hz; the client runs the same shared physics for prediction, with 120ms
   interpolation for remote players. Warmup with free respawn until 2+ players.

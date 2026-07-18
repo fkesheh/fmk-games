@@ -17,7 +17,8 @@ import type {
 
 export interface MenuCallbacks {
   onQuickJoin(name: string): void;
-  onCreatePrivate(name: string, mapId: MapId): void;
+  onCreatePublic(name: string, mapId: MapId): void; // listed in the room browser
+  onCreatePrivate(name: string, mapId: MapId): void; // share-code only
   onJoinPrivate(name: string, code: string): void;
   onListRooms(): Promise<RoomInfo[]>;
   onBuy(weapon: WeaponId): void;
@@ -58,16 +59,19 @@ const TEAM_NAME: Record<Team, string> = { T: 'TERRORISTS', CT: 'COUNTER-TERRORIS
 
 const MAP_NAMES = new Map<MapId, string>(MAP_LIST.map((m) => [m.id, m.name]));
 
-// onboarding controls card per UX_BIBLE (WASD/mouse/LMB/R/B/Tab/1-6/Esc)
+// onboarding controls card per UX_BIBLE (full binding set)
 const CONTROLS: ReadonlyArray<readonly [string, string]> = [
   ['WASD', 'Move'],
   ['Mouse', 'Look'],
   ['LMB', 'Fire'],
+  ['RMB', 'Scope (AWM)'],
+  ['Space', 'Jump'],
+  ['Ctrl / C', 'Crouch'],
   ['R', 'Reload'],
   ['B', 'Buy'],
-  ['Tab', 'Score'],
+  ['Tab', 'Scoreboard'],
   ['1-6 / Wheel', 'Weapons'],
-  ['Esc', 'Menu'],
+  ['Esc', 'Pause'],
 ];
 
 // ---- small DOM helpers ------------------------------------------------------
@@ -227,7 +231,7 @@ export class Menus {
 
   private buildCreateCol(): HTMLElement {
     const sec = el('div', 'm9-sec');
-    sec.appendChild(el('h2', 'm9-sec-title', 'CREATE PRIVATE'));
+    sec.appendChild(el('h2', 'm9-sec-title', 'CREATE'));
     const grid = el('div', 'm9-map-grid');
     const buttons: HTMLButtonElement[] = [];
     for (const m of MAP_LIST) {
@@ -242,10 +246,18 @@ export class Menus {
       grid.appendChild(b);
     }
     sec.appendChild(grid);
-    const create = el('button', 'm9-btn m9-btn-primary m9-wide', 'CREATE');
-    create.type = 'button';
-    create.addEventListener('click', () => this.cb.onCreatePrivate(this.name(), this.selectedMap));
-    sec.appendChild(create);
+    const actions = el('div', 'm9-create-actions');
+    const pub = el('button', 'm9-btn m9-btn-primary', 'CREATE PUBLIC');
+    pub.type = 'button';
+    pub.title = 'Listed in the room browser';
+    pub.addEventListener('click', () => this.cb.onCreatePublic(this.name(), this.selectedMap));
+    const priv = el('button', 'm9-btn', 'CREATE PRIVATE');
+    priv.type = 'button';
+    priv.title = 'Share-code only';
+    priv.addEventListener('click', () => this.cb.onCreatePrivate(this.name(), this.selectedMap));
+    actions.appendChild(pub);
+    actions.appendChild(priv);
+    sec.appendChild(actions);
     return sec;
   }
 
@@ -429,7 +441,7 @@ export class Menus {
     const sig =
       `${scoreT}|${scoreCT}|${you}|` +
       roster
-        .map((r) => `${r.id}:${r.name}:${r.team}:${r.kills}:${r.deaths}:${r.money ?? ''}:${r.connected ? 1 : 0}`)
+        .map((r) => `${r.id}:${r.name}:${r.team}:${r.kills}:${r.deaths}:${r.headshots}:${r.money ?? ''}:${r.connected ? 1 : 0}`)
         .join('|');
     if (sig === this.scoreSig && this.isShown('score')) return;
     this.scoreSig = sig;
@@ -465,6 +477,7 @@ export class Menus {
     cols.appendChild(el('span', '', 'NAME'));
     cols.appendChild(el('span', 'm9-c-num', 'K'));
     cols.appendChild(el('span', 'm9-c-num', 'D'));
+    cols.appendChild(el('span', 'm9-c-num', 'HS'));
     cols.appendChild(el('span', 'm9-c-num', '$'));
     wrap.appendChild(cols);
 
@@ -481,6 +494,7 @@ export class Menus {
       row.appendChild(el('span', 'm9-c-name', r.name));
       row.appendChild(el('span', 'm9-c-num', `${r.kills}`));
       row.appendChild(el('span', 'm9-c-num', `${r.deaths}`));
+      row.appendChild(el('span', 'm9-c-num', `${r.headshots}`));
       row.appendChild(el('span', 'm9-c-num', r.id === you && r.money !== null ? `$${r.money}` : ''));
       wrap.appendChild(row);
     }
@@ -525,7 +539,7 @@ export class Menus {
         row.appendChild(el('span', 'm9-top3-rank', `#${i + 1}`));
         row.appendChild(el('span', r.team === 'T' ? 'm9-t' : 'm9-ct', r.team));
         row.appendChild(el('span', 'm9-top3-name', r.name));
-        row.appendChild(el('span', 'm9-top3-kd', `${r.kills} K · ${r.deaths} D`));
+        row.appendChild(el('span', 'm9-top3-kd', `${r.kills}K (${r.headshots} HS)`));
         list.appendChild(row);
       });
     panel.appendChild(list);
@@ -642,6 +656,7 @@ const CSS = `
 .m9-map-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:10px;}
 .m9-map{padding:8px 2px;font-size:12px;font-weight:600;letter-spacing:.02em;text-transform:none;}
 .m9-map.m9-sel{border-color:var(--m9-hudAccent);color:var(--m9-hudAccent);}
+.m9-create-actions{display:grid;grid-template-columns:1fr 1fr;gap:6px;}
 .m9-code{text-align:center;letter-spacing:.4em;text-transform:uppercase;margin-bottom:10px;
   font-family:ui-monospace,Menlo,Consolas,monospace;}
 
@@ -698,7 +713,7 @@ const CSS = `
 .m9-table-head{padding:9px 12px;font-weight:800;font-size:13px;letter-spacing:.14em;}
 .m9-th-t{background:var(--m9-tAmber);color:var(--m9-ink);}
 .m9-th-ct{background:var(--m9-ctBlue);color:var(--m9-paper);}
-.m9-row{display:grid;grid-template-columns:18px 1fr 44px 44px 64px;gap:4px;align-items:center;
+.m9-row{display:grid;grid-template-columns:18px 1fr 44px 44px 44px 64px;gap:4px;align-items:center;
   padding:6px 12px;font-size:13px;border-top:1px solid rgba(var(--m9-metalDark-rgb),.5);}
 .m9-cols-head{font-size:12px;color:var(--m9-steel);letter-spacing:.08em;}
 .m9-row.m9-you{background:rgba(var(--m9-hudAccent-rgb),.16);}

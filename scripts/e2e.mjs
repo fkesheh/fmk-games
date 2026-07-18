@@ -6,7 +6,8 @@
 // browser instances (separate processes: no cross-tab rAF throttling) through
 // the frozen window.__fps surface: private-room create/join, phase machine
 // warmup->freeze->live, movement, combat (aim math + semi-auto fire edges),
-// buy flow, state-surface shape, and a 6-map screenshot tour.
+// buy flow, state-surface shape, a 6-map screenshot tour, public-room create
+// (code === null), debug scoreboard toggle, and jump-apex height.
 //
 // Exit 0 only if every assertion passes AND zero page/console/network errors
 // were seen on either page (benign favicon noise excluded).
@@ -101,8 +102,18 @@ const LAUNCH_ARGS = [
   '--enable-unsafe-swiftshader', // allow sw fallback; hardware ANGLE still preferred
 ];
 
+// one slow frame must not abort the whole suite (software GL + shadowed
+// soldier models make individual captures genuinely slow on loaded machines)
+const PROTOCOL_TIMEOUT_MS = Number(process.env.E2E_PROTOCOL_TIMEOUT ?? 300000);
+const LAUNCH_OPTS = {
+  headless: true,
+  args: LAUNCH_ARGS,
+  protocolTimeout: PROTOCOL_TIMEOUT_MS,
+  dumpio: !!process.env.E2E_DUMPIO, // pipe browser stderr (GPU/context-loss noise) when diagnosing
+};
+
 async function launchOne(tag) {
-  let browser = await puppeteer.launch({ headless: true, args: LAUNCH_ARGS });
+  let browser = await puppeteer.launch(LAUNCH_OPTS);
   browsers.push(browser);
   let page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 720 });
@@ -112,7 +123,7 @@ async function launchOne(tag) {
     await browser.close();
     browsers.pop();
     browser = await puppeteer.launch({
-      headless: true,
+      ...LAUNCH_OPTS,
       args: [...LAUNCH_ARGS, '--use-gl=angle', '--use-angle=swiftshader'],
     });
     browsers.push(browser);
@@ -133,16 +144,86 @@ function trackErrors(page, tag) {
     pageErrors.push(`[${tag}] console.error: ${m.text()} (${url})`);
   });
   page.on('pageerror', (e) => pageErrors.push(`[${tag}] pageerror: ${e.message}`));
+  page.on('error', (e) => pageErrors.push(`[${tag}] page CRASHED: ${e.message}`));
   page.on('requestfailed', (r) => {
     if (/favicon/.test(r.url())) return;
     pageErrors.push(`[${tag}] requestfailed: ${r.url()} — ${r.failure()?.errorText ?? '?'}`);
   });
 }
 
+// ---- hang diagnostics ---------------------------------------------------------
+// Discriminates, at the moment a capture stalls: (a) main thread blocked
+// (evaluate itself never returns), (b) WebGL context lost / rAF starved
+// (evaluate returns but rafFired=false or glLost=true), (c) NaN poisoning
+// (posFinite=false), (d) mere slowness (everything healthy, shot lands late).
+async function probePage(page, label) {
+  const evalP = page.evaluate(
+    () =>
+      new Promise((res) => {
+        let st = null;
+        let stateErr = null;
+        try {
+          st = window.__fps ? window.__fps.state() : null;
+        } catch (e) {
+          stateErr = e instanceof Error ? e.message : String(e);
+        }
+        const canvas = document.getElementById('game');
+        let glLost = 'no-canvas';
+        try {
+          const gl = canvas && (canvas.getContext('webgl2') || canvas.getContext('webgl'));
+          glLost = gl ? gl.isContextLost() : 'no-context';
+        } catch (e) {
+          glLost = `err:${e instanceof Error ? e.message : String(e)}`;
+        }
+        const t0 = performance.now();
+        let raf = false;
+        requestAnimationFrame(() => {
+          raf = true;
+        });
+        setTimeout(
+          () =>
+            res({
+              posFinite: st ? st.pos.every((v) => Number.isFinite(v)) : null,
+              phase: st ? st.phase : null,
+              stateErr,
+              glLost,
+              rafFired: raf,
+              rafWaitMs: Math.round(performance.now() - t0),
+            }),
+          400,
+        );
+      }),
+  );
+  const r = await Promise.race([evalP, sleep(6000).then(() => 'MAIN-THREAD-UNRESPONSIVE')]);
+  console.log(`[diag] ${label}: ${typeof r === 'string' ? r : JSON.stringify(r)}`);
+  return r;
+}
+
 async function shot(page, name) {
   const file = path.join(SHOTS_DIR, name);
-  await page.screenshot({ path: file });
-  console.log(`shot  ${name}`);
+  const t0 = Date.now();
+  // bounded per-capture timeout (healthy captures are <1s even on swiftshader):
+  // a wedged compositor must not park the suite for the full protocolTimeout
+  try {
+    await page.screenshot({ path: file, timeout: 30000 });
+    console.log(`shot  ${name} (${((Date.now() - t0) / 1000).toFixed(1)}s)`);
+    return;
+  } catch (err) {
+    console.log(
+      `[diag] ${name}: capture failed at ${((Date.now() - t0) / 1000).toFixed(1)}s ` +
+        `(${err instanceof Error ? err.message : String(err)}) — probing, then one retry`,
+    );
+    try {
+      await probePage(page, `${name} post-fail`);
+      await probePage(page, `${name} post-fail+7s`);
+    } catch (probeErr) {
+      console.log(`[diag] ${name}: probe itself failed (${probeErr instanceof Error ? probeErr.message : String(probeErr)})`);
+    }
+  }
+  // one retry with a wider window: transient compositor/GPU stalls clear; a
+  // persistent wedge rejects here and aborts the suite with diag output above
+  await page.screenshot({ path: file, timeout: 90000 });
+  console.log(`shot  ${name} (retry, ${((Date.now() - t0) / 1000).toFixed(1)}s)`);
 }
 
 // ---- gameplay helpers -----------------------------------------------------------
@@ -428,6 +509,66 @@ async function main() {
     }
     console.log(`tour ${mapId}: ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   }
+
+  // -- (11) public room: A leaves the tour room by re-joining via createPublic
+  //    (startJoin drops the old world/socket first). Public rooms have no code.
+  const prevRoom = (await fpsState(A)).roomId;
+  await A.evaluate(() => window.__fps.createPublic('Alice', 'crossfire'));
+  const pub = await waitFor(async () => {
+    const s = await fpsState(A);
+    return s && s.roomId !== null && s.roomId !== prevRoom && s.code === null && s.mapId === 'crossfire'
+      ? s
+      : null;
+  }, 15000, 'A createPublic join (crossfire, code null)');
+  check(
+    'A createPublic joins a public crossfire room (code === null)',
+    true,
+    `room=${pub.roomId} (was ${prevRoom}) code=${pub.code} map=${pub.mapId}`,
+  );
+
+  // -- (12) scoreboard: debug.scoreboard mirrors the Tab edge; the layer is
+  //    .fps-menus .m9-layer-score, always in the DOM, shown via display:flex
+  //    (client/src/ui/menus.ts makeLayer/show) — so assert computed visibility.
+  const scoreSel = '.fps-menus .m9-layer-score';
+  const scoreVisible = () =>
+    A.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      return el !== null && getComputedStyle(el).display !== 'none';
+    }, scoreSel);
+  await A.evaluate(() => window.__fps.debug.scoreboard(true));
+  const shown = await waitFor(async () => ((await scoreVisible()) ? true : null), 5000, 'scoreboard visible');
+  await A.evaluate(() => window.__fps.debug.scoreboard(false));
+  const hidden = await waitFor(async () => ((await scoreVisible()) ? null : true), 5000, 'scoreboard hidden');
+  check('debug.scoreboard(true/false) toggles .m9-layer-score visibility', shown === true && hidden === true);
+
+  // -- (13) jump apex: flat spawn ground on crossfire; one 100ms jump press,
+  //    sample feet y every 30ms for 1s inside the page (no evaluate round-trip
+  //    jitter). jumpVel 5.9 -> apex ~0.87m; assert a conservative > 0.75m.
+  await sleep(500); // settle on the ground after the spawn snapshot
+  const jump = await A.evaluate(
+    () =>
+      new Promise((resolve) => {
+        const fps = window.__fps;
+        const startY = fps.state().pos[1];
+        let maxY = startY;
+        fps.debug.press('jump', true);
+        setTimeout(() => fps.debug.press('jump', false), 100);
+        const t0 = performance.now();
+        const iv = setInterval(() => {
+          const y = fps.state().pos[1];
+          if (y > maxY) maxY = y;
+          if (performance.now() - t0 >= 1000) {
+            clearInterval(iv);
+            resolve({ startY, maxY });
+          }
+        }, 30);
+      }),
+  );
+  check(
+    'jump apex > 0.75m on flat ground (jumpVel 5.9)',
+    jump.maxY - jump.startY > 0.75,
+    `start=${jump.startY.toFixed(2)} apex=+${(jump.maxY - jump.startY).toFixed(2)}m`,
+  );
 
   // -- error-banner DOM check (window.onerror surface may not raise pageerror) -----------
   for (const [tag, page] of [['A', A], ['B', B]]) {

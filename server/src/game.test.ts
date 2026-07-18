@@ -5,8 +5,8 @@
 // same dustbowl solids the server sim uses — fully deterministic.
 // ============================================================================
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ECONOMY, INPUT_FIRE, MAPS, PLAYER, WEAPONS, boxToAABB, hitscan } from '@fps/shared';
-import type { C2S, GameEvent, PlayerId, RoomPhase, S2C, Team, Vec3 } from '@fps/shared';
+import { ECONOMY, INPUT_FIRE, MAPS, MULTIKILL_WINDOW, PLAYER, WEAPONS, boxToAABB, hitscan } from '@fps/shared';
+import type { C2S, GameEvent, HitscanTarget, PlayerId, RoomPhase, S2C, Team, Vec3 } from '@fps/shared';
 import { GameRoom } from './game.js';
 import type { RoomIO } from './game.js';
 
@@ -211,18 +211,52 @@ function navPath(x0: number, z0: number, x1: number, z1: number): Array<{ x: num
   }));
 }
 
+interface FightOpts {
+  /** aim height above target feet (default 0.75 = chest; ~1.65 = head-band center) */
+  aimHeight?: number;
+  /** stand-and-fire horizontal distance (default 12) */
+  fireDist?: number;
+  /** loop iterations between trigger pulls (default 8; >= 6 respects the 0.17s fire interval) */
+  cadence?: number;
+  /** probe against ALL alive players and fire only when the closest hit is the target */
+  strict?: boolean;
+  /** with strict: fire only when the probe hit on the target is a headshot */
+  headshot?: boolean;
+  /** extra player who BFS-walks toward the shooter for the whole fight */
+  lure?: PlayerId;
+}
+
 /**
  * Drive `shooter` until `target` dies: BFS-path toward the target (repath when
- * wedged or stale), stand and fire the pistol at the chest whenever the shared
- * hitscan says the line is clear at <= 12m. Throws if the budget runs out.
+ * wedged or stale), stand and fire the pistol at the aim point whenever the shared
+ * hitscan says the line is clear at <= fireDist. Throws if the budget runs out.
  */
-function fightUntilKill(room: GameRoom, io: FakeIO, feed: InputFeed, shooter: PlayerId, target: PlayerId): void {
+function fightUntilKill(
+  room: GameRoom,
+  io: FakeIO,
+  feed: InputFeed,
+  shooter: PlayerId,
+  target: PlayerId,
+  opts: FightOpts = {},
+): void {
+  const aimHeight = opts.aimHeight ?? 0.75;
+  const fireDist = opts.fireDist ?? 12;
+  const cadence = opts.cadence ?? 8;
+  const strict = opts.strict ?? false;
+  const needHead = opts.headshot ?? false;
+  const lureId = opts.lure;
   let lastX = 0;
   let lastZ = 0;
   let stuck = 0;
   let path: Array<{ x: number; z: number }> = [];
   let pathIdx = 0;
   let lastPathAt = -1000;
+  let lurePath: Array<{ x: number; z: number }> = [];
+  let lurePathIdx = 0;
+  let lureLastPathAt = -1000;
+  let lureLastX = 0;
+  let lureLastZ = 0;
+  let lureStuck = 0;
   for (let i = 0; i < 2500; i++) {
     const snap = io.lastSnap(shooter);
     const me = snap.players.find((p) => p.id === shooter);
@@ -231,15 +265,29 @@ function fightUntilKill(room: GameRoom, io: FakeIO, feed: InputFeed, shooter: Pl
     if (!tgt.alive) return;
 
     const eye: Vec3 = { x: me.x, y: me.y + PLAYER.heightStand - PLAYER.eyeOffset, z: me.z };
-    const chest: Vec3 = { x: tgt.x, y: tgt.y + 0.75, z: tgt.z };
-    const dx = chest.x - eye.x;
-    const dy = chest.y - eye.y;
-    const dz = chest.z - eye.z;
+    const aim: Vec3 = { x: tgt.x, y: tgt.y + aimHeight, z: tgt.z };
+    const dx = aim.x - eye.x;
+    const dy = aim.y - eye.y;
+    const dz = aim.z - eye.z;
     const dist = Math.hypot(dx, dz) || 1e-9;
     const len = Math.hypot(dx, dy, dz) || 1e-9;
     const dir: Vec3 = { x: dx / len, y: dy / len, z: dz / len };
-    const clear =
-      hitscan(eye, dir, [{ id: 'tgt', x: tgt.x, y: tgt.y, z: tgt.z, height: PLAYER.heightStand }], SOLIDS, 200) !== null;
+    let clear: boolean;
+    if (strict) {
+      // probe everyone: the trigger is pulled only when the TARGET eats the bullet
+      const others: HitscanTarget[] = [];
+      for (const pl of snap.players) {
+        if (pl.id !== shooter && pl.alive) {
+          others.push({ id: pl.id, x: pl.x, y: pl.y, z: pl.z, height: PLAYER.heightStand });
+        }
+      }
+      const probe = hitscan(eye, dir, others, SOLIDS, 200);
+      clear = probe !== null && probe.targetId === target && (!needHead || probe.headshot);
+    } else {
+      clear =
+        hitscan(eye, dir, [{ id: 'tgt', x: tgt.x, y: tgt.y, z: tgt.z, height: PLAYER.heightStand }], SOLIDS, 200) !==
+        null;
+    }
     // input yaw/pitch so the server's aimDir(yaw,pitch) equals `dir`
     let yaw = Math.atan2(-dx, -dz);
     const pitch = Math.atan2(dy, dist);
@@ -247,7 +295,7 @@ function fightUntilKill(room: GameRoom, io: FakeIO, feed: InputFeed, shooter: Pl
     const moved = Math.hypot(me.x - lastX, me.z - lastZ);
     lastX = me.x;
     lastZ = me.z;
-    const walking = !(clear && dist <= 12);
+    const walking = !(clear && dist <= fireDist);
     if (walking && moved < 0.01) stuck++;
     else stuck = 0;
 
@@ -260,7 +308,7 @@ function fightUntilKill(room: GameRoom, io: FakeIO, feed: InputFeed, shooter: Pl
 
     let moveZ = 0;
     let buttons = 0;
-    if (clear && dist <= 12 && snap.you.mag > 0 && i % 8 === 0) {
+    if (clear && dist <= fireDist && snap.you.mag > 0 && i % cadence === 0) {
       // semi-auto: one edge per shot, well over the 0.17s fire interval
       buttons = INPUT_FIRE;
     } else if (walking) {
@@ -279,6 +327,43 @@ function fightUntilKill(room: GameRoom, io: FakeIO, feed: InputFeed, shooter: Pl
     if (snap.you.mag === 0) room.handleReload(shooter);
     feed.send(room, shooter, { moveX: 0, moveZ, yaw, pitch, buttons });
     if (i % 30 === 0) feed.send(room, target); // keep the target's input clock fresh
+
+    if (lureId !== undefined) {
+      // the lure converges on the shooter so a follow-up kill fits MULTIKILL_WINDOW
+      const lm = snap.players.find((p) => p.id === lureId);
+      if (lm !== undefined && lm.alive) {
+        const ldx = me.x - lm.x;
+        const ldz = me.z - lm.z;
+        const ldist = Math.hypot(ldx, ldz);
+        const lmoved = Math.hypot(lm.x - lureLastX, lm.z - lureLastZ);
+        lureLastX = lm.x;
+        lureLastZ = lm.z;
+        if (ldist > 2 && lmoved < 0.01) lureStuck++;
+        else lureStuck = 0;
+        if (lurePathIdx >= lurePath.length || i - lureLastPathAt > 90 || lureStuck > 20) {
+          lurePath = navPath(lm.x, lm.z, me.x, me.z);
+          lurePathIdx = 0;
+          lureLastPathAt = i;
+          lureStuck = 0;
+        }
+        let lureYaw = Math.atan2(-ldx, -ldz);
+        let lureMove = 0;
+        if (ldist > 2) {
+          const wp = lurePath[lurePathIdx];
+          if (wp !== undefined) {
+            if (Math.hypot(wp.x - lm.x, wp.z - lm.z) < 0.5) {
+              lurePathIdx++;
+            } else {
+              lureYaw = Math.atan2(-(wp.x - lm.x), -(wp.z - lm.z));
+              lureMove = 1;
+            }
+          } else {
+            lureMove = 1; // no path: close straight in
+          }
+        }
+        feed.send(room, lureId, { moveX: 0, moveZ: lureMove, yaw: lureYaw, pitch: 0, buttons: 0 });
+      }
+    }
     tick();
   }
   throw new Error('fight did not resolve within the tick budget');
@@ -431,6 +516,67 @@ describe('GameRoom economy', () => {
     expect(you.weapons).toEqual(['pistol', 'knife', 'rifle']); // held weapon stays first
     expect(you.weapon).toBe('pistol');
     expect(you.canBuy).toBe(true);
+    room.stop();
+  });
+});
+
+describe('GameRoom stats', () => {
+  it('headshot kill lands in the roster; a quick follow-up kill broadcasts multikill 2', () => {
+    const io = new FakeIO();
+    const room = new GameRoom('dustbowl', 'public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.addPlayer('p2', 'Bravo');
+    room.addPlayer('p3', 'Carol');
+    room.start();
+    const feed = new InputFeed();
+    advanceToPhase(io, 'p1', 'live');
+
+    // 3 players => 2v1: the lone player is the killer (a 1v1 kill would end the
+    // round, and the streak resets at freeze — the follow-up needs a live round)
+    const ids: PlayerId[] = ['p1', 'p2', 'p3'];
+    const onTeam = (t: Team): PlayerId[] => ids.filter((id) => teamOf(io, id) === t);
+    const solo = onTeam('T').length === 1 ? onTeam('T') : onTeam('CT');
+    const killer = solo[0];
+    if (killer === undefined) throw new Error('expected a solo player in a 2v1');
+    const victims = ids.filter((id) => id !== killer);
+    const v1 = victims[0];
+    const v2 = victims[1];
+    if (v1 === undefined || v2 === undefined) throw new Error('expected two victims in a 2v1');
+
+    // kill 1: the killing blow must be a headshot — aim at the head-band center
+    // (top 0.3m) from <= 4m, where even max spread (1.6 deg with one shot of
+    // bloom => 0.11m) cannot leave the band; strict probing guarantees v1 eats it
+    fightUntilKill(room, io, feed, killer, v1, {
+      aimHeight: PLAYER.heightStand - 0.15,
+      fireDist: 4,
+      strict: true,
+      headshot: true,
+      lure: v2,
+    });
+    const kill1At = io.lastSnap(killer).serverTime;
+
+    const kills = eventsOfType(io, killer, 'kill');
+    expect(kills.length).toBe(1);
+    expect(kills[0]?.killerId).toBe(killer);
+    expect(kills[0]?.victimId).toBe(v1);
+    expect(kills[0]?.weapon).toBe('pistol');
+    expect(kills[0]?.headshot).toBe(true);
+
+    // roster-carrying message: a fresh joiner's `joined` carries the full roster
+    room.addPlayer('p4', 'Delta');
+    const entry = io.joined('p4').roster.find((e) => e.id === killer);
+    expect(entry?.kills).toBe(1);
+    expect(entry?.headshots).toBe(1);
+
+    // kill 2: v2 was lured to the fight, so it dies well inside MULTIKILL_WINDOW
+    fightUntilKill(room, io, feed, killer, v2, { cadence: 6, strict: true });
+    const kill2At = io.lastSnap(killer).serverTime;
+    expect(kill2At - kill1At).toBeLessThanOrEqual(MULTIKILL_WINDOW * 1000);
+
+    const multis = eventsOfType(io, killer, 'multikill');
+    expect(multis.length).toBe(1);
+    expect(multis[0]?.playerId).toBe(killer);
+    expect(multis[0]?.count).toBe(2);
     room.stop();
   });
 });

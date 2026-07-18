@@ -14,6 +14,7 @@ import {
   MAPS,
   MAX_PLAYERS,
   MIN_PLAYERS_FOR_MATCH,
+  MULTIKILL_WINDOW,
   NET,
   PLAYER,
   PRIVATE_CODE_LEN,
@@ -106,6 +107,9 @@ interface PlayerState {
   money: number;
   kills: number;
   deaths: number;
+  headshots: number;
+  lastKillAt: number; // serverTime ms of this player's last kill, 0 = none
+  streak: number; // multikill streak (kills within MULTIKILL_WINDOW of the previous)
   spawnProtectedUntil: number; // serverTime ms
   respawnAt: number | null; // warmup respawn timer, else null
   spectateTarget: PlayerId | null; // set while dead in a live round
@@ -216,7 +220,8 @@ export class GameRoom {
         ammo: new Map<WeaponId, Ammo>([['pistol', defaultAmmo('pistol')]]),
         reloadUntil: 0, nextShotAt: 0, bloom: 0, shotSeq: 0,
         hp: PLAYER.maxHp, alive: true,
-        money: ECONOMY.start, kills: 0, deaths: 0,
+        money: ECONOMY.start, kills: 0, deaths: 0, headshots: 0,
+        lastKillAt: 0, streak: 0,
         spawnProtectedUntil: 0, respawnAt: null, spectateTarget: null,
         snap, you, snapshotMsg,
       };
@@ -414,6 +419,8 @@ export class GameRoom {
     for (const p of this.players.values()) {
       this.placeAtSpawn(p, now); // teleported, healed, protected
       this.refillWeapons(p); // every owned weapon refills mag+reserve for free
+      p.streak = 0; // multikill streaks reset for everyone at every freeze
+      p.lastKillAt = 0;
     }
     this.broadcast({
       t: 'round_start', round,
@@ -637,6 +644,20 @@ export class GameRoom {
     victim.reloadUntil = 0;
     victim.bloom = 0;
     killer.kills++;
+    if (headshot) killer.headshots++;
+    // multikill streak: within MULTIKILL_WINDOW of the killer's previous kill
+    // extends it, otherwise it restarts at 1; dying resets the victim's own
+    if (killer.lastKillAt > 0 && now - killer.lastKillAt <= MULTIKILL_WINDOW * 1000) {
+      killer.streak++;
+    } else {
+      killer.streak = 1;
+    }
+    killer.lastKillAt = now;
+    victim.streak = 0;
+    victim.lastKillAt = 0;
+    if (killer.streak >= 2) {
+      this.broadcast({ t: 'multikill', playerId: killer.id, count: Math.min(killer.streak, 5) });
+    }
     if (this.phase !== 'warmup') killer.money = killReward(killer.money); // no economy in warmup
     this.broadcast({ t: 'kill', killerId: killer.id, victimId: victim.id, weapon: def.id, headshot });
     if (this.phase === 'warmup') {
@@ -828,7 +849,7 @@ export class GameRoom {
     // money is populated only for the receiving player
     return {
       id: p.id, name: p.name, team: p.team,
-      kills: p.kills, deaths: p.deaths,
+      kills: p.kills, deaths: p.deaths, headshots: p.headshots,
       money: p.id === forId ? p.money : null,
       connected: true,
     };
