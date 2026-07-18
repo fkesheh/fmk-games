@@ -2,7 +2,9 @@
 // Layout carved out of solid mass: 8x8 central hub, a 2.5m ring corridor around it
 // (the loop), 4 side rooms (N/S = team spawn rooms, W/E = flank rooms); all other
 // interior volume is solid concreteDark. Invariants verified:
-//   - enclosed: outer walls h=3 + ceiling slab (bottom at y=2.8), no gaps
+//   - enclosed: outer walls h=3 + ceiling slabs (bottom at y=2.8); the only
+//     openings are 4 interior skylight slots (~2m, hub + N/S rooms + NE ring
+//     junction) that let the sun throw light pools indoors; edges stay sealed
 //   - routes CT(N) -> T(S): west ring, east ring, through the hub = 3 (+ ring loop)
 //   - no spawn sightline: N/S lines must thread hub N door [0.8,2.8] + S door [-3,-1];
 //     every such line crosses the 2x2 central pillar (door sets are staggered), and
@@ -28,13 +30,13 @@ export const bunker: MapDef = {
   theme: {
     sky: PALETTE.steel,
     horizon: PALETTE.ink,
-    ground: PALETTE.metalDark,
+    ground: PALETTE.concreteDark,
     fog: PALETTE.charcoal,
     fogDensity: 0.018,
     sunDir: [0.2, -1, 0.15],
     sunColor: PALETTE.steel,
-    sunIntensity: 0.9,
-    hemiIntensity: 1.5,
+    sunIntensity: 1.3,
+    hemiIntensity: 2.5,
   },
   boxes: [
     // ---- outer shell: walls h=3 + ceiling (slab bottom y=2.8) ----
@@ -42,7 +44,23 @@ export const bunker: MapDef = {
     { x: 0, y: 1.5, z: D / 2, w: W + 2, h: 3, d: 1, mat: 'concreteDark' },
     { x: -W / 2, y: 1.5, z: 0, w: 1, h: 3, d: D + 2, mat: 'concreteDark' },
     { x: W / 2, y: 1.5, z: 0, w: 1, h: 3, d: D + 2, mat: 'concreteDark' },
-    { x: 0, y: 2.95, z: 0, w: W + 2, h: 0.3, d: D + 2, mat: 'metalDark' },
+    // ceiling (slab bottom y=2.8) tiled around 4 skylight slots (~2m) so the
+    // sun throws real light pools + contact shadows indoors; slots sit over
+    // open floor only (hub W of pillar, N/S spawn rooms, NE ring junction) —
+    // outer edges remain fully sealed (slots keep >=7.5m off the outer walls)
+    { x: 0, y: 2.95, z: -15, w: W + 2, h: 0.3, d: 4, mat: 'concreteDark' }, // z[-17,-13]
+    { x: -8, y: 2.95, z: -12, w: 18, h: 0.3, d: 2, mat: 'concreteDark' }, // slot: N room x[1,3] z[-13,-11]
+    { x: 10, y: 2.95, z: -12, w: 14, h: 0.3, d: 2, mat: 'concreteDark' },
+    { x: 0, y: 2.95, z: -9.3, w: W + 2, h: 0.3, d: 3.4, mat: 'concreteDark' }, // z[-11,-7.6]
+    { x: -5.65, y: 2.95, z: -6.7, w: 22.7, h: 0.3, d: 1.8, mat: 'concreteDark' }, // slot: NE junction x[5.7,7.5] z[-7.6,-5.8]
+    { x: 12.25, y: 2.95, z: -6.7, w: 9.5, h: 0.3, d: 1.8, mat: 'concreteDark' },
+    { x: 0, y: 2.95, z: -3.4, w: W + 2, h: 0.3, d: 4.8, mat: 'concreteDark' }, // z[-5.8,-1]
+    { x: -10.25, y: 2.95, z: 0, w: 13.5, h: 0.3, d: 2, mat: 'concreteDark' }, // slot: hub x[-3.5,-1.5] z[-1,1]
+    { x: 7.75, y: 2.95, z: 0, w: 18.5, h: 0.3, d: 2, mat: 'concreteDark' },
+    { x: 0, y: 2.95, z: 6, w: W + 2, h: 0.3, d: 10, mat: 'concreteDark' }, // z[1,11]
+    { x: -10, y: 2.95, z: 12, w: 14, h: 0.3, d: 2, mat: 'concreteDark' }, // slot: S room x[-3,-1] z[11,13]
+    { x: 8, y: 2.95, z: 12, w: 18, h: 0.3, d: 2, mat: 'concreteDark' },
+    { x: 0, y: 2.95, z: 15, w: W + 2, h: 0.3, d: 4, mat: 'concreteDark' }, // z[13,17]
 
     // ---- solid corner masses (bunker is carved, not built) ----
     { x: -10.25, y: 1.5, z: -11.6, w: 10, h: 3, d: 7.8, mat: 'concreteDark' }, // NW
@@ -127,24 +145,25 @@ export const bunker: MapDef = {
     { x: 12.5, y: 0.6, z: 0, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
     { x: 12.5, y: 1.8, z: 0, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
 
-    // ---- pipe runs along walls (y 2.325-2.575: above heads, below ceiling) ----
-    { x: 0, y: 2.45, z: -7.55, w: 15, h: 0.25, d: 0.3, mat: 'metalDark' }, // ring N
-    { x: 0, y: 2.45, z: 7.55, w: 15, h: 0.25, d: 0.3, mat: 'metalDark' }, // ring S
-    { x: -7.55, y: 2.45, z: 0, w: 0.3, h: 0.25, d: 15, mat: 'metalDark' }, // ring W
-    { x: 7.55, y: 2.45, z: 0, w: 0.3, h: 0.25, d: 15, mat: 'metalDark' }, // ring E
-    { x: 0, y: 2.45, z: -15.35, w: 10.6, h: 0.25, d: 0.3, mat: 'metalDark' }, // N room
-    { x: 0, y: 2.45, z: 15.35, w: 10.6, h: 0.25, d: 0.3, mat: 'metalDark' }, // S room
-    { x: -15.35, y: 2.45, z: 0, w: 0.3, h: 0.25, d: 10.6, mat: 'metalDark' }, // W room
-    { x: 15.35, y: 2.45, z: 0, w: 0.3, h: 0.25, d: 10.6, mat: 'metalDark' }, // E room
+    // ---- pipe runs along walls (y 2.325-2.575: above heads, below ceiling);
+    // 'metal' (not metalDark) so the steel reads against concreteDark in gloom
+    { x: 0, y: 2.45, z: -7.55, w: 15, h: 0.25, d: 0.3, mat: 'metal' }, // ring N
+    { x: 0, y: 2.45, z: 7.55, w: 15, h: 0.25, d: 0.3, mat: 'metal' }, // ring S
+    { x: -7.55, y: 2.45, z: 0, w: 0.3, h: 0.25, d: 15, mat: 'metal' }, // ring W
+    { x: 7.55, y: 2.45, z: 0, w: 0.3, h: 0.25, d: 15, mat: 'metal' }, // ring E
+    { x: 0, y: 2.45, z: -15.35, w: 10.6, h: 0.25, d: 0.3, mat: 'metal' }, // N room
+    { x: 0, y: 2.45, z: 15.35, w: 10.6, h: 0.25, d: 0.3, mat: 'metal' }, // S room
+    { x: -15.35, y: 2.45, z: 0, w: 0.3, h: 0.25, d: 10.6, mat: 'metal' }, // W room
+    { x: 15.35, y: 2.45, z: 0, w: 0.3, h: 0.25, d: 10.6, mat: 'metal' }, // E room
     // vertical drop pipes in room corners
-    { x: -5.2, y: 1.4, z: -15.2, w: 0.3, h: 2.8, d: 0.3, mat: 'metalDark' },
-    { x: 5.2, y: 1.4, z: -15.2, w: 0.3, h: 2.8, d: 0.3, mat: 'metalDark' },
-    { x: -5.2, y: 1.4, z: 15.2, w: 0.3, h: 2.8, d: 0.3, mat: 'metalDark' },
-    { x: 5.2, y: 1.4, z: 15.2, w: 0.3, h: 2.8, d: 0.3, mat: 'metalDark' },
-    { x: -15.2, y: 1.4, z: -3.7, w: 0.3, h: 2.8, d: 0.3, mat: 'metalDark' },
-    { x: -15.2, y: 1.4, z: 3.7, w: 0.3, h: 2.8, d: 0.3, mat: 'metalDark' },
-    { x: 15.2, y: 1.4, z: -3.7, w: 0.3, h: 2.8, d: 0.3, mat: 'metalDark' },
-    { x: 15.2, y: 1.4, z: 3.7, w: 0.3, h: 2.8, d: 0.3, mat: 'metalDark' },
+    { x: -5.2, y: 1.4, z: -15.2, w: 0.3, h: 2.8, d: 0.3, mat: 'metal' },
+    { x: 5.2, y: 1.4, z: -15.2, w: 0.3, h: 2.8, d: 0.3, mat: 'metal' },
+    { x: -5.2, y: 1.4, z: 15.2, w: 0.3, h: 2.8, d: 0.3, mat: 'metal' },
+    { x: 5.2, y: 1.4, z: 15.2, w: 0.3, h: 2.8, d: 0.3, mat: 'metal' },
+    { x: -15.2, y: 1.4, z: -3.7, w: 0.3, h: 2.8, d: 0.3, mat: 'metal' },
+    { x: -15.2, y: 1.4, z: 3.7, w: 0.3, h: 2.8, d: 0.3, mat: 'metal' },
+    { x: 15.2, y: 1.4, z: -3.7, w: 0.3, h: 2.8, d: 0.3, mat: 'metal' },
+    { x: 15.2, y: 1.4, z: 3.7, w: 0.3, h: 2.8, d: 0.3, mat: 'metal' },
 
     // ---- ceiling beams (hang to y2.51; clear of players and crate stacks) ----
     { x: 0, y: 2.62, z: 0, w: 8, h: 0.22, d: 0.5, mat: 'metalDark' }, // hub

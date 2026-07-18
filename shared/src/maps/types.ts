@@ -49,7 +49,7 @@ export interface MapTheme {
   sunDir: [number, number, number]; // normalized-ish direction TOWARDS scene
   sunColor: string; // PALETTE hex
   sunIntensity: number; // 0.8..2.2
-  hemiIntensity: number; // 0.3..0.9
+  hemiIntensity: number; // 0.3..2.5 (indoor/dark-albedo maps run 1.5-2.5: the hemisphere IS the light there)
 }
 
 export interface MapDef {

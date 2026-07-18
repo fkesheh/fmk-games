@@ -33,10 +33,10 @@ export const frostbite: MapDef = {
   },
   boxes: [
     // ---- outer walls (h=5, valley rock) ----
-    { x: 0, y: 2.5, z: -D / 2, w: W + 2, h: 5, d: 1, mat: 'rock' },
-    { x: 0, y: 2.5, z: D / 2, w: W + 2, h: 5, d: 1, mat: 'rock' },
-    { x: -W / 2, y: 2.5, z: 0, w: 1, h: 5, d: D + 2, mat: 'rock' },
-    { x: W / 2, y: 2.5, z: 0, w: 1, h: 5, d: D + 2, mat: 'rock' },
+    { x: 0, y: 2.5, z: -D / 2, w: W + 2, h: 5, d: 1, mat: 'concrete' },
+    { x: 0, y: 2.5, z: D / 2, w: W + 2, h: 5, d: 1, mat: 'concrete' },
+    { x: -W / 2, y: 2.5, z: 0, w: 1, h: 5, d: D + 2, mat: 'concrete' },
+    { x: W / 2, y: 2.5, z: 0, w: 1, h: 5, d: D + 2, mat: 'concrete' },
 
     // ---- ice-ridge lane dividers (x=+-12; gaps: creek z -9.2..-0.8, south z 8..12) ----
     { x: -12, y: 1.2, z: -12.1, w: 2.5, h: 2.4, d: 5.8, mat: 'ice' },
@@ -56,25 +56,25 @@ export const frostbite: MapDef = {
     { x: 0, y: 1.5, z: -15, w: 18, h: 3, d: 1.5, mat: 'ice' },
 
     // ---- quadrant rock clusters (lane screens + diagonal sightline breakers) ----
-    { x: -20, y: 1.25, z: 15, w: 10.5, h: 2.5, d: 2.5, mat: 'rock' },
-    { x: 20, y: 1.25, z: 15, w: 10.5, h: 2.5, d: 2.5, mat: 'rock' },
-    { x: -20, y: 1.25, z: -15, w: 10.5, h: 2.5, d: 2.5, mat: 'rock' },
-    { x: 20, y: 1.25, z: -15, w: 10.5, h: 2.5, d: 2.5, mat: 'rock' },
+    { x: -20, y: 1.25, z: 15, w: 10.5, h: 2.5, d: 2.5, mat: 'concrete' },
+    { x: 20, y: 1.25, z: 15, w: 10.5, h: 2.5, d: 2.5, mat: 'concrete' },
+    { x: -20, y: 1.25, z: -15, w: 10.5, h: 2.5, d: 2.5, mat: 'concrete' },
+    { x: 20, y: 1.25, z: -15, w: 10.5, h: 2.5, d: 2.5, mat: 'concrete' },
     // corner formations sealing the spawn strips (merge with the screens above)
-    { x: -20, y: 1.25, z: 18.5, w: 3, h: 2.5, d: 6, mat: 'rock' },
-    { x: 20, y: 1.25, z: 18.5, w: 3, h: 2.5, d: 6, mat: 'rock' },
-    { x: -20, y: 1.25, z: -18.5, w: 3, h: 2.5, d: 6, mat: 'rock' },
-    { x: 20, y: 1.25, z: -18.5, w: 3, h: 2.5, d: 6, mat: 'rock' },
+    { x: -20, y: 1.25, z: 18.5, w: 3, h: 2.5, d: 6, mat: 'concrete' },
+    { x: 20, y: 1.25, z: 18.5, w: 3, h: 2.5, d: 6, mat: 'concrete' },
+    { x: -20, y: 1.25, z: -18.5, w: 3, h: 2.5, d: 6, mat: 'concrete' },
+    { x: 20, y: 1.25, z: -18.5, w: 3, h: 2.5, d: 6, mat: 'concrete' },
 
     // ---- frozen creek gully (channel z -8..-2, floor 0.6 below bank tops) ----
     { x: 0, y: 0.03, z: -5, w: 58, h: 0.06, d: 6, mat: 'ice' }, // ice floor
     { x: 0, y: 0.3, z: -1.4, w: 58, h: 0.6, d: 1.2, mat: 'snow' }, // south bank
     { x: 0, y: 0.3, z: -8.6, w: 58, h: 0.6, d: 1.2, mat: 'snow' }, // north bank
-    { x: 0, y: 1.25, z: -5, w: 3, h: 2.5, d: 8.8, mat: 'rock' }, // dam rock jammed mid creek
-    { x: -17.5, y: 1.25, z: -5, w: 2.5, h: 2.5, d: 3, mat: 'rock' }, // creek boulders
-    { x: 17.5, y: 1.25, z: -5, w: 2.5, h: 2.5, d: 3, mat: 'rock' },
-    { x: -27.5, y: 1.1, z: -2, w: 4, h: 2.2, d: 3, mat: 'rock' }, // creek-mouth rocks
-    { x: 27.5, y: 1.1, z: -2, w: 4, h: 2.2, d: 3, mat: 'rock' },
+    { x: 0, y: 1.25, z: -5, w: 3, h: 2.5, d: 8.8, mat: 'concrete' }, // dam rock jammed mid creek
+    { x: -17.5, y: 1.25, z: -5, w: 2.5, h: 2.5, d: 3, mat: 'concrete' }, // creek boulders
+    { x: 17.5, y: 1.25, z: -5, w: 2.5, h: 2.5, d: 3, mat: 'concrete' },
+    { x: -27.5, y: 1.1, z: -2, w: 4, h: 2.2, d: 3, mat: 'concrete' }, // creek-mouth rocks
+    { x: 27.5, y: 1.1, z: -2, w: 4, h: 2.2, d: 3, mat: 'concrete' },
     // step crossings (ground -> 0.4 step -> 0.6 bank): south side + inside creek
     { x: -21, y: 0.2, z: -0.3, w: 2.4, h: 0.4, d: 1, mat: 'snow' },
     { x: -21, y: 0.2, z: -7.5, w: 2.4, h: 0.4, d: 1, mat: 'ice' },
@@ -139,6 +139,8 @@ export const frostbite: MapDef = {
   deco: [
     { kind: 'snowRock', count: 16, x0: -29, z0: -21, x1: -14, z1: 21, minSpacing: 4.5 },
     { kind: 'snowRock', count: 16, x0: 14, z0: -21, x1: 29, z1: 21, minSpacing: 4.5 },
+    { kind: 'snowRock', count: 8, x0: -29, z0: -21, x1: -20, z1: 21, minSpacing: 4 },
+    { kind: 'snowRock', count: 8, x0: 20, z0: -21, x1: 29, z1: 21, minSpacing: 4 },
     { kind: 'snowRock', count: 10, x0: -13, z0: -21, x1: 13, z1: 21, minSpacing: 5 },
     { kind: 'snowRock', count: 10, x0: -13, z0: -20, x1: 13, z1: 20, minSpacing: 5 },
     { kind: 'shrub', count: 48, x0: -29, z0: -21, x1: 29, z1: 21, minSpacing: 3.5 },

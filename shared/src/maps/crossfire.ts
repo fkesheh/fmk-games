@@ -31,10 +31,10 @@ export const crossfire: MapDef = {
     ground: PALETTE.concrete,
     fog: PALETTE.fogDay,
     fogDensity: 0.007,
-    sunDir: [0.4, -1, 0.25],
+    sunDir: [0.55, -0.62, 0.5],
     sunColor: PALETTE.paper,
     sunIntensity: 1.6,
-    hemiIntensity: 0.7,
+    hemiIntensity: 1.35,
   },
   boxes: [
     // ---- outer walls ----
@@ -132,9 +132,9 @@ export const crossfire: MapDef = {
     ],
   },
   deco: [
-    { kind: 'barrel', count: 18, x0: -27, z0: -19, x1: -10, z1: 19, minSpacing: 3 },
-    { kind: 'barrel', count: 10, x0: 11, z0: -19, x1: 27, z1: 2, minSpacing: 3.5 },
-    { kind: 'pallet', count: 16, x0: -10, z0: 6, x1: 27, z1: 19, minSpacing: 3.5 },
-    { kind: 'pipe', count: 14, x0: -4, z0: -19, x1: 27, z1: 19, minSpacing: 4 },
+    { kind: 'barrel', count: 28, x0: -27, z0: -19, x1: -12, z1: 19, minSpacing: 3 },
+    { kind: 'barrel', count: 16, x0: 14, z0: -19, x1: 27, z1: 0, minSpacing: 3.5 },
+    { kind: 'pallet', count: 24, x0: -10, z0: 8, x1: 27, z1: 19, minSpacing: 3.5 },
+    { kind: 'pipe', count: 22, x0: 2, z0: -19, x1: 27, z1: 19, minSpacing: 4 },
   ],
 };
