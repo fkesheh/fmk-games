@@ -284,6 +284,10 @@ export class Effects {
     if (idx === -1) idx = this.pCursor; // pool full: recycle oldest-ish slot
     this.pCursor = (idx + 1) % PARTICLE_POOL;
 
+    // Count only genuinely-new activations: recycling a live slot must not
+    // inflate pActive (else the pActive===0 early-out in update() never fires).
+    const wasDead = this.pLife[idx]! <= 0;
+
     const i3 = idx * 3;
     const i4 = idx * 4;
     const pos = this.posAttr.array as Float32Array;
@@ -301,6 +305,21 @@ export class Effects {
     this.pLife[idx] = life;
     this.pMaxLife[idx] = life;
     this.pGrav[idx] = grav;
-    this.pActive++;
+    if (wasDead) this.pActive++;
+  }
+
+  /**
+   * Release all GPU resources owned by this pool: the 64 cloned tracer
+   * materials + tracer box geometries, and the Points geometry + its
+   * PointsMaterial. Called by ClientGame.teardownWorld() on room teardown.
+   * The shared mat() cache is untouched — only per-instance clones die here.
+   */
+  dispose(): void {
+    for (const m of this.tracers) {
+      m.geometry.dispose();
+      (m.material as THREE.MeshLambertMaterial).dispose();
+    }
+    this.points.geometry.dispose();
+    (this.points.material as THREE.PointsMaterial).dispose();
   }
 }

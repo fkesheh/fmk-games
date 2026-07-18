@@ -357,11 +357,6 @@ export class Menus {
     const head = el('div', 'm9-buy-head');
     head.appendChild(el('h2', 'm9-sec-title m9-buy-title', 'BUY MENU'));
     head.appendChild(el('div', 'm9-money', `$${money}`));
-    const close = el('button', 'm9-btn m9-btn-small m9-close', '✕');
-    close.type = 'button';
-    close.setAttribute('aria-label', 'Close buy menu');
-    close.addEventListener('click', () => this.hideBuy());
-    head.appendChild(close);
     panel.appendChild(head);
 
     if (!canBuy) panel.appendChild(el('div', 'm9-note', 'Buy time expired'));

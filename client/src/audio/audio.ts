@@ -40,12 +40,14 @@ export class AudioEngine {
   private master: GainNode | null = null;
   private noiseBuf: AudioBuffer | null = null;
   private amb: AmbientPatch | null = null;
+  private pendingAmb: boolean | null = null; // ambient() deferred while ctx suspended
   private stepFlip = false; // footstep alternates between two slight variants
 
   /** Create/unlock the AudioContext. Called on first user gesture; idempotent. */
   resume(): void {
     if (this.ctx) {
       if (this.ctx.state === 'suspended') void this.ctx.resume();
+      this.flushPendingAmbient();
       return;
     }
     const Ctor: typeof AudioContext | undefined = window.AudioContext
@@ -68,6 +70,7 @@ export class AudioEngine {
     for (let i = 0; i < data.length; i++) data[i] = next() * 2 - 1;
     this.noiseBuf = buf;
     if (ctx.state === 'suspended') void ctx.resume();
+    this.flushPendingAmbient();
   }
 
   /** One-shot effect. dist attenuates linearly: full ≤10m → 0 at 45m. */
@@ -168,7 +171,13 @@ export class AudioEngine {
     const ctx = this.ctx;
     const master = this.master;
     const nbuf = this.noiseBuf;
-    if (!ctx || !master || !nbuf || ctx.state !== 'running') return;
+    if (!ctx || !master || !nbuf || ctx.state !== 'running') {
+      // context missing/suspended (joined before the gesture completed) —
+      // remember the request; resume() applies it once running
+      this.pendingAmb = outdoor;
+      return;
+    }
+    this.pendingAmb = null;
     try {
       if (this.amb && this.amb.outdoor === outdoor) return; // bed already running
       const t0 = ctx.currentTime;
@@ -177,6 +186,57 @@ export class AudioEngine {
     } catch {
       // audio must never crash the client
     }
+  }
+
+  /** Stop the ambient bed with a 0.3s fade. Called on world teardown. */
+  stopAmbient(): void {
+    this.pendingAmb = null;
+    const patch = this.amb;
+    this.amb = null;
+    if (!patch) return;
+    try {
+      const ctx = this.ctx;
+      if (ctx && ctx.state === 'running') {
+        this.stopPatch(patch, ctx.currentTime, 0.3);
+      } else {
+        // context gone/suspended: ramps would never run — kill immediately
+        for (const s of patch.sources) {
+          try {
+            s.stop();
+          } catch {
+            // already stopped — fine
+          }
+        }
+        try {
+          patch.gain.disconnect();
+        } catch {
+          // already disconnected — fine
+        }
+      }
+    } catch {
+      // audio must never crash the client
+    }
+  }
+
+  /** Apply a deferred ambient() request once the context is running. */
+  private flushPendingAmbient(): void {
+    const ctx = this.ctx;
+    if (!ctx || this.pendingAmb === null) return;
+    if (ctx.state === 'running') {
+      const outdoor = this.pendingAmb;
+      this.pendingAmb = null;
+      this.ambient(outdoor);
+      return;
+    }
+    ctx.resume().then(() => {
+      if (this.pendingAmb !== null && ctx.state === 'running') {
+        const outdoor = this.pendingAmb;
+        this.pendingAmb = null;
+        this.ambient(outdoor);
+      }
+    }, () => {
+      // resume rejected (autoplay policy) — pending stays, next gesture retries
+    });
   }
 
   // ---- synth primitives ------------------------------------------------------
@@ -271,13 +331,13 @@ export class AudioEngine {
     return { outdoor, gain, sources };
   }
 
-  /** Fade a bed out over XFADE, then stop + disconnect it. */
-  private stopPatch(p: AmbientPatch, t0: number): void {
+  /** Fade a bed out over `fade` seconds, then stop + disconnect it. */
+  private stopPatch(p: AmbientPatch, t0: number, fade: number = XFADE): void {
     p.gain.gain.cancelScheduledValues(t0);
-    p.gain.gain.setTargetAtTime(0, t0, XFADE / 3);
+    p.gain.gain.setTargetAtTime(0, t0, fade / 3);
     for (const s of p.sources) {
       try {
-        s.stop(t0 + XFADE + 0.05);
+        s.stop(t0 + fade + 0.05);
       } catch {
         // already stopped — fine
       }

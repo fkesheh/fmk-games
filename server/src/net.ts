@@ -25,10 +25,17 @@ const MIME_TYPES: Record<string, string> = {
 
 const MAX_PAYLOAD = 16 * 1024; // wire messages are tiny; bigger frames are abuse
 
+// Liveness policy: heartbeat pings double as a dead-peer detector. A pong
+// clears the count; 2 consecutive unanswered protocol pings (≈2 heartbeat
+// intervals, well under NET.inputTimeoutMs) mean the connection is hard-dropped
+// and the socket is terminated so the close path frees the player slot.
+const MAX_MISSED_PONGS = 2;
+
 export class Session {
   readonly id: PlayerId;
   private readonly ws: WebSocket;
   private pingSentAt = 0;
+  private missedPongs = 0;
   private rtt = 0;
 
   constructor(id: PlayerId, ws: WebSocket) {
@@ -65,6 +72,16 @@ export class Session {
   /** Send a ws protocol ping and stamp the clock for the next rtt sample. */
   heartbeat(): void {
     if (this.ws.readyState !== WebSocket.OPEN) return;
+    if (this.pingSentAt > 0) {
+      // previous ping was never answered
+      this.missedPongs += 1;
+      if (this.missedPongs >= MAX_MISSED_PONGS) {
+        // dead peer: terminate — the 'close' event drives the single
+        // onDisconnect path, same as any other drop (no double-report)
+        this.terminate();
+        return;
+      }
+    }
     this.pingSentAt = Date.now();
     try {
       this.ws.ping();
@@ -76,9 +93,11 @@ export class Session {
   /** Record a protocol pong against the last heartbeat. */
   notePong(): void {
     if (this.pingSentAt > 0) this.rtt = Math.max(0, Date.now() - this.pingSentAt);
+    this.pingSentAt = 0;
+    this.missedPongs = 0;
   }
 
-  /** Hard terminate, server shutdown only. */
+  /** Hard terminate: dead-peer liveness drops and server shutdown. */
   terminate(): void {
     try {
       this.ws.terminate();

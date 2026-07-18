@@ -47,8 +47,12 @@ export class Predictor {
 
   /**
    * Authoritative correction: adopt server state, then replay unacked inputs.
-   * onGround is derived from vy: the server zeroes vy exactly on land/bonk and
-   * discrete gravity steps never land on 0 mid-air, so vy === 0 <=> grounded.
+   * onGround is derived from vy plus previous vertical motion: the server zeroes
+   * vy exactly on land — but ALSO on a mid-air head-bonk without setting
+   * onGround — so vy === 0 alone is not proof of grounded. Treat vy === 0 as
+   * grounded only when the body was already falling/grounded (prevVy <= 0 or
+   * prevOnGround); a bonk arrives with prevVy > 0 (still rising) and stays
+   * airborne.
    */
   reconcile(
     x: number,
@@ -60,6 +64,8 @@ export class Predictor {
     speedMul: number,
   ): void {
     const b = this.b;
+    const prevVy = b.vy;
+    const prevOnGround = b.onGround;
     b.x = x;
     b.y = y;
     b.z = z;
@@ -67,7 +73,7 @@ export class Predictor {
     b.vz = 0;
     b.vy = vy;
     b.height = height;
-    b.onGround = vy === 0;
+    b.onGround = vy === 0 && (prevVy <= 0 || prevOnGround);
     // drop inputs the server has consumed (queue is seq-ordered)
     let acked = 0;
     while (acked < this.pending.length) {

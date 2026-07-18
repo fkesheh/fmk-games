@@ -167,8 +167,24 @@ export class SceneRig {
     return Math.sin(t) * 0.55 + Math.sin(t * 1.93 + 1.3) * 0.3 + Math.sin(t * 3.71 + 2.1) * 0.15;
   }
 
-  /** Full-viewport readable failure message (PALETTE colors), shown once. */
+  /** Tracked context-error overlay (single element; never duplicated). */
+  private static contextErrorEl: HTMLDivElement | null = null;
+
+  /**
+   * Remove the context-error overlay if present. Public so the caller's
+   * failure fallback (e.g. ClientGame returning to the main menu) can unblock
+   * the UI after the rig constructor threw. Idempotent — safe to call when no
+   * overlay is shown.
+   */
+  static clearContextError(): void {
+    SceneRig.contextErrorEl?.remove();
+    SceneRig.contextErrorEl = null;
+  }
+
+  /** Full-viewport readable failure message (PALETTE colors); idempotent — reuses one overlay. */
   private static showContextError(): void {
+    if (SceneRig.contextErrorEl?.isConnected) return;
+    SceneRig.clearContextError(); // drop a detached stale element, if any
     const div = document.createElement('div');
     div.textContent = 'WebGL is not available in this browser — STRICKEN needs GPU rendering to run.';
     const s = div.style;
@@ -184,5 +200,6 @@ export class SceneRig {
     s.font = '16px/1.5 system-ui, sans-serif';
     s.zIndex = '1000';
     document.body.appendChild(div);
+    SceneRig.contextErrorEl = div;
   }
 }

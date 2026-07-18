@@ -20,7 +20,7 @@ import {
 /** One stored world state: where every player stood at a given server tick. */
 interface LagFrame {
   tick: number;
-  entries: HitscanTarget[]; // private copies; treated as read-only
+  entries: HitscanTarget[]; // owned by the buffer; treated as read-only
 }
 
 /**
@@ -36,19 +36,22 @@ export class LagBuffer {
     this.maxTicks = Math.max(1, maxTicks);
   }
 
+  /**
+   * Store one frame. OWNERSHIP TRANSFER: the buffer retains the handed-over
+   * `entries` array and its objects by reference (no defensive copy — this
+   * runs in the tick hot path). The caller must not mutate entries after push.
+   */
   push(
     tick: number,
     entries: Array<{ id: PlayerId; x: number; y: number; z: number; height: number }>,
   ): void {
-    // Copy entries: the caller may reuse/mutate its own objects after push.
-    const copied = entries.map((e) => ({ id: e.id, x: e.x, y: e.y, z: e.z, height: e.height }));
     const last = this.frames[this.frames.length - 1];
     if (last !== undefined && tick === last.tick) {
-      last.entries = copied; // idempotent re-push of the same tick
+      last.entries = entries; // idempotent re-push of the same tick
       return;
     }
     if (last !== undefined && tick < last.tick) return; // stale tick, never happens in tick order
-    this.frames.push({ tick, entries: copied });
+    this.frames.push({ tick, entries });
     while (this.frames.length > this.maxTicks) this.frames.shift();
   }
 

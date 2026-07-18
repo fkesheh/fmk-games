@@ -13,7 +13,10 @@ export interface HudState {
   hp: number; alive: boolean; money: number; canBuy: boolean;
   weapon: WeaponId; weaponName: string; mag: number; reserve: number;
   phase: RoomPhase; phaseEndsInSec: number; round: number; scoreT: number; scoreCT: number;
-  spreadPx: number; scoped: boolean; spectating: string | null;
+  spreadPx: number; scoped: boolean;
+  /** Convention: a string starting with 'respawn' is a self respawn countdown
+   *  (rendered as-is); anything else is a spectate target name ('SPECTATING X'). */
+  spectating: string | null;
 }
 
 // Killfeed shows the weapon's short designation (from the frozen WEAPONS names).
@@ -454,7 +457,12 @@ export class Hud {
     if (s.spectating !== this.cSpec) {
       this.cSpec = s.spectating;
       this.specEl.classList.toggle('fh-hidden', s.spectating === null);
-      if (s.spectating !== null) this.specEl.textContent = `SPECTATING ${s.spectating}`;
+      if (s.spectating !== null) {
+        // 'respawn in N' is a self countdown, not a spectate target — no prefix.
+        this.specEl.textContent = s.spectating.startsWith('respawn')
+          ? s.spectating
+          : `SPECTATING ${s.spectating}`;
+      }
     }
   }
 
@@ -501,9 +509,9 @@ export class Hud {
     this.arcNext = (this.arcNext + 1) % ARC_POOL;
     const deg = (-yawRelative * 180) / Math.PI;
     arc.setAttribute('transform', `rotate(${deg} 80 80)`);
-    arc.classList.remove('fh-on');
-    void arc.getBoundingClientRect(); // restart the fade animation
     arc.classList.add('fh-on');
+    // restart the fade via WAAPI — no layout read on the combat hot path
+    arc.getAnimations().forEach((a) => { a.cancel(); a.play(); });
   }
 
   /** Big center text for 2.5s; queues while another banner is up. */

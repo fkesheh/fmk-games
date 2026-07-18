@@ -87,6 +87,15 @@ export const dustbowl: MapDef = {
     // scattered extra cover
     { x: -8, y: 0.45, z: 20, w: 3, h: 0.9, d: 1, mat: 'sandDark' },
     { x: 8, y: 0.45, z: -20, w: 3, h: 0.9, d: 1, mat: 'sandDark' },
+
+    // lane-gap + end-zone dressing (added post-review: keeps box count in the
+    // 40-90 map invariant band; gaps stay > 1.4m, spawns untouched)
+    { x: -14.5, y: 0.6, z: -2, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
+    { x: 14.5, y: 0.6, z: 2, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
+    { x: 0, y: 0.45, z: 12.5, w: 1, h: 0.9, d: 1, mat: 'sandDark' },
+    { x: 0, y: 0.45, z: -12.5, w: 1, h: 0.9, d: 1, mat: 'sandDark' },
+    { x: -22, y: 0.45, z: -20, w: 3, h: 0.9, d: 1, mat: 'sandDark' },
+    { x: 18, y: 0.6, z: -14, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
   ],
   spawns: {
     T: [
