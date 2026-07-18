@@ -10,6 +10,8 @@
 // main.ts calls; do not rename without syncing both sides):
 //   game.resize(): void                      — forwards to SceneRig.resize()
 //   game.buy(w: WeaponId): void              — send C2S buy (menu onBuy + debug)
+//   game.addBot(): void                      — send C2S add_bot (menu onAddBot + debug)
+//   game.removeBot(): void                   — send C2S remove_bot (menu onRemoveBot + debug)
 //   game.reload(): void                      — send C2S reload (debug)
 //   game.debugSetLook(yaw, pitch): void      — writes InputController yaw/pitch
 //   game.debugSetMove(x, z): void            — overrides move axes (0,0 releases)
@@ -59,6 +61,8 @@ interface FpsApi {
   createPublic(name: string, mapId: MapId): void;
   createPrivate(name: string, mapId: MapId): void;
   joinPrivate(name: string, code: string): void;
+  addBot(): void;
+  removeBot(): void;
   debug: {
     setLook(yaw: number, pitch: number): void;
     setMove(x: number, z: number): void;
@@ -127,6 +131,8 @@ function boot(): void {
     onJoinPrivate: (name, code) => game?.joinPrivate(name, code),
     onListRooms: () => game?.listRooms() ?? Promise.resolve([]),
     onBuy: (weapon) => game?.buy(weapon),
+    onAddBot: () => game?.addBot(),
+    onRemoveBot: () => game?.removeBot(),
     onResume: () => {
       // re-request pointer lock on the canvas directly; may reject when the
       // browser refuses (e.g. too soon after Esc) — not fatal, user clicks again
@@ -220,6 +226,8 @@ function boot(): void {
     createPublic: (name, mapId) => g.createPublic(name, mapId),
     createPrivate: (name, mapId) => g.createPrivate(name, mapId),
     joinPrivate: (name, code) => g.joinPrivate(name, code),
+    addBot: () => g.addBot(),
+    removeBot: () => g.removeBot(),
     debug: {
       setLook: (yaw, pitch) => g.debugSetLook(yaw, pitch),
       setMove: (x, z) => g.debugSetMove(x, z),

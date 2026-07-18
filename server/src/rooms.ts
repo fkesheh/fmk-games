@@ -81,6 +81,16 @@ export class Lobby {
         case 'buy':
           this.sessionRoom.get(sess.id)?.handleBuy(sess.id, msg.weapon);
           break;
+        case 'add_bot': {
+          const room = this.sessionRoom.get(sess.id);
+          if (room !== undefined && room.addBot() === null) {
+            this.sendError(sess, 'room_full', 'room is full');
+          }
+          break;
+        }
+        case 'remove_bot':
+          this.sessionRoom.get(sess.id)?.removeBot(); // false (no bots) is fine
+          break;
         case 'ping':
           break; // answered at the transport layer (net.ts); never routed
       }

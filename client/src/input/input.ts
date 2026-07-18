@@ -52,6 +52,7 @@ export class InputController {
   private keyCHeld = false; // 'C' — crouch = ctrlHeld || keyCHeld
   private fireHeld = false;
   private altHeld = false;
+  private keyFHeld = false; // 'F' — scope = altHeld || keyFHeld
   private tabHeld = false;
   // Semi-auto latch: a press that starts AND ends between two frame() samples
   // is still reported in exactly one frame() result.
@@ -72,6 +73,7 @@ export class InputController {
     this.started = true;
     this.canvas.addEventListener('click', this.onClick);
     this.canvas.addEventListener('contextmenu', this.onContextMenu);
+    document.addEventListener('contextmenu', this.onDocumentContextMenu);
     document.addEventListener('pointerlockchange', this.onPointerLockChange);
     document.addEventListener('pointerlockerror', this.onPointerLockError);
     document.addEventListener('mousemove', this.onMouseMove);
@@ -88,6 +90,7 @@ export class InputController {
     this.started = false;
     this.canvas.removeEventListener('click', this.onClick);
     this.canvas.removeEventListener('contextmenu', this.onContextMenu);
+    document.removeEventListener('contextmenu', this.onDocumentContextMenu);
     document.removeEventListener('pointerlockchange', this.onPointerLockChange);
     document.removeEventListener('pointerlockerror', this.onPointerLockError);
     document.removeEventListener('mousemove', this.onMouseMove);
@@ -117,7 +120,7 @@ export class InputController {
     this.fireLatch = false; // consumed by this frame — reported exactly once
     if (this.jumpHeld) buttons |= INPUT_JUMP;
     if (this.ctrlHeld || this.keyCHeld) buttons |= INPUT_CROUCH;
-    if (this.altHeld) buttons |= INPUT_ALT;
+    if (this.altHeld || this.keyFHeld) buttons |= INPUT_ALT;
     const o = this.frameOut;
     o.moveX = (this.keyD ? 1 : 0) - (this.keyA ? 1 : 0); // right positive
     o.moveZ = (this.keyW ? 1 : 0) - (this.keyS ? 1 : 0); // forward positive
@@ -137,7 +140,7 @@ export class InputController {
   private clearHeld(): void {
     this.keyW = this.keyA = this.keyS = this.keyD = false;
     this.jumpHeld = this.ctrlHeld = this.keyCHeld = false;
-    this.fireHeld = this.altHeld = false;
+    this.fireHeld = this.altHeld = this.keyFHeld = false;
     this.fireLatch = false;
     if (this.tabHeld) {
       // never leave the scoreboard stuck open across blur/unlock
@@ -160,6 +163,12 @@ export class InputController {
 
   private readonly onContextMenu = (e: Event): void => {
     e.preventDefault(); // RMB is alt-fire/scope, never a context menu
+  };
+
+  private readonly onDocumentContextMenu = (e: Event): void => {
+    // canvas-level suppression misses nothing when locked, but the pointer is
+    // captured and targets can vary by engine — block the menu document-wide.
+    if (this.locked()) e.preventDefault();
   };
 
   private readonly onPointerLockChange = (): void => {
@@ -219,6 +228,7 @@ export class InputController {
       case 'ControlLeft':
       case 'ControlRight': this.ctrlHeld = true; break;
       case 'KeyC': this.keyCHeld = true; break;
+      case 'KeyF': this.keyFHeld = true; break;
       case 'KeyR': if (!e.repeat) this.queue.push({ kind: 'reload' }); break;
       case 'KeyB': if (!e.repeat) this.queue.push({ kind: 'buy' }); break;
       case 'Tab':
@@ -256,6 +266,7 @@ export class InputController {
       case 'ControlLeft':
       case 'ControlRight': this.ctrlHeld = false; break;
       case 'KeyC': this.keyCHeld = false; break;
+      case 'KeyF': this.keyFHeld = false; break;
       case 'Tab':
         if (this.tabHeld) {
           this.tabHeld = false;

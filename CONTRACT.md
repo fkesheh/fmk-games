@@ -95,10 +95,21 @@ export class GameRoom {
   handleReload(id: PlayerId): void;
   handleSwitch(id: PlayerId, weapon: WeaponId): void;
   handleBuy(id: PlayerId, weapon: WeaponId): void;
+  addBot(): PlayerId | null;      // null if room full; bot named 'Bot N', team auto-balanced
+  removeBot(): boolean;           // removes the most recently added bot; false if none
+  botCount(): number;
   start(): void;   // own setInterval at TICK_RATE; idempotent
   stop(): void;
 }
 ```
+Bot integration invariants (frozen):
+- Bots hold normal player slots (roster `bot: true`); identical spawn/round/damage/stats rules.
+- Each tick (before movement), for every bot: build its BotPercept (enemies = alive players of the
+  other team), call its BotBrain, and apply the returned BotCommand through the SAME code path as
+  a client `input` message (seq increments per bot) plus reload/buy handling.
+- Bots are exempt from stalePlayers() and the inputs/s kick (they emit exactly 1 input/tick).
+- Bots have no session: RoomIO.send/rttMs for a bot id must no-op / return 0 (S1 guarantees).
+- addPlayer into a FULL room containing bots: kick the longest-connected bot first, then join.
 Behavioral invariants (S2, uses S3 helpers):
 - **Phases:** `warmup` (free respawn after ROUNDS.warmupRespawnDelay s, damage on, no economy) →
   when connected ≥ MIN_PLAYERS_FOR_MATCH: `freeze` (round 1..N; players teleported to spawns, healed,
@@ -168,8 +179,51 @@ export function resolveShot(ctx: ShotContext, seed: number): ShotHit[];
 export function wallEndPoint(origin: Vec3, dir: Vec3, solids: AABB[], maxDist: number): Vec3;
 ```
 
-### `server/src/economy.ts` (S3)
+### `server/src/bots.ts` (S4 — server-driven bot players)
+
+Bots are server-side players: the room feeds each bot's `BotCommand` through the exact same
+input/reload/buy path as human clients. Bots appear as normal roster entries with `bot: true`.
+
 ```ts
+export interface BotPercept {
+  self: { x: number; y: number; z: number; yaw: number; pitch: number; hp: number;
+          mag: number; reserve: number; reloading: boolean; crouch: boolean };
+  enemies: Array<{ id: PlayerId; x: number; y: number; z: number; height: number; alive: boolean }>;
+  solids: AABB[];
+  map: MapDef;
+  tick: number;
+  phase: RoomPhase;
+  money: number;
+  owned: WeaponId[];
+  canBuy: boolean;
+}
+export interface BotCommand {
+  moveX: number; moveZ: number; yaw: number; pitch: number; buttons: number; // INPUT_* bits
+  reload: boolean;
+  buy: WeaponId | null;
+}
+export class BotBrain {
+  constructor(seed: number);
+  tick(p: BotPercept): BotCommand; // deterministic per seed; once per server tick per bot
+}
+```
+
+Behavior invariants (frozen):
+- **Perception:** nearest alive enemy with clear LOS (raycastSolids between the two eye positions
+  has no hit) within 45m; 360° awareness (no FOV cone — keeps bots fun and code simple).
+- **Engage:** turn toward the target's chest (y + height×0.65) at ≤ 6 rad/s; fire only when aim
+  error < 3° AND a 300ms reaction time since acquiring the target has passed. Auto weapons: bursts
+  of 4–8 fire ticks separated by 8–15 tick pauses; semi: single fire ticks every ~10 ticks. Reload
+  when mag === 0 (reload flag; never while firing). Strafe while engaging: moveX = sin(tick/20)
+  clamped to [-1,1].
+- **Patrol (no target):** walk a BFS path over a 0.75m walkability grid derived from map solids
+  (grid built once per brain, cached) to a seeded-random reachable waypoint; repath on arrival,
+  after 5s, or when blocked > 0.5s; face the walk direction; press jump when blocked on the ground.
+  In 'live', waypoint choice biases toward the enemy team's half of the map (z sign of their spawns).
+- **Buy:** when canBuy: rifle if money ≥ price, else smg if affordable, else null.
+- **Determinism:** one seeded rng stream per brain; no Math.random, no Date, no I/O.
+
+### `server/src/economy.ts` (S3)```ts
 export function tryBuy(money: number, owned: WeaponId[], want: WeaponId, canBuy: boolean):
   { ok: true; money: number; owned: WeaponId[] } | { ok: false; reason: string };
 // knife+pistol are always owned & never buyable. Primary slots: smg/shotgun/rifle/sniper —
@@ -184,8 +238,8 @@ export function roundRewards(winner: Team | null): { t: number; ct: number }; //
 ```ts
 export class Lobby {
   constructor();
-  handleMessage(sess: Session, msg: C2S): void; // list_rooms/quick_join/create_private/join_private/
-  // leave + routes input/reload/switch/buy to the session's current room
+  handleMessage(sess: Session, msg: C2S): void; // list_rooms/quick_join/create_public/create_private/
+  // join_private/leave/add_bot/remove_bot + routes input/reload/switch/buy to the session's room
   handleDisconnect(sess: Session): void;
   roomCount(): number;
 }
@@ -262,8 +316,10 @@ export class InputController {
   onLockChange: ((locked: boolean) => void) | null;
 }
 ```
-Keys: WASD move · Space jump · Ctrl or C crouch · LMB fire · RMB alt · R reload · B buy ·
-Tab scoreboard (preventDefault) · Esc menu · 1-6 / wheel weapon slots. Blur clears all held state.
+Keys: WASD move · Space jump · Ctrl or C crouch · LMB fire · RMB **or F** alt (scope) · R reload ·
+B buy · Tab scoreboard (preventDefault) · Esc menu · 1-6 / wheel weapon slots. Blur clears all held state.
+`contextmenu` is preventDefault'd at the DOCUMENT level while pointer-locked (belt-and-braces —
+canvas-only suppression loses to browser edge cases).
 Semi-auto fire latch: a fire press that begins AND ends between two frame() samples must still be
 reported once — latch INPUT_FIRE until it has been included in exactly one frame() result.
 
@@ -380,6 +436,8 @@ export interface MenuCallbacks {
   onJoinPrivate(name: string, code: string): void;
   onListRooms(): Promise<RoomInfo[]>;
   onBuy(weapon: WeaponId): void;
+  onAddBot(): void;
+  onRemoveBot(): void;
   onResume(): void;  // re-request pointer lock
   onLeave(): void;   // leave room -> main menu
 }
@@ -392,12 +450,13 @@ export class Menus {
   showBuy(money: number, owned: WeaponId[], canBuy: boolean): void;
   hideBuy(): void;
   showScoreboard(roster: RosterEntry[], you: PlayerId, scoreT: number, scoreCT: number): void;
-  // columns: NAME, K, D, HS (headshots), $ (own row only)
+  // columns: NAME (bot entries get a 'BOT' tag), K, D, HS (headshots), $ (own row only)
   hideScoreboard(): void;
   showMatchEnd(winner: Team, scoreT: number, scoreCT: number, youTeam: Team | null, roster: RosterEntry[]): void;
   // includes top-3 players by kills from roster
   showJoining(): void;   // dim overlay "Joining…" — required state, shown during connect+join
-  showPause(): void;     // in-room Esc surface: Resume (re-lock), Leave Room; NOT the main menu
+  showPause(botCount: number): void;     // in-room Esc surface: Resume (re-lock), ADD BOT,
+  // REMOVE BOT (disabled when botCount 0), Leave Room; NOT the main menu
   hideAll(): void;
 }
 ```
@@ -446,6 +505,7 @@ window.__fps = {
   createPublic(name: string, mapId: MapId): void;
   createPrivate(name: string, mapId: MapId): void;
   joinPrivate(name: string, code: string): void;
+  addBot(): void; removeBot(): void;
   debug: {
     setLook(yaw: number, pitch: number): void;
     setMove(x: number, z: number): void;
@@ -459,18 +519,21 @@ declare global { interface Window { __fps?: ... } }
 
 ## Per-asset visual spec (model sheets — silhouettes + parts + storytelling)
 
-**Soldier** (`playerModels.ts`, 20–28 prims, ~1.8u tall): blocky humanoid, more realistic
+**Soldier** (`playerModels.ts`, 22–32 prims, ~1.8u tall): blocky humanoid, more realistic
 proportions (not a cube-stack): torso box slightly tapered (two stacked boxes, chest wider than
 waist) in team uniform (CT ctBlue chest/ctDark limbs; T tAmber chest/tBrown limbs); a vest plate
-box on the chest (team dark); head box (skin) + helmet with a brim (slightly wider box + thin brim
-slab, team dark); TWO-SEGMENT arms (upper arm + forearm pivot at elbow) angled forward holding the
-weapon two-handed (right at grip, left at forend); two-segment legs (thigh + shin pivots) with
-boot boxes (ink); weapon = makeWeaponModel(current) scaled 0.9 in hands; nameplate sprite 0.35u
-above head (name text, team color on translucent ink bg). Walk: thighs/shins counter-swing ±25°
-sin(phase), arms counter-swing subtly, phase from distance travelled; idle: subtle torso breathe;
-AIM POSE: the arms+weapon pivot group pitches with the player's pitch (±0.6 rad clamp) so you can
-read where someone aims; crouch: legs bend (thigh forward, shin down), torso -0.35u; death: whole
-group rotates to lying over 0.4s, sinks 1u after 2s.
+box on the chest (team dark); shoulder pads (small team-dark boxes on the shoulders); a backpack
+box on the back (team dark); head box (skin) + helmet with a brim (slightly wider box + thin brim
+slab, team dark) + a visor/goggle strip across the eyes (ink); TWO-SEGMENT arms (upper arm +
+forearm pivot at elbow) angled forward holding the weapon two-handed (right at grip, left at
+forend); two-segment legs (thigh + shin pivots) with boot boxes (ink); weapon =
+makeWeaponModel(current) scaled 0.9 in hands; nameplate sprite 0.35u above head (name text, team
+color on translucent ink bg). Walk: thighs/shins counter-swing ±25° sin(phase), arms counter-swing
+subtly, phase from distance travelled; idle: subtle torso breathe; AIM POSE: the arms+weapon pivot
+group pitches with the player's pitch (±0.6 rad clamp) AND the head follows pitch at 0.5× so you
+can read where someone aims; HIT FLINCH: when a model's hp drops between snapshots, a 100ms torso
+jolt (small backward pitch impulse) — sell the hit; crouch: legs bend (thigh forward, shin down),
+torso -0.35u; death: whole group rotates to lying over 0.4s, sinks 1u after 2s.
 
 **Weapons** (`viewModel.ts` `makeWeaponModel`, 6–12 prims each, metalDark/charcoal bodies):
 - knife: 0.5u blade (steel box, tapered tip via scaled cone) + woodDark grip; held tilted.

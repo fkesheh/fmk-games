@@ -22,6 +22,8 @@ export interface MenuCallbacks {
   onJoinPrivate(name: string, code: string): void;
   onListRooms(): Promise<RoomInfo[]>;
   onBuy(weapon: WeaponId): void;
+  onAddBot(): void;
+  onRemoveBot(): void;
   onResume(): void; // re-request pointer lock
   onLeave(): void; // leave room -> main menu
 }
@@ -64,7 +66,7 @@ const CONTROLS: ReadonlyArray<readonly [string, string]> = [
   ['WASD', 'Move'],
   ['Mouse', 'Look'],
   ['LMB', 'Fire'],
-  ['RMB', 'Scope (AWM)'],
+  ['RMB / F', 'Scope (AWM)'],
   ['Space', 'Jump'],
   ['Ctrl / C', 'Crouch'],
   ['R', 'Reload'],
@@ -111,6 +113,7 @@ export class Menus {
   private readonly layers: Record<LayerId, HTMLElement>;
 
   private nameInput: HTMLInputElement | null = null;
+  private removeBotBtn: HTMLButtonElement | null = null;
   private roomListEl: HTMLElement | null = null;
   private roomReq = 0; // stale-guard for async room-list refreshes
   private scoreSig = ''; // scoreboard content signature — skips no-op rebuilds
@@ -441,7 +444,7 @@ export class Menus {
     const sig =
       `${scoreT}|${scoreCT}|${you}|` +
       roster
-        .map((r) => `${r.id}:${r.name}:${r.team}:${r.kills}:${r.deaths}:${r.headshots}:${r.money ?? ''}:${r.connected ? 1 : 0}`)
+        .map((r) => `${r.id}:${r.name}:${r.team}:${r.kills}:${r.deaths}:${r.headshots}:${r.money ?? ''}:${r.bot ? 1 : 0}:${r.connected ? 1 : 0}`)
         .join('|');
     if (sig === this.scoreSig && this.isShown('score')) return;
     this.scoreSig = sig;
@@ -491,7 +494,10 @@ export class Menus {
       if (!r.connected) dot.classList.add('m9-off');
       dot.title = r.connected ? 'connected' : 'disconnected';
       row.appendChild(dot);
-      row.appendChild(el('span', 'm9-c-name', r.name));
+      const nameCell = el('span', 'm9-c-name');
+      nameCell.appendChild(document.createTextNode(r.name));
+      if (r.bot) nameCell.appendChild(el('span', 'm9-bot-tag', 'BOT'));
+      row.appendChild(nameCell);
       row.appendChild(el('span', 'm9-c-num', `${r.kills}`));
       row.appendChild(el('span', 'm9-c-num', `${r.deaths}`));
       row.appendChild(el('span', 'm9-c-num', `${r.headshots}`));
@@ -569,6 +575,14 @@ export class Menus {
       this.hide('pause');
       this.cb.onResume();
     });
+    const addBot = el('button', 'm9-btn m9-wide', 'ADD BOT');
+    addBot.type = 'button';
+    addBot.addEventListener('click', () => this.cb.onAddBot()); // menu stays open; caller re-shows
+    const removeBot = el('button', 'm9-btn m9-wide', 'REMOVE BOT');
+    removeBot.type = 'button';
+    removeBot.disabled = true;
+    removeBot.addEventListener('click', () => this.cb.onRemoveBot());
+    this.removeBotBtn = removeBot;
     const leave = el('button', 'm9-btn m9-btn-danger m9-wide', 'LEAVE ROOM');
     leave.type = 'button';
     leave.addEventListener('click', () => {
@@ -576,11 +590,14 @@ export class Menus {
       this.cb.onLeave();
     });
     panel.appendChild(resume);
+    panel.appendChild(addBot);
+    panel.appendChild(removeBot);
     panel.appendChild(leave);
     this.layers.pause.appendChild(panel);
   }
 
-  showPause(): void {
+  showPause(botCount: number): void {
+    if (this.removeBotBtn !== null) this.removeBotBtn.disabled = botCount <= 0;
     this.showExclusive('pause');
   }
 
@@ -720,6 +737,8 @@ const CSS = `
 .m9-dot{width:8px;height:8px;border-radius:50%;background:var(--m9-hpGreen);display:inline-block;}
 .m9-dot.m9-off{background:transparent;border:1px solid var(--m9-concreteDark);}
 .m9-c-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.m9-bot-tag{margin-left:6px;padding:0 5px;border-radius:3px;font-size:10px;font-weight:800;
+  letter-spacing:.1em;background:var(--m9-steel);color:var(--m9-ink);vertical-align:1px;}
 .m9-c-num{text-align:right;font-variant-numeric:tabular-nums;}
 
 .m9-end-panel{text-align:center;display:flex;flex-direction:column;align-items:center;gap:14px;

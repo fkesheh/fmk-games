@@ -40,6 +40,10 @@ export function parseC2S(raw: unknown): C2S | null {
       return { t: 'join_private', name: raw.name.trim().slice(0, 16) || 'Player', code: raw.code.toUpperCase() };
     case 'leave':
       return { t: 'leave' };
+    case 'add_bot':
+      return { t: 'add_bot' };
+    case 'remove_bot':
+      return { t: 'remove_bot' };
     case 'input': {
       if (!num(raw.seq) || !num(raw.moveX) || !num(raw.moveZ) || !num(raw.yaw) || !num(raw.pitch) || !num(raw.buttons)) return null;
       return {

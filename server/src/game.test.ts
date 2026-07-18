@@ -580,3 +580,54 @@ describe('GameRoom stats', () => {
     room.stop();
   });
 });
+
+describe('GameRoom bots', () => {
+  it('addBot rosters a teamed bot that patrols or engages; removeBot shrinks the room', () => {
+    const io = new FakeIO();
+    const room = new GameRoom('dustbowl', 'public', io);
+    room.addPlayer('p1', 'Alpha');
+
+    const botId = room.addBot();
+    if (botId === null) throw new Error('addBot returned null with a free slot');
+    expect(room.botCount()).toBe(1);
+    expect(room.playerCount()).toBe(2);
+
+    // roster entry broadcast to the human: bot flag set, team auto-assigned
+    const entry = eventsOfType(io, 'p1', 'player_joined')
+      .map((e) => e.entry)
+      .find((e) => e.id === botId);
+    expect(entry?.bot).toBe(true);
+    expect(entry?.team === 'T' || entry?.team === 'CT').toBe(true);
+
+    room.start();
+    const feed = new InputFeed();
+    advanceToPhase(io, 'p1', 'live'); // 1 human + 1 bot = MIN_PLAYERS_FOR_MATCH
+
+    // spawn = where the round-1 freeze teleported the bot
+    const spawn = io.lastSnap('p1').players.find((p) => p.id === botId);
+    if (spawn === undefined) throw new Error('bot missing from snapshot');
+
+    // ~10s of live with the human idle (heartbeat inputs only, never moves/fires).
+    // roundTime is 100s, so no time-limit round end can teleport anyone mid-test.
+    let maxDist = 0;
+    for (let i = 0; i < 300; i++) {
+      if (i % 30 === 0) feed.send(room, 'p1');
+      tick();
+      const b = io.lastSnap('p1').players.find((p) => p.id === botId);
+      if (b !== undefined) maxDist = Math.max(maxDist, Math.hypot(b.x - spawn.x, b.z - spawn.z));
+    }
+
+    // patrol moves the bot; engaging the idle human makes it fire — either proves the brain runs
+    const botShots = eventsOfType(io, 'p1', 'shot').filter((e) => e.shooterId === botId).length;
+    const botHits = eventsOfType(io, 'p1', 'dmg_taken').filter((e) => e.fromId === botId).length;
+    expect(
+      maxDist > 1 || botShots > 0 || botHits > 0,
+      `bot brain runs (moved ${maxDist.toFixed(2)}m from spawn, ${botShots} shots, ${botHits} hits on the human)`,
+    ).toBe(true);
+
+    expect(room.removeBot()).toBe(true);
+    expect(room.botCount()).toBe(0);
+    expect(room.playerCount()).toBe(1);
+    room.stop();
+  });
+});

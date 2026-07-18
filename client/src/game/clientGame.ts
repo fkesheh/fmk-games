@@ -13,6 +13,7 @@
 // frozen table above them is unchanged, do not rename without syncing both):
 //   resize(): void                       — forwards to SceneRig.resize()
 //   buy(w): void / reload(): void        — send the C2S (menu onBuy + e2e debug)
+//   addBot(): void / removeBot(): void   — send the C2S (menu onAddBot/onRemoveBot)
 //   debugSetLook(yaw, pitch): void       — writes InputController yaw/pitch
 //   debugSetMove(x, z): void             — overrides move axes (0,0 releases)
 //   debugSetButton(btn, down): void      — sets/clears an INPUT_* held bit
@@ -281,6 +282,18 @@ export class ClientGame {
   /** Menu onBuy + e2e debug: send the buy request; server validates. */
   buy(weapon: WeaponId): void {
     this.conn?.send({ t: 'buy', weapon });
+  }
+
+  /** Menu onAddBot: ask the server to add a bot to the current room. */
+  addBot(): void {
+    if (this.world === null) return; // in-room only
+    this.conn?.send({ t: 'add_bot' });
+  }
+
+  /** Menu onRemoveBot: remove the most recently added bot. */
+  removeBot(): void {
+    if (this.world === null) return; // in-room only
+    this.conn?.send({ t: 'remove_bot' });
   }
 
   /** E2E debug: same path as the R edge. */
@@ -1064,7 +1077,7 @@ export class ClientGame {
         }
         case 'menu': {
           if (this.world !== null) {
-            this.menus.showPause();
+            this.menus.showPause(this.botCount());
             if (document.pointerLockElement !== null) document.exitPointerLock();
           } else {
             this.menus.showMain();
@@ -1132,11 +1145,20 @@ export class ClientGame {
     return [...this.state.roster.values()];
   }
 
+  /** Live bot count for the pause menu's REMOVE BOT disabled state. */
+  private botCount(): number {
+    let n = 0;
+    for (const r of this.state.roster.values()) {
+      if (r.bot) n++;
+    }
+    return n;
+  }
+
   private onLockChange(locked: boolean): void {
     if (locked) return;
     // browsers swallow the Esc keydown on pointer-lock exit — this is the pause signal;
     // an intentional unlock for the buy menu must NOT pause
-    if (this.world !== null && !this.buyOpen) this.menus.showPause();
+    if (this.world !== null && !this.buyOpen) this.menus.showPause(this.botCount());
   }
 
   private readonly onKeyDown = (e: KeyboardEvent): void => {

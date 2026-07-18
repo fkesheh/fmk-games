@@ -14,6 +14,9 @@ synthesized, all colors from one frozen palette).
   (right-click scope) — distinct damage/range/spread/price profiles.
 - **6 maps**: Dustbowl (dusk desert), Crossfire (industrial yard), Office (indoor cubicles),
   Frostbite (snow valley), Urbana (old town), Bunker (underground CQB with skylights).
+- **Server-side bots** — add/remove from the pause menu (Esc) to fill a game (e.g. 4v4); they
+  patrol with BFS pathfinding, engage on sight with reaction time/burst discipline, buy rifles,
+  take normal roster slots (BOT tag), and yield their slot when a human joins a full room.
 - **Public rooms** (quick join + room list + create-public with map picker) and **private rooms**
   (5-char share code, pick the map).
 - **Feel**: client prediction + lag-compensated hits, tracers, bullet-hole decals, hit markers,

@@ -32,6 +32,8 @@ export type C2S =
   | { t: 'create_private'; name: string; mapId: MapId }
   | { t: 'join_private'; name: string; code: string }
   | { t: 'leave' }
+  | { t: 'add_bot' } // add a server-driven bot to the current room (bot takes a player slot)
+  | { t: 'remove_bot' } // remove the most recently added bot
   | {
       t: 'input';
       seq: number; // monotonically increasing per client, starts at 1
@@ -64,8 +66,9 @@ export interface RosterEntry {
   kills: number;
   deaths: number;
   headshots: number; // kills that were headshots (scoreboard HS column)
+  bot: boolean; // server-driven player (scoreboard shows a BOT tag)
   money: number | null; // populated only for the receiving player, null otherwise
-  connected: boolean;
+  connected: boolean; // always true for bots
 }
 
 // One player inside a snapshot. x/y/z = FEET position (y is the floor under them).

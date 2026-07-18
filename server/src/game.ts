@@ -1,8 +1,9 @@
 // ============================================================================
 // server/src/game.ts (S2) — authoritative game room.
 // Owns all mutable match state: phase machine, movement sim, fire/damage/death,
-// round flow, economy glue, snapshots + events. Combat math is combat.ts (S3),
-// buy rules are economy.ts (S3); socket/session handling is net.ts (S1).
+// round flow, economy glue, server-driven bots, snapshots + events. Combat math
+// is combat.ts (S3), buy rules are economy.ts (S3); socket/session handling is
+// net.ts (S1).
 // Behavioral invariants: CONTRACT.md "Behavioral invariants (S2)". Never throws.
 // ============================================================================
 import {
@@ -59,6 +60,8 @@ import type {
 import { LagBuffer, resolveShot, wallEndPoint } from './combat.js';
 import type { ShotContext, ShotHit } from './combat.js';
 import { killReward, roundRewards, tryBuy } from './economy.js';
+import { BotBrain } from './bots.js';
+import type { BotCommand, BotPercept } from './bots.js';
 
 // ---------------------------------------------------------------------------
 // Frozen wire surface (CONTRACT.md module table). S1 injects its sessions.
@@ -81,6 +84,7 @@ interface PlayerState {
   id: PlayerId;
   name: string;
   team: Team;
+  bot: boolean; // server-driven (S4 brain); no session, exempt from stale/kick guards
   // movement / aim
   body: BodyState;
   yaw: number;
@@ -119,6 +123,13 @@ interface PlayerState {
   snapshotMsg: SnapshotMsg;
 }
 
+/** Server-side runtime for one bot: its brain, emitted input seq, tick scratch. */
+interface BotState {
+  brain: BotBrain;
+  seq: number; // last emitted input seq (per-client monotonic, starts at 1)
+  percept: BotPercept; // reused scratch, mutated in place each tick (no hot allocs)
+}
+
 const ROOM_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 let roomSeq = 0; // mixes into the rng seed so same-ms rooms still differ
 
@@ -142,6 +153,8 @@ export class GameRoom {
   private readonly io: RoomIO;
   private readonly solids: AABB[];
   private readonly players = new Map<PlayerId, PlayerState>();
+  private readonly bots = new Map<PlayerId, BotState>(); // insertion order = add order
+  private botCounter = 0; // 'Bot N' counter — never reused, also seeds the brain
   private readonly lag = new LagBuffer(NET.lagBufferTicks);
   private readonly next: () => number;
 
@@ -189,51 +202,14 @@ export class GameRoom {
 
   addPlayer(id: PlayerId, name: string): void {
     try {
-      if (this.players.has(id) || this.players.size >= MAX_PLAYERS) return;
-      const now = Date.now();
-      // auto-assign the smaller team, coin flip on tie
-      const t = this.countConnected('T');
-      const ct = this.countConnected('CT');
-      const team: Team = t < ct ? 'T' : ct < t ? 'CT' : this.next() < 0.5 ? 'T' : 'CT';
-
-      const snap: PlayerSnap = {
-        id, x: 0, y: 0, z: 0, yaw: 0, pitch: 0,
-        hp: PLAYER.maxHp, alive: true, crouch: false, moving: false, weapon: 'pistol',
-      };
-      const you: YouSnap = {
-        hp: PLAYER.maxHp, alive: true, money: ECONOMY.start,
-        weapons: ['pistol', 'knife'], weapon: 'pistol',
-        mag: WEAPONS.pistol.mag, reserve: WEAPONS.pistol.reserve,
-        canBuy: false, spectateTarget: null, respawnAt: null, vy: 0,
-      };
-      const snapshotMsg: SnapshotMsg = {
-        t: 'snapshot', tick: 0, serverTime: 0, ack: 0,
-        phase: this.phase, phaseEndsAt: 0, players: [], you,
-      };
-      const p: PlayerState = {
-        id, name, team,
-        body: makeBody(0, 0, 0),
-        yaw: 0, pitch: 0, scoped: false,
-        inputQueue: [], lastProcessedSeq: 0, lastInputAt: now,
-        inputWindow: 0, inputWindowCount: 0, prevButtons: 0,
-        weapons: ['knife', 'pistol'], ownedOrdered: ['pistol', 'knife'], weapon: 'pistol',
-        ammo: new Map<WeaponId, Ammo>([['pistol', defaultAmmo('pistol')]]),
-        reloadUntil: 0, nextShotAt: 0, bloom: 0, shotSeq: 0,
-        hp: PLAYER.maxHp, alive: true,
-        money: ECONOMY.start, kills: 0, deaths: 0, headshots: 0,
-        lastKillAt: 0, streak: 0,
-        spawnProtectedUntil: 0, respawnAt: null, spectateTarget: null,
-        snap, you, snapshotMsg,
-      };
-      this.players.set(id, p);
-      this.placeAtSpawn(p, now); // drop-in: always spawn alive, with protection
-      this.io.send(id, {
-        t: 'joined', roomId: this.id, code: this.code, mapId: this.mapId,
-        you: id, team, tick: this.tickN, serverTime: now,
-        round: this.round, scoreT: this.scoreT, scoreCT: this.scoreCT,
-        roster: this.buildRoster(id),
-      });
-      this.broadcastExcept(id, { t: 'player_joined', entry: this.rosterEntry(p, null) });
+      if (this.players.has(id)) return;
+      if (this.players.size >= MAX_PLAYERS) {
+        // full room: displace the longest-connected bot so the human can join
+        const oldest = this.bots.keys().next();
+        if (oldest.done) return; // full of humans: join refused
+        this.removePlayer(oldest.value);
+      }
+      this.joinPlayer(id, name, false);
     } catch (err) {
       console.error('[game] addPlayer failed', err);
     }
@@ -242,10 +218,133 @@ export class GameRoom {
   removePlayer(id: PlayerId): void {
     try {
       if (!this.players.delete(id)) return;
+      this.bots.delete(id);
       this.broadcast({ t: 'player_left', id });
     } catch (err) {
       console.error('[game] removePlayer failed', err);
     }
+  }
+
+  addBot(): PlayerId | null {
+    try {
+      if (this.players.size >= MAX_PLAYERS) return null; // bots hold normal slots
+      this.botCounter++;
+      const n = this.botCounter;
+      const brain = new BotBrain(this.botSeed(n));
+      const id = this.freshPlayerId();
+      this.joinPlayer(id, `Bot ${n}`, true); // identical join flow, roster bot: true
+      if (!this.players.has(id)) return null; // join refused (already logged)
+      this.bots.set(id, {
+        brain,
+        seq: 0,
+        percept: {
+          self: {
+            x: 0, y: 0, z: 0, yaw: 0, pitch: 0, hp: 0,
+            mag: 0, reserve: 0, reloading: false, crouch: false,
+          },
+          enemies: [],
+          solids: this.solids,
+          map: this.map,
+          tick: 0,
+          phase: this.phase,
+          money: 0,
+          owned: [],
+          canBuy: false,
+        },
+      });
+      return id;
+    } catch (err) {
+      console.error('[game] addBot failed', err);
+      return null;
+    }
+  }
+
+  removeBot(): boolean {
+    try {
+      // insertion order: the last key is the most recently added bot
+      let last: PlayerId | null = null;
+      for (const id of this.bots.keys()) last = id;
+      if (last === null) return false;
+      this.removePlayer(last); // full leave flow
+      return true;
+    } catch (err) {
+      console.error('[game] removeBot failed', err);
+      return false;
+    }
+  }
+
+  botCount(): number {
+    return this.bots.size;
+  }
+
+  /** Shared join flow for humans and bots: identical spawn/roster/broadcast. */
+  private joinPlayer(id: PlayerId, name: string, bot: boolean): void {
+    if (this.players.has(id) || this.players.size >= MAX_PLAYERS) return;
+    const now = Date.now();
+    const team = this.pickTeam();
+
+    const snap: PlayerSnap = {
+      id, x: 0, y: 0, z: 0, yaw: 0, pitch: 0,
+      hp: PLAYER.maxHp, alive: true, crouch: false, moving: false, weapon: 'pistol',
+    };
+    const you: YouSnap = {
+      hp: PLAYER.maxHp, alive: true, money: ECONOMY.start,
+      weapons: ['pistol', 'knife'], weapon: 'pistol',
+      mag: WEAPONS.pistol.mag, reserve: WEAPONS.pistol.reserve,
+      canBuy: false, spectateTarget: null, respawnAt: null, vy: 0,
+    };
+    const snapshotMsg: SnapshotMsg = {
+      t: 'snapshot', tick: 0, serverTime: 0, ack: 0,
+      phase: this.phase, phaseEndsAt: 0, players: [], you,
+    };
+    const p: PlayerState = {
+      id, name, team, bot,
+      body: makeBody(0, 0, 0),
+      yaw: 0, pitch: 0, scoped: false,
+      inputQueue: [], lastProcessedSeq: 0, lastInputAt: now,
+      inputWindow: 0, inputWindowCount: 0, prevButtons: 0,
+      weapons: ['knife', 'pistol'], ownedOrdered: ['pistol', 'knife'], weapon: 'pistol',
+      ammo: new Map<WeaponId, Ammo>([['pistol', defaultAmmo('pistol')]]),
+      reloadUntil: 0, nextShotAt: 0, bloom: 0, shotSeq: 0,
+      hp: PLAYER.maxHp, alive: true,
+      money: ECONOMY.start, kills: 0, deaths: 0, headshots: 0,
+      lastKillAt: 0, streak: 0,
+      spawnProtectedUntil: 0, respawnAt: null, spectateTarget: null,
+      snap, you, snapshotMsg,
+    };
+    this.players.set(id, p);
+    this.placeAtSpawn(p, now); // drop-in: always spawn alive, with protection
+    this.io.send(id, {
+      t: 'joined', roomId: this.id, code: this.code, mapId: this.mapId,
+      you: id, team, tick: this.tickN, serverTime: now,
+      round: this.round, scoreT: this.scoreT, scoreCT: this.scoreCT,
+      roster: this.buildRoster(id),
+    });
+    this.broadcastExcept(id, { t: 'player_joined', entry: this.rosterEntry(p, null) });
+  }
+
+  private pickTeam(): Team {
+    // auto-assign the smaller team, coin flip on tie
+    const t = this.countConnected('T');
+    const ct = this.countConnected('CT');
+    return t < ct ? 'T' : ct < t ? 'CT' : this.next() < 0.5 ? 'T' : 'CT';
+  }
+
+  private freshPlayerId(): PlayerId {
+    let id = randomToken(this.next, 8);
+    while (this.players.has(id)) id = randomToken(this.next, 8);
+    return id;
+  }
+
+  private botSeed(botIndex: number): number {
+    // deterministic hash (FNV-1a) of room id + bot index: one seeded brain each
+    let h = 0x811c9dc5;
+    const s = `${this.id}#${botIndex}`;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return h >>> 0;
   }
 
   handleInput(id: PlayerId, msg: InputMsg): void {
@@ -260,10 +359,13 @@ export class GameRoom {
         p.inputWindow = bucket;
         p.inputWindowCount = 0;
       }
-      p.inputWindowCount++;
-      if (p.inputWindowCount > NET.inputQueueCap) {
-        this.removePlayer(id); // S1 owns the socket close
-        return;
+      if (!p.bot) {
+        // bots emit exactly 1 input/tick: exempt from the speedhack kick
+        p.inputWindowCount++;
+        if (p.inputWindowCount > NET.inputQueueCap) {
+          this.removePlayer(id); // S1 owns the socket close
+          return;
+        }
       }
       if (msg.seq <= p.lastProcessedSeq) return; // stale/duplicate
       if (p.inputQueue.length >= NET.inputQueueCap) p.inputQueue.shift(); // oldest dropped
@@ -339,6 +441,7 @@ export class GameRoom {
     const now = Date.now();
     const out: PlayerId[] = [];
     for (const p of this.players.values()) {
+      if (p.bot) continue; // server-driven: no socket to time out
       if (now - p.lastInputAt > NET.inputTimeoutMs) out.push(p.id);
     }
     return out;
@@ -360,11 +463,94 @@ export class GameRoom {
     const now = Date.now();
     this.tickN++;
     this.advancePhase(now);
+    this.tickBots(now); // bots emit their input BEFORE any movement is consumed
     for (const p of this.players.values()) this.tickPlayer(p, now);
     this.pushLagBuffer();
     if (this.phase === 'live') this.checkElimination(now);
     this.updateSpectators();
     this.sendSnapshots(now);
+  }
+
+  // -------------------------------------------------------------------------
+  // Bots (S4): one brain tick per bot per server tick. The returned BotCommand
+  // is fed through the exact same input/reload/buy handlers a client message
+  // hits (with the same clamps parseC2S would apply on the wire).
+  // -------------------------------------------------------------------------
+
+  private tickBots(now: number): void {
+    if (this.bots.size === 0) return;
+    for (const [id, b] of this.bots) {
+      const p = this.players.get(id);
+      if (p === undefined) continue; // player gone (mid-removal): nothing to drive
+      // percept: reused scratch mutated in place (no per-tick allocation);
+      // enemies = alive players of the other team at CURRENT positions/heights
+      const self = b.percept.self;
+      self.x = p.body.x;
+      self.y = p.body.y;
+      self.z = p.body.z;
+      self.yaw = p.yaw;
+      self.pitch = p.pitch;
+      self.hp = p.hp;
+      const def = WEAPONS[p.weapon];
+      const ammo = p.ammo.get(p.weapon);
+      self.mag = def.mag === -1 ? -1 : ammo !== undefined ? ammo.mag : 0;
+      self.reserve = def.reserve === -1 ? -1 : ammo !== undefined ? ammo.reserve : 0;
+      self.reloading = p.reloadUntil > 0;
+      self.crouch = p.body.height < PLAYER.heightStand;
+      const enemies = b.percept.enemies;
+      let n = 0;
+      for (const o of this.players.values()) {
+        if (o.team === p.team || !o.alive) continue;
+        let e = enemies[n];
+        if (e === undefined) {
+          e = { id: '', x: 0, y: 0, z: 0, height: 0, alive: true };
+          enemies[n] = e;
+        }
+        e.id = o.id;
+        e.x = o.body.x;
+        e.y = o.body.y;
+        e.z = o.body.z;
+        e.height = o.body.height;
+        e.alive = true;
+        n++;
+      }
+      enemies.length = n;
+      b.percept.tick = this.tickN;
+      b.percept.phase = this.phase;
+      b.percept.money = p.money;
+      b.percept.owned = p.weapons;
+      b.percept.canBuy = this.canBuyAt(now);
+
+      let cmd: BotCommand;
+      try {
+        cmd = b.brain.tick(b.percept);
+      } catch (err) {
+        console.error('[game] bot brain failed', err);
+        continue;
+      }
+      // a buggy brain must not poison the sim: parseC2S drops non-finite inputs
+      if (
+        !Number.isFinite(cmd.moveX) ||
+        !Number.isFinite(cmd.moveZ) ||
+        !Number.isFinite(cmd.yaw) ||
+        !Number.isFinite(cmd.pitch) ||
+        !Number.isFinite(cmd.buttons)
+      ) {
+        continue;
+      }
+      b.seq++;
+      this.handleInput(id, {
+        t: 'input',
+        seq: b.seq,
+        moveX: Math.min(1, Math.max(-1, cmd.moveX)),
+        moveZ: Math.min(1, Math.max(-1, cmd.moveZ)),
+        yaw: cmd.yaw,
+        pitch: Math.min(1.45, Math.max(-1.45, cmd.pitch)),
+        buttons: cmd.buttons & 0xf,
+      });
+      if (cmd.reload) this.handleReload(id);
+      if (cmd.buy !== null) this.handleBuy(id, cmd.buy);
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -850,6 +1036,7 @@ export class GameRoom {
     return {
       id: p.id, name: p.name, team: p.team,
       kills: p.kills, deaths: p.deaths, headshots: p.headshots,
+      bot: p.bot,
       money: p.id === forId ? p.money : null,
       connected: true,
     };

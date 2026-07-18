@@ -1,12 +1,15 @@
 // ============================================================================
 // C4 — soldier models + animation. One blocky humanoid per remote player,
 // driven by interpolated PlayerSnaps. See CONTRACT.md "Soldier" model sheet
-// (20–28 prims, two-segment limbs, tapered torso, aim group).
+// (22–32 prims, two-segment limbs, tapered torso, aim group).
 // Invariants:
 // - root group sits at FEET with yaw; `body` child carries crouch offset +
 //   death tilt so the two never fight over one Euler.
 // - `aim` group at shoulder height carries BOTH arms + the weapon and pitches
-//   with snap.pitch (±0.6 clamp) so aim direction reads on other players.
+//   with snap.pitch (±0.6 clamp); the head group follows at 0.5× so aim
+//   direction reads through the head too.
+// - HIT FLINCH: an hp drop between sync() calls kicks a 100ms backward-pitch
+//   impulse on the torso group that decays linearly (small jolt).
 // - meshes come only from contract factories; nameplate sprite is the
 //   sanctioned CanvasTexture exception (colors still PALETTE-derived).
 // - limb/weapon pivots stay unbaked (animated); nothing allocates per frame —
@@ -25,6 +28,9 @@ const KNEE_SWING = 0.5; // shins counter-swing at a fraction of the thigh
 const ARM_SWING = 0.35; // subtle arm counter-swing (hands stay on the weapon)
 const PHASE_RATE = 2.2; // walk phase advance per (m/s * s)
 const PITCH_CLAMP = 0.6; // rad, applied to the whole arms+weapon aim group
+const HEAD_PITCH_FOLLOW = 0.5; // head tracks aim pitch at half rate
+const FLINCH_S = 0.1; // hit flinch impulse duration
+const FLINCH_RAD = 0.14; // peak backward torso pitch on a hit
 const BREATHE_HZ = 2;
 const BREATHE_AMP = 0.02; // torso scaleY ±
 const CROUCH_THIGH_RAD = 1.3; // thigh rotates forward into a squat
@@ -136,6 +142,7 @@ interface Soldier {
   armL: THREE.Group; // shoulder pivots (elbows hold a fixed two-hand pose)
   armR: THREE.Group;
   aim: THREE.Group; // arms + weapon; pitches with snap.pitch
+  headGroup: THREE.Group; // head+helmet+brim+visor; follows pitch at 0.5×
   weaponHolder: THREE.Group; // at the right hand; counter-rotated so pitch reads clean
   weaponMesh: THREE.Group;
   weapon: WeaponId;
@@ -152,6 +159,8 @@ interface Soldier {
   deathT: number;
   flashT: number;
   flashRoll: number; // deterministic roll steps, no Math.random
+  lastHp: number; // hp at previous sync; a drop triggers the flinch
+  flinchT: number; // remaining flinch impulse time (0 = idle)
   lastX: number;
   lastZ: number;
   seen: number; // frame stamp for mark-and-sweep removal
@@ -175,17 +184,25 @@ export class PlayerModels {
     const dark = darkHex(p.team);
 
     // tapered torso: waist box narrower than the chest box above it, plus a
-    // team-dark vest plate on the chest front
+    // team-dark vest plate on the chest front, shoulder pads, and a backpack
+    // on the back (all ride the torso so breathe + hit flinch move them)
     const torsoGroup = at(new THREE.Group(), 0, HIP_Y, 0);
     const waist = at(box(0.4, 0.3, 0.24, chest), 0, 0.15, 0);
     const chestMesh = at(box(0.5, 0.35, 0.28, chest), 0, 0.475, 0);
     const vest = at(box(0.34, 0.26, 0.06, dark), 0, 0.47, -0.16);
-    torsoGroup.add(waist, chestMesh, vest);
+    const padL = at(box(0.18, 0.1, 0.22, dark), -SHOULDER_X, 0.6, 0);
+    const padR = at(box(0.18, 0.1, 0.22, dark), SHOULDER_X, 0.6, 0);
+    const backpack = at(box(0.34, 0.36, 0.12, dark), 0, 0.44, 0.2);
+    torsoGroup.add(waist, chestMesh, vest, padL, padR, backpack);
 
-    const head = at(box(0.26, 0.26, 0.26, PALETTE.skin), 0, HEAD_Y, 0);
-    const helmet = at(box(0.3, 0.14, 0.3, dark), 0, HELMET_Y, 0);
-    const brim = at(box(0.36, 0.03, 0.36, dark), 0, BRIM_Y, 0); // thin slab, wider than the helmet
-    body.add(torsoGroup, head, helmet, brim);
+    // head group pitches with aim at 0.5×: head + helmet + brim + ink visor
+    const headGroup = at(new THREE.Group(), 0, HEAD_Y, 0);
+    const head = at(box(0.26, 0.26, 0.26, PALETTE.skin), 0, 0, 0);
+    const helmet = at(box(0.3, 0.14, 0.3, dark), 0, HELMET_Y - HEAD_Y, 0);
+    const brim = at(box(0.36, 0.03, 0.36, dark), 0, BRIM_Y - HEAD_Y, 0); // thin slab, wider than the helmet
+    const visor = at(box(0.28, 0.05, 0.03, PALETTE.ink), 0, 0.02, -0.14); // goggle strip across the eyes
+    headGroup.add(head, helmet, brim, visor);
+    body.add(torsoGroup, headGroup);
 
     // two-segment legs: thigh pivot at the hip, shin pivot at the knee (child
     // of the thigh so the whole leg swings together), ink boot at the ankle
@@ -258,6 +275,9 @@ export class PlayerModels {
     const chestMeshes = [waist, chestMesh];
     const darkMeshes = [
       vest,
+      padL,
+      padR,
+      backpack,
       helmet,
       brim,
       thighLMesh,
@@ -269,7 +289,7 @@ export class PlayerModels {
       foreLMesh,
       foreRMesh,
     ];
-    for (const mesh of [...chestMeshes, ...darkMeshes, head, bootL, bootR]) {
+    for (const mesh of [...chestMeshes, ...darkMeshes, head, visor, bootL, bootR]) {
       mesh.castShadow = true;
     }
 
@@ -290,6 +310,7 @@ export class PlayerModels {
       armL,
       armR,
       aim,
+      headGroup,
       weaponHolder,
       weaponMesh,
       weapon: p.weapon,
@@ -305,6 +326,8 @@ export class PlayerModels {
       deathT: 0,
       flashT: 0,
       flashRoll: 0,
+      lastHp: p.hp,
+      flinchT: 0,
       lastX: p.x,
       lastZ: p.z,
       seen: 0,
@@ -354,6 +377,11 @@ export class PlayerModels {
         m.weapon = p.weapon;
       }
 
+      // hit flinch: an hp drop between syncs kicks the torso impulse (alive only —
+      // a lethal drop plays the death anim instead)
+      if (p.alive && p.hp < m.lastHp) m.flinchT = FLINCH_S;
+      m.lastHp = p.hp;
+
       // root: feet position + yaw
       m.root.position.set(p.x, p.y, p.z);
       m.root.rotation.y = p.yaw;
@@ -390,6 +418,9 @@ export class PlayerModels {
         m.armL.rotation.x = ARM_BASE_L;
         m.armR.rotation.x = ARM_BASE_R;
         m.aim.rotation.x = 0;
+        m.headGroup.rotation.x = 0;
+        m.torsoGroup.rotation.x = 0;
+        m.flinchT = 0;
         m.root.visible = p.id !== localId && m.deathT < DEATH_KEEP_S;
         continue;
       }
@@ -415,10 +446,20 @@ export class PlayerModels {
       m.shinR.rotation.x = swing * KNEE_SWING + m.crouchAmt * CROUCH_KNEE_RAD;
       m.armL.rotation.x = ARM_BASE_L - swing * ARM_SWING; // arms counter-swing their leg, subtly
       m.armR.rotation.x = ARM_BASE_R + swing * ARM_SWING;
-      // AIM POSE: whole arms+weapon group pitches so the aim direction reads
+      // AIM POSE: whole arms+weapon group pitches so the aim direction reads,
+      // and the head follows at half rate so it reads through the head too
       const pitchC = Math.max(-PITCH_CLAMP, Math.min(PITCH_CLAMP, p.pitch));
       m.aim.rotation.x = pitchC;
+      m.headGroup.rotation.x = pitchC * HEAD_PITCH_FOLLOW;
       m.torsoGroup.scale.y = 1 + BREATHE_AMP * Math.sin(m.breathe) * (1 - m.swingAmp);
+
+      // hit flinch decay: backward torso pitch, linear falloff over 100ms
+      if (m.flinchT > 0) {
+        m.flinchT = Math.max(0, m.flinchT - dt);
+        m.torsoGroup.rotation.x = FLINCH_RAD * (m.flinchT / FLINCH_S);
+      } else {
+        m.torsoGroup.rotation.x = 0;
+      }
 
       // ---- crouch: legs bend (thigh forward, shin down), torso -0.35u ----
       m.body.position.y = -CROUCH_DROP * m.crouchAmt;

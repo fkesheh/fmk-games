@@ -7,7 +7,8 @@
 // the frozen window.__fps surface: private-room create/join, phase machine
 // warmup->freeze->live, movement, combat (aim math + semi-auto fire edges),
 // buy flow, state-surface shape, a 6-map screenshot tour, public-room create
-// (code === null), debug scoreboard toggle, and jump-apex height.
+// (code === null), debug scoreboard toggle, jump-apex height, and server-side
+// bot add/remove with a 6s combat soak.
 //
 // Exit 0 only if every assertion passes AND zero page/console/network errors
 // were seen on either page (benign favicon noise excluded).
@@ -568,6 +569,57 @@ async function main() {
     'jump apex > 0.75m on flat ground (jumpVel 5.9)',
     jump.maxY - jump.startY > 0.75,
     `start=${jump.startY.toFixed(2)} apex=+${(jump.maxY - jump.startY).toFixed(2)}m`,
+  );
+
+  // -- (14) bots: A is alone in the public crossfire room here (B stayed in
+  //    the private dustbowl room from the combat flow) — so assert deltas off
+  //    the live count, not absolutes. Kept after (12)/(13) so bots cannot
+  //    start a match mid-scoreboard/jump and perturb those samples.
+  const botsBefore = (await fpsState(A)).players;
+  await A.evaluate(() => {
+    window.__fps.addBot();
+    window.__fps.addBot();
+  });
+  let added = null;
+  try {
+    added = await waitFor(async () => {
+      const s = await fpsState(A);
+      return s.players === botsBefore + 2 ? s : null;
+    }, 5000, 'players +2 after 2x addBot');
+  } catch {
+    // reported by the failing check below — later bot checks still run
+  }
+  check(
+    'addBot x2 increases player count by exactly 2',
+    added !== null,
+    added ? `${botsBefore} -> ${added.players}` : `expected ${botsBefore + 2}, still ${(await fpsState(A)).players}`,
+  );
+
+  // -- (15) removeBot drops the most recently added bot.
+  await A.evaluate(() => window.__fps.removeBot());
+  let removed = null;
+  try {
+    removed = await waitFor(async () => {
+      const s = await fpsState(A);
+      return s.players === botsBefore + 1 ? s : null;
+    }, 5000, 'players -1 after removeBot');
+  } catch {
+    // reported by the failing check below
+  }
+  check(
+    'removeBot decreases player count by exactly 1',
+    removed !== null,
+    removed ? `${botsBefore + 2} -> ${removed.players}` : `expected ${botsBefore + 1}, still ${(await fpsState(A)).players}`,
+  );
+
+  // -- (16) soak: the remaining bot fights for ~6s (it may start a real match
+  //    and hunt A) — nothing on either page may crash or log.
+  const errsBeforeSoak = pageErrors.length;
+  await sleep(6000);
+  check(
+    '6s bot soak: zero page errors on either page',
+    pageErrors.length === errsBeforeSoak,
+    `${pageErrors.length - errsBeforeSoak} new error(s)`,
   );
 
   // -- error-banner DOM check (window.onerror surface may not raise pageerror) -----------
