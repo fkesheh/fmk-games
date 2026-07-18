@@ -5,7 +5,8 @@
 //   - frozen creek gully: 0.6-deep trench (snow banks) with ice floor; crossed by
 //     jumping the banks or via 0.4 step boxes at x = -21 / -6 / 6 / 21
 //   - no T spawn visible from any CT spawn (twin ice screens at z=+-15 block all pairs)
-//   - cover (h>=0.9) at least every 8m along each lane; longest open sightline <= 37m
+//   - cover (h>=0.9) at least every 8m along each lane; longest open sightline 41.4m <= 42m
+//     (bank-top creek lane capped by h=2.5 dam/boulders; gap-mouth diagonal by w=5 ice spikes)
 //   - 7 spawns per team, all on y=0 ground, none inside boxes
 import { PALETTE } from '../palette.js';
 import type { MapDef } from './types.js';
@@ -45,9 +46,10 @@ export const frostbite: MapDef = {
     { x: 12, y: 1.2, z: 3.6, w: 2.5, h: 2.4, d: 8.8, mat: 'ice' },
     { x: 12, y: 1.2, z: 14, w: 2.5, h: 2.4, d: 4, mat: 'ice' },
 
-    // ice spikes guarding the south gap mouths (also break the x=+-14.5 sightlines)
-    { x: -14.5, y: 1.3, z: 10, w: 2.5, h: 2.6, d: 2, mat: 'ice' },
-    { x: 14.5, y: 1.3, z: 10, w: 2.5, h: 2.6, d: 2, mat: 'ice' },
+    // ice spikes guarding the south gap mouths (break x=+-14.5 lanes + the 42m
+    // connector diagonal; w=5 keeps the z 9..11 crossing >= 12m wide)
+    { x: -14.5, y: 1.3, z: 10, w: 5, h: 2.6, d: 2, mat: 'ice' },
+    { x: 14.5, y: 1.3, z: 10, w: 5, h: 2.6, d: 2, mat: 'ice' },
 
     // ---- spawn screen ice ridges (block every T<->CT spawn sightline) ----
     { x: 0, y: 1.5, z: 15, w: 18, h: 3, d: 1.5, mat: 'ice' },
@@ -68,9 +70,9 @@ export const frostbite: MapDef = {
     { x: 0, y: 0.03, z: -5, w: 58, h: 0.06, d: 6, mat: 'ice' }, // ice floor
     { x: 0, y: 0.3, z: -1.4, w: 58, h: 0.6, d: 1.2, mat: 'snow' }, // south bank
     { x: 0, y: 0.3, z: -8.6, w: 58, h: 0.6, d: 1.2, mat: 'snow' }, // north bank
-    { x: 0, y: 1, z: -5, w: 3, h: 2, d: 8.8, mat: 'rock' }, // dam rock jammed mid creek
-    { x: -17.5, y: 1, z: -5, w: 2.5, h: 2, d: 3, mat: 'rock' }, // creek boulders
-    { x: 17.5, y: 1, z: -5, w: 2.5, h: 2, d: 3, mat: 'rock' },
+    { x: 0, y: 1.25, z: -5, w: 3, h: 2.5, d: 8.8, mat: 'rock' }, // dam rock jammed mid creek
+    { x: -17.5, y: 1.25, z: -5, w: 2.5, h: 2.5, d: 3, mat: 'rock' }, // creek boulders
+    { x: 17.5, y: 1.25, z: -5, w: 2.5, h: 2.5, d: 3, mat: 'rock' },
     { x: -27.5, y: 1.1, z: -2, w: 4, h: 2.2, d: 3, mat: 'rock' }, // creek-mouth rocks
     { x: 27.5, y: 1.1, z: -2, w: 4, h: 2.2, d: 3, mat: 'rock' },
     // step crossings (ground -> 0.4 step -> 0.6 bank): south side + inside creek
@@ -90,8 +92,9 @@ export const frostbite: MapDef = {
     { x: 5, y: 0.95, z: 6, w: 2.5, h: 1.9, d: 2.5, mat: 'ice' },
     { x: -5, y: 0.95, z: -11, w: 2.5, h: 1.9, d: 3, mat: 'ice' },
     { x: 5, y: 0.95, z: -11, w: 2.5, h: 1.9, d: 3, mat: 'ice' },
-    { x: -9.5, y: 1, z: 0.2, w: 2.5, h: 2, d: 2.5, mat: 'ice' }, // bank-side blocks
-    { x: 9.5, y: 1, z: 0.2, w: 2.5, h: 2, d: 2.5, mat: 'ice' },
+    // bank-side ridges (z -1.05..4.95: cap the west-lane -> east-divider diagonal at ~39m)
+    { x: -9.5, y: 1, z: 1.95, w: 2.5, h: 2, d: 6, mat: 'ice' },
+    { x: 9.5, y: 1, z: 1.95, w: 2.5, h: 2, d: 6, mat: 'ice' },
 
     // ---- west lane cover (rock cluster + snowdrifts) ----
     { x: -24, y: 1, z: 2.5, w: 3, h: 2, d: 2.5, mat: 'rock' },

@@ -1,42 +1,235 @@
-import * as THREE from 'three';
+// ============================================================================
+// C11 — app shell + boot + debug surface. Builds the DOM-side roots (index.html
+// provides #app/#game/#hud/#menu), constructs ClientState/Hud/Menus/ClientGame,
+// runs the rAF loop (dt-clamped), forwards resize, unlocks audio on the first
+// gesture, shows a ?debug overlay, exposes the frozen window.__fps surface used
+// by e2e, and guards every failure path with a visible error banner.
+//
+// C10/C11 SEAM (specs/C11.md — ClientGame's frozen table has no audio, resize,
+// buy, or debug hooks, so these are additive public methods C10 implements and
+// main.ts calls; do not rename without syncing both sides):
+//   game.resize(): void                      — forwards to SceneRig.resize()
+//   game.buy(w: WeaponId): void              — send C2S buy (menu onBuy + debug)
+//   game.reload(): void                      — send C2S reload (debug)
+//   game.debugSetLook(yaw, pitch): void      — writes InputController yaw/pitch
+//   game.debugSetMove(x, z): void            — overrides move axes (0,0 releases)
+//   game.debugSetButton(btn, down): void     — sets/clears an INPUT_* held bit
+//   game.debugInfo(): { pos: [x,y,z]; players: number; pingMs: number }
+//   plus room-flow hud.show(true on joined / false on leave) inside ClientGame.
+// Reverse direction: main dispatches ONE 'fps:gesture' window Event on the
+// first pointerdown/keydown; ClientGame listens for it and resumes its
+// internally-constructed AudioEngine (browsers gate AudioContext on a gesture).
+// ============================================================================
+import { PALETTE } from '@fps/shared';
+import type { MapId, RoomId, RoomPhase, Team, WeaponId } from '@fps/shared';
+import { ClientState } from './game/state';
+import { ClientGame } from './game/clientGame';
+import { Hud } from './ui/hud';
+import { Menus } from './ui/menus';
 import './style.css';
 
-// Placeholder render-pipeline check: a rotating cube on a dark background.
-// Will be replaced by the actual game client.
+// ---- frozen e2e surface (CONTRACT.md "Debug & test surface") ---------------
+type DebugButton = 'fire' | 'jump' | 'crouch' | 'alt';
 
-const app = document.querySelector<HTMLDivElement>('#app');
-if (!app) throw new Error('missing #app element');
+// JSON-safe snapshot of everything a test driver needs; pos is [x, y, z] feet.
+interface FpsState {
+  phase: RoomPhase;
+  roomId: RoomId | null;
+  code: string | null;
+  mapId: MapId | null;
+  team: Team | null;
+  hp: number;
+  alive: boolean;
+  pos: [number, number, number];
+  players: number;
+  rosterSize: number;
+  ping: number;
+  money: number;
+  mag: number;
+  reserve: number;
+  round: number;
+  scoreT: number;
+  scoreCT: number;
+  weapon: WeaponId;
+}
 
-const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setPixelRatio(window.devicePixelRatio);
-renderer.setSize(window.innerWidth, window.innerHeight);
-app.appendChild(renderer.domElement);
+interface FpsApi {
+  state(): FpsState;
+  joinQuick(name: string): void;
+  createPrivate(name: string, mapId: MapId): void;
+  joinPrivate(name: string, code: string): void;
+  debug: {
+    setLook(yaw: number, pitch: number): void;
+    setMove(x: number, z: number): void;
+    press(btn: DebugButton, down: boolean): void;
+    reload(): void;
+    buy(w: WeaponId): void;
+  };
+}
 
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0b0e14);
+declare global {
+  interface Window {
+    __fps?: FpsApi;
+  }
+}
 
-const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
-camera.position.set(0, 0.8, 3);
-camera.lookAt(0, 0, 0);
+const MAX_FRAME_MS = 100; // dt clamp: background-tab gaps must not teleport the sim
+const DEBUG_HZ_MS = 250; // ?debug overlay refresh (4Hz)
 
-const cube = new THREE.Mesh(
-  new THREE.BoxGeometry(1, 1, 1),
-  new THREE.MeshStandardMaterial({ color: 0x4cc2ff, metalness: 0.2, roughness: 0.4 }),
-);
-scene.add(cube);
+function must<T extends HTMLElement>(selector: string): T {
+  const el = document.querySelector<T>(selector);
+  if (el === null) throw new Error(`missing ${selector} element`);
+  return el;
+}
 
-const keyLight = new THREE.DirectionalLight(0xffffff, 1.2);
-keyLight.position.set(3, 5, 4);
-scene.add(keyLight);
-scene.add(new THREE.AmbientLight(0x8899ff, 0.4));
+// ---- fatal error surface (CONTRACT RULE 9) ----------------------------------
+let bannerEl: HTMLDivElement | null = null;
+function showError(text: string): void {
+  if (bannerEl === null) {
+    bannerEl = document.createElement('div');
+    bannerEl.className = 'error-banner';
+    document.body.appendChild(bannerEl);
+  }
+  bannerEl.textContent = text;
+}
 
-window.addEventListener('resize', () => {
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
+window.onerror = (_event, _source, _lineno, _colno, error) => {
+  showError(`Error: ${error?.message ?? 'unknown'} — reload to retry`);
+};
+window.addEventListener('unhandledrejection', (ev: PromiseRejectionEvent) => {
+  showError(`Error: ${ev.reason instanceof Error ? ev.reason.message : String(ev.reason)}`);
 });
 
-renderer.setAnimationLoop((time) => {
-  cube.rotation.set(time * 0.0006, time * 0.0009, 0);
-  renderer.render(scene, camera);
-});
+function boot(): void {
+  const app = must<HTMLDivElement>('#app');
+  const canvas = must<HTMLCanvasElement>('#game');
+
+  // PALETTE -> CSS custom properties consumed by style.css (single source of truth).
+  const rootStyle = document.documentElement.style;
+  rootStyle.setProperty('--c11-ink', PALETTE.ink);
+  rootStyle.setProperty('--c11-text', PALETTE.hudText);
+  rootStyle.setProperty('--c11-danger', PALETTE.danger);
+
+  const state = new ClientState();
+  const hud = new Hud(must<HTMLElement>('#hud'));
+  hud.show(false); // ClientGame flips it on at 'joined' and off on leave (C10 flow)
+
+  // Menu callbacks wire straight onto ClientGame's frozen join/leave API plus
+  // the seam methods in the header. They can only fire after boot completes,
+  // by which point `game` is set — optional calls cover the boot-failure path.
+  let game: ClientGame | null = null;
+  const menus = new Menus(must<HTMLElement>('#menu'), {
+    onQuickJoin: (name) => game?.joinQuick(name),
+    onCreatePrivate: (name, mapId) => game?.createPrivate(name, mapId),
+    onJoinPrivate: (name, code) => game?.joinPrivate(name, code),
+    onListRooms: () => game?.listRooms() ?? Promise.resolve([]),
+    onBuy: (weapon) => game?.buy(weapon),
+    onResume: () => {
+      // re-request pointer lock on the canvas directly; may reject when the
+      // browser refuses (e.g. too soon after Esc) — not fatal, user clicks again
+      void Promise.resolve(canvas.requestPointerLock()).catch(() => undefined);
+    },
+    onLeave: () => game?.leave(),
+  });
+
+  // SceneRig (WebGL) is constructed inside ClientGame — this is where a missing
+  // WebGL context throws; guard it with a readable error instead of a white screen.
+  try {
+    game = new ClientGame({ canvas, hud, menus, state });
+  } catch (err) {
+    showError(`Cannot start: WebGL unavailable (${err instanceof Error ? err.message : String(err)})`);
+    return;
+  }
+  const g: ClientGame = game;
+
+  // ---- rAF loop: one bad frame must never kill the loop (RULE 9) ------------
+  let last = -1;
+  let frames = 0; // counted between ?debug overlay refreshes
+  const loop = (now: number): void => {
+    const clamped = last < 0 ? now : Math.min(now, last + MAX_FRAME_MS);
+    last = clamped;
+    frames += 1;
+    try {
+      g.frame(clamped);
+    } catch (err) {
+      showError(`Frame error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    window.requestAnimationFrame(loop);
+  };
+  window.requestAnimationFrame(loop);
+
+  // ---- resize → game (SceneRig.resize inside; seam) --------------------------
+  window.addEventListener('resize', () => g.resize());
+
+  // ---- first-gesture audio unlock: 'fps:gesture' seam event ------------------
+  const onGesture = (): void => {
+    window.removeEventListener('pointerdown', onGesture, true);
+    window.removeEventListener('keydown', onGesture, true);
+    window.dispatchEvent(new Event('fps:gesture')); // ClientGame resumes its AudioEngine
+  };
+  window.addEventListener('pointerdown', onGesture, true);
+  window.addEventListener('keydown', onGesture, true);
+
+  // ---- ?debug overlay: fps / ping / pos / phase @ 4Hz -------------------------
+  if (new URLSearchParams(window.location.search).has('debug')) {
+    const overlay = document.createElement('div');
+    overlay.className = 'debug-overlay';
+    app.appendChild(overlay);
+    window.setInterval(() => {
+      const fps = Math.round(frames * (1000 / DEBUG_HZ_MS));
+      frames = 0;
+      const info = g.debugInfo();
+      overlay.textContent =
+        `fps   ${fps}\n` +
+        `ping  ${Math.round(info.pingMs)}ms\n` +
+        `pos   ${info.pos[0].toFixed(1)} ${info.pos[1].toFixed(1)} ${info.pos[2].toFixed(1)}\n` +
+        `phase ${state.phase}`;
+    }, DEBUG_HZ_MS);
+  }
+
+  // ---- frozen e2e debug surface ----------------------------------------------
+  window.__fps = {
+    state: (): FpsState => {
+      const you = state.latestYou;
+      const info = g.debugInfo();
+      return {
+        phase: state.phase,
+        roomId: state.roomId,
+        code: state.code,
+        mapId: state.mapId,
+        team: state.team,
+        hp: you?.hp ?? 100,
+        alive: you?.alive ?? false,
+        pos: [info.pos[0], info.pos[1], info.pos[2]],
+        players: info.players,
+        rosterSize: state.roster.size,
+        ping: Math.round(info.pingMs),
+        money: you?.money ?? 0,
+        mag: you?.mag ?? 0,
+        reserve: you?.reserve ?? 0,
+        round: state.round,
+        scoreT: state.scoreT,
+        scoreCT: state.scoreCT,
+        weapon: you?.weapon ?? 'knife',
+      };
+    },
+    joinQuick: (name) => g.joinQuick(name),
+    createPrivate: (name, mapId) => g.createPrivate(name, mapId),
+    joinPrivate: (name, code) => g.joinPrivate(name, code),
+    debug: {
+      setLook: (yaw, pitch) => g.debugSetLook(yaw, pitch),
+      setMove: (x, z) => g.debugSetMove(x, z),
+      press: (btn, down) => g.debugSetButton(btn, down),
+      reload: () => g.reload(),
+      buy: (w) => g.buy(w),
+    },
+  };
+
+  menus.showMain();
+}
+
+try {
+  boot();
+} catch (err) {
+  showError(`Boot failed: ${err instanceof Error ? err.message : String(err)}`);
+}

@@ -1,90 +1,66 @@
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+// ============================================================================
+// S1 — entry: wire NetServer <-> Lobby, resolve the static dir, run the 1s
+// stale sweep (closes sockets of input-stale/kicked players; the lobby reaps
+// empty rooms in the same poll), and shut down cleanly on SIGTERM/SIGINT.
+// A throwing hook must never kill the process: net.ts wraps hook calls, the
+// lobby wraps its bodies, and the sweep wraps its poll.
+// ============================================================================
 import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { WebSocketServer, type WebSocket } from 'ws';
+import { NetServer } from './net.js';
+import { Lobby } from './rooms.js';
 
 const PORT = Number(process.env.PORT ?? 8080);
 
-// Placeholder server: logs WebSocket connections on /ws and, when a client
-// production build exists, serves it over HTTP. Will be replaced by the
-// authoritative game server later.
-
-const here = path.dirname(fileURLToPath(import.meta.url));
-// tsx dev runs from server/src; the production bundle lives in server/dist.
-const clientDist = [
-  path.resolve(here, '../client/dist'),
-  path.resolve(here, '../../client/dist'),
-].find((p) => existsSync(p));
-
-const MIME_TYPES: Record<string, string> = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.json': 'application/json',
-  '.map': 'application/json',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.svg': 'image/svg+xml',
-  '.ico': 'image/x-icon',
-  '.wasm': 'application/wasm',
-  '.woff2': 'font/woff2',
-  '.txt': 'text/plain; charset=utf-8',
-};
-
-async function handleHttp(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  if (clientDist === undefined) {
-    res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-    res.end('fps server: no client build found (run `npm run build`)');
-    return;
+/**
+ * Client production build, when present on disk. Candidates cover cwd = the
+ * server package (npm workspace scripts), cwd = repo root, tsx dev
+ * (here = server/src), and the bundled layout (here = server/dist, where
+ * ../../client/dist is the path the Docker image relies on).
+ */
+function resolveStaticDir(): string | null {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    path.resolve(process.cwd(), '../client/dist'),
+    path.resolve(process.cwd(), 'client/dist'),
+    path.resolve(here, '../client/dist'),
+    path.resolve(here, '../../client/dist'),
+  ];
+  for (const dir of candidates) {
+    if (existsSync(path.join(dir, 'index.html'))) return dir;
   }
-
-  const url = new URL(req.url ?? '/', 'http://localhost');
-  let pathname = decodeURIComponent(url.pathname);
-  if (pathname === '/') pathname = '/index.html';
-
-  const filePath = path.resolve(clientDist, `.${pathname}`);
-  if (!filePath.startsWith(clientDist + path.sep)) {
-    res.writeHead(403).end('Forbidden');
-    return;
-  }
-
-  try {
-    const data = await readFile(filePath);
-    const contentType = MIME_TYPES[path.extname(filePath)] ?? 'application/octet-stream';
-    res.writeHead(200, { 'content-type': contentType });
-    res.end(data);
-  } catch {
-    res.writeHead(404).end('Not Found');
-  }
+  return null;
 }
 
-const server = createServer((req, res) => {
-  handleHttp(req, res).catch((err: unknown) => {
-    console.error('[http] error', err);
-    if (!res.headersSent) res.writeHead(500);
-    res.end('Internal Server Error');
-  });
+const lobby = new Lobby();
+const net = new NetServer({
+  onMessage: (sess, msg) => lobby.handleMessage(sess, msg),
+  onDisconnect: (sess) => lobby.handleDisconnect(sess),
 });
 
-const wss = new WebSocketServer({ noServer: true });
-wss.on('connection', (ws: WebSocket) => {
-  console.log('[ws] client connected');
-  ws.on('close', () => console.log('[ws] client disconnected'));
-  ws.on('error', (err) => console.error('[ws] error', err));
-});
+net.start(PORT, resolveStaticDir());
 
-server.on('upgrade', (req, socket, head) => {
-  const { pathname } = new URL(req.url ?? '/', 'http://localhost');
-  if (pathname === '/ws') {
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
-  } else {
-    socket.destroy();
+// 1s sweep: rooms report input-stale players (NET.inputTimeoutMs); their
+// sockets are closed here. The same poll reaps empty rooms.
+const sweep = setInterval(() => {
+  try {
+    for (const sess of lobby.pollStaleSessions()) sess.close();
+  } catch (err) {
+    console.error('[server] stale sweep failed', err);
   }
-});
+}, 1000);
 
-server.listen(PORT, () => {
-  console.log(`[server] listening on http://localhost:${PORT} (ws at /ws)`);
-});
+let shuttingDown = false;
+function shutdown(signal: string): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[server] ${signal}: shutting down`);
+  clearInterval(sweep);
+  lobby.close(); // stop room tick intervals
+  net.close(); // terminate sockets, close ws + http
+  setTimeout(() => process.exit(0), 200).unref(); // let close frames flush
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

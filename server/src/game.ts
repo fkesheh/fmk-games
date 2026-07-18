@@ -543,7 +543,9 @@ export class GameRoom {
     const fireDown = (msg.buttons & INPUT_FIRE) !== 0;
     const fireEdge = fireDown && (p.prevButtons & INPUT_FIRE) === 0;
     p.prevButtons = msg.buttons;
-    if (!p.alive || this.phase === 'freeze') return; // look only, no move/shoot
+    // frozen invariant: bodies step + damage applies ONLY in warmup/live;
+    // freeze/roundEnd/matchEnd still ack + track aim (above) but never simulate
+    if (!p.alive || (this.phase !== 'warmup' && this.phase !== 'live')) return;
     stepBody(
       p.body,
       {

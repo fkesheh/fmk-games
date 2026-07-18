@@ -7,8 +7,9 @@
 //   - no spawn sightline: N/S lines must thread hub N door [0.8,2.8] + S door [-3,-1];
 //     every such line crosses the 2x2 central pillar (door sets are staggered), and
 //     ring routes require bends a straight line cannot make
-//   - longest open sightline ~21m (worst case threads hub E door + W door + W room
-//     door); straight ring runs are 15.4m; hard limit is 25m
+//   - longest open sightline <25m: the spawn-room -> flank-room diagonal through two
+//     doors (~27.5m raw) is cut by a full-height column mid flank room plus flank
+//     masses extended to z=+-4.0; straight ring runs are 15.4m; hard limit is 25m
 //   - cover every <=8m on routes (room crates -> ring nub -> junction crate -> ...)
 //   - corridors 2.5m; worst pinches 1.5m (ring nubs) / 1.6m (junction crates) >= 1.4m
 //   - 7 spawns/team, all on y=0 ground, none inside boxes (>=0.9m clearance)
@@ -49,11 +50,12 @@ export const bunker: MapDef = {
     { x: -10.25, y: 1.5, z: 11.6, w: 10, h: 3, d: 7.8, mat: 'concreteDark' }, // SW
     { x: 10.25, y: 1.5, z: 11.6, w: 10, h: 3, d: 7.8, mat: 'concreteDark' }, // SE
 
-    // ---- W/E room flank masses (seal ring corridor outer wall) ----
-    { x: -11.6, y: 1.5, z: -6.6, w: 7.8, h: 3, d: 2.2, mat: 'concreteDark' },
-    { x: -11.6, y: 1.5, z: 6.6, w: 7.8, h: 3, d: 2.2, mat: 'concreteDark' },
-    { x: 11.6, y: 1.5, z: -6.6, w: 7.8, h: 3, d: 2.2, mat: 'concreteDark' },
-    { x: 11.6, y: 1.5, z: 6.6, w: 7.8, h: 3, d: 2.2, mat: 'concreteDark' },
+    // ---- W/E room flank masses (seal ring corridor outer wall; inner face at
+    // z=+-4.0 so diagonals threading both room doors end on them at <25m) ----
+    { x: -11.6, y: 1.5, z: -5.85, w: 7.8, h: 3, d: 3.7, mat: 'concreteDark' },
+    { x: -11.6, y: 1.5, z: 5.85, w: 7.8, h: 3, d: 3.7, mat: 'concreteDark' },
+    { x: 11.6, y: 1.5, z: -5.85, w: 7.8, h: 3, d: 3.7, mat: 'concreteDark' },
+    { x: 11.6, y: 1.5, z: 5.85, w: 7.8, h: 3, d: 3.7, mat: 'concreteDark' },
 
     // ---- W room east wall (doors z[-3.7,-1.7] + [1.7,3.7]) ----
     { x: -8.3, y: 1.5, z: -4.6, w: 1.2, h: 3, d: 1.8, mat: 'concreteDark' },
@@ -116,14 +118,12 @@ export const bunker: MapDef = {
     { x: -4, y: 0.6, z: 11, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
     { x: 0, y: 0.6, z: 12, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
     { x: -4.9, y: 0.6, z: 9.6, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
-    // ---- W room crates ----
-    { x: -11, y: 0.6, z: -4, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
-    { x: -11, y: 0.6, z: 4, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
+    // ---- W room: full-height column (cuts door-threading diagonals) + crate stack ----
+    { x: -10.5, y: 1.5, z: 0, w: 1.6, h: 3, d: 4.4, mat: 'concreteDark' },
     { x: -12.5, y: 0.6, z: 0, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
     { x: -12.5, y: 1.8, z: 0, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
-    // ---- E room crates (180° rotation) ----
-    { x: 11, y: 0.6, z: 4, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
-    { x: 11, y: 0.6, z: -4, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
+    // ---- E room (180° rotation) ----
+    { x: 10.5, y: 1.5, z: 0, w: 1.6, h: 3, d: 4.4, mat: 'concreteDark' },
     { x: 12.5, y: 0.6, z: 0, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
     { x: 12.5, y: 1.8, z: 0, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
 
@@ -141,10 +141,10 @@ export const bunker: MapDef = {
     { x: 5.2, y: 1.4, z: -15.2, w: 0.3, h: 2.8, d: 0.3, mat: 'metalDark' },
     { x: -5.2, y: 1.4, z: 15.2, w: 0.3, h: 2.8, d: 0.3, mat: 'metalDark' },
     { x: 5.2, y: 1.4, z: 15.2, w: 0.3, h: 2.8, d: 0.3, mat: 'metalDark' },
-    { x: -15.2, y: 1.4, z: -5.2, w: 0.3, h: 2.8, d: 0.3, mat: 'metalDark' },
-    { x: -15.2, y: 1.4, z: 5.2, w: 0.3, h: 2.8, d: 0.3, mat: 'metalDark' },
-    { x: 15.2, y: 1.4, z: -5.2, w: 0.3, h: 2.8, d: 0.3, mat: 'metalDark' },
-    { x: 15.2, y: 1.4, z: 5.2, w: 0.3, h: 2.8, d: 0.3, mat: 'metalDark' },
+    { x: -15.2, y: 1.4, z: -3.7, w: 0.3, h: 2.8, d: 0.3, mat: 'metalDark' },
+    { x: -15.2, y: 1.4, z: 3.7, w: 0.3, h: 2.8, d: 0.3, mat: 'metalDark' },
+    { x: 15.2, y: 1.4, z: -3.7, w: 0.3, h: 2.8, d: 0.3, mat: 'metalDark' },
+    { x: 15.2, y: 1.4, z: 3.7, w: 0.3, h: 2.8, d: 0.3, mat: 'metalDark' },
 
     // ---- ceiling beams (hang to y2.51; clear of players and crate stacks) ----
     { x: 0, y: 2.62, z: 0, w: 8, h: 0.22, d: 0.5, mat: 'metalDark' }, // hub
