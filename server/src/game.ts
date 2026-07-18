@@ -167,6 +167,9 @@ export class GameRoom {
   private buyOpenUntil = 0; // serverTime ms; canBuy while live && now < this
   private matchEndResetAt = 0; // serverTime ms; warmup reset 6s after match_end
   private timer: ReturnType<typeof setInterval> | null = null;
+  // queued team-switch requests (made during freeze/live/roundEnd/matchEnd),
+  // applied at the next beginFreeze; warmup switches apply immediately instead
+  private readonly teamSwitchQueue = new Map<PlayerId, Team>();
 
   // tick scratch, reused across ticks (hot-path allocation ban)
   private readonly snapPlayers: PlayerSnap[] = [];
@@ -219,6 +222,7 @@ export class GameRoom {
     try {
       if (!this.players.delete(id)) return;
       this.bots.delete(id);
+      this.teamSwitchQueue.delete(id); // drop any pending switch for the leaver
       this.broadcast({ t: 'player_left', id });
     } catch (err) {
       console.error('[game] removePlayer failed', err);
@@ -330,6 +334,37 @@ export class GameRoom {
     return t < ct ? 'T' : ct < t ? 'CT' : this.next() < 0.5 ? 'T' : 'CT';
   }
 
+  /** Balance guard (frozen): target team must not already have >= other + 1. */
+  private teamSwitchAllowed(team: Team): boolean {
+    const target = this.countConnected(team);
+    const other = this.countConnected(team === 'T' ? 'CT' : 'T');
+    return target < other + 1;
+  }
+
+  /** Immediate switch (warmup): set team, broadcast, respawn with protection. */
+  private applyTeamSwitch(p: PlayerState, team: Team, now: number): void {
+    p.team = team;
+    this.teamSwitchQueue.delete(p.id); // satisfied: drop any stale queued request
+    this.broadcast({ t: 'team_changed', id: p.id, team });
+    this.placeAtSpawn(p, now); // new team's spawns, spawn protection included
+  }
+
+  /** beginFreeze application of queued requests; guard re-evaluated per request. */
+  private applyQueuedTeamSwitches(): void {
+    if (this.teamSwitchQueue.size === 0) return;
+    for (const [id, team] of this.teamSwitchQueue) {
+      this.teamSwitchQueue.delete(id); // consumed either way
+      const p = this.players.get(id);
+      if (p === undefined || p.team === team) continue; // gone or already there
+      if (!this.teamSwitchAllowed(team)) {
+        this.io.send(id, { t: 'error', code: 'team_full', message: 'team is full' });
+        continue;
+      }
+      p.team = team;
+      this.broadcast({ t: 'team_changed', id, team });
+    }
+  }
+
   private freshPlayerId(): PlayerId {
     let id = randomToken(this.next, 8);
     while (this.players.has(id)) id = randomToken(this.next, 8);
@@ -421,6 +456,32 @@ export class GameRoom {
       this.sendEvent(id, { t: 'buy_result', ok: true, weapon, reason: null });
     } catch (err) {
       console.error('[game] handleBuy failed', err);
+    }
+  }
+
+  // Team switch (frozen invariant): no-op if already on `team`. Balance guard:
+  // denied with {t:'error', code:'team_full'} when the target team already has
+  // >= (other team + 1) players (bots count — they hold normal slots). In
+  // warmup the switch applies immediately (respawn at the new team's spawns
+  // with protection); in freeze/live/roundEnd/matchEnd it is queued and
+  // applied at the next beginFreeze with the guard re-evaluated. Requests
+  // denied at beginFreeze are dropped WITH the error message (documented
+  // choice — the alternative was a silent drop).
+  handleSwitchTeam(id: PlayerId, team: Team): void {
+    try {
+      const p = this.players.get(id);
+      if (p === undefined || p.team === team) return; // unknown or no-op
+      if (this.phase === 'warmup') {
+        if (!this.teamSwitchAllowed(team)) {
+          this.io.send(id, { t: 'error', code: 'team_full', message: 'team is full' });
+          return;
+        }
+        this.applyTeamSwitch(p, team, Date.now());
+        return;
+      }
+      this.teamSwitchQueue.set(id, team); // latest request wins
+    } catch (err) {
+      console.error('[game] handleSwitchTeam failed', err);
     }
   }
 
@@ -602,6 +663,10 @@ export class GameRoom {
     this.phase = 'freeze';
     this.round = round;
     this.phaseEndsAt = now + ROUNDS.freezeTime * 1000;
+    // queued team switches apply now (halftime's side swap already happened in
+    // advanceAfterRound, so guards below see post-swap teams); placeAtSpawn in
+    // the loop then teleports switchers to their NEW team's spawns
+    this.applyQueuedTeamSwitches();
     for (const p of this.players.values()) {
       this.placeAtSpawn(p, now); // teleported, healed, protected
       this.refillWeapons(p); // every owned weapon refills mag+reserve for free

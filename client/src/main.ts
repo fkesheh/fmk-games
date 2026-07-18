@@ -12,6 +12,7 @@
 //   game.buy(w: WeaponId): void              — send C2S buy (menu onBuy + debug)
 //   game.addBot(): void                      — send C2S add_bot (menu onAddBot + debug)
 //   game.removeBot(): void                   — send C2S remove_bot (menu onRemoveBot + debug)
+//   game.switchTeam(team: Team): void        — send C2S switch_team (menu onSwitchTeam + debug)
 //   game.reload(): void                      — send C2S reload (debug)
 //   game.debugSetLook(yaw, pitch): void      — writes InputController yaw/pitch
 //   game.debugSetMove(x, z): void            — overrides move axes (0,0 releases)
@@ -70,6 +71,7 @@ interface FpsApi {
     reload(): void;
     buy(w: WeaponId): void;
     scoreboard(down: boolean): void;
+    switchTeam(team: Team): void;
   };
 }
 
@@ -133,6 +135,7 @@ function boot(): void {
     onBuy: (weapon) => game?.buy(weapon),
     onAddBot: () => game?.addBot(),
     onRemoveBot: () => game?.removeBot(),
+    onSwitchTeam: (team) => game?.switchTeam(team),
     onResume: () => {
       // re-request pointer lock on the canvas directly; may reject when the
       // browser refuses (e.g. too soon after Esc) — not fatal, user clicks again
@@ -235,6 +238,7 @@ function boot(): void {
       reload: () => g.reload(),
       buy: (w) => g.buy(w),
       scoreboard: (down) => g.scoreboard(down),
+      switchTeam: (team) => g.switchTeam(team),
     },
   };
 

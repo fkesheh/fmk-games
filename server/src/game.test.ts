@@ -56,6 +56,10 @@ class FakeIO implements RoomIO {
       .filter((m): m is Extract<S2C, { t: 'event' }> => m.t === 'event')
       .map((m) => m.ev);
   }
+
+  errors(id: PlayerId): Array<Extract<S2C, { t: 'error' }>> {
+    return (this.log.get(id) ?? []).filter((m): m is Extract<S2C, { t: 'error' }> => m.t === 'error');
+  }
 }
 
 // ---- drive helpers -----------------------------------------------------------
@@ -96,8 +100,8 @@ function setupDuel(io: FakeIO): GameRoom {
   return room;
 }
 
-function advanceToPhase(io: FakeIO, id: PlayerId, phase: RoomPhase): void {
-  const ok = advanceUntil(() => io.lastSnap(id).phase === phase);
+function advanceToPhase(io: FakeIO, id: PlayerId, phase: RoomPhase, maxSteps = 500): void {
+  const ok = advanceUntil(() => io.lastSnap(id).phase === phase, maxSteps);
   expect(ok, `room reaches phase ${phase}`).toBe(true);
 }
 
@@ -628,6 +632,103 @@ describe('GameRoom bots', () => {
     expect(room.removeBot()).toBe(true);
     expect(room.botCount()).toBe(0);
     expect(room.playerCount()).toBe(1);
+    room.stop();
+  });
+});
+
+describe('GameRoom team switching', () => {
+  it('warmup: a switch applies immediately — team_changed, roster, respawn on the new team', () => {
+    const io = new FakeIO();
+    const room = new GameRoom('dustbowl', 'public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.start();
+    vi.advanceTimersByTime(200); // settle into solo warmup
+    expect(io.lastSnap('p1').phase).toBe('warmup');
+
+    const from = teamOf(io, 'p1');
+    const to: Team = from === 'T' ? 'CT' : 'T';
+    room.handleSwitchTeam('p1', to); // solo room: target 0 < own 1 + 1, guard passes
+
+    // the broadcast is synchronous: one team_changed carrying the new team
+    const changes = eventsOfType(io, 'p1', 'team_changed');
+    expect(changes.length).toBe(1);
+    expect(changes[0]?.id).toBe('p1');
+    expect(changes[0]?.team).toBe(to);
+
+    // respawned at the NEW team's spawns: placeAtSpawn sets exact spawn coords
+    // and p1 never sends an input, so the body is never stepped off them
+    tick();
+    const self = io.lastSnap('p1').players.find((p) => p.id === 'p1');
+    if (self === undefined) throw new Error('p1 missing from snapshot');
+    expect(MAPS.dustbowl.spawns[to].some((s) => s.x === self.x && s.z === self.z)).toBe(true);
+
+    // roster reflects the switch: a fresh joiner's `joined` carries it
+    room.addPlayer('p2', 'Bravo');
+    expect(io.joined('p2').roster.find((e) => e.id === 'p1')?.team).toBe(to);
+    room.stop();
+  });
+
+  it('guard: in a 2v1 the solo player joining the 2-player team is denied team_full', () => {
+    const io = new FakeIO();
+    const room = new GameRoom('dustbowl', 'public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.addPlayer('p2', 'Bravo');
+    room.addPlayer('p3', 'Carol');
+    room.start();
+    advanceToPhase(io, 'p1', 'freeze'); // 3 players => always 2v1
+
+    const ids: PlayerId[] = ['p1', 'p2', 'p3'];
+    const onTeam = (t: Team): PlayerId[] => ids.filter((id) => teamOf(io, id) === t);
+    const soloTeam: Team = onTeam('T').length === 1 ? 'T' : 'CT';
+    const solo = onTeam(soloTeam)[0];
+    if (solo === undefined) throw new Error('expected a solo player in a 2v1');
+    const bigTeam: Team = soloTeam === 'T' ? 'CT' : 'T';
+
+    room.handleSwitchTeam(solo, bigTeam); // 2 >= 1 + 1: the balance guard must deny it
+
+    // queued during the round: the room idles and the clock gives round 1 to
+    // the bigger team (2 alive vs 1); the denial lands when the guard is
+    // re-evaluated at round 2's beginFreeze — never a team_changed mid-round
+    advanceToPhase(io, solo, 'roundEnd', 3500); // freeze 3s + live 100s on the clock
+    expect(eventsOfType(io, solo, 'team_changed').length).toBe(0);
+    advanceToPhase(io, solo, 'freeze'); // round 2: queued request re-evaluated, denied
+
+    expect(io.errors(solo).filter((e) => e.code === 'team_full').length).toBe(1);
+
+    // no team_changed for the denied request, and a fresh roster shows the old team
+    for (const id of ids) {
+      expect(eventsOfType(io, id, 'team_changed').filter((e) => e.id === solo).length).toBe(0);
+    }
+    room.addPlayer('p4', 'Delta');
+    expect(io.joined('p4').roster.find((e) => e.id === solo)?.team).toBe(soloTeam);
+    room.stop();
+  });
+
+  it('queued: a freeze/live switch request is applied at the next freeze', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io); // p2 takes the team p1 didn't: always 1v1
+    const feed = new InputFeed();
+    advanceToPhase(io, 'p1', 'freeze');
+
+    const to = teamOf(io, 'p2');
+    room.handleSwitchTeam('p1', to); // 1 < 1 + 1: guard passes, queued for the next freeze
+
+    advanceToPhase(io, 'p1', 'live'); // the whole round-1 freeze passed: nothing applied
+    expect(eventsOfType(io, 'p1', 'team_changed').length).toBe(0);
+
+    // p2 eliminates p1: round 1 ends and round 2's beginFreeze applies the switch
+    fightUntilKill(room, io, feed, 'p2', 'p1');
+    advanceToPhase(io, 'p1', 'freeze');
+
+    const changes = eventsOfType(io, 'p1', 'team_changed');
+    expect(changes.length).toBe(1);
+    expect(changes[0]?.id).toBe('p1');
+    expect(changes[0]?.team).toBe(to);
+
+    // round-2 freeze teleported p1 to a spawn of its NEW team
+    const self = io.lastSnap('p1').players.find((p) => p.id === 'p1');
+    if (self === undefined) throw new Error('p1 missing from snapshot');
+    expect(MAPS.dustbowl.spawns[to].some((s) => s.x === self.x && s.z === self.z)).toBe(true);
     room.stop();
   });
 });

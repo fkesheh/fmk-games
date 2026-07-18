@@ -78,6 +78,9 @@ export class Lobby {
         case 'switch':
           this.sessionRoom.get(sess.id)?.handleSwitch(sess.id, msg.weapon);
           break;
+        case 'switch_team':
+          this.sessionRoom.get(sess.id)?.handleSwitchTeam(sess.id, msg.team);
+          break;
         case 'buy':
           this.sessionRoom.get(sess.id)?.handleBuy(sess.id, msg.weapon);
           break;

@@ -14,6 +14,7 @@
 //   resize(): void                       — forwards to SceneRig.resize()
 //   buy(w): void / reload(): void        — send the C2S (menu onBuy + e2e debug)
 //   addBot(): void / removeBot(): void   — send the C2S (menu onAddBot/onRemoveBot)
+//   switchTeam(team): void               — send the C2S (menu onSwitchTeam + e2e debug)
 //   debugSetLook(yaw, pitch): void       — writes InputController yaw/pitch
 //   debugSetMove(x, z): void             — overrides move axes (0,0 releases)
 //   debugSetButton(btn, down): void      — sets/clears an INPUT_* held bit
@@ -296,6 +297,12 @@ export class ClientGame {
     this.conn?.send({ t: 'remove_bot' });
   }
 
+  /** Menu onSwitchTeam + e2e debug: request a team change; server guards balance. */
+  switchTeam(team: Team): void {
+    if (this.world === null) return; // in-room only
+    this.conn?.send({ t: 'switch_team', team });
+  }
+
   /** E2E debug: same path as the R edge. */
   reload(): void {
     this.doReload();
@@ -509,6 +516,12 @@ export class ClientGame {
         if (this.joining) {
           this.joining = false;
           this.menus.showMain(msg.message);
+        } else if (this.world !== null) {
+          // in-room rejections (team_full on a denied switch, etc.): the
+          // existing HUD banner is the visible in-room error surface (it
+          // renders under an open menu's dim, but stays queued/visible in
+          // play and after the menu closes)
+          this.hud.banner(msg.message, '');
         }
         break;
       case 'pong':
@@ -777,6 +790,14 @@ export class ClientGame {
         this.syncPool.delete(ev.id);
         this.others.delete(ev.id);
         break;
+      case 'team_changed': {
+        // roster carries team (nameplates/scoreboard/sync merge all read it);
+        // when it's us, state.team drives the pause menu's current-team disable
+        const entry = s.roster.get(ev.id);
+        if (entry !== undefined) entry.team = ev.team;
+        if (ev.id === s.youId) s.team = ev.team;
+        break;
+      }
       case 'buy_result': {
         if (ev.ok) {
           this.audio.sfx('buy');
@@ -1077,7 +1098,7 @@ export class ClientGame {
         }
         case 'menu': {
           if (this.world !== null) {
-            this.menus.showPause(this.botCount());
+            this.menus.showPause(this.botCount(), this.state.team);
             if (document.pointerLockElement !== null) document.exitPointerLock();
           } else {
             this.menus.showMain();
@@ -1158,7 +1179,7 @@ export class ClientGame {
     if (locked) return;
     // browsers swallow the Esc keydown on pointer-lock exit — this is the pause signal;
     // an intentional unlock for the buy menu must NOT pause
-    if (this.world !== null && !this.buyOpen) this.menus.showPause(this.botCount());
+    if (this.world !== null && !this.buyOpen) this.menus.showPause(this.botCount(), this.state.team);
   }
 
   private readonly onKeyDown = (e: KeyboardEvent): void => {

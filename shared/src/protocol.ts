@@ -44,6 +44,9 @@ export function parseC2S(raw: unknown): C2S | null {
       return { t: 'add_bot' };
     case 'remove_bot':
       return { t: 'remove_bot' };
+    case 'switch_team':
+      if (raw.team !== 'T' && raw.team !== 'CT') return null;
+      return { t: 'switch_team', team: raw.team };
     case 'input': {
       if (!num(raw.seq) || !num(raw.moveX) || !num(raw.moveZ) || !num(raw.yaw) || !num(raw.pitch) || !num(raw.buttons)) return null;
       return {

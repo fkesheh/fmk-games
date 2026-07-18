@@ -7,8 +7,9 @@
 // the frozen window.__fps surface: private-room create/join, phase machine
 // warmup->freeze->live, movement, combat (aim math + semi-auto fire edges),
 // buy flow, state-surface shape, a 6-map screenshot tour, public-room create
-// (code === null), debug scoreboard toggle, jump-apex height, and server-side
-// bot add/remove with a 6s combat soak.
+// (code === null), debug scoreboard toggle, jump-apex height, server-side
+// bot add/remove with a 6s combat soak, and team switching (immediate in
+// warmup / queued to the next freeze otherwise; team_full balance guard).
 //
 // Exit 0 only if every assertion passes AND zero page/console/network errors
 // were seen on either page (benign favicon noise excluded).
@@ -94,8 +95,18 @@ async function waitForServer(timeoutMs = 15000) {
 }
 
 // ---- browser ------------------------------------------------------------------
+// Render resolution. 1280x720 is the default (screenshot fidelity); on machines
+// where software rasterization can't keep the client at realtime (jump-apex and
+// combat assertions are sim-rate sensitive), E2E_VIEWPORT=640x360 cuts the
+// raster load ~4x — same pattern as E2E_PORT / E2E_PROTOCOL_TIMEOUT.
+const VIEWPORT = (() => {
+  const m = /^(\d{3,4})x(\d{3,4})$/.exec(process.env.E2E_VIEWPORT ?? '');
+  return m === null
+    ? { width: 1280, height: 720 }
+    : { width: Number(m[1]), height: Number(m[2]) };
+})();
 const LAUNCH_ARGS = [
-  '--window-size=1280,720',
+  `--window-size=${VIEWPORT.width},${VIEWPORT.height}`,
   '--mute-audio',
   '--disable-background-timer-throttling',
   '--disable-renderer-backgrounding',
@@ -107,7 +118,11 @@ const LAUNCH_ARGS = [
 // soldier models make individual captures genuinely slow on loaded machines)
 const PROTOCOL_TIMEOUT_MS = Number(process.env.E2E_PROTOCOL_TIMEOUT ?? 300000);
 const LAUNCH_OPTS = {
-  headless: true,
+  // 'shell' (chrome-headless-shell): the new-headless full compositor can wedge
+  // (BeginFrame never completes; captureScreenshot stalls past protocolTimeout)
+  // on machines with contended/broken GPU state — the shell's software pipeline
+  // has no such dependency and still provides webgl2 (SwiftShader) + rAF.
+  headless: 'shell',
   args: LAUNCH_ARGS,
   protocolTimeout: PROTOCOL_TIMEOUT_MS,
   dumpio: !!process.env.E2E_DUMPIO, // pipe browser stderr (GPU/context-loss noise) when diagnosing
@@ -117,7 +132,7 @@ async function launchOne(tag) {
   let browser = await puppeteer.launch(LAUNCH_OPTS);
   browsers.push(browser);
   let page = await browser.newPage();
-  await page.setViewport({ width: 1280, height: 720 });
+  await page.setViewport({ width: VIEWPORT.width, height: VIEWPORT.height });
   const gl = await page.evaluate(() => !!document.createElement('canvas').getContext('webgl2'));
   if (!gl) {
     console.log(`[${tag}] no hardware webgl2 — relaunching on swiftshader`);
@@ -129,7 +144,7 @@ async function launchOne(tag) {
     });
     browsers.push(browser);
     page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 720 });
+    await page.setViewport({ width: VIEWPORT.width, height: VIEWPORT.height });
     const gl2 = await page.evaluate(() => !!document.createElement('canvas').getContext('webgl2'));
     if (!gl2) throw new Error(`[${tag}] webgl2 unavailable even on swiftshader`);
   }
@@ -620,6 +635,146 @@ async function main() {
     '6s bot soak: zero page errors on either page',
     pageErrors.length === errsBeforeSoak,
     `${pageErrors.length - errsBeforeSoak} new error(s)`,
+  );
+
+  // -- (17) team switch: frozen semantics — immediate apply in warmup; queued
+  //    and applied at the next beginFreeze (guard re-evaluated) in any other
+  //    phase. Post-soak the room holds A + 1 bot, so the queued path dominates.
+  //    Detection is a TEAM wait, not a phase wait: once the flip lands the old
+  //    team is empty, so the room forfeit-cycles with ONE-TICK (~33ms) freezes
+  //    that a 150ms phase poll can never catch — the flipped team persists for
+  //    rounds and is the reliable signal. 1v1 => the guard always allows this
+  //    switch (1 < 1 + 1). The 5s immediate window covers the warmup path; the
+  //    long window covers a full round (live 100s + roundEnd 4s + matchEnd
+  //    detour) for the queued one.
+  const team17Before = (await fpsState(A)).team;
+  const team17Target = team17Before === 'T' ? 'CT' : 'T';
+  let lastLog17 = 0;
+  const log17 = async (tag) => {
+    const now = Date.now();
+    if (now - lastLog17 < 2000) return;
+    lastLog17 = now;
+    const s = await fpsState(A);
+    if (s !== null) console.log(`switch17 ${tag}: phase=${s.phase} team=${s.team} round=${s.round}`);
+  };
+  await A.evaluate((t) => window.__fps.debug.switchTeam(t), team17Target);
+  let flip17 = null;
+  let path17 = 'immediate';
+  try {
+    flip17 = await waitFor(async () => {
+      await log17('immediate');
+      const s = await fpsState(A);
+      return s !== null && s.team === team17Target ? s : null;
+    }, 5000, 'team flip (immediate/warmup path)');
+  } catch {
+    path17 = 'queued'; // not immediate — the request applies at the next beginFreeze
+  }
+  if (flip17 === null) {
+    try {
+      flip17 = await waitFor(async () => {
+        await log17('queued');
+        const s = await fpsState(A);
+        return s !== null && s.team === team17Target ? s : null;
+      }, 125000, 'team flip at the next beginFreeze (queued path)');
+    } catch {
+      flip17 = null; // reported by the failing check below
+    }
+  }
+  check(
+    'debug.switchTeam flips A team (immediate in warmup, else at next freeze)',
+    flip17 !== null,
+    flip17
+      ? `${team17Before} -> ${flip17.team} (${path17} path, phase=${flip17.phase} round=${flip17.round})`
+      : `still ${(await fpsState(A)).team}, target ${team17Target}`,
+  );
+
+  // -- (18) team_full guard: after (17), A shares a team with the soak bot and
+  //    the other team is EMPTY — so B's quick-join (the only public room)
+  //    deterministically lands B alone on the small team: a 2v1. B requests
+  //    the larger team; the guard (target >= other + 1) must deny it. A bare
+  //    "no flip within 3s" cannot tell DENIED from ALLOWED-but-queued (a grant
+  //    would apply only at the next beginFreeze), so the attempt is made
+  //    during roundEnd (next freeze ~4s out; the post-(17) forfeit cycle keeps
+  //    roundEnds frequent) and B's team is watched from the attempt THROUGH
+  //    that beginFreeze +5s: the guard re-evaluates there, so surviving it
+  //    proves the request was dropped, not merely pending. Round 5's roundEnd
+  //    is skipped: the halftime swap at its end flips EVERYONE, guard or no
+  //    guard. (Dev note: shaping via addBot alone is impossible — pickTeam
+  //    auto-balances with a coin flip on ties and removeBot is LIFO — hence
+  //    the second human as the switcher.)
+  const aRoom18 = (await fpsState(A)).roomId;
+  await B.evaluate(() => window.__fps.joinQuick('Bob'));
+  let bIn18 = null;
+  try {
+    bIn18 = await waitFor(async () => {
+      const [sa, sb] = await Promise.all([fpsState(A), fpsState(B)]);
+      return sb !== null && sb.roomId !== null && sb.roomId === aRoom18 && sb.team !== sa.team
+        ? sb
+        : null;
+    }, 15000, 'B quick-join into A public room on the opposite team');
+  } catch {
+    bIn18 = null; // reported by the failing check below; (18) guard check is skipped
+  }
+  let denied18 = false;
+  let detail18 = '';
+  if (bIn18 === null) {
+    detail18 = `B failed to land on the opposite team (in ${(await fpsState(B)).roomId}, want ${aRoom18})`;
+  } else {
+    try {
+      // arm the attempt inside a roundEnd (re-issue if the phase raced past)
+      let bTeam18 = null;
+      let bTarget18 = null;
+      for (let tries = 0; tries < 2 && bTeam18 === null; tries++) {
+        const safe = await waitFor(async () => {
+          const s = await fpsState(B);
+          return s !== null && s.phase === 'roundEnd' && s.round !== 5 ? s : null;
+        }, 120000, "roundEnd with round !== 5 for the guard attempt");
+        const target = safe.team === 'T' ? 'CT' : 'T';
+        await B.evaluate((t) => window.__fps.debug.switchTeam(t), target);
+        const now = await fpsState(B);
+        if (now !== null && now.phase === 'roundEnd') {
+          bTeam18 = safe.team;
+          bTarget18 = target;
+        }
+      }
+      if (bTeam18 === null) throw new Error('could not attempt during roundEnd (phase raced twice)');
+      // watch from the attempt through the NEXT transition into freeze +5s
+      const t0 = Date.now();
+      let prevPhase = 'roundEnd';
+      let freezeAt = 0;
+      let changedTo = null;
+      while (Date.now() - t0 < 125000) {
+        const s = await fpsState(B);
+        if (s !== null) {
+          if (s.team !== bTeam18) {
+            changedTo = s.team;
+            break;
+          }
+          if (s.phase !== prevPhase) {
+            if (s.phase === 'freeze' && freezeAt === 0) freezeAt = Date.now();
+            prevPhase = s.phase;
+          }
+          if (freezeAt !== 0 && Date.now() - freezeAt >= 5000) break; // freeze passed, request dropped
+        }
+        await sleep(200);
+      }
+      denied18 = changedTo === null && freezeAt !== 0;
+      detail18 =
+        `B=${bTeam18} target=${bTarget18}` +
+        (changedTo !== null
+          ? ` FLIPPED to ${changedTo} — guard let it through`
+          : freezeAt === 0
+            ? ' — no freeze within 125s, inconclusive'
+            : ' — unchanged through beginFreeze + 5s (denied, request dropped)');
+    } catch (err) {
+      denied18 = false;
+      detail18 = `aborted: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+  check(
+    'team_full guard: switch to the larger team is denied (no flip through the next freeze)',
+    denied18,
+    detail18,
   );
 
   // -- error-banner DOM check (window.onerror surface may not raise pageerror) -----------

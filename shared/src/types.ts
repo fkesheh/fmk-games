@@ -34,6 +34,7 @@ export type C2S =
   | { t: 'leave' }
   | { t: 'add_bot' } // add a server-driven bot to the current room (bot takes a player slot)
   | { t: 'remove_bot' } // remove the most recently added bot
+  | { t: 'switch_team'; team: Team } // request to join the given team (see GameRoom semantics)
   | {
       t: 'input';
       seq: number; // monotonically increasing per client, starts at 1
@@ -115,6 +116,7 @@ export type GameEvent =
   | { t: 'halftime'; roster: RosterEntry[] } // sides swapped; REPLACE local roster with this one
   | { t: 'player_joined'; entry: RosterEntry }
   | { t: 'player_left'; id: PlayerId }
+  | { t: 'team_changed'; id: PlayerId; team: Team } // broadcast; roster update for id (also fired when applied at freeze)
   | { t: 'buy_result'; ok: boolean; weapon: WeaponId | null; reason: string | null };
 
 export type S2C =

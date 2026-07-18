@@ -98,6 +98,7 @@ export class GameRoom {
   addBot(): PlayerId | null;      // null if room full; bot named 'Bot N', team auto-balanced
   removeBot(): boolean;           // removes the most recently added bot; false if none
   botCount(): number;
+  handleSwitchTeam(id: PlayerId, team: Team): void; // semantics under Bot integration invariants
   start(): void;   // own setInterval at TICK_RATE; idempotent
   stop(): void;
 }
@@ -110,6 +111,13 @@ Bot integration invariants (frozen):
 - Bots are exempt from stalePlayers() and the inputs/s kick (they emit exactly 1 input/tick).
 - Bots have no session: RoomIO.send/rttMs for a bot id must no-op / return 0 (S1 guarantees).
 - addPlayer into a FULL room containing bots: kick the longest-connected bot first, then join.
+- **Team switch (frozen):** `handleSwitchTeam(id, team)` — no-op if already on that team. Balance
+  guard: deny with `{t:'error', code:'team_full'}` (to the requester) if the target team already
+  has ≥ (other team count + 1) players. In `warmup` the switch applies IMMEDIATELY: set team,
+  broadcast `team_changed`, respawn the player at their new team's spawns. During freeze/live/
+  roundEnd the request is QUEUED and applied at the next beginFreeze (guard re-evaluated then;
+  broadcast `team_changed` when applied). At halftime the side swap happens first, then queued
+  requests are re-evaluated against post-swap teams.
 Behavioral invariants (S2, uses S3 helpers):
 - **Phases:** `warmup` (free respawn after ROUNDS.warmupRespawnDelay s, damage on, no economy) →
   when connected ≥ MIN_PLAYERS_FOR_MATCH: `freeze` (round 1..N; players teleported to spawns, healed,
@@ -438,6 +446,7 @@ export interface MenuCallbacks {
   onBuy(weapon: WeaponId): void;
   onAddBot(): void;
   onRemoveBot(): void;
+  onSwitchTeam(team: Team): void; // request team change (server guards balance)
   onResume(): void;  // re-request pointer lock
   onLeave(): void;   // leave room -> main menu
 }
@@ -455,8 +464,9 @@ export class Menus {
   showMatchEnd(winner: Team, scoreT: number, scoreCT: number, youTeam: Team | null, roster: RosterEntry[]): void;
   // includes top-3 players by kills from roster
   showJoining(): void;   // dim overlay "Joining…" — required state, shown during connect+join
-  showPause(botCount: number): void;     // in-room Esc surface: Resume (re-lock), ADD BOT,
-  // REMOVE BOT (disabled when botCount 0), Leave Room; NOT the main menu
+  showPause(botCount: number, youTeam: Team | null): void; // in-room Esc surface: Resume (re-lock),
+  // ADD BOT, REMOVE BOT (disabled at 0 bots), JOIN T / JOIN CT (your current team disabled),
+  // Leave Room; NOT the main menu
   hideAll(): void;
 }
 ```
@@ -512,6 +522,7 @@ window.__fps = {
     press(btn: 'fire' | 'jump' | 'crouch' | 'alt', down: boolean): void;
     reload(): void; buy(w: WeaponId): void;
     scoreboard(down: boolean): void; // e2e-only mirror of the Tab edge
+    switchTeam(team: Team): void;    // e2e-only mirror of the pause-menu team buttons
   };
 };
 declare global { interface Window { __fps?: ... } }

@@ -24,6 +24,7 @@ export interface MenuCallbacks {
   onBuy(weapon: WeaponId): void;
   onAddBot(): void;
   onRemoveBot(): void;
+  onSwitchTeam(team: Team): void; // request team change (server guards balance)
   onResume(): void; // re-request pointer lock
   onLeave(): void; // leave room -> main menu
 }
@@ -114,6 +115,7 @@ export class Menus {
 
   private nameInput: HTMLInputElement | null = null;
   private removeBotBtn: HTMLButtonElement | null = null;
+  private teamBtns: Record<Team, { btn: HTMLButtonElement; tag: HTMLElement }> | null = null;
   private roomListEl: HTMLElement | null = null;
   private roomReq = 0; // stale-guard for async room-list refreshes
   private scoreSig = ''; // scoreboard content signature — skips no-op rebuilds
@@ -583,6 +585,10 @@ export class Menus {
     removeBot.disabled = true;
     removeBot.addEventListener('click', () => this.cb.onRemoveBot());
     this.removeBotBtn = removeBot;
+    // team switch: menu stays open; caller re-shows with the updated team
+    const joinT = this.buildTeamBtn('T', 'JOIN T', 'm9-btn-t');
+    const joinCT = this.buildTeamBtn('CT', 'JOIN CT', 'm9-btn-ct');
+    this.teamBtns = { T: joinT, CT: joinCT };
     const leave = el('button', 'm9-btn m9-btn-danger m9-wide', 'LEAVE ROOM');
     leave.type = 'button';
     leave.addEventListener('click', () => {
@@ -592,12 +598,37 @@ export class Menus {
     panel.appendChild(resume);
     panel.appendChild(addBot);
     panel.appendChild(removeBot);
+    panel.appendChild(joinT.btn);
+    panel.appendChild(joinCT.btn);
     panel.appendChild(leave);
     this.layers.pause.appendChild(panel);
   }
 
-  showPause(botCount: number): void {
+  private buildTeamBtn(
+    team: Team,
+    label: string,
+    cls: string,
+  ): { btn: HTMLButtonElement; tag: HTMLElement } {
+    const btn = el('button', `m9-btn m9-wide m9-team-btn ${cls}`);
+    btn.type = 'button';
+    btn.appendChild(el('span', '', label));
+    const tag = el('span', 'm9-team-current', 'CURRENT'); // text marker, never color-only
+    tag.style.display = 'none';
+    btn.appendChild(tag);
+    btn.addEventListener('click', () => this.cb.onSwitchTeam(team));
+    return { btn, tag };
+  }
+
+  showPause(botCount: number, youTeam: Team | null): void {
     if (this.removeBotBtn !== null) this.removeBotBtn.disabled = botCount <= 0;
+    if (this.teamBtns !== null) {
+      for (const team of ['T', 'CT'] as const) {
+        const { btn, tag } = this.teamBtns[team];
+        const current = team === youTeam;
+        btn.disabled = current; // already on this team — nothing to switch to
+        tag.style.display = current ? '' : 'none';
+      }
+    }
     this.showExclusive('pause');
   }
 
@@ -765,6 +796,12 @@ const CSS = `
 
 .m9-pause-panel{width:min(320px,92vw);display:flex;flex-direction:column;gap:10px;text-align:center;}
 .m9-pause-title{margin:0 0 6px;font-size:24px;letter-spacing:.2em;}
+.fps-menus .m9-btn-t{border-color:var(--m9-tAmber);color:var(--m9-tAmber);}
+.fps-menus .m9-btn-t:hover:not(:disabled){border-color:var(--m9-tAmber);background:rgba(var(--m9-tAmber-rgb),.15);}
+.fps-menus .m9-btn-ct{border-color:var(--m9-ctBlue);color:var(--m9-ctBlue);}
+.fps-menus .m9-btn-ct:hover:not(:disabled){border-color:var(--m9-ctBlue);background:rgba(var(--m9-ctBlue-rgb),.15);}
+.m9-team-btn{display:flex;align-items:center;justify-content:center;gap:8px;}
+.m9-team-current{font-size:10px;font-weight:800;letter-spacing:.12em;color:var(--m9-steel);}
 
 @media (max-width:760px){
   .m9-cols{grid-template-columns:1fr;}
