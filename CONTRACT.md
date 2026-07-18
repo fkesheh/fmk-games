@@ -324,10 +324,13 @@ export class InputController {
   onLockChange: ((locked: boolean) => void) | null;
 }
 ```
-Keys: WASD move · Space jump · Ctrl or C crouch · LMB fire · RMB **or F** alt (scope) · R reload ·
+Keys: WASD move · Space jump · C crouch · LMB fire · RMB **or F** alt (scope) · R reload ·
 B buy · Tab scoreboard (preventDefault) · Esc menu · 1-6 / wheel weapon slots. Blur clears all held state.
 `contextmenu` is preventDefault'd at the DOCUMENT level while pointer-locked (belt-and-braces —
 canvas-only suppression loses to browser edge cases).
+Ctrl is deliberately UNBOUND: Ctrl+W / Ctrl+R / Ctrl+Tab are unpreventable browser shortcuts
+(close/reload/switch tab) and Ctrl+click is right-click on macOS — binding crouch to Ctrl kills
+the game tab the first time someone crouches while moving forward.
 Semi-auto fire latch: a fire press that begins AND ends between two frame() samples must still be
 reported once — latch INPUT_FIRE until it has been included in exactly one frame() result.
 

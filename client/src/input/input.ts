@@ -48,8 +48,7 @@ export class InputController {
   private keyS = false;
   private keyD = false;
   private jumpHeld = false;
-  private ctrlHeld = false; // either Ctrl
-  private keyCHeld = false; // 'C' — crouch = ctrlHeld || keyCHeld
+  private keyCHeld = false; // 'C' — crouch
   private fireHeld = false;
   private altHeld = false;
   private keyFHeld = false; // 'F' — scope = altHeld || keyFHeld
@@ -119,7 +118,7 @@ export class InputController {
     if (this.fireHeld || this.fireLatch) buttons |= INPUT_FIRE;
     this.fireLatch = false; // consumed by this frame — reported exactly once
     if (this.jumpHeld) buttons |= INPUT_JUMP;
-    if (this.ctrlHeld || this.keyCHeld) buttons |= INPUT_CROUCH;
+    if (this.keyCHeld) buttons |= INPUT_CROUCH;
     if (this.altHeld || this.keyFHeld) buttons |= INPUT_ALT;
     const o = this.frameOut;
     o.moveX = (this.keyD ? 1 : 0) - (this.keyA ? 1 : 0); // right positive
@@ -139,7 +138,7 @@ export class InputController {
   // ---- internal -------------------------------------------------------------------
   private clearHeld(): void {
     this.keyW = this.keyA = this.keyS = this.keyD = false;
-    this.jumpHeld = this.ctrlHeld = this.keyCHeld = false;
+    this.jumpHeld = this.keyCHeld = false;
     this.fireHeld = this.altHeld = this.keyFHeld = false;
     this.fireLatch = false;
     if (this.tabHeld) {
@@ -225,8 +224,6 @@ export class InputController {
       case 'KeyS': this.keyS = true; break;
       case 'KeyD': this.keyD = true; break;
       case 'Space': this.jumpHeld = true; break;
-      case 'ControlLeft':
-      case 'ControlRight': this.ctrlHeld = true; break;
       case 'KeyC': this.keyCHeld = true; break;
       case 'KeyF': this.keyFHeld = true; break;
       case 'KeyR': if (!e.repeat) this.queue.push({ kind: 'reload' }); break;
@@ -263,8 +260,6 @@ export class InputController {
       case 'KeyS': this.keyS = false; break;
       case 'KeyD': this.keyD = false; break;
       case 'Space': this.jumpHeld = false; break;
-      case 'ControlLeft':
-      case 'ControlRight': this.ctrlHeld = false; break;
       case 'KeyC': this.keyCHeld = false; break;
       case 'KeyF': this.keyFHeld = false; break;
       case 'Tab':

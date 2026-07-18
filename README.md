@@ -51,7 +51,7 @@ The server serves the built client and the `/ws` endpoint on port 8080.
 
 ## Controls
 
-WASD move · mouse look · LMB fire · RMB scope (AWM) · Space jump · Ctrl/C crouch ·
+WASD move · mouse look · LMB fire · RMB / F scope (AWM) · Space jump · C crouch ·
 R reload · B buy menu · Tab scoreboard · 1-6 / wheel weapons · Esc pause
 
 ## Repo layout

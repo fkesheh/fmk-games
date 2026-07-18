@@ -7,9 +7,10 @@
 // the frozen window.__fps surface: private-room create/join, phase machine
 // warmup->freeze->live, movement, combat (aim math + semi-auto fire edges),
 // buy flow, state-surface shape, a 6-map screenshot tour, public-room create
-// (code === null), debug scoreboard toggle, jump-apex height, server-side
-// bot add/remove with a 6s combat soak, and team switching (immediate in
-// warmup / queued to the next freeze otherwise; team_full balance guard).
+// (code === null), debug scoreboard toggle, jump-apex height, crouch travel
+// speed (server sim honors the crouch bit), server-side bot add/remove with
+// a 6s combat soak, and team switching (immediate in warmup / queued to the
+// next freeze otherwise; team_full balance guard).
 //
 // Exit 0 only if every assertion passes AND zero page/console/network errors
 // were seen on either page (benign favicon noise excluded).
@@ -584,6 +585,48 @@ async function main() {
     'jump apex > 0.75m on flat ground (jumpVel 5.9)',
     jump.maxY - jump.startY > 0.75,
     `start=${jump.startY.toFixed(2)} apex=+${(jump.maxY - jump.startY).toFixed(2)}m`,
+  );
+
+  // -- (19) crouch: placed before the (14) bots for the same reason as
+  //    (12)/(13) — A is still alone in the public crossfire room, so the phase
+  //    is warmup (a match needs 2 players), A is alive on flat spawn ground,
+  //    and the movement sim runs (bodies step in warmup/live). Measure travel
+  //    standing vs crouched on the same heading; the crouch leg walks BACK
+  //    (yaw + PI) along the just-proven-clear outbound path, so a wall can
+  //    never shrink the crouched sample. True ratio = crouchSpeedMul 0.45
+  //    (server sim must honor the bit); assert a conservative < 0.60.
+  const measureTravel = async (yaw) => {
+    await A.evaluate((y) => window.__fps.debug.setLook(y, 0), yaw);
+    await sleep(150); // let the look input land before sampling pos
+    const before = (await fpsState(A)).pos;
+    await A.evaluate(() => window.__fps.debug.setMove(0, 1));
+    await sleep(1000);
+    await A.evaluate(() => window.__fps.debug.setMove(0, 0));
+    const after = (await fpsState(A)).pos;
+    return Math.hypot(after[0] - before[0], after[2] - before[2]);
+  };
+  let crouchRatio = null;
+  let crouchDetail = '';
+  for (const yaw of [0, Math.PI / 2, Math.PI, -Math.PI / 2]) {
+    const s19 = await fpsState(A);
+    if (s19 === null || (s19.phase !== 'warmup' && s19.phase !== 'live') || !s19.alive) {
+      await sleep(500); // sim not stepping (or A down) — retry on the next heading
+      continue;
+    }
+    const standing = await measureTravel(yaw);
+    if (standing < 3) continue; // spawn faces a wall — try another heading
+    await A.evaluate(() => window.__fps.debug.press('crouch', true));
+    const crouched = await measureTravel(yaw + Math.PI); // retrace the proven-clear path
+    await A.evaluate(() => window.__fps.debug.press('crouch', false));
+    crouchRatio = crouched / standing;
+    crouchDetail = `standing ${standing.toFixed(2)}m vs crouched ${crouched.toFixed(2)}m — ratio ${crouchRatio.toFixed(2)} (want < 0.60; crouchSpeedMul 0.45)`;
+    break;
+  }
+  await A.evaluate(() => window.__fps.debug.press('crouch', false)); // never leak the bit into (14)+
+  check(
+    'crouch: crouched travel < 60% of standing (server sim honors the crouch bit)',
+    crouchRatio !== null && crouchRatio < 0.6,
+    crouchDetail || 'never got a live/warmup sample on a clear heading',
   );
 
   // -- (14) bots: A is alone in the public crossfire room here (B stayed in
