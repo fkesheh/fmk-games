@@ -28,20 +28,20 @@ export const crossfire: MapDef = {
   theme: {
     sky: PALETTE.skyDay,
     horizon: PALETTE.fogDay,
-    ground: PALETTE.concreteDark,
+    ground: PALETTE.concrete,
     fog: PALETTE.fogDay,
     fogDensity: 0.007,
     sunDir: [0.4, -1, 0.25],
     sunColor: PALETTE.paper,
-    sunIntensity: 1.4,
-    hemiIntensity: 0.5,
+    sunIntensity: 1.6,
+    hemiIntensity: 0.7,
   },
   boxes: [
     // ---- outer walls ----
-    { x: 0, y: 2.5, z: -D / 2, w: W + 2, h: 5, d: 1, mat: 'concreteDark' },
-    { x: 0, y: 2.5, z: D / 2, w: W + 2, h: 5, d: 1, mat: 'concreteDark' },
-    { x: -W / 2, y: 2.5, z: 0, w: 1, h: 5, d: D + 2, mat: 'concreteDark' },
-    { x: W / 2, y: 2.5, z: 0, w: 1, h: 5, d: D + 2, mat: 'concreteDark' },
+    { x: 0, y: 2.5, z: -D / 2, w: W + 2, h: 5, d: 1, mat: 'concrete' },
+    { x: 0, y: 2.5, z: D / 2, w: W + 2, h: 5, d: 1, mat: 'concrete' },
+    { x: -W / 2, y: 2.5, z: 0, w: 1, h: 5, d: D + 2, mat: 'concrete' },
+    { x: W / 2, y: 2.5, z: 0, w: 1, h: 5, d: D + 2, mat: 'concrete' },
 
     // ---- spawn sightline slabs (x[-11,11], z +/-[13,15]) ----
     { x: 0, y: 1.5, z: 14, w: 22, h: 3, d: 2, mat: 'concrete' },

@@ -41,7 +41,6 @@ import type {
   PlayerSnap,
   RoomInfo,
   RosterEntry,
-  RoundEndReason,
   S2C,
   Team,
   Vec3,
@@ -80,12 +79,6 @@ const SHOT_SFX: Record<WeaponId, SfxKind> = {
   shotgun: 'shot_shotgun',
   rifle: 'shot_rifle',
   sniper: 'shot_sniper',
-};
-
-const ROUND_REASON: Record<RoundEndReason, string> = {
-  elimination: 'Elimination',
-  time: 'Time expired',
-  forfeit: 'Forfeit',
 };
 
 // indoor maps (ceilinged) get the low hum; everything else gets wind
@@ -150,6 +143,9 @@ export class ClientGame {
   private lastBodyZ = 0;
   private respawnSec = -1; // cached countdown second for the warmup-death label
   private respawnLabel = '';
+  private lastWeapon: WeaponId | null = null; // last weapon pushed into the viewmodel
+  private warmupBannerShown = false; // WARMUP banner fires once per warmup entry
+  private lastGuardErrMs = Number.NEGATIVE_INFINITY; // guard() error-log rate limit
   // e2e debug overrides (window.__fps.debug via C11); win over held keys when set
   private dbgMove: { x: number; z: number } | null = null;
   private dbgButtons = 0;
@@ -184,6 +180,9 @@ export class ClientGame {
     // B/Esc close an open buy menu while the pointer is unlocked (InputController
     // only sees keys while locked, so it never delivers these)
     window.addEventListener('keydown', this.onKeyDown);
+    // the GPU context can die mid-session (driver reset, VRAM pressure) —
+    // surface it through the standard menu error path, not a frozen canvas
+    this.canvas.addEventListener('webglcontextlost', this.onContextLost);
   }
 
   // ---- public API (frozen; called by C11 main.ts) -----------------------------
@@ -253,6 +252,7 @@ export class ClientGame {
     this.failRoomList();
     window.removeEventListener('fps:gesture', this.onFirstGesture);
     window.removeEventListener('keydown', this.onKeyDown);
+    this.canvas.removeEventListener('webglcontextlost', this.onContextLost);
   }
 
   // ---- C10/C11 seam (additive public methods — see header) ---------------------
@@ -402,6 +402,9 @@ export class ClientGame {
     if (w === null) return;
     this.world = null; // null first: input.stop()'s lock-loss must not pop the pause menu
     this.input.stop();
+    this.audio.stopAmbient(); // the looping bed must not outlive the room
+    w.models.clear(); // nameplate canvases/materials are per-instance
+    w.effects.dispose(); // tracer/particle materials are per-instance clones
     w.rig.dispose(); // scene geometries + renderer; the next join rebuilds from scratch
     this.scoped = false;
     this.buyOpen = false;
@@ -432,6 +435,8 @@ export class ClientGame {
     this.lastButtons = 0;
     this.stepAccM = 0;
     this.respawnSec = -1;
+    this.lastWeapon = null;
+    this.warmupBannerShown = false;
     this.dbgMove = null;
     this.dbgButtons = 0;
   }
@@ -500,7 +505,9 @@ export class ClientGame {
     try {
       this.buildWorld(msg.mapId);
     } catch {
-      // WebGL unavailable — SceneRig already posted its readable error div
+      // WebGL unavailable — SceneRig posted an opaque error div over the whole
+      // viewport; clear it or it blocks the menu we're falling back to
+      SceneRig.clearContextError();
       this.conn?.send({ t: 'leave' });
       this.conn?.close();
       this.conn = null;
@@ -521,6 +528,7 @@ export class ClientGame {
     const conn = this.conn;
     if (conn !== null && conn.pingMs() > 0) s.serverOffset = conn.serverOffsetMs();
 
+    const prevPhase = s.phase;
     w.interp.push(msg.serverTime, msg.players);
 
     // own authoritative correction (vy included so gravity replays mid-jump)
@@ -532,24 +540,53 @@ export class ClientGame {
           this.hadSelfSnap = true;
           w.predictor.reset(p.x, p.y, p.z);
         } else {
-          w.predictor.reconcile(
-            p.x,
-            p.y,
-            p.z,
-            p.crouch ? PLAYER.heightCrouch : PLAYER.heightStand,
-            you.vy,
-            msg.ack,
-            WEAPONS[you.weapon].moveMul,
-          );
+          // freeze start / any >2m snap is a server teleport (round spawn) —
+          // in-flight inputs are meaningless across it: re-base, don't replay
+          const b = w.predictor.body();
+          const teleported = Math.hypot(p.x - b.x, p.y - b.y, p.z - b.z) > 2;
+          if ((prevPhase !== 'freeze' && msg.phase === 'freeze') || teleported) {
+            w.predictor.reset(p.x, p.y, p.z);
+          } else {
+            w.predictor.reconcile(
+              p.x,
+              p.y,
+              p.z,
+              p.crouch ? PLAYER.heightCrouch : PLAYER.heightStand,
+              you.vy,
+              msg.ack,
+              WEAPONS[you.weapon].moveMul,
+            );
+          }
         }
         break;
       }
     }
 
-    const prevPhase = s.phase;
     s.phase = msg.phase;
     s.phaseEndsAt = msg.phaseEndsAt;
     s.latestYou = you;
+
+    // a (re-)entry into warmup is a new match — stale scores must not survive it
+    if (msg.phase === 'warmup' && (prevPhase !== 'warmup' || s.round !== 0)) {
+      s.round = 0;
+      s.scoreT = 0;
+      s.scoreCT = 0;
+    }
+    // UX_BIBLE: name the pre-match phase, once per warmup entry
+    if (msg.phase === 'warmup') {
+      if (!this.warmupBannerShown && s.round === 0) {
+        this.warmupBannerShown = true;
+        this.hud.banner('WARMUP', 'match starts when 2+ players');
+      }
+    } else {
+      this.warmupBannerShown = false;
+    }
+    // the server changes the held weapon silently (death->pistol, buy replace,
+    // match reset, spawn) where the slot edge never fires; same-id is a no-op
+    if (you.weapon !== this.lastWeapon) {
+      this.lastWeapon = you.weapon;
+      w.viewmodel.setWeapon(you.weapon);
+    }
 
     // match end screen is dismissed by the return to warmup
     if (prevPhase === 'matchEnd' && msg.phase === 'warmup') {
@@ -577,17 +614,9 @@ export class ClientGame {
         w.effects.tracer(ev.from, ev.to);
         w.effects.impact(ev.to);
         this.audio.sfx(SHOT_SFX[ev.weapon], { dist: this.distFromCamera(ev.from) });
-        if (ev.shooterId === s.youId) {
-          w.viewmodel.fire();
-          w.rig.shake(0.1);
-          const def = WEAPONS[ev.weapon];
-          this.bloomDeg = Math.min(
-            this.bloomDeg + def.spreadPerShot,
-            Math.max(0, def.maxSpreadDeg - def.spreadDeg),
-          );
-        } else {
-          w.models.muzzle(ev.shooterId);
-        }
+        // self: viewmodel/shake/bloom already fired on the local input edge —
+        // re-firing here would double the kick a full RTT + tick late
+        if (ev.shooterId !== s.youId) w.models.muzzle(ev.shooterId);
         break;
       }
       case 'kill': {
@@ -639,9 +668,10 @@ export class ClientGame {
       case 'round_end': {
         s.scoreT = ev.scoreT;
         s.scoreCT = ev.scoreCT;
-        const title =
-          ev.winner === null ? 'ROUND DRAW' : ev.winner === s.team ? 'ROUND WON' : 'ROUND LOST';
-        this.hud.banner(title, ROUND_REASON[ev.reason]);
+        this.hud.banner(
+          ev.winner === null ? 'ROUND DRAW' : `${ev.winner} WINS THE ROUND`,
+          `T ${ev.scoreT} : ${ev.scoreCT} CT`,
+        );
         this.audio.sfx('round_end');
         this.closeBuy();
         break;
@@ -718,6 +748,7 @@ export class ClientGame {
       const moveX = this.dbgMove?.x ?? f.moveX; // e2e override wins over held keys
       const moveZ = this.dbgMove?.z ?? f.moveZ;
       const buttons = f.buttons | this.dbgButtons;
+      const prevButtons = this.lastButtons;
       this.lastButtons = buttons;
       this.seq++;
       this.conn?.send({
@@ -729,6 +760,24 @@ export class ClientGame {
         pitch: this.input.pitch,
         buttons,
       });
+      // immediate local fire feedback — the server 'shot' echo trails by an
+      // RTT + tick; mag is -1 for melee (always fires), 0 = empty. The self
+      // echo skips viewmodel/shake/bloom (see onEvent 'shot').
+      if (
+        alive &&
+        you !== null &&
+        you.mag !== 0 &&
+        (buttons & INPUT_FIRE) !== 0 &&
+        (prevButtons & INPUT_FIRE) === 0
+      ) {
+        w.viewmodel.fire();
+        w.rig.shake(0.1);
+        const fireDef = WEAPONS[you.weapon];
+        this.bloomDeg = Math.min(
+          this.bloomDeg + fireDef.spreadPerShot,
+          Math.max(0, fireDef.maxSpreadDeg - fireDef.spreadDeg),
+        );
+      }
       if (predict && you !== null) {
         this.pushPrediction(w, moveX, moveZ, WEAPONS[you.weapon].moveMul);
       }
@@ -818,7 +867,8 @@ export class ClientGame {
 
     // ---- models / viewmodel / effects / hud ----
     w.models.sync(this.syncOut, s.youId ?? '', dt);
-    w.viewmodel.update(dt, alive && hSpeed > MOVE_MIN_SPEED, scopedNow);
+    // scoped hides the viewmodel; dead/spectating must too (no floating own gun)
+    w.viewmodel.update(dt, alive && hSpeed > MOVE_MIN_SPEED, scopedNow || !alive);
     w.effects.update(dt);
 
     const h = this.hudState;
@@ -952,7 +1002,11 @@ export class ClientGame {
         case 'scoreboard': {
           if (e.down) {
             const s = this.state;
-            this.menus.showScoreboard(this.rosterArray(), s.youId ?? '', s.scoreT, s.scoreCT);
+            const roster = this.rosterArray();
+            // roster money only refreshes on joins/halftime — patch ours live
+            const me = s.youId !== null ? s.roster.get(s.youId) : undefined;
+            if (me !== undefined && s.latestYou !== null) me.money = s.latestYou.money;
+            this.menus.showScoreboard(roster, s.youId ?? '', s.scoreT, s.scoreCT);
           } else {
             this.menus.hideScoreboard();
           }
@@ -978,7 +1032,10 @@ export class ClientGame {
     const w = this.world;
     if (w !== null && you !== null) {
       const dur = WEAPONS[you.weapon].reload;
-      if (dur > 0) w.viewmodel.reload(dur); // knife has no reload animation
+      if (dur > 0) {
+        w.viewmodel.reload(dur); // knife has no reload animation
+        this.audio.sfx('reload');
+      }
     }
   }
 
@@ -1044,11 +1101,31 @@ export class ClientGame {
     this.audio.resume(); // idempotent — creates/unlocks the AudioContext (C7)
   };
 
+  private readonly onContextLost = (): void => {
+    // no preventDefault: we never attempt a webglcontextrestored recovery —
+    // tear down and surface the standard menu error path (the main.ts banner
+    // mechanism is window.onerror-only, unreachable without a real throw)
+    if (this.world === null) return;
+    this.conn?.close();
+    this.conn = null;
+    this.teardownWorld();
+    this.resetState();
+    this.hud.show(false);
+    this.menus.showMain('Graphics context lost — reload the page');
+  };
+
   private guard(fn: () => void): void {
     try {
       fn();
-    } catch {
-      // robustness rule: one bad message/frame must never kill the rAF loop
+    } catch (err) {
+      // robustness rule: one bad message/frame must never kill the rAF loop —
+      // keep swallowing, but log (≤1 per 2s) so a persistent frameInner fault
+      // is visible instead of silently dead
+      const now = performance.now();
+      if (now - this.lastGuardErrMs >= 2000) {
+        this.lastGuardErrMs = now;
+        console.error('[frame]', err);
+      }
     }
   }
 }

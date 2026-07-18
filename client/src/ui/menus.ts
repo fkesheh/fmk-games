@@ -619,9 +619,9 @@ const CSS = `
   background:var(--m9-charcoal);border:1px solid var(--m9-metalDark);border-radius:6px;padding:10px 16px;}
 .fps-menus .m9-btn:hover:not(:disabled){border-color:var(--m9-hudAccent);}
 .fps-menus .m9-btn:disabled{opacity:.4;cursor:default;}
-.m9-btn-primary{background:var(--m9-hudAccent);border-color:var(--m9-hudAccent);color:var(--m9-ink);}
+.fps-menus .m9-btn-primary{background:var(--m9-hudAccent);border-color:var(--m9-hudAccent);color:var(--m9-ink);}
 .m9-btn-small{padding:5px 10px;font-size:12px;}
-.m9-btn-danger{border-color:var(--m9-danger);color:var(--m9-danger);}
+.fps-menus .m9-btn-danger{border-color:var(--m9-danger);color:var(--m9-danger);}
 .m9-btn-danger:hover{background:rgba(var(--m9-danger-rgb),.15);}
 .m9-wide{width:100%;}
 
@@ -725,7 +725,7 @@ const CSS = `
 .m9-join-text{font-size:22px;font-weight:700;letter-spacing:.24em;animation:m9pulse 1.4s ease-in-out infinite;}
 @keyframes m9pulse{0%,100%{opacity:.5;}50%{opacity:1;}}
 
-.m9-layer-chip{align-items:flex-start;justify-content:flex-start;}
+.fps-menus .m9-layer-chip{align-items:flex-start;justify-content:flex-start;}
 .m9-chip{margin:14px;background:rgba(var(--m9-ink-rgb),.82);border:1px solid var(--m9-metalDark);
   border-radius:6px;padding:6px 10px;font-size:12px;letter-spacing:.05em;}
 

@@ -252,7 +252,10 @@ async function main() {
     movedFrom ? `moved ${moved.toFixed(2)}m (${movedFrom.map((v) => v.toFixed(1))} -> ${movedTo.map((v) => v.toFixed(1))})` : `moved ${moved.toFixed(2)}m`,
   );
 
-  // -- HUD shot during live -----------------------------------------------------------
+  // -- HUD shot during live (close the auto-opened buy menu first: B keydown is
+  //    handled on window even without pointer lock — see ClientGame.onKeyDown) --
+  await A.keyboard.press('KeyB');
+  await sleep(250);
   await shot(A, 'hud-live.png');
 
   // -- combat: A and B walk at each other (collide-and-slide rounds box corners);
@@ -270,14 +273,15 @@ async function main() {
   /**
    * Walk `page` towards targetPos. Box-map wall following: while wedged, strafe
    * in ONE committed direction (per-page fixed initDir so A and B cannot mirror
-   * into the same trap; flipped only after 5s of continuous wedge) so
-   * collide-and-slide carries us around a wall edge instead of ping-ponging.
+   * into the same trap). The direction flips ONLY on a continuous 5s wedge (no
+   * slide at all — a true dead corner); lateral slide counts as progress, so a
+   * working strafe is never reversed mid-wall.
    */
   async function approach(page, selfPos, targetPos, initDir) {
     const dist = await aimAt(page, selfPos, targetPos);
     let w = walkers.get(page);
     if (w === undefined) {
-      w = { lastPos: null, wedgedSince: 0, dir: initDir, dirSetAt: 0 };
+      w = { lastPos: null, wedgedSince: 0, dir: initDir };
       walkers.set(page, w);
     }
     const now = Date.now();
@@ -289,11 +293,12 @@ async function main() {
       w.wedgedSince = 0;
     } else {
       if (w.wedgedSince === 0) w.wedgedSince = now;
-      if (now - w.wedgedSince > 800) {
-        if (now - w.dirSetAt > 5000) {
-          w.dir = -w.dir; // 5s wedged continuously: committed way is a dead corner
-          w.dirSetAt = now;
-        }
+      const wedgedMs = now - w.wedgedSince;
+      if (wedgedMs > 5000) {
+        w.dir = -w.dir; // dead corner: commit the other way
+        w.wedgedSince = now;
+        mx = w.dir;
+      } else if (wedgedMs > 800) {
         mx = w.dir;
       }
     }
@@ -410,11 +415,12 @@ async function main() {
     }, 15000, `tour join ${mapId}`);
     await sleep(2000); // world build + spawn snapshot + a few rendered frames
     const yaws = [0, 2.1, 4.2];
+    const strafes = [0, 1, -1]; // diagonal walks slide along walls (no face-plant shots)
     for (let i = 0; i < yaws.length; i++) {
-      await A.evaluate((y) => window.__fps.debug.setLook(y, -0.08), yaws[i]);
+      await A.evaluate((y) => window.__fps.debug.setLook(y, -0.12), yaws[i]);
       if (i > 0) {
-        await A.evaluate(() => window.__fps.debug.setMove(0, 1));
-        await sleep(2000);
+        await A.evaluate((s) => window.__fps.debug.setMove(s, 1), strafes[i]);
+        await sleep(1500);
         await A.evaluate(() => window.__fps.debug.setMove(0, 0));
       }
       await sleep(300); // settle frames

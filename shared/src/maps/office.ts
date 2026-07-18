@@ -32,16 +32,19 @@ export const office: MapDef = {
   sizeZ: D,
   floorMat: 'carpet',
   theme: {
-    // interior gloom: dim cool "fluorescent" sun + strong hemisphere fill
-    sky: PALETTE.skyIndoor,
+    // interior gloom: the ceiling slab shadow-casts over the whole floor, so
+    // the sun lights ~nothing — the hemisphere IS the light. Steel sky reads
+    // as cool fluorescent fill; concrete-tinted ground bounce; fog stays
+    // charcoal so the gloom survives once lit.
+    sky: PALETTE.steel,
     horizon: PALETTE.charcoal,
-    ground: PALETTE.carpet,
+    ground: PALETTE.concrete,
     fog: PALETTE.charcoal,
     fogDensity: 0.012,
     sunDir: [0.3, -1, 0.2],
     sunColor: PALETTE.paper,
     sunIntensity: 1.0,
-    hemiIntensity: 0.75,
+    hemiIntensity: 1.5,
   },
   boxes: [
     // ---- outer walls (h=3.5, plaster) ----

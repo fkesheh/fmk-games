@@ -26,15 +26,15 @@ export const bunker: MapDef = {
   sizeZ: D,
   floorMat: 'metalDark',
   theme: {
-    sky: PALETTE.skyIndoor,
+    sky: PALETTE.steel,
     horizon: PALETTE.ink,
-    ground: PALETTE.charcoal,
-    fog: PALETTE.ink,
+    ground: PALETTE.metalDark,
+    fog: PALETTE.charcoal,
     fogDensity: 0.018,
     sunDir: [0.2, -1, 0.15],
     sunColor: PALETTE.steel,
     sunIntensity: 0.9,
-    hemiIntensity: 0.8,
+    hemiIntensity: 1.5,
   },
   boxes: [
     // ---- outer shell: walls h=3 + ceiling (slab bottom y=2.8) ----

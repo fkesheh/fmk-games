@@ -18,6 +18,12 @@ const SHAKE_SPEED = 18; // noise clock rate (rad/s of noise input)
 const SHADOW_EXTENT = 40;
 const SUN_DISTANCE = 60; // sun sits at -sunDir x 60
 
+// ---- ambient floor (STYLE_BIBLE: "min ambient floor: players always clearly lit") ----
+// Effective hemi fill = relative luminance(sky color) x hemiIntensity; setTheme
+// never lets a theme drop it below this, so indoor maps can't ship pitch-black.
+const MIN_AMBIENT_LUMINANCE = 0.12;
+const AMBIENT_FLOOR_SCRATCH = new THREE.Color(); // reuse — no per-theme alloc
+
 export class SceneRig {
   readonly renderer: THREE.WebGLRenderer;
   readonly scene: THREE.Scene;
@@ -72,6 +78,7 @@ export class SceneRig {
     sc.far = SUN_DISTANCE * 3;
     sc.updateProjectionMatrix();
     this.sun.shadow.normalBias = 0.03; // tame acne on flat-shaded Lambert
+    this.sun.shadow.radius = 4; // soften staircase edges (ignored by PCFSoft — harmless safeguard)
     this.scene.add(this.sun);
     this.scene.add(this.sun.target); // target defaults to origin
 
@@ -83,6 +90,7 @@ export class SceneRig {
     this.hemi.color.set(theme.sky);
     this.hemi.groundColor.set(theme.ground);
     this.hemi.intensity = theme.hemiIntensity;
+    this.enforceAmbientFloor();
 
     this.sun.color.set(theme.sunColor);
     this.sun.intensity = theme.sunIntensity;
@@ -160,6 +168,24 @@ export class SceneRig {
   }
 
   // ---- private helpers --------------------------------------------------------
+
+  /**
+   * Enforce the STYLE_BIBLE ambient floor: effective hemi fill (sky-color
+   * relative luminance x intensity) must stay >= MIN_AMBIENT_LUMINANCE.
+   * Lifts intensity to compensate; a degenerate near-black sky color is lerped
+   * halfway toward PALETTE.steel first, since intensity alone can't rescue it.
+   */
+  private enforceAmbientFloor(): void {
+    const c = this.hemi.color;
+    let lum = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b; // Rec. 709
+    if (lum < 1e-3) {
+      c.lerp(AMBIENT_FLOOR_SCRATCH.set(PALETTE.steel), 0.5);
+      lum = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+    }
+    if (lum * this.hemi.intensity < MIN_AMBIENT_LUMINANCE) {
+      this.hemi.intensity = MIN_AMBIENT_LUMINANCE / lum;
+    }
+  }
 
   /** Smooth pseudo-noise in [-1, 1]: layered sines, allocation-free. */
   private noise(axis: number): number {

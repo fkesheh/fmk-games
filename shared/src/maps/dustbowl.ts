@@ -22,11 +22,11 @@ export const dustbowl: MapDef = {
     horizon: PALETTE.sand,
     ground: PALETTE.dust,
     fog: PALETTE.fogDusk,
-    fogDensity: 0.008,
+    fogDensity: 0.012,
     sunDir: [0.5, -1, 0.35],
     sunColor: PALETTE.muzzle,
-    sunIntensity: 1.6,
-    hemiIntensity: 0.55,
+    sunIntensity: 1.5,
+    hemiIntensity: 0.7,
   },
   boxes: [
     // ---- outer walls ----
@@ -116,9 +116,12 @@ export const dustbowl: MapDef = {
     ],
   },
   deco: [
-    { kind: 'cactus', count: 10, x0: -31, z0: -23, x1: -16, z1: 23, minSpacing: 5 },
+    { kind: 'cactus', count: 14, x0: -31, z0: -23, x1: -16, z1: 23, minSpacing: 4 },
     { kind: 'rock', count: 8, x0: 16, z0: -23, x1: 31, z1: 23, minSpacing: 6 },
-    { kind: 'shrub', count: 22, x0: -31, z0: -23, x1: 31, z1: 23, minSpacing: 4 },
-    { kind: 'barrel', count: 8, x0: -12, z0: -23, x1: 12, z1: 23, minSpacing: 5 },
+    { kind: 'shrub', count: 30, x0: -31, z0: -23, x1: 31, z1: 23, minSpacing: 3 },
+    { kind: 'barrel', count: 14, x0: -16, z0: -23, x1: 16, z1: 23, minSpacing: 3 },
+    // corner/dead-zone dressing (style bible: corners get the most dressing)
+    { kind: 'cactus', count: 6, x0: -31, z0: 16, x1: -18, z1: 23, minSpacing: 3 },
+    { kind: 'shrub', count: 8, x0: 18, z0: -23, x1: 31, z1: -14, minSpacing: 3 },
   ],
 };

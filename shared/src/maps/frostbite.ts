@@ -25,11 +25,11 @@ export const frostbite: MapDef = {
     horizon: PALETTE.snowShadow,
     ground: PALETTE.snowShadow,
     fog: PALETTE.fogCold,
-    fogDensity: 0.01,
+    fogDensity: 0.018,
     sunDir: [0.3, -1, 0.4],
     sunColor: PALETTE.ice,
     sunIntensity: 1.2,
-    hemiIntensity: 0.65,
+    hemiIntensity: 0.85,
   },
   boxes: [
     // ---- outer walls (h=5, valley rock) ----
@@ -140,6 +140,7 @@ export const frostbite: MapDef = {
     { kind: 'snowRock', count: 16, x0: -29, z0: -21, x1: -14, z1: 21, minSpacing: 4.5 },
     { kind: 'snowRock', count: 16, x0: 14, z0: -21, x1: 29, z1: 21, minSpacing: 4.5 },
     { kind: 'snowRock', count: 10, x0: -13, z0: -21, x1: 13, z1: 21, minSpacing: 5 },
-    { kind: 'shrub', count: 32, x0: -29, z0: -21, x1: 29, z1: 21, minSpacing: 3.5 },
+    { kind: 'snowRock', count: 10, x0: -13, z0: -20, x1: 13, z1: 20, minSpacing: 5 },
+    { kind: 'shrub', count: 48, x0: -29, z0: -21, x1: 29, z1: 21, minSpacing: 3.5 },
   ],
 };

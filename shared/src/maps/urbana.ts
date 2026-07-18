@@ -28,7 +28,7 @@ const R = (x0: number, x1: number, z0: number, z1: number, h: number, mat: MatId
 // building block + roofRed cap (cap bottom = building top: unreachable, skyline only)
 const struct = (x0: number, x1: number, z0: number, z1: number, h: number, mat: MatId): BoxDef[] => [
   R(x0, x1, z0, z1, h, mat),
-  B((x0 + x1) / 2, h + 0.45, (z0 + z1) / 2, x1 - x0 - 0.5, 0.9, z1 - z0 - 0.5, 'roofRed'),
+  B((x0 + x1) / 2, h + 0.55, (z0 + z1) / 2, x1 - x0 - 0.2, 1.1, z1 - z0 - 0.2, 'roofRed'),
 ];
 
 // market stall: solid crate-mat body (eye-blocker) + roofRed awning slab
@@ -46,13 +46,13 @@ export const urbana: MapDef = {
   theme: {
     sky: PALETTE.skyDay,
     horizon: PALETTE.plaster,
-    ground: PALETTE.concreteDark,
+    ground: PALETTE.plaster,
     fog: PALETTE.fogDay,
     fogDensity: 0.006,
     sunDir: [0.45, -1, 0.3],
     sunColor: PALETTE.paper,
-    sunIntensity: 1.7,
-    hemiIntensity: 0.5,
+    sunIntensity: 1.5,
+    hemiIntensity: 0.8,
   },
   boxes: [
     // ---- outer walls (h=5, corners overlap: no gaps) ----
@@ -164,14 +164,14 @@ export const urbana: MapDef = {
   },
   deco: [
     // market barrels along the street and squares (client scatter, non-collidable)
-    { kind: 'barrel', count: 8, x0: -4.5, z0: -15, x1: 4.5, z1: 15, minSpacing: 4 },
-    { kind: 'barrel', count: 7, x0: -13, z0: -9, x1: -5.5, z1: 9, minSpacing: 4 },
-    { kind: 'barrel', count: 7, x0: 5.5, z0: -11, x1: 13, z1: 3, minSpacing: 4 },
-    { kind: 'barrel', count: 5, x0: -17.5, z0: -19, x1: -14, z1: 19, minSpacing: 5 },
-    { kind: 'barrel', count: 5, x0: 14, z0: -19, x1: 17.5, z1: 19, minSpacing: 5 },
+    { kind: 'barrel', count: 12, x0: -4.5, z0: -15, x1: 4.5, z1: 15, minSpacing: 2.5 },
+    { kind: 'barrel', count: 9, x0: -13, z0: -9, x1: -5.5, z1: 9, minSpacing: 2.5 },
+    { kind: 'barrel', count: 9, x0: 5.5, z0: -11, x1: 13, z1: 3, minSpacing: 2.5 },
+    { kind: 'barrel', count: 5, x0: -17.5, z0: -19, x1: -14, z1: 19, minSpacing: 3 },
+    { kind: 'barrel', count: 5, x0: 14, z0: -19, x1: 17.5, z1: 19, minSpacing: 3 },
     // shrubs dress corners, nooks and the spawn courts
-    { kind: 'shrub', count: 12, x0: -27, z0: -21, x1: 27, z1: 21, minSpacing: 6 },
-    { kind: 'shrub', count: 4, x0: -17, z0: -21.4, x1: 17, z1: -17.5, minSpacing: 5 },
-    { kind: 'shrub', count: 4, x0: -17, z0: 17.5, x1: 17, z1: 21.4, minSpacing: 5 },
+    { kind: 'shrub', count: 12, x0: -27, z0: -21, x1: 27, z1: 21, minSpacing: 3 },
+    { kind: 'shrub', count: 4, x0: -17, z0: -21.4, x1: 17, z1: -17.5, minSpacing: 2.5 },
+    { kind: 'shrub', count: 4, x0: -17, z0: 17.5, x1: 17, z1: 21.4, minSpacing: 2.5 },
   ],
 };

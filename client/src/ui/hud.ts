@@ -105,7 +105,8 @@ const CSS = `
 .fh-top { position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
   display: flex; align-items: center; gap: 18px; }
 .fh-score { font-size: 24px; font-weight: 700; letter-spacing: 1px;
-  background: var(--fh-ink-55); padding: 4px 12px; border-radius: 3px; }
+  background: var(--fh-ink-85); padding: 4px 12px; border-radius: 3px;
+  text-shadow: 0 0 2px var(--fh-ink), 0 1px 2px var(--fh-ink); }
 .fh-score-t { color: var(--fh-t); }
 .fh-score-ct { color: var(--fh-ct); }
 .fh-clock { text-align: center; background: var(--fh-ink-55);
@@ -247,6 +248,7 @@ export class Hud {
     st.setProperty('--fh-ink', PALETTE.ink);
     st.setProperty('--fh-ink-55', alpha(PALETTE.ink, 0.55));
     st.setProperty('--fh-ink-70', alpha(PALETTE.ink, 0.72));
+    st.setProperty('--fh-ink-85', alpha(PALETTE.ink, 0.85));
     st.setProperty('--fh-scope-ink', alpha(PALETTE.ink, 0.97));
     st.setProperty('--fh-t', PALETTE.tAmber);
     st.setProperty('--fh-ct', PALETTE.ctBlue);
