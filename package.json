@@ -4,14 +4,13 @@
   "private": true,
   "type": "module",
   "workspaces": [
-    "shared",
-    "server",
-    "client"
+    "platform/*",
+    "games/*/*"
   ],
   "scripts": {
-    "dev": "concurrently -n server,client \"npm run dev -w @fps/server\" \"npm run dev -w @fps/client\"",
-    "build": "npm run build -w @fps/client && npm run build -w @fps/server",
-    "start": "npm run start -w @fps/server",
+    "dev": "concurrently -n server,client \"npm run dev -w @platform/server\" \"npm run dev -w @fps/client\"",
+    "build": "npm run build -w @fps/client && npm run build -w @platform/server",
+    "start": "npm run start -w @platform/server",
     "typecheck": "npm run typecheck --workspaces",
     "test": "vitest run"
   },

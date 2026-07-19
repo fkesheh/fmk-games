@@ -63,7 +63,7 @@ const fpsState = (page) => page.evaluate(() => window.__fps?.state() ?? null);
 
 // ---- server -------------------------------------------------------------------
 function startServer() {
-  const child = spawn(process.execPath, ['server/dist/server.js'], {
+  const child = spawn(process.execPath, ['platform/server/dist/server.js'], {
     cwd: ROOT,
     env: { ...process.env, PORT: String(PORT) },
     stdio: ['ignore', 'pipe', 'pipe'],

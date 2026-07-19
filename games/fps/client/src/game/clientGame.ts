@@ -206,11 +206,13 @@ export class ClientGame {
   }
 
   createPublic(name: string, mapId: MapId): void {
-    this.startJoin((c) => c.send({ t: 'create_public', name, mapId }));
+    // platform lobby envelope: mapId rides inside opaque settings (see
+    // connection.ts LobbyCreate); the module validates it in createRoom
+    this.startJoin((c) => c.send({ t: 'create_public', name, settings: { mapId } }));
   }
 
   createPrivate(name: string, mapId: MapId): void {
-    this.startJoin((c) => c.send({ t: 'create_private', name, mapId }));
+    this.startJoin((c) => c.send({ t: 'create_private', name, settings: { mapId } }));
   }
 
   joinPrivate(name: string, code: string): void {

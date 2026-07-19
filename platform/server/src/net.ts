@@ -10,8 +10,8 @@ import { readFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import path from 'node:path';
 import { WebSocket, WebSocketServer, type RawData } from 'ws';
-import { NET, encodeS2C, parseC2S } from '@fps/shared';
-import type { C2S, PlayerId, S2C } from '@fps/shared';
+import { NET, encodeS2C, parseC2S } from '@platform/shared';
+import type { C2S, PlayerId, S2C } from '@platform/shared';
 
 // ---- static content types (spec: html/js/css/json/png/ico) ----
 const MIME_TYPES: Record<string, string> = {

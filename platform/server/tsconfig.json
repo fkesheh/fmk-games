@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "paths": {
+      "@platform/shared": ["../shared/src/index.ts"],
+      "@platform/shared/*": ["../shared/src/*"],
+      "@fps/server": ["../../games/fps/server/src/module.ts"],
+      "@fps/shared": ["../../games/fps/shared/src/index.ts"],
+      "@fps/shared/*": ["../../games/fps/shared/src/*"]
+    }
+  },
+  "include": ["src"]
+}

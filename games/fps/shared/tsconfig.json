@@ -1,0 +1,12 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "paths": {
+      "@platform/shared": ["../../../platform/shared/src/index.ts"],
+      "@platform/shared/*": ["../../../platform/shared/src/*"]
+    }
+  },
+  "include": ["src"]
+}

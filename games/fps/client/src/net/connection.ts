@@ -7,8 +7,18 @@
 //   serverNow = performance.now() + offset   (see ClientState, C10)
 // 'pong' is consumed here and never forwarded to onMessage.
 // ============================================================================
-import { decodeS2C, encodeC2S, NET } from '@fps/shared';
-import type { C2S, S2C } from '@fps/shared';
+import { decodeS2C, NET } from '@fps/shared';
+import type { C2S, MapId, S2C } from '@fps/shared';
+
+/**
+ * Platform lobby create envelopes (platform/shared/src/protocol.ts LobbyC2S):
+ * the lobby owns create/join now and passes `settings` opaquely to the game
+ * module — the fps mapId travels inside it. Everything else the client sends
+ * is the frozen fps C2S (room-level tags route to the room RAW).
+ */
+export type LobbyCreate =
+  | { t: 'create_public'; name: string; settings: { mapId: MapId } }
+  | { t: 'create_private'; name: string; settings: { mapId: MapId } };
 
 // ---- tuning (frozen by CONTRACT.md) -----------------------------------------
 const CONNECT_TIMEOUT_MS = 5000;
@@ -93,11 +103,11 @@ export class Connection {
   }
 
   /** No-op unless the socket is open (mirrors the server's Session.send). */
-  send(msg: C2S): void {
+  send(msg: C2S | LobbyCreate): void {
     const ws = this.ws;
     if (ws === null || ws.readyState !== WebSocket.OPEN) return;
     try {
-      ws.send(encodeC2S(msg));
+      ws.send(JSON.stringify(msg)); // encodeC2S: the wire is plain JSON
     } catch {
       // racing a close — drop the frame
     }

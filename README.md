@@ -54,15 +54,22 @@ The server serves the built client and the `/ws` endpoint on port 8080.
 WASD move · mouse look · LMB fire · RMB / F scope (AWM) · Space jump · C crouch ·
 R reload · B buy menu · Tab scoreboard · 1-6 / wheel weapons · Esc pause
 
-## Repo layout
+## Repo layout (platform + games)
 
-- `shared/` — frozen contract: wire types, balance config, palette, physics, 6 map data files
-- `server/` — authoritative server: transport (`net.ts`), matchmaking (`rooms.ts`),
-  game room (`game.ts`), combat/economy (`combat.ts`, `economy.ts`)
-- `client/` — three.js game: prediction/interp (`net/`), renderer (`render/`), HUD/menus
-  (`ui/`), orchestration (`game/`), synthesized audio (`audio/`)
-- `CONTRACT.md` — the frozen module/balance/visual contract everything was built against
-- `scripts/e2e.mjs` — two-browser end-to-end suite (join, phases, movement, kill, buy)
+This is a multi-game monorepo (see `docs/STRUCTURE.md`). The platform owns transport,
+matchmaking, and rooms; games plug in via one registry entry. Adding a new game = a new
+`games/<id>/` directory + registering it in `platform/server/src/registry.ts`.
+
+- `platform/shared/` — game-agnostic contract: rng, lobby protocol, the `GameModule` interface
+- `platform/server/` — ws/http transport (`net.ts`), matchmaking (`lobby.ts`), entry (`index.ts`)
+- `games/fps/shared/` — STRICKEN's frozen contract: wire types, balance config, palette,
+  physics, 6 map data files
+- `games/fps/server/` — the FPS game module: game room (`game.ts`), combat/economy
+  (`combat.ts`, `economy.ts`), bot brains (`bots.ts`), registry plug (`module.ts`)
+- `games/fps/client/` — three.js game client: prediction/interp (`net/`), renderer (`render/`),
+  HUD/menus (`ui/`), orchestration (`game/`), synthesized audio (`audio/`)
+- `CONTRACT.md` — the frozen FPS contract; `docs/STRUCTURE.md` — the platform contract
+- `scripts/e2e.mjs` — two-browser end-to-end suite (join, phases, movement, kill, buy, bots, teams)
 
 ## Gates
 

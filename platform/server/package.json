@@ -1,5 +1,5 @@
 {
-  "name": "@fps/server",
+  "name": "@platform/server",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -10,6 +10,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@fps/server": "0.0.0",
+    "@platform/shared": "0.0.0",
     "ws": "8.21.1"
   },
   "devDependencies": {

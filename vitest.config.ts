@@ -4,10 +4,11 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   resolve: {
     alias: {
-      '@fps/shared': fileURLToPath(new URL('./shared/src', import.meta.url)),
+      '@fps/shared': fileURLToPath(new URL('./games/fps/shared/src', import.meta.url)),
+      '@platform/shared': fileURLToPath(new URL('./platform/shared/src', import.meta.url)),
     },
   },
   test: {
-    include: ['shared/src/**/*.test.ts', 'server/src/**/*.test.ts'],
+    include: ['games/fps/shared/src/**/*.test.ts', 'games/fps/server/src/**/*.test.ts'],
   },
 });

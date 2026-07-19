@@ -27,6 +27,7 @@ import {
   boxToAABB,
   eyePos,
   makeBody,
+  parseC2S,
   rewindTicks,
   rng,
   rngInt,
@@ -187,10 +188,14 @@ export class GameRoom {
     this.code = visibility === 'private' ? randomToken(this.next, PRIVATE_CODE_LEN) : null;
   }
 
-  info(): RoomInfo {
+  // fps RoomInfo plus the platform RoomInfo fields (game/label) — one object
+  // satisfies both the fps client (mapId) and the lobby list (game, label).
+  info(): RoomInfo & { game: 'fps'; label: string } {
     return {
       id: this.id,
       code: this.code,
+      game: 'fps',
+      label: this.map.name, // map display name (lobby list subtitle)
       mapId: this.mapId,
       players: this.players.size,
       maxPlayers: MAX_PLAYERS,
@@ -380,6 +385,43 @@ export class GameRoom {
       h = Math.imul(h, 0x01000193);
     }
     return h >>> 0;
+  }
+
+  /**
+   * GameRoomHandle entry: the platform lobby routes RAW room-level envelopes
+   * here (lobby tags are platform-owned and ignored below). Validate with the
+   * frozen fps parser; silently drop nulls — never throw on wire data.
+   */
+  handleMessage(id: PlayerId, msg: unknown): void {
+    const parsed = parseC2S(msg);
+    if (parsed === null) return;
+    switch (parsed.t) {
+      case 'input':
+        this.handleInput(id, parsed);
+        return;
+      case 'reload':
+        this.handleReload(id);
+        return;
+      case 'switch':
+        this.handleSwitch(id, parsed.weapon);
+        return;
+      case 'buy':
+        this.handleBuy(id, parsed.weapon);
+        return;
+      case 'switch_team':
+        this.handleSwitchTeam(id, parsed.team);
+        return;
+      case 'add_bot':
+        if (this.addBot() === null) {
+          this.io.send(id, { t: 'error', code: 'room_full', message: 'room is full' });
+        }
+        return;
+      case 'remove_bot':
+        this.removeBot(); // false (no bots) is fine
+        return;
+      default:
+        return; // lobby-level tags (list_rooms, quick_join, create_*, join_private, leave, ping)
+    }
   }
 
   handleInput(id: PlayerId, msg: InputMsg): void {

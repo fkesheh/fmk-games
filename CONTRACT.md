@@ -6,15 +6,15 @@ ownership list.** You implement bodies and private helpers inside your own files
 
 ## Frozen files (Layer 1 — code)
 
-- `shared/src/types.ts` — all wire types, ids, enums, events
-- `shared/src/config.ts` — tick rate, player physics constants, economy, rounds, WEAPONS table
-- `shared/src/palette.ts` — the named palette (ALL colors trace here)
-- `shared/src/rng.ts` — seeded RNG (mulberry32)
-- `shared/src/physics.ts` — stepBody collide-and-slide, AABB/raycast, hitscan, spread, falloff
-- `shared/src/protocol.ts` — parseC2S / encode / decode
-- `shared/src/maps/types.ts`, `shared/src/maps/index.ts`, `shared/src/maps/dustbowl.ts` (reference map)
-- `shared/src/maps/{crossfire,office,frostbite,urbana,bunker}.ts` — placeholder data; owned by tasks M1–M5 (they replace file CONTENTS, never the format)
-- `client/src/contract/visual.ts` — mat/box/cyl/cone/sphere/at/bake visual vocabulary
+- `games/fps/shared/src/types.ts` — all wire types, ids, enums, events
+- `games/fps/shared/src/config.ts` — tick rate, player physics constants, economy, rounds, WEAPONS table
+- `games/fps/shared/src/palette.ts` — the named palette (ALL colors trace here)
+- `games/fps/shared/src/rng.ts` — seeded RNG (mulberry32)
+- `games/fps/shared/src/physics.ts` — stepBody collide-and-slide, AABB/raycast, hitscan, spread, falloff
+- `games/fps/shared/src/protocol.ts` — parseC2S / encode / decode
+- `games/fps/shared/src/maps/types.ts`, `games/fps/shared/src/maps/index.ts`, `games/fps/shared/src/maps/dustbowl.ts` (reference map)
+- `games/fps/shared/src/maps/{crossfire,office,frostbite,urbana,bunker}.ts` — placeholder data; owned by tasks M1–M5 (they replace file CONTENTS, never the format)
+- `games/fps/client/src/contract/visual.ts` — mat/box/cyl/cone/sphere/at/bake visual vocabulary
 
 ## RULES (every implementer, no exceptions)
 
@@ -24,7 +24,7 @@ ownership list.** You implement bodies and private helpers inside your own files
    `exactOptionalPropertyTypes` and `noUncheckedIndexedAccess` are ON — code accordingly.
 4. **Imports:** you may import from `@fps/shared`, `three` (client), `ws`/`node:*` (server), and the
    exact exports listed in the module table below. No other cross-module imports.
-5. **All colors from PALETTE.** Meshes only via `client/src/contract/visual.ts` factories
+5. **All colors from PALETTE.** Meshes only via `games/fps/client/src/contract/visual.ts` factories
    (`box/cyl/cone/sphere/at/mat/bake`). Exceptions allowed: sky-dome `MeshBasicMaterial` with vertex
    colors, particle `THREE.Points` materials, nameplate `CanvasTexture` sprites — colors still from PALETTE.
 6. **Bake all static geometry** via `bake()`. Dynamic pivots (limbs, weapon, rotor) stay unbaked.
@@ -57,7 +57,7 @@ ownership list.** You implement bodies and private helpers inside your own files
 
 ## Module table — server (task S1/S2/S3)
 
-### `server/src/net.ts` (S1)
+### `games/fps/server/src/net.ts` (S1)
 ```ts
 export class Session {
   readonly id: PlayerId;
@@ -78,7 +78,7 @@ export class NetServer {
 }
 ```
 
-### `server/src/game.ts` (S2)
+### `games/fps/server/src/game.ts` (S2)
 ```ts
 export interface RoomIO {
   send(id: PlayerId, msg: S2C): void;
@@ -166,7 +166,7 @@ Behavioral invariants (S2, uses S3 helpers):
   roundRewards(null) applies (both teams get loss reward).
 - Input queue per player capped at NET.inputQueueCap; older inputs dropped.
 
-### `server/src/combat.ts` (S3)
+### `games/fps/server/src/combat.ts` (S3)
 ```ts
 export class LagBuffer {
   constructor(maxTicks: number);
@@ -187,7 +187,7 @@ export function resolveShot(ctx: ShotContext, seed: number): ShotHit[];
 export function wallEndPoint(origin: Vec3, dir: Vec3, solids: AABB[], maxDist: number): Vec3;
 ```
 
-### `server/src/bots.ts` (S4 — server-driven bot players)
+### `games/fps/server/src/bots.ts` (S4 — server-driven bot players)
 
 Bots are server-side players: the room feeds each bot's `BotCommand` through the exact same
 input/reload/buy path as human clients. Bots appear as normal roster entries with `bot: true`.
@@ -231,7 +231,7 @@ Behavior invariants (frozen):
 - **Buy:** when canBuy: rifle if money ≥ price, else smg if affordable, else null.
 - **Determinism:** one seeded rng stream per brain; no Math.random, no Date, no I/O.
 
-### `server/src/economy.ts` (S3)```ts
+### `games/fps/server/src/economy.ts` (S3)```ts
 export function tryBuy(money: number, owned: WeaponId[], want: WeaponId, canBuy: boolean):
   { ok: true; money: number; owned: WeaponId[] } | { ok: false; reason: string };
 // knife+pistol are always owned & never buyable. Primary slots: smg/shotgun/rifle/sniper —
@@ -242,7 +242,7 @@ export function killReward(money: number): number;                    // +ECONOM
 export function roundRewards(winner: Team | null): { t: number; ct: number }; // win/lossReward, clamp handled by caller
 ```
 
-### `server/src/rooms.ts` (S1)
+### `games/fps/server/src/rooms.ts` (S1)
 ```ts
 export class Lobby {
   constructor();
@@ -261,7 +261,7 @@ export class Lobby {
 - If MAX_ROOMS rooms exist, quick_join/create_private fail with `{t:'error', code:'rooms_full'}`.
 - A session is in ≤1 room; `leave` returns it to lobby state (can rejoin/list).
 
-### `server/src/index.ts` (S1)
+### `games/fps/server/src/index.ts` (S1)
 Entry: `PORT = env PORT ?? 8080`; creates NetServer + Lobby, wires hooks, staticDir =
 `../client/dist` relative to server dist when it exists (production), else null. Closes sockets of
 players reported by `room.stalePlayers()` (poll every 1s via each room's tick — S1 may poll
@@ -270,7 +270,7 @@ players reported by `room.stalePlayers()` (poll every 1s via each room's tick �
 
 ## Module table — client (tasks C1..C11)
 
-### `client/src/net/connection.ts` (C1)
+### `games/fps/client/src/net/connection.ts` (C1)
 ```ts
 export class Connection {
   onMessage: ((msg: S2C) => void) | null = null;
@@ -284,7 +284,7 @@ export class Connection {
 }
 ```
 
-### `client/src/net/interpolation.ts` (C1)
+### `games/fps/client/src/net/interpolation.ts` (C1)
 ```ts
 export class InterpBuffer {
   push(serverTimeMs: number, players: PlayerSnap[]): void;
@@ -294,7 +294,7 @@ export class InterpBuffer {
 }
 ```
 
-### `client/src/net/prediction.ts` (C1)
+### `games/fps/client/src/net/prediction.ts` (C1)
 ```ts
 export interface PendingInput { seq: number; input: MoveInput; }
 export class Predictor {
@@ -308,7 +308,7 @@ export class Predictor {
 }
 ```
 
-### `client/src/input/input.ts` (C2)
+### `games/fps/client/src/input/input.ts` (C2)
 ```ts
 export type InputEdge =
   | { kind: 'reload' } | { kind: 'slot'; n: number } | { kind: 'buy' }
@@ -334,7 +334,7 @@ the game tab the first time someone crouches while moving forward.
 Semi-auto fire latch: a fire press that begins AND ends between two frame() samples must still be
 reported once — latch INPUT_FIRE until it has been included in exactly one frame() result.
 
-### `client/src/render/scene.ts` (C3)
+### `games/fps/client/src/render/scene.ts` (C3)
 ```ts
 export class SceneRig {
   readonly renderer: THREE.WebGLRenderer; readonly scene: THREE.Scene; readonly camera: THREE.PerspectiveCamera;
@@ -348,7 +348,7 @@ export class SceneRig {
 ```
 Renderer: ACESFilmicToneMapping, SRGB output, antialias, pixelRatio ≤ 2, shadowMap enabled PCFSoft.
 
-### `client/src/render/mapRenderer.ts` (C3)
+### `games/fps/client/src/render/mapRenderer.ts` (C3)
 ```ts
 export function buildMap(map: MapDef): { root: THREE.Group; solids: AABB[] };
 // ground plane (sizeX+8 x sizeZ+8, floorMat color, receiveShadow)
@@ -360,7 +360,7 @@ export function buildMap(map: MapDef): { root: THREE.Group; solids: AABB[] };
 export const MAT_COLORS: Record<MatId, string>; // maps each MatId to a PALETTE entry
 ```
 
-### `client/src/render/playerModels.ts` (C4)
+### `games/fps/client/src/render/playerModels.ts` (C4)
 ```ts
 export class PlayerModels {
   constructor(scene: THREE.Scene);
@@ -372,7 +372,7 @@ export class PlayerModels {
 }
 ```
 
-### `client/src/render/viewModel.ts` (C5)
+### `games/fps/client/src/render/viewModel.ts` (C5)
 ```ts
 export function makeWeaponModel(id: WeaponId): THREE.Group; // used by viewmodel AND playerModels (C4)
 export class ViewModel {
@@ -384,7 +384,7 @@ export class ViewModel {
 }
 ```
 
-### `client/src/render/effects.ts` (C6)
+### `games/fps/client/src/render/effects.ts` (C6)
 ```ts
 export class Effects {
   constructor(scene: THREE.Scene);
@@ -402,7 +402,7 @@ export class Effects {
 ```
 Pooled: ≤ 64 tracers, ≤ 256 particles total. `THREE.Points` + small quad meshes; reuse.
 
-### `client/src/audio/audio.ts` (C7)
+### `games/fps/client/src/audio/audio.ts` (C7)
 ```ts
 export type SfxKind = 'shot_knife' | 'shot_pistol' | 'shot_smg' | 'shot_shotgun' | 'shot_rifle'
   | 'shot_sniper' | 'reload' | 'hit' | 'headshot' | 'death' | 'footstep'
@@ -417,7 +417,7 @@ export class AudioEngine {
 Fully synthesized (oscillators + noise buffers, envelopes, filters). Each shot kind distinct
 (crack/boom/pop). `hit` = short tick, `headshot` = higher ding, `death` = thud, round/win stingers.
 
-### `client/src/ui/hud.ts` (C8)
+### `games/fps/client/src/ui/hud.ts` (C8)
 ```ts
 export interface HudState {
   hp: number; alive: boolean; money: number; canBuy: boolean;
@@ -438,7 +438,7 @@ export class Hud {
 DOM-based, pointer-events none. Crosshair: 4 lines, gap = spreadPx; hidden while scoped; scope
 overlay = black vignette + thin cross + circle when scoped. Layout/colors per UX_BIBLE.md.
 
-### `client/src/ui/menus.ts` (C9)
+### `games/fps/client/src/ui/menus.ts` (C9)
 ```ts
 export interface MenuCallbacks {
   onQuickJoin(name: string): void;
@@ -476,7 +476,7 @@ export class Menus {
 Buy menu: cards for smg/shotgun/rifle/sniper with name, price, dmg/rpm/mag stats; disabled state
 when unaffordable or !canBuy; knife+pistol shown as "issued". Styling per UX_BIBLE.md.
 
-### `client/src/game/state.ts` (C10)
+### `games/fps/client/src/game/state.ts` (C10)
 ```ts
 export class ClientState {
   youId: PlayerId | null; team: Team | null; roomId: RoomId | null; code: string | null;
@@ -489,7 +489,7 @@ export class ClientState {
 }
 ```
 
-### `client/src/game/clientGame.ts` (C10)
+### `games/fps/client/src/game/clientGame.ts` (C10)
 ```ts
 export class ClientGame {
   constructor(opts: { canvas: HTMLCanvasElement; hud: Hud; menus: Menus; state: ClientState });
@@ -506,7 +506,7 @@ AudioEngine against ClientState, per this contract. Handles all S2C messages and
 (sounds, killfeed, hitmarkers, shake, banners, spectate). Own weapon switch cancels reload client-side.
 Fire events: local fire animation immediately; server hit event confirms.
 
-### `client/src/main.ts` + `client/src/style.css` + `client/index.html` (C11)
+### `games/fps/client/src/main.ts` + `games/fps/client/src/style.css` + `client/index.html` (C11)
 App shell: full-viewport canvas, #hud + #menu overlay roots, creates Menus/Hud/ClientState/ClientGame,
 rAF loop, resize handler, first-gesture audio resume, `?debug` overlay (tick/ping/pos/fps).
 Exposes the frozen debug surface (used by e2e):
@@ -613,7 +613,7 @@ cover (box or prop-height ≥0.9) at least every 8m along each route; longest op
 ## Debug & test surface
 
 - `window.__fps` as specced under C11 — required by scripts/e2e.mjs.
-- Unit tests (task T1): `shared/src/physics.test.ts` (walk, wall slide, step-up, crouch-block-stand,
-  hitscan head/body/wall-block, falloff, spread determinism), `shared/src/protocol.test.ts`
-  (accept/ reject cases), `server/src/game.test.ts` (buy flow ok/fail, elimination ends round,
+- Unit tests (task T1): `games/fps/shared/src/physics.test.ts` (walk, wall slide, step-up, crouch-block-stand,
+  hitscan head/body/wall-block, falloff, spread determinism), `games/fps/shared/src/protocol.test.ts`
+  (accept/ reject cases), `games/fps/server/src/game.test.ts` (buy flow ok/fail, elimination ends round,
   kill reward, warmup→freeze transition at 2 players) using a fake RoomIO.
