@@ -18,9 +18,19 @@ export class BankRoom implements GameRoomHandle { /* platform contract */ }
 
 Behavioral invariants (frozen):
 - **Join/leave:** players join in order (play order = join order). addPlayer sends a fresh
-  `bank_state` to the joiner (phase 'lobby' or mid-match spectator... mid-match joiners are
-  added to the END of the order and play from the NEXT round; this round they watch with
-  banked=true). removePlayer: if it was their turn, advance; broadcast state.
+  `bank_state` to the joiner. **Mid-round joiners participate IMMEDIATELY** — appended to the
+  END of the order with banked=false; they can roll on their turn and bank at once (the
+  physical-game rule: you sit down and play). Joining during roundEnd/matchEnd needs no
+  special case (next round resets banked for everyone).
+- **Rejoin (resume token):** addPlayer(id, name, resume?) — if `resume` matches an existing
+  player entry's id AND that entry is disconnected: re-bind — the entry's id becomes the new
+  session id (order slot, score, banked all preserved), connected=true, state broadcast.
+  If the entry is still connected (token used from a second tab/session), ignore `resume`
+  and join as a new player.
+- **Ghost purge:** disconnected entries stay for the CURRENT round (score kept for rejoin)
+  and are REMOVED at the next round start (round transitions + match reset). Purging a
+  disconnected current player advances the turn first. removePlayer: if it was their turn,
+  advance; broadcast state.
 - **Match flow:** phase 'lobby' until connected ≥ MIN_PLAYERS → round 1, 'playing',
   currentId = first player. Each roll: only from currentId, only in 'playing'; rollCount++;
   apply `rollEffect` (shared/dice.ts) with the per-roll stream `rng(Date.now() ^ tickish)`;

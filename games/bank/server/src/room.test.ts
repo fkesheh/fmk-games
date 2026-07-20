@@ -297,11 +297,12 @@ describe('BankRoom', () => {
   it('bank mid-round: score += pot, pot unchanged, turn passes to next non-banked', () => {
     const io = new FakeIO();
     const room = boot(io, [['p1', 'Alice'], ['p2', 'Bob'], ['p3', 'Carol']]);
-    // round 1 has only the first two players active (p3 joined mid-match);
-    // end it via all-banked so all three play round 2.
+    // p3 joined mid-round-1 and is active AT ONCE (the new join rule), so all
+    // three must bank to end round 1; then all three play round 2.
     const potR1 = rollAt(room, io, EPOCH + 1_000).potAfter;
     room.handleMessage('p1', { t: 'bank' });
     room.handleMessage('p2', { t: 'bank' });
+    room.handleMessage('p3', { t: 'bank' });
     expect(io.state('p1').phase).toBe('roundEnd');
     vi.advanceTimersByTime(ROUND_END_MS);
     let st = io.state('p1');
@@ -428,10 +429,10 @@ describe('BankRoom', () => {
     expect(st.turnEndsAt).toBe(Date.now() + TURN_MS); // fresh timer for p2
   });
 
-  it('mid-match joiner watches banked until the next round, then plays in join order', () => {
+  it('mid-match joiner plays at once: appended to the END, rolls when their turn comes', () => {
     const io = new FakeIO();
     const room = boot(io, [['p1', 'Alice'], ['p2', 'Bob']]);
-    rollAt(room, io, EPOCH + 1_000);
+    rollAt(room, io, EPOCH + 1_000); // p1 rolls; the turn passes to p2
     room.addPlayer('p3', 'Carol');
     const joinSt = io.state('p3'); // joiners get a fresh bank_state
     expect(joinSt.phase).toBe('playing');
@@ -439,28 +440,38 @@ describe('BankRoom', () => {
     expect(joinSt.players).toHaveLength(3);
     const p3 = joinSt.players[2]; // appended to the END of the order
     expect(p3?.id).toBe('p3');
-    expect(p3?.banked).toBe(true); // sits out the rest of this round
+    expect(p3?.banked).toBe(false); // sits down and plays THIS round
     expect(joinSt.currentId).toBe('p2'); // the turn is unaffected
-    // cannot roll while watching
+    // still cannot roll off-turn
     room.handleMessage('p3', { t: 'roll' });
     expect(io.events('p3', 'roll')).toHaveLength(0);
     expect(io.state('p3').rollCount).toBe(1);
-    // p1 + p2 banking ends the round (p3 already counts as banked)
+    // p2 rolls and the turn reaches p3 in the CURRENT round
+    rollAt(room, io, EPOCH + 2_000);
+    expect(io.state('p1').currentId).toBe('p3');
+    const ev = rollAt(room, io, EPOCH + 3_000, 'p3');
+    expect(ev.rollerId).toBe('p3'); // the joiner rolled in the round they joined
+    expect(io.state('p1').currentId).toBe('p1'); // then the order cycles back
+  });
+
+  it('3 players: a mid-round-1 joiner rolls and banks in round 1', () => {
+    const io = new FakeIO();
+    const room = boot(io, [['p1', 'Alice'], ['p2', 'Bob']]);
+    rollAt(room, io, EPOCH + 1_000); // p1; currentId = p2
+    room.addPlayer('p3', 'Carol'); // round-1 joiner — active immediately
+    rollAt(room, io, EPOCH + 2_000); // p2; currentId = p3
+    const ev = rollAt(room, io, EPOCH + 3_000, 'p3'); // p3 rolls IN round 1
+    expect(ev.rollerId).toBe('p3');
+    expect(io.state('p1').round).toBe(1);
+    // all THREE must bank before round 1 can end: p3 is a live player
     room.handleMessage('p1', { t: 'bank' });
     room.handleMessage('p2', { t: 'bank' });
-    expect(io.events('p3', 'round_end')[0]).toMatchObject({ reason: 'all_banked', round: 1 });
-    vi.advanceTimersByTime(ROUND_END_MS);
-    // next round: p3 is active, still last in the order
-    let st = io.state('p3');
-    expect(st.round).toBe(2);
-    expect(player(st, 'p3').banked).toBe(false);
-    expect(st.currentId).toBe('p1');
-    rollAt(room, io, EPOCH + 2_000);
-    rollAt(room, io, EPOCH + 3_000);
-    st = io.state('p1');
-    expect(st.currentId).toBe('p3');
-    const ev = rollAt(room, io, EPOCH + 4_000, 'p3');
-    expect(ev.rollerId).toBe('p3');
+    expect(io.state('p1').phase).toBe('playing'); // p3 still in => round 1 goes on
+    room.handleMessage('p3', { t: 'bank' });
+    const ends = io.events('p1', 'round_end');
+    expect(ends).toHaveLength(1);
+    expect(ends[0]).toMatchObject({ reason: 'all_banked', round: 1 });
+    expect(player(io.state('p3'), 'p3').score).toBeGreaterThan(0); // scored in round 1
   });
 
   it('aborts to lobby on low population, keeps scores, resets them on the new match', () => {
@@ -483,6 +494,72 @@ describe('BankRoom', () => {
     expect(st2.round).toBe(1);
     expect(player(st2, 'p1').score).toBe(0);
     expect(player(st2, 'p2').score).toBe(0);
+  });
+
+  it('rejoin: a resume token re-binds the entry — new id, order/score/banked preserved', () => {
+    const io = new FakeIO();
+    const room = boot(io, [['p1', 'Alice'], ['p2', 'Bob'], ['p3', 'Carol']]);
+    const pot = rollAt(room, io, EPOCH + 1_000).potAfter;
+    room.handleMessage('p1', { t: 'bank' }); // p1 banks: score = pot > 0
+    expect(player(io.state('p2'), 'p1').score).toBe(pot);
+    room.removePlayer('p1'); // disconnect: the entry stays (2 connected, no abort)
+    expect(player(io.state('p2'), 'p1').connected).toBe(false);
+    room.addPlayer('p1b', 'Alice', 'p1'); // resume = old id => re-bind
+    const st = io.state('p2');
+    expect(st.players).toHaveLength(3); // NO duplicate row
+    const alice = st.players[0]; // the join-order slot is preserved (p1 was first)
+    expect(alice?.id).toBe('p1b'); // the entry's id became the new session id
+    expect(alice?.name).toBe('Alice');
+    expect(alice?.score).toBe(pot); // score preserved
+    expect(alice?.banked).toBe(true); // banked preserved
+    expect(alice?.connected).toBe(true);
+    expect(room.playerCount()).toBe(3); // the room doesn't double-count either
+    expect(io.state('p1b').you).toBe('p1b'); // fresh state for the new session
+    expect(st.phase).toBe('playing'); // the match continues untouched
+    expect(st.currentId).toBe('p2');
+  });
+
+  it('resume against a still-connected entry is ignored: the joiner is a new player', () => {
+    const io = new FakeIO();
+    const room = boot(io, [['p1', 'Alice'], ['p2', 'Bob']]);
+    const pot = rollAt(room, io, EPOCH + 1_000).potAfter;
+    room.handleMessage('p1', { t: 'bank' }); // give p1 a score + banked state
+    room.addPlayer('p1clone', 'Alice', 'p1'); // second tab with p1's token — p1 CONNECTED
+    const st = io.state('p1');
+    expect(st.players).toHaveLength(3); // two separate entries, no re-bind
+    const orig = player(st, 'p1');
+    expect(orig.connected).toBe(true); // the original session is untouched
+    expect(orig.score).toBe(pot);
+    expect(orig.banked).toBe(true);
+    const clone = player(st, 'p1clone');
+    expect(clone.score).toBe(0); // nothing transferred to the fresh entry
+    expect(clone.banked).toBe(false); // a mid-round joiner, active at once
+    expect(clone.connected).toBe(true);
+    expect(room.playerCount()).toBe(3);
+  });
+
+  it('ghost purge: a disconnected entry is removed at the next round start', () => {
+    const io = new FakeIO();
+    const room = boot(io, [['p1', 'Alice'], ['p2', 'Bob'], ['p3', 'Carol']]);
+    rollAt(room, io, EPOCH + 1_000); // p1 rolls; currentId = p2
+    room.removePlayer('p3'); // ghost: the entry stays for THIS round
+    let st = io.state('p1');
+    expect(st.players).toHaveLength(3);
+    expect(player(st, 'p3').connected).toBe(false);
+    expect(room.playerCount()).toBe(2);
+    room.handleMessage('p1', { t: 'bank' });
+    room.handleMessage('p2', { t: 'bank' });
+    expect(io.state('p1').phase).toBe('roundEnd');
+    vi.advanceTimersByTime(ROUND_END_MS); // round 2 starts: ghosts are purged
+    st = io.state('p1');
+    expect(st.phase).toBe('playing');
+    expect(st.round).toBe(2);
+    expect(st.players).toHaveLength(2); // p3 is GONE from the state
+    expect(st.players.some((p) => p.id === 'p3')).toBe(false);
+    expect(st.currentId).toBe('p1'); // the game continues normally
+    const ev = rollAt(room, io, EPOCH + 10_000);
+    expect(ev.rollerId).toBe('p1');
+    expect(io.state('p2').players).toHaveLength(2);
   });
 });
 

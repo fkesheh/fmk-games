@@ -191,6 +191,7 @@ interface BankDebugState {
   you: string | null;
   players: BankPlayerState[];
   score: number; // banked total of `you`
+  resume: string | null; // the stored rejoin token (localStorage 'bank.resume'), if any
 }
 
 interface BankApi {
@@ -219,6 +220,7 @@ const LOG_MAX = 6; // event log keeps the last ~6 entries (docs/BANK.md)
 const NAME_MAX = 16; // lobby cleanName cap (platform protocol)
 const CODE_MAX = 8;
 const DICE_TUMBLE_MS = 600; // tumble frames before the dice settle on d1/d2
+const RESUME_KEY = 'bank.resume'; // localStorage: { playerId, code } rejoin record
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -246,6 +248,8 @@ export class BankGame {
   private ws: WebSocket | null = null;
   private welcomed = false;
   private playerId: string | null = null;
+  private resumeToken: string | null = null; // rejoin token loaded from localStorage
+  private roomCode: string | null = null; // code of the room we're in/joining, when known
   private state: BankState | null = null;
   private rooms: RoomInfo[] = [];
   private screen: 'menu' | 'table' = 'menu';
@@ -449,6 +453,10 @@ export class BankGame {
       bank: () => this.bank(),
     };
 
+    // ---- rejoin record (token captured BEFORE welcome overwrites storage) ------
+    this.loadResume();
+    if (this.roomCode !== null) this.codeInput.value = this.roomCode; // stored-code prefill
+
     this.connect();
     this.renderMenu();
   }
@@ -498,9 +506,57 @@ export class BankGame {
     return Date.now() + this.offset;
   }
 
+  // ---- rejoin record (localStorage 'bank.resume': { playerId, code }) -----------
+  /** Reads the stored record once at startup; corrupt/blocked storage is non-fatal. */
+  private loadResume(): void {
+    try {
+      const raw = localStorage.getItem(RESUME_KEY);
+      if (raw === null) return;
+      const v: unknown = JSON.parse(raw);
+      if (!isObj(v)) return;
+      if (str(v.playerId)) this.resumeToken = v.playerId;
+      if (str(v.code)) this.roomCode = v.code;
+    } catch {
+      // storage blocked or corrupt JSON — play without rejoin
+    }
+  }
+
+  /** Writes { playerId, code } — after every welcome and after joining a room. */
+  private persistResume(): void {
+    if (this.playerId === null) return;
+    try {
+      localStorage.setItem(
+        RESUME_KEY,
+        JSON.stringify({ playerId: this.playerId, code: this.roomCode }),
+      );
+    } catch {
+      // storage blocked — non-fatal
+    }
+  }
+
+  /** Drops the whole record on an explicit leave (the ghost is removed, not kept). */
+  private clearResume(): void {
+    this.resumeToken = null;
+    this.roomCode = null;
+    try {
+      localStorage.removeItem(RESUME_KEY);
+    } catch {
+      // storage blocked — non-fatal
+    }
+  }
+
   // ---- lobby actions (game filter 'bank' on every create/join) -------------------
+  // Every join flow carries the stored rejoin token when we have one; the server
+  // re-binds a disconnected ghost entry with that id (docs/BANK.md "Rejoin").
   private joinQuick(name: string): void {
-    this.send({ t: 'quick_join', name: cleanName(name), game: 'bank' });
+    const msg: Extract<LobbyC2S, { t: 'quick_join' }> = {
+      t: 'quick_join',
+      name: cleanName(name),
+      game: 'bank',
+    };
+    if (this.resumeToken !== null) msg.resume = this.resumeToken;
+    this.roomCode = null; // public room: no code
+    this.send(msg);
   }
   /** Variant chosen in the create section (or the e2e override passed in). */
   private menuSettings(): BankSettings {
@@ -511,28 +567,42 @@ export class BankGame {
   }
   private createPublic(name: string, settings?: BankSettings): void {
     const s = settings ?? this.menuSettings();
-    this.send({
+    const msg: Extract<LobbyC2S, { t: 'create_public' }> = {
       t: 'create_public',
       name: cleanName(name),
       game: 'bank',
       settings: { sevenBonus: s.sevenBonus, totalRounds: s.totalRounds, raceTarget: s.raceTarget },
-    });
+    };
+    if (this.resumeToken !== null) msg.resume = this.resumeToken;
+    this.roomCode = null; // public room: no code
+    this.send(msg);
   }
   private createPrivate(name: string, settings?: BankSettings): void {
     const s = settings ?? this.menuSettings();
-    this.send({
+    const msg: Extract<LobbyC2S, { t: 'create_private' }> = {
       t: 'create_private',
       name: cleanName(name),
       game: 'bank',
       settings: { sevenBonus: s.sevenBonus, totalRounds: s.totalRounds, raceTarget: s.raceTarget },
-    });
+    };
+    if (this.resumeToken !== null) msg.resume = this.resumeToken;
+    this.roomCode = null; // the code is server-generated; not known client-side
+    this.send(msg);
   }
   private joinPrivate(name: string, code: string): void {
-    if (code.length === 0) {
+    const c = code.length > 0 ? code : (this.roomCode ?? ''); // stored-code fallback
+    if (c.length === 0) {
       this.setNotice('enter a room code first');
       return;
     }
-    this.send({ t: 'join_private', name: cleanName(name), code });
+    const msg: Extract<LobbyC2S, { t: 'join_private' }> = {
+      t: 'join_private',
+      name: cleanName(name),
+      code: c,
+    };
+    if (this.resumeToken !== null) msg.resume = this.resumeToken;
+    this.roomCode = c; // candidate; a 'no_room' error clears it again
+    this.send(msg);
   }
   private roll(): void {
     this.send({ t: 'roll' });
@@ -547,6 +617,7 @@ export class BankGame {
       case 'welcome':
         this.playerId = msg.playerId;
         this.welcomed = true;
+        this.persistResume(); // fresh session id for the next page load
         this.send({ t: 'list_rooms' });
         this.setNotice('');
         this.renderMenu();
@@ -561,6 +632,10 @@ export class BankGame {
         break;
       }
       case 'error':
+        if (msg.code === 'no_room' && this.roomCode !== null) {
+          this.roomCode = null; // stale room — drop the stored code (token stays)
+          this.persistResume();
+        }
         this.setNotice(msg.message);
         break;
       case 'bank_state':
@@ -595,6 +670,11 @@ export class BankGame {
       this.potShown = s.pot; // no count-up animation on the very first snapshot
       this.pushLog('You joined the table');
       if (s.lastRoll !== null) this.settleDice(s.lastRoll.d1, s.lastRoll.d2);
+      if (this.playerId !== null) {
+        // joined: a rebind makes the CURRENT session id the valid rejoin token
+        this.resumeToken = this.playerId;
+        this.persistResume();
+      }
     }
     // matchEnd -> lobby is the server's full reset: banner has been shown, auto-return
     if (prevPhase === 'matchEnd' && s.phase === 'lobby') {
@@ -669,6 +749,7 @@ export class BankGame {
   // ---- actions -> screens ------------------------------------------------------------
   private leaveToMenu(notice: string): void {
     this.send({ t: 'leave' });
+    this.clearResume(); // explicit leave: no rejoin back into that room
     this.state = null;
     this.logLines.length = 0;
     this.bannerText = '';
@@ -851,6 +932,7 @@ export class BankGame {
         you: this.playerId,
         players: [],
         score: 0,
+        resume: this.resumeToken,
       };
     }
     const me = s.players.find((p) => p.id === this.playerId);
@@ -864,6 +946,7 @@ export class BankGame {
       you: this.playerId,
       players: s.players.map((p) => ({ ...p })),
       score: me?.score ?? 0,
+      resume: this.resumeToken,
     };
   }
 }

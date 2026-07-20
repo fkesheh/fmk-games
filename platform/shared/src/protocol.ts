@@ -17,12 +17,18 @@ export const NET = {
 // `settings` is opaque to the platform; the module validates it in createRoom.
 export type LobbyC2S =
   | { t: 'list_rooms' }
-  | { t: 'quick_join'; name: string; game?: string }
-  | { t: 'create_public'; name: string; game?: string; settings?: Record<string, unknown> }
-  | { t: 'create_private'; name: string; game?: string; settings?: Record<string, unknown> }
-  | { t: 'join_private'; name: string; code: string }
+  | { t: 'quick_join'; name: string; game?: string; resume?: PlayerId }
+  | { t: 'create_public'; name: string; game?: string; settings?: Record<string, unknown>; resume?: PlayerId }
+  | { t: 'create_private'; name: string; game?: string; settings?: Record<string, unknown>; resume?: PlayerId }
+  | { t: 'join_private'; name: string; code: string; resume?: PlayerId }
   | { t: 'leave' }
   | { t: 'ping'; ts: number };
+
+/** Sanitize a resume token (a previous session's playerId), or undefined. */
+export function cleanResume(v: unknown): PlayerId | undefined | null {
+  if (v === undefined) return undefined;
+  return typeof v === 'string' && v.length >= 4 && v.length <= 24 ? v : null;
+}
 
 /** Room-level pass-through: envelope-checked ({t: string}) but NOT validated. */
 export type RawEnvelope = { t: string } & Record<string, unknown>;
@@ -79,40 +85,55 @@ export function parseC2S(raw: unknown): C2S | null {
     case 'quick_join': {
       const name = cleanName(raw.name);
       const game = cleanGame(raw.game);
-      if (name === null || game === null) return null;
-      const msg: { t: 'quick_join'; name: string; game?: string } = { t: 'quick_join', name };
+      const resume = cleanResume(raw.resume);
+      if (name === null || game === null || resume === null) return null;
+      const msg: { t: 'quick_join'; name: string; game?: string; resume?: PlayerId } = { t: 'quick_join', name };
       if (game !== undefined) msg.game = game;
+      if (resume !== undefined) msg.resume = resume;
       return msg;
     }
     case 'create_public': {
       const name = cleanName(raw.name);
       const game = cleanGame(raw.game);
       const settings = cleanSettings(raw.settings);
-      if (name === null || game === null || settings === null) return null;
-      const msg: { t: 'create_public'; name: string; game?: string; settings?: Record<string, unknown> } = {
+      const resume = cleanResume(raw.resume);
+      if (name === null || game === null || settings === null || resume === null) return null;
+      const msg: { t: 'create_public'; name: string; game?: string; settings?: Record<string, unknown>; resume?: PlayerId } = {
         t: 'create_public',
         name,
       };
       if (game !== undefined) msg.game = game;
       if (settings !== undefined) msg.settings = settings;
+      if (resume !== undefined) msg.resume = resume;
       return msg;
     }
     case 'create_private': {
       const name = cleanName(raw.name);
       const game = cleanGame(raw.game);
       const settings = cleanSettings(raw.settings);
-      if (name === null || game === null || settings === null) return null;
-      const msg: { t: 'create_private'; name: string; game?: string; settings?: Record<string, unknown> } = {
+      const resume = cleanResume(raw.resume);
+      if (name === null || game === null || settings === null || resume === null) return null;
+      const msg: { t: 'create_private'; name: string; game?: string; settings?: Record<string, unknown>; resume?: PlayerId } = {
         t: 'create_private',
         name,
       };
       if (game !== undefined) msg.game = game;
       if (settings !== undefined) msg.settings = settings;
+      if (resume !== undefined) msg.resume = resume;
       return msg;
     }
-    case 'join_private':
+    case 'join_private': {
       if (!str(raw.name, 16) || !str(raw.code, 8)) return null;
-      return { t: 'join_private', name: raw.name.trim().slice(0, 16) || 'Player', code: raw.code.toUpperCase() };
+      const resume = cleanResume(raw.resume);
+      if (resume === null) return null;
+      const msg: { t: 'join_private'; name: string; code: string; resume?: PlayerId } = {
+        t: 'join_private',
+        name: raw.name.trim().slice(0, 16) || 'Player',
+        code: raw.code.toUpperCase(),
+      };
+      if (resume !== undefined) msg.resume = resume;
+      return msg;
+    }
     case 'leave':
       return { t: 'leave' };
     case 'ping':

@@ -53,13 +53,14 @@ function randomToken(next: () => number, len: number): string {
 /**
  * Server-side player record, join order = Map insertion order. Entries persist
  * (connected=false) when a player leaves: scores survive a low-pop abort and a
- * same-session rejoin, and the wire type carries `connected` for the rail.
+ * resume-token rejoin until the ghost purge at the next round start, and the
+ * wire type carries `connected` for the rail.
  */
 interface Player {
   id: PlayerId;
   name: string;
   score: number; // banked total across the match
-  banked: boolean; // sits out the rest of the round (banked or joined mid-round)
+  banked: boolean; // sits out the rest of the round after banking
   connected: boolean;
   lastMsgAt: number; // serverTime ms of last room-level message; stale sweep
 }
@@ -133,29 +134,30 @@ export class BankRoom implements GameRoomHandle {
     return out;
   }
 
-  addPlayer(id: PlayerId, name: string): void {
+  addPlayer(id: PlayerId, name: string, resume?: PlayerId): void {
     try {
       const now = Date.now();
       const existing = this.players.get(id);
       if (existing !== undefined) {
-        // same-session rejoin: keep score + join-order slot, watch this round
+        // same-session rejoin: keep score + join-order slot, play on
         existing.connected = true;
         existing.name = name;
         existing.lastMsgAt = now;
-        if (this.phase === 'playing' || this.phase === 'roundEnd') existing.banked = true;
+      } else if (resume !== undefined && this.rebindGhost(resume, id, name, now)) {
+        // resume matched a disconnected entry: re-bound in place above
       } else {
         if (this.playerCount() >= MAX_PLAYERS) {
           // unreachable via the lobby (it guards room_full first); never throws
           this.io.send(id, { t: 'error', code: 'room_full', message: 'room is full' });
           return;
         }
-        // mid-match joiners go to the END of the order and play from the NEXT
-        // round; this round they watch with banked=true
+        // mid-match joiners go to the END of the order and participate
+        // IMMEDIATELY (banked=false: they roll on their turn, bank at once)
         this.players.set(id, {
           id,
           name,
           score: 0,
-          banked: this.phase === 'playing' || this.phase === 'roundEnd',
+          banked: false,
           connected: true,
           lastMsgAt: now,
         });
@@ -245,6 +247,7 @@ export class BankRoom implements GameRoomHandle {
       return;
     }
     this.round++;
+    this.purgeGhosts(); // disconnected entries die at the round boundary
     for (const p of this.players.values()) p.banked = false;
     this.pot = 0;
     this.rollCount = 0;
@@ -282,6 +285,7 @@ export class BankRoom implements GameRoomHandle {
 
   /** matchEnd -> FULL reset, then lobby rules (>= MIN_PLAYERS restarts at once). */
   private fullReset(): void {
+    this.purgeGhosts(); // match reset drops every disconnected entry
     for (const p of this.players.values()) {
       p.score = 0;
       p.banked = false;
@@ -410,6 +414,43 @@ export class BankRoom implements GameRoomHandle {
   // -------------------------------------------------------------------------
   // Helpers
   // -------------------------------------------------------------------------
+
+  /**
+   * Resume-token rejoin (docs/BANK.md "Rejoin"): `oldId` matches an existing
+   * entry that is currently disconnected — re-bind it to the new session id,
+   * keeping its exact join-order slot, score and banked flag. Returns false
+   * when there is no such entry or it is still connected (caller joins as new).
+   */
+  private rebindGhost(oldId: PlayerId, newId: PlayerId, name: string, now: number): boolean {
+    const ghost = this.players.get(oldId);
+    if (ghost === undefined || ghost.connected) return false;
+    ghost.id = newId;
+    ghost.name = name;
+    ghost.connected = true;
+    ghost.lastMsgAt = now;
+    // rebuild the map so the re-bound entry keeps its exact join-order slot
+    const entries = [...this.players.entries()];
+    this.players.clear();
+    for (const [key, p] of entries) this.players.set(key === oldId ? newId : key, p);
+    if (this.currentId === oldId) this.currentId = newId; // id reference update
+    return true;
+  }
+
+  /**
+   * Round-start cleanup (docs/BANK.md "Ghost purge"): disconnected entries stay
+   * for the current round (score kept for a rejoiner) and are removed here, at
+   * every transition into a new round and at match reset. If a purged ghost
+   * somehow still holds the turn, the turn advances first.
+   */
+  private purgeGhosts(): void {
+    if (this.currentId !== null) {
+      const cur = this.players.get(this.currentId);
+      if (cur !== undefined && !cur.connected) this.nextTurn(); // advance first
+    }
+    for (const p of [...this.players.values()]) {
+      if (!p.connected) this.players.delete(p.id);
+    }
+  }
 
   private firstConnectedId(): PlayerId | null {
     for (const p of this.players.values()) {

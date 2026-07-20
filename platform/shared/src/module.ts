@@ -34,7 +34,9 @@ export interface GameRoomHandle {
   /** ids with no input for the game's timeout — the platform closes their sockets. */
   stalePlayers(): PlayerId[];
   /** Called when a session joins. The room sends its own join payload to the player. */
-  addPlayer(id: PlayerId, name: string): void;
+  addPlayer(id: PlayerId, name: string, resume?: PlayerId): void;
+  // resume: a playerId from a previous (disconnected) session. Games that support
+  // rejoin may re-bind the new session to the old entry; others ignore it.
   removePlayer(id: PlayerId): void;
   /**
    * A room-level message from a player: the RAW decoded JSON object with a string

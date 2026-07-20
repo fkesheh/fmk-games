@@ -4,16 +4,26 @@
 //
 // Builds the whole monorepo first (npm run build must produce
 // games/bank/client/dist), spawns the production platform server
-// (platform/server/dist), then drives TWO browser instances (separate
+// (platform/server/dist), then drives THREE browser instances (separate
 // processes: no cross-tab timer throttling) through the window.__bank debug
 // surface against the multi-game static route /bank/:
 //   A createPrivate('Alice') -> private-room code; B joinPrivate('Bob', code);
 //   both see 2 players; the current player (found by polling state()) rolls
 //   until pot > 0; B banks mid-round REGARDLESS of turn -> B score == pot at
 //   bank time, the pot itself is UNCHANGED (banking never drains it), B is
-//   marked banked; the non-banked page keeps rolling until the round ends
+//   marked banked; the non-banked pages keep rolling until the round ends
 //   (bust7 / all_banked; the 30s auto-roll backstops termination) -> the
 //   round increments (or match_end after round 10 — loop is capped).
+// (20) mid-round join (docs/BANK.md "Join/leave"): page C joins the SAME code
+//   during round 1 -> all three pages see players.length === 3, C's entry is
+//   NOT pre-banked (banked=false: mid-round joiners participate immediately),
+//   and the turn reaches C within one full cycle (poll up to ~60s; the 30s
+//   auto-roll backstops any stall). The roll/round-out loops then drive C too.
+// (21) reconnect (docs/BANK.md "Rejoin (resume token)"): B's playerId + banked
+//   score are read, page B RELOADS and joinPrivate('Bob', code) re-sends the
+//   client's stored resume token -> the room re-binds B's entry to the new
+//   session: exactly one Bob, score preserved, players.length unchanged on A
+//   (no ghost duplicate).
 // Then the room-variant flow: A createPrivate('Alice', {sevenBonus:false,
 //   totalRounds:20}) — the lobby leaves the current room on create — opens a
 //   SECOND private room on the variant; B rejoins by the fresh code; both
@@ -292,16 +302,69 @@ async function main() {
   }, 15000, "phase 'playing'");
   check("phase reaches 'playing' with 2 players", true);
 
+  // -- (20) mid-round join: C sits down in round 1 and plays IMMEDIATELY -----------
+  // docs/BANK.md "Join/leave": a mid-round joiner is appended to the END of the
+  // order with banked=false — no spectating with banked=true until next round.
+  const C = await launchOne('C');
+  await C.goto(`${BASE}/bank/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await waitFor(() => C.evaluate(() => !!window.__bank), 15000, '__bank on C');
+  await C.evaluate((c) => window.__bank.joinPrivate('Carol', c), code);
+  const threeWay = await waitFor(async () => {
+    const [sa, sb, sc] = await Promise.all([bankState(A), bankState(B), bankState(C)]);
+    return sa !== null &&
+      sb !== null &&
+      sc !== null &&
+      sa.players.length === 3 &&
+      sb.players.length === 3 &&
+      sc.players.length === 3 &&
+      sc.players.some((p) => p.name === 'Carol')
+      ? { sa, sb, sc }
+      : null;
+  }, 10000, 'players.length === 3 on all three pages');
+  check(
+    'mid-round join: C joins round 1 — all three pages see 3 players',
+    true,
+    `C sees [${threeWay.sc.players.map((p) => p.name)}]`,
+  );
+  const carolOnC = threeWay.sc.players.find((p) => p.id === threeWay.sc.you);
+  const carolOnA = threeWay.sa.players.find((p) => p.name === 'Carol');
+  check(
+    'mid-round join: C is NOT pre-banked (participates immediately)',
+    carolOnC !== undefined && carolOnC.banked === false && carolOnA !== undefined && carolOnA.banked === false,
+    `banked C-view=${carolOnC?.banked} A-view=${carolOnA?.banked}`,
+  );
+  // The turn must REACH C within one full cycle. A/B roll promptly when current
+  // (C's own turn is left alone so it can be observed; the 30s auto-roll
+  // backstops a stall); the poll rides over a round boundary if a bust7 lands
+  // first — C keeps its slot (and banked=false) in the next round.
+  const cId = threeWay.sc.you;
+  const cTurnT0 = Date.now();
+  let cTurn = null;
+  while (Date.now() - cTurnT0 < 60000) {
+    const [sa, sb, sc] = await Promise.all([bankState(A), bankState(B), bankState(C)]);
+    if (sc !== null && sc.currentId !== null && sc.currentId === cId) {
+      cTurn = sc;
+      break;
+    }
+    if (!(await rollIfCurrent(A, sa))) await rollIfCurrent(B, sb);
+    await sleep(300);
+  }
+  check(
+    'mid-round join: the turn reaches C within one full cycle',
+    cTurn !== null,
+    cTurn !== null ? `round=${cTurn.round} currentId=${cTurn.currentId}` : 'C never became currentId within 60s',
+  );
+
   // -- roll until the pot grows (first safe-window roll always adds to it) ----------------
   const rollT0 = Date.now();
   let potState = null;
   while (Date.now() - rollT0 < 60000) {
-    const [sa, sb] = await Promise.all([bankState(A), bankState(B)]);
+    const [sa, sb, sc] = await Promise.all([bankState(A), bankState(B), bankState(C)]);
     if (sa !== null && sa.phase === 'playing' && sa.pot > 0) {
       potState = sa;
       break;
     }
-    if (!(await rollIfCurrent(A, sa))) await rollIfCurrent(B, sb);
+    if (!(await rollIfCurrent(A, sa)) && !(await rollIfCurrent(B, sb))) await rollIfCurrent(C, sc);
     await sleep(400);
   }
   check(
@@ -344,21 +407,21 @@ async function main() {
     `A.pot=${aAfterBank?.pot} B.pot=${banked.s.pot} (was ${potAtBank})`,
   );
 
-  // -- the non-banked page rolls the round out (bust7 / all_banked) --------------------------
-  // B sits the round out; A is the only non-banked player. The pot only GROWS
+  // -- the non-banked pages roll the round out (bust7 / all_banked) ----------------------
+  // B sits the round out; A and C are the non-banked players. The pot only GROWS
   // on non-bust rolls, so a post-safe-window 7 ends it; the 30s auto-roll
   // backstops any stall. Cap the loop: match_end after round 10 also exits.
   const roundBefore = banked.s.round;
   const roundT0 = Date.now();
   let endSeen = null;
   while (Date.now() - roundT0 < 150000) {
-    const s = await bankState(A);
+    const [s, sc] = await Promise.all([bankState(A), bankState(C)]);
     if (s !== null) {
       if (s.phase !== 'playing' || s.round > roundBefore) {
         endSeen = s;
         break;
       }
-      await rollIfCurrent(A, s);
+      if (!(await rollIfCurrent(A, s))) await rollIfCurrent(C, sc);
     }
     await sleep(350);
   }
@@ -375,6 +438,71 @@ async function main() {
     'round increments after the round ends (or match_end)',
     true,
     `round ${roundBefore} -> ${advanced.round} phase=${advanced.phase}`,
+  );
+
+  // -- (21) reconnect: B reloads and RESUMES its entry via the stored resume token -----
+  // docs/BANK.md "Rejoin (resume token)": the client persists its playerId and
+  // joinPrivate re-sends it as `resume`; the room re-binds the disconnected
+  // entry to the NEW session id (order slot, score, banked preserved) instead
+  // of appending a second Bob. Per the contract the rebound entry's id BECOMES
+  // the new session id, so state().you rotates on reload — identity continuity
+  // is asserted as: exactly one Bob, bound to B's current session (id === you),
+  // the original id consumed, player count unchanged.
+  const bOrig = await bankState(B);
+  const bOrigYou = bOrig.you;
+  const bOrigScore = bOrig.score; // banked in round 1; kept across rounds
+  const aCountBefore = (await bankState(A)).players.length;
+  await B.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+  // welcomed again (fresh session) before joining: you is non-null once the
+  // new welcome lands, so joinPrivate goes out on an open socket with the
+  // client's stored resume token attached.
+  await waitFor(
+    () => B.evaluate(() => window.__bank?.state()?.you != null),
+    15000,
+    'B welcomed again after reload',
+  );
+  await B.evaluate((c) => window.__bank.joinPrivate('Bob', c), code);
+  const bBack = await waitFor(async () => {
+    const s = await bankState(B);
+    if (s === null || s.you === null) return null;
+    const me = s.players.find((p) => p.id === s.you);
+    return me !== undefined && me.name === 'Bob' ? s : null;
+  }, 10000, 'B back at the table after reload');
+  const bobs = bBack.players.filter((p) => p.name === 'Bob');
+  check(
+    'rejoin: B resumes the SAME entry — one Bob, rebound to the new session (no duplicate)',
+    bBack.players.length === aCountBefore &&
+      bobs.length === 1 &&
+      bobs[0].id === bBack.you &&
+      !bBack.players.some((p) => p.id === bOrigYou),
+    `you ${bOrigYou} -> ${bBack.you}; players=${bBack.players.length} (was ${aCountBefore})`,
+  );
+  check(
+    "rejoin: B's banked score survives the reload",
+    bobs[0].score === bOrigScore && bBack.score === bOrigScore,
+    `score=${bBack.score} (was ${bOrigScore})`,
+  );
+  // Measured on A (not a hard gate): the same broadcast reaches every page,
+  // so poll briefly for A's view to settle on the rebound entry, then check.
+  const aAfterRejoin = await (async () => {
+    const t0 = Date.now();
+    let last = null;
+    while (Date.now() - t0 < 10000) {
+      const s = await bankState(A);
+      if (s !== null) {
+        last = s;
+        const seen = s.players.filter((p) => p.name === 'Bob');
+        if (s.players.length === aCountBefore && seen.length === 1 && seen[0].id === bBack.you) return s;
+      }
+      await sleep(200);
+    }
+    return last;
+  })();
+  const aBobs = aAfterRejoin === null ? [] : aAfterRejoin.players.filter((p) => p.name === 'Bob');
+  check(
+    'rejoin: A sees players.length unchanged (no ghost duplicate)',
+    aAfterRejoin !== null && aAfterRejoin.players.length === aCountBefore && aBobs.length === 1,
+    `A sees ${aAfterRejoin?.players.length} players (was ${aCountBefore}), Bobs=${aBobs.length}`,
   );
 
   // -- (14) room variants: settings reach state() + the header chip --------------------
