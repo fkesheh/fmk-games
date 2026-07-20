@@ -3,15 +3,29 @@
 // Session plumbing over `ws`. Static layout (multi-game): the generated
 // launcher page is served at / and each registered game's client dist under
 // its /<gameId>/ prefix (falls back to that dist's index.html on any miss).
-// Invariants: every inbound payload passes parseC2S or is dropped silently
-// (never throw on wire data); app-level 'ping' is answered here (transport
-// concern, never reaches hooks); a throwing hook must never kill the process.
-// rtt comes from ws protocol-level ping/pong.
+// Dev mode: a game whose vite dev server answers probeDevServer is mounted as
+// a reverse PROXY to that server (plain node:http, no deps) instead of the
+// static dist, so one port serves launcher + both HMR clients; vite's HMR
+// websocket targets the page origin (its own base path), so matching upgrade
+// requests are tunneled to the vite server too. Invariants: every inbound
+// payload passes parseC2S or is dropped silently (never throw on wire data);
+// app-level 'ping' is answered here (transport concern, never reaches hooks);
+// a throwing hook must never kill the process. rtt comes from ws
+// protocol-level ping/pong.
 // ============================================================================
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import {
+  createServer,
+  get as httpGet,
+  request as httpRequest,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from 'node:http';
+import { connect as tcpConnect } from 'node:net';
 import path from 'node:path';
+import type { Duplex } from 'node:stream';
 import { WebSocket, WebSocketServer, type RawData } from 'ws';
 import { NET, encodeS2C, parseC2S } from '@platform/shared';
 import type { C2S, PlayerId, S2C } from '@platform/shared';
@@ -117,8 +131,46 @@ export interface NetHooks {
 
 /** One game's static mount: its built client dist served under `prefix`. */
 export interface StaticMount {
+  readonly kind: 'static';
   readonly prefix: string; // '/fps/' — leading + trailing slash
   readonly dir: string; // absolute path to the built client dist
+}
+
+/**
+ * One game's dev mount: `prefix` is reverse-proxied to the vite dev server on
+ * localhost (http requests piped through, websocket upgrades tunneled for HMR).
+ */
+export interface ProxyMount {
+  readonly kind: 'proxy';
+  readonly prefix: string; // '/fps/' — leading + trailing slash
+  readonly port: number; // vite dev-server port
+}
+
+export type Mount = StaticMount | ProxyMount;
+
+// Response headers that describe the upstream hop, not the resource — node
+// re-chunks/re-frames the piped body for the downstream connection itself.
+const HOP_BY_HOP_HEADERS = new Set(['connection', 'transfer-encoding', 'keep-alive']);
+
+/**
+ * One-shot liveness probe for a vite dev server: GET its game base path with
+ * a short timeout. Any http status under 500 means a live server (even a 404
+ * proves something is listening); connection errors and timeouts mean it is
+ * not running. Probing the base path (not just the port) keeps a foreign
+ * process on the same port from looking like vite only when it 500s there.
+ */
+export function probeDevServer(port: number, prefix: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const req = httpGet({ host: 'localhost', port, path: prefix, timeout: 500 }, (res) => {
+      res.resume(); // drain so the socket can be reused/closed cleanly
+      resolve((res.statusCode ?? 500) < 500);
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.on('error', () => resolve(false));
+  });
 }
 
 export class NetServer {
@@ -132,9 +184,9 @@ export class NetServer {
     this.hooks = hooks;
   }
 
-  start(port: number, mounts: readonly StaticMount[], launcherHtml: string): void {
+  start(port: number, mounts: readonly Mount[], launcherHtml: string): void {
     const http = createServer((req, res) => {
-      serveStatic(req, res, mounts, launcherHtml).catch((err: unknown) => {
+      serveHttp(req, res, mounts, launcherHtml).catch((err: unknown) => {
         console.error('[net] http error', err);
         if (!res.headersSent) res.writeHead(500);
         res.end('Internal Server Error');
@@ -156,10 +208,18 @@ export class NetServer {
         return;
       }
       if (pathname === '/ws') {
+        // the game websocket — always the platform's own, never proxied
         wss.handleUpgrade(req, socket, head, (ws2) => wss.emit('connection', ws2, req));
-      } else {
-        socket.destroy();
+        return;
       }
+      // vite HMR sockets target the page origin at the game's base path
+      // (e.g. ws://host/fps/?token=...), so they must be tunneled upstream
+      const proxy = mounts.find((m): m is ProxyMount => m.kind === 'proxy' && pathname.startsWith(m.prefix));
+      if (proxy) {
+        proxyUpgrade(req, socket, head, proxy);
+        return;
+      }
+      socket.destroy();
     });
 
     // ws protocol-level ping to every socket; pongs update per-session rtt
@@ -169,7 +229,10 @@ export class NetServer {
     this.pingTimer.unref();
 
     http.listen(port, () => {
-      const games = mounts.map((m) => m.prefix).join(' ') || 'none';
+      const games =
+        mounts
+          .map((m) => (m.kind === 'proxy' ? `${m.prefix} (proxy :${m.port})` : `${m.prefix} (static)`))
+          .join(' ') || 'none';
       console.log(`[net] listening on http://localhost:${port} (ws at /ws, games: ${games})`);
     });
   }
@@ -242,11 +305,11 @@ function rawText(data: RawData): string {
   return Buffer.from(data).toString('utf8');
 }
 
-// ---- http: launcher at /, per-game dists under /<id>/ with SPA fallback ----
-async function serveStatic(
+// ---- http: launcher at /, per-game mounts under /<id>/ with SPA fallback ----
+async function serveHttp(
   req: IncomingMessage,
   res: ServerResponse,
-  mounts: readonly StaticMount[],
+  mounts: readonly Mount[],
   launcherHtml: string,
 ): Promise<void> {
   let pathname: string;
@@ -272,6 +335,10 @@ async function serveStatic(
       return;
     }
     if (pathname.startsWith(mount.prefix)) {
+      if (mount.kind === 'proxy') {
+        proxyRequest(req, res, mount);
+        return;
+      }
       await serveGameFile(mount.dir, pathname.slice(mount.prefix.length), res);
       return;
     }
@@ -279,6 +346,66 @@ async function serveStatic(
 
   res.writeHead(404);
   res.end('Not Found');
+}
+
+/**
+ * Forward one http request to the game's vite dev server (original method,
+ * url — path + query — and headers) and pipe its response back, minus
+ * hop-by-hop headers. An unreachable upstream answers 502 with instructions;
+ * that can only race in if vite dies between the startup probe and now.
+ */
+function proxyRequest(req: IncomingMessage, res: ServerResponse, mount: ProxyMount): void {
+  const upstream = httpRequest(
+    {
+      host: 'localhost',
+      port: mount.port,
+      method: req.method,
+      path: req.url,
+      headers: req.headers,
+    },
+    (upRes) => {
+      const headers: Record<string, string | string[]> = {};
+      for (const [name, value] of Object.entries(upRes.headers)) {
+        if (value === undefined || HOP_BY_HOP_HEADERS.has(name)) continue;
+        headers[name] = value;
+      }
+      res.writeHead(upRes.statusCode ?? 502, headers);
+      upRes.pipe(res);
+    },
+  );
+  upstream.on('error', () => {
+    if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end(
+      `Bad Gateway: the vite dev server for ${mount.prefix} is not reachable on :${mount.port}.\n` +
+        'Start it with `npm run dev` from the repo root (it launches platform + both games).\n',
+    );
+  });
+  req.pipe(upstream);
+}
+
+/**
+ * Tunnel a websocket upgrade to the game's vite dev server (HMR client). The
+ * original request line and headers are replayed verbatim — vite 8 only
+ * accepts the upgrade when the path equals the client base (`/fps/`) and the
+ * `vite-hmr` subprotocol + token query pass through, so nothing is rewritten.
+ */
+function proxyUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer, mount: ProxyMount): void {
+  const upstream = tcpConnect(mount.port, 'localhost', () => {
+    let requestHead = `${req.method ?? 'GET'} ${req.url ?? '/'} HTTP/${req.httpVersion}\r\n`;
+    for (let i = 0; i + 1 < req.rawHeaders.length; i += 2) {
+      const name = req.rawHeaders[i];
+      const value = req.rawHeaders[i + 1];
+      if (name === undefined || value === undefined) continue;
+      requestHead += `${name}: ${value}\r\n`;
+    }
+    upstream.write(requestHead + '\r\n');
+    if (head.length > 0) upstream.write(head);
+    upstream.pipe(socket);
+    socket.pipe(upstream);
+  });
+  upstream.on('error', () => socket.destroy());
+  socket.on('error', () => upstream.destroy());
+  socket.on('close', () => upstream.destroy());
 }
 
 /** Serve one file from a game dist; any miss falls back to its index.html (SPA). */

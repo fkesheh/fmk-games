@@ -1,35 +1,45 @@
 // ============================================================================
 // Platform entry: wire NetServer <-> Lobby over the game registry, serve the
-// generated launcher page at / and every registered game's client dist under
-// /<gameId>/ (per-prefix SPA fallback; games without a build on disk are
-// listed but not mounted), run the 1s stale sweep (closes sockets of
-// input-stale/kicked players; the lobby reaps empty rooms in the same poll),
-// and shut down cleanly on SIGTERM/SIGINT. A throwing hook must never kill
-// the process: net.ts wraps hook calls, the lobby wraps its bodies, and the
-// sweep wraps its poll.
+// generated launcher page at / and every registered game under /<gameId>/ —
+// PROXIED to its vite dev server when GameModule.devPort answers (dev mode,
+// per-prefix HMR included), else its built client dist with SPA fallback
+// (production; games without a build on disk are listed but not mounted) —
+// run the 1s stale sweep (closes sockets of input-stale/kicked players; the
+// lobby reaps empty rooms in the same poll), and shut down cleanly on
+// SIGTERM/SIGINT. A throwing hook must never kill the process: net.ts wraps
+// hook calls, the lobby wraps its bodies, and the sweep wraps its poll.
 // ============================================================================
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type { GameModule } from '@platform/shared';
-import { NetServer, type StaticMount } from './net.js';
+import { NetServer, probeDevServer, type Mount } from './net.js';
 import { Lobby } from './lobby.js';
 import { GAMES } from './registry.js';
 
 const PORT = Number(process.env.PORT ?? 8080);
 
 /**
- * Static mounts for the multi-game layout: one '/<id>/' prefix per registered
- * module whose built client (index.html) is on disk. A game without a build
- * is skipped here but still appears on the launcher (its link 404s).
+ * Mounts for the multi-game layout: one '/<id>/' prefix per registered
+ * module. A module whose devPort answers the one-shot probe is proxied to
+ * that vite dev server (single dev entry point through this server);
+ * otherwise its built client (index.html on disk) is served statically —
+ * the only mode possible in production, where no vite server runs. A game
+ * with neither is skipped here but still appears on the launcher (404s).
  */
-function resolveMounts(modules: readonly GameModule[]): StaticMount[] {
-  const mounts: StaticMount[] = [];
-  for (const mod of modules) {
-    if (existsSync(path.join(mod.clientDist, 'index.html'))) {
-      mounts.push({ prefix: `/${mod.id}/`, dir: mod.clientDist });
-    }
-  }
-  return mounts;
+async function resolveMounts(modules: readonly GameModule[]): Promise<Mount[]> {
+  const resolved = await Promise.all(
+    modules.map(async (mod): Promise<Mount | null> => {
+      const prefix = `/${mod.id}/`;
+      if (mod.devPort !== undefined && (await probeDevServer(mod.devPort, prefix))) {
+        return { kind: 'proxy', prefix, port: mod.devPort };
+      }
+      if (existsSync(path.join(mod.clientDist, 'index.html'))) {
+        return { kind: 'static', prefix, dir: mod.clientDist };
+      }
+      return null;
+    }),
+  );
+  return resolved.filter((m): m is Mount => m !== null);
 }
 
 /** Registry values are trusted constants; escape anyway before inlining into HTML. */
@@ -98,7 +108,14 @@ const net = new NetServer({
   onDisconnect: (sess) => lobby.handleDisconnect(sess),
 });
 
-net.start(PORT, resolveMounts(GAMES), launcherHtml(GAMES));
+// Probing dev servers is async; everything else (lobby, sweep, signals) is
+// safe to set up now — net.close() tolerates a never-started NetServer.
+resolveMounts(GAMES)
+  .then((mounts) => net.start(PORT, mounts, launcherHtml(GAMES)))
+  .catch((err: unknown) => {
+    console.error('[server] startup failed', err);
+    process.exit(1);
+  });
 
 // 1s sweep: rooms report input-stale players; their sockets are closed here.
 // The same poll reaps empty rooms.

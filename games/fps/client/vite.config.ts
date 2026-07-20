@@ -10,6 +10,8 @@ export default defineConfig({
     },
   },
   server: {
+    port: 5173,
+    strictPort: true, // never drift — the platform dev proxy probes this exact port
     proxy: {
       '/ws': {
         target: 'ws://localhost:8080',

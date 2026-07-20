@@ -66,6 +66,9 @@ export const bankModule: GameModule = {
   id: 'bank',
   name: 'BANK',
   clientDist: resolveClientDist(),
+  // vite dev server (npm run dev -w @bank/client): the platform proxies /bank/
+  // here when it answers, so one port (8080) serves launcher + HMR client.
+  devPort: 5174,
   createRoom(opts): GameRoomHandle {
     return new BankRoom(opts.visibility, opts.io, resolveSettings(opts.settings));
   },

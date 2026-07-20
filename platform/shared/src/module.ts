@@ -50,7 +50,9 @@ export interface GameRoomHandle {
 export interface GameModule {
   readonly id: string; // 'fps'
   readonly name: string; // display name
-  readonly clientDist: string; // absolute path to the built client (served at /)
+  readonly clientDist: string; // absolute path to the built client (served at /<id>/)
+  readonly devPort?: number; // vite dev-server port; when reachable, /<id>/ is proxied
+  // there instead of serving clientDist (single dev entry point through the platform server)
   createRoom(opts: {
     visibility: Visibility;
     io: RoomIO;

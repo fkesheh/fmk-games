@@ -54,6 +54,9 @@ export const fpsModule: GameModule = {
   id: 'fps',
   name: 'STRICKEN',
   clientDist: resolveClientDist(),
+  // vite dev server (npm run dev -w @fps/client): the platform proxies /fps/
+  // here when it answers, so one port (8080) serves launcher + HMR client.
+  devPort: 5173,
   createRoom(opts): GameRoomHandle {
     const mapId = mapIdFrom(opts.settings);
     // The platform RoomIO is structurally identical to the fps contract's own
