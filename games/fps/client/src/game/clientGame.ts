@@ -1115,7 +1115,11 @@ export class ClientGame {
           break;
         }
         case 'menu': {
-          if (this.world !== null) {
+          // Esc priority: an open buy menu eats it first ("B / Esc to close") —
+          // only a second Esc, with no buy menu open, reaches the pause menu.
+          if (this.buyOpen) {
+            this.closeBuy();
+          } else if (this.world !== null) {
             this.menus.showPause(this.botCount(), this.state.team);
             if (document.pointerLockElement !== null) document.exitPointerLock();
           } else {
