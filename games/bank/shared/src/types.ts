@@ -48,6 +48,7 @@ export interface BankState {
   players: BankPlayerState[]; // join order
   lastRoll: LastRoll | null;
   winnerId: string | null; // set at matchEnd
+  code: string | null; // the room's private join code (null for public rooms)
   you: string; // the receiving player's id (per-recipient)
 }
 

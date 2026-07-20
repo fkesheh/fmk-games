@@ -30,6 +30,15 @@
 //   pages must deep-match state().settings ({sevenBonus:false,totalRounds:20,
 //   raceTarget:null}) and show the variant label in the table header chip
 //   ("20 rounds · plain 7").
+// (26) invite: in A's private room the table UI must show the room's code in a
+//   visible chip next to a COPY-INVITE-ish button, and a fresh page D opened
+//   directly on /bank/?code=<code> must prefill the menu code input (or
+//   auto-join the room from the param). D is closed afterwards.
+// (27) leave: A clicks the top-bar LEAVE button (.table-top > button.btn-small,
+//   wired to leaveToMenu in game.ts) -> A lands back on the menu, B's
+//   players.length drops to 1 within 5s, and 5s later A is still on the menu
+//   with players unchanged (an explicit leave drops the resume record: no
+//   auto-rejoin).
 //
 // The join code is read from state().code first; fallbacks are the lobby's
 // server-log line ("created (private, code XXXXX, game bank)") and a DOM
@@ -562,6 +571,132 @@ async function main() {
     'variant: table header chip shows the variant label (both pages)',
     variantLabelIn(headerA) && variantLabelIn(headerB),
     `A="${headerA.split('\n')[0]?.trim()}" B="${headerB.split('\n')[0]?.trim()}"`,
+  );
+
+  // -- (26) invite: the private-room code is shareable from the table UI ----------
+  // A is in the variant private room. The table screen must carry the room's
+  // code in a visible element (the share chip) plus a COPY-INVITE-ish button,
+  // and /bank/?code=<code> on a fresh page D must either prefill the menu's
+  // code input or auto-join the room straight from the query param. These are
+  // soft checks (no waitFor abort) so a lagging client feature fails only the
+  // invite assertions. D is closed at the end (its ghost, if it auto-joined,
+  // is purged at the round's end per docs/BANK.md "Ghost purge").
+  const inviteCode = (await bankState(A))?.code ?? variantCode;
+  const codeChip = await A.evaluate((c) => {
+    if (c === null) return null;
+    const scope = document.querySelector('.table');
+    if (scope === null) return null;
+    const visible = (el) => {
+      for (let n = el; n !== null; n = n.parentElement) {
+        if (n.classList !== undefined && n.classList.contains('hidden')) return false;
+      }
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    };
+    const leaf = [...scope.querySelectorAll('*')].find(
+      (el) =>
+        el.children.length === 0 &&
+        (el.textContent ?? '').toUpperCase().includes(c.toUpperCase()) &&
+        visible(el),
+    );
+    return leaf === undefined ? null : (leaf.textContent ?? '').trim();
+  }, inviteCode ?? null);
+  check(
+    'invite: code chip visible in the table UI carrying the room code',
+    inviteCode !== null && codeChip !== null && codeChip.toUpperCase().includes(inviteCode.toUpperCase()),
+    codeChip !== null ? `"${codeChip}" (code ${inviteCode})` : `no visible element carries ${inviteCode}`,
+  );
+
+  const copyBtn = await A.evaluate(() => {
+    const btn = [...document.querySelectorAll('.table button')].find((b) =>
+      /copy|invite/i.test(b.textContent ?? ''),
+    );
+    return btn === undefined ? null : (btn.textContent ?? '').trim();
+  });
+  check("invite: a 'COPY INVITE'-ish button exists in the table UI", copyBtn !== null, copyBtn ?? 'none found');
+
+  const D = await launchOne('D');
+  await D.goto(`${BASE}/bank/?code=${encodeURIComponent(inviteCode ?? '')}`, {
+    waitUntil: 'domcontentloaded',
+    timeout: 30000,
+  });
+  await waitFor(() => D.evaluate(() => !!window.__bank), 15000, '__bank on D');
+  let dVia = null;
+  try {
+    dVia = await waitFor(async () => {
+      const s = await bankState(D);
+      if (s !== null && s.you !== null && s.players.some((p) => p.id === s.you)) {
+        return `auto-join (D in the room, players=${s.players.length})`;
+      }
+      const inputVal = await D.evaluate(() => document.querySelector('.menu-code-input')?.value ?? null);
+      return inviteCode !== null && inputVal === inviteCode ? `prefill (input=${inputVal})` : null;
+    }, 10000, 'D ?code= prefill/auto-join');
+  } catch {
+    // recorded as a failing check below — the leave flow does not depend on D
+  }
+  check(
+    'invite: /bank/?code=<code> prefills the code input (or auto-joins)',
+    dVia !== null,
+    dVia ?? 'neither prefill nor auto-join within 10s',
+  );
+  await D.close();
+
+  // -- (27) leave: A's LEAVE button exits to the menu and frees the seat ----------
+  // game.ts wires the table top bar's DIRECT-child `button.btn.btn-small` (text
+  // 'LEAVE') to leaveToMenu('') -> {t:'leave'} + showMenu (the COPY INVITE button
+  // shares the classes but is nested inside .table-invite — the child combinator
+  // keeps the selector unique). An explicit leave also drops the resume record
+  // (clearResume), so A must NOT auto-rejoin: B's player count drops by one
+  // within 5s and stays there, A still on the menu 5s later.
+  const LEAVE_SEL = '.table-top > button.btn-small';
+  await A.waitForSelector(LEAVE_SEL, { visible: true, timeout: 10000 });
+  const leaveLabel = await A.evaluate(
+    (sel) => document.querySelector(sel)?.textContent?.trim() ?? null,
+    LEAVE_SEL,
+  );
+  check('leave: the top-bar LEAVE button is present', leaveLabel === 'LEAVE', leaveLabel ?? 'not found');
+
+  const bBeforeLeave = (await bankState(B)).players.length;
+  await A.click(LEAVE_SEL);
+  const aMenu = await waitFor(async () => {
+    const onMenu = await A.evaluate(() => {
+      const m = document.querySelector('.screen.menu');
+      return m !== null && !m.classList.contains('hidden');
+    });
+    if (!onMenu) return null;
+    const s = await bankState(A);
+    return s !== null && s.phase === 'none' && s.players.length === 0 ? s : null;
+  }, 5000, 'A back on the menu after LEAVE');
+  check('leave: A lands back on the menu (menu screen visible)', true, `phase=${aMenu.phase}`);
+
+  const bAfter = await waitFor(async () => {
+    const s = await bankState(B);
+    return s !== null && s.players.length === bBeforeLeave - 1 && !s.players.some((p) => p.name === 'Alice')
+      ? s
+      : null;
+  }, 5000, "B's players.length drops by one after A leaves");
+  check(
+    "leave: B's state().players.length drops to 1 within 5s (Alice gone)",
+    true,
+    `${bBeforeLeave} -> ${bAfter.players.length} [${bAfter.players.map((p) => p.name)}]`,
+  );
+
+  await sleep(5000);
+  const aStillMenu = await A.evaluate(() => {
+    const m = document.querySelector('.screen.menu');
+    return m !== null && !m.classList.contains('hidden');
+  });
+  const aIdle = await bankState(A);
+  const bIdle = await bankState(B);
+  check(
+    'leave: no auto-rejoin — A still on the menu, players unchanged after 5 more seconds',
+    aStillMenu &&
+      aIdle !== null &&
+      aIdle.phase === 'none' &&
+      aIdle.players.length === 0 &&
+      bIdle !== null &&
+      bIdle.players.length === bAfter.players.length,
+    `A.onMenu=${aStillMenu} A.players=${aIdle?.players.length} B.players=${bIdle?.players.length}`,
   );
 
   // -- error surface --------------------------------------------------------------------------

@@ -37,7 +37,12 @@ export interface GameRoomHandle {
   addPlayer(id: PlayerId, name: string, resume?: PlayerId): void;
   // resume: a playerId from a previous (disconnected) session. Games that support
   // rejoin may re-bind the new session to the old entry; others ignore it.
-  removePlayer(id: PlayerId): void;
+  /**
+   * permanent=true: the player explicitly left (C2S 'leave') — remove them fully.
+   * permanent=false/omitted: socket dropped — games MAY ghost the entry briefly
+   * (rejoin via resume) and purge later.
+   */
+  removePlayer(id: PlayerId, permanent?: boolean): void;
   /**
    * A room-level message from a player: the RAW decoded JSON object with a string
    * `t` field (envelope-checked by the platform). The GAME validates the rest with

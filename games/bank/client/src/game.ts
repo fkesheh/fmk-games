@@ -27,7 +27,14 @@ type LobbyMsg =
   | { t: 'pong'; ts: number; serverTime: number }
   | { t: 'error'; code: string; message: string };
 
-type S2C = LobbyMsg | BankState | BankEvent;
+/** bank_state plus the private-room code the server piggybacks alongside it. */
+interface StateMsg {
+  t: 'bank_state';
+  state: BankState;
+  code: string | null; // 5-char private-room code; null for public rooms/older servers
+}
+
+type S2C = LobbyMsg | StateMsg | BankEvent;
 
 function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
@@ -122,6 +129,7 @@ function parseState(v: Record<string, unknown>): BankState | null {
     players,
     lastRoll,
     winnerId: v.winnerId,
+    code: v.code === null ? null : str(v.code) ? v.code : null,
     you: v.you,
   };
 }
@@ -148,8 +156,12 @@ function parseS2C(raw: unknown): S2C | null {
       return str(raw.code) && str(raw.message)
         ? { t: 'error', code: raw.code, message: raw.message }
         : null;
-    case 'bank_state':
-      return parseState(raw);
+    case 'bank_state': {
+      const state = parseState(raw);
+      if (state === null) return null;
+      // the code rides beside the state (not part of the frozen BankState): optional
+      return { t: 'bank_state', state, code: str(raw.code) ? raw.code : null };
+    }
     case 'roll': {
       if (!num(raw.d1) || !num(raw.d2) || !str(raw.rollerId) || !num(raw.potAfter)) return null;
       const eff = effect(raw.effect);
@@ -191,6 +203,7 @@ interface BankDebugState {
   you: string | null;
   players: BankPlayerState[];
   score: number; // banked total of `you`
+  code: string | null; // private-room code when known (state piggyback or the join code)
   resume: string | null; // the stored rejoin token (localStorage 'bank.resume'), if any
 }
 
@@ -221,6 +234,7 @@ const NAME_MAX = 16; // lobby cleanName cap (platform protocol)
 const CODE_MAX = 8;
 const DICE_TUMBLE_MS = 600; // tumble frames before the dice settle on d1/d2
 const RESUME_KEY = 'bank.resume'; // localStorage: { playerId, code } rejoin record
+const NAME_KEY = 'bank.name'; // localStorage: last joined name (invite-link auto-join)
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -251,6 +265,9 @@ export class BankGame {
   private resumeToken: string | null = null; // rejoin token loaded from localStorage
   private roomCode: string | null = null; // code of the room we're in/joining, when known
   private state: BankState | null = null;
+  private stateCode: string | null = null; // private-room code piggybacked on bank_state
+  private pendingJoin: { name: string; code: string } | null = null; // invite-link auto-join
+  private copiedTimer = 0; // 'COPIED' feedback reset handle
   private rooms: RoomInfo[] = [];
   private screen: 'menu' | 'table' = 'menu';
   private readonly logLines: string[] = [];
@@ -273,6 +290,9 @@ export class BankGame {
   private readonly menuButtons: HTMLButtonElement[] = [];
   private readonly roundEl: HTMLDivElement;
   private readonly variantEl: HTMLDivElement;
+  private readonly inviteEl: HTMLDivElement;
+  private readonly inviteCodeEl: HTMLSpanElement;
+  private readonly copyBtn: HTMLButtonElement;
   private readonly potEl: HTMLDivElement;
   private readonly potFlashEl: HTMLDivElement;
   private readonly timerFillEl: HTMLDivElement;
@@ -378,6 +398,26 @@ export class BankGame {
     this.variantEl.style.color = 'var(--gold-bright)';
     this.variantEl.style.textTransform = 'uppercase';
     topBar.appendChild(this.variantEl);
+    // invite chip (private rooms only): 'CODE XXXXX' + copyable invite link
+    this.inviteEl = el('div', 'table-invite hidden');
+    this.inviteEl.style.display = 'flex';
+    this.inviteEl.style.alignItems = 'center';
+    this.inviteEl.style.gap = '8px';
+    this.inviteCodeEl = el('span', 'table-invite-code');
+    this.inviteCodeEl.style.padding = '4px 12px';
+    this.inviteCodeEl.style.border = '1px solid var(--gold-deep)';
+    this.inviteCodeEl.style.borderRadius = '999px';
+    this.inviteCodeEl.style.fontSize = '12px';
+    this.inviteCodeEl.style.letterSpacing = '0.18em';
+    this.inviteCodeEl.style.color = 'var(--gold-bright)';
+    this.inviteEl.appendChild(this.inviteCodeEl);
+    this.copyBtn = el('button', 'btn btn-small', 'COPY INVITE');
+    this.copyBtn.addEventListener('click', () => {
+      this.audio.resume();
+      this.copyInvite();
+    });
+    this.inviteEl.appendChild(this.copyBtn);
+    topBar.appendChild(this.inviteEl);
     const leaveBtn = el('button', 'btn btn-small', 'LEAVE');
     leaveBtn.addEventListener('click', () => {
       this.audio.resume();
@@ -456,6 +496,15 @@ export class BankGame {
     // ---- rejoin record (token captured BEFORE welcome overwrites storage) ------
     this.loadResume();
     if (this.roomCode !== null) this.codeInput.value = this.roomCode; // stored-code prefill
+
+    // ---- invite link (?code=XXXXX): prefill + auto-join, then strip the param ----
+    const linkCode = new URLSearchParams(location.search).get('code');
+    if (linkCode !== null && linkCode.length > 0) {
+      history.replaceState(null, '', location.pathname + location.hash); // no re-trigger on refresh
+      this.codeInput.value = linkCode; // link code beats the stored-code prefill
+      const name = this.storedName();
+      if (name !== null) this.pendingJoin = { name, code: linkCode }; // attempted after welcome
+    }
 
     this.connect();
     this.renderMenu();
@@ -545,6 +594,26 @@ export class BankGame {
     }
   }
 
+  // ---- last-joined name (localStorage 'bank.name') ------------------------------
+  /** The stored name for the invite-link auto-join; blocked storage => null. */
+  private storedName(): string | null {
+    try {
+      const v = localStorage.getItem(NAME_KEY);
+      return v !== null && v.trim().length > 0 ? v : null;
+    } catch {
+      return null; // storage blocked — no auto-join
+    }
+  }
+
+  /** Remembers the cleaned name on every join so an invite link can auto-join later. */
+  private persistName(name: string): void {
+    try {
+      localStorage.setItem(NAME_KEY, name);
+    } catch {
+      // storage blocked — non-fatal
+    }
+  }
+
   // ---- lobby actions (game filter 'bank' on every create/join) -------------------
   // Every join flow carries the stored rejoin token when we have one; the server
   // re-binds a disconnected ghost entry with that id (docs/BANK.md "Rejoin").
@@ -556,6 +625,7 @@ export class BankGame {
     };
     if (this.resumeToken !== null) msg.resume = this.resumeToken;
     this.roomCode = null; // public room: no code
+    this.persistName(msg.name);
     this.send(msg);
   }
   /** Variant chosen in the create section (or the e2e override passed in). */
@@ -575,6 +645,7 @@ export class BankGame {
     };
     if (this.resumeToken !== null) msg.resume = this.resumeToken;
     this.roomCode = null; // public room: no code
+    this.persistName(msg.name);
     this.send(msg);
   }
   private createPrivate(name: string, settings?: BankSettings): void {
@@ -587,6 +658,7 @@ export class BankGame {
     };
     if (this.resumeToken !== null) msg.resume = this.resumeToken;
     this.roomCode = null; // the code is server-generated; not known client-side
+    this.persistName(msg.name);
     this.send(msg);
   }
   private joinPrivate(name: string, code: string): void {
@@ -602,6 +674,7 @@ export class BankGame {
     };
     if (this.resumeToken !== null) msg.resume = this.resumeToken;
     this.roomCode = c; // candidate; a 'no_room' error clears it again
+    this.persistName(msg.name);
     this.send(msg);
   }
   private roll(): void {
@@ -621,6 +694,11 @@ export class BankGame {
         this.send({ t: 'list_rooms' });
         this.setNotice('');
         this.renderMenu();
+        if (this.pendingJoin !== null) {
+          const { name, code } = this.pendingJoin;
+          this.pendingJoin = null; // single attempt — on failure the error notice shows
+          this.joinPrivate(name, code);
+        }
         break;
       case 'room_list':
         this.rooms = msg.rooms.filter((r) => r.game === 'bank'); // bank-only room list
@@ -639,7 +717,7 @@ export class BankGame {
         this.setNotice(msg.message);
         break;
       case 'bank_state':
-        this.onState(msg);
+        this.onState(msg.state, msg.code);
         break;
       case 'roll':
         this.onRoll(msg);
@@ -659,7 +737,7 @@ export class BankGame {
     }
   }
 
-  private onState(s: BankState): void {
+  private onState(s: BankState, code: string | null): void {
     const first = this.state === null;
     const prevPhase = this.state?.phase ?? null;
     const wasMyTurn =
@@ -682,6 +760,7 @@ export class BankGame {
       return;
     }
     this.state = s;
+    this.stateCode = code; // refreshed every snapshot; drives the invite chip
     this.potTarget = s.pot;
 
     const myTurn = s.phase === 'playing' && s.currentId === this.playerId;
@@ -751,6 +830,7 @@ export class BankGame {
     this.send({ t: 'leave' });
     this.clearResume(); // explicit leave: no rejoin back into that room
     this.state = null;
+    this.stateCode = null;
     this.logLines.length = 0;
     this.bannerText = '';
     this.showMenu(notice);
@@ -821,6 +901,10 @@ export class BankGame {
     const s = this.state;
     if (s === null) return;
     this.variantEl.textContent = variantLabel(s.settings);
+    // invite chip: private rooms only (wire code wins; the join-known code is the fallback)
+    const inviteCode = this.stateCode ?? this.roomCode;
+    this.inviteEl.classList.toggle('hidden', inviteCode === null);
+    if (inviteCode !== null) this.inviteCodeEl.textContent = `CODE ${inviteCode}`;
     if (s.settings.raceTarget !== null) {
       const myScore = s.players.find((p) => p.id === this.playerId)?.score ?? 0;
       this.roundEl.textContent = `RACE TO ${s.settings.raceTarget} · ${myScore} / ${s.settings.raceTarget}`;
@@ -887,6 +971,48 @@ export class BankGame {
     this.potFlashEl.textContent = text;
   }
 
+  /** Copies the invite link; navigator.clipboard first, textarea fallback. */
+  private copyInvite(): void {
+    const code = this.stateCode ?? this.roomCode;
+    if (code === null) return;
+    const url = `${location.origin}/bank/?code=${code}`;
+    const clip: Clipboard | undefined = navigator.clipboard;
+    if (clip !== undefined) {
+      clip.writeText(url).then(
+        () => this.showCopied(),
+        () => this.copyInviteFallback(url), // denied (permissions/insecure ctx): fallback path
+      );
+    } else {
+      this.copyInviteFallback(url);
+    }
+  }
+
+  /** Pre-clipboard-era path: hidden textarea + execCommand('copy'). */
+  private copyInviteFallback(url: string): void {
+    const ta = el('textarea');
+    ta.value = url;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand('copy');
+    } catch {
+      // copy unsupported — the code is still readable in the chip
+    }
+    ta.remove();
+    this.showCopied();
+  }
+
+  /** Brief 'COPIED' label on the copy button. */
+  private showCopied(): void {
+    this.copyBtn.textContent = 'COPIED';
+    window.clearTimeout(this.copiedTimer);
+    this.copiedTimer = window.setTimeout(() => {
+      this.copyBtn.textContent = 'COPY INVITE';
+    }, 1200);
+  }
+
   private nameOf(id: string): string {
     return this.state?.players.find((p) => p.id === id)?.name ?? 'Someone';
   }
@@ -932,6 +1058,7 @@ export class BankGame {
         you: this.playerId,
         players: [],
         score: 0,
+        code: this.stateCode ?? this.roomCode,
         resume: this.resumeToken,
       };
     }
@@ -946,6 +1073,7 @@ export class BankGame {
       you: this.playerId,
       players: s.players.map((p) => ({ ...p })),
       score: me?.score ?? 0,
+      code: this.stateCode ?? this.roomCode,
       resume: this.resumeToken,
     };
   }

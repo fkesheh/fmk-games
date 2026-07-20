@@ -173,7 +173,13 @@ export class BankRoom implements GameRoomHandle {
     }
   }
 
-  removePlayer(id: PlayerId): void {
+  /**
+   * permanent=false/omitted: ghost — the entry + score persist (rejoin /
+   * low-pop abort) until the round-start purge. permanent=true (explicit
+   * leave): the entry is REMOVED at once, so the leaver vanishes from the
+   * rail immediately — the turn is advanced first if it was theirs.
+   */
+  removePlayer(id: PlayerId, permanent?: boolean): void {
     try {
       const p = this.players.get(id);
       if (p === undefined || !p.connected) return;
@@ -186,6 +192,9 @@ export class BankRoom implements GameRoomHandle {
           else if (this.currentId === id) this.nextTurn(); // it was their turn: advance
         }
       }
+      // explicit leave: the entry dies now (the flow above already moved the
+      // turn off them / nulled currentId, so no dangling reference survives)
+      if (permanent === true) this.players.delete(id);
       this.broadcastState();
     } catch (err) {
       console.error('[bank] removePlayer failed', err);
@@ -489,6 +498,7 @@ export class BankRoom implements GameRoomHandle {
     }
     return {
       t: 'bank_state',
+      code: this.code, // private-room invite code (null for public); everyone in the room may see it
       phase: this.phase,
       settings: this.settings, // frozen variant; never mutated, shared by reference
       round: this.round,

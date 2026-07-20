@@ -120,7 +120,7 @@ export class Lobby {
           this.joinPrivate(sess, msg.name, msg.code, msg.resume);
           break;
         case 'leave':
-          this.leaveRoom(sess.id);
+          this.leaveRoom(sess.id, true); // explicit leave: permanent removal
           break;
         case 'ping':
           break; // answered at the transport layer (net.ts); never routed
@@ -351,11 +351,11 @@ export class Lobby {
     room.addPlayer(sess.id, name, resume); // the room sends its own join payload
   }
 
-  private leaveRoom(id: PlayerId): void {
+  private leaveRoom(id: PlayerId, permanent = false): void {
     const room = this.sessionRoom.get(id);
     if (room === undefined) return;
     this.sessionRoom.delete(id); // before removePlayer: lobby-initiated, not a kick
-    room.removePlayer(id);
+    room.removePlayer(id, permanent);
     if (room.playerCount() > 0) return;
     const tracked = this.rooms.get(room.id);
     if (tracked === undefined) return;
