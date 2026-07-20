@@ -310,6 +310,14 @@ async function main() {
     potState !== null ? `pot=${potState.pot} rollCount=${potState.rollCount} round=${potState.round}` : 'pot still 0 after 60s',
   );
 
+  // -- roll EVENTS reach the UI (unwrap regression: log lines + dice animation) --------------
+  {
+    const logHasRoll = (p) =>
+      p.evaluate(() => [...document.querySelectorAll('.log-line')].some((el) => /rolled/i.test(el.textContent ?? '')));
+    const [la, lb] = await Promise.all([logHasRoll(A), logHasRoll(B)]);
+    check('roll events reach the UI (event log shows a roll on both pages)', la && lb, `A=${la} B=${lb}`);
+  }
+
   // -- felt-table shot (dice settled, pot up) ---------------------------------------------
   await sleep(900); // dice tumble (~600ms) settles on the rolled faces
   await shot(A, 'bank-table.png');

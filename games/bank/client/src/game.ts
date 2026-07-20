@@ -171,6 +171,9 @@ function parseS2C(raw: unknown): S2C | null {
       return str(raw.winnerId) || raw.winnerId === null
         ? { t: 'match_end', winnerId: raw.winnerId }
         : null;
+    case 'event':
+      // server wraps game events as {t:'event', ev} (fps/platform convention) — unwrap + re-parse
+      return parseS2C(raw.ev);
     default:
       return null; // unknown envelope: drop, never throw on wire data
   }
