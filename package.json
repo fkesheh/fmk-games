@@ -8,8 +8,8 @@
     "games/*/*"
   ],
   "scripts": {
-    "dev": "concurrently -n server,client \"npm run dev -w @platform/server\" \"npm run dev -w @fps/client\"",
-    "build": "npm run build -w @fps/client && npm run build -w @platform/server",
+    "dev": "concurrently -n server,fps,bank \"npm run dev -w @platform/server\" \"npm run dev -w @fps/client\" \"npm run dev -w @bank/client\"",
+    "build": "npm run build -w @fps/client && npm run build -w @bank/client && npm run build -w @platform/server",
     "start": "npm run start -w @platform/server",
     "typecheck": "npm run typecheck --workspaces",
     "test": "vitest run"

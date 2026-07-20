@@ -1,9 +1,12 @@
 // ============================================================================
-// S1 — transport: http static + SPA fallback, WebSocketServer on /ws, Session
-// plumbing over `ws`. Invariants: every inbound payload passes parseC2S or is
-// dropped silently (never throw on wire data); app-level 'ping' is answered
-// here (transport concern, never reaches hooks); a throwing hook must never
-// kill the process. rtt comes from ws protocol-level ping/pong.
+// S1 — transport: http static + per-game SPA fallback, WebSocketServer on /ws,
+// Session plumbing over `ws`. Static layout (multi-game): the generated
+// launcher page is served at / and each registered game's client dist under
+// its /<gameId>/ prefix (falls back to that dist's index.html on any miss).
+// Invariants: every inbound payload passes parseC2S or is dropped silently
+// (never throw on wire data); app-level 'ping' is answered here (transport
+// concern, never reaches hooks); a throwing hook must never kill the process.
+// rtt comes from ws protocol-level ping/pong.
 // ============================================================================
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
@@ -112,6 +115,12 @@ export interface NetHooks {
   onDisconnect(sess: Session): void;
 }
 
+/** One game's static mount: its built client dist served under `prefix`. */
+export interface StaticMount {
+  readonly prefix: string; // '/fps/' — leading + trailing slash
+  readonly dir: string; // absolute path to the built client dist
+}
+
 export class NetServer {
   private readonly hooks: NetHooks;
   private readonly sessions = new Map<PlayerId, Session>();
@@ -123,9 +132,9 @@ export class NetServer {
     this.hooks = hooks;
   }
 
-  start(port: number, staticDir: string | null): void {
+  start(port: number, mounts: readonly StaticMount[], launcherHtml: string): void {
     const http = createServer((req, res) => {
-      serveStatic(req, res, staticDir).catch((err: unknown) => {
+      serveStatic(req, res, mounts, launcherHtml).catch((err: unknown) => {
         console.error('[net] http error', err);
         if (!res.headersSent) res.writeHead(500);
         res.end('Internal Server Error');
@@ -160,7 +169,8 @@ export class NetServer {
     this.pingTimer.unref();
 
     http.listen(port, () => {
-      console.log(`[net] listening on http://localhost:${port} (ws at /ws, static: ${staticDir ?? 'none'})`);
+      const games = mounts.map((m) => m.prefix).join(' ') || 'none';
+      console.log(`[net] listening on http://localhost:${port} (ws at /ws, games: ${games})`);
     });
   }
 
@@ -232,13 +242,13 @@ function rawText(data: RawData): string {
   return Buffer.from(data).toString('utf8');
 }
 
-// ---- http: serve staticDir, SPA fallback to index.html on any miss ----
-async function serveStatic(req: IncomingMessage, res: ServerResponse, staticDir: string | null): Promise<void> {
-  if (staticDir === null) {
-    res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-    res.end('fps server running (no client build found)');
-    return;
-  }
+// ---- http: launcher at /, per-game dists under /<id>/ with SPA fallback ----
+async function serveStatic(
+  req: IncomingMessage,
+  res: ServerResponse,
+  mounts: readonly StaticMount[],
+  launcherHtml: string,
+): Promise<void> {
   let pathname: string;
   try {
     pathname = decodeURIComponent(new URL(req.url ?? '/', 'http://localhost').pathname);
@@ -247,10 +257,36 @@ async function serveStatic(req: IncomingMessage, res: ServerResponse, staticDir:
     res.end('Bad Request');
     return;
   }
-  if (pathname === '/') pathname = '/index.html';
 
-  const root = path.resolve(staticDir);
-  let filePath = path.resolve(root, `.${pathname}`);
+  if (pathname === '/') {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(launcherHtml);
+    return;
+  }
+
+  for (const mount of mounts) {
+    if (pathname === mount.prefix.slice(0, -1)) {
+      // '/fps' -> '/fps/' so the client's relative asset URLs stay under the prefix
+      res.writeHead(301, { location: mount.prefix });
+      res.end();
+      return;
+    }
+    if (pathname.startsWith(mount.prefix)) {
+      await serveGameFile(mount.dir, pathname.slice(mount.prefix.length), res);
+      return;
+    }
+  }
+
+  res.writeHead(404);
+  res.end('Not Found');
+}
+
+/** Serve one file from a game dist; any miss falls back to its index.html (SPA). */
+async function serveGameFile(dir: string, rel: string, res: ServerResponse): Promise<void> {
+  if (rel === '') rel = 'index.html';
+
+  const root = path.resolve(dir);
+  let filePath = path.resolve(root, rel);
   if (filePath !== root && !filePath.startsWith(root + path.sep)) {
     res.writeHead(403);
     res.end('Forbidden');

@@ -1,8 +1,22 @@
-# STRICKEN
+# STRICKEN (+ BANK) — multiplayer game platform
 
-A browser multiplayer tactical FPS in the spirit of Counter-Strike — three.js client,
-authoritative Node.js WebSocket server, zero assets (all geometry procedural, all audio
-synthesized, all colors from one frozen palette).
+A browser multiplayer game platform with two games sharing one server:
+- **STRICKEN** (`/fps/`) — tactical FPS in the spirit of Counter-Strike
+- **BANK** (`/bank/`) — the classic push-your-luck dice party game (canonical Bank rules)
+
+`/` is a launcher page; both games ride one WebSocket (`/ws`). Everything is
+procedural: no assets — flat-shaded low-poly 3D (FPS), DOM dice (BANK),
+synthesized WebAudio throughout, colors from frozen palettes.
+
+## BANK — rules (canonical)
+
+Two dice per turn into a shared pot, players rolling in join order. The first 3
+rolls of a round are safe — a 7 there is worth **70**. After that: **a 7 busts the
+round** (pot lost), **doubles double the pot**. Anyone may **BANK** at any time —
+pocket the current pot value and sit out the round (the pot keeps growing for the
+rest). Round ends on a bust or when everyone's banked. 10 rounds, highest banked
+total wins. 30s turn timer (server auto-rolls), up to 8 players, private rooms
+with share codes, quick-join public rooms.
 
 ## Features
 
@@ -68,8 +82,10 @@ matchmaking, and rooms; games plug in via one registry entry. Adding a new game 
   (`combat.ts`, `economy.ts`), bot brains (`bots.ts`), registry plug (`module.ts`)
 - `games/fps/client/` — three.js game client: prediction/interp (`net/`), renderer (`render/`),
   HUD/menus (`ui/`), orchestration (`game/`), synthesized audio (`audio/`)
-- `CONTRACT.md` — the frozen FPS contract; `docs/STRUCTURE.md` — the platform contract
-- `scripts/e2e.mjs` — two-browser end-to-end suite (join, phases, movement, kill, buy, bots, teams)
+- `games/bank/{shared,server,client}` — BANK dice: rules contract, turn-based room, felt-table UI
+- `CONTRACT.md` — the frozen FPS contract; `docs/STRUCTURE.md` — the platform contract;
+  `docs/BANK.md` — the BANK game contract
+- `scripts/e2e.mjs` — two-browser FPS suite · `scripts/e2e-bank.mjs` — two-browser BANK suite
 
 ## Gates
 

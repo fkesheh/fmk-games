@@ -1,27 +1,95 @@
 // ============================================================================
 // Platform entry: wire NetServer <-> Lobby over the game registry, serve the
-// first registered game's client dist at /, run the 1s stale sweep (closes
-// sockets of input-stale/kicked players; the lobby reaps empty rooms in the
-// same poll), and shut down cleanly on SIGTERM/SIGINT. A throwing hook must
-// never kill the process: net.ts wraps hook calls, the lobby wraps its bodies,
-// and the sweep wraps its poll.
+// generated launcher page at / and every registered game's client dist under
+// /<gameId>/ (per-prefix SPA fallback; games without a build on disk are
+// listed but not mounted), run the 1s stale sweep (closes sockets of
+// input-stale/kicked players; the lobby reaps empty rooms in the same poll),
+// and shut down cleanly on SIGTERM/SIGINT. A throwing hook must never kill
+// the process: net.ts wraps hook calls, the lobby wraps its bodies, and the
+// sweep wraps its poll.
 // ============================================================================
 import { existsSync } from 'node:fs';
 import path from 'node:path';
-import { NetServer } from './net.js';
+import type { GameModule } from '@platform/shared';
+import { NetServer, type StaticMount } from './net.js';
 import { Lobby } from './lobby.js';
 import { GAMES } from './registry.js';
 
 const PORT = Number(process.env.PORT ?? 8080);
 
 /**
- * Single-game platform: the first registered module's built client is served
- * at /. Falls back to the plain-text placeholder when no build is on disk.
+ * Static mounts for the multi-game layout: one '/<id>/' prefix per registered
+ * module whose built client (index.html) is on disk. A game without a build
+ * is skipped here but still appears on the launcher (its link 404s).
  */
-function resolveStaticDir(): string | null {
-  const dist = GAMES[0]?.clientDist;
-  if (dist === undefined) return null;
-  return existsSync(path.join(dist, 'index.html')) ? dist : null;
+function resolveMounts(modules: readonly GameModule[]): StaticMount[] {
+  const mounts: StaticMount[] = [];
+  for (const mod of modules) {
+    if (existsSync(path.join(mod.clientDist, 'index.html'))) {
+      mounts.push({ prefix: `/${mod.id}/`, dir: mod.clientDist });
+    }
+  }
+  return mounts;
+}
+
+/** Registry values are trusted constants; escape anyway before inlining into HTML. */
+function escapeHtml(s: string): string {
+  return s
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;');
+}
+
+/**
+ * The launcher page, generated inline (no build step): a dark arcade menu
+ * with one card per registered game linking to its /<id>/ client.
+ */
+function launcherHtml(modules: readonly GameModule[]): string {
+  const cards = modules
+    .map(
+      (m) =>
+        `      <a class="card" href="/${escapeHtml(m.id)}/">\n` +
+        `        <span class="name">${escapeHtml(m.name)}</span>\n` +
+        `        <span class="id">${escapeHtml(m.id)}</span>\n` +
+        `      </a>`,
+    )
+    .join('\n');
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ARCADE</title>
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+        align-items: center; justify-content: center; gap: 48px;
+        background: #0b0e14; color: #e8eaf0;
+        font-family: system-ui, -apple-system, sans-serif;
+      }
+      h1 { margin: 0; font-size: 40px; font-weight: 800; letter-spacing: 0.5em; text-indent: 0.5em; color: #f5c542; }
+      .grid { display: flex; flex-wrap: wrap; justify-content: center; gap: 24px; padding: 0 24px; }
+      .card {
+        display: flex; flex-direction: column; align-items: center; gap: 8px;
+        width: 220px; padding: 32px 16px; border: 1px solid #2a3142; border-radius: 12px;
+        background: #131826; color: inherit; text-decoration: none;
+        transition: border-color 120ms, transform 120ms;
+      }
+      .card:hover { border-color: #f5c542; transform: translateY(-2px); }
+      .card .name { font-size: 20px; font-weight: 700; letter-spacing: 0.15em; }
+      .card .id { font-size: 12px; color: #8a93a8; }
+    </style>
+  </head>
+  <body>
+    <h1>ARCADE</h1>
+    <main class="grid">
+${cards}
+    </main>
+  </body>
+</html>
+`;
 }
 
 const lobby = new Lobby(GAMES);
@@ -30,7 +98,7 @@ const net = new NetServer({
   onDisconnect: (sess) => lobby.handleDisconnect(sess),
 });
 
-net.start(PORT, resolveStaticDir());
+net.start(PORT, resolveMounts(GAMES), launcherHtml(GAMES));
 
 // 1s sweep: rooms report input-stale players; their sockets are closed here.
 // The same poll reaps empty rooms.

@@ -24,6 +24,7 @@ import puppeteer from 'puppeteer';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = Number(process.env.E2E_PORT ?? 8080);
 const BASE = `http://localhost:${PORT}`;
+const GAME_URL = `${BASE}/fps/`; // the launcher lives at /; the fps client is mounted at /fps/
 const SHOTS_DIR = path.join(ROOT, 'screenshots');
 const MAP_IDS = ['dustbowl', 'crossfire', 'office', 'frostbite', 'urbana', 'bunker'];
 
@@ -280,11 +281,11 @@ async function main() {
   const B = await launchOne('B');
 
   // -- load app, main menu shot ---------------------------------------------------
-  await A.goto(BASE, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await A.goto(GAME_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await waitFor(() => A.evaluate(() => !!window.__fps), 15000, '__fps on A');
   await sleep(800); // menu paint
   await shot(A, 'menu.png');
-  await B.goto(BASE, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await B.goto(GAME_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await waitFor(() => B.evaluate(() => !!window.__fps), 15000, '__fps on B');
 
   // -- private room create + join ---------------------------------------------------

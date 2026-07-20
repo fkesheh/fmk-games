@@ -8,7 +8,10 @@
       "@platform/shared/*": ["../shared/src/*"],
       "@fps/server": ["../../games/fps/server/src/module.ts"],
       "@fps/shared": ["../../games/fps/shared/src/index.ts"],
-      "@fps/shared/*": ["../../games/fps/shared/src/*"]
+      "@fps/shared/*": ["../../games/fps/shared/src/*"],
+      "@bank/server": ["../../games/bank/server/src/module.ts"],
+      "@bank/shared": ["../../games/bank/shared/src/index.ts"],
+      "@bank/shared/*": ["../../games/bank/shared/src/*"]
     }
   },
   "include": ["src"]
