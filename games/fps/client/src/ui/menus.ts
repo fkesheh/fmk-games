@@ -33,7 +33,7 @@ export interface MenuCallbacks {
 const NAME_KEY = 'stricken.name';
 const STYLE_ID = 'fps-menus-style';
 
-type LayerId = 'main' | 'buy' | 'score' | 'end' | 'joining' | 'pause' | 'chip';
+type LayerId = 'main' | 'buy' | 'score' | 'end' | 'joining' | 'pause' | 'chip' | 'botprompt';
 // modal layers are mutually exclusive; scoreboard + chip stack on top freely
 const MODALS: readonly LayerId[] = ['main', 'buy', 'end', 'joining', 'pause'];
 
@@ -138,6 +138,7 @@ export class Menus {
       joining: this.makeLayer('joining', true),
       pause: this.makeLayer('pause', true),
       chip: this.makeLayer('chip', false), // non-modal: never eats pointer events
+      botprompt: this.makeLayer('botprompt', false), // non-modal: only its panel takes events
     };
     this.buildJoining();
     this.buildPause();
@@ -359,6 +360,40 @@ export class Menus {
       el('div', 'm9-chip', code !== null ? `${roomLabel} · code ${code} (share)` : roomLabel),
     );
     this.show('chip');
+  }
+
+  // ---- bot prompt (bottom center-right, non-modal) --------------------------
+  // Suggests bots when a room is empty; auto-dismiss is the caller's job (C11).
+  showBotPrompt(onAdd: (n: number) => void, onDismiss: () => void): void {
+    const layer = this.layers.botprompt;
+    layer.textContent = '';
+
+    const panel = el('div', 'm9-botprompt');
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-label', 'Add bots to this room');
+    panel.appendChild(el('div', 'm9-botprompt-text', 'Alone in this room — add some bots?'));
+
+    const row = el('div', 'm9-botprompt-btns');
+    const add3 = el('button', 'm9-btn m9-btn-primary m9-btn-small', 'ADD 3 BOTS');
+    add3.type = 'button';
+    add3.addEventListener('click', () => onAdd(3));
+    const add1 = el('button', 'm9-btn m9-btn-small', 'ADD 1 BOT');
+    add1.type = 'button';
+    add1.addEventListener('click', () => onAdd(1));
+    const nope = el('button', 'm9-btn m9-btn-small', 'NO THANKS');
+    nope.type = 'button';
+    nope.addEventListener('click', () => onDismiss());
+    row.appendChild(add3);
+    row.appendChild(add1);
+    row.appendChild(nope);
+    panel.appendChild(row);
+
+    layer.appendChild(panel);
+    this.show('botprompt');
+  }
+
+  hideBotPrompt(): void {
+    this.hide('botprompt');
   }
 
   // ---- buy menu ---------------------------------------------------------------
@@ -793,6 +828,12 @@ const CSS = `
 .fps-menus .m9-layer-chip{align-items:flex-start;justify-content:flex-start;}
 .m9-chip{margin:14px;background:rgba(var(--m9-ink-rgb),.82);border:1px solid var(--m9-metalDark);
   border-radius:6px;padding:6px 10px;font-size:12px;letter-spacing:.05em;}
+
+.fps-menus .m9-layer-botprompt{align-items:flex-end;justify-content:flex-end;padding:0 6vw 96px;}
+.m9-botprompt{display:flex;flex-direction:column;gap:10px;pointer-events:auto;
+  background:rgba(var(--m9-ink-rgb),.82);border:1px solid var(--m9-metalDark);
+  border-radius:6px;padding:10px 14px;font-size:12px;letter-spacing:.05em;}
+.m9-botprompt-btns{display:flex;gap:6px;flex-wrap:wrap;}
 
 .m9-pause-panel{width:min(320px,92vw);display:flex;flex-direction:column;gap:10px;text-align:center;}
 .m9-pause-title{margin:0 0 6px;font-size:24px;letter-spacing:.2em;}

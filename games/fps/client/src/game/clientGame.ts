@@ -74,6 +74,7 @@ const STEP_EVERY_M = PLAYER.speedRun * 0.38; // one footstep per 1.824m ≈ 0.38
 const STEP_CLAMP_M = 0.5; // teleport/reconcile snaps never trigger footsteps
 const MOVE_MIN_SPEED = 0.5; // m/s — matches PlayerSnap.moving / walk-bob threshold
 const LIST_ROOMS_TIMEOUT_MS = 4000;
+const BOT_PROMPT_HIDE_MS = 20000; // solo bot prompt auto-dismiss
 const DEG2RAD = Math.PI / 180;
 const TWO_PI = Math.PI * 2;
 
@@ -158,6 +159,9 @@ export class ClientGame {
   private respawnLabel = '';
   private lastWeapon: WeaponId | null = null; // last weapon pushed into the viewmodel
   private warmupBannerShown = false; // WARMUP banner fires once per warmup entry
+  private botPromptShown = false; // solo bot prompt fires once per join
+  private botPromptVisible = false;
+  private botPromptTimer: ReturnType<typeof setTimeout> | null = null;
   private lastGuardErrMs = Number.NEGATIVE_INFINITY; // guard() error-log rate limit
   // e2e debug overrides (window.__fps.debug via C11); win over held keys when set
   private dbgMove: { x: number; z: number } | null = null;
@@ -456,6 +460,7 @@ export class ClientGame {
     this.world = null; // null first: input.stop()'s lock-loss must not pop the pause menu
     this.input.stop();
     this.audio.stopAmbient(); // the looping bed must not outlive the room
+    this.hideBotPrompt(); // the solo prompt must not outlive the room either
     w.models.clear(); // nameplate canvases/materials are per-instance
     w.effects.dispose(); // tracer/particle materials are per-instance clones
     w.rig.dispose(); // scene geometries + renderer; the next join rebuilds from scratch
@@ -490,6 +495,7 @@ export class ClientGame {
     this.respawnSec = -1;
     this.lastWeapon = null;
     this.warmupBannerShown = false;
+    this.botPromptShown = false;
     this.dbgMove = null;
     this.dbgButtons = 0;
   }
@@ -554,6 +560,7 @@ export class ClientGame {
     this.lastButtons = 0;
     this.stepAccM = 0;
     this.respawnSec = -1;
+    this.botPromptShown = false; // one solo bot prompt per join
     // clock: trust the min-RTT pong sample once it exists, else seed from joined
     const conn = this.conn;
     s.serverOffset =
@@ -578,6 +585,7 @@ export class ClientGame {
     this.menus.hideAll();
     this.menus.showInRoom(MAPS[msg.mapId].name, msg.code);
     this.audio.ambient(!INDOOR_MAPS.has(msg.mapId));
+    this.maybeShowBotPrompt();
   }
 
   private onSnapshot(msg: Extract<S2C, { t: 'snapshot' }>): void {
@@ -640,6 +648,9 @@ export class ClientGame {
     } else {
       this.warmupBannerShown = false;
     }
+    // solo bot prompt: any phase change out of warmup dismisses it
+    if (msg.phase !== 'warmup') this.hideBotPrompt();
+    this.maybeShowBotPrompt();
     // the server changes the held weapon silently (death->pistol, buy replace,
     // match reset, spawn) where the slot edge never fires; same-id is a no-op
     if (you.weapon !== this.lastWeapon) {
@@ -786,11 +797,13 @@ export class ClientGame {
       }
       case 'player_joined':
         s.roster.set(ev.entry.id, ev.entry);
+        if (s.roster.size > 1) this.hideBotPrompt(); // no longer solo
         break;
       case 'player_left':
         s.roster.delete(ev.id);
         this.syncPool.delete(ev.id);
         this.others.delete(ev.id);
+        this.maybeShowBotPrompt(); // solo again — no-op once shown this join
         break;
       case 'team_changed': {
         // roster carries team (nameplates/scoreboard/sync merge all read it);
@@ -901,7 +914,7 @@ export class ClientGame {
     const fov = scopedNow && def.zoomFov !== null ? def.zoomFov : BASE_FOV;
     const c = this.camPos;
     let spectName: string | null = null;
-    let spectated = false;
+    let spectId: PlayerId | null = null;
     if (!alive && you !== null && you.spectateTarget !== null) {
       for (const p of this.syncOut) {
         if (p.id !== you.spectateTarget) continue;
@@ -910,10 +923,11 @@ export class ClientGame {
         c.z = p.z;
         w.rig.applyCamera(c, p.yaw, p.pitch, BASE_FOV);
         spectName = s.roster.get(p.id)?.name ?? p.id;
-        spectated = true;
+        spectId = p.id;
         break;
       }
     }
+    const spectated = spectId !== null;
     if (!spectated) {
       c.x = body.x; // eye = feet + height - eyeOffset (inlined: no per-frame Vec3)
       c.y = body.y + body.height - PLAYER.eyeOffset;
@@ -961,7 +975,9 @@ export class ClientGame {
     }
 
     // ---- models / viewmodel / effects / hud ----
-    w.models.sync(this.syncOut, s.youId ?? '', dt);
+    // spectating parks the camera at the target's eye: hide the TARGET's model
+    // (not our own corpse's), or we render the inside of its head as a black band
+    w.models.sync(this.syncOut, spectId ?? s.youId ?? '', dt);
     // scoped hides the viewmodel; dead/spectating must too (no floating own gun)
     w.viewmodel.update(dt, alive && hSpeed > MOVE_MIN_SPEED, scopedNow || !alive);
     w.effects.update(dt);
@@ -1175,6 +1191,40 @@ export class ClientGame {
       if (r.bot) n++;
     }
     return n;
+  }
+
+  /**
+   * Solo bot prompt: in a room, alone (roster = just you), in warmup — offer
+   * bots once per join. Hidden by hideBotPrompt triggers (roster > 1, phase
+   * leaving warmup, 20s timeout, leaving the room).
+   */
+  private maybeShowBotPrompt(): void {
+    const s = this.state;
+    if (this.world === null || this.botPromptShown || s.youId === null) return;
+    if (s.phase !== 'warmup' || s.roster.size !== 1 || !s.roster.has(s.youId)) return;
+    this.botPromptShown = true;
+    this.botPromptVisible = true;
+    this.menus.showBotPrompt(
+      (n) => {
+        for (let i = 0; i < n; i++) this.addBot();
+      },
+      () => {},
+    );
+    this.botPromptTimer = setTimeout(() => {
+      this.botPromptTimer = null;
+      this.hideBotPrompt();
+    }, BOT_PROMPT_HIDE_MS);
+  }
+
+  /** Idempotent: safe to call from every roster/phase/lifecycle change. */
+  private hideBotPrompt(): void {
+    if (this.botPromptTimer !== null) {
+      clearTimeout(this.botPromptTimer);
+      this.botPromptTimer = null;
+    }
+    if (!this.botPromptVisible) return;
+    this.botPromptVisible = false;
+    this.menus.hideBotPrompt();
   }
 
   private onLockChange(locked: boolean): void {
