@@ -1,14 +1,18 @@
 // ============================================================================
-// BANK room tests — every invariant from docs/BANK.md "Tests", driven straight
-// against BankRoom over a fake RoomIO. vi fake timers also freeze Date.now, so
-// the room's per-roll stream rng(Date.now() ^ (rollCounter * 2654435761)) is
-// deterministic. Wanted dice outcomes are located by probing a throwaway room
-// at candidate times, then replayed verbatim in the real room: same
-// construction + same roll times + same roll history => same seeds => same
-// dice, regardless of how the room counts rolls internally.
+// BANK room tests — every invariant from docs/BANK.md "Tests" plus the
+// "Room variants" contract (sevenBonus / totalRounds / raceTarget settings,
+// bad_settings rejection), driven straight against BankRoom and the frozen
+// bankModule.createRoom entry point over a fake RoomIO. vi fake timers also
+// freeze Date.now, so the room's per-roll stream
+// rng(Date.now() ^ (rollCounter * 2654435761)) is deterministic. Wanted dice
+// outcomes are located by probing a throwaway room at candidate times, then
+// replayed verbatim in the real room: same roll times + same roll history =>
+// same seeds => same dice (settings never influence the dice stream, only how
+// a roll resolves), regardless of how the room counts rolls internally.
 // ============================================================================
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  DEFAULT_SETTINGS,
   MATCH_RESET_SECONDS,
   MAX_PLAYERS,
   ROUND_END_SECONDS,
@@ -18,7 +22,8 @@ import {
   TURN_SECONDS,
 } from '@bank/shared';
 import type { BankEvent, BankPlayerState, BankState } from '@bank/shared';
-import type { PlayerId, RoomIO } from '@platform/shared';
+import type { GameRoomHandle, PlayerId, RoomIO } from '@platform/shared';
+import { bankModule } from './module.js';
 import { BankRoom } from './room.js';
 
 /** Wire shape: fresh per-recipient state, or one shared event envelope. */
@@ -90,7 +95,7 @@ function player(st: BankState, id: PlayerId): BankPlayerState {
 }
 
 /** Rooms stopped in afterEach (the turn timer must be cleared per contract). */
-const tracked: BankRoom[] = [];
+const tracked: GameRoomHandle[] = [];
 
 function boot(io: FakeIO, players: ReadonlyArray<readonly [PlayerId, string]>): BankRoom {
   const room = new BankRoom('public', io);
@@ -102,10 +107,27 @@ function boot(io: FakeIO, players: ReadonlyArray<readonly [PlayerId, string]>): 
 }
 
 /**
+ * Variant room through the frozen module entry point: createRoom validates
+ * the settings (throwing on bad ones) and freezes the variant into the room.
+ */
+function bootVariant(
+  io: FakeIO,
+  players: ReadonlyArray<readonly [PlayerId, string]>,
+  settings: Record<string, unknown>,
+): GameRoomHandle {
+  const room = bankModule.createRoom({ visibility: 'public', io, settings });
+  room.start();
+  for (const [id, name] of players) room.addPlayer(id, name);
+  room.start();
+  tracked.push(room);
+  return room;
+}
+
+/**
  * Roll from whoever currently holds the turn, at fake time t. `via` is any
  * connected player used to read state/events (events are broadcast to all).
  */
-function rollAt(room: BankRoom, io: FakeIO, t: number, via: PlayerId = 'p1'): RollMsg {
+function rollAt(room: GameRoomHandle, io: FakeIO, t: number, via: PlayerId = 'p1'): RollMsg {
   const cur = io.state(via).currentId;
   if (cur === null) throw new Error('no current player to roll for');
   const before = io.events(via, 'roll').length;
@@ -174,10 +196,11 @@ describe('BankRoom', () => {
     expect(st.currentId).toBeNull();
     expect(st.totalRounds).toBe(TOTAL_ROUNDS);
     expect(st.safeRolls).toBe(SAFE_ROLLS);
+    expect(st.settings).toEqual(DEFAULT_SETTINGS); // no settings at creation => defaults
     expect(room.playerCount()).toBe(1);
     const info = room.info();
     expect(info.game).toBe('bank');
-    expect(info.label).toBe('10 rounds');
+    expect(info.label).toBe('10 rounds · 7=70');
     expect(info.maxPlayers).toBe(MAX_PLAYERS);
     expect(info.phase).toBe('lobby');
     // invalid room-level messages are silently dropped (game's own parser)
@@ -460,5 +483,119 @@ describe('BankRoom', () => {
     expect(st2.round).toBe(1);
     expect(player(st2, 'p1').score).toBe(0);
     expect(player(st2, 'p2').score).toBe(0);
+  });
+});
+
+// ---- room variants (docs/BANK.md "Room variants") --------------------------
+// Variant rooms are built through bankModule.createRoom, the frozen entry
+// point that validates settings. The dice stream never depends on settings,
+// so probe times found on default-settings rooms replay verbatim: only the
+// roll RESOLUTION (effect/pot) and the match-length rules change.
+
+describe('BankRoom variants', () => {
+  it('sevenBonus:false — a safe-window 7 adds a plain 7 (no bonus70 effect)', () => {
+    // probe on default settings: effect 'bonus70' marks a safe-window sum of 7
+    const tRoll = findRollTime([], (ev) => ev.effect === 'bonus70', EPOCH + 1_000);
+    const io = new FakeIO();
+    const room = bootVariant(io, [['p1', 'Alice'], ['p2', 'Bob']], { sevenBonus: false });
+    expect(room.info().label).toBe('10 rounds · plain 7');
+    const ev = rollAt(room, io, tRoll); // same seed as the probe => same dice
+    expect(ev.d1 + ev.d2).toBe(7);
+    expect(ev.effect).toBe('add'); // the plain-7 variant never fires bonus70
+    expect(ev.potAfter).toBe(7);
+    const st = io.state('p1');
+    expect(st.pot).toBe(7);
+    expect(st.settings).toEqual({ sevenBonus: false, totalRounds: 10, raceTarget: null });
+    expect(st.lastRoll?.effect).toBe('add');
+  });
+
+  it('totalRounds:20 — label reflects it and round 10 does NOT end the match', () => {
+    const io = new FakeIO();
+    const room = bootVariant(io, [['p1', 'Alice'], ['p2', 'Bob']], { totalRounds: 20 });
+    expect(room.info().label).toBe('20 rounds · 7=70');
+    let st = io.state('p1');
+    expect(st.totalRounds).toBe(20);
+    expect(st.settings).toEqual({ sevenBonus: true, totalRounds: 20, raceTarget: null });
+    // play 10 full rounds (2 safe-window rolls + 2 banks each — never busts)
+    let now = EPOCH;
+    for (let round = 1; round <= 10; round++) {
+      now += 1_000;
+      rollAt(room, io, now);
+      room.handleMessage('p2', { t: 'bank' });
+      now += 1_000;
+      rollAt(room, io, now);
+      room.handleMessage('p1', { t: 'bank' });
+      expect(io.state('p1').phase).toBe('roundEnd');
+      expect(io.events('p1', 'round_end')).toHaveLength(round);
+      now += ROUND_END_MS;
+      vi.advanceTimersByTime(ROUND_END_MS);
+    }
+    // under the canonical 10-round rules the match would be over; here it isn't
+    st = io.state('p1');
+    expect(st.phase).toBe('playing');
+    expect(st.round).toBe(11);
+    expect(st.currentId).toBe('p1');
+    expect(io.events('p1', 'match_end')).toHaveLength(0);
+  });
+
+  it('race mode (raceTarget:500) — banking past the target ends the match at once', () => {
+    const io = new FakeIO();
+    const room = bootVariant(io, [['p1', 'Alice'], ['p2', 'Bob']], { raceTarget: 500 });
+    expect(room.info().label).toBe('race to 500 · 7=70');
+    let st = io.state('p1');
+    expect(st.settings).toEqual({ sevenBonus: true, totalRounds: 10, raceTarget: 500 });
+    // grow the pot past 500: the safe window can't bust, then hunt doubles
+    // (each doubles the pot); every probed time replays deterministically.
+    const history: number[] = [EPOCH + 1_000, EPOCH + 2_000, EPOCH + 3_000];
+    for (const t of history) rollAt(room, io, t);
+    let pot = io.state('p1').pot;
+    let t0 = EPOCH + 4_000;
+    while (pot < 500) {
+      const t = findRollTime(history, (ev) => ev.effect === 'double', t0);
+      history.push(t);
+      rollAt(room, io, t);
+      pot = io.state('p1').pot;
+      t0 = t + 1;
+    }
+    expect(pot).toBeGreaterThanOrEqual(500);
+    expect(io.events('p1', 'match_end')).toHaveLength(0); // no round cap in race mode
+    room.handleMessage('p1', { t: 'bank' }); // p1's score jumps to >= 500
+    const banks = io.events('p1', 'bank');
+    expect(banks[banks.length - 1]).toMatchObject({ playerId: 'p1', amount: pot });
+    const ends = io.events('p1', 'match_end');
+    expect(ends).toHaveLength(1);
+    expect(ends[0]).toMatchObject({ winnerId: 'p1' }); // immediate win, no round cap
+    st = io.state('p1');
+    expect(st.phase).toBe('matchEnd');
+    expect(st.winnerId).toBe('p1');
+    expect(player(st, 'p1').score).toBe(pot);
+    expect(io.events('p1', 'round_end')).toHaveLength(0); // race win skips round_end
+    vi.advanceTimersByTime(ROUND_END_MS); // no roundEnd pause runs a new round
+    expect(io.state('p1').phase).toBe('matchEnd');
+    // the usual matchEnd reset still applies afterwards
+    vi.advanceTimersByTime(MATCH_RESET_MS);
+    const st2 = io.state('p1');
+    expect(st2.phase).toBe('playing');
+    expect(st2.round).toBe(1);
+    expect(player(st2, 'p1').score).toBe(0);
+    expect(player(st2, 'p2').score).toBe(0);
+  });
+
+  it('createRoom throws on bad settings (the lobby surfaces bad_settings)', () => {
+    const io = new FakeIO();
+    // out-of-choice values
+    expect(() =>
+      bankModule.createRoom({ visibility: 'public', io, settings: { totalRounds: 15 } }),
+    ).toThrow();
+    expect(() =>
+      bankModule.createRoom({ visibility: 'public', io, settings: { raceTarget: 1000 } }),
+    ).toThrow();
+    // wrong types
+    expect(() =>
+      bankModule.createRoom({ visibility: 'public', io, settings: { sevenBonus: 'yes' } }),
+    ).toThrow();
+    expect(() =>
+      bankModule.createRoom({ visibility: 'public', io, settings: { totalRounds: '20' } }),
+    ).toThrow();
   });
 });

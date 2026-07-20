@@ -1,12 +1,14 @@
 // ============================================================================
 // BANK GameModule — the bank dice game plug into the platform registry (the
 // ONLY bank-server file that imports @platform/shared). Owns the clientDist
-// probe; createRoom ignores settings (bank has none) — all match logic stays
-// in room.ts.
+// probe and the room-variant settings validation (docs/BANK.md "Room
+// variants"); all match logic stays in room.ts.
 // ============================================================================
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { DEFAULT_SETTINGS } from '@bank/shared';
+import type { BankSettings } from '@bank/shared';
 import type { GameModule, GameRoomHandle } from '@platform/shared';
 import { BankRoom } from './room.js';
 
@@ -37,12 +39,34 @@ function resolveClientDist(): string {
   return dev;
 }
 
+/**
+ * Validate + resolve the room variant (docs/BANK.md "Room variants"). Every
+ * field is optional and defaults from DEFAULT_SETTINGS; a present-but-wrong
+ * field (bad type or out-of-choice value) throws — the lobby forwards the
+ * message as a `bad_settings` error.
+ */
+function resolveSettings(raw: Record<string, unknown> | undefined): BankSettings {
+  const s = raw ?? {};
+  const sevenBonus = s['sevenBonus'] ?? DEFAULT_SETTINGS.sevenBonus;
+  if (typeof sevenBonus !== 'boolean') {
+    throw new Error('settings.sevenBonus must be a boolean');
+  }
+  const totalRounds = s['totalRounds'] ?? DEFAULT_SETTINGS.totalRounds;
+  if (totalRounds !== 10 && totalRounds !== 20) {
+    throw new Error('settings.totalRounds must be 10 or 20');
+  }
+  const raceTarget = s['raceTarget'] ?? DEFAULT_SETTINGS.raceTarget;
+  if (raceTarget !== null && raceTarget !== 500) {
+    throw new Error('settings.raceTarget must be null or 500');
+  }
+  return { sevenBonus, totalRounds, raceTarget };
+}
+
 export const bankModule: GameModule = {
   id: 'bank',
   name: 'BANK',
   clientDist: resolveClientDist(),
   createRoom(opts): GameRoomHandle {
-    // bank has no room settings; whatever the lobby passes through is ignored
-    return new BankRoom(opts.visibility, opts.io);
+    return new BankRoom(opts.visibility, opts.io, resolveSettings(opts.settings));
   },
 };

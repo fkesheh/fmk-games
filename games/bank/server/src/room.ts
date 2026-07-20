@@ -2,24 +2,34 @@
 // BANK room (docs/BANK.md) — authoritative, turn-based, event-driven (no tick
 // loop). Two dice per turn into a shared pot; banking locks the pot in for one
 // player and it KEEPS GROWING for the rest; a post-safe-window 7 busts the
-// round. 10 rounds per match, then a full reset through the lobby rules.
-// Timers (one at a time): 30s turn auto-roll, 5s roundEnd pause, 8s matchEnd
-// reset. Behavioral invariants: docs/BANK.md "Server: room.ts". Never throws.
+// round. Match length + variant come from the frozen BankSettings (default:
+// 10 rounds, 7=70, no race), then a full reset through the lobby rules. Race
+// mode (raceTarget set): the match ends the MOMENT a bank takes a player to
+// >= raceTarget. Timers (one at a time): 30s turn auto-roll, 5s roundEnd
+// pause, 8s matchEnd reset. Behavioral invariants: docs/BANK.md "Server:
+// room.ts". Never throws.
 // ============================================================================
 import {
+  DEFAULT_SETTINGS,
   MATCH_RESET_SECONDS,
   MAX_PLAYERS,
   MIN_PLAYERS,
   ROUND_END_SECONDS,
   SAFE_ROLLS,
   STALE_MS,
-  TOTAL_ROUNDS,
   TURN_SECONDS,
   parseBankC2S,
   rollDice,
   rollEffect,
 } from '@bank/shared';
-import type { BankEvent, BankPhase, BankPlayerState, BankState, LastRoll } from '@bank/shared';
+import type {
+  BankEvent,
+  BankPhase,
+  BankPlayerState,
+  BankSettings,
+  BankState,
+  LastRoll,
+} from '@bank/shared';
 import { rng, rngInt } from '@platform/shared';
 import type {
   GameRoomHandle,
@@ -60,10 +70,11 @@ export class BankRoom implements GameRoomHandle {
   readonly visibility: Visibility;
 
   private readonly io: RoomIO;
+  private readonly settings: BankSettings; // frozen variant for this room's lifetime
   private readonly players = new Map<PlayerId, Player>(); // insertion order = join order
 
   private phase: BankPhase = 'lobby';
-  private round = 0; // 0 outside a match, 1..TOTAL_ROUNDS during play
+  private round = 0; // 0 outside a match, 1..settings.totalRounds during play
   private pot = 0;
   private rollCount = 0; // rolls taken THIS round (safe window = first SAFE_ROLLS)
   private rollCounter = 0; // ever-increasing per-roll stream salt
@@ -74,13 +85,22 @@ export class BankRoom implements GameRoomHandle {
   private timer: ReturnType<typeof setTimeout> | null = null; // one phase timer at a time
   private stopped = false;
 
-  constructor(visibility: Visibility, io: RoomIO) {
+  constructor(visibility: Visibility, io: RoomIO, settings: BankSettings = DEFAULT_SETTINGS) {
     this.visibility = visibility;
     this.io = io;
+    this.settings = { ...settings }; // defensive copy: the variant never mutates
     // server-side generation (room id, private code) uses rng(Date.now())
     const next = rng((Date.now() ^ (roomSeq++ * 0x9e3779b9)) >>> 0);
     this.id = randomToken(next, 8);
     this.code = visibility === 'private' ? randomToken(next, PRIVATE_CODE_LEN) : null;
+  }
+
+  /** Contract label: "10 rounds · 7=70" / "20 rounds · plain 7" / "race to 500 · 7=70". */
+  private variantLabel(): string {
+    const bonus = this.settings.sevenBonus ? '7=70' : 'plain 7';
+    return this.settings.raceTarget !== null
+      ? `race to ${this.settings.raceTarget} · ${bonus}`
+      : `${this.settings.totalRounds} rounds · ${bonus}`;
   }
 
   info(): RoomInfo {
@@ -88,7 +108,7 @@ export class BankRoom implements GameRoomHandle {
       id: this.id,
       code: this.code,
       game: 'bank',
-      label: `${TOTAL_ROUNDS} rounds`,
+      label: this.variantLabel(),
       players: this.playerCount(),
       maxPlayers: MAX_PLAYERS,
       phase: this.phase,
@@ -214,9 +234,13 @@ export class BankRoom implements GameRoomHandle {
     this.broadcastState();
   }
 
-  /** Next round after the roundEnd pause; round TOTAL_ROUNDS's end goes to matchEnd. */
+  /**
+   * Next round after the roundEnd pause. Normal mode: the end of round
+   * settings.totalRounds goes to matchEnd. Race mode has no round cap (the
+   * match ends only on a bank reaching raceTarget).
+   */
   private startNextRound(): void {
-    if (this.round >= TOTAL_ROUNDS) {
+    if (this.settings.raceTarget === null && this.round >= this.settings.totalRounds) {
       this.endMatch();
       return;
     }
@@ -241,8 +265,13 @@ export class BankRoom implements GameRoomHandle {
     this.setTimer(() => this.startNextRound(), ROUND_END_SECONDS * 1000);
   }
 
-  private endMatch(): void {
-    this.winnerId = this.computeWinnerId();
+  /**
+   * match_end + reset timer. `raceWinner` is set only by race mode (the bank
+   * that crossed raceTarget wins instantly); otherwise highest score, ties
+   * broken by join order.
+   */
+  private endMatch(raceWinner?: PlayerId): void {
+    this.winnerId = raceWinner ?? this.computeWinnerId();
     this.phase = 'matchEnd';
     this.currentId = null;
     this.turnEndsAt = 0;
@@ -301,7 +330,7 @@ export class BankRoom implements GameRoomHandle {
     // per-roll seeded stream (frozen): rng(Date.now() ^ (rollCounter * 2654435761))
     const next = rng((Date.now() ^ (this.rollCounter * 2654435761)) >>> 0);
     const [d1, d2] = rollDice(next);
-    const { effect, apply } = rollEffect(d1, d2, this.rollCount);
+    const { effect, apply } = rollEffect(d1, d2, this.rollCount, this.settings.sevenBonus);
     this.pot = apply(this.pot);
     this.lastRoll = { d1, d2, rollerId, effect, potAfter: this.pot };
     this.broadcastEvent({ t: 'roll', d1, d2, rollerId, effect, potAfter: this.pot });
@@ -316,7 +345,11 @@ export class BankRoom implements GameRoomHandle {
     p.score += this.pot;
     p.banked = true;
     this.broadcastEvent({ t: 'bank', playerId: p.id, amount: this.pot });
-    if (this.allConnectedBanked()) this.endRound('all_banked');
+    // race mode: the match ends the MOMENT a bank reaches the target — the
+    // match_end event fires right after this bank event
+    if (this.settings.raceTarget !== null && p.score >= this.settings.raceTarget) {
+      this.endMatch(p.id);
+    } else if (this.allConnectedBanked()) this.endRound('all_banked');
     else if (this.currentId === p.id) this.nextTurn();
     this.broadcastState();
   }
@@ -416,8 +449,9 @@ export class BankRoom implements GameRoomHandle {
     return {
       t: 'bank_state',
       phase: this.phase,
+      settings: this.settings, // frozen variant; never mutated, shared by reference
       round: this.round,
-      totalRounds: TOTAL_ROUNDS,
+      totalRounds: this.settings.totalRounds,
       pot: this.pot,
       rollCount: this.rollCount,
       safeRolls: SAFE_ROLLS,

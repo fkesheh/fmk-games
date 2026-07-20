@@ -13,20 +13,21 @@ export function rollDice(next: () => number): [number, number] {
 
 /**
  * Resolve a roll against the round's roll count (1-based: the roll JUST taken).
- * - Safe window (rollCount <= SAFE_ROLLS): sum 7 => +SEVEN_BONUS; everything
- *   else => +sum (doubles do NOT double in the safe window).
+ * - Safe window (rollCount <= SAFE_ROLLS): sum 7 => +SEVEN_BONUS when the
+ *   sevenBonus variant is on, else +7; everything else => +sum (doubles do NOT
+ *   double in the safe window).
  * - After the safe window: sum 7 => bust; doubles => double the pot; else +sum.
  */
 export function rollEffect(
   d1: number,
   d2: number,
   rollCount: number,
+  sevenBonus = true,
 ): { effect: RollEffect; apply: (pot: number) => number } {
   const sum = d1 + d2;
   if (rollCount <= SAFE_ROLLS) {
-    return sum === 7
-      ? { effect: 'bonus70', apply: (pot) => pot + SEVEN_BONUS }
-      : { effect: 'add', apply: (pot) => pot + sum };
+    if (sum === 7 && sevenBonus) return { effect: 'bonus70', apply: (pot) => pot + SEVEN_BONUS };
+    return { effect: 'add', apply: (pot) => pot + sum };
   }
   if (sum === 7) return { effect: 'bust7', apply: (pot) => pot };
   if (d1 === d2) return { effect: 'double', apply: (pot) => pot * 2 };

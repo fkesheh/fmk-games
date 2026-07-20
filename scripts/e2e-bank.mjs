@@ -14,6 +14,12 @@
 //   marked banked; the non-banked page keeps rolling until the round ends
 //   (bust7 / all_banked; the 30s auto-roll backstops termination) -> the
 //   round increments (or match_end after round 10 — loop is capped).
+// Then the room-variant flow: A createPrivate('Alice', {sevenBonus:false,
+//   totalRounds:20}) — the lobby leaves the current room on create — opens a
+//   SECOND private room on the variant; B rejoins by the fresh code; both
+//   pages must deep-match state().settings ({sevenBonus:false,totalRounds:20,
+//   raceTarget:null}) and show the variant label in the table header chip
+//   ("20 rounds · plain 7").
 //
 // The join code is read from state().code first; fallbacks are the lobby's
 // server-log line ("created (private, code XXXXX, game bank)") and a DOM
@@ -209,6 +215,25 @@ function meOf(s, name) {
   return s.players.find((p) => p.id === s.you) ?? s.players.find((p) => p.name === name) ?? null;
 }
 
+// ---- room-variant flow (docs/BANK.md "Room variants") --------------------------
+// Sent as createPrivate's 2nd arg (debug signature per the client task); the
+// room fills the rest from DEFAULT_SETTINGS, so the frozen variant differs.
+const VARIANT_CREATE = { sevenBonus: false, totalRounds: 20 };
+const VARIANT_EXPECTED = { sevenBonus: false, totalRounds: 20, raceTarget: null };
+
+/** Deep match of state().settings against the frozen variant. */
+function settingsMatch(s) {
+  return (
+    s !== null &&
+    s.settings !== null &&
+    typeof s.settings === 'object' &&
+    Object.entries(VARIANT_EXPECTED).every(([k, v]) => s.settings[k] === v)
+  );
+}
+
+/** The header chip renders the contract label, e.g. "20 rounds · plain 7". */
+const variantLabelIn = (text) => /20\s*rounds/i.test(text) && /plain\s*7/i.test(text);
+
 // ---- main ---------------------------------------------------------------------------
 async function main() {
   await mkdir(SHOTS_DIR, { recursive: true });
@@ -342,6 +367,65 @@ async function main() {
     'round increments after the round ends (or match_end)',
     true,
     `round ${roundBefore} -> ${advanced.round} phase=${advanced.phase}`,
+  );
+
+  // -- (14) room variants: settings reach state() + the header chip --------------------
+  // A's createPrivate(name, settings) makes the lobby leave the first room and
+  // open a SECOND private room on the variant {sevenBonus:false, totalRounds:20}
+  // (raceTarget defaults to null); B rejoins by the fresh code. state().settings
+  // must deep-match the frozen variant on both pages and the table header must
+  // show its label ("20 rounds · plain 7").
+  await A.evaluate((v) => window.__bank.createPrivate('Alice', v), VARIANT_CREATE);
+  const aVariant = await waitFor(async () => {
+    const s = await bankState(A);
+    return s !== null && s.phase === 'lobby' && s.players.length === 1 && s.players[0]?.name === 'Alice'
+      ? s
+      : null;
+  }, 10000, 'A in a fresh (variant) private room');
+  check(
+    'variant: A createPrivate(name, settings) opens a fresh private room',
+    true,
+    `phase=${aVariant.phase} players=${aVariant.players.length}`,
+  );
+
+  const variantCode = await getRoomCode(A);
+  check(
+    'variant: new join code obtained',
+    variantCode !== null,
+    variantCode !== null ? `${variantCode} (first room was ${code})` : 'no code from state()/server-log/DOM',
+  );
+
+  await B.evaluate((c) => window.__bank.joinPrivate('Bob', c), variantCode);
+  const variantBoth = await waitFor(async () => {
+    const [sa, sb] = await Promise.all([bankState(A), bankState(B)]);
+    return sa !== null && sb !== null && sa.players.length === 2 && sb.players.length === 2
+      ? { sa, sb }
+      : null;
+  }, 10000, 'both pages in the variant room');
+  check('variant: B joins by code, both pages see 2 players', true);
+
+  check(
+    'variant: state().settings deep-matches on both pages',
+    settingsMatch(variantBoth.sa) && settingsMatch(variantBoth.sb),
+    `A=${JSON.stringify(variantBoth.sa.settings)} B=${JSON.stringify(variantBoth.sb.settings)}`,
+  );
+
+  const [headerA, headerB] = await Promise.all([
+    A.evaluate(() => {
+      const top = document.querySelector('.table-top');
+      const table = document.querySelector('.table');
+      return `${top?.textContent ?? ''}\n${table?.textContent ?? ''}`;
+    }),
+    B.evaluate(() => {
+      const top = document.querySelector('.table-top');
+      const table = document.querySelector('.table');
+      return `${top?.textContent ?? ''}\n${table?.textContent ?? ''}`;
+    }),
+  ]);
+  check(
+    'variant: table header chip shows the variant label (both pages)',
+    variantLabelIn(headerA) && variantLabelIn(headerB),
+    `A="${headerA.split('\n')[0]?.trim()}" B="${headerB.split('\n')[0]?.trim()}"`,
   );
 
   // -- error surface --------------------------------------------------------------------------

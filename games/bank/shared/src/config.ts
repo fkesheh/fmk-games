@@ -16,3 +16,12 @@ export const TURN_SECONDS = 30; // auto-roll for the current player on expiry
 export const ROUND_END_SECONDS = 5; // pause showing the outcome before next round
 export const MATCH_RESET_SECONDS = 8; // matchEnd -> full reset to lobby
 export const STALE_MS = 300_000; // idle player sweep (watching after banking is fine)
+
+// ---- variant defaults & validation (room creation settings) ----
+export const DEFAULT_SETTINGS: import('./types.js').BankSettings = {
+  sevenBonus: true,
+  totalRounds: 10,
+  raceTarget: null,
+};
+export const ROUND_CHOICES = [10, 20] as const;
+export const RACE_CHOICES = [500] as const;

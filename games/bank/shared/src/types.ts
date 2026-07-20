@@ -4,6 +4,14 @@
 
 export type BankPhase = 'lobby' | 'playing' | 'roundEnd' | 'matchEnd';
 
+/** Room rule variants, chosen at creation (platform passes them opaquely). */
+export interface BankSettings {
+  sevenBonus: boolean; // true: a 7 in the safe window is worth 70; false: plain 7
+  totalRounds: number; // 10 | 20 — ignored when raceTarget is set
+  raceTarget: number | null; // 500 => race mode: first player to bank >= 500 wins immediately
+}
+
+
 /** Room-level messages (the platform lobby handles join/leave/list itself). */
 export type BankC2S = { t: 'roll' } | { t: 'bank' };
 
@@ -29,6 +37,7 @@ export interface LastRoll {
 export interface BankState {
   t: 'bank_state';
   phase: BankPhase;
+  settings: BankSettings; // the variant this room is playing
   round: number; // 1-based during play
   totalRounds: number;
   pot: number;

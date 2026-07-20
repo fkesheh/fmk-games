@@ -53,21 +53,40 @@ export const bankModule: GameModule = { id: 'bank', name: 'BANK', clientDist: <r
 ```
 clientDist resolution mirrors the fps module's candidate-path probing (dev + docker layouts).
 
+## Room variants (settings)
+
+`createRoom(opts.settings)` accepts `{ sevenBonus?, totalRounds?, raceTarget? }` (all optional;
+defaults from `DEFAULT_SETTINGS` in shared/config.ts):
+- `sevenBonus: boolean` — a 7 in the safe window is worth 70 (true, canonical) or a plain 7 (false).
+- `totalRounds: 10 | 20` — match length in rounds (ignored in race mode).
+- `raceTarget: 500 | null` — race mode: the match ends the moment a bank takes a player to
+  ≥ raceTarget (that player wins immediately; no round cap).
+Anything else (wrong type, out-of-choice value) ⇒ `createRoom` throws ⇒ `bad_settings` error.
+`BankState.settings` carries the frozen variant to clients. `info().label` reflects it:
+`"10 rounds · 7=70"` / `"20 rounds · plain 7"` / `"race to 500 · 7=70"`.
+Race mode win condition replaces the TOTAL_ROUNDS one; winner banner text is the client's concern.
+The room's ROLL logic calls `rollEffect(d1, d2, rollCount, settings.sevenBonus)`.
+
 ## Client (Vite app, base '/bank/', outDir dist)
 
 DOM + canvas-free dice (CSS 3D or flat pip faces; NO three.js — keep the bundle tiny).
 Casino felt mood: deep green table (#1d5c3f), gold accents, ink background, white pips.
 
 - `src/game.ts` — connection + lobby flow (welcome/quick_join {name,game:'bank'}/
-  create_public {name,game:'bank',settings:{}}/create_private/join_private/list_rooms with
+  create_public {name,game:'bank',settings}/create_private/join_private/list_rooms with
   game filter 'bank'), state store, all rendering: felt table, BIG pot (counts up
   animated), two dice that tumble (random faces cycling ~600ms then settle on d1/d2 —
   cosmetic rng client-side is fine for the tumble frames), player rail (name, score,
   banked check, current-turn highlight, YOU marker), event log (last ~6: "Bob rolled 8 →
   pot 42", "Alice BANKED 42", "7! round over"), ROLL button (only your turn, pulsing),
   BANK button (always available while you're unbanked in 'playing'; disabled otherwise),
-  turn timer bar (30s), round indicator ("ROUND 3/10"), winner banner at matchEnd,
+  turn timer bar (30s), round indicator, winner banner at matchEnd,
   menu screen (name, quick join, create public/private, join by code, room list).
+  VARIANT UI (frozen): the create section has a checkbox "7 = 70 in first 3 rolls" (default
+  on) and a match-length select ("10 rounds" / "20 rounds" / "First to 500"); create sends
+  `settings: { sevenBonus, totalRounds, raceTarget }` per the variant contract. The table
+  header shows the variant label (from state.settings). Round indicator: "ROUND n/10" or
+  "ROUND n/20"; race mode: "RACE TO 500" + your score progress (e.g. "340 / 500").
 - `src/dice.ts` — dice renderer + tumble animation (two dice faces, pip layout per value).
 - `src/audio.ts` — tiny WebAudio synth: dice clatter, bank chime, bust thud, turn tick.
 - Debug surface (e2e): `window.__bank = { state(): JSON-safe { phase, round, pot, rollCount,

@@ -12,6 +12,7 @@ import type {
   BankEvent,
   BankPhase,
   BankPlayerState,
+  BankSettings,
   BankState,
   RollEffect,
 } from '@bank/shared';
@@ -47,6 +48,12 @@ function effect(v: unknown): RollEffect | null {
   return v === 'add' || v === 'bonus70' || v === 'double' || v === 'bust7' ? v : null;
 }
 
+function parseSettings(v: unknown): BankSettings | null {
+  if (!isObj(v) || !bool(v.sevenBonus) || !num(v.totalRounds)) return null;
+  if (!(num(v.raceTarget) || v.raceTarget === null)) return null;
+  return { sevenBonus: v.sevenBonus, totalRounds: v.totalRounds, raceTarget: v.raceTarget };
+}
+
 function parsePlayer(v: unknown): BankPlayerState | null {
   if (!isObj(v) || !str(v.id) || !str(v.name) || !num(v.score) || !bool(v.banked) || !bool(v.connected)) {
     return null;
@@ -74,6 +81,8 @@ function parseRoomInfo(v: unknown): RoomInfo | null {
 function parseState(v: Record<string, unknown>): BankState | null {
   const ph = phase(v.phase);
   if (ph === null) return null;
+  const settings = parseSettings(v.settings);
+  if (settings === null) return null;
   if (!num(v.round) || !num(v.totalRounds) || !num(v.pot) || !num(v.rollCount)) return null;
   if (!num(v.safeRolls) || !num(v.turnEndsAt)) return null;
   if (!(str(v.currentId) || v.currentId === null)) return null;
@@ -102,6 +111,7 @@ function parseState(v: Record<string, unknown>): BankState | null {
   return {
     t: 'bank_state',
     phase: ph,
+    settings,
     round: v.round,
     totalRounds: v.totalRounds,
     pot: v.pot,
@@ -170,6 +180,7 @@ function parseS2C(raw: unknown): S2C | null {
 /** JSON-safe snapshot of everything a test driver needs. */
 interface BankDebugState {
   phase: BankPhase | 'none'; // 'none' before the first bank_state arrives
+  settings: BankSettings | null; // the room variant; null before the first bank_state
   round: number;
   pot: number;
   rollCount: number;
@@ -182,8 +193,8 @@ interface BankDebugState {
 interface BankApi {
   state(): BankDebugState;
   joinQuick(name: string): void;
-  createPublic(name: string): void;
-  createPrivate(name: string): void;
+  createPublic(name: string, settings?: BankSettings): void;
+  createPrivate(name: string, settings?: BankSettings): void;
   joinPrivate(name: string, code: string): void;
   roll(): void;
   bank(): void;
@@ -222,6 +233,12 @@ function cleanName(v: string): string {
   return v.trim().slice(0, NAME_MAX) || 'Player';
 }
 
+/** Variant chip text, mirroring the server's info().label (docs/BANK.md). */
+function variantLabel(s: BankSettings): string {
+  const bonus = s.sevenBonus ? '7=70' : 'plain 7';
+  return s.raceTarget !== null ? `race to ${s.raceTarget} · ${bonus}` : `${s.totalRounds} rounds · ${bonus}`;
+}
+
 export class BankGame {
   private ws: WebSocket | null = null;
   private welcomed = false;
@@ -243,9 +260,12 @@ export class BankGame {
   private readonly noticeEl: HTMLDivElement;
   private readonly nameInput: HTMLInputElement;
   private readonly codeInput: HTMLInputElement;
+  private readonly sevenBonusInput: HTMLInputElement;
+  private readonly lengthSelect: HTMLSelectElement;
   private readonly roomsEl: HTMLDivElement;
   private readonly menuButtons: HTMLButtonElement[] = [];
   private readonly roundEl: HTMLDivElement;
+  private readonly variantEl: HTMLDivElement;
   private readonly potEl: HTMLDivElement;
   private readonly potFlashEl: HTMLDivElement;
   private readonly timerFillEl: HTMLDivElement;
@@ -268,6 +288,49 @@ export class BankGame {
     this.nameInput.placeholder = 'your name';
     this.nameInput.autocomplete = 'off';
     this.menuEl.appendChild(this.nameInput);
+
+    // ---- create-section variant picker (docs/BANK.md "VARIANT UI") -----------
+    const options = el('div', 'menu-options');
+    options.style.display = 'flex';
+    options.style.flexWrap = 'wrap';
+    options.style.justifyContent = 'center';
+    options.style.alignItems = 'center';
+    options.style.gap = '14px';
+    options.style.fontSize = '14px';
+    options.style.color = 'var(--cream-dim)';
+
+    const sevenLabel = el('label');
+    sevenLabel.style.display = 'flex';
+    sevenLabel.style.alignItems = 'center';
+    sevenLabel.style.gap = '6px';
+    sevenLabel.style.cursor = 'pointer';
+    this.sevenBonusInput = el('input');
+    this.sevenBonusInput.type = 'checkbox';
+    this.sevenBonusInput.checked = true; // canonical default (DEFAULT_SETTINGS)
+    this.sevenBonusInput.style.accentColor = 'var(--gold)';
+    sevenLabel.appendChild(this.sevenBonusInput);
+    sevenLabel.appendChild(document.createTextNode('7 = 70 in first 3 rolls'));
+    options.appendChild(sevenLabel);
+
+    this.lengthSelect = el('select');
+    this.lengthSelect.style.padding = '8px 10px';
+    this.lengthSelect.style.border = '1px solid var(--gold-deep)';
+    this.lengthSelect.style.borderRadius = '8px';
+    this.lengthSelect.style.background = '#101c15';
+    this.lengthSelect.style.color = 'var(--cream)';
+    this.lengthSelect.style.fontSize = '14px';
+    this.lengthSelect.style.outline = 'none';
+    for (const [value, text] of [
+      ['10', '10 rounds'],
+      ['20', '20 rounds'],
+      ['race', 'First to 500'],
+    ] as const) {
+      const opt = el('option', undefined, text);
+      opt.value = value;
+      this.lengthSelect.appendChild(opt);
+    }
+    options.appendChild(this.lengthSelect);
+    this.menuEl.appendChild(options);
 
     const menuActions = el('div', 'menu-actions');
     this.menuButtons.push(
@@ -299,6 +362,15 @@ export class BankGame {
     const topBar = el('div', 'table-top');
     this.roundEl = el('div', 'table-round', 'ROUND 1/10');
     topBar.appendChild(this.roundEl);
+    this.variantEl = el('div', 'table-variant');
+    this.variantEl.style.padding = '4px 12px';
+    this.variantEl.style.border = '1px solid var(--gold-deep)';
+    this.variantEl.style.borderRadius = '999px';
+    this.variantEl.style.fontSize = '12px';
+    this.variantEl.style.letterSpacing = '0.18em';
+    this.variantEl.style.color = 'var(--gold-bright)';
+    this.variantEl.style.textTransform = 'uppercase';
+    topBar.appendChild(this.variantEl);
     const leaveBtn = el('button', 'btn btn-small', 'LEAVE');
     leaveBtn.addEventListener('click', () => {
       this.audio.resume();
@@ -367,8 +439,8 @@ export class BankGame {
     window.__bank = {
       state: () => this.debugState(),
       joinQuick: (name) => this.joinQuick(name),
-      createPublic: (name) => this.createPublic(name),
-      createPrivate: (name) => this.createPrivate(name),
+      createPublic: (name, settings) => this.createPublic(name, settings),
+      createPrivate: (name, settings) => this.createPrivate(name, settings),
       joinPrivate: (name, code) => this.joinPrivate(name, code),
       roll: () => this.roll(),
       bank: () => this.bank(),
@@ -427,11 +499,30 @@ export class BankGame {
   private joinQuick(name: string): void {
     this.send({ t: 'quick_join', name: cleanName(name), game: 'bank' });
   }
-  private createPublic(name: string): void {
-    this.send({ t: 'create_public', name: cleanName(name), game: 'bank', settings: {} });
+  /** Variant chosen in the create section (or the e2e override passed in). */
+  private menuSettings(): BankSettings {
+    const sevenBonus = this.sevenBonusInput.checked;
+    const value = this.lengthSelect.value;
+    if (value === 'race') return { sevenBonus, totalRounds: 10, raceTarget: 500 };
+    return { sevenBonus, totalRounds: value === '20' ? 20 : 10, raceTarget: null };
   }
-  private createPrivate(name: string): void {
-    this.send({ t: 'create_private', name: cleanName(name), game: 'bank', settings: {} });
+  private createPublic(name: string, settings?: BankSettings): void {
+    const s = settings ?? this.menuSettings();
+    this.send({
+      t: 'create_public',
+      name: cleanName(name),
+      game: 'bank',
+      settings: { sevenBonus: s.sevenBonus, totalRounds: s.totalRounds, raceTarget: s.raceTarget },
+    });
+  }
+  private createPrivate(name: string, settings?: BankSettings): void {
+    const s = settings ?? this.menuSettings();
+    this.send({
+      t: 'create_private',
+      name: cleanName(name),
+      game: 'bank',
+      settings: { sevenBonus: s.sevenBonus, totalRounds: s.totalRounds, raceTarget: s.raceTarget },
+    });
   }
   private joinPrivate(name: string, code: string): void {
     if (code.length === 0) {
@@ -645,7 +736,13 @@ export class BankGame {
   private renderTable(): void {
     const s = this.state;
     if (s === null) return;
-    this.roundEl.textContent = `ROUND ${s.round}/${s.totalRounds}`;
+    this.variantEl.textContent = variantLabel(s.settings);
+    if (s.settings.raceTarget !== null) {
+      const myScore = s.players.find((p) => p.id === this.playerId)?.score ?? 0;
+      this.roundEl.textContent = `RACE TO ${s.settings.raceTarget} · ${myScore} / ${s.settings.raceTarget}`;
+    } else {
+      this.roundEl.textContent = `ROUND ${s.round}/${s.totalRounds}`;
+    }
     this.renderPlayers(s);
     this.renderLog();
 
@@ -743,6 +840,7 @@ export class BankGame {
     if (s === null) {
       return {
         phase: 'none',
+        settings: null,
         round: 0,
         pot: 0,
         rollCount: 0,
@@ -755,6 +853,7 @@ export class BankGame {
     const me = s.players.find((p) => p.id === this.playerId);
     return {
       phase: s.phase,
+      settings: { ...s.settings },
       round: s.round,
       pot: s.pot,
       rollCount: s.rollCount,
