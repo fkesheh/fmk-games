@@ -1,5 +1,5 @@
 // ============================================================================
-// C9 — Menus (main / buy / scoreboard / match end / joining / pause / room chip).
+// C9 — Menus (main / buy / scoreboard / match end / joining / pause / room chip / dev console).
 // DOM overlays mounted on the #menu root handed in by C11. Styles are injected
 // here (style.css belongs to C11). Every color traces to PALETTE via CSS custom
 // properties (--m9-*) set on the root element.
@@ -32,6 +32,7 @@ export interface MenuCallbacks {
 // ---- private constants ------------------------------------------------------
 const NAME_KEY = 'stricken.name';
 const STYLE_ID = 'fps-menus-style';
+const CONSOLE_MAX_LINES = 50; // dev console keeps only the tail of the output log
 
 type LayerId = 'main' | 'buy' | 'score' | 'end' | 'joining' | 'pause' | 'chip' | 'botprompt';
 // modal layers are mutually exclusive; scoreboard + chip stack on top freely
@@ -120,6 +121,10 @@ export class Menus {
   private roomReq = 0; // stale-guard for async room-list refreshes
   private scoreSig = ''; // scoreboard content signature — skips no-op rebuilds
   private selectedMap: MapId = MAP_LIST[0]?.id ?? 'dustbowl';
+  private consoleEl: HTMLElement | null = null; // built lazily on first use
+  private consoleOutEl: HTMLElement | null = null;
+  private consoleInputEl: HTMLInputElement | null = null;
+  private consoleCmd: ((text: string) => string) | null = null;
 
   constructor(root: HTMLElement, cb: MenuCallbacks) {
     this.cb = cb;
@@ -670,6 +675,88 @@ export class Menus {
   hideAll(): void {
     for (const id of Object.keys(this.layers) as LayerId[]) this.hide(id);
     this.scoreSig = '';
+    this.hideConsole();
+  }
+
+  // ---- developer console (`~`, CONTRACT.md 'Developer console') ----------------
+  // Top-of-screen panel, not a modal layer: it stacks over the game and menus.
+  // Pointer unlock + game-input suppression are the caller's job (C11); Esc here
+  // closes (the caller's Esc edge also closes — hiding is idempotent).
+  showConsole(onCommand: (text: string) => string): void {
+    if (this.consoleEl === null) this.buildConsole();
+    this.consoleCmd = onCommand;
+    const root = this.consoleEl;
+    if (root === null) return;
+    root.style.display = 'flex';
+    const out = this.consoleOutEl;
+    if (out !== null) out.scrollTop = out.scrollHeight;
+    const input = this.consoleInputEl;
+    if (input !== null) input.focus();
+  }
+
+  hideConsole(): void {
+    if (this.consoleEl !== null) this.consoleEl.style.display = 'none';
+    if (this.consoleInputEl !== null) this.consoleInputEl.blur();
+  }
+
+  consoleLog(line: string): void {
+    if (this.consoleEl === null) this.buildConsole();
+    const out = this.consoleOutEl;
+    if (out === null) return;
+    out.appendChild(el('div', 'm9-console-line', line));
+    while (out.childElementCount > CONSOLE_MAX_LINES) out.firstElementChild?.remove();
+    out.scrollTop = out.scrollHeight;
+  }
+
+  consoleVisible(): boolean {
+    return this.consoleEl !== null && this.consoleEl.style.display !== 'none';
+  }
+
+  private buildConsole(): void {
+    const root = el('div', 'm9-console');
+    root.style.display = 'none';
+    root.setAttribute('role', 'dialog');
+    root.setAttribute('aria-label', 'Developer console');
+
+    const out = el('div', 'm9-console-out');
+    const row = el('div', 'm9-console-row');
+    row.appendChild(el('span', 'm9-console-prompt', '>'));
+    const input = el('input', 'm9-console-input');
+    input.type = 'text';
+    input.maxLength = 120;
+    input.spellcheck = false;
+    input.autocomplete = 'off';
+    input.setAttribute('aria-label', 'Console command');
+    input.addEventListener('keydown', (e) => this.onConsoleKey(e));
+    row.appendChild(input);
+
+    root.appendChild(out);
+    root.appendChild(row);
+    this.host.appendChild(root);
+    this.consoleEl = root;
+    this.consoleOutEl = out;
+    this.consoleInputEl = input;
+  }
+
+  private onConsoleKey(e: KeyboardEvent): void {
+    const input = this.consoleInputEl;
+    if (input === null) return;
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      e.stopPropagation(); // never leak into game input (buy on B, etc.)
+      const text = input.value;
+      input.value = '';
+      if (text.trim() === '' || this.consoleCmd === null) return;
+      this.consoleLog(`> ${text}`); // echo, then the result line (ok or error reason)
+      const result = this.consoleCmd(text);
+      if (result !== '') this.consoleLog(result);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      this.hideConsole();
+    } else if (e.key === '`' || e.key === '~') {
+      e.preventDefault(); // never type the toggle char; the caller's `~` toggle closes us
+    }
   }
 
   // ---- name persistence ----------------------------------------------------------
@@ -843,6 +930,18 @@ const CSS = `
 .fps-menus .m9-btn-ct:hover:not(:disabled){border-color:var(--m9-ctBlue);background:rgba(var(--m9-ctBlue-rgb),.15);}
 .m9-team-btn{display:flex;align-items:center;justify-content:center;gap:8px;}
 .m9-team-current{font-size:10px;font-weight:800;letter-spacing:.12em;color:var(--m9-steel);}
+
+.fps-menus .m9-console{position:absolute;top:0;left:0;right:0;height:40%;display:flex;flex-direction:column;
+  pointer-events:auto;background:rgba(var(--m9-ink-rgb),.88);border-bottom:1px solid var(--m9-metalDark);
+  box-shadow:0 10px 32px rgba(var(--m9-ink-rgb),.65);
+  font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;color:var(--m9-hudText);}
+.m9-console-out{flex:1;overflow-y:auto;padding:8px 12px;line-height:1.45;}
+.m9-console-line{white-space:pre-wrap;word-break:break-word;}
+.m9-console-row{display:flex;align-items:center;gap:8px;padding:6px 12px;
+  border-top:1px solid rgba(var(--m9-metalDark-rgb),.7);}
+.m9-console-prompt{color:var(--m9-hudAccent);font-weight:700;}
+.m9-console-input{flex:1;background:transparent;border:none;outline:none;padding:2px 0;
+  color:var(--m9-hudText);font:inherit;font-family:inherit;}
 
 @media (max-width:760px){
   .m9-cols{grid-template-columns:1fr;}

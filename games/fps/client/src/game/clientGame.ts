@@ -20,6 +20,7 @@
 //   debugSetButton(btn, down): void      — sets/clears an INPUT_* held bit
 //   debugInfo(): { pos; players; pingMs } — e2e state probe (pos = predicted feet)
 //   scoreboard(down): void               — e2e-only mirror of the Tab edge
+//   consoleExec(text): string            — dev console Enter + e2e debug hook
 // Reverse direction: main.ts dispatches ONE 'fps:gesture' window Event on the
 // first pointerdown/keydown; we listen for it and resume the AudioEngine here
 // (browsers gate AudioContext creation on a user gesture).
@@ -30,6 +31,7 @@ import {
   INPUT_CROUCH,
   INPUT_FIRE,
   INPUT_JUMP,
+  INPUT_WALK,
   MAPS,
   NET,
   PLAYER,
@@ -72,6 +74,7 @@ const TICK_MS = 1000 / TICK_RATE;
 const MAX_INPUTS_PER_FRAME = 4; // mirrors NET.maxInputPerTick — drop backlog after a hitch
 const STEP_EVERY_M = PLAYER.speedRun * 0.38; // one footstep per 1.824m ≈ 0.38s at run speed
 const STEP_CLAMP_M = 0.5; // teleport/reconcile snaps never trigger footsteps
+const WALK_STEP_VOL = 0.4; // Shift walk: slow AND quiet (PLAYER.walkSpeedMul does the slow)
 const MOVE_MIN_SPEED = 0.5; // m/s — matches PlayerSnap.moving / walk-bob threshold
 const LIST_ROOMS_TIMEOUT_MS = 4000;
 const BOT_PROMPT_HIDE_MS = 20000; // solo bot prompt auto-dismiss
@@ -105,6 +108,11 @@ function wrapPi(a: number): number {
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
+}
+
+/** Console `buy` argument validation (WEAPON_ORDER is the frozen id list). */
+function isWeaponId(s: string): s is WeaponId {
+  return (WEAPON_ORDER as readonly string[]).includes(s);
 }
 
 /** Per-room render/sim bundle. Built on 'joined', disposed wholesale on leave. */
@@ -152,12 +160,14 @@ export class ClientGame {
   private bloomDeg = 0; // cosmetic crosshair bloom, mirrors server spread+bloom
   private buyOpen = false;
   private buySig = ''; // money|weapons|canBuy signature of the open buy menu
+  private consoleOpen = false; // `~` dev console overlay visible; pointer unlocked
   private stepAccM = 0; // own footstep distance accumulator
   private lastBodyX = 0;
   private lastBodyZ = 0;
   private respawnSec = -1; // cached countdown second for the warmup-death label
   private respawnLabel = '';
   private lastWeapon: WeaponId | null = null; // last weapon pushed into the viewmodel
+  private prevHeld: WeaponId | null = null; // Q quick-switch target (held before lastWeapon)
   private warmupBannerShown = false; // WARMUP banner fires once per warmup entry
   private botPromptShown = false; // solo bot prompt fires once per join
   private botPromptVisible = false;
@@ -326,7 +336,7 @@ export class ClientGame {
   }
 
   /** E2E debug: hold/release an INPUT_* button bit. */
-  debugSetButton(btn: 'fire' | 'jump' | 'crouch' | 'alt', down: boolean): void {
+  debugSetButton(btn: 'fire' | 'jump' | 'crouch' | 'alt' | 'walk', down: boolean): void {
     const bit =
       btn === 'fire'
         ? INPUT_FIRE
@@ -334,6 +344,8 @@ export class ClientGame {
           ? INPUT_JUMP
           : btn === 'crouch'
             ? INPUT_CROUCH
+            : btn === 'walk'
+              ? INPUT_WALK
           : INPUT_ALT;
     this.dbgButtons = down ? this.dbgButtons | bit : this.dbgButtons & ~bit;
   }
@@ -357,6 +369,63 @@ export class ClientGame {
       this.menus.showScoreboard(roster, s.youId ?? '', s.scoreT, s.scoreCT);
     } else {
       this.menus.hideScoreboard();
+    }
+  }
+
+  /**
+   * Dev console Enter handler + e2e hook (__fps.debug.console): parse and run
+   * one command line; returns the result line the overlay echoes under `> cmd`.
+   * Commands are frozen in CONTRACT.md "Developer console" — case-insensitive,
+   * optional '/' prefix; unknown commands / bad args get a helpful error.
+   */
+  consoleExec(text: string): string {
+    const parts = text.trim().replace(/^\/+/, '').split(/\s+/).filter((p) => p !== '');
+    const cmd = (parts[0] ?? '').toLowerCase();
+    const arg = parts[1];
+    switch (cmd) {
+      case '':
+        return "type 'help' for commands";
+      case 'help':
+        return 'help · addbot [n] / bot_add [n] · removebot / bot_kick · jointeam t|ct · buy <weapon> · kill';
+      case 'addbot':
+      case 'bot_add': {
+        if (this.world === null) return 'not in a room';
+        let n = 1;
+        if (arg !== undefined) {
+          n = Number(arg);
+          if (!Number.isInteger(n) || n < 1) return `bad bot count '${arg}' — usage: addbot [n]`;
+        }
+        for (let i = 0; i < n; i++) this.addBot();
+        return 'ok';
+      }
+      case 'removebot':
+      case 'bot_kick': {
+        if (this.world === null) return 'not in a room';
+        this.removeBot();
+        return 'ok';
+      }
+      case 'jointeam': {
+        if (this.world === null) return 'not in a room';
+        const team = arg?.toLowerCase();
+        if (team !== 't' && team !== 'ct') return 'usage: jointeam t|ct';
+        this.switchTeam(team === 'ct' ? 'CT' : 'T');
+        return 'ok';
+      }
+      case 'buy': {
+        if (this.world === null) return 'not in a room';
+        if (arg === undefined) return `usage: buy <${WEAPON_ORDER.join('|')}>`;
+        const id = arg.toLowerCase();
+        if (!isWeaponId(id)) return `unknown weapon '${arg}' — ${WEAPON_ORDER.join(' ')}`;
+        this.buy(id);
+        return 'ok';
+      }
+      case 'kill': {
+        if (this.world === null) return 'not in a room';
+        this.conn?.send({ t: 'suicide' }); // server: death with killerId null
+        return 'ok';
+      }
+      default:
+        return `unknown command '${cmd}' — type 'help'`;
     }
   }
 
@@ -458,6 +527,7 @@ export class ClientGame {
     const w = this.world;
     if (w === null) return;
     this.world = null; // null first: input.stop()'s lock-loss must not pop the pause menu
+    this.closeConsole(); // the console overlay must not outlive the room (relock no-ops here)
     this.input.stop();
     this.audio.stopAmbient(); // the looping bed must not outlive the room
     this.hideBotPrompt(); // the solo prompt must not outlive the room either
@@ -494,6 +564,7 @@ export class ClientGame {
     this.stepAccM = 0;
     this.respawnSec = -1;
     this.lastWeapon = null;
+    this.prevHeld = null;
     this.warmupBannerShown = false;
     this.botPromptShown = false;
     this.dbgMove = null;
@@ -654,6 +725,7 @@ export class ClientGame {
     // the server changes the held weapon silently (death->pistol, buy replace,
     // match reset, spawn) where the slot edge never fires; same-id is a no-op
     if (you.weapon !== this.lastWeapon) {
+      this.prevHeld = this.lastWeapon; // Q target: the weapon held before this one
       this.lastWeapon = you.weapon;
       w.viewmodel.setWeapon(you.weapon);
     }
@@ -844,6 +916,9 @@ export class ClientGame {
     // frozen invariant: bodies move only in warmup/live — prediction follows it
     const predict = alive && (s.phase === 'warmup' || s.phase === 'live');
 
+    // the menus console input swallows Esc (stopPropagation) and hides itself —
+    // reconcile our flags + relock once a frame when that happens
+    if (this.consoleOpen && !this.menus.consoleVisible()) this.closeConsole();
     this.handleEdges();
 
     // ---- input sampling: send at TICK_RATE, predict locally on the same inputs ----
@@ -950,7 +1025,8 @@ export class ClientGame {
       this.stepAccM += Math.min(Math.hypot(body.x - this.lastBodyX, body.z - this.lastBodyZ), STEP_CLAMP_M);
       if (this.stepAccM >= STEP_EVERY_M) {
         this.stepAccM %= STEP_EVERY_M;
-        this.audio.sfx('footstep');
+        // Shift walk is slow AND quiet: own steps at the frozen x0.4 volume
+        this.audio.sfx('footstep', { vol: (this.lastButtons & INPUT_WALK) !== 0 ? WALK_STEP_VOL : 1 });
       }
     }
     this.lastBodyX = body.x;
@@ -1018,6 +1094,7 @@ export class ClientGame {
           yaw: this.input.yaw,
           jump: (this.lastButtons & INPUT_JUMP) !== 0,
           crouch: (this.lastButtons & INPUT_CROUCH) !== 0,
+          walk: (this.lastButtons & INPUT_WALK) !== 0,
         },
       },
       speedMul,
@@ -1110,6 +1187,30 @@ export class ClientGame {
           }
           break;
         }
+        case 'console': {
+          if (this.consoleOpen) this.closeConsole();
+          else this.openConsole();
+          break;
+        }
+        case 'qswitch': {
+          // Q: swap to the previously HELD weapon (frozen quick-switch) —
+          // no-op until a second weapon was held, or when it is no longer owned
+          const you = this.state.latestYou;
+          const prev = this.prevHeld;
+          if (
+            w !== null &&
+            you !== null &&
+            prev !== null &&
+            prev !== you.weapon &&
+            you.weapons.includes(prev)
+          ) {
+            this.conn?.send({ t: 'switch', weapon: prev });
+            // optimistic, same as the slot edge; the snapshot confirms
+            w.viewmodel.setWeapon(prev);
+            this.bloomDeg = 0;
+          }
+          break;
+        }
         case 'scoreboard': {
           this.scoreboard(e.down);
           break;
@@ -1182,6 +1283,24 @@ export class ClientGame {
     }
   }
 
+  // ---- developer console (pointer unlocks while open so the input is typeable) ----
+
+  private openConsole(): void {
+    if (this.world === null || this.consoleOpen) return; // in-room only (input not started out of room)
+    this.consoleOpen = true; // set BEFORE the unlock so onLockChange skips the pause menu
+    this.input.consoleOpen = true; // InputController suppresses gameplay keys while open
+    this.menus.showConsole((text) => this.consoleExec(text));
+    if (document.pointerLockElement !== null) document.exitPointerLock();
+  }
+
+  private closeConsole(): void {
+    if (!this.consoleOpen) return;
+    this.consoleOpen = false;
+    this.input.consoleOpen = false;
+    this.menus.hideConsole();
+    this.relock();
+  }
+
   // ---- misc ------------------------------------------------------------------------------
 
   private rosterArray(): RosterEntry[] {
@@ -1234,11 +1353,24 @@ export class ClientGame {
   private onLockChange(locked: boolean): void {
     if (locked) return;
     // browsers swallow the Esc keydown on pointer-lock exit — this is the pause signal;
-    // an intentional unlock for the buy menu must NOT pause
-    if (this.world !== null && !this.buyOpen) this.menus.showPause(this.botCount(), this.state.team);
+    // an intentional unlock for the buy menu or dev console must NOT pause
+    if (this.world !== null && !this.buyOpen && !this.consoleOpen) {
+      this.menus.showPause(this.botCount(), this.state.team);
+    }
   }
 
   private readonly onKeyDown = (e: KeyboardEvent): void => {
+    if (this.consoleOpen) {
+      // the console overlay owns keystrokes while open. Esc closes it here:
+      // InputController swallows Esc while consoleOpen (and Backquote it turns
+      // into a 'console' edge, which toggles via handleEdges — do NOT also
+      // close on Backquote here or the key would close-then-reopen)
+      if (e.code === 'Escape') {
+        e.preventDefault();
+        this.closeConsole();
+      }
+      return;
+    }
     if (!this.buyOpen) return;
     if (e.code === 'KeyB' || e.code === 'Escape') {
       e.preventDefault();

@@ -56,9 +56,11 @@ export function parseC2S(raw: unknown): C2S | null {
         moveZ: clamp(raw.moveZ, -1, 1),
         yaw: raw.yaw,
         pitch: clamp(raw.pitch, -1.45, 1.45),
-        buttons: raw.buttons & 0xf,
+        buttons: raw.buttons & 0x1f,
       };
     }
+    case 'suicide':
+      return { t: 'suicide' };
     case 'reload':
       return { t: 'reload' };
     case 'switch':

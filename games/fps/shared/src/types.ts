@@ -22,7 +22,8 @@ export interface Vec3 {
 export const INPUT_FIRE = 1 << 0;
 export const INPUT_JUMP = 1 << 1;
 export const INPUT_CROUCH = 1 << 2;
-export const INPUT_ALT = 1 << 3; // right mouse: sniper scope
+export const INPUT_ALT = 1 << 3; // right mouse / F: sniper scope
+export const INPUT_WALK = 1 << 4; // Shift: slow + quiet walk (CS walk)
 
 // ---- client -> server ----
 export type C2S =
@@ -47,6 +48,7 @@ export type C2S =
   | { t: 'reload' }
   | { t: 'switch'; weapon: WeaponId }
   | { t: 'buy'; weapon: WeaponId }
+  | { t: 'suicide' } // console 'kill' command: the server kills the sender (killerId null)
   | { t: 'ping'; ts: number };
 
 // ---- server -> client ----

@@ -732,3 +732,26 @@ describe('GameRoom team switching', () => {
     room.stop();
   });
 });
+
+describe('GameRoom suicide (console kill command)', () => {
+  it('kills the sender (kill event, killerId null) and is ignored while dead', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io);
+    advanceToPhase(io, 'p1', 'live');
+
+    room.handleMessage('p1', { t: 'suicide' }); // wire-level entry: parse + dispatch
+    tick();
+
+    const kills = eventsOfType(io, 'p1', 'kill');
+    expect(kills.length).toBe(1);
+    expect(kills[0]?.killerId).toBeNull();
+    expect(kills[0]?.victimId).toBe('p1');
+    expect(io.lastSnap('p1').you.alive).toBe(false);
+
+    // a repeat while still dead (round not yet reset) is a no-op
+    room.handleMessage('p1', { t: 'suicide' });
+    tick();
+    expect(eventsOfType(io, 'p1', 'kill').length).toBe(1);
+    room.stop();
+  });
+});

@@ -17,6 +17,7 @@ export const PLAYER = {
   eyeOffset: 0.18, // eye = feet + height - eyeOffset
   speedRun: 4.8, // m/s at moveMul 1.0
   crouchSpeedMul: 0.45,
+  walkSpeedMul: 0.55, // Shift walk: slow AND quiet (footstep volume x0.4 client-side)
   jumpVel: 5.9, // m/s vertical (~0.87m apex — clears 0.8 docks, not 1.2 crates)
   gravity: 20, // m/s^2
   stepUp: 0.42, // max ledge auto-step height

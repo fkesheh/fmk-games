@@ -12,6 +12,7 @@ import {
   INPUT_CROUCH,
   INPUT_FIRE,
   INPUT_JUMP,
+  INPUT_WALK,
   MAPS,
   MAX_PLAYERS,
   MIN_PLAYERS_FOR_MATCH,
@@ -411,6 +412,9 @@ export class GameRoom {
       case 'switch_team':
         this.handleSwitchTeam(id, parsed.team);
         return;
+      case 'suicide':
+        this.handleSuicide(id);
+        return;
       case 'add_bot':
         if (this.addBot() === null) {
           this.io.send(id, { t: 'error', code: 'room_full', message: 'room is full' });
@@ -498,6 +502,21 @@ export class GameRoom {
       this.sendEvent(id, { t: 'buy_result', ok: true, weapon, reason: null });
     } catch (err) {
       console.error('[game] handleBuy failed', err);
+    }
+  }
+
+  // Console 'kill' command (C2S suicide): the existing death path with no
+  // killer — kill event carries killerId null, weapon 'knife', headshot false,
+  // no kill reward / streak for anyone. Only where bodies actually simulate
+  // (warmup/live): ignored while dead and in freeze/roundEnd/matchEnd.
+  handleSuicide(id: PlayerId): void {
+    try {
+      const p = this.players.get(id);
+      if (p === undefined || !p.alive) return;
+      if (this.phase !== 'warmup' && this.phase !== 'live') return;
+      this.kill(p, null, false, WEAPONS.knife, Date.now());
+    } catch (err) {
+      console.error('[game] handleSuicide failed', err);
     }
   }
 
@@ -854,6 +873,7 @@ export class GameRoom {
         yaw: msg.yaw,
         jump: (msg.buttons & INPUT_JUMP) !== 0,
         crouch: (msg.buttons & INPUT_CROUCH) !== 0,
+        walk: (msg.buttons & INPUT_WALK) !== 0,
       },
       WEAPONS[p.weapon].moveMul,
       TICK_DT,
@@ -930,29 +950,31 @@ export class GameRoom {
     if (killed) this.kill(victim, shooter, hit.headshot, def, now);
   }
 
-  private kill(victim: PlayerState, killer: PlayerState, headshot: boolean, def: WeaponDef, now: number): void {
+  private kill(victim: PlayerState, killer: PlayerState | null, headshot: boolean, def: WeaponDef, now: number): void {
     victim.alive = false;
     victim.hp = 0;
     victim.deaths++;
     victim.reloadUntil = 0;
     victim.bloom = 0;
-    killer.kills++;
-    if (headshot) killer.headshots++;
-    // multikill streak: within MULTIKILL_WINDOW of the killer's previous kill
-    // extends it, otherwise it restarts at 1; dying resets the victim's own
-    if (killer.lastKillAt > 0 && now - killer.lastKillAt <= MULTIKILL_WINDOW * 1000) {
-      killer.streak++;
-    } else {
-      killer.streak = 1;
+    if (killer !== null) {
+      killer.kills++;
+      if (headshot) killer.headshots++;
+      // multikill streak: within MULTIKILL_WINDOW of the killer's previous kill
+      // extends it, otherwise it restarts at 1; dying resets the victim's own
+      if (killer.lastKillAt > 0 && now - killer.lastKillAt <= MULTIKILL_WINDOW * 1000) {
+        killer.streak++;
+      } else {
+        killer.streak = 1;
+      }
+      killer.lastKillAt = now;
     }
-    killer.lastKillAt = now;
     victim.streak = 0;
     victim.lastKillAt = 0;
-    if (killer.streak >= 2) {
+    if (killer !== null && killer.streak >= 2) {
       this.broadcast({ t: 'multikill', playerId: killer.id, count: Math.min(killer.streak, 5) });
     }
-    if (this.phase !== 'warmup') killer.money = killReward(killer.money); // no economy in warmup
-    this.broadcast({ t: 'kill', killerId: killer.id, victimId: victim.id, weapon: def.id, headshot });
+    if (killer !== null && this.phase !== 'warmup') killer.money = killReward(killer.money); // no economy in warmup
+    this.broadcast({ t: 'kill', killerId: killer !== null ? killer.id : null, victimId: victim.id, weapon: def.id, headshot });
     if (this.phase === 'warmup') {
       // warmup: free respawn, owned list persists
       victim.respawnAt = now + ROUNDS.warmupRespawnDelay * 1000;

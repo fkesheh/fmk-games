@@ -12,8 +12,13 @@
 // a 6s combat soak, team switching (immediate in warmup / queued to the
 // next freeze otherwise; team_full balance guard), the solo bot prompt
 // (visible when alone; 'ADD 3 BOTS' adds 3 players and hides it; absent when
-// joining a room that already has players), and spectate visual sanity (chip
-// reads 'SPECTATING'; no >40% viewport near-opaque black overlay).
+// joining a room that already has players), spectate visual sanity (chip
+// reads 'SPECTATING'; no >40% viewport near-opaque black overlay), shift-walk
+// travel speed (server sim honors the walk bit via debug.press('walk')), Q
+// quick-switch (buy smg -> Digit2 pistol -> KeyQ back to smg, on a third
+// shell page with the pointer-lock observable stubbed — real lock is denied
+// headless), and the developer console (debug.console('addbot 2') adds 2
+// players; an unknown command returns an error string).
 //
 // Exit 0 only if every assertion passes AND zero page/console/network errors
 // were seen on either page (benign favicon noise excluded).
@@ -164,8 +169,12 @@ const LAUNCH_OPTS = {
   dumpio: !!process.env.E2E_DUMPIO, // pipe browser stderr (GPU/context-loss noise) when diagnosing
 };
 
-async function launchOne(tag) {
-  let browser = await puppeteer.launch(LAUNCH_OPTS);
+async function launchOne(tag, opts = {}) {
+  // headless 'shell' is the default (screenshot stability); opts.extraArgs
+  // appends Chromium flags for probe-style pages that need them.
+  const { headless = 'shell', extraArgs = [] } = opts;
+  const args = [...LAUNCH_ARGS, ...extraArgs];
+  let browser = await puppeteer.launch({ ...LAUNCH_OPTS, headless, args });
   browsers.push(browser);
   let page = await browser.newPage();
   await page.setViewport({ width: VIEWPORT.width, height: VIEWPORT.height });
@@ -176,7 +185,8 @@ async function launchOne(tag) {
     browsers.pop();
     browser = await puppeteer.launch({
       ...LAUNCH_OPTS,
-      args: [...LAUNCH_ARGS, '--use-gl=angle', '--use-angle=swiftshader'],
+      headless,
+      args: [...args, '--use-gl=angle', '--use-angle=swiftshader'],
     });
     browsers.push(browser);
     page = await browser.newPage();
@@ -709,6 +719,38 @@ async function main() {
     crouchDetail || 'never got a live/warmup sample on a clear heading',
   );
 
+  // -- (23) shift-walk: identical conditions to (19) — A is still alone in the
+  //    public crossfire room (warmup, alive, flat spawn ground), so the same
+  //    standing-outbound / modified-retrace measurement works. The walk bit
+  //    rides the crouch bit's exact path: debug.press('walk') -> dbgButtons ->
+  //    INPUT_WALK in the C2S input frame -> server stepBody scales by
+  //    walkSpeedMul 0.55. (A real Shift key could never work here: input.ts
+  //    gates held keys on pointer lock, which headless-shell denies.) Assert
+  //    the spec band: walked = 45..70% of standing.
+  let walkRatio = null;
+  let walkDetail = '';
+  for (const yaw of [0, Math.PI / 2, Math.PI, -Math.PI / 2]) {
+    const s23 = await fpsState(A);
+    if (s23 === null || (s23.phase !== 'warmup' && s23.phase !== 'live') || !s23.alive) {
+      await sleep(500); // sim not stepping (or A down) — retry on the next heading
+      continue;
+    }
+    const standing = await measureTravel(yaw);
+    if (standing < 3) continue; // spawn faces a wall — try another heading
+    await A.evaluate(() => window.__fps.debug.press('walk', true));
+    const walked = await measureTravel(yaw + Math.PI); // retrace the proven-clear path
+    await A.evaluate(() => window.__fps.debug.press('walk', false));
+    walkRatio = walked / standing;
+    walkDetail = `standing ${standing.toFixed(2)}m vs walked ${walked.toFixed(2)}m — ratio ${walkRatio.toFixed(2)} (want 0.45..0.70; walkSpeedMul 0.55)`;
+    break;
+  }
+  await A.evaluate(() => window.__fps.debug.press('walk', false)); // never leak the bit into (14)+
+  check(
+    'shift-walk: walked travel is 45-70% of standing (server sim honors the walk bit)',
+    walkRatio !== null && walkRatio >= 0.45 && walkRatio <= 0.7,
+    walkDetail || 'never got a live/warmup sample on a clear heading',
+  );
+
   // -- (14) bots: A is alone in the public crossfire room here (B stayed in
   //    the private dustbowl room from the combat flow) — so assert deltas off
   //    the live count, not absolutes. Kept after (12)/(13) so bots cannot
@@ -945,7 +987,11 @@ async function main() {
   //    out the view — no #hud/#menu element covering >40% of the viewport with
   //    a near-opaque (alpha >= 0.5) black-ish non-gradient background
   //    (body/#app are the page's opaque ink backdrop by design; the .fh-vig
-  //    vignette is a radial gradient).
+  //    vignette is a radial gradient). One legit overlay is EXCLUDED by
+  //    dismissal: when A dies close to a round boundary, the next freeze
+  //    auto-opens the buy menu over the spectate view (an open .m9-layer-buy
+  //    IS a 78%-ink full-viewport layer) — it is closed with B and that sample
+  //    skipped rather than counted as a blackout.
   let specOk = false;
   let specDetail = '';
   let chipSeen = null;
@@ -955,6 +1001,15 @@ async function main() {
   while (Date.now() < specDeadline && chipSeen === null) {
     const s = await fpsState(A);
     if (s !== null && !s.alive) {
+      const buyOpen22 = await A.evaluate(() => {
+        const el = document.querySelector('.fps-menus .m9-layer-buy');
+        return el !== null && getComputedStyle(el).display !== 'none';
+      });
+      if (buyOpen22) {
+        await A.keyboard.press('KeyB'); // legit freeze buy menu, not a blackout
+        await sleep(200);
+        continue;
+      }
       const chip = await A.evaluate(() => {
         const el = document.querySelector('#hud .fh-spec');
         if (el === null) return null;
@@ -1009,10 +1064,149 @@ async function main() {
     specDetail,
   );
 
-  // -- error-banner DOM check (window.onerror surface may not raise pageerror) -----------
+  // -- error-banner DOM check for A/B, then RELEASE both browsers: their work
+  //    ends at (22), and the (24)/(25) page runs leaner with only one chromium
+  //    plus the server alive. (window.onerror surface may not raise pageerror,
+  //    hence the DOM probe.)
   for (const [tag, page] of [['A', A], ['B', B]]) {
     const banner = await page.evaluate(() => document.querySelector('.error-banner')?.textContent ?? null);
     if (banner) pageErrors.push(`[${tag}] error-banner visible: ${banner}`);
+  }
+  await Promise.all([A.browser().close().catch(() => {}), B.browser().close().catch(() => {})]);
+
+  // -- (24) Q quick-switch: the Q/slot edges are gated on pointer lock
+  //    (input.ts onKeyDown -> locked()), and REAL pointer lock is untestable
+  //    here: chrome-headless-shell denies every request (probed:
+  //    pointerlockerror), while the new-headless modes that grant it wedge
+  //    this machine's compositor in-room (probed: rAF stalls -> the 5s input-
+  //    timeout kick; WebGL context loss -> the client's own onContextLost
+  //    closes the connection). So C stays on the proven-stable shell and the
+  //    test stubs the ONE read-only observable locked() consults: with
+  //    __fakeLock set, Document.prototype.pointerLockElement reports the
+  //    canvas. Everything downstream is the real path — keydown -> edge queue
+  //    -> handleEdges -> C2S switch -> server validation -> snapshot.
+  //    Flow: fresh private crossfire room + 1 bot; round 1 C rushes
+  //    defenseless (meets the bot halfway, dies fast); every round outcome
+  //    pays >= ECONOMY.lossReward (1900), so the round-2 freeze has
+  //    money >= 1500 -> debug.buy('smg') (the canBuy path). NOTE: the server
+  //    does NOT auto-switch when the held weapon survives the buy (pistol is
+  //    issued, never dropped) — setWeapon only fires when the held primary
+  //    was replaced — so Digit3 equips the smg before the 'weapon smg'
+  //    assert. Then KeyB closes the buy menu -> __fakeLock on -> Digit2
+  //    (slot edge = the weapon switch path) -> pistol -> KeyQ -> back to smg
+  //    (the previously held).
+  let qOk = false;
+  let qDetail = '';
+  let C = null;
+  try {
+    C = await launchOne('C');
+    await C.evaluateOnNewDocument(() => {
+      window.__fakeLock = false;
+      const real = Object.getOwnPropertyDescriptor(Document.prototype, 'pointerLockElement');
+      Object.defineProperty(Document.prototype, 'pointerLockElement', {
+        configurable: true,
+        get() {
+          if (window.__fakeLock) return document.getElementById('game');
+          return real !== undefined && real.get !== undefined ? real.get.call(this) : null;
+        },
+      });
+    });
+    await C.goto(GAME_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await waitFor(() => C.evaluate(() => !!window.__fps), 15000, '__fps on C');
+    await C.evaluate(() => window.__fps.createPrivate('Carol', 'crossfire'));
+    await waitFor(async () => {
+      const s = await fpsState(C);
+      return s !== null && s.roomId !== null ? s : null;
+    }, 10000, 'C createPrivate join');
+    await C.evaluate(() => window.__fps.addBot());
+    await C.evaluate(() => window.__fps.debug.setMove(0, 1)); // rush until round 1 ends
+    const rich24 = await waitFor(async () => {
+      const s = await fpsState(C);
+      if (s === null) return null;
+      if (s.phase === 'live' || s.phase === 'warmup') {
+        await C.evaluate(() => window.__fps.debug.setMove(0, 1)); // re-assert the rush
+      }
+      return s.phase === 'freeze' && s.money >= 1500 ? s : null;
+    }, 150000, 'freeze with money >= 1500 (one full round + slack)');
+    await C.evaluate(() => window.__fps.debug.setMove(0, 0));
+    await C.evaluate(() => window.__fps.debug.buy('smg'));
+    await waitFor(async () => {
+      const s = await fpsState(C);
+      return s !== null && s.money === rich24.money - 1500 ? s : null;
+    }, 5000, 'money -1500 after buy (buy confirmed)');
+    await C.keyboard.press('KeyB'); // close the auto-opened buy menu (works unlocked)
+    await sleep(250);
+    await C.evaluate(() => {
+      window.__fakeLock = true; // locked() now true for the game's canvas
+    });
+    await waitFor(
+      () => C.evaluate(() => document.pointerLockElement !== null),
+      5000,
+      'fake pointer lock on C',
+    );
+    await C.keyboard.press('Digit3'); // slot 3 = smg — equip the bought gun (no auto-switch)
+    await waitFor(async () => {
+      const s = await fpsState(C);
+      return s !== null && s.weapon === 'smg' ? s : null;
+    }, 5000, 'weapon smg after buy + Digit3');
+    await C.keyboard.press('Digit2'); // slot 2 = pistol (WEAPON_ORDER)
+    await waitFor(async () => {
+      const s = await fpsState(C);
+      return s !== null && s.weapon === 'pistol' ? s : null;
+    }, 5000, 'weapon pistol after Digit2');
+    await C.keyboard.press('KeyQ');
+    await waitFor(async () => {
+      const s = await fpsState(C);
+      return s !== null && s.weapon === 'smg' ? s : null;
+    }, 5000, 'weapon smg after KeyQ (quick-switch to the previously held)');
+    await C.evaluate(() => {
+      window.__fakeLock = false;
+    });
+    qOk = true;
+    qDetail = `bought smg at $${rich24.money}, Digit3 -> smg, Digit2 -> pistol, KeyQ -> smg`;
+  } catch (err) {
+    qDetail = err instanceof Error ? err.message : String(err);
+    if (C !== null) await C.evaluate(() => window.__fps?.debug.setMove(0, 0)).catch(() => {});
+  }
+  check('Q quick-switch: buy smg, slot to pistol, Q returns to smg', qOk, qDetail);
+
+  // -- (25) developer console (CONTRACT.md 'Developer console'): the e2e hook
+  //    __fps.debug.console(text) executes a command exactly like Enter in the
+  //    overlay (clientGame.consoleExec). Runs on C, normally still in the (24)
+  //    room (private — nobody else can join); if (24) lost the room (e.g., an
+  //    input-timeout kick), C re-joins first — the console check is
+  //    independent of quick-switch. 'addbot 2' must grow the room by exactly 2
+  //    within 5s; an unknown command must return the non-empty error line the
+  //    overlay would print.
+  let conOk = false;
+  let conDetail = '';
+  try {
+    if (C === null) throw new Error('page C unavailable (24 failed at launch)');
+    if ((await fpsState(C)).roomId === null) {
+      await C.evaluate(() => window.__fps.createPrivate('Carol', 'crossfire'));
+      await waitFor(async () => {
+        const s = await fpsState(C);
+        return s !== null && s.roomId !== null ? s : null;
+      }, 10000, 'C re-join for the console check');
+    }
+    const before25 = (await fpsState(C)).players;
+    const nonsense = await C.evaluate(() => window.__fps.debug.console('nonsense'));
+    await C.evaluate(() => window.__fps.debug.console('addbot 2'));
+    const populated25 = await waitFor(async () => {
+      const s = await fpsState(C);
+      return s !== null && s.players === before25 + 2 ? s : null;
+    }, 5000, 'players +2 after console addbot 2');
+    conOk = typeof nonsense === 'string' && nonsense.trim() !== '';
+    conDetail = `nonsense -> ${JSON.stringify(nonsense)}; players ${before25} -> ${populated25.players}`;
+  } catch (err) {
+    conDetail = err instanceof Error ? err.message : String(err);
+  }
+  check('console: addbot 2 adds 2 players; unknown command returns an error string', conOk, conDetail);
+
+  // -- error-banner DOM check on C (A/B were probed before their early close) --
+  if (C !== null) {
+    const banner = await C.evaluate(() => document.querySelector('.error-banner')?.textContent ?? null).catch(() => null);
+    if (banner) pageErrors.push(`[C] error-banner visible: ${banner}`);
   }
 }
 

@@ -29,7 +29,7 @@ function box(x: number, y: number, z: number, w: number, h: number, d: number): 
 }
 
 function input(over: Partial<MoveInput> = {}): MoveInput {
-  return { moveX: 0, moveZ: 0, yaw: 0, jump: false, crouch: false, ...over };
+  return { moveX: 0, moveZ: 0, yaw: 0, jump: false, crouch: false, walk: false, ...over };
 }
 
 function run(b: BodyState, inp: MoveInput, ticks: number, solids: AABB[], speedMul = 1): BodyState {
@@ -75,6 +75,19 @@ describe('stepBody walking', () => {
     run(crouched, input({ moveZ: 1, crouch: true }), 30, []);
     expect(crouched.z).toBeCloseTo(-PLAYER.speedRun * PLAYER.crouchSpeedMul, 5);
     expect(crouched.height).toBe(PLAYER.heightCrouch);
+  });
+
+  it('walk (Shift) scales speed by walkSpeedMul, independent of crouch; crouch wins when both', () => {
+    const walker = makeBody(0, 0, 0);
+    run(walker, input({ moveZ: 1, walk: true }), 30, []);
+    expect(walker.z).toBeCloseTo(-PLAYER.speedRun * PLAYER.walkSpeedMul, 5);
+    expect(walker.height).toBe(PLAYER.heightStand); // walking never crouches the body
+
+    // both held: crouch takes precedence (crouchSpeedMul < walkSpeedMul)
+    const both = makeBody(0, 0, 0);
+    run(both, input({ moveZ: 1, walk: true, crouch: true }), 30, []);
+    expect(both.z).toBeCloseTo(-PLAYER.speedRun * PLAYER.crouchSpeedMul, 5);
+    expect(both.height).toBe(PLAYER.heightCrouch);
   });
 });
 

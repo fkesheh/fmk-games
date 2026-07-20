@@ -18,6 +18,7 @@
 //   game.debugSetMove(x, z): void            — overrides move axes (0,0 releases)
 //   game.debugSetButton(btn, down): void     — sets/clears an INPUT_* held bit
 //   game.debugInfo(): { pos: [x,y,z]; players: number; pingMs: number }
+//   game.consoleExec(text): string           — dev console Enter + e2e debug hook
 //   plus room-flow hud.show(true on joined / false on leave) inside ClientGame.
 // Reverse direction: main dispatches ONE 'fps:gesture' window Event on the
 // first pointerdown/keydown; ClientGame listens for it and resumes its
@@ -32,7 +33,7 @@ import { Menus } from './ui/menus';
 import './style.css';
 
 // ---- frozen e2e surface (CONTRACT.md "Debug & test surface") ---------------
-type DebugButton = 'fire' | 'jump' | 'crouch' | 'alt';
+type DebugButton = 'fire' | 'jump' | 'crouch' | 'alt' | 'walk';
 
 // JSON-safe snapshot of everything a test driver needs; pos is [x, y, z] feet.
 interface FpsState {
@@ -72,6 +73,7 @@ interface FpsApi {
     buy(w: WeaponId): void;
     scoreboard(down: boolean): void;
     switchTeam(team: Team): void;
+    console(text: string): string; // dev console command, exactly like Enter
   };
 }
 
@@ -239,6 +241,7 @@ function boot(): void {
       buy: (w) => g.buy(w),
       scoreboard: (down) => g.scoreboard(down),
       switchTeam: (team) => g.switchTeam(team),
+      console: (text) => g.consoleExec(text),
     },
   };
 

@@ -47,7 +47,7 @@ describe('parseC2S accepts', () => {
   it('clamps input axes/pitch, floors seq, masks buttons', () => {
     expect(
       parseC2S({ t: 'input', seq: 7.9, moveX: 2, moveZ: -3, yaw: 0.25, pitch: 9, buttons: 0xff }),
-    ).toEqual({ t: 'input', seq: 7, moveX: 1, moveZ: -1, yaw: 0.25, pitch: 1.45, buttons: 0xf });
+    ).toEqual({ t: 'input', seq: 7, moveX: 1, moveZ: -1, yaw: 0.25, pitch: 1.45, buttons: 0x1f });
     expect(
       parseC2S({ t: 'input', seq: 1, moveX: 0, moveZ: 0, yaw: -2.5, pitch: -9, buttons: 0 }),
     ).toEqual({ t: 'input', seq: 1, moveX: 0, moveZ: 0, yaw: -2.5, pitch: -1.45, buttons: 0 });

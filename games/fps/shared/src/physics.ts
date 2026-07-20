@@ -31,6 +31,7 @@ export interface MoveInput {
   yaw: number;
   jump: boolean;
   crouch: boolean;
+  walk: boolean; // Shift walk: slower + quieter
 }
 
 /** Mutable body state advanced by stepBody. x/y/z = FEET position. */
@@ -88,7 +89,7 @@ export function stepBody(b: BodyState, inp: MoveInput, speedMul: number, dt: num
   let wz = -cos * inp.moveZ - sin * inp.moveX;
   const len = Math.hypot(wx, wz);
   if (len > 1) { wx /= len; wz /= len; }
-  const speed = PLAYER.speedRun * speedMul * (inp.crouch ? PLAYER.crouchSpeedMul : 1);
+  const speed = PLAYER.speedRun * speedMul * (inp.crouch ? PLAYER.crouchSpeedMul : inp.walk ? PLAYER.walkSpeedMul : 1);
   b.vx = wx * speed;
   b.vz = wz * speed;
 

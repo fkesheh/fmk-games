@@ -324,13 +324,30 @@ export class InputController {
   onLockChange: ((locked: boolean) => void) | null;
 }
 ```
-Keys: WASD move · Space jump · C crouch · LMB fire · RMB **or F** alt (scope) · R reload ·
-B buy · Tab scoreboard (preventDefault) · Esc menu · 1-6 / wheel weapon slots. Blur clears all held state.
+Keys: WASD move · Space jump · C crouch · Shift walk (slow + quiet) · LMB fire · RMB **or F** alt
+(scope) · R reload · B buy · Tab scoreboard (preventDefault) · Esc menu · 1-6 / wheel weapon
+slots · **Q quick-switch** (previous weapon) · **`~` developer console**. Blur clears all held state.
 `contextmenu` is preventDefault'd at the DOCUMENT level while pointer-locked (belt-and-braces —
 canvas-only suppression loses to browser edge cases).
 Ctrl is deliberately UNBOUND: Ctrl+W / Ctrl+R / Ctrl+Tab are unpreventable browser shortcuts
 (close/reload/switch tab) and Ctrl+click is right-click on macOS — binding crouch to Ctrl kills
 the game tab the first time someone crouches while moving forward.
+
+## Developer console (frozen)
+
+CS-style console on the `~`/Backquote key: toggles a DOM overlay (pointer unlocked while open;
+game input suppressed except Esc, which closes it; Enter executes). While open, keystrokes go
+to its input. Commands (case-insensitive, `/`-prefix optional):
+- `help` — list commands in the output log
+- `addbot [n]` / `bot_add [n]` — add n bots (default 1)
+- `removebot` / `bot_kick` — remove the most recent bot
+- `jointeam t|ct` — request a team switch (same guard as the pause-menu buttons)
+- `buy <weapon>` — buy by weapon id (knife/pistol/smg/shotgun/rifle/sniper)
+- `kill` — suicide (server: C2S 'suicide', death with killerId null)
+The console echoes `> cmd` then the result line (ok or the error reason). e2e hook:
+`__fps.debug.console(text)` executes a command exactly like Enter (clientGame.consoleExec).
+Quick-switch (frozen): Q swaps to the previously HELD weapon (client tracks the last two held;
+server 'switch' message as usual).
 Semi-auto fire latch: a fire press that begins AND ends between two frame() samples must still be
 reported once — latch INPUT_FIRE until it has been included in exactly one frame() result.
 

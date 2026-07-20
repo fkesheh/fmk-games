@@ -3,15 +3,19 @@
 // Keys tracked by e.code (layout-independent). Window blur AND pointer-lock
 // loss clear every held key/button so nothing sticks. Gameplay keys/edges are
 // only honored while pointer-locked; unlocked DOM menus keep normal typing.
+// Two exceptions: Backquote (`~`) emits a 'console' edge locked or not, and
+// while consoleOpen every other game key/button is suppressed entirely.
 // ============================================================================
-import { INPUT_ALT, INPUT_CROUCH, INPUT_FIRE, INPUT_JUMP } from '@fps/shared';
+import { INPUT_ALT, INPUT_CROUCH, INPUT_FIRE, INPUT_JUMP, INPUT_WALK } from '@fps/shared';
 
 export type InputEdge =
   | { kind: 'reload' }
   | { kind: 'slot'; n: number }
   | { kind: 'buy' }
   | { kind: 'scoreboard'; down: boolean }
-  | { kind: 'menu' };
+  | { kind: 'menu' }
+  | { kind: 'qswitch' } // Q: quick-switch to the previously held weapon
+  | { kind: 'console' }; // Backquote (`~`): toggle the developer console
 
 // ---- tuning (frozen by CONTRACT.md / UX_BIBLE.md) ---------------------------
 const SENS = 0.0022; // rad per mouse px
@@ -38,6 +42,10 @@ export class InputController {
   yaw = 0;
   pitch = 0;
   onLockChange: ((locked: boolean) => void) | null = null;
+  // Set by the console overlay. While true, ALL game keys/buttons are
+  // suppressed: no held-state changes, no edges except 'console' itself
+  // (so Backquote can close it again). Blur still clears held state.
+  consoleOpen = false;
 
   private started = false;
   private zoomed = false;
@@ -53,6 +61,8 @@ export class InputController {
   private altHeld = false;
   private keyFHeld = false; // 'F' — scope = altHeld || keyFHeld
   private tabHeld = false;
+  private shiftLHeld = false; // walk = shiftLHeld || shiftRHeld
+  private shiftRHeld = false;
   // Semi-auto latch: a press that starts AND ends between two frame() samples
   // is still reported in exactly one frame() result.
   private fireLatch = false;
@@ -112,7 +122,7 @@ export class InputController {
   }
 
   // ---- per-frame state ----------------------------------------------------------
-  /** Held WASD/jump/crouch/fire/alt. Safe every rAF; returns a reused object. */
+  /** Held WASD/jump/crouch/fire/alt/walk. Safe every rAF; returns a reused object. */
   frame(): { moveX: number; moveZ: number; buttons: number } {
     let buttons = 0;
     if (this.fireHeld || this.fireLatch) buttons |= INPUT_FIRE;
@@ -120,6 +130,7 @@ export class InputController {
     if (this.jumpHeld) buttons |= INPUT_JUMP;
     if (this.keyCHeld) buttons |= INPUT_CROUCH;
     if (this.altHeld || this.keyFHeld) buttons |= INPUT_ALT;
+    if (this.shiftLHeld || this.shiftRHeld) buttons |= INPUT_WALK;
     const o = this.frameOut;
     o.moveX = (this.keyD ? 1 : 0) - (this.keyA ? 1 : 0); // right positive
     o.moveZ = (this.keyW ? 1 : 0) - (this.keyS ? 1 : 0); // forward positive
@@ -140,6 +151,7 @@ export class InputController {
     this.keyW = this.keyA = this.keyS = this.keyD = false;
     this.jumpHeld = this.keyCHeld = false;
     this.fireHeld = this.altHeld = this.keyFHeld = false;
+    this.shiftLHeld = this.shiftRHeld = false;
     this.fireLatch = false;
     if (this.tabHeld) {
       // never leave the scoreboard stuck open across blur/unlock
@@ -192,7 +204,7 @@ export class InputController {
   };
 
   private readonly onMouseDown = (e: MouseEvent): void => {
-    if (!this.locked()) return;
+    if (this.consoleOpen || !this.locked()) return;
     if (e.button === 0) {
       this.fireHeld = true;
       this.fireLatch = true;
@@ -208,7 +220,7 @@ export class InputController {
   };
 
   private readonly onWheel = (e: WheelEvent): void => {
-    if (!this.locked()) return;
+    if (this.consoleOpen || !this.locked()) return;
     e.preventDefault();
     if (e.deltaY === 0) return;
     const step = e.deltaY > 0 ? 1 : -1; // wheel down = next slot, up = prev
@@ -217,6 +229,15 @@ export class InputController {
   };
 
   private readonly onKeyDown = (e: KeyboardEvent): void => {
+    // Backquote is handled before every gate: it toggles the console from
+    // anywhere (locked or not) and is the only edge let through while the
+    // console is open — so the same key can close it again.
+    if (e.code === 'Backquote') {
+      if (!e.repeat) this.queue.push({ kind: 'console' });
+      e.preventDefault();
+      return;
+    }
+    if (this.consoleOpen) return; // console owns the keyboard — no held state, no edges
     if (!this.locked()) return;
     switch (e.code) {
       case 'KeyW': this.keyW = true; break;
@@ -226,6 +247,9 @@ export class InputController {
       case 'Space': this.jumpHeld = true; break;
       case 'KeyC': this.keyCHeld = true; break;
       case 'KeyF': this.keyFHeld = true; break;
+      case 'ShiftLeft': this.shiftLHeld = true; break;
+      case 'ShiftRight': this.shiftRHeld = true; break;
+      case 'KeyQ': if (!e.repeat) this.queue.push({ kind: 'qswitch' }); break;
       case 'KeyR': if (!e.repeat) this.queue.push({ kind: 'reload' }); break;
       case 'KeyB': if (!e.repeat) this.queue.push({ kind: 'buy' }); break;
       case 'Tab':
@@ -262,6 +286,8 @@ export class InputController {
       case 'Space': this.jumpHeld = false; break;
       case 'KeyC': this.keyCHeld = false; break;
       case 'KeyF': this.keyFHeld = false; break;
+      case 'ShiftLeft': this.shiftLHeld = false; break;
+      case 'ShiftRight': this.shiftRHeld = false; break;
       case 'Tab':
         if (this.tabHeld) {
           this.tabHeld = false;
