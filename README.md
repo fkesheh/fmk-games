@@ -1,12 +1,23 @@
-# STRICKEN (+ BANK) — multiplayer game platform
+# STRICKEN (+ BANK + KART GP) — multiplayer game platform
 
-A browser multiplayer game platform with two games sharing one server:
+A browser multiplayer game platform with three games sharing one server:
 - **STRICKEN** (`/fps/`) — tactical FPS in the spirit of Counter-Strike
 - **BANK** (`/bank/`) — the classic push-your-luck dice party game (canonical Bank rules)
+- **KART GP** (`/kart/`) — multiplayer kart racing: drift physics, 3-lap races, one circuit
 
-`/` is a launcher page; both games ride one WebSocket (`/ws`). Everything is
-procedural: no assets — flat-shaded low-poly 3D (FPS), DOM dice (BANK),
-synthesized WebAudio throughout, colors from frozen palettes.
+`/` is a launcher page; all games ride one WebSocket (`/ws`). Everything is
+procedural: no assets — flat-shaded low-poly 3D (FPS, KART), DOM/CSS 3D dice
+(BANK), synthesized WebAudio throughout, colors from frozen palettes.
+
+## KART GP — driving model & rules
+
+Arcade-sim kart physics (client-simulated, server-refereed): engine/brake curves,
+bicycle steering with speed-sensitive lock, surface grip (asphalt vs grass),
+barrier collisions, and handbrake **drift** — hold a drift ≥1.2s to charge a
+mini-turbo. Races: 5s grid → 3-2-1-GO → 3 laps → results. Up to 8 karts, ranked
+by checkpoint progress (gates in order, server-authoritative), best-lap tracking,
+mid-race join at the back, public/private rooms. Controls: WASD/arrows drive,
+Space/Shift drift, R respawn at last gate.
 
 ## BANK — rules (canonical)
 

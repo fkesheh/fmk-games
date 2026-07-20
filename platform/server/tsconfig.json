@@ -11,7 +11,10 @@
       "@fps/shared/*": ["../../games/fps/shared/src/*"],
       "@bank/server": ["../../games/bank/server/src/module.ts"],
       "@bank/shared": ["../../games/bank/shared/src/index.ts"],
-      "@bank/shared/*": ["../../games/bank/shared/src/*"]
+      "@bank/shared/*": ["../../games/bank/shared/src/*"],
+      "@kart/server": ["../../games/kart/server/src/module.ts"],
+      "@kart/shared": ["../../games/kart/shared/src/index.ts"],
+      "@kart/shared/*": ["../../games/kart/shared/src/*"]
     }
   },
   "include": ["src"]

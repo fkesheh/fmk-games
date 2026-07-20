@@ -16,9 +16,12 @@ COPY games/fps/client/package.json games/fps/client/package.json
 COPY games/bank/shared/package.json games/bank/shared/package.json
 COPY games/bank/server/package.json games/bank/server/package.json
 COPY games/bank/client/package.json games/bank/client/package.json
+COPY games/kart/shared/package.json games/kart/shared/package.json
+COPY games/kart/server/package.json games/kart/server/package.json
+COPY games/kart/client/package.json games/kart/client/package.json
 RUN npm ci
 COPY . .
-RUN npm run build && npm run build -w @bank/client
+RUN npm run build && npm run build -w @bank/client && npm run build -w @kart/client
 
 # ---- prod deps: the server bundle imports only node builtins + ws (esbuild inlines
 # the game server + shared packages), so no game/shared src is shipped.
@@ -35,6 +38,9 @@ COPY games/fps/client/package.json games/fps/client/package.json
 COPY games/bank/shared/package.json games/bank/shared/package.json
 COPY games/bank/server/package.json games/bank/server/package.json
 COPY games/bank/client/package.json games/bank/client/package.json
+COPY games/kart/shared/package.json games/kart/shared/package.json
+COPY games/kart/server/package.json games/kart/server/package.json
+COPY games/kart/client/package.json games/kart/client/package.json
 RUN npm ci --omit=dev
 
 # ---- runtime. Each game module resolves its clientDist as
@@ -48,6 +54,7 @@ COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=build /app/platform/server/dist ./platform/server/dist
 COPY --from=build /app/games/fps/client/dist ./games/fps/client/dist
 COPY --from=build /app/games/bank/client/dist ./games/bank/client/dist
+COPY --from=build /app/games/kart/client/dist ./games/kart/client/dist
 USER node
 EXPOSE 8080
 CMD ["node", "platform/server/dist/server.js"]

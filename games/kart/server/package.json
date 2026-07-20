@@ -1,0 +1,20 @@
+{
+  "name": "@kart/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/module.ts",
+    "./*": "./src/*.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@kart/shared": "0.0.0",
+    "@platform/shared": "0.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.1"
+  }
+}

@@ -12,6 +12,7 @@
   "dependencies": {
     "@bank/server": "0.0.0",
     "@fps/server": "0.0.0",
+    "@kart/server": "0.0.0",
     "@platform/shared": "0.0.0",
     "ws": "8.21.1"
   },

@@ -1,0 +1,594 @@
+/* ============================================================================
+   KART GP client — paddock theme (docs/KART.md): ink background, charcoal
+   panels, gold accents. EVERY color traces to KPAL (@kart/shared palette) —
+   the CSS vars below are the palette, rgba() tints are alpha variants of the
+   same entries. Screens + HUD chrome live here; the 3D scene is drawn by
+   render.ts onto the canvas. No external assets or fonts.
+   ============================================================================ */
+
+:root {
+  --ink: #14171c; /* KPAL.ink */
+  --charcoal: #23282f; /* KPAL.charcoal */
+  --gold: #d4af37; /* KPAL.gold */
+  --steel: #9aa3ad; /* KPAL.steel */
+  --cream: #e8e6df; /* KPAL.hudText */
+  --danger: #c0392b; /* KPAL.danger */
+  --teal: #2f8f8f; /* KPAL.kartTeal */
+  --asphalt: #4a5058; /* KPAL.asphaltLight */
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--ink);
+  color: var(--cream);
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+}
+
+#app {
+  height: 100%;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.error-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  padding: 10px 16px;
+  background: var(--danger);
+  color: var(--cream);
+  font-size: 14px;
+  text-align: center;
+  z-index: 99;
+}
+
+/* ---- screens ----------------------------------------------------------------- */
+
+.screen {
+  height: 100%;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  overflow-y: auto;
+}
+
+/* ---- menu (same idiom as the bank menu) --------------------------------------- */
+
+.menu {
+  justify-content: center;
+  gap: 14px;
+  padding: 32px 20px;
+}
+
+.menu-title {
+  margin: 0;
+  font-size: clamp(48px, 11vw, 88px);
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  color: var(--gold);
+  text-shadow: 0 2px 0 rgba(20, 23, 28, 0.9), 0 6px 24px rgba(212, 175, 55, 0.25);
+}
+
+.menu-sub {
+  margin: 0 0 8px;
+  color: var(--steel);
+  font-style: italic;
+  letter-spacing: 0.08em;
+}
+
+.menu-notice {
+  min-height: 18px;
+  padding: 6px 14px;
+  border: 1px solid var(--gold);
+  border-radius: 6px;
+  color: var(--gold);
+  font-size: 14px;
+}
+
+.menu-name,
+.menu-code-input {
+  box-sizing: border-box;
+  padding: 12px 14px;
+  border: 1px solid var(--asphalt);
+  border-radius: 8px;
+  background: var(--charcoal);
+  color: var(--cream);
+  font-size: 16px;
+  text-align: center;
+  letter-spacing: 0.06em;
+  outline: none;
+}
+
+.menu-name {
+  width: min(320px, 80vw);
+}
+
+.menu-name:focus,
+.menu-code-input:focus {
+  border-color: var(--gold);
+}
+
+.menu-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+}
+
+.menu-code {
+  display: flex;
+  gap: 10px;
+}
+
+.menu-code-input {
+  width: 120px;
+  text-transform: uppercase;
+}
+
+.menu-rooms-title {
+  margin: 18px 0 0;
+  font-size: 13px;
+  letter-spacing: 0.3em;
+  color: var(--steel);
+}
+
+.menu-rooms {
+  width: min(420px, 90vw);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.room-empty {
+  text-align: center;
+  color: var(--steel);
+  font-size: 14px;
+  font-style: italic;
+}
+
+.room-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 8px 12px;
+  border: 1px solid rgba(74, 80, 88, 0.6);
+  border-radius: 8px;
+  background: rgba(35, 40, 47, 0.6);
+  font-size: 14px;
+}
+
+.room-title {
+  color: var(--gold);
+  font-weight: 600;
+}
+
+.room-label {
+  color: var(--steel);
+  font-style: italic;
+}
+
+.room-meta {
+  margin-left: auto;
+  color: var(--steel);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- buttons ----------------------------------------------------------------- */
+
+.btn {
+  padding: 12px 20px;
+  border: 1px solid var(--gold);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--gold);
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, box-shadow 120ms ease;
+}
+
+.btn:hover:not(:disabled) {
+  background: rgba(212, 175, 55, 0.12);
+}
+
+.btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.btn-gold {
+  background: var(--gold);
+  color: var(--ink);
+  border-color: var(--gold);
+}
+
+.btn-gold:hover:not(:disabled) {
+  background: var(--cream);
+  border-color: var(--cream);
+  color: var(--ink);
+}
+
+.btn-small {
+  padding: 6px 12px;
+  font-size: 12px;
+}
+
+/* ---- race screen: canvas + overlays ------------------------------------------- */
+
+.race {
+  position: relative;
+  padding: 0;
+  overflow: hidden;
+}
+
+.race-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.race-top {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 6;
+}
+
+/* ---- HUD (ready / countdown / racing) ------------------------------------------ */
+
+.hud {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 4;
+}
+
+.hud-left {
+  position: absolute;
+  top: 14px;
+  left: 16px;
+}
+
+.hud-place {
+  font-size: clamp(40px, 7vw, 72px);
+  font-weight: 800;
+  line-height: 1;
+  color: var(--cream);
+  text-shadow: 0 2px 0 rgba(20, 23, 28, 0.9), 0 4px 18px rgba(20, 23, 28, 0.7);
+  font-variant-numeric: tabular-nums;
+}
+
+.hud-lap {
+  margin-top: 6px;
+  font-size: clamp(16px, 2.4vw, 24px);
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  color: var(--gold);
+  text-shadow: 0 2px 8px rgba(20, 23, 28, 0.8);
+}
+
+.hud-right {
+  position: absolute;
+  top: 14px;
+  right: 16px;
+  text-align: right;
+}
+
+.hud-speed {
+  color: var(--cream);
+  text-shadow: 0 2px 0 rgba(20, 23, 28, 0.9), 0 4px 18px rgba(20, 23, 28, 0.7);
+}
+
+.hud-speed-num {
+  font-size: clamp(36px, 6vw, 60px);
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+
+.hud-speed-unit {
+  margin-left: 6px;
+  font-size: 14px;
+  letter-spacing: 0.2em;
+  color: var(--steel);
+}
+
+.hud-times {
+  position: absolute;
+  left: 16px;
+  bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.hud-time-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.hud-time-label {
+  width: 44px;
+  font-size: 12px;
+  letter-spacing: 0.24em;
+  color: var(--steel);
+}
+
+.hud-time-value {
+  font-size: clamp(18px, 3vw, 28px);
+  font-weight: 700;
+  color: var(--cream);
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 2px 8px rgba(20, 23, 28, 0.8);
+}
+
+.hud-best {
+  color: var(--gold);
+}
+
+.hud-turbo {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.hud-turbo-label {
+  font-size: 12px;
+  letter-spacing: 0.24em;
+  color: var(--steel);
+}
+
+.hud-turbo-bar {
+  width: 160px;
+  height: 10px;
+  border: 1px solid var(--asphalt);
+  border-radius: 5px;
+  background: rgba(20, 23, 28, 0.6);
+  overflow: hidden;
+}
+
+.hud-turbo-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--gold);
+  transition: width 80ms linear;
+}
+
+.hud-turbo.charged .hud-turbo-label {
+  color: var(--teal);
+}
+
+.hud-turbo.charged .hud-turbo-fill {
+  background: var(--teal);
+  box-shadow: 0 0 12px rgba(47, 143, 143, 0.8);
+}
+
+/* next-gate chevron: a CSS triangle, rotated inline toward the gate */
+.hud-gate {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  margin-left: -14px;
+  width: 0;
+  height: 0;
+  border-left: 14px solid transparent;
+  border-right: 14px solid transparent;
+  border-bottom: 22px solid var(--gold);
+  filter: drop-shadow(0 2px 6px rgba(20, 23, 28, 0.8));
+}
+
+/* ---- lobby overlay (the grid) --------------------------------------------------- */
+
+.lobby-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(20, 23, 28, 0.62);
+}
+
+.lobby-panel {
+  min-width: min(420px, 92vw);
+  padding: 22px 26px;
+  border: 1px solid var(--gold);
+  border-radius: 12px;
+  background: rgba(35, 40, 47, 0.92);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.lobby-title {
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: 0.4em;
+  color: var(--gold);
+}
+
+.lobby-players {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+
+.lobby-status {
+  min-height: 20px;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: var(--cream);
+}
+
+.lobby-hint {
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  color: var(--steel);
+}
+
+/* ---- player chips (grid list) ---------------------------------------------------- */
+
+.player-chip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border: 1px solid rgba(74, 80, 88, 0.6);
+  border-radius: 999px;
+  background: rgba(20, 23, 28, 0.5);
+  font-size: 14px;
+}
+
+.player-chip.you {
+  border-color: var(--gold);
+}
+
+.player-color {
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  box-shadow: 0 0 0 2px rgba(20, 23, 28, 0.8);
+}
+
+.player-name {
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.player-you {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--gold);
+  color: var(--ink);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+}
+
+.player-slot {
+  margin-left: auto;
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  color: var(--steel);
+}
+
+/* ---- countdown ------------------------------------------------------------------ */
+
+.countdown-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 7;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  font-size: clamp(120px, 30vw, 260px);
+  font-weight: 800;
+  color: var(--gold);
+  text-shadow: 0 4px 0 rgba(20, 23, 28, 0.9), 0 10px 50px rgba(20, 23, 28, 0.8);
+}
+
+/* ---- transient race message (lap / finish) --------------------------------------- */
+
+.race-msg {
+  position: absolute;
+  top: 18%;
+  left: 0;
+  right: 0;
+  z-index: 6;
+  text-align: center;
+  font-size: clamp(20px, 4vw, 36px);
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  color: var(--cream);
+  text-shadow: 0 2px 0 rgba(20, 23, 28, 0.9), 0 4px 20px rgba(20, 23, 28, 0.8);
+  pointer-events: none;
+}
+
+/* ---- results --------------------------------------------------------------------- */
+
+.results-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(20, 23, 28, 0.72);
+}
+
+.results-panel {
+  min-width: min(520px, 94vw);
+  padding: 24px 28px;
+  border: 1px solid var(--gold);
+  border-radius: 12px;
+  background: rgba(35, 40, 47, 0.94);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
+
+.results-title {
+  font-size: 18px;
+  font-weight: 800;
+  letter-spacing: 0.4em;
+  color: var(--gold);
+}
+
+.results-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.results-table th {
+  padding: 6px 10px;
+  font-size: 11px;
+  letter-spacing: 0.24em;
+  text-align: left;
+  color: var(--steel);
+  border-bottom: 1px solid var(--asphalt);
+}
+
+.results-table td {
+  padding: 8px 10px;
+  font-size: 15px;
+  color: var(--cream);
+  border-bottom: 1px solid rgba(74, 80, 88, 0.4);
+}
+
+.results-table tr.you td {
+  color: var(--gold);
+  font-weight: 700;
+}
+
+.result-place {
+  font-weight: 800;
+}
+
+.results-note {
+  min-height: 16px;
+  font-size: 13px;
+  letter-spacing: 0.18em;
+  color: var(--steel);
+}
