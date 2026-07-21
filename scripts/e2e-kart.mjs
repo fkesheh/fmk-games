@@ -48,7 +48,17 @@
 // assist toggled on via KeyT (verified on state().assist), then throttle ONLY
 // — setInput(1,0,0) with the steer argument locked at 0 and never touched —
 // while the client's pure-pursuit auto-steer must steer itself around gate 1
-// (server-credited progress > 0) within 60s. Both pages then reload into
+// (server-credited progress > 0) within 60s. Two kids-mode hardening checks
+// follow in the same room: STUCK AUTO-RESPAWN (the kart is pinned nose-first
+// into a barrier with the assist OFF — the guard is assist-only — then the
+// assist is re-enabled while pinned: within ~8s the client must auto-respawn
+// to a gate, proven by a > 15m teleport between poll samples landing within
+// ~GATE_RADIUS of a gate with the speed reset) and WRONG-WAY RECOVERY (spun
+// ~180° by a forward full-lock circle from the anchor, throttle-only with the
+// assist on must return the facing to within ~30° of the track travel
+// direction — the best of the nearest gate tangent and the exact centerline
+// tangent — within ~10s and grow the server-credited progress). Both pages
+// then reload into
 // fresh menu clients for the private-room flow above (the client has no
 // leave-room debug hook; the assist toggle persists to localStorage, so it
 // is verified OFF before the reload).
@@ -661,6 +671,272 @@ async function main() {
     'kids assist (KIDS MODE): throttle-only with steer locked at 0 — the client auto-steer credits gate 1 (progress > 0 within 60s)',
     assistOn === true && assistProgress !== null && assistProgress > 0,
     `assist on=${assistOn} off=${assistOff}; progress ${assistBase ?? '?'} -> ${assistProgress ?? 'none'} in ~${assistSecs}s`,
+  );
+
+  // -- kids stuck auto-respawn (KIDS MODE hardening): pinned with assist on -----
+  // The assist-only stuck guard (docs/KART.md 'Kids mode'): with KIDS MODE on, a
+  // kart held at a standstill under throttle (a kid can wedge it nose-first into
+  // a barrier where the pursuit cannot unwind it — zero speed, zero yaw rate) is
+  // auto-respawned to the last credited gate with NO R press. The feature is
+  // assist-only, so the pin is forced with the assist OFF (it cannot fire early):
+  // a verified R-respawn to the anchor gate, ~3s of centerline pursuit AWAY from
+  // it (so the teleport back is a > 15m jump no standstill kart can fake inside
+  // one poll interval), then a SLOW (brake-capped, < 7 m/s) run at a FIXED aim
+  // point 30m past the barrier — an aim re-derived per tick or a fast arrival
+  // just grinds along the wall — until the position flat-lines (< 1.5m over a
+  // 2.5s window). Then the assist is re-enabled while pinned and the throttle
+  // re-latched: the client must teleport back within ~8s of the confirmed pin,
+  // land by a gate coordinate (<= GATE_RADIUS + 1m), and show a reset speed
+  // (< 10 m/s at the jump sample — gear-1 from rest needs ~1s for that). Both
+  // proofs ride telemetry().own.
+  const kidsTrack = computeTrackData(); // same frozen math — a cheap recompute
+  const kidsGates = kidsTrack.gates;
+
+  // Verified R-respawn to the anchor gate (standstill + near the centerline) —
+  // the gears section's pattern: one R retry covers a swallowed keypress.
+  const kidsRespawn = async () => {
+    await A.evaluate(() => window.__kart.setInput(0, 0, 0, false));
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await A.keyboard.press('KeyR');
+      try {
+        await waitFor(async () => {
+          const t = await kartTelemetry(A);
+          const pose = telePose(t);
+          const sp = t !== null && t.own !== null && typeof t.own === 'object' ? t.own.speedMps : null;
+          if (pose === null || typeof sp !== 'number' || Math.abs(sp) >= 0.5) return null;
+          const ci = nearestIndex(kidsTrack.centerline, pose.x, pose.z);
+          const c = kidsTrack.centerline[ci];
+          return Math.hypot(c[0] - pose.x, c[1] - pose.z) < 8 ? true : null;
+        }, 3000, 'A respawned to the anchor gate (standstill, on road)');
+        return true;
+      } catch {
+        // one R retry, then proceed anyway
+      }
+    }
+    return false;
+  };
+
+  // Assist toggle with a verified landing (one KeyT retry; the key is
+  // race-screen only and a press can be swallowed under load). Returns false if
+  // state().assist never reached `want`.
+  const kidsAssistTo = async (want) => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const cur = await kartState(A);
+      if (cur !== null && cur.assist === want) return true;
+      await A.keyboard.press('KeyT');
+      const ok = await waitFor(async () => {
+        const s = await kartState(A);
+        return s !== null && s.assist === want ? true : null;
+      }, 3000, `state().assist === ${want}`).catch(() => false);
+      if (ok) return true;
+    }
+    return false;
+  };
+
+  await kidsRespawn();
+  // drive AWAY from the anchor under centerline pursuit (~3s from a standstill
+  // is ~25-35m — far less than the ~85m gate spacing, so no new gate credit)
+  const awayT0 = Date.now();
+  while (Date.now() - awayT0 < 3000) {
+    const pose = telePose(await kartTelemetry(A));
+    if (pose !== null) {
+      const ci = nearestIndex(kidsTrack.centerline, pose.x, pose.z);
+      const aim = aheadPoint(kidsTrack, ci);
+      const diff = wrapPi(Math.atan2(-(aim.x - pose.x), -(aim.z - pose.z)) - pose.yaw);
+      await A.evaluate((st2) => window.__kart.setInput(1, 0, st2, false), Math.max(-1, Math.min(1, -diff * 2.2)));
+    }
+    await sleep(150);
+  }
+  // pin: SLOW pure-pursuit of a FIXED aim 30m past the barrier on the
+  // left-of-travel normal (the drive.ts collideBarrier convention), computed
+  // ONCE — an aim re-derived per tick curves the chase into a wall-grind, and
+  // a fast arrival just slides along the barrier. Braking to < 7 m/s first
+  // keeps the speed-sensitive lock wide, so the kart spears the wall near-
+  // perpendicular and settles nose-in. The other side is tried after 7s.
+  const pinTrail = []; // [{t,x,z}] — stationary-window detection
+  let pinPos = null;
+  let pinT0 = 0;
+  let pinSide = 1;
+  let pinAim = null; // fixed aim point; recomputed only on the side flip
+  const pinStart = Date.now();
+  while (Date.now() - pinStart < 15000 && pinPos === null) {
+    const t = await kartTelemetry(A);
+    const pose = telePose(t);
+    const sp = t !== null && t.own !== null && typeof t.own === 'object' ? t.own.speedMps : null;
+    if (pose !== null) {
+      if (pinAim === null) {
+        const ci = nearestIndex(kidsTrack.centerline, pose.x, pose.z);
+        const c = kidsTrack.centerline[ci];
+        const c2 = kidsTrack.centerline[(ci + 1) % TRACK_SAMPLES];
+        const dx = c2[0] - c[0];
+        const dz = c2[1] - c[1];
+        const l = Math.hypot(dx, dz) || 1;
+        pinAim = { x: c[0] + (-dz / l) * pinSide * 30, z: c[1] + (dx / l) * pinSide * 30 };
+      }
+      const diff = wrapPi(Math.atan2(-(pinAim.x - pose.x), -(pinAim.z - pose.z)) - pose.yaw);
+      const slow = typeof sp === 'number' && sp > 7;
+      await A.evaluate(
+        (th, br, st2) => window.__kart.setInput(th, br, st2, false),
+        slow ? 0 : 0.6,
+        slow ? 1 : 0,
+        Math.max(-1, Math.min(1, -diff * 2.2)),
+      );
+      const now = Date.now();
+      pinTrail.push({ t: now, x: pose.x, z: pose.z });
+      while (pinTrail.length > 0 && now - pinTrail[0].t > 2600) pinTrail.shift();
+      if (
+        pinTrail.length > 1 &&
+        now - pinTrail[0].t >= 2500 &&
+        Math.hypot(pose.x - pinTrail[0].x, pose.z - pinTrail[0].z) < 1.5
+      ) {
+        pinPos = { x: pose.x, z: pose.z };
+        pinT0 = now; // the confirmed pin: the ~8s auto-respawn budget starts here
+      }
+      if (now - pinStart > 7000 && pinSide === 1) {
+        pinSide = -1; // this wall would not pin — try the other one
+        pinAim = null;
+        pinTrail.length = 0;
+      }
+    }
+    await sleep(150);
+  }
+  // assist ON while pinned, throttle re-latched (the pursuit owns the steer):
+  // watch for the teleport — a > 15m move between consecutive ~0.3s samples is
+  // impossible from a standstill (gear-1 accel needs ~1.4s for that)
+  let jumpMs = 0; // ms from the confirmed pin to the teleport (0 = never)
+  let jumpGateD = null; // distance from the landing point to the nearest gate
+  let jumpSpeed = null; // |speed| at the jump sample (respawn resets it to 0)
+  let stuckAssistOn = false;
+  if (pinPos !== null) {
+    stuckAssistOn = await kidsAssistTo(true);
+    let prev = pinPos;
+    const watchStart = Date.now();
+    while (Date.now() - watchStart < 12000 && jumpMs === 0) {
+      await A.evaluate(() => window.__kart.setInput(1, 0, 0, false));
+      const t = await kartTelemetry(A);
+      const pose = telePose(t);
+      const sp = t !== null && t.own !== null && typeof t.own === 'object' ? t.own.speedMps : null;
+      if (pose !== null) {
+        if (Math.hypot(pose.x - prev.x, pose.z - prev.z) > 15) {
+          jumpMs = Date.now() - pinT0;
+          jumpSpeed = typeof sp === 'number' ? Math.abs(sp) : null;
+          let best = Infinity;
+          for (const g of kidsGates) best = Math.min(best, Math.hypot(g.x - pose.x, g.z - pose.z));
+          jumpGateD = best;
+        }
+        prev = { x: pose.x, z: pose.z };
+      }
+      await sleep(150);
+    }
+  }
+  await A.evaluate(() => window.__kart.setInput(0, 0, 0, false));
+  check(
+    'kids stuck auto-respawn: pinned nose-first with KIDS MODE on, the client auto-respawns to a gate within ~8s (teleport, speed reset)',
+    pinPos !== null && stuckAssistOn && jumpMs > 0 && jumpMs <= 8500 && jumpGateD !== null && jumpGateD <= 10 && jumpSpeed !== null && jumpSpeed < 10,
+    `pin=${pinPos !== null ? `(${pinPos.x.toFixed(1)},${pinPos.z.toFixed(1)})` : 'never pinned in 15s'} assist-on=${stuckAssistOn} ` +
+      `jump=${jumpMs > 0 ? `${(jumpMs / 1000).toFixed(1)}s after pin` : 'none in 12s'} gateDist=${jumpGateD !== null ? jumpGateD.toFixed(1) : '?'} ` +
+      `postSpeed=${jumpSpeed !== null ? jumpSpeed.toFixed(1) : '?'}`,
+  );
+
+  // -- kids wrong-way recovery (KIDS MODE hardening): facing + progress --------
+  // Spun ~180° off the travel direction, a kid holding only throttle must be
+  // brought back by the assist: within ~10s the kart's facing returns to within
+  // ~30° of the track travel direction and the server-credited progress
+  // eventually increases (the pursuit then drives on to the next gate). The
+  // facing is measured two ways and the BEST is taken: yaw vs the NEAREST
+  // GATE's tangent (the frozen reference) and yaw vs the centerline tangent at
+  // the kart's nearest sample (the exact travel direction — what the client's
+  // recovery aligns to, drive.ts assistSteer). The gate tangent alone is an
+  // unsound yardstick inside a corner: gate 1's tangent drifts ~28° within
+  // 14m of travel (measured on the frozen track math), which would eat the
+  // whole 30° window. The spin is done by hand (assist OFF — it would own the
+  // steer channel): a forward full-lock circle from the verified anchor
+  // respawn (at ~5 m/s the speed-sensitive lock is wide, the loop fits the
+  // road, yaw climbs ~1.3 rad/s; steer -1 = LEFT = yaw increases), with a
+  // reverse-out (same rotation direction) if the barrier wedges the circle.
+  // Either recovery shape passes: a three-point-turn drive-out restores the
+  // facing on the spot, a wrong-way auto-respawn restores it at the anchor.
+  await kidsAssistTo(false); // the spin is manual
+  await kidsRespawn(); // standstill at the anchor gate, facing along travel
+  const wwPose0 = telePose(await kartTelemetry(A));
+  const anchorYaw = wwPose0 !== null ? wwPose0.yaw : null;
+  let spunDeg = null; // rotation actually reached (deg off the anchor yaw)
+  if (anchorYaw !== null) {
+    let bestDelta = 0;
+    let bestAt = Date.now();
+    let retries = 0;
+    const spinT0 = Date.now();
+    await A.evaluate(() => window.__kart.setInput(0.5, 0, -1, false)); // forward full-lock LEFT circle
+    while (Date.now() - spinT0 < 12000) {
+      const pose = telePose(await kartTelemetry(A));
+      if (pose !== null) {
+        const d = Math.abs(wrapPi(pose.yaw - anchorYaw));
+        if (d > bestDelta + 0.05) {
+          bestDelta = d;
+          bestAt = Date.now();
+        }
+        if (d >= Math.PI - 0.35) break; // ~160°+ off — squarely wrong-way
+        if (Date.now() - bestAt > 2500 && retries < 4) {
+          retries++; // wedged mid-circle: reverse out (in reverse +1 swings the nose LEFT too)
+          await A.evaluate(() => window.__kart.setInput(0, 1, 1, false));
+          await sleep(1200);
+          await A.evaluate(() => window.__kart.setInput(0.5, 0, -1, false));
+          bestAt = Date.now();
+        }
+      }
+      await sleep(120);
+    }
+    await A.evaluate(() => window.__kart.setInput(0, 1, 0, false)); // brake to a stop...
+    await sleep(800);
+    await A.evaluate(() => window.__kart.setInput(0, 0, 0, false));
+    spunDeg = (bestDelta * 180) / Math.PI;
+  }
+  // assist ON, throttle only: facing must come back within ~10s; progress must
+  // eventually increase (cap the whole drive at 35s)
+  const wwBaseline = ownRaceFields(await kartState(A)).progress;
+  let wwAssistOn = false;
+  let facingMs = 0; // ms from assist-on when facing first <= 30° (0 = never)
+  let facingBestDeg = null; // best min(gate, centerline) reading seen
+  let facingBestGateDeg = null; // best gate-tangent-only reading (diagnostics)
+  let progressUp = false;
+  if (spunDeg !== null && spunDeg >= 150) {
+    wwAssistOn = await kidsAssistTo(true);
+    const wwT0 = Date.now();
+    while (Date.now() - wwT0 < 35000 && !(facingMs > 0 && progressUp)) {
+      await A.evaluate(() => window.__kart.setInput(1, 0, 0, false)); // throttle only
+      const [s, t] = await Promise.all([kartState(A), kartTelemetry(A)]);
+      const pose = telePose(t);
+      if (pose !== null) {
+        let gD = Infinity;
+        let gBest = kidsGates[0];
+        for (const g of kidsGates) {
+          const d = Math.hypot(g.x - pose.x, g.z - pose.z);
+          if (d < gD) {
+            gD = d;
+            gBest = g;
+          }
+        }
+        const gateDeg = (Math.abs(wrapPi(pose.yaw - Math.atan2(-gBest.tx, -gBest.tz))) * 180) / Math.PI;
+        const ci = nearestIndex(kidsTrack.centerline, pose.x, pose.z);
+        const clDeg = (Math.abs(wrapPi(pose.yaw - kidsTrack.travelYaw[ci])) * 180) / Math.PI;
+        const deg = Math.min(gateDeg, clDeg);
+        if (facingBestDeg === null || deg < facingBestDeg) facingBestDeg = deg;
+        if (facingBestGateDeg === null || gateDeg < facingBestGateDeg) facingBestGateDeg = gateDeg;
+        if (facingMs === 0 && deg <= 30) facingMs = Date.now() - wwT0;
+      }
+      const prog = ownRaceFields(s).progress;
+      if (prog !== null && (wwBaseline === null ? prog > 0 : prog > wwBaseline)) progressUp = true;
+      await sleep(200);
+    }
+  }
+  await A.evaluate(() => window.__kart.setInput(0, 0, 0, false));
+  const wwAssistOff = await kidsAssistTo(false); // MUST be off before the reload (localStorage persists)
+  check(
+    'kids wrong-way recovery: spun ~180° with KIDS MODE on, throttle-only returns the facing to within ~30° of the track travel direction within ~10s and progress increases',
+    spunDeg !== null && spunDeg >= 150 && wwAssistOn && facingMs > 0 && facingMs <= 10500 && progressUp,
+    `spun=${spunDeg !== null ? `${spunDeg.toFixed(0)}°` : 'no pose'} assist-on=${wwAssistOn} ` +
+      `facing=${facingMs > 0 ? `<=30° at ${(facingMs / 1000).toFixed(1)}s` : `never (best min ${facingBestDeg !== null ? facingBestDeg.toFixed(0) : '?'}°, gate-only ${facingBestGateDeg !== null ? facingBestGateDeg.toFixed(0) : '?'}°)`} ` +
+      `progress ${wwBaseline ?? '?'} -> ${progressUp ? 'up' : 'flat'}; assist off=${wwAssistOff}`,
   );
 
   // -- reset: reload both pages into fresh menu clients --------------------------------

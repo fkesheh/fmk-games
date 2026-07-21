@@ -362,6 +362,7 @@ interface RemoteSample {
   vz: number;
   steer: number;
   drift: boolean;
+  nitroActive: boolean;
 }
 
 /** What gets drawn for a remote kart this frame. */
@@ -372,6 +373,7 @@ interface RemoteVisual {
   yaw: number;
   steer: number;
   drift: boolean;
+  nitroActive: boolean;
 }
 
 function el<K extends keyof HTMLElementTagNameMap>(
@@ -440,7 +442,7 @@ function sampleBuffer(buf: RemoteSample[], renderTime: number): RemoteVisual | n
   if (lo < 0) {
     const first = buf[0];
     if (first === undefined) return null; // unreachable; satisfies noUncheckedIndexedAccess
-    return { x: first.x, y: first.y, z: first.z, yaw: first.yaw, steer: first.steer, drift: first.drift };
+    return { x: first.x, y: first.y, z: first.z, yaw: first.yaw, steer: first.steer, drift: first.drift, nitroActive: first.nitroActive };
   }
   const a = buf[lo];
   if (a === undefined) return null; // unreachable
@@ -448,13 +450,13 @@ function sampleBuffer(buf: RemoteSample[], renderTime: number): RemoteVisual | n
   if (b === undefined) {
     // at/after the newest sample: short velocity extrapolation, position only
     const k = Math.min(EXTRAPOLATE_MAX_MS, Math.max(0, renderTime - a.t)) / 1000;
-    return { x: a.x + a.vx * k, y: a.y, z: a.z + a.vz * k, yaw: a.yaw, steer: a.steer, drift: a.drift };
+    return { x: a.x + a.vx * k, y: a.y, z: a.z + a.vz * k, yaw: a.yaw, steer: a.steer, drift: a.drift, nitroActive: a.nitroActive };
   }
   const dx = b.x - a.x;
   const dy = b.y - a.y;
   const dz = b.z - a.z;
   if (dx * dx + dy * dy + dz * dz > TELEPORT_SQ) {
-    return { x: b.x, y: b.y, z: b.z, yaw: b.yaw, steer: b.steer, drift: b.drift }; // teleport: snap
+    return { x: b.x, y: b.y, z: b.z, yaw: b.yaw, steer: b.steer, drift: b.drift, nitroActive: b.nitroActive }; // teleport: snap
   }
   const span = b.t - a.t;
   const t = span > 0 ? Math.min(1, Math.max(0, (renderTime - a.t) / span)) : 1;
@@ -465,6 +467,7 @@ function sampleBuffer(buf: RemoteSample[], renderTime: number): RemoteVisual | n
     yaw: lerpAngle(a.yaw, b.yaw, t),
     steer: a.steer + (b.steer - a.steer) * t,
     drift: b.drift, // discrete fields from the newer sample
+    nitroActive: b.nitroActive,
   };
 }
 
@@ -1236,7 +1239,7 @@ export class KartApp {
       this.drive.step(dt);
       this.sendPacket();
       const s = this.drive.state(); // module scratch — consume, never retain
-      this.scene.updateKart(this.selfId(), s.x, s.y, s.z, s.yaw, s.steer, s.drifting, dt);
+      this.scene.updateKart(this.selfId(), s.x, s.y, s.z, s.yaw, s.steer, s.drifting, s.nitroLeft > 0, dt);
       this.updateRemotes(dt);
       this.scene.setCamera(s.x, s.y, s.z, s.yaw, Math.abs(forwardSpeed(s)), dt);
       this.updateHud(s, now);
@@ -1252,7 +1255,7 @@ export class KartApp {
       const v = sampleBuffer(buf, renderTime);
       if (v === null) continue;
       this.visuals.set(id, v);
-      this.scene.updateKart(id, v.x, v.y, v.z, v.yaw, v.steer, v.drift, dt);
+      this.scene.updateKart(id, v.x, v.y, v.z, v.yaw, v.steer, v.drift, v.nitroActive, dt);
     }
   }
 
@@ -1406,6 +1409,7 @@ export class KartApp {
       vz: p.v[1],
       steer: p.steer,
       drift: p.drift,
+      nitroActive: p.nitroActive,
     };
     const last = buf[buf.length - 1];
     if (last !== undefined && time < last.t) return; // out-of-order: drop (15Hz self-heals)

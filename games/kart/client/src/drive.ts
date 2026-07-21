@@ -6,8 +6,12 @@
 // credited gate doubles as the R-respawn anchor. Keyboard: Arrows/WASD drive,
 // Space/Shift drift (handbrake), R respawn; window blur clears every held key
 // (this game has no pointer lock). KIDS MODE (setAssist): pure-pursuit auto-steer
-// ~10m ahead on the centerline replaces the keyboard steer channel; throttle,
-// brake, drift, R and nitro stay manual. state()/packet() return module scratch
+// ~10m ahead on the centerline replaces the keyboard steer channel, hardened by
+// three assist-only safeties — wrong-way recovery (>100° off the travel tangent
+// for 1.2s of sim time → full-lock steer back to within 30°), stuck auto-respawn
+// (throttle held 2.5s while barely moving → respawn(); kids can't press R) and
+// the reverse steer mirror (the bicycle model's yaw rate flips sign with speedF).
+// Throttle, brake, drift, R and nitro stay manual. state()/packet() return module scratch
 // objects — copy out what you keep; nothing here allocates per frame, and
 // logic never calls Math.random (deterministic per input sequence).
 // ============================================================================
@@ -25,6 +29,13 @@ const BARRIER_OUT = 1.2; // barrier wall offset past the road edge (m)
 const DRIFT_VIS_RATE = 10; // driftVisual approach rate /s
 const PURSUIT_AHEAD = 10; // KIDS MODE lookahead along the centerline (m)
 const PURSUIT_GAIN = 2.2; // KIDS MODE steer = clamp(-yawErr * gain)
+const WRONG_WAY_RAD = (100 * Math.PI) / 180; // facing vs travel past this = wrong way
+const WRONG_WAY_HOLD_S = 1.2; // continuous wrong-way sim time before recovery
+const RECOVER_DONE_RAD = (30 * Math.PI) / 180; // recovery exits inside this alignment
+const STUCK_THROTTLE = 0.5; // auto-respawn needs the throttle held above this
+const STUCK_SPEED = 0.5; // ...while |speed| stays under this (m/s)
+const STUCK_HOLD_S = 2.5; // continuous stuck sim time before the auto-respawn
+const REVERSE_FLIP_SPEED = -0.5; // speedF below this mirrors the assist steer
 const CORRECT_SUPPRESS_S = 0.6; // post-respawn window where server echoes are known-stale
 
 export interface DriveState extends KartState {
@@ -85,6 +96,9 @@ export class DriveController {
   private frozen = false; // pre-GO freeze: step() integrates nothing
   private assistOn = false; // KIDS MODE — app-owned; reset()/blur never clear it
   private correctSuppress = 0; // sim-seconds left where correctTo() is ignored
+  private wrongWayT = 0; // continuous sim-seconds facing >100° off the travel tangent
+  private recovering = false; // wrong-way recovery: full-lock steer, pursuit off
+  private stuckT = 0; // continuous sim-seconds throttle held while nearly stopped
 
   /** App-wired nitro request hook — fired on a fresh KeyN press. */
   onNitro: (() => void) | null = null;
@@ -126,6 +140,9 @@ export class DriveController {
     this.pktClock = PACKET_DT;
     this.expectedGate = 0;
     this.anchorX = x; this.anchorZ = z; this.anchorYaw = yaw;
+    this.wrongWayT = 0;
+    this.recovering = false;
+    this.stuckT = 0;
   }
 
   /** Latch an external input (debug surface / e2e). Merged over the keyboard per step. */
@@ -153,9 +170,10 @@ export class DriveController {
 
   /**
    * KIDS MODE toggle: while on, step() ignores the keyboard/latched steer and
-   * drives the steer channel with pure pursuit toward the centerline ~10m ahead.
-   * Throttle/brake/drift/R/nitro stay manual. App-owned — reset() and window
-   * blur do NOT clear it.
+   * drives the steer channel with the assist controller (pure pursuit toward
+   * the centerline ~10m ahead + wrong-way recovery + reverse mirror), and a
+   * stuck kart auto-respawns. Throttle/brake/drift/R/nitro stay manual.
+   * App-owned — reset() and window blur do NOT clear it.
    */
   setAssist(on: boolean): void {
     this.assistOn = on;
@@ -199,10 +217,23 @@ export class DriveController {
     }
     e.throttle = clamp((this.keyUp ? 1 : 0) + this.ext.throttle, 0, 1);
     e.brake = clamp((this.keyDown ? 1 : 0) + this.ext.brake, 0, 1);
-    // KIDS MODE: the steer channel is fully owned by the pursuit controller.
-    e.steer = this.assistOn
-      ? this.autoSteer()
-      : clamp((this.keyRight ? 1 : 0) - (this.keyLeft ? 1 : 0) + this.ext.steer, -1, 1);
+    // KIDS MODE: the steer channel is fully owned by the assist controller.
+    if (this.assistOn) {
+      // STUCK AUTO-RESPAWN (kids can't press R): throttle held while barely
+      // moving for STUCK_HOLD_S of continuous sim time teleports to the anchor.
+      if (e.throttle > STUCK_THROTTLE && Math.abs(forwardSpeed(this.k)) < STUCK_SPEED) {
+        this.stuckT += dtc;
+        if (this.stuckT >= STUCK_HOLD_S) {
+          this.stuckT = 0;
+          this.respawn();
+        }
+      } else {
+        this.stuckT = 0;
+      }
+      e.steer = this.assistSteer(dtc);
+    } else {
+      e.steer = clamp((this.keyRight ? 1 : 0) - (this.keyLeft ? 1 : 0) + this.ext.steer, -1, 1);
+    }
     e.drift = this.keyDrift || this.ext.drift;
     this.acc += dtc;
     while (this.acc >= SUBSTEP_DT) {
@@ -250,27 +281,61 @@ export class DriveController {
   // ---- internals --------------------------------------------------------------
 
   /**
-   * KIDS MODE pure pursuit: walk the centerline forward from the kart's nearest
+   * KIDS MODE assist channel — owns e.steer while assist is on, layering three
+   * safeties over pure pursuit (all deterministic on sim time, no allocation).
+   * WRONG-WAY RECOVERY: facing more than WRONG_WAY_RAD off the nearest
+   * centerline tangent for WRONG_WAY_HOLD_S continuous drops pursuit in favor
+   * of a full-lock steer toward the tangent (the sign that shrinks the yaw
+   * error fastest) until aligned within RECOVER_DONE_RAD. REVERSE FLIP: the
+   * bicycle model's yaw rate is proportional to speedF, so while reversing the
+   * whole assist output is mirrored (backing up steers opposite, like a real
+   * car). Pure pursuit: walk the centerline forward from the kart's nearest
    * sample to the point ~PURSUIT_AHEAD m ahead, then steer toward it. Positive
    * steer = RIGHT (yaw decreases): with the platform yaw convention
    * forward = (-sin(yaw), -cos(yaw)), the desired yaw to a target is
    * atan2(-dx, -dz), so steer = clamp(-yawErr * gain) turns toward the target.
    */
-  private autoSteer(): number {
+  private assistSteer(dtc: number): number {
     const k = this.k;
     const cl = this.track.centerline;
     const n = cl.length;
-    let i = closestOnTrack(this.track, k.x, k.z).index;
-    let ahead = 0;
-    for (let steps = 0; steps < n && ahead < PURSUIT_AHEAD; steps++) {
-      const a = cl[i]!;
-      i = (i + 1) % n;
-      const b = cl[i]!;
-      ahead += Math.hypot(b[0] - a[0], b[1] - a[1]);
+    const i0 = closestOnTrack(this.track, k.x, k.z).index;
+    const a0 = cl[i0]!;
+    const b0 = cl[(i0 + 1) % n]!;
+    // travel direction at the nearest sample — same yaw convention as creditGate
+    const travelYaw = Math.atan2(-(b0[0] - a0[0]), -(b0[1] - a0[1]));
+    const yawErr = wrapPi(travelYaw - k.yaw); // facing vs travel, |·| in 0..π
+    if (this.recovering) {
+      if (Math.abs(yawErr) < RECOVER_DONE_RAD) {
+        this.recovering = false;
+        this.wrongWayT = 0;
+      }
+    } else if (Math.abs(yawErr) > WRONG_WAY_RAD) {
+      this.wrongWayT += dtc;
+      if (this.wrongWayT > WRONG_WAY_HOLD_S) this.recovering = true;
+    } else {
+      this.wrongWayT = 0;
     }
-    const target = cl[i]!;
-    const desiredYaw = Math.atan2(-(target[0] - k.x), -(target[1] - k.z));
-    return clamp(-wrapPi(desiredYaw - k.yaw) * PURSUIT_GAIN, -1, 1);
+
+    let steer: number;
+    if (this.recovering) {
+      // full lock toward the tangent: positive steer = RIGHT = yaw decreases
+      steer = yawErr > 0 ? -1 : 1;
+    } else {
+      let i = i0;
+      let ahead = 0;
+      for (let steps = 0; steps < n && ahead < PURSUIT_AHEAD; steps++) {
+        const a = cl[i]!;
+        i = (i + 1) % n;
+        const b = cl[i]!;
+        ahead += Math.hypot(b[0] - a[0], b[1] - a[1]);
+      }
+      const target = cl[i]!;
+      const desiredYaw = Math.atan2(-(target[0] - k.x), -(target[1] - k.z));
+      steer = clamp(-wrapPi(desiredYaw - k.yaw) * PURSUIT_GAIN, -1, 1);
+    }
+    // mirror the command while backing up (yaw response flips with speedF)
+    return forwardSpeed(k) < REVERSE_FLIP_SPEED ? -steer : steer;
   }
 
   private substep(): void {
@@ -362,6 +427,9 @@ export class DriveController {
     this.driftVis = 0;
     this.pktClock = PACKET_DT; // tell the server at once
     this.correctSuppress = CORRECT_SUPPRESS_S; // echoes of the old spot are stale now
+    this.wrongWayT = 0; // re-anchored facing travel — recovery state is moot
+    this.recovering = false;
+    this.stuckT = 0;
   }
 
   private clearHeld(): void {

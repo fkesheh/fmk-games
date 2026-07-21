@@ -5,7 +5,8 @@
 // hemi + sun from the TrackTheme; the sun's 2048 shadow box follows the watched
 // kart. Every other surface is flat-shaded MeshLambertMaterial in KPAL colors.
 // buildTrack bakes all static deco into ~1 mesh per material; karts stay
-// unbaked (front wheels steer, all wheels spin, the body rolls while drifting).
+// unbaked (front wheels steer, all wheels spin, the body rolls while drifting,
+// and a small exhaust flame flickers while nitro is active).
 // All scatter is seeded (@platform/shared rng) — Math.random is never touched.
 // ============================================================================
 import * as THREE from 'three';
@@ -85,6 +86,32 @@ let curbMat: THREE.MeshLambertMaterial | null = null;
 function curbMaterial(): THREE.MeshLambertMaterial {
   if (!curbMat) curbMat = new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true });
   return curbMat;
+}
+
+// ---- nitro flame materials (emissive fx — the fps muzzle-flash precedent) ------
+// Lazily shared across all karts; NOT in the mat() cache (emissive must not leak
+// onto plain body prims that share a cached hex).
+let flameOuterMat: THREE.MeshLambertMaterial | null = null;
+function flameOuter(): THREE.MeshLambertMaterial {
+  if (!flameOuterMat) {
+    flameOuterMat = new THREE.MeshLambertMaterial({
+      color: KPAL.kartOrange, // fire orange
+      emissive: KPAL.kartOrange,
+      flatShading: true,
+    });
+  }
+  return flameOuterMat;
+}
+let flameInnerMat: THREE.MeshLambertMaterial | null = null;
+function flameInner(): THREE.MeshLambertMaterial {
+  if (!flameInnerMat) {
+    flameInnerMat = new THREE.MeshLambertMaterial({
+      color: KPAL.gold, // hot yellow core (muzzle-flash tone)
+      emissive: KPAL.gold,
+      flatShading: true,
+    });
+  }
+  return flameInnerMat;
 }
 
 // ---- mesh factories (origin at center, y-up) -----------------------------------
@@ -308,6 +335,8 @@ interface KartVisual {
   body: THREE.Group; // drift-roll pivot (every non-wheel prim)
   wheels: THREE.Mesh[]; // all four — spin about the axle (local X)
   steerPivots: THREE.Group[]; // front pair — yaw with steer
+  flame: THREE.Group; // nitro exhaust flame — visible only while boosting
+  flameT: number; // accumulated flicker phase (deterministic, dt-driven)
   snapped: boolean; // first updateKart snaps instead of easing
   tx: number; // latest target transform
   ty: number;
@@ -579,9 +608,11 @@ export class KartScene {
    * Push the latest target transform for a kart and ease towards it (~12/s —
    * the interpolation lives in here, callers just forward sim/snapshot poses).
    * First call after addKart snaps. Wheels spin with signed travel distance,
-   * the front pair steers, the body rolls slightly while drifting.
+   * the front pair steers, the body rolls slightly while drifting, and while
+   * nitroActive a small emissive flame flickers at the exhaust tip (a
+   * deterministic scale pulse — no Math.random).
    */
-  updateKart(id: string, x: number, y: number, z: number, yaw: number, steer: number, drift: boolean, dt: number): void {
+  updateKart(id: string, x: number, y: number, z: number, yaw: number, steer: number, drift: boolean, nitroActive: boolean, dt: number): void {
     const v = this.karts.get(id);
     if (!v) return; // addKart must run first — ignore stray state
     v.tx = x;
@@ -611,6 +642,16 @@ export class KartScene {
     }
     v.steerVis += (steer * STEER_VIS - v.steerVis) * Math.min(1, 14 * d);
     v.roll += ((drift ? -v.steerVis * DRIFT_ROLL : 0) - v.roll) * Math.min(1, 10 * d);
+    // nitro flame: only while boosting, quick deterministic scale flicker
+    // anchored at the exhaust tip (group origin — the flame grows rearward).
+    v.flame.visible = nitroActive;
+    if (nitroActive) {
+      v.flameT += d;
+      const t = v.flameT;
+      const len = 0.85 + 0.3 * Math.sin(t * 34) + 0.1 * Math.sin(t * 61);
+      const wide = 0.9 + 0.15 * Math.sin(t * 47 + 1.3);
+      v.flame.scale.set(wide, wide, len);
+    }
     v.root.position.set(v.cx, v.cy, v.cz);
     v.root.rotation.y = v.cyaw;
     v.body.rotation.z = v.roll;
@@ -682,10 +723,11 @@ export class KartScene {
   // ---- private helpers -------------------------------------------------------------
 
   /**
-   * 20 prims (docs/KART.md allows 18-26): chassis, nose, front wing, 2 side
+   * 22 prims (docs/KART.md allows 18-26): chassis, nose, front wing, 2 side
    * pods, seat, engine block, rear bumper, exhaust, roll bar, driver torso,
    * helmet (player color), steering wheel, rear wing blade + 2 supports,
-   * 4 wheels. Faces local -z so root.rotation.y = platform yaw works.
+   * 2 nitro flame cones (emissive, hidden until boost), 4 wheels.
+   * Faces local -z so root.rotation.y = platform yaw works.
    */
   private buildKart(color: string): KartVisual {
     const root = new THREE.Group();
@@ -707,6 +749,21 @@ export class KartScene {
     put(box(1.2, 0.12, 0.1, KPAL.charcoal), 0, 0.25, 1.26); // rear bumper
     const exhaust = put(cyl(0.05, 0.05, 0.4, 6, KPAL.charcoal), 0.28, 0.5, 1.1);
     exhaust.rotation.x = Math.PI / 2; // axis along z
+    // nitro flame at the exhaust tip (pipe spans z 0.9-1.3): outer orange cone
+    // + smaller hot core, apexes pointing rearward (+z). Hidden until boost.
+    // Emissive fx — no shadow casting. Fresh cone geometries, NOT the cone()
+    // factory (that one shares the plain mat() cache; flames need emissive).
+    const flame = new THREE.Group();
+    flame.position.set(0.28, 0.5, 1.3);
+    const flameOut = new THREE.Mesh(new THREE.ConeGeometry(0.09, 0.5, 6), flameOuter());
+    flameOut.rotation.x = Math.PI / 2; // apex -> +z (rearward)
+    flameOut.position.z = 0.25;
+    const flameIn = new THREE.Mesh(new THREE.ConeGeometry(0.05, 0.3, 6), flameInner());
+    flameIn.rotation.x = Math.PI / 2;
+    flameIn.position.z = 0.15;
+    flame.add(flameOut, flameIn);
+    flame.visible = false;
+    body.add(flame);
     const rollBar = put(cyl(0.045, 0.045, 0.55, 6, KPAL.steel), 0, 0.95, 0.58);
     rollBar.rotation.z = Math.PI / 2; // axis across the kart
     put(box(0.46, 0.5, 0.3, KPAL.charcoal), 0, 0.66, 0.3); // driver torso
@@ -744,6 +801,8 @@ export class KartScene {
       body,
       wheels,
       steerPivots,
+      flame,
+      flameT: 0,
       snapped: false,
       tx: 0,
       ty: 0,
