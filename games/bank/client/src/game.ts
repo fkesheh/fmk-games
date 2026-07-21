@@ -661,6 +661,17 @@ export class BankGame {
     this.persistName(msg.name);
     this.send(msg);
   }
+  private joinPublic(name: string, roomId: string): void {
+    const msg: Extract<LobbyC2S, { t: 'join_public' }> = {
+      t: 'join_public',
+      name: cleanName(name),
+      roomId,
+    };
+    if (this.resumeToken !== null) msg.resume = this.resumeToken;
+    this.roomCode = null; // public room: no code
+    this.persistName(msg.name);
+    this.send(msg);
+  }
   private joinPrivate(name: string, code: string): void {
     const c = code.length > 0 ? code : (this.roomCode ?? ''); // stored-code fallback
     if (c.length === 0) {
@@ -893,6 +904,23 @@ export class BankGame {
       row.appendChild(title);
       row.appendChild(el('span', 'room-label', room.label));
       row.appendChild(el('span', 'room-meta', `${room.players}/${room.maxPlayers} · ${room.phase}`));
+      if (room.visibility === 'public') {
+        // public rows join by id (join_public); private ones need the code flow
+        row.style.cursor = 'pointer';
+        row.style.transition = 'border-color 120ms ease, background 120ms ease';
+        row.addEventListener('mouseenter', () => {
+          row.style.borderColor = 'rgba(216, 180, 90, 0.6)';
+          row.style.background = 'rgba(29, 92, 63, 0.45)';
+        });
+        row.addEventListener('mouseleave', () => {
+          row.style.borderColor = '';
+          row.style.background = '';
+        });
+        row.addEventListener('click', () => {
+          this.audio.resume(); // browsers gate AudioContext on a user gesture
+          this.joinPublic(this.menuName(), room.id);
+        });
+      }
       this.roomsEl.appendChild(row);
     }
   }

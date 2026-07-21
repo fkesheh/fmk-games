@@ -2,7 +2,9 @@
 // Platform lobby: matchmaking, room lifecycle, session->room routing —
 // rooms.ts generalized around a GameModule registry (games plug in via
 // registry.ts; this file never imports a game). Preserved behaviors: public
-// quick-join matching (prefer warmup, first room with space), private rooms
+// quick-join matching (prefer warmup, first room with space), join_public by
+// room id (public rooms only; missing or private => 'no_room', full =>
+// 'room_full'), private rooms
 // with game-generated 5-char codes, the MAX_ROOMS guard ('rooms_full'),
 // 'no_room'/'room_full' on join_private, list_rooms (public only), a session
 // in at most one room, empty-room reaping (private immediately, public after
@@ -39,6 +41,7 @@ interface TrackedRoom {
 const LOBBY_TAGS: ReadonlySet<string> = new Set([
   'list_rooms',
   'quick_join',
+  'join_public',
   'create_public',
   'create_private',
   'join_private',
@@ -109,6 +112,9 @@ export class Lobby {
           break;
         case 'quick_join':
           this.quickJoin(sess, msg.name, msg.game, msg.resume);
+          break;
+        case 'join_public':
+          this.joinPublic(sess, msg.name, msg.roomId, msg.resume);
           break;
         case 'create_public':
           this.createPublic(sess, msg.name, msg.game, msg.settings, msg.resume);
@@ -227,6 +233,21 @@ export class Lobby {
     }
     this.leaveRoom(sess.id);
     this.joinRoom(sess, room, name, resume);
+  }
+
+  private joinPublic(sess: Session, name: string, roomId: string, resume: PlayerId | undefined): void {
+    const tracked = this.rooms.get(roomId);
+    // private rooms answer 'no_room' too: join-by-id must not reveal them
+    if (tracked === undefined || tracked.room.info().visibility !== 'public') {
+      this.sendError(sess, 'no_room', 'no public room with that id');
+      return;
+    }
+    if (tracked.room.playerCount() >= tracked.room.info().maxPlayers) {
+      this.sendError(sess, 'room_full', 'room is full');
+      return;
+    }
+    this.leaveRoom(sess.id);
+    this.joinRoom(sess, tracked.room, name, resume);
   }
 
   private createPublic(

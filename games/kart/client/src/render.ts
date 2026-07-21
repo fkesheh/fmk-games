@@ -615,7 +615,10 @@ export class KartScene {
     v.root.rotation.y = v.cyaw;
     v.body.rotation.z = v.roll;
     for (const wheel of v.wheels) wheel.rotation.x = v.spin;
-    for (const pivot of v.steerPivots) pivot.rotation.y = v.steerVis;
+    // steer + = RIGHT (yaw decreases). The kart faces local -z, so its right
+    // side is local +x; rotating a -z-facing wheel by rotation.y = -angle
+    // swings its nose toward +x — hence the negative sign here.
+    for (const pivot of v.steerPivots) pivot.rotation.y = -v.steerVis;
   }
 
   /**

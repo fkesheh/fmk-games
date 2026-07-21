@@ -263,6 +263,7 @@ interface KartDebugState {
   nitroLeft: number; // charges left this race (you.nitroLeft, server-authoritative)
   gapAheadMs: number; // ms behind the player one place ahead; 0 for the leader
   frozen: boolean; // drive sim frozen (pre-GO freeze: every phase but 'racing')
+  assist: boolean; // KIDS MODE auto-steer active (drive.setAssist)
 }
 
 interface KartRemoteDebug {
@@ -300,6 +301,7 @@ interface KartTelemetry {
   nitroLeft: number; // nitro charges left (you.nitroLeft, server-authoritative)
   gapAheadMs: number; // ms behind the player one place ahead; 0 for the leader
   frozen: boolean; // drive sim frozen (pre-GO freeze: every phase but 'racing')
+  assist: boolean; // KIDS MODE auto-steer active (drive.setAssist)
 }
 
 interface KartApi {
@@ -340,6 +342,7 @@ const SKID_EVERY_MS = 450; // retrigger cadence for the skid loop while drifting
 const THUD_DROP = 4; // m/s of forward speed lost in one frame => barrier thud
 const NAME_MAX = 16; // lobby cleanName cap (platform protocol)
 const CODE_MAX = 8;
+const KIDS_KEY = 'kart.kids'; // localStorage key for the KIDS MODE assist toggle
 const TWO_PI = Math.PI * 2;
 
 const ZERO_INPUT: KartInput = { throttle: 0, brake: 0, steer: 0, drift: false };
@@ -379,6 +382,16 @@ function el<K extends keyof HTMLElementTagNameMap>(
   if (className !== undefined) node.className = className;
   if (text !== undefined) node.textContent = text;
   return node;
+}
+
+/** KIDS MODE persisted toggle (localStorage 'kart.kids'); false when storage is blocked. */
+function readKidsStored(): boolean {
+  try {
+    const v = localStorage.getItem(KIDS_KEY);
+    return v === '1' || v === 'true';
+  } catch {
+    return false; // storage unavailable (private mode) — assist defaults off
+  }
 }
 
 /** Trimmed, length-capped display name; 'Player' when whitespace-only (lobby rule). */
@@ -506,18 +519,21 @@ export class KartApp {
   private prevSpeed = 0;
   private lastSkidAt = 0;
   private lastFrame = 0;
+  private assist = false; // KIDS MODE auto-steer (docs/KART.md) — mirrored to localStorage 'kart.kids'
 
   // ---- DOM handles (built once in the constructor, updated in place) ----------------
   private readonly menuEl: HTMLDivElement;
   private readonly noticeEl: HTMLDivElement;
   private readonly nameInput: HTMLInputElement;
   private readonly codeInput: HTMLInputElement;
+  private readonly kidsInput: HTMLInputElement; // menu KIDS MODE checkbox
   private readonly roomsEl: HTMLDivElement;
   private readonly menuButtons: HTMLButtonElement[] = [];
   private readonly raceEl: HTMLDivElement;
   private readonly canvas: HTMLCanvasElement;
   private readonly hudEl: HTMLDivElement;
   private readonly placeEl: HTMLDivElement;
+  private readonly kidsBadgeEl: HTMLDivElement; // small 'KIDS' badge next to the place readout
   private readonly lapEl: HTMLDivElement;
   private readonly speedNumEl: HTMLSpanElement;
   private readonly gearEl: HTMLSpanElement;
@@ -537,6 +553,8 @@ export class KartApp {
   private readonly resultsNoteEl: HTMLDivElement;
 
   constructor(root: HTMLElement) {
+    this.assist = readKidsStored(); // KIDS MODE persisted toggle (localStorage 'kart.kids')
+
     // ---- menu screen ----------------------------------------------------------
     this.menuEl = el('div', 'screen menu');
     this.menuEl.appendChild(el('h1', 'menu-title', 'KART GP'));
@@ -571,6 +589,16 @@ export class KartApp {
     );
     this.menuEl.appendChild(codeRow);
 
+    // KIDS MODE auto-steer assist (docs/KART.md "Kids mode") — persisted in localStorage
+    const kidsRow = el('label', 'menu-kids');
+    this.kidsInput = el('input');
+    this.kidsInput.type = 'checkbox';
+    this.kidsInput.checked = this.assist;
+    this.kidsInput.addEventListener('change', () => this.setAssist(this.kidsInput.checked));
+    kidsRow.appendChild(this.kidsInput);
+    kidsRow.appendChild(el('span', 'menu-kids-label', 'KIDS MODE — auto steer'));
+    this.menuEl.appendChild(kidsRow);
+
     this.menuEl.appendChild(el('h2', 'menu-rooms-title', 'TRACKS'));
     this.roomsEl = el('div', 'menu-rooms');
     this.menuEl.appendChild(this.roomsEl);
@@ -596,6 +624,18 @@ export class KartApp {
     const hudLeft = el('div', 'hud-left');
     this.placeEl = el('div', 'hud-place', 'P—');
     hudLeft.appendChild(this.placeEl);
+    // KIDS badge: small, next to the place readout (inline styles: style.css is another owner's file)
+    this.kidsBadgeEl = el('div', 'hud-kids hidden', 'KIDS');
+    this.kidsBadgeEl.style.marginTop = '4px';
+    this.kidsBadgeEl.style.width = 'fit-content';
+    this.kidsBadgeEl.style.padding = '2px 6px';
+    this.kidsBadgeEl.style.borderRadius = '4px';
+    this.kidsBadgeEl.style.background = 'var(--gold)';
+    this.kidsBadgeEl.style.color = 'var(--ink)';
+    this.kidsBadgeEl.style.fontSize = '11px';
+    this.kidsBadgeEl.style.fontWeight = '800';
+    this.kidsBadgeEl.style.letterSpacing = '0.12em';
+    hudLeft.appendChild(this.kidsBadgeEl);
     this.lapEl = el('div', 'hud-lap', `LAP 1/${LAPS_TO_WIN}`);
     hudLeft.appendChild(this.lapEl);
     this.hudEl.appendChild(hudLeft);
@@ -731,6 +771,7 @@ export class KartApp {
     this.scene.setTheme(this.track.theme);
     this.scene.buildTrack(this.track);
     this.drive = new DriveController(this.track);
+    this.drive.setAssist(this.assist); // kids-mode assist restored before the first join
     // nitro key (N) asks the SERVER to spend a charge; only racing may spend one.
     // The boost itself starts when the server's nitro race event echoes back.
     this.drive.onNitro = () => {
@@ -741,6 +782,11 @@ export class KartApp {
     // ---- listeners (driving keys are owned by drive.ts; audio unlocks on clicks) ----
     window.addEventListener('resize', () => {
       if (this.screen === 'race') this.scene.resize();
+    });
+    // T toggles KIDS MODE in-game (docs/KART.md "Kids mode"); the menu uses the checkbox
+    window.addEventListener('keydown', (e) => {
+      if (e.code !== 'KeyT' || e.repeat || this.screen !== 'race') return;
+      this.setAssist(!this.assist);
     });
 
     // ---- timers (setInterval for net: rAF pauses in background tabs) ---------------
@@ -860,6 +906,17 @@ export class KartApp {
     this.send(msg);
   }
 
+  /** Room-list row click: join a specific room by id (same flow as joinPrivate; kart
+   *  carries no resume token — docs/KART.md: "resume token optional v1: NOT required"). */
+  private joinPublic(name: string, roomId: string): void {
+    const msg: Extract<LobbyC2S, { t: 'join_public' }> = {
+      t: 'join_public',
+      name: cleanName(name),
+      roomId,
+    };
+    this.send(msg);
+  }
+
   // ---- message routing -------------------------------------------------------------
   private onMessage(msg: S2C): void {
     switch (msg.t) {
@@ -904,6 +961,7 @@ export class KartApp {
     this.colorIdx = msg.color;
     this.phase = msg.phase; // set directly — joining is not a phase TRANSITION
     this.applyFreeze(); // mid-race joiners drive at once; everyone else waits for GO
+    this.drive.setAssist(this.assist); // kids-mode assist follows the stored toggle into the room
     this.you = null;
     this.phaseEndsAt = 0;
     this.countdownShown = 0;
@@ -1132,6 +1190,19 @@ export class KartApp {
     this.sendPacket();
   }
 
+  // ---- kids mode (auto-steer assist, docs/KART.md "Kids mode") -----------------------------
+  /** Single funnel for the assist toggle: the menu checkbox and the T key both land here. */
+  private setAssist(on: boolean): void {
+    this.assist = on;
+    this.kidsInput.checked = on;
+    this.drive.setAssist(on);
+    try {
+      localStorage.setItem(KIDS_KEY, on ? '1' : '0');
+    } catch {
+      // storage unavailable — the toggle still works for this session
+    }
+  }
+
   // ---- input ------------------------------------------------------------------------------
   /** Latch the debug driver into drive.ts (survives grid resets until resetRoom). */
   private setDebugInput(throttle: number, brake: number, steer: number, drift: boolean): void {
@@ -1248,6 +1319,7 @@ export class KartApp {
     } else {
       this.placeEl.textContent = 'P—';
     }
+    this.kidsBadgeEl.classList.toggle('hidden', !this.assist); // KIDS badge while assist is on
     this.lapEl.textContent = `LAP ${Math.min(you?.lap ?? 1, LAPS_TO_WIN)}/${LAPS_TO_WIN}`;
 
     // speed
@@ -1390,6 +1462,11 @@ export class KartApp {
     }
     for (const room of this.rooms) {
       const row = el('div', 'room-row');
+      row.style.cursor = 'pointer'; // hover affordance (inline: style.css is another owner's file)
+      row.addEventListener('click', () => {
+        this.audio.resume(); // same gesture unlock as the menu buttons
+        this.joinPublic(this.menuName(), room.id);
+      });
       row.appendChild(
         el('span', 'room-title', room.visibility === 'private' ? 'private race' : 'public race'),
       );
@@ -1456,6 +1533,7 @@ export class KartApp {
       nitroLeft: you?.nitroLeft ?? NITRO_CHARGES,
       gapAheadMs: you?.gapAheadMs ?? 0,
       frozen: this.phase !== 'racing',
+      assist: this.assist,
     };
   }
 
@@ -1502,6 +1580,7 @@ export class KartApp {
       nitroLeft: this.you?.nitroLeft ?? NITRO_CHARGES,
       gapAheadMs: this.you?.gapAheadMs ?? 0,
       frozen: this.phase !== 'racing',
+      assist: this.assist,
     };
   }
 }

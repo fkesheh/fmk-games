@@ -18,6 +18,7 @@ export const NET = {
 export type LobbyC2S =
   | { t: 'list_rooms' }
   | { t: 'quick_join'; name: string; game?: string; resume?: PlayerId }
+  | { t: 'join_public'; name: string; roomId: string; resume?: PlayerId } // join a specific public room by id (room list rows)
   | { t: 'create_public'; name: string; game?: string; settings?: Record<string, unknown>; resume?: PlayerId }
   | { t: 'create_private'; name: string; game?: string; settings?: Record<string, unknown>; resume?: PlayerId }
   | { t: 'join_private'; name: string; code: string; resume?: PlayerId }
@@ -89,6 +90,19 @@ export function parseC2S(raw: unknown): C2S | null {
       if (name === null || game === null || resume === null) return null;
       const msg: { t: 'quick_join'; name: string; game?: string; resume?: PlayerId } = { t: 'quick_join', name };
       if (game !== undefined) msg.game = game;
+      if (resume !== undefined) msg.resume = resume;
+      return msg;
+    }
+    case 'join_public': {
+      const name = cleanName(raw.name);
+      const resume = cleanResume(raw.resume);
+      if (name === null || resume === null) return null;
+      if (!str(raw.roomId, 16)) return null;
+      const msg: { t: 'join_public'; name: string; roomId: string; resume?: PlayerId } = {
+        t: 'join_public',
+        name,
+        roomId: raw.roomId,
+      };
       if (resume !== undefined) msg.resume = resume;
       return msg;
     }

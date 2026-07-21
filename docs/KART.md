@@ -77,6 +77,14 @@ place: "P2 · +1.8s" / "P1 · LEADER".
 Grid/lobby and the first ~6s after GO show a small controls hint card (non-modal, fades):
 WASD/arrows drive · Space/Shift drift · N nitro ×3 · R respawn at last gate.
 
+## Kids mode (frozen)
+
+A per-player assist toggle ("KIDS MODE"): menu checkbox (persisted in localStorage) +
+in-game toggle key T, HUD badge while active. When on, the CLIENT steers automatically
+(pure-pursuit toward the centerline ~10m ahead, same sign convention as the input) and
+ignores keyboard steer; the kid controls ONLY throttle/brake (and nitro). Server-side
+indistinguishable from normal input. Debug surface exposes `assist` for e2e.
+
 ## Track (frozen, shared/track.ts)
 
 One circuit: closed Catmull-Rom through TRACK_POINTS (authored below), road half-width

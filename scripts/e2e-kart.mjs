@@ -39,6 +39,19 @@
 //   (the retuned DOWNSHIFT_HYST must show no (g,g-1,g) oscillation x3+), and
 //   the same run must top >= 28 m/s on a straight (TOP_SPEED 36, floored for
 //   the headless sim rate).
+// Two checks run in a PUBLIC room BEFORE the private-room flow: A createPublic
+// and B joins it by roomId — the id is read from the lobby's creation log
+// (the frozen debug surface exposes no roomId) and B joins through the menu
+// room-row click, the client's only join_public sender (row -> joinPublic(
+// menuName(), room.id) with the wire RoomInfo.id) — both pages then assert 2
+// players. With MIN_PLAYERS met that room races too, so KIDS MODE rides it:
+// assist toggled on via KeyT (verified on state().assist), then throttle ONLY
+// — setInput(1,0,0) with the steer argument locked at 0 and never touched —
+// while the client's pure-pursuit auto-steer must steer itself around gate 1
+// (server-credited progress > 0) within 60s. Both pages then reload into
+// fresh menu clients for the private-room flow above (the client has no
+// leave-room debug hook; the assist toggle persists to localStorage, so it
+// is verified OFF before the reload).
 // Gate positions are recomputed here from the FROZEN track math (closed
 // Catmull-Rom over TRACK_POINTS, 256 samples, gate i at t=i/8 — a line-level
 // mirror of games/kart/shared/src/track.ts, which the e2e cannot import);
@@ -48,7 +61,7 @@
 //                   progress, pos{x,y,z}, speed, players(count), nitroLeft
 //                   (server-authoritative charges), gapAheadMs (ms behind the
 //                   kart one place ahead, 0 for the leader; a nested `you`
-//                   block is also tolerated)}
+//                   block is also tolerated), assist (KIDS MODE auto-steer)}
 //   telemetry() -> {phase, playerId, own{x,y,z,yaw,...}, remotes:[{id,name,
 //                   x,z,yaw,...}], phaseEndsInMs, ...}
 // so a join is observed as phase leaving 'menu', remote positions come from
@@ -546,6 +559,132 @@ async function main() {
     'window.__kart exposes the frozen debug surface',
     surfaceMissing.length === 0,
     surfaceMissing.length > 0 ? `missing: ${surfaceMissing}` : KART_SURFACE.join('/'),
+  );
+
+  // -- join-by-id: B joins A's PUBLIC room by roomId (join_public) -------------------
+  // The frozen debug surface carries neither a roomId nor a joinPublic hook —
+  // the client's ONLY join_public sender is the menu room-row click (app.ts:
+  // row -> joinPublic(menuName(), room.id) with the wire RoomInfo.id). So the
+  // roomId comes from the lobby's creation log line (same fallback family as
+  // getRoomCode) and B joins through the real client path: type its menu name,
+  // wait for A's room to render in B's menu room list (on the menu the client
+  // polls list_rooms every 3s; the server lists PUBLIC rooms only) and click
+  // the row — the client ships {t:'join_public', name, roomId} itself.
+  await A.evaluate(() => window.__kart.createPublic('Alice'));
+  await waitFor(async () => {
+    const s = await kartState(A);
+    return joined(s) ? s : null;
+  }, 10000, 'A createPublic join');
+  const pubMatches = [...serverLog.matchAll(/room (\S+) created \(public, game kart\)/g)];
+  const publicRoomId = pubMatches.length > 0 ? pubMatches[pubMatches.length - 1][1] : null;
+  await B.evaluate(() => {
+    const inp = document.querySelector('.menu-name');
+    if (inp !== null) inp.value = 'Bob'; // the row click joins as menuName()
+  });
+  const bRowText = await waitFor(
+    () =>
+      B.evaluate(() => {
+        const row = document.querySelector('.menu-rooms .room-row');
+        if (row === null) return null;
+        row.click(); // app.ts row handler: joinPublic(menuName(), room.id)
+        return row.textContent;
+      }),
+    15000,
+    "A's public room row in B's menu list",
+  );
+  await waitFor(async () => {
+    const s = await kartState(B);
+    return joined(s) ? s : null;
+  }, 10000, 'B join_public(row) join');
+  const pubSeated = await waitFor(async () => {
+    const [sa, sb] = await Promise.all([kartState(A), kartState(B)]);
+    return sa !== null && sb !== null && sa.players === 2 && sb.players === 2 ? { sa, sb } : null;
+  }, 10000, 'public room players === 2 on both pages');
+  check(
+    "join-by-id: B joins A's PUBLIC room by roomId (join_public) — both pages see 2 players",
+    publicRoomId !== null,
+    `roomId=${publicRoomId ?? '?'} (lobby log); B clicked row "${bRowText}"; counts A=${pubSeated.sa.players} B=${pubSeated.sb.players}`,
+  );
+
+  // -- kids assist (KIDS MODE): throttle only, steer locked at 0 ----------------------
+  // docs/KART.md 'Kids mode': with the assist on, the CLIENT pure-pursues the
+  // centerline ~10m ahead and OWNS the steer channel (drive.ts) — the kid
+  // holds only throttle/brake. The debug surface exposes `assist` as a flag on
+  // state()/telemetry(); the in-game toggle is KeyT (race screen only). The
+  // public room above met MIN_PLAYERS, so its own phase machine runs to
+  // 'racing': flip the assist on (verified), latch setInput(1,0,0) — the
+  // steer argument is 0 at latch and NEVER touched again — and give the
+  // client up to 60s to steer itself around gate 1 (server-credited
+  // progress > 0, exactly the guided loop's proof below but with no steer
+  // input at all). The assist is toggled back off before the reload: the
+  // toggle persists to localStorage and the fresh client below must come up
+  // unassisted (the A/D steer-sign check would read garbage otherwise).
+  await waitFor(async () => {
+    const s = await kartState(A);
+    return s !== null && s.phase === 'racing' ? s : null;
+  }, 30000, "public room phase 'racing'");
+  const assistBase = ownRaceFields(await kartState(A)).progress;
+  await A.keyboard.press('KeyT');
+  const assistOn = await waitFor(async () => {
+    const s = await kartState(A);
+    return s !== null && s.assist === true ? true : null;
+  }, 3000, 'state().assist === true after KeyT').catch(() => false);
+  await A.evaluate(() => window.__kart.setInput(1, 0, 0, false));
+  let assistProgress = null;
+  let assistLastLog = 0;
+  const assistT0 = Date.now();
+  while (Date.now() - assistT0 < 60000) {
+    const s = await kartState(A);
+    const fields = ownRaceFields(s);
+    if (fields.progress !== null && fields.progress > 0) {
+      assistProgress = fields.progress;
+      break;
+    }
+    if (Date.now() - assistLastLog >= 5000) {
+      assistLastLog = Date.now();
+      console.log(
+        `assist t=${((Date.now() - assistT0) / 1000).toFixed(0)}s progress=${fields.progress ?? '?'} ` +
+          `nextGate=${fields.nextGate ?? '?'} phase=${s !== null ? s.phase : '?'}`,
+      );
+    }
+    await A.evaluate(() => window.__kart.setInput(1, 0, 0, false)); // re-latch throttle-only; steer stays 0
+    await sleep(500);
+  }
+  await A.evaluate(() => window.__kart.setInput(0, 0, 0, false)); // park A before the reload
+  await A.keyboard.press('KeyT'); // assist back off (persists to localStorage)
+  const assistOff = await waitFor(async () => {
+    const s = await kartState(A);
+    return s !== null && s.assist === false ? true : null;
+  }, 3000, 'state().assist === false after the second KeyT').catch(() => false);
+  const assistSecs = ((Date.now() - assistT0) / 1000).toFixed(1);
+  check(
+    'kids assist (KIDS MODE): throttle-only with steer locked at 0 — the client auto-steer credits gate 1 (progress > 0 within 60s)',
+    assistOn === true && assistProgress !== null && assistProgress > 0,
+    `assist on=${assistOn} off=${assistOff}; progress ${assistBase ?? '?'} -> ${assistProgress ?? 'none'} in ~${assistSecs}s`,
+  );
+
+  // -- reset: reload both pages into fresh menu clients --------------------------------
+  // The public room keeps running server-side (the stale purge + public reap
+  // sweep it); the private-room flow below wants fresh menu clients and the
+  // client has no leave-room debug hook, so a reload is the clean reset. The
+  // menu-buttons-enabled read proves the socket welcomed before the lobby
+  // calls (renderMenu disables every menu button until 'welcome').
+  await Promise.all([
+    A.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }),
+    B.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }),
+  ]);
+  await waitFor(() => A.evaluate(() => !!window.__kart), 15000, '__kart on A after reload');
+  await waitFor(() => B.evaluate(() => !!window.__kart), 15000, '__kart on B after reload');
+  await waitFor(
+    async () => {
+      const [wa, wb] = await Promise.all([
+        A.evaluate(() => document.querySelector('.menu-actions button:not(:disabled)') !== null),
+        B.evaluate(() => document.querySelector('.menu-actions button:not(:disabled)') !== null),
+      ]);
+      return wa && wb ? true : null;
+    },
+    10000,
+    'both pages welcomed after reload (menu buttons enabled)',
   );
 
   // -- private room create + join by code ----------------------------------------------

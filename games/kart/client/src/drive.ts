@@ -5,7 +5,9 @@
 // shoulder, soft kart-kart repulsion, and an in-order gate tracker whose last
 // credited gate doubles as the R-respawn anchor. Keyboard: Arrows/WASD drive,
 // Space/Shift drift (handbrake), R respawn; window blur clears every held key
-// (this game has no pointer lock). state()/packet() return module scratch
+// (this game has no pointer lock). KIDS MODE (setAssist): pure-pursuit auto-steer
+// ~10m ahead on the centerline replaces the keyboard steer channel; throttle,
+// brake, drift, R and nitro stay manual. state()/packet() return module scratch
 // objects — copy out what you keep; nothing here allocates per frame, and
 // logic never calls Math.random (deterministic per input sequence).
 // ============================================================================
@@ -21,18 +23,21 @@ const MAX_FRAME_DT = 0.25; // tab-back hitch clamp; sim time beyond this is drop
 const PACKET_DT = 1 / SNAPSHOT_HZ; // kart_state stream rate (15Hz)
 const BARRIER_OUT = 1.2; // barrier wall offset past the road edge (m)
 const DRIFT_VIS_RATE = 10; // driftVisual approach rate /s
+const PURSUIT_AHEAD = 10; // KIDS MODE lookahead along the centerline (m)
+const PURSUIT_GAIN = 2.2; // KIDS MODE steer = clamp(-yawErr * gain)
 
 export interface DriveState extends KartState {
   steer: number; // current effective steering input -1..1 (wheel visual)
   driftVisual: number; // smoothed 0..1 drift intensity (skid visual)
   speed: number; // signed forward speed, m/s
+  assist: boolean; // KIDS MODE auto-steer active (HUD badge / debug surface)
 }
 
 // ---- module scratch (zero per-frame allocation; do not retain) ----------------
 const STATE_OUT: DriveState = {
   x: 0, y: 0, z: 0, yaw: 0, vx: 0, vz: 0,
   gear: 1, shiftLeft: 0, drifting: false, nitroLeft: 0,
-  steer: 0, driftVisual: 0, speed: 0,
+  steer: 0, driftVisual: 0, speed: 0, assist: false,
 };
 const PACKET_OUT: Extract<KartC2S, { t: 'kart_state' }> = {
   t: 'kart_state', seq: 0, p: [0, 0, 0], yaw: 0, v: [0, 0], steer: 0, drift: false,
@@ -41,6 +46,12 @@ const NO_OTHERS: ReadonlyArray<readonly [number, number, number]> = [];
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
+}
+
+/** Wrap an angle to (-π, π]. */
+function wrapPi(a: number): number {
+  const TWO_PI = Math.PI * 2;
+  return ((((a + Math.PI) % TWO_PI) + TWO_PI) % TWO_PI) - Math.PI;
 }
 
 /** True when a key event targets an editable element (lobby inputs keep typing). */
@@ -71,6 +82,7 @@ export class DriveController {
   private seq = 0; // per-client monotonic, never reset within a connection
   private driftVis = 0;
   private frozen = false; // pre-GO freeze: step() integrates nothing
+  private assistOn = false; // KIDS MODE — app-owned; reset()/blur never clear it
 
   /** App-wired nitro request hook — fired on a fresh KeyN press. */
   onNitro: (() => void) | null = null;
@@ -137,6 +149,16 @@ export class DriveController {
     this.frozen = frozen;
   }
 
+  /**
+   * KIDS MODE toggle: while on, step() ignores the keyboard/latched steer and
+   * drives the steer channel with pure pursuit toward the centerline ~10m ahead.
+   * Throttle/brake/drift/R/nitro stay manual. App-owned — reset() and window
+   * blur do NOT clear it.
+   */
+  setAssist(on: boolean): void {
+    this.assistOn = on;
+  }
+
   /** Server-approved nitro (the nitro event for the local player): start the boost. */
   activateNitro(): void {
     this.k.nitroLeft = NITRO_TIME;
@@ -155,7 +177,10 @@ export class DriveController {
     }
     e.throttle = clamp((this.keyUp ? 1 : 0) + this.ext.throttle, 0, 1);
     e.brake = clamp((this.keyDown ? 1 : 0) + this.ext.brake, 0, 1);
-    e.steer = clamp((this.keyRight ? 1 : 0) - (this.keyLeft ? 1 : 0) + this.ext.steer, -1, 1);
+    // KIDS MODE: the steer channel is fully owned by the pursuit controller.
+    e.steer = this.assistOn
+      ? this.autoSteer()
+      : clamp((this.keyRight ? 1 : 0) - (this.keyLeft ? 1 : 0) + this.ext.steer, -1, 1);
     e.drift = this.keyDrift || this.ext.drift;
     this.acc += dtc;
     while (this.acc >= SUBSTEP_DT) {
@@ -178,6 +203,7 @@ export class DriveController {
     o.steer = this.eff.steer;
     o.driftVisual = this.driftVis;
     o.speed = forwardSpeed(k);
+    o.assist = this.assistOn;
     return o;
   }
 
@@ -200,6 +226,30 @@ export class DriveController {
   }
 
   // ---- internals --------------------------------------------------------------
+
+  /**
+   * KIDS MODE pure pursuit: walk the centerline forward from the kart's nearest
+   * sample to the point ~PURSUIT_AHEAD m ahead, then steer toward it. Positive
+   * steer = RIGHT (yaw decreases): with the platform yaw convention
+   * forward = (-sin(yaw), -cos(yaw)), the desired yaw to a target is
+   * atan2(-dx, -dz), so steer = clamp(-yawErr * gain) turns toward the target.
+   */
+  private autoSteer(): number {
+    const k = this.k;
+    const cl = this.track.centerline;
+    const n = cl.length;
+    let i = closestOnTrack(this.track, k.x, k.z).index;
+    let ahead = 0;
+    for (let steps = 0; steps < n && ahead < PURSUIT_AHEAD; steps++) {
+      const a = cl[i]!;
+      i = (i + 1) % n;
+      const b = cl[i]!;
+      ahead += Math.hypot(b[0] - a[0], b[1] - a[1]);
+    }
+    const target = cl[i]!;
+    const desiredYaw = Math.atan2(-(target[0] - k.x), -(target[1] - k.z));
+    return clamp(-wrapPi(desiredYaw - k.yaw) * PURSUIT_GAIN, -1, 1);
+  }
 
   private substep(): void {
     const k = this.k;
