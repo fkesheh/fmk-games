@@ -45,9 +45,13 @@ anti-cheat only, same class as .io racers).
 ## Kart physics (frozen, shared/kartPhysics.ts)
 
 Client-owned simulation; deterministic per (state,input,dt,surface). See the file for the
-exact model: engine curve to TOP_SPEED, brake/reverse, bicycle steering with speed-sensitive
-lock, lateral grip decay (asphalt vs grass), handbrake DRIFT (grip collapse + sharper steer;
-drifting ≥ TURBO_MIN_S charges a mini-turbo on release), barrier push-out + velocity damp.
+exact model: per-gear engine curve via an automatic 5-speed gearbox (shift at gear top with
+a 0.35s engine cut, downshift with hysteresis), brake/reverse, bicycle steering with
+speed-sensitive lock AND a grip-limited understeer cap (lateral accel ≤ 11 m/s² road /
+6 grass — fast corners demand speed management), lateral grip decay (asphalt vs grass),
+handbrake DRIFT (grip collapse + sharper steer + understeer-cap bypass; drifting ≥
+TURBO_MIN_S charges a mini-turbo on release), barrier push-out + velocity damp.
+Steer semantics: positive steer = RIGHT (yaw decreases, platform convention).
 
 ## Track (frozen, shared/track.ts)
 

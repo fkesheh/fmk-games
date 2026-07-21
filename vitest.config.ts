@@ -15,6 +15,7 @@ export default defineConfig({
       'games/fps/shared/src/**/*.test.ts',
       'games/fps/server/src/**/*.test.ts',
       'games/bank/server/src/**/*.test.ts',
+      'games/kart/shared/src/**/*.test.ts',
       'games/kart/server/src/**/*.test.ts',
     ],
   },

@@ -31,7 +31,7 @@ export interface DriveState extends KartState {
 // ---- module scratch (zero per-frame allocation; do not retain) ----------------
 const STATE_OUT: DriveState = {
   x: 0, y: 0, z: 0, yaw: 0, vx: 0, vz: 0,
-  drifting: false, driftTime: 0, turboLeft: 0,
+  gear: 1, shiftLeft: 0, drifting: false, driftTime: 0, turboLeft: 0,
   steer: 0, driftVisual: 0, speed: 0,
 };
 const PACKET_OUT: KartC2S = {
@@ -101,6 +101,7 @@ export class DriveController {
     const k = this.k;
     k.x = x; k.y = 0; k.z = z; k.yaw = yaw;
     k.vx = 0; k.vz = 0;
+    k.gear = 1; k.shiftLeft = 0;
     k.drifting = false; k.driftTime = 0; k.turboLeft = 0;
     this.acc = 0;
     this.driftVis = 0;
@@ -147,6 +148,7 @@ export class DriveController {
     const o = STATE_OUT;
     o.x = k.x; o.y = k.y; o.z = k.z; o.yaw = k.yaw;
     o.vx = k.vx; o.vz = k.vz;
+    o.gear = k.gear; o.shiftLeft = k.shiftLeft;
     o.drifting = k.drifting; o.driftTime = k.driftTime; o.turboLeft = k.turboLeft;
     o.steer = this.eff.steer;
     o.driftVisual = this.driftVis;
@@ -257,6 +259,7 @@ export class DriveController {
     const k = this.k;
     k.x = this.anchorX; k.y = 0; k.z = this.anchorZ; k.yaw = this.anchorYaw;
     k.vx = 0; k.vz = 0;
+    k.gear = 1; k.shiftLeft = 0;
     k.drifting = false; k.driftTime = 0; k.turboLeft = 0;
     this.acc = 0;
     this.driftVis = 0;

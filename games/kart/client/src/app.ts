@@ -20,9 +20,9 @@ import {
   KPAL,
   LAPS_TO_WIN,
   MIN_PLAYERS,
-  TOP_SPEED,
   TURBO_MIN_S,
   buildTrack,
+  engineRevs,
   forwardSpeed,
   gridSlot,
 } from '@kart/shared';
@@ -250,6 +250,7 @@ interface KartDebugState {
   progress: number;
   pos: { x: number; y: number; z: number };
   speed: number; // signed forward speed, m/s
+  gear: number; // 1-based automatic gearbox gear (index into the contract GEARS)
   players: number; // karts in the room (snapshot count)
 }
 
@@ -279,6 +280,7 @@ interface KartTelemetry {
     yaw: number;
     speedMps: number;
     speedKmh: number;
+    gear: number; // current gearbox gear (1-based)
     drifting: boolean;
     driftTime: number;
     turboLeft: number;
@@ -503,6 +505,7 @@ export class KartApp {
   private readonly placeEl: HTMLDivElement;
   private readonly lapEl: HTMLDivElement;
   private readonly speedNumEl: HTMLSpanElement;
+  private readonly gearEl: HTMLSpanElement;
   private readonly lapTimeEl: HTMLSpanElement;
   private readonly bestEl: HTMLSpanElement;
   private readonly turboEl: HTMLDivElement;
@@ -583,6 +586,14 @@ export class KartApp {
 
     const hudRight = el('div', 'hud-right');
     const speed = el('div', 'hud-speed');
+    // gear readout next to the speed — inline styles: style.css is another owner's file
+    this.gearEl = el('span', 'hud-gear', '1');
+    this.gearEl.style.fontSize = 'clamp(28px, 4.5vw, 44px)';
+    this.gearEl.style.fontWeight = '800';
+    this.gearEl.style.fontVariantNumeric = 'tabular-nums';
+    this.gearEl.style.color = 'var(--gold)';
+    this.gearEl.style.marginRight = '10px';
+    speed.appendChild(this.gearEl);
     this.speedNumEl = el('span', 'hud-speed-num', '0');
     speed.appendChild(this.speedNumEl);
     speed.appendChild(el('span', 'hud-speed-unit', 'km/h'));
@@ -1078,7 +1089,7 @@ export class KartApp {
   private updateAudio(s: DriveState, now: number): void {
     const spd = forwardSpeed(s);
     const on = this.phase === 'ready' || this.phase === 'countdown' || this.phase === 'racing';
-    this.audio.engine(Math.min(1, Math.abs(spd) / TOP_SPEED), on);
+    this.audio.engine(engineRevs(s), on); // per-gear revs: the note drops on every upshift
     if (s.drifting && (!this.prevDrifting || now - this.lastSkidAt > SKID_EVERY_MS)) {
       this.audio.sfx('skid'); // edge + slow retrigger = a continuous-ish skid loop
       this.lastSkidAt = now;
@@ -1137,6 +1148,10 @@ export class KartApp {
 
     // speed
     this.speedNumEl.textContent = String(Math.round(Math.abs(forwardSpeed(s)) * 3.6));
+
+    // gear: big number beside the speed; flashes while the upshift cuts the engine
+    this.gearEl.textContent = String(s.gear);
+    this.gearEl.style.opacity = s.shiftLeft > 0 && Math.floor(now / 90) % 2 === 0 ? '0.25' : '1';
 
     // current lap time (frozen at our finish) + best lap
     let current = -1;
@@ -1331,6 +1346,7 @@ export class KartApp {
       progress: you?.progress ?? 0,
       pos: { x: s.x, y: s.y, z: s.z },
       speed: forwardSpeed(s),
+      gear: s.gear,
       players: this.players.size,
     };
   }
@@ -1369,6 +1385,7 @@ export class KartApp {
         yaw: s.yaw,
         speedMps: spd,
         speedKmh: spd * 3.6,
+        gear: s.gear,
         drifting: s.drifting,
         driftTime: s.driftTime,
         turboLeft: s.turboLeft,

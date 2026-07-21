@@ -5,9 +5,10 @@
 // yaw convention matches the platform: forward = (-sin(yaw), -cos(yaw)).
 // ============================================================================
 import {
-  BRAKE, DRAG, DRIFT_MIN_SPEED, DRIFT_STEER_MUL, ENGINE, GRASS_DRAG, GRASS_ENGINE_MUL,
-  GRIP_DRIFT, GRIP_GRASS, GRIP_ROAD, MAX_LOCK, MIN_LOCK, REVERSE_TOP, ROLL, TOP_SPEED,
-  TURBO_BOOST, TURBO_MIN_S, TURBO_S, WHEELBASE,
+  BRAKE, DRAG, DRIFT_MIN_SPEED, DRIFT_STEER_MUL, ENGINE, GEARS, GRASS_DRAG,
+  GRASS_ENGINE_MUL, GRIP_DRIFT, GRIP_GRASS, GRIP_ROAD, LAT_G, LAT_G_GRASS,
+  MAX_LOCK, MIN_LOCK, REVERSE_TOP, ROLL, SHIFT_TIME, TOP_SPEED, TURBO_BOOST,
+  TURBO_MIN_S, TURBO_S, WHEELBASE,
 } from './config.js';
 
 export type Surface = 'road' | 'grass';
@@ -15,7 +16,7 @@ export type Surface = 'road' | 'grass';
 export interface KartInput {
   throttle: number; // 0..1
   brake: number; // 0..1 (also reverses from standstill)
-  steer: number; // -1..1 (positive = right)
+  steer: number; // -1..1 (positive = RIGHT: kart turns clockwise seen from above)
   drift: boolean; // handbrake held
 }
 
@@ -23,13 +24,15 @@ export interface KartState {
   x: number; y: number; z: number;
   yaw: number;
   vx: number; vz: number; // world velocity
+  gear: number; // 1-based index into GEARS (reverse always uses gear 1)
+  shiftLeft: number; // remaining upshift engine-cut seconds
   drifting: boolean;
   driftTime: number; // consecutive seconds in drift (for turbo charge)
   turboLeft: number; // remaining mini-turbo seconds
 }
 
 export function makeKart(x: number, z: number, yaw: number): KartState {
-  return { x, y: 0, z, yaw, vx: 0, vz: 0, drifting: false, driftTime: 0, turboLeft: 0 };
+  return { x, y: 0, z, yaw, vx: 0, vz: 0, gear: 1, shiftLeft: 0, drifting: false, driftTime: 0, turboLeft: 0 };
 }
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -40,10 +43,14 @@ function lerp(a: number, b: number, t: number): number {
 }
 
 /**
- * Advance the kart one step. Model: engine curve + brake/reverse + drag on the
- * forward axis; bicycle steering (yaw rate = v/L · tan δ) with speed-sensitive
- * lock; lateral velocity killed by surface grip (drift collapses it); handbrake
- * drift with mini-turbo on release.
+ * Advance the kart one step.
+ * Longitudinal: per-gear engine curve (automatic gearbox, engine cut during
+ * upshifts), brake/reverse, drag. Steering: bicycle model (yaw rate =
+ * v/L · tan δ) with speed-sensitive lock, capped by the surface's max lateral
+ * acceleration (understeer at speed); positive steer turns RIGHT (yaw
+ * decreases, platform convention). Lateral velocity killed by surface grip;
+ * handbrake drift collapses grip AND bypasses the understeer cap (sliding),
+ * charging a mini-turbo on release.
  */
 export function stepKart(s: KartState, inp: KartInput, dt: number, surface: Surface): KartState {
   const fx = -Math.sin(s.yaw);
@@ -73,14 +80,28 @@ export function stepKart(s: KartState, inp: KartInput, dt: number, surface: Surf
     }
   }
 
-  // ---- longitudinal ----
-  let engineMul = surface === 'grass' ? GRASS_ENGINE_MUL : 1;
+  // ---- longitudinal: automatic gearbox ----
+  if (s.shiftLeft > 0) {
+    s.shiftLeft = Math.max(0, s.shiftLeft - dt); // engine cut during the shift
+  }
+  const gear = GEARS[clamp(s.gear, 1, GEARS.length) - 1]!;
+  const engineMul = surface === 'grass' ? GRASS_ENGINE_MUL : 1;
   if (s.turboLeft > 0) {
     s.turboLeft = Math.max(0, s.turboLeft - dt);
     speedF += TURBO_BOOST * engineMul * dt;
   }
-  if (throttle > 0 && speedF < TOP_SPEED) {
-    speedF += ENGINE * engineMul * throttle * Math.max(0, 1 - speedF / TOP_SPEED) * dt;
+  if (s.shiftLeft === 0 && throttle > 0 && speedF >= 0 && speedF < gear.top) {
+    // flat engine force per gear; REV LIMITER: no engine force at/above the gear top
+    // (drag pulls back under it, so speed settles at the top without taper math
+    // that provably could never reach the shift point).
+    speedF += ENGINE * gear.accel * engineMul * throttle * dt;
+  }
+  // upshift at the gear top; downshift with hysteresis (never below gear 1)
+  if (s.shiftLeft === 0 && s.gear < GEARS.length && speedF >= gear.top) {
+    s.gear += 1;
+    s.shiftLeft = SHIFT_TIME;
+  } else if (s.gear > 1 && speedF < GEARS[s.gear - 2]!.top - 1.5) {
+    s.gear -= 1;
   }
   if (brake > 0) {
     if (speedF > 0.5) speedF -= BRAKE * brake * dt;
@@ -93,11 +114,19 @@ export function stepKart(s: KartState, inp: KartInput, dt: number, surface: Surf
   if (Math.abs(speedF) < 0.05 && throttle === 0 && brake === 0) speedF = 0;
   speedF = clamp(speedF, -REVERSE_TOP, TOP_SPEED * 1.15);
 
-  // ---- steering (bicycle model) ----
+  // ---- steering (bicycle model) + understeer cap ----
+  // positive steer = RIGHT: yaw decreases (platform convention).
   const lock = lerp(MAX_LOCK, MIN_LOCK, clamp(Math.abs(speedF) / TOP_SPEED, 0, 1));
   const steerAngle = steer * lock * (s.drifting ? DRIFT_STEER_MUL : 1);
   if (Math.abs(speedF) > 0.05) {
-    s.yaw += (speedF / WHEELBASE) * Math.tan(steerAngle) * dt;
+    let yawRate = -(speedF / WHEELBASE) * Math.tan(steerAngle);
+    if (!s.drifting) {
+      // grip-limited turn: lateral accel may not exceed μ (drift bypasses = sliding)
+      const latG = surface === 'grass' ? LAT_G_GRASS : LAT_G;
+      const cap = latG / Math.max(2, Math.abs(speedF));
+      yawRate = clamp(yawRate, -cap, cap);
+    }
+    s.yaw += yawRate * dt;
   }
 
   // ---- lateral grip ----
@@ -119,4 +148,12 @@ export function stepKart(s: KartState, inp: KartInput, dt: number, surface: Surf
 /** Current forward speed in m/s (signed). */
 export function forwardSpeed(s: KartState): number {
   return s.vx * -Math.sin(s.yaw) + s.vz * -Math.cos(s.yaw);
+}
+
+/** Engine revs 0..1 within the current gear band (drives the engine audio). */
+export function engineRevs(s: KartState): number {
+  const top = GEARS[clamp(s.gear, 1, GEARS.length) - 1]!.top;
+  const prev = s.gear > 1 ? GEARS[s.gear - 2]!.top : 0;
+  const sp = clamp(Math.abs(forwardSpeed(s)), prev, top);
+  return top === prev ? 1 : (sp - prev) / (top - prev);
 }
