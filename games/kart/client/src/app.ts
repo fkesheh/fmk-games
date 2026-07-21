@@ -333,6 +333,7 @@ const EXTRAPOLATE_MAX_MS = 250; // past-newest velocity extrapolation cap
 const TELEPORT_SQ = 10 * 10; // m² — bigger jumps snap, never lerp (matches fps interp)
 const CORRECT_DIST_SQ = 5 * 5; // m² — server/own divergence that triggers a correction
 const CORRECT_BLEND = 0.35; // fraction of the gap closed per correcting snapshot (GENTLE)
+const OFFSET_EMA = 0.2; // server-clock offset smoothing per pong (spike must not lurch remotes)
 const MAX_FRAME_DT = 0.05; // s — tab-switch clamp for the local sim
 const GO_FLASH_MS = 900; // how long the big GO! stays up
 const HINT_HOLD_MS = 5000; // controls hint card stays fully up this long after GO…
@@ -487,6 +488,7 @@ export class KartApp {
 
   // ---- net timing ----------------------------------------------------------------
   private offset = 0; // serverNow = Date.now() + offset (rtt/2 estimate, like bank)
+  private offsetSet = false; // first pong sets the offset directly; later pongs EMA it
   private rttMs = 0;
   private packetsSent = 0; // kart_state frames actually sent (drive.ts owns the seq)
 
@@ -935,7 +937,14 @@ export class KartApp {
         const rtt = performance.now() - msg.ts;
         if (rtt >= 0) {
           this.rttMs = rtt;
-          this.offset = msg.serverTime + rtt / 2 - Date.now();
+          const measured = msg.serverTime + rtt / 2 - Date.now();
+          // EMA, never replacement: a single rtt spike must not jump the
+          // shared render time base — every remote kart would visibly lurch
+          // by speed × Δoffset (worst on nitro-fast karts).
+          this.offset = this.offsetSet
+            ? this.offset + (measured - this.offset) * OFFSET_EMA
+            : measured;
+          this.offsetSet = true;
         }
         break;
       }
@@ -1095,13 +1104,15 @@ export class KartApp {
   }
 
   /** GENTLE server correction: the server echoes our own last state; only a
-   *  >5m divergence (clamp/packet loss) pulls the local kart, and only partway. */
+   *  >5m divergence (clamp/packet loss) pulls the local kart, and only partway.
+   *  drive.correctTo nudges position ONLY (velocity/gates/anchor untouched) and
+   *  ignores the known-stale echoes right after an R-respawn teleport. */
   private correctOwn(p: KartPlayerSnap): void {
     const s = this.drive.state();
     const dx = p.p[0] - s.x;
     const dz = p.p[2] - s.z;
     if (dx * dx + dz * dz > CORRECT_DIST_SQ) {
-      this.drive.reset(s.x + dx * CORRECT_BLEND, s.z + dz * CORRECT_BLEND, s.yaw);
+      this.drive.correctTo(s.x + dx * CORRECT_BLEND, s.z + dz * CORRECT_BLEND);
     }
   }
 

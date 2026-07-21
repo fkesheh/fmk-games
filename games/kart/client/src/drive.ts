@@ -25,6 +25,7 @@ const BARRIER_OUT = 1.2; // barrier wall offset past the road edge (m)
 const DRIFT_VIS_RATE = 10; // driftVisual approach rate /s
 const PURSUIT_AHEAD = 10; // KIDS MODE lookahead along the centerline (m)
 const PURSUIT_GAIN = 2.2; // KIDS MODE steer = clamp(-yawErr * gain)
+const CORRECT_SUPPRESS_S = 0.6; // post-respawn window where server echoes are known-stale
 
 export interface DriveState extends KartState {
   steer: number; // current effective steering input -1..1 (wheel visual)
@@ -83,6 +84,7 @@ export class DriveController {
   private driftVis = 0;
   private frozen = false; // pre-GO freeze: step() integrates nothing
   private assistOn = false; // KIDS MODE — app-owned; reset()/blur never clear it
+  private correctSuppress = 0; // sim-seconds left where correctTo() is ignored
 
   /** App-wired nitro request hook — fired on a fresh KeyN press. */
   onNitro: (() => void) | null = null;
@@ -164,11 +166,31 @@ export class DriveController {
     this.k.nitroLeft = NITRO_TIME;
   }
 
+  /**
+   * GENTLE own-state server correction (app.ts correctOwn): nudge POSITION
+   * only. Velocity, gear, the gate tracker and the respawn anchor are all
+   * untouched — this is a nudge, not the grid reset (drive.reset() zeroes
+   * velocity, restarts the gate tracker at 0 and re-anchors mid-track).
+   * Suppressed for CORRECT_SUPPRESS_S of sim time after a respawn: the server
+   * then still echoes our PRE-teleport position for ~rtt/2 + a snapshot
+   * interval, and pulling toward that known-stale echo rubber-bands the kart
+   * (the echo adopts the respawned position from our next kart_state — the
+   * net model is client-trusted, so the divergence heals by itself).
+   */
+  correctTo(x: number, z: number): void {
+    if (this.correctSuppress > 0) return;
+    this.k.x = x;
+    this.k.z = z;
+  }
+
   /** Advance the sim by render dt (seconds); runs fixed 120Hz substeps inside. */
   step(dt: number): void {
     if (!(dt > 0)) return; // NaN/negative guard
     const dtc = Math.min(dt, MAX_FRAME_DT);
     this.pktClock += dtc;
+    if (this.correctSuppress > 0) {
+      this.correctSuppress = Math.max(0, this.correctSuppress - dtc);
+    }
     const e = this.eff;
     if (this.frozen) {
       e.throttle = 0; e.brake = 0; e.steer = 0; e.drift = false;
@@ -339,6 +361,7 @@ export class DriveController {
     this.acc = 0;
     this.driftVis = 0;
     this.pktClock = PACKET_DT; // tell the server at once
+    this.correctSuppress = CORRECT_SUPPRESS_S; // echoes of the old spot are stale now
   }
 
   private clearHeld(): void {
