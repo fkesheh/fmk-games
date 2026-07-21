@@ -57,6 +57,11 @@ export class InputController {
   private keyD = false;
   private jumpHeld = false;
   private keyCHeld = false; // 'C' — crouch
+  // Caps Lock crouch state, flipped on EVERY CapsLock key event (down AND up).
+  // Windows fires keydown+keyup per physical press/release → hold-crouch.
+  // macOS fires keydown only when caps engages and keyup when it disengages
+  // (two physical presses) → toggle-crouch. One flag serves both platforms.
+  private capsCrouch = false;
   private fireHeld = false;
   private altHeld = false;
   private keyFHeld = false; // 'F' — scope = altHeld || keyFHeld
@@ -128,7 +133,7 @@ export class InputController {
     if (this.fireHeld || this.fireLatch) buttons |= INPUT_FIRE;
     this.fireLatch = false; // consumed by this frame — reported exactly once
     if (this.jumpHeld) buttons |= INPUT_JUMP;
-    if (this.keyCHeld) buttons |= INPUT_CROUCH;
+    if (this.keyCHeld || this.capsCrouch) buttons |= INPUT_CROUCH;
     if (this.altHeld || this.keyFHeld) buttons |= INPUT_ALT;
     if (this.shiftLHeld || this.shiftRHeld) buttons |= INPUT_WALK;
     const o = this.frameOut;
@@ -152,6 +157,7 @@ export class InputController {
     this.jumpHeld = this.keyCHeld = false;
     this.fireHeld = this.altHeld = this.keyFHeld = false;
     this.shiftLHeld = this.shiftRHeld = false;
+    this.capsCrouch = false; // no stuck crouch on blur/unlock
     this.fireLatch = false;
     if (this.tabHeld) {
       // never leave the scoreboard stuck open across blur/unlock
@@ -239,6 +245,12 @@ export class InputController {
     }
     if (this.consoleOpen) return; // console owns the keyboard — no held state, no edges
     if (!this.locked()) return;
+    if (e.code === 'CapsLock') {
+      // flip capsCrouch on down AND up (keyup case is in onKeyUp). NOT
+      // preventDefault'd: CapsLock also toggles OS caps state — harmless here.
+      if (!e.repeat) this.capsCrouch = !this.capsCrouch;
+      return;
+    }
     switch (e.code) {
       case 'KeyW': this.keyW = true; break;
       case 'KeyA': this.keyA = true; break;
@@ -279,6 +291,13 @@ export class InputController {
   private readonly onKeyUp = (e: KeyboardEvent): void => {
     // ungated: held flags must clear even if lock was lost between down and up
     switch (e.code) {
+      case 'CapsLock':
+        // flip counterpart to onKeyDown. Ignores consoleOpen (keyup philosophy:
+        // clearing/second-half events are always safe), but still gated by
+        // pointer lock like the keydown — otherwise a Windows keyup while
+        // unlocked would flip crouch on with no matching keydown.
+        if (this.locked() && !e.repeat) this.capsCrouch = !this.capsCrouch;
+        break;
       case 'KeyW': this.keyW = false; break;
       case 'KeyA': this.keyA = false; break;
       case 'KeyS': this.keyS = false; break;

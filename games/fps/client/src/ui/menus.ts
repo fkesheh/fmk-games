@@ -70,7 +70,7 @@ const CONTROLS: ReadonlyArray<readonly [string, string]> = [
   ['LMB', 'Fire'],
   ['RMB / F', 'Scope (AWM)'],
   ['Space', 'Jump'],
-  ['C', 'Crouch'],
+  ['C / Caps Lock', 'Crouch'],
   ['R', 'Reload'],
   ['B', 'Buy'],
   ['Tab', 'Scoreboard'],
