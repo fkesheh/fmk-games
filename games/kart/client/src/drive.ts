@@ -10,7 +10,7 @@
 // logic never calls Math.random (deterministic per input sequence).
 // ============================================================================
 import {
-  BARRIER_DAMP, GATES, GATE_RADIUS, KART_RADIUS, SNAPSHOT_HZ,
+  BARRIER_DAMP, GATES, GATE_RADIUS, KART_RADIUS, NITRO_TIME, SNAPSHOT_HZ,
   closestOnTrack, forwardSpeed, makeKart, stepKart, surfaceAt,
 } from '@kart/shared';
 import type { KartC2S, KartInput, KartState, TrackDef } from '@kart/shared';
@@ -31,10 +31,10 @@ export interface DriveState extends KartState {
 // ---- module scratch (zero per-frame allocation; do not retain) ----------------
 const STATE_OUT: DriveState = {
   x: 0, y: 0, z: 0, yaw: 0, vx: 0, vz: 0,
-  gear: 1, shiftLeft: 0, drifting: false, driftTime: 0, turboLeft: 0,
+  gear: 1, shiftLeft: 0, drifting: false, nitroLeft: 0,
   steer: 0, driftVisual: 0, speed: 0,
 };
-const PACKET_OUT: KartC2S = {
+const PACKET_OUT: Extract<KartC2S, { t: 'kart_state' }> = {
   t: 'kart_state', seq: 0, p: [0, 0, 0], yaw: 0, v: [0, 0], steer: 0, drift: false,
 };
 const NO_OTHERS: ReadonlyArray<readonly [number, number, number]> = [];
@@ -70,6 +70,10 @@ export class DriveController {
   private pktClock = PACKET_DT; // first packet() fires immediately
   private seq = 0; // per-client monotonic, never reset within a connection
   private driftVis = 0;
+  private frozen = false; // pre-GO freeze: step() integrates nothing
+
+  /** App-wired nitro request hook — fired on a fresh KeyN press. */
+  onNitro: (() => void) | null = null;
 
   // other karts' [x,y,z] for soft repulsion — reference retained, caller-owned
   private others: ReadonlyArray<readonly [number, number, number]> = NO_OTHERS;
@@ -102,7 +106,7 @@ export class DriveController {
     k.x = x; k.y = 0; k.z = z; k.yaw = yaw;
     k.vx = 0; k.vz = 0;
     k.gear = 1; k.shiftLeft = 0;
-    k.drifting = false; k.driftTime = 0; k.turboLeft = 0;
+    k.drifting = false;
     this.acc = 0;
     this.driftVis = 0;
     this.pktClock = PACKET_DT;
@@ -123,12 +127,32 @@ export class DriveController {
     this.others = positions;
   }
 
+  /**
+   * Pre-GO freeze: while frozen, step() integrates nothing — input is ignored,
+   * velocity is zeroed, and the kart holds its grid slot no matter what the
+   * keyboard or a debug setInput latch says. The packet clock keeps running so
+   * the (stationary) state stream never gaps.
+   */
+  setFrozen(frozen: boolean): void {
+    this.frozen = frozen;
+  }
+
+  /** Server-approved nitro (the nitro event for the local player): start the boost. */
+  activateNitro(): void {
+    this.k.nitroLeft = NITRO_TIME;
+  }
+
   /** Advance the sim by render dt (seconds); runs fixed 120Hz substeps inside. */
   step(dt: number): void {
     if (!(dt > 0)) return; // NaN/negative guard
     const dtc = Math.min(dt, MAX_FRAME_DT);
     this.pktClock += dtc;
     const e = this.eff;
+    if (this.frozen) {
+      e.throttle = 0; e.brake = 0; e.steer = 0; e.drift = false;
+      this.k.vx = 0; this.k.vz = 0;
+      return;
+    }
     e.throttle = clamp((this.keyUp ? 1 : 0) + this.ext.throttle, 0, 1);
     e.brake = clamp((this.keyDown ? 1 : 0) + this.ext.brake, 0, 1);
     e.steer = clamp((this.keyRight ? 1 : 0) - (this.keyLeft ? 1 : 0) + this.ext.steer, -1, 1);
@@ -149,7 +173,8 @@ export class DriveController {
     o.x = k.x; o.y = k.y; o.z = k.z; o.yaw = k.yaw;
     o.vx = k.vx; o.vz = k.vz;
     o.gear = k.gear; o.shiftLeft = k.shiftLeft;
-    o.drifting = k.drifting; o.driftTime = k.driftTime; o.turboLeft = k.turboLeft;
+    o.drifting = k.drifting;
+    o.nitroLeft = k.nitroLeft;
     o.steer = this.eff.steer;
     o.driftVisual = this.driftVis;
     o.speed = forwardSpeed(k);
@@ -260,7 +285,7 @@ export class DriveController {
     k.x = this.anchorX; k.y = 0; k.z = this.anchorZ; k.yaw = this.anchorYaw;
     k.vx = 0; k.vz = 0;
     k.gear = 1; k.shiftLeft = 0;
-    k.drifting = false; k.driftTime = 0; k.turboLeft = 0;
+    k.drifting = false;
     this.acc = 0;
     this.driftVis = 0;
     this.pktClock = PACKET_DT; // tell the server at once
@@ -283,6 +308,7 @@ export class DriveController {
       case 'ArrowRight': case 'KeyD': this.keyRight = true; break;
       case 'Space': case 'ShiftLeft': case 'ShiftRight': this.keyDrift = true; break;
       case 'KeyR': if (!e.repeat) this.respawn(); break;
+      case 'KeyN': if (!e.repeat) this.onNitro?.(); break;
       default: return; // not a game key — leave the event alone
     }
     e.preventDefault(); // game keys never scroll/navigate the page

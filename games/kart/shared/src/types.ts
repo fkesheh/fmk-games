@@ -5,15 +5,17 @@
 export type KartPhase = 'lobby' | 'ready' | 'countdown' | 'racing' | 'results';
 
 /** Room-level messages (platform lobby handles join/leave/list itself). */
-export type KartC2S = {
-  t: 'kart_state';
-  seq: number; // per-client monotonic
-  p: [number, number, number]; // kart origin (y ~0)
-  yaw: number;
-  v: [number, number]; // velocity x/z m/s
-  steer: number; // -1..1
-  drift: boolean;
-};
+export type KartC2S =
+  | {
+      t: 'kart_state';
+      seq: number; // per-client monotonic
+      p: [number, number, number]; // kart origin (y ~0)
+      yaw: number;
+      v: [number, number]; // velocity x/z m/s
+      steer: number; // -1..1
+      drift: boolean;
+    }
+  | { t: 'nitro' }; // consume one nitro charge (NITRO_CHARGES per race)
 
 export interface KartPlayerInfo {
   id: string;
@@ -34,6 +36,7 @@ export interface KartPlayerSnap extends KartPlayerInfo {
   place: number; // 1-based race position
   finished: boolean;
   finishMs: number; // race time at finish, -1 while racing
+  nitroActive: boolean; // currently boosting (remote flame/skid visual)
 }
 
 export interface KartYou {
@@ -44,6 +47,8 @@ export interface KartYou {
   finished: boolean;
   finishMs: number;
   bestLapMs: number; // -1 until a lap completes
+  nitroLeft: number; // charges remaining this race (NITRO_CHARGES at GO)
+  gapAheadMs: number; // est. ms behind the player one place ahead; 0 for the leader
 }
 
 export type RaceEvent =
@@ -51,6 +56,7 @@ export type RaceEvent =
   | { kind: 'go' }
   | { kind: 'gate'; playerId: string; gate: number }
   | { kind: 'lap'; playerId: string; lap: number; lapMs: number }
+  | { kind: 'nitro'; playerId: string; left: number } // a charge was consumed (remote sfx/visual)
   | { kind: 'finish'; playerId: string; place: number }
   | { kind: 'timeout' }
   | { kind: 'restart' };

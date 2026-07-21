@@ -17,11 +17,21 @@ anti-cheat only, same class as .io racers).
 
 - **Lobby:** players join (grid slot by join order). When ≥ MIN_PLAYERS: 5s "get ready",
   then countdown 3-2-1-GO (1s each, `phase:'countdown'`).
+- **Pre-GO freeze (frozen):** karts may NOT move before GO. Client: the drive sim is frozen
+  (no input, no stepping) in lobby/ready/countdown. Server: kart_state positions are IGNORED
+  outside 'racing', and at GO every player's snapshot position is reset to their grid slot —
+  any pre-GO movement is wiped server-side regardless of client behavior.
 - **Race (`phase:'racing'`):** 3 laps (LAPS_TO_WIN). Clients stream `kart_state` at 15Hz.
   Server tracks per-player `progress` = lap×GATES + nextGateIndex; a gate credit requires
   passing within GATE_RADIUS of the expected gate IN ORDER (skipping gates gives no credit).
   Finish = progress ≥ LAPS_TO_WIN×GATES ⇒ `finishOrder` append; when all connected players
   finished (or RACE_TIMEOUT_S) ⇒ results.
+- **Nitro (frozen):** each player gets NITRO_CHARGES (3) per race, refilled at GO. Pressing
+  the nitro key (N) sends `{t:'nitro'}`; the server validates a charge remains (else silently
+  ignores) and broadcasts a `nitro` race event (remote whoosh). The boost itself applies
+  client-side in stepKart: +NITRO_BOOST engine for NITRO_TIME seconds (stacks with turbo).
+  `you.nitroLeft` in snapshots is authoritative for the HUD pips; `nitroActive` on player
+  snaps drives remote visuals.
 - **Results (`phase:'results'`, 10s):** finishOrder + per-player best lap ms. Then back to
   lobby (scores/race state reset; players stay seated; new race starts when ≥ MIN_PLAYERS).
 - **Mid-race joiners:** spawn at the back of the grid (progress 0, lap 1) and race too.
@@ -45,13 +55,27 @@ anti-cheat only, same class as .io racers).
 ## Kart physics (frozen, shared/kartPhysics.ts)
 
 Client-owned simulation; deterministic per (state,input,dt,surface). See the file for the
-exact model: per-gear engine curve via an automatic 5-speed gearbox (shift at gear top with
-a 0.35s engine cut, downshift with hysteresis), brake/reverse, bicycle steering with
+exact model: per-gear engine force via an automatic 5-speed gearbox (rev limiter at each
+gear top, SHIFT_TIME engine cut on upshift, downshift with DOWNSHIFT_HYST — wider than the
+cut's speed cost so the box never oscillates), brake/reverse, bicycle steering with
 speed-sensitive lock AND a grip-limited understeer cap (lateral accel ≤ 11 m/s² road /
-6 grass — fast corners demand speed management), lateral grip decay (asphalt vs grass),
-handbrake DRIFT (grip collapse + sharper steer + understeer-cap bypass; drifting ≥
-TURBO_MIN_S charges a mini-turbo on release), barrier push-out + velocity damp.
+6 grass — fast corners demand braking), lateral grip decay (asphalt vs grass), handbrake
+DRIFT (grip collapse + sharper steer + cap bypass — a rotation tool, NO boost attached),
+NITRO (see rules above), barrier push-out + velocity damp.
 Steer semantics: positive steer = RIGHT (yaw decreases, platform convention).
+
+## Gap timing (frozen)
+
+The server records each player's timestamp at every gate credit. Each snapshot's
+`you.gapAheadMs` estimates your gap to the player one place ahead: if you both have a
+timestamp for the same gate sequence (lap×GATES+idx), gap = your time − theirs; otherwise
+estimated from your spatial distance / 20 m/s. 0 for the leader. HUD shows it next to the
+place: "P2 · +1.8s" / "P1 · LEADER".
+
+## Onboarding hints (frozen)
+
+Grid/lobby and the first ~6s after GO show a small controls hint card (non-modal, fades):
+WASD/arrows drive · Space/Shift drift · N nitro ×3 · R respawn at last gate.
 
 ## Track (frozen, shared/track.ts)
 

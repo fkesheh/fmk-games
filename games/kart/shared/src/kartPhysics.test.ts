@@ -1,15 +1,18 @@
 // ============================================================================
 // kartPhysics unit tests (FROZEN contract module). Automatic gearbox (upshift
-// at gear top + SHIFT_TIME engine cut, downshift hysteresis), steer sign
+// at gear top + SHIFT_TIME engine cut, DOWNSHIFT_HYST downshift hysteresis —
+// wide enough that the box never oscillates up/down around a top), steer sign
 // contract (positive = RIGHT = yaw decreases), grip-limited understeer cap,
-// lateral surface grip, drift mini-turbo, reverse clamp, determinism.
+// lateral surface grip, drift as a pure rotation tool (no boost attached),
+// reverse clamp, determinism.
 // All deterministic: stepKart directly with fixed DT, no DOM, no randomness.
-// Note: the engine/drag equilibrium sits below each gear top, so gearbox tests
-// seed speed at/above the top to cross the upshift threshold (same as a turbo
-// or downhill overshoot would); drift tests seed speed >= DRIFT_MIN_SPEED.
+// Note: gearbox threshold tests seed speed at/above a gear top to cross the
+// upshift threshold on the first step (same as a nitro or downhill overshoot
+// would); drift tests seed speed >= DRIFT_MIN_SPEED.
 // ============================================================================
 import { describe, expect, it } from 'vitest';
 import {
+  DOWNSHIFT_HYST,
   DRIFT_MIN_SPEED,
   DRIFT_STEER_MUL,
   GEARS,
@@ -22,9 +25,6 @@ import {
   REVERSE_TOP,
   SHIFT_TIME,
   TOP_SPEED,
-  TURBO_BOOST,
-  TURBO_MIN_S,
-  TURBO_S,
   WHEELBASE,
 } from './config.js';
 import {
@@ -69,7 +69,6 @@ function yawRateAt(speed: number, steer: number, surface: Surface = 'road', drif
   const s = atSpeed(speed);
   if (drifting) {
     s.drifting = true;
-    s.driftTime = 0.1;
   }
   stepKart(s, input({ steer, drift: drifting }), DT, surface);
   return s.yaw / DT;
@@ -94,7 +93,7 @@ describe('gearbox', () => {
   });
 
   it('upshifts at the gear top and cuts the engine for SHIFT_TIME (speed stalls during the shift)', () => {
-    const s = atSpeed(12); // above gear-1 top: upshifts on the first step
+    const s = atSpeed(GEARS[0]!.top); // at the gear-1 top: upshifts on the first step
     stepKart(s, input({ throttle: 1 }), DT, 'road');
     expect(s.gear).toBe(2);
     expect(s.shiftLeft).toBeCloseTo(SHIFT_TIME, 10);
@@ -135,8 +134,8 @@ describe('gearbox', () => {
     expect(g2.shiftLeft).toBeGreaterThan(0);
   });
 
-  it('downshifts with hysteresis (1.5 m/s below the previous top), never below gear 1', () => {
-    const floor = GEARS[1]!.top - 1.5;
+  it('downshifts with hysteresis (DOWNSHIFT_HYST m/s below the previous top), never below gear 1', () => {
+    const floor = GEARS[1]!.top - DOWNSHIFT_HYST;
     const stays = atSpeed(floor + 0.5);
     stays.gear = 3;
     stepKart(stays, input(), DT, 'road');
@@ -146,6 +145,23 @@ describe('gearbox', () => {
     drops.gear = 3;
     stepKart(drops, input(), DT, 'road');
     expect(drops.gear).toBe(2); // below the floor: downshift one gear
+  });
+
+  it('never oscillates: a full-throttle run from standstill shifts up monotonically and settles in the top gear', () => {
+    // Regression test for the gear-loop bug: the speed a shift cut costs must
+    // stay above the downshift floor, so the box can never go 2->3->2->3.
+    const s = makeKart(0, 0, 0);
+    let prevGear = s.gear;
+    let maxGear = s.gear;
+    for (let i = 0; i < Math.round(15 / DT); i++) {
+      stepKart(s, input({ throttle: 1 }), DT, 'road');
+      expect(s.gear).toBeGreaterThanOrEqual(prevGear); // non-decreasing: no downshift anywhere in the run
+      prevGear = s.gear;
+      maxGear = Math.max(maxGear, s.gear);
+    }
+    expect(maxGear).toBe(GEARS.length); // reached the overdrive gear…
+    expect(s.gear).toBe(GEARS.length); // …and settled there (no hunting around its top)
+    expect(forwardSpeed(s)).toBeGreaterThan(GEARS[GEARS.length - 2]!.top); // cruising past the gear-4 top
   });
 });
 
@@ -181,7 +197,7 @@ describe('understeer cap', () => {
   });
 
   it('does not bind at low speed: full lock stays on the bicycle rate', () => {
-    const v = 5; // at 8 m/s the cap already binds (bicycle 2.46 > 11/8), so probe at 5
+    const v = 5; // at 8 m/s the cap already binds (bicycle 2.55 > 11/8), so probe at 5
     const measured = Math.abs(yawRateAt(v, 1));
     const uncapped = (v / WHEELBASE) * Math.tan(lockAt(v));
     expect(Math.abs(measured - uncapped) / uncapped).toBeLessThan(0.02);
@@ -225,45 +241,30 @@ describe('lateral grip', () => {
   });
 });
 
-// ---- (e) drift + mini-turbo --------------------------------------------------
+// ---- (e) drift (rotation tool only — mini-turbo REMOVED) ---------------------
 
-describe('drift mini-turbo', () => {
-  it('holding a drift for >= TURBO_MIN_S charges a turbo on release', () => {
-    const s = atSpeed(20);
-    stepKart(s, input({ drift: true }), DT, 'road');
-    expect(s.drifting).toBe(true);
-
-    run(s, input({ drift: true, steer: 0.3 }), TURBO_MIN_S + 0.3);
-    expect(s.drifting).toBe(true);
-    expect(s.driftTime).toBeGreaterThanOrEqual(TURBO_MIN_S);
-
-    stepKart(s, input(), DT, 'road'); // release the handbrake
-    expect(s.drifting).toBe(false);
-    expect(s.turboLeft).toBeGreaterThan(0);
-    expect(s.turboLeft).toBeLessThanOrEqual(TURBO_S);
-  });
-
-  it('a short drift (< TURBO_MIN_S) charges no turbo', () => {
-    const s = atSpeed(20);
-    run(s, input({ drift: true, throttle: 1 }), 0.5);
-    stepKart(s, input({ throttle: 1 }), DT, 'road'); // release
-    expect(s.drifting).toBe(false);
-    expect(s.turboLeft).toBe(0);
-  });
-
-  it('the turbo adds TURBO_BOOST of engine acceleration', () => {
-    const boosted = atSpeed(20);
-    boosted.turboLeft = 1;
-    const base = atSpeed(20);
-    stepKart(boosted, input(), DT, 'road');
-    stepKart(base, input(), DT, 'road');
-    expect(forwardSpeed(boosted) - forwardSpeed(base)).toBeCloseTo(TURBO_BOOST * DT, 2);
-  });
-
+describe('drift', () => {
   it('drift cannot engage below DRIFT_MIN_SPEED', () => {
     const s = atSpeed(DRIFT_MIN_SPEED - 1);
     stepKart(s, input({ drift: true }), DT, 'road');
     expect(s.drifting).toBe(false);
+  });
+
+  it('a long drift at speed charges NOTHING and exits cleanly', () => {
+    // Mini-turbo is gone: KartState carries no turbo/charge fields at all (this
+    // file compiling against the contract proves it). Drift only rotates.
+    const s = atSpeed(20);
+    stepKart(s, input({ drift: true }), DT, 'road');
+    expect(s.drifting).toBe(true);
+
+    run(s, input({ drift: true, steer: 0.3 }), 2); // hold the drift well past any old charge window
+    expect(s.drifting).toBe(true); // still sliding (speed bled but above the exit floor)
+    expect(s.nitroLeft).toBe(0); // nitro is server-granted; drift never touches it
+
+    stepKart(s, input(), DT, 'road'); // release the handbrake
+    expect(s.drifting).toBe(false); // exits cleanly…
+    expect(s.nitroLeft).toBe(0); // …with nothing charged
+    expect(forwardSpeed(s)).toBeGreaterThan(0); // and still rolling forward
   });
 });
 
@@ -298,7 +299,7 @@ describe('determinism', () => {
     const out: number[] = [];
     for (let i = 0; i < 600; i++) {
       stepKart(s, script[i % script.length]!, DT, i % 240 < 120 ? 'road' : 'grass');
-      out.push(s.x, s.z, s.yaw, s.vx, s.vz, s.gear, s.shiftLeft, s.driftTime, s.turboLeft);
+      out.push(s.x, s.z, s.yaw, s.vx, s.vz, s.gear, s.shiftLeft, s.drifting ? 1 : 0, s.nitroLeft);
     }
     return JSON.stringify(out);
   }

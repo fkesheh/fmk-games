@@ -5,10 +5,10 @@
 // yaw convention matches the platform: forward = (-sin(yaw), -cos(yaw)).
 // ============================================================================
 import {
-  BRAKE, DRAG, DRIFT_MIN_SPEED, DRIFT_STEER_MUL, ENGINE, GEARS, GRASS_DRAG,
-  GRASS_ENGINE_MUL, GRIP_DRIFT, GRIP_GRASS, GRIP_ROAD, LAT_G, LAT_G_GRASS,
-  MAX_LOCK, MIN_LOCK, REVERSE_TOP, ROLL, SHIFT_TIME, TOP_SPEED, TURBO_BOOST,
-  TURBO_MIN_S, TURBO_S, WHEELBASE,
+  BRAKE, DOWNSHIFT_HYST, DRAG, DRIFT_MIN_SPEED, DRIFT_STEER_MUL, ENGINE, GEARS,
+  GRASS_DRAG, GRASS_ENGINE_MUL, GRIP_DRIFT, GRIP_GRASS, GRIP_ROAD, LAT_G,
+  LAT_G_GRASS, MAX_LOCK, MIN_LOCK, NITRO_BOOST, REVERSE_TOP, ROLL, SHIFT_TIME,
+  TOP_SPEED, WHEELBASE,
 } from './config.js';
 
 export type Surface = 'road' | 'grass';
@@ -27,12 +27,11 @@ export interface KartState {
   gear: number; // 1-based index into GEARS (reverse always uses gear 1)
   shiftLeft: number; // remaining upshift engine-cut seconds
   drifting: boolean;
-  driftTime: number; // consecutive seconds in drift (for turbo charge)
-  turboLeft: number; // remaining mini-turbo seconds
+  nitroLeft: number; // remaining nitro boost seconds (client-applied after server ok)
 }
 
 export function makeKart(x: number, z: number, yaw: number): KartState {
-  return { x, y: 0, z, yaw, vx: 0, vz: 0, gear: 1, shiftLeft: 0, drifting: false, driftTime: 0, turboLeft: 0 };
+  return { x, y: 0, z, yaw, vx: 0, vz: 0, gear: 1, shiftLeft: 0, drifting: false, nitroLeft: 0 };
 }
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -64,20 +63,11 @@ export function stepKart(s: KartState, inp: KartInput, dt: number, surface: Surf
   const brake = clamp(inp.brake, 0, 1);
   const steer = clamp(inp.steer, -1, 1);
 
-  // ---- drift state ----
+  // ---- drift state (rotation tool only — no boost attached) ----
   if (inp.drift && !s.drifting && Math.abs(speedF) > DRIFT_MIN_SPEED) {
     s.drifting = true;
-    s.driftTime = 0;
-  }
-  if (s.drifting) {
-    if (inp.drift && Math.abs(speedF) > 2) {
-      s.driftTime += dt;
-    } else {
-      // release: charge a mini-turbo if the drift was long enough
-      if (s.driftTime >= TURBO_MIN_S) s.turboLeft = TURBO_S;
-      s.drifting = false;
-      s.driftTime = 0;
-    }
+  } else if (s.drifting && (!inp.drift || Math.abs(speedF) <= 2)) {
+    s.drifting = false;
   }
 
   // ---- longitudinal: automatic gearbox ----
@@ -86,9 +76,9 @@ export function stepKart(s: KartState, inp: KartInput, dt: number, surface: Surf
   }
   const gear = GEARS[clamp(s.gear, 1, GEARS.length) - 1]!;
   const engineMul = surface === 'grass' ? GRASS_ENGINE_MUL : 1;
-  if (s.turboLeft > 0) {
-    s.turboLeft = Math.max(0, s.turboLeft - dt);
-    speedF += TURBO_BOOST * engineMul * dt;
+  if (s.nitroLeft > 0) {
+    s.nitroLeft = Math.max(0, s.nitroLeft - dt);
+    speedF += NITRO_BOOST * engineMul * dt;
   }
   if (s.shiftLeft === 0 && throttle > 0 && speedF >= 0 && speedF < gear.top) {
     // flat engine force per gear; REV LIMITER: no engine force at/above the gear top
@@ -96,11 +86,12 @@ export function stepKart(s: KartState, inp: KartInput, dt: number, surface: Surf
     // that provably could never reach the shift point).
     speedF += ENGINE * gear.accel * engineMul * throttle * dt;
   }
-  // upshift at the gear top; downshift with hysteresis (never below gear 1)
+  // upshift at the gear top; downshift only well below it (never below gear 1) —
+  // the hysteresis exceeds the speed a shift cut costs, so the box never oscillates
   if (s.shiftLeft === 0 && s.gear < GEARS.length && speedF >= gear.top) {
     s.gear += 1;
     s.shiftLeft = SHIFT_TIME;
-  } else if (s.gear > 1 && speedF < GEARS[s.gear - 2]!.top - 1.5) {
+  } else if (s.gear > 1 && speedF < GEARS[s.gear - 2]!.top - DOWNSHIFT_HYST) {
     s.gear -= 1;
   }
   if (brake > 0) {

@@ -20,6 +20,7 @@ function clamp(v: number, lo: number, hi: number): number {
 export function parseKartC2S(raw: unknown): KartC2S | null {
   if (typeof raw !== 'object' || raw === null) return null;
   const r = raw as Record<string, unknown>;
+  if (r.t === 'nitro') return { t: 'nitro' };
   if (r.t !== 'kart_state') return null;
   if (!num(r.seq) || !vec3(r.p) || !num(r.yaw) || !vec2(r.v) || !num(r.steer)) return null;
   for (const n of [r.p[0], r.p[1], r.p[2], r.v[0], r.v[1]]) {

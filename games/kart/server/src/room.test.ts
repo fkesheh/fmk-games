@@ -3,18 +3,23 @@
 // room's own 15Hz interval is driven by vi fake timers (which also fake
 // Date.now), and karts are "driven" by feeding kart_state positions taken
 // straight from buildTrack().gates — a position exactly on a gate is always
-// within GATE_RADIUS of it, so the run is fully deterministic.
+// within GATE_RADIUS of it, so the run is fully deterministic. Also covers
+// the pre-GO position freeze / GO grid reset, nitro charges, and gap timing
+// (you.gapAheadMs, docs/KART.md "Gap timing").
 // ============================================================================
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   COUNTDOWN_SECONDS,
   GATES,
   LAPS_TO_WIN,
+  NITRO_CHARGES,
+  NITRO_TIME,
   RACE_TIMEOUT_S,
   READY_SECONDS,
   RESULTS_SECONDS,
   SNAPSHOT_HZ,
   buildTrack,
+  gridSlot,
 } from '@kart/shared';
 import type { KartPhase, KartS2C, RaceEvent } from '@kart/shared';
 import type { PlayerId, RoomIO } from '@platform/shared';
@@ -323,6 +328,143 @@ describe('KartRoom race end', () => {
     expect(io.lastSnap('p1').phase).toBe('results');
     expect(eventsOfKind(io, 'p1', 'timeout').length).toBe(1);
     expect(io.lastSnap('p1').you.finished).toBe(false);
+    room.stop();
+  });
+});
+
+describe('KartRoom pre-GO freeze', () => {
+  /** p1 joins first => grid slot 0; snapshot positions come from `players`. */
+  function posOf(io: FakeIO, id: PlayerId): [number, number, number] {
+    const self = io.lastSnap(id).players.find((p) => p.id === id);
+    if (self === undefined) throw new Error(`no ${id} in snapshot`);
+    return self.p;
+  }
+
+  it('kart_state during ready/countdown is ignored (stays on grid); after GO it tracks', () => {
+    const io = new FakeIO();
+    const room = new KartRoom('public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.addPlayer('p2', 'Bravo');
+    room.start();
+    const feed = new StateFeed();
+    const spawn = gridSlot(TRACK, 0);
+
+    advanceToPhase(io, 'p1', 'ready');
+    feed.send(room, 'p1', spawn.x + 30, spawn.z + 30); // off-grid: ignored
+    tick();
+    expect(posOf(io, 'p1')).toEqual([spawn.x, 0, spawn.z]);
+
+    advanceToPhase(io, 'p1', 'countdown');
+    feed.send(room, 'p1', spawn.x - 25, spawn.z + 40); // still ignored
+    tick();
+    expect(posOf(io, 'p1')).toEqual([spawn.x, 0, spawn.z]);
+
+    advanceToPhase(io, 'p1', 'racing');
+    feed.send(room, 'p1', spawn.x + 12, spawn.z + 34); // racing: tracks normally
+    tick();
+    expect(posOf(io, 'p1')).toEqual([spawn.x + 12, 0, spawn.z + 34]);
+    room.stop();
+  });
+
+  it('a player off the grid at GO is back on their slot in the first racing snapshot', () => {
+    const io = new FakeIO();
+    const room = new KartRoom('public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.addPlayer('p2', 'Bravo');
+    room.start();
+    const feed = new StateFeed();
+    const spawn = gridSlot(TRACK, 0);
+
+    advanceToPhase(io, 'p1', 'countdown');
+    feed.send(room, 'p1', spawn.x + 77, spawn.z - 55); // shoved off-grid pre-GO
+    tick();
+    advanceToPhase(io, 'p1', 'racing'); // first racing snapshot, no new kart_state fed
+
+    expect(posOf(io, 'p1')).toEqual([spawn.x, 0, spawn.z]);
+    room.stop();
+  });
+});
+
+describe('KartRoom nitro', () => {
+  it('spends 3 charges (events left 2/1/0), ignores a 4th, nitroActive clears after NITRO_TIME', () => {
+    const io = new FakeIO();
+    const { room } = setupRace(io); // p1 + p2 seated, phase 'racing'
+
+    const selfNitroActive = (): boolean | undefined =>
+      io.lastSnap('p1').players.find((p) => p.id === 'p1')?.nitroActive;
+    const nitroEvents = (): Array<Extract<RaceEvent, { kind: 'nitro' }>> =>
+      eventsOfKind(io, 'p1', 'nitro').filter((e) => e.playerId === 'p1');
+
+    expect(io.lastSnap('p1').you.nitroLeft).toBe(NITRO_CHARGES); // refilled at GO
+    expect(selfNitroActive()).toBe(false);
+
+    room.handleMessage('p1', { t: 'nitro' });
+    room.handleMessage('p1', { t: 'nitro' });
+    room.handleMessage('p1', { t: 'nitro' });
+    tick(); // let a snapshot land on top of the events
+
+    expect(nitroEvents().map((e) => e.left)).toEqual([2, 1, 0]);
+    expect(io.lastSnap('p1').you.nitroLeft).toBe(0);
+    expect(selfNitroActive()).toBe(true);
+
+    room.handleMessage('p1', { t: 'nitro' }); // no charges left: silently ignored
+    tick();
+    expect(nitroEvents().length).toBe(3);
+    expect(io.lastSnap('p1').you.nitroLeft).toBe(0);
+    expect(selfNitroActive()).toBe(true); // still inside the last charge's window
+
+    vi.advanceTimersByTime(NITRO_TIME * 1000 + 200); // past the boost window
+    expect(selfNitroActive()).toBe(false);
+    room.stop();
+  });
+});
+
+describe('KartRoom gap timing', () => {
+  it('p2 crosses gate 1 two seconds after p1: p2 gapAheadMs ~2s, leader p1 sees 0', () => {
+    const io = new FakeIO();
+    const { room, feed } = setupRace(io);
+
+    driveGate(room, feed, 'p1', 1); // p1 crosses gate 1 at t = X
+    driveGate(room, feed, 'p1', 2); // keep p1 unambiguously ahead (progress 2 > 1)
+    vi.advanceTimersByTime(2000);
+    driveGate(room, feed, 'p2', 1); // p2 crosses gate 1 at t = X + ~2s
+
+    // p2's next snapshot: both have a gate-1 timestamp, so the gap is the
+    // real crossing delta (~2s), not the spatial estimate
+    const p2you = io.lastSnap('p2').you;
+    expect(p2you.place).toBe(2);
+    expect(p2you.gapAheadMs).toBeGreaterThanOrEqual(1500);
+    expect(p2you.gapAheadMs).toBeLessThanOrEqual(2500);
+
+    const p1you = io.lastSnap('p1').you;
+    expect(p1you.place).toBe(1);
+    expect(p1you.gapAheadMs).toBe(0); // leader has nobody ahead
+    room.stop();
+  });
+
+  it('gapAheadMs is 0 in every non-racing phase (lobby/ready/countdown/results)', () => {
+    const io = new FakeIO();
+    const room = new KartRoom('public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.start();
+
+    vi.advanceTimersByTime(200); // lobby
+    expect(io.lastSnap('p1').phase).toBe('lobby');
+    expect(io.lastSnap('p1').you.gapAheadMs).toBe(0);
+
+    room.addPlayer('p2', 'Bravo');
+    advanceToPhase(io, 'p1', 'ready');
+    expect(io.lastSnap('p1').you.gapAheadMs).toBe(0);
+
+    advanceToPhase(io, 'p1', 'countdown');
+    expect(io.lastSnap('p1').you.gapAheadMs).toBe(0);
+
+    advanceToPhase(io, 'p1', 'racing');
+    const feed = new StateFeed();
+    driveRace(room, feed, 'p1');
+    driveRace(room, feed, 'p2');
+    advanceToPhase(io, 'p1', 'results');
+    expect(io.lastSnap('p1').you.gapAheadMs).toBe(0);
     room.stop();
   });
 });

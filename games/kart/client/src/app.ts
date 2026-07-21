@@ -20,7 +20,7 @@ import {
   KPAL,
   LAPS_TO_WIN,
   MIN_PLAYERS,
-  TURBO_MIN_S,
+  NITRO_CHARGES,
   buildTrack,
   engineRevs,
   forwardSpeed,
@@ -106,6 +106,7 @@ function parseYou(v: unknown): KartYou | null {
   if (!isObj(v)) return null;
   if (!num(v.lap) || !num(v.nextGate) || !num(v.progress) || !num(v.place)) return null;
   if (!bool(v.finished) || !num(v.finishMs) || !num(v.bestLapMs)) return null;
+  if (!num(v.nitroLeft) || !num(v.gapAheadMs)) return null;
   return {
     lap: v.lap,
     nextGate: v.nextGate,
@@ -114,6 +115,8 @@ function parseYou(v: unknown): KartYou | null {
     finished: v.finished,
     finishMs: v.finishMs,
     bestLapMs: v.bestLapMs,
+    nitroLeft: v.nitroLeft,
+    gapAheadMs: v.gapAheadMs,
   };
 }
 
@@ -123,7 +126,7 @@ function parsePlayerSnap(v: unknown): KartPlayerSnap | null {
   if (info === null) return null;
   if (!vec3(v.p) || !num(v.yaw) || !vec2(v.v) || !num(v.steer) || !bool(v.drift)) return null;
   if (!num(v.lap) || !num(v.nextGate) || !num(v.progress) || !num(v.place)) return null;
-  if (!bool(v.finished) || !num(v.finishMs)) return null;
+  if (!bool(v.finished) || !num(v.finishMs) || !bool(v.nitroActive)) return null;
   return {
     ...info,
     p: v.p,
@@ -137,6 +140,7 @@ function parsePlayerSnap(v: unknown): KartPlayerSnap | null {
     place: v.place,
     finished: v.finished,
     finishMs: v.finishMs,
+    nitroActive: v.nitroActive,
   };
 }
 
@@ -152,6 +156,10 @@ function parseRaceEvent(v: unknown): RaceEvent | null {
     case 'lap':
       return str(v.playerId) && num(v.lap) && num(v.lapMs)
         ? { kind: 'lap', playerId: v.playerId, lap: v.lap, lapMs: v.lapMs }
+        : null;
+    case 'nitro':
+      return str(v.playerId) && num(v.left)
+        ? { kind: 'nitro', playerId: v.playerId, left: v.left }
         : null;
     case 'finish':
       return str(v.playerId) && num(v.place)
@@ -252,6 +260,9 @@ interface KartDebugState {
   speed: number; // signed forward speed, m/s
   gear: number; // 1-based automatic gearbox gear (index into the contract GEARS)
   players: number; // karts in the room (snapshot count)
+  nitroLeft: number; // charges left this race (you.nitroLeft, server-authoritative)
+  gapAheadMs: number; // ms behind the player one place ahead; 0 for the leader
+  frozen: boolean; // drive sim frozen (pre-GO freeze: every phase but 'racing')
 }
 
 interface KartRemoteDebug {
@@ -282,11 +293,13 @@ interface KartTelemetry {
     speedKmh: number;
     gear: number; // current gearbox gear (1-based)
     drifting: boolean;
-    driftTime: number;
-    turboLeft: number;
+    nitroLeft: number; // remaining nitro BOOST seconds (client sim, not the charge count)
   };
   remotes: KartRemoteDebug[];
   phaseEndsInMs: number;
+  nitroLeft: number; // nitro charges left (you.nitroLeft, server-authoritative)
+  gapAheadMs: number; // ms behind the player one place ahead; 0 for the leader
+  frozen: boolean; // drive sim frozen (pre-GO freeze: every phase but 'racing')
 }
 
 interface KartApi {
@@ -320,6 +333,8 @@ const CORRECT_DIST_SQ = 5 * 5; // m² — server/own divergence that triggers a 
 const CORRECT_BLEND = 0.35; // fraction of the gap closed per correcting snapshot (GENTLE)
 const MAX_FRAME_DT = 0.05; // s — tab-switch clamp for the local sim
 const GO_FLASH_MS = 900; // how long the big GO! stays up
+const HINT_HOLD_MS = 5000; // controls hint card stays fully up this long after GO…
+const HINT_FADE_MS = 1000; // …then fades out (gone at ~6s, per docs/KART.md)
 const MSG_MS = 2600; // transient center message lifetime
 const SKID_EVERY_MS = 450; // retrigger cadence for the skid loop while drifting
 const THUD_DROP = 4; // m/s of forward speed lost in one frame => barrier thud
@@ -480,6 +495,7 @@ export class KartApp {
   private countdownShown = 0; // big number currently up (dedupes event + snapshot)
   private goActive = false;
   private goUntil = 0; // performance.now() deadline for the GO! flash
+  private goAt = 0; // performance.now() at GO (0 = none yet); times the hint card fade
   private msgUntil = 0; // performance.now() deadline for the transient message
   private lapStartAt = 0; // serverNow ms when the current lap began
   private lastYouLap = 1; // previous snapshot lap (edge detection)
@@ -487,7 +503,6 @@ export class KartApp {
   private frozenLapMs = -1; // lap-time value frozen at our finish
   private wasFinished = false;
   private prevDrifting = false; // audio edges
-  private prevTurboLeft = 0;
   private prevSpeed = 0;
   private lastSkidAt = 0;
   private lastFrame = 0;
@@ -508,14 +523,15 @@ export class KartApp {
   private readonly gearEl: HTMLSpanElement;
   private readonly lapTimeEl: HTMLSpanElement;
   private readonly bestEl: HTMLSpanElement;
-  private readonly turboEl: HTMLDivElement;
-  private readonly turboFillEl: HTMLDivElement;
+  private readonly nitroEl: HTMLDivElement;
+  private readonly nitroPips: HTMLSpanElement[] = []; // NITRO_CHARGES pips, dim when spent
   private readonly gateEl: HTMLDivElement;
   private readonly lobbyEl: HTMLDivElement;
   private readonly lobbyPlayersEl: HTMLDivElement;
   private readonly lobbyStatusEl: HTMLDivElement;
   private readonly countdownEl: HTMLDivElement;
   private readonly msgEl: HTMLDivElement;
+  private readonly hintEl: HTMLDivElement;
   private readonly resultsEl: HTMLDivElement;
   private readonly resultsBodyEl: HTMLTableSectionElement;
   private readonly resultsNoteEl: HTMLDivElement;
@@ -574,11 +590,11 @@ export class KartApp {
     raceTop.appendChild(leaveBtn);
     this.raceEl.appendChild(raceTop);
 
-    // HUD: place + lap (top-left), speed (top-right), times (bottom-left),
-    // turbo meter (bottom-right), next-gate chevron (top-center)
+    // HUD: place + gap + lap (top-left), speed (top-right), times (bottom-left),
+    // nitro pips (bottom-right), next-gate chevron (top-center)
     this.hudEl = el('div', 'hud hidden');
     const hudLeft = el('div', 'hud-left');
-    this.placeEl = el('div', 'hud-place', 'P—/—');
+    this.placeEl = el('div', 'hud-place', 'P—');
     hudLeft.appendChild(this.placeEl);
     this.lapEl = el('div', 'hud-lap', `LAP 1/${LAPS_TO_WIN}`);
     hudLeft.appendChild(this.lapEl);
@@ -613,13 +629,33 @@ export class KartApp {
     hudTimes.appendChild(bestRow);
     this.hudEl.appendChild(hudTimes);
 
-    this.turboEl = el('div', 'hud-turbo');
-    this.turboEl.appendChild(el('div', 'hud-turbo-label', 'TURBO'));
-    const turboBar = el('div', 'hud-turbo-bar');
-    this.turboFillEl = el('div', 'hud-turbo-fill');
-    turboBar.appendChild(this.turboFillEl);
-    this.turboEl.appendChild(turboBar);
-    this.hudEl.appendChild(this.turboEl);
+    // nitro pips: NITRO_CHARGES small charges at the bottom-right, dim when spent.
+    // Inline styles: style.css is another owner's file (the hud-turbo-label class exists).
+    this.nitroEl = el('div', 'hud-nitro');
+    this.nitroEl.style.position = 'absolute';
+    this.nitroEl.style.right = '16px';
+    this.nitroEl.style.bottom = '16px';
+    this.nitroEl.style.display = 'flex';
+    this.nitroEl.style.flexDirection = 'column';
+    this.nitroEl.style.alignItems = 'flex-end';
+    this.nitroEl.style.gap = '6px';
+    this.nitroEl.appendChild(el('div', 'hud-turbo-label', 'NITRO'));
+    const pipRow = el('div');
+    pipRow.style.display = 'flex';
+    pipRow.style.gap = '6px';
+    for (let i = 0; i < NITRO_CHARGES; i++) {
+      const pip = el('span', 'hud-nitro-pip');
+      pip.style.width = '22px';
+      pip.style.height = '10px';
+      pip.style.borderRadius = '5px';
+      pip.style.border = '1px solid var(--asphalt)';
+      pip.style.background = 'var(--gold)';
+      pip.style.transition = 'opacity 120ms linear';
+      this.nitroPips.push(pip);
+      pipRow.appendChild(pip);
+    }
+    this.nitroEl.appendChild(pipRow);
+    this.hudEl.appendChild(this.nitroEl);
 
     this.gateEl = el('div', 'hud-gate hidden');
     this.hudEl.appendChild(this.gateEl);
@@ -636,6 +672,32 @@ export class KartApp {
     lobbyPanel.appendChild(el('div', 'lobby-hint', 'WASD / ARROWS to drive — SPACE to drift'));
     this.lobbyEl.appendChild(lobbyPanel);
     this.raceEl.appendChild(this.lobbyEl);
+
+    // controls hint card (docs/KART.md "Onboarding hints"): non-modal, bottom-center;
+    // up pre-GO, holds ~5s after GO, then fades. Inline styles: style.css is another
+    // owner's file — the HUD idiom (cream on translucent ink, asphalt border).
+    this.hintEl = el(
+      'div',
+      'hint-card',
+      `WASD/arrows drive · Space/Shift drift · N nitro ×${NITRO_CHARGES} · R respawn at last gate`,
+    );
+    this.hintEl.style.position = 'absolute';
+    this.hintEl.style.left = '50%';
+    this.hintEl.style.bottom = '16px';
+    this.hintEl.style.transform = 'translateX(-50%)';
+    this.hintEl.style.maxWidth = '92vw';
+    this.hintEl.style.padding = '8px 16px';
+    this.hintEl.style.border = '1px solid var(--asphalt)';
+    this.hintEl.style.borderRadius = '8px';
+    this.hintEl.style.background = 'rgba(20, 23, 28, 0.6)';
+    this.hintEl.style.color = 'var(--cream)';
+    this.hintEl.style.fontSize = '13px';
+    this.hintEl.style.letterSpacing = '0.08em';
+    this.hintEl.style.textAlign = 'center';
+    this.hintEl.style.textShadow = '0 2px 8px rgba(20, 23, 28, 0.8)';
+    this.hintEl.style.pointerEvents = 'none'; // non-modal: never eats driving input
+    this.hintEl.style.zIndex = '6';
+    this.raceEl.appendChild(this.hintEl);
 
     this.countdownEl = el('div', 'countdown-overlay hidden');
     this.raceEl.appendChild(this.countdownEl);
@@ -669,6 +731,11 @@ export class KartApp {
     this.scene.setTheme(this.track.theme);
     this.scene.buildTrack(this.track);
     this.drive = new DriveController(this.track);
+    // nitro key (N) asks the SERVER to spend a charge; only racing may spend one.
+    // The boost itself starts when the server's nitro race event echoes back.
+    this.drive.onNitro = () => {
+      if (this.phase === 'racing') this.send({ t: 'nitro' });
+    };
     this.scene.resize();
 
     // ---- listeners (driving keys are owned by drive.ts; audio unlocks on clicks) ----
@@ -836,6 +903,7 @@ export class KartApp {
     this.slot = msg.slot;
     this.colorIdx = msg.color;
     this.phase = msg.phase; // set directly — joining is not a phase TRANSITION
+    this.applyFreeze(); // mid-race joiners drive at once; everyone else waits for GO
     this.you = null;
     this.phaseEndsAt = 0;
     this.countdownShown = 0;
@@ -872,8 +940,10 @@ export class KartApp {
     this.debugInput = null;
     this.drive.setInput({ ...ZERO_INPUT }); // clear a latched debug driver
     this.drive.setOthers([]);
+    this.applyFreeze(); // back at the menu the sim is frozen ('lobby' !== 'racing')
     this.countdownShown = 0;
     this.goActive = false;
+    this.goAt = 0;
     this.audio.engine(0, false);
     this.clearSceneKarts();
   }
@@ -890,7 +960,6 @@ export class KartApp {
     this.frozenLapMs = -1;
     this.wasFinished = false;
     this.prevDrifting = false;
-    this.prevTurboLeft = 0;
     this.prevSpeed = 0;
     this.lapStartAt = this.serverNow();
   }
@@ -900,6 +969,7 @@ export class KartApp {
     if (!this.joined) return; // stale room traffic after a leave
     const prevPhase = this.phase;
     this.phase = snap.phase;
+    this.applyFreeze(); // pre-GO freeze: the sim integrates only while 'racing'
     this.you = snap.you;
     this.phaseEndsAt = snap.phaseEndsAt;
     if (snap.phase !== prevPhase) this.onPhaseChange(prevPhase, snap.phase);
@@ -951,6 +1021,12 @@ export class KartApp {
     if (snap.phase === 'results') this.buildResults();
   }
 
+  /** Pre-GO freeze (docs/KART.md): the local sim integrates only while racing —
+   *  frozen in lobby/ready/countdown/results. Idempotent; safe to call per snapshot. */
+  private applyFreeze(): void {
+    this.drive.setFrozen(this.phase !== 'racing');
+  }
+
   private onPhaseChange(prev: KartPhase, next: KartPhase): void {
     // a new race runs through 'ready' first: reset onto the grid exactly once per race
     if ((next === 'ready' || next === 'countdown') && prev !== 'ready' && prev !== 'countdown') {
@@ -991,6 +1067,15 @@ export class KartApp {
         }
         break;
       }
+      case 'nitro':
+        if (ev.playerId === this.playerId) {
+          this.drive.activateNitro(); // the server spent a charge — the boost is client-side
+          if (this.you !== null) this.you.nitroLeft = ev.left; // beats the next snapshot by a tick
+          this.audio.sfx('turbo'); // nitro whoosh
+        } else {
+          this.audio.sfx('turbo'); // remote whoosh (distance model lives in audio.ts)
+        }
+        break;
       case 'finish':
         if (ev.playerId === this.playerId) {
           this.audio.sfx('finish');
@@ -1014,9 +1099,12 @@ export class KartApp {
   private showGo(): void {
     if (this.goActive) return;
     this.goActive = true;
-    this.goUntil = performance.now() + GO_FLASH_MS;
+    this.goAt = performance.now();
+    this.goUntil = this.goAt + GO_FLASH_MS;
     this.countdownShown = 0;
     this.lapStartAt = this.serverNow(); // the race clock starts at GO
+    // no grid reset here: the server wipes positions at GO and the first racing
+    // snapshot's gentle >5m correction (correctOwn) settles us onto our slot
     this.audio.sfx('go');
   }
 
@@ -1095,8 +1183,7 @@ export class KartApp {
       this.lastSkidAt = now;
     }
     this.prevDrifting = s.drifting;
-    if (s.turboLeft > 0 && this.prevTurboLeft <= 0) this.audio.sfx('turbo');
-    this.prevTurboLeft = s.turboLeft;
+    // no sim-edge whoosh: nitro is the only boost now, and its sfx rides the race event
     if (this.prevSpeed - spd > THUD_DROP) this.audio.sfx('thud'); // barrier killed our speed
     this.prevSpeed = spd;
   }
@@ -1120,6 +1207,18 @@ export class KartApp {
 
     this.msgEl.classList.toggle('hidden', now > this.msgUntil);
 
+    // controls hint card: up through lobby/ready/countdown, holds after GO, then
+    // fades out (docs/KART.md "Onboarding hints")
+    const preGo = phase === 'lobby' || phase === 'ready' || phase === 'countdown';
+    const sinceGo = this.goAt > 0 ? now - this.goAt : Number.POSITIVE_INFINITY;
+    const hintUp = preGo || (phase === 'racing' && sinceGo < HINT_HOLD_MS + HINT_FADE_MS);
+    this.hintEl.classList.toggle('hidden', !hintUp);
+    if (hintUp) {
+      const fade =
+        preGo || sinceGo <= HINT_HOLD_MS ? 1 : 1 - (sinceGo - HINT_HOLD_MS) / HINT_FADE_MS;
+      this.hintEl.style.opacity = String(fade);
+    }
+
     // lobby status line
     if (phase === 'ready') {
       this.lobbyStatusEl.textContent =
@@ -1140,10 +1239,15 @@ export class KartApp {
           : 'BACK TO GRID…';
     }
 
-    // place + lap
-    const count = this.players.size;
-    this.placeEl.textContent =
-      you !== null && you.place > 0 ? `P${you.place}/${count}` : `P—/${count > 0 ? count : '—'}`;
+    // place + gap to the kart one place ahead (docs/KART.md "Gap timing")
+    if (you !== null && you.place > 0) {
+      this.placeEl.textContent =
+        you.place === 1
+          ? 'P1 · LEADER'
+          : `P${you.place} · +${(you.gapAheadMs / 1000).toFixed(1)}s`;
+    } else {
+      this.placeEl.textContent = 'P—';
+    }
     this.lapEl.textContent = `LAP ${Math.min(you?.lap ?? 1, LAPS_TO_WIN)}/${LAPS_TO_WIN}`;
 
     // speed
@@ -1163,10 +1267,11 @@ export class KartApp {
     if (best < 0 && this.playerId !== null) best = this.bestLaps.get(this.playerId) ?? this.lastLapMs;
     this.bestEl.textContent = fmtMs(best);
 
-    // turbo meter: fills while drifting toward the mini-turbo charge
-    const frac = s.drifting ? Math.min(1, s.driftTime / TURBO_MIN_S) : s.turboLeft > 0 ? 1 : 0;
-    this.turboFillEl.style.width = `${Math.round(frac * 100)}%`;
-    this.turboEl.classList.toggle('charged', s.turboLeft > 0);
+    // nitro pips: one lit pip per charge left (you.nitroLeft is authoritative), dim when spent
+    const nitroLeft = you?.nitroLeft ?? NITRO_CHARGES;
+    this.nitroPips.forEach((pip, i) => {
+      pip.style.opacity = i < nitroLeft ? '1' : '0.25';
+    });
 
     // next-gate chevron: rotate toward the gate relative to our yaw
     const showGate = (phase === 'countdown' || phase === 'racing') && you !== null;
@@ -1348,6 +1453,9 @@ export class KartApp {
       speed: forwardSpeed(s),
       gear: s.gear,
       players: this.players.size,
+      nitroLeft: you?.nitroLeft ?? NITRO_CHARGES,
+      gapAheadMs: you?.gapAheadMs ?? 0,
+      frozen: this.phase !== 'racing',
     };
   }
 
@@ -1387,11 +1495,13 @@ export class KartApp {
         speedKmh: spd * 3.6,
         gear: s.gear,
         drifting: s.drifting,
-        driftTime: s.driftTime,
-        turboLeft: s.turboLeft,
+        nitroLeft: s.nitroLeft, // boost seconds left (client sim), NOT the charge count
       },
       remotes,
       phaseEndsInMs: this.phaseEndsAt > 0 ? Math.max(0, this.phaseEndsAt - this.serverNow()) : 0,
+      nitroLeft: this.you?.nitroLeft ?? NITRO_CHARGES,
+      gapAheadMs: this.you?.gapAheadMs ?? 0,
+      frozen: this.phase !== 'racing',
     };
   }
 }

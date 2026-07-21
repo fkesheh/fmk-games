@@ -22,6 +22,8 @@ import {
   LAPS_TO_WIN,
   MAX_PLAYERS,
   MIN_PLAYERS,
+  NITRO_CHARGES,
+  NITRO_TIME,
   READY_SECONDS,
   RESULTS_SECONDS,
   RACE_TIMEOUT_S,
@@ -86,8 +88,13 @@ interface Player {
   place: number; // 1-based; grid order (slot+1) outside racing/results
   lapStartAt: number; // serverTime ms of current lap start, -1 outside racing
   bestLapMs: number; // -1 until a lap completes
+  // gap timing: credit count (== progress after the increment) -> serverTime ms
+  gateTimes: Map<number, number>;
   finished: boolean;
   finishMs: number; // race time at finish, -1 while racing
+  // nitro (per race, refilled at GO)
+  nitroLeft: number; // charges remaining (0 outside racing until the GO refill)
+  nitroUntil: number; // serverTime ms; nitroActive in snaps while now < nitroUntil
 }
 
 export class KartRoom implements GameRoomHandle {
@@ -208,9 +215,16 @@ export class KartRoom implements GameRoomHandle {
       const p = this.players.get(id);
       if (p === undefined) return;
       const now = Date.now();
-      p.lastStateAt = now; // any valid kart_state is liveness
+      p.lastStateAt = now; // any valid message is liveness
+      if (parsed.t === 'nitro') {
+        this.tryNitro(p, now);
+        return;
+      }
       if (parsed.seq <= p.lastSeq) return; // per-client monotonic: drop late dupes
       p.lastSeq = parsed.seq;
+      // Pre-GO freeze (frozen): positions are IGNORED outside 'racing' — the
+      // snapshot stays at the grid slot until GO wipes any pre-GO movement.
+      if (this.phase !== 'racing') return;
       p.x = parsed.p[0];
       p.y = parsed.p[1];
       p.z = parsed.p[2];
@@ -219,7 +233,7 @@ export class KartRoom implements GameRoomHandle {
       p.vz = parsed.v[1];
       p.steer = parsed.steer;
       p.drift = parsed.drift;
-      if (this.phase === 'racing' && !p.finished) this.tryGateCredit(p, now);
+      if (!p.finished) this.tryGateCredit(p, now);
     } catch (err) {
       console.error('[kart] handleMessage failed', err);
     }
@@ -308,7 +322,21 @@ export class KartRoom implements GameRoomHandle {
     this.raceStartAt = now;
     this.raceEndsAt = now + RACE_TIMEOUT_S * 1000;
     this.phaseEndsAt = this.raceEndsAt;
-    for (const p of this.players.values()) p.lapStartAt = now;
+    for (const p of this.players.values()) {
+      // Pre-GO freeze: wipe any streamed pre-GO movement back to the grid slot
+      const spawn = gridSlot(this.track, p.slot);
+      p.x = spawn.x;
+      p.y = 0;
+      p.z = spawn.z;
+      p.yaw = spawn.yaw;
+      p.vx = 0;
+      p.vz = 0;
+      p.steer = 0;
+      p.drift = false;
+      p.nitroLeft = NITRO_CHARGES; // per-race charges refill at GO
+      p.nitroUntil = 0;
+      p.lapStartAt = now;
+    }
     this.updatePlaces();
     this.broadcastEvent({ kind: 'go' });
   }
@@ -347,6 +375,7 @@ export class KartRoom implements GameRoomHandle {
     const credited = p.nextGate;
     p.nextGate = (p.nextGate + 1) % GATES;
     p.progress++;
+    p.gateTimes.set(p.progress, now); // gap timing: timestamp every credit
     this.broadcastEvent({ kind: 'gate', playerId: p.id, gate: credited });
     if (credited === 0 && p.lapStartAt >= 0) {
       const lapMs = now - p.lapStartAt;
@@ -363,6 +392,19 @@ export class KartRoom implements GameRoomHandle {
     }
     this.updatePlaces();
     if (this.allFinished()) this.enterResults(now);
+  }
+
+  /**
+   * Nitro (frozen): one charge per use, only while racing, only if a charge
+   * remains (else silently ignored). The boost itself is client-side; the
+   * server times nitroActive (NITRO_TIME) for snaps and broadcasts the event.
+   */
+  private tryNitro(p: Player, now: number): void {
+    if (this.phase !== 'racing') return;
+    if (p.nitroLeft <= 0) return;
+    p.nitroLeft--;
+    p.nitroUntil = now + NITRO_TIME * 1000;
+    this.broadcastEvent({ kind: 'nitro', playerId: p.id, left: p.nitroLeft });
   }
 
   /**
@@ -424,8 +466,11 @@ export class KartRoom implements GameRoomHandle {
       place: slot + 1, // grid order until places are computed at GO
       lapStartAt: -1,
       bestLapMs: -1,
+      gateTimes: new Map(),
       finished: false,
       finishMs: -1,
+      nitroLeft: 0, // no charges until the GO refill (mid-race joiners included)
+      nitroUntil: 0,
     };
     if (this.phase === 'racing') p.lapStartAt = now; // mid-race joiner races immediately
     return p;
@@ -448,8 +493,11 @@ export class KartRoom implements GameRoomHandle {
     p.place = p.slot + 1;
     p.lapStartAt = -1;
     p.bestLapMs = -1;
+    p.gateTimes.clear();
     p.finished = false;
     p.finishMs = -1;
+    p.nitroLeft = 0;
+    p.nitroUntil = 0;
   }
 
   private lowestFreeSlot(): number {
@@ -468,6 +516,31 @@ export class KartRoom implements GameRoomHandle {
       players.push({ id: p.id, name: p.name, slot: p.slot, color: p.color });
     }
     return { t: 'kart_joined', you: you.id, slot: you.slot, color: you.color, phase: this.phase, players };
+  }
+
+  /**
+   * Gap timing (docs/KART.md, frozen): ms behind the player one place ahead.
+   * Exact when both karts have a timestamp for the same gate sequence (the
+   * common credit count, i.e. min progress), else estimated from the spatial
+   * distance at 20 m/s. 0 for the leader and outside 'racing'.
+   */
+  private gapAheadMs(you: Player): number {
+    if (this.phase !== 'racing' || you.place <= 1) return 0;
+    let ahead: Player | undefined;
+    for (const p of this.players.values()) {
+      if (p.place === you.place - 1) {
+        ahead = p;
+        break;
+      }
+    }
+    if (ahead === undefined) return 0;
+    const seq = Math.min(you.progress, ahead.progress);
+    if (seq > 0) {
+      const mine = you.gateTimes.get(seq);
+      const theirs = ahead.gateTimes.get(seq);
+      if (mine !== undefined && theirs !== undefined) return Math.max(0, mine - theirs);
+    }
+    return Math.round((Math.hypot(you.x - ahead.x, you.z - ahead.z) / 20) * 1000);
   }
 
   /** Fresh per-recipient snapshot (the `you` block differs). */
@@ -490,6 +563,7 @@ export class KartRoom implements GameRoomHandle {
         place: p.place,
         finished: p.finished,
         finishMs: p.finishMs,
+        nitroActive: now < p.nitroUntil,
       });
     }
     return {
@@ -507,6 +581,8 @@ export class KartRoom implements GameRoomHandle {
         finished: you.finished,
         finishMs: you.finishMs,
         bestLapMs: you.bestLapMs,
+        nitroLeft: you.nitroLeft,
+        gapAheadMs: this.gapAheadMs(you),
       },
       players,
     };

@@ -14,7 +14,7 @@
 //   countdown window). Then A drives: setInput(1,0,0,false) until A's
 //   streamed position (state().pos — what the client ships to the server at
 //   15Hz) has advanced > 10m (polled, capped at 10s — the geared model
-//   cruises ~7.7 m/s in gear 1 and a software-rendered client can step its
+//   cruises ~12 m/s in gear 1 and a software-rendered client can step its
 //   sim slower than wall clock), while B's view of Alice's kart
 //   (telemetry().remotes, the interpolated remote) must move too (> 5m over
 //   the same window). After that a guidance loop pure-pursues A along the
@@ -26,14 +26,29 @@
 //   yaw INCREASES; steer +1 = D must turn RIGHT, yaw DECREASES — the frozen
 //   convention is positive steer = RIGHT) and the automatic gearbox (from a
 //   standstill, ~8s of full throttle must reach gear >= 3 and keep climbing
-//   past the gear-1 top of 10 m/s).
+//   past the gear-1 top of 12 m/s). Two frozen-rule checks bracket the drive:
+//   the PRE-GO FREEZE (full throttle latched through the ready+countdown poll
+//   must move A < 1m — the client sim does not step and the server ignores
+//   pre-GO positions) and NITRO (3 charges per race, refilled at GO: KeyN
+//   spends a charge server-side — state() nitroLeft goes 3->2->1->0 and a 4th
+//   press is ignored — while the client applies +NITRO_BOOST for NITRO_TIME,
+//   proven by an A/B pair of full-throttle launches from the same respawn
+//   anchor, boosted vs no-boost top speed at the same throttle). The physics
+//   tail adds: B's state() gapAheadMs > 0 with A a gate up (gap HUD; 0 is
+//   leader-only), a ~20s centerline pursuit sampling the gearbox at 2Hz
+//   (the retuned DOWNSHIFT_HYST must show no (g,g-1,g) oscillation x3+), and
+//   the same run must top >= 28 m/s on a straight (TOP_SPEED 36, floored for
+//   the headless sim rate).
 // Gate positions are recomputed here from the FROZEN track math (closed
 // Catmull-Rom over TRACK_POINTS, 256 samples, gate i at t=i/8 — a line-level
 // mirror of games/kart/shared/src/track.ts, which the e2e cannot import);
 // steer corrections ride telemetry().own {x,z,yaw}.
 // The client's debug surface has its own layout (not the wire snapshot):
 //   state()     -> {phase ('menu' outside a room), place, lap, nextGate,
-//                   progress, pos{x,y,z}, speed, players(count)}
+//                   progress, pos{x,y,z}, speed, players(count), nitroLeft
+//                   (server-authoritative charges), gapAheadMs (ms behind the
+//                   kart one place ahead, 0 for the leader; a nested `you`
+//                   block is also tolerated)}
 //   telemetry() -> {phase, playerId, own{x,y,z,yaw,...}, remotes:[{id,name,
 //                   x,z,yaw,...}], phaseEndsInMs, ...}
 // so a join is observed as phase leaving 'menu', remote positions come from
@@ -328,6 +343,31 @@ function ownRaceFields(s) {
   return { progress: num(you.progress), nextGate: num(you.nextGate) };
 }
 
+/**
+ * Server-authoritative nitro charges left (you.nitroLeft on the wire): flat
+ * on state() per the client's debug surface; a nested `you` block is also
+ * tolerated. NOTE: this is the CHARGE count (3 at GO), not the client sim's
+ * boost-seconds field of the same name on telemetry().own.
+ */
+function ownNitroLeft(s) {
+  if (s === null || typeof s !== 'object') return null;
+  const you = s.you !== null && typeof s.you === 'object' ? s.you : s;
+  const n = you.nitroLeft;
+  return typeof n === 'number' && Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Gap to the kart one place ahead (you.gapAheadMs on the wire — ms behind,
+ * 0 for the leader; docs/KART.md 'Gap timing'): flat on state() per the
+ * client's debug surface; a nested `you` block is also tolerated.
+ */
+function ownGapAheadMs(s) {
+  if (s === null || typeof s !== 'object') return null;
+  const you = s.you !== null && typeof s.you === 'object' ? s.you : s;
+  const n = you.gapAheadMs;
+  return typeof n === 'number' && Number.isFinite(n) ? n : null;
+}
+
 /** A remote kart by display name from telemetry().remotes. */
 function remoteByName(tele, name) {
   const rs = tele !== null && Array.isArray(tele.remotes) ? tele.remotes : [];
@@ -451,6 +491,35 @@ function aheadPoint(track, ci) {
   return { x: p[0], z: p[1] };
 }
 
+/**
+ * Longest run of consecutive (g, g-1, g) repetitions in a 2Hz gear-sample
+ * sequence — the signature of the pre-fix downshift/upshift loop (the box
+ * rattled g,g-1,g,g-1,... at every gear top because DOWNSHIFT_HYST was
+ * narrower than the speed a shift cut costs). A legit corner downshift
+ * re-upshifts ONCE (1 rep); two back-to-back corners give 2. nulls
+ * (unreadable ticks) break a run.
+ */
+function gearOscillationReps(seq) {
+  let worst = 0;
+  let i = 0;
+  while (i + 2 < seq.length) {
+    const g = seq[i];
+    if (typeof g === 'number' && seq[i + 1] === g - 1 && seq[i + 2] === g) {
+      let dips = 1;
+      let j = i + 3;
+      while (j + 1 < seq.length && seq[j] === g - 1 && seq[j + 1] === g) {
+        dips++;
+        j += 2;
+      }
+      worst = Math.max(worst, dips);
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  return worst;
+}
+
 // ---- main ---------------------------------------------------------------------------
 async function main() {
   await mkdir(SHOTS_DIR, { recursive: true });
@@ -516,11 +585,41 @@ async function main() {
   // are not on state(); they are derived from telemetry()'s phase timer for
   // the detail line. The grid shot is taken on the first 'countdown'
   // sighting (karts gridded, number on screen).
+  //
+  // The PRE-GO FREEZE measurement rides this same loop instead of a serial
+  // window: full throttle is latched on the first pre-GO sample and every
+  // pre-GO position is tracked until GO. Frozen (docs/KART.md): outside
+  // 'racing' the client drive sim does not step (input ignored, velocity
+  // zeroed) and the server ignores pre-GO positions. Riding the poll keeps
+  // the whole ready+countdown span observable even when slow evaluates
+  // compress wall-clock margins — a serial window can land inside the
+  // countdown under load and the loop then never sees 'ready'.
   const phasesSeen = []; // [{phase, countdown}] — distinct consecutive samples
   let gridShot = false;
+  let freezeLatched = false; // throttle latched on the first pre-GO sample
+  let freezePos0 = null; // position at latch
+  let freezeMoved = 0; // max displacement from freezePos0 while pre-GO
+  let freezeSpanMs = 0; // latch -> last pre-GO sample (needs >= 2s)
+  let freezeT0 = 0;
+  const freezePhases = new Set(); // phases observed while latched (proof of pre-GO)
   await waitFor(async () => {
     const [s, tele] = await Promise.all([kartState(A), kartTelemetry(A)]);
     if (!joined(s)) return null;
+    if (s.phase !== 'racing') {
+      freezePhases.add(s.phase);
+      if (!freezeLatched) {
+        freezeLatched = true;
+        freezeT0 = Date.now();
+        freezePos0 = statePos(s);
+        await A.evaluate(() => window.__kart.setInput(1, 0, 0, false));
+      } else {
+        const fp = statePos(s);
+        freezeSpanMs = Date.now() - freezeT0;
+        if (freezePos0 !== null && fp !== null) {
+          freezeMoved = Math.max(freezeMoved, Math.hypot(fp[0] - freezePos0[0], fp[2] - freezePos0[2]));
+        }
+      }
+    }
     const ms = tele !== null && typeof tele.phaseEndsInMs === 'number' ? tele.phaseEndsInMs : null;
     const cd = s.phase === 'countdown' && ms !== null ? Math.min(3, Math.max(1, Math.ceil(ms / 1000))) : null;
     const last = phasesSeen[phasesSeen.length - 1];
@@ -533,6 +632,7 @@ async function main() {
     }
     return s.phase === 'racing' ? s : null;
   }, 30000, "phase 'racing' after ready + countdown");
+  await A.evaluate(() => window.__kart.setInput(0, 0, 0, false)); // unlatch the freeze throttle at GO
   if (!gridShot) {
     console.log('countdown window missed — kart-grid.png taken after the fact (phase checks below will fail)');
     await shot(A, 'kart-grid.png');
@@ -552,6 +652,15 @@ async function main() {
     "phase reaches 'racing' in order (ready -> countdown -> racing)",
     idxReady !== -1 && idxCd !== -1 && idxRace !== -1 && idxReady < idxCd && idxCd < idxRace,
     `sequence: ${seenOrder.join(' -> ')}`,
+  );
+  check(
+    'pre-GO freeze: full throttle latched through ready/countdown moves A < 1m',
+    freezeLatched &&
+      freezePos0 !== null &&
+      freezeSpanMs >= 2000 &&
+      freezeMoved < 1 &&
+      (freezePhases.has('ready') || freezePhases.has('countdown')),
+    `moved ${freezeMoved.toFixed(2)}m over ${(freezeSpanMs / 1000).toFixed(1)}s latched; phases [${[...freezePhases].join(', ')}]`,
   );
 
   // -- drive: A full throttle; the streamed position must move > 10m ---------
@@ -706,14 +815,36 @@ async function main() {
     progressSeen !== null ? `progress=${progressSeen}` : 'no gate credit within 60s of guided driving',
   );
 
+  // -- gap HUD: A is a gate up on B, so B's gapAheadMs must be > 0 -------------
+  // Frozen (docs/KART.md 'Gap timing'): you.gapAheadMs estimates the gap to
+  // the player one place ahead — gate-timestamp diff when both stamped the
+  // same gate sequence, else spatial distance / 20 m/s; 0 for the leader. A
+  // has just been credited progress > 0 while B never left the grid, so B
+  // trails A. A missing surface fails this one check without aborting the
+  // tail (same tolerance as the A/D entry-speed read).
+  let gapB = null;
+  try {
+    gapB = await waitFor(async () => {
+      const g = ownGapAheadMs(await kartState(B));
+      return g !== null && g > 0 ? g : null;
+    }, 5000, "B's state() gapAheadMs > 0 with A a gate up");
+  } catch {
+    // gapB stays null — reported by the check below
+  }
+  check(
+    "gap HUD: with A a gate up on B, B's state() gapAheadMs > 0 (0 is leader-only)",
+    gapB !== null && gapB > 0,
+    gapB !== null ? `B gapAheadMs=${gapB}ms` : 'gapAheadMs unavailable on B state() (flat or you.*)',
+  );
+
   // -- A/D direction: the frozen steer sign (positive steer = RIGHT = yaw -----
   // decreases). Setup is deterministic: R-respawn puts the kart on the last
   // credited gate (standstill on the centerline, facing along travel) — the
   // post-guided kart is at 15+ m/s in an unknown spot, and at geared-model
   // speeds a 1s full-lock turn carries it into the barrier (a nose-in kart
-  // wedges: zero speed => zero yaw rate). Launch to ~9 m/s, then steer each
-  // way for 0.7s at feathered throttle. Deltas are wrapPi'd so a heading
-  // crossing ±PI still reads right.
+  // wedges: zero speed => zero yaw rate). Launch to ~7 m/s (tight, slow turns
+  // stay clear of the walls), then steer each way for 0.7s at light throttle.
+  // Deltas are wrapPi'd so a heading crossing ±PI still reads right.
   await A.keyboard.press('KeyR'); // client respawn (drive.ts onKeyDown)
   await sleep(400);
   await A.evaluate(() => window.__kart.setInput(1, 0, 0, false));
@@ -722,16 +853,16 @@ async function main() {
     adEntry = await waitFor(async () => {
       const t = await kartTelemetry(A);
       const sp = t !== null && t.own !== null && typeof t.own === 'object' ? t.own.speedMps : null;
-      return typeof sp === 'number' && sp >= 9 ? sp : null;
-    }, 5000, 'A reaches 9 m/s after respawn');
+      return typeof sp === 'number' && sp >= 7 ? sp : null;
+    }, 5000, 'A reaches 7 m/s after respawn');
   } catch {
-    console.log('A/D: 9 m/s entry not reached in 5s — measuring anyway');
+    console.log('A/D: 7 m/s entry not reached in 5s — measuring anyway');
   }
   const adYaw0 = telePose(await kartTelemetry(A))?.yaw ?? null;
-  await A.evaluate(() => window.__kart.setInput(0.4, 0, -1, false)); // A — expect LEFT
+  await A.evaluate(() => window.__kart.setInput(0.3, 0, -1, false)); // A — expect LEFT
   await sleep(700);
   const adYaw1 = telePose(await kartTelemetry(A))?.yaw ?? null;
-  await A.evaluate(() => window.__kart.setInput(0.4, 0, 1, false)); // D — expect RIGHT
+  await A.evaluate(() => window.__kart.setInput(0.3, 0, 1, false)); // D — expect RIGHT
   await sleep(700);
   const adYaw2 = telePose(await kartTelemetry(A))?.yaw ?? null;
   await A.evaluate(() => window.__kart.setInput(0, 0, 0, false));
@@ -747,28 +878,37 @@ async function main() {
   // -- gears: the automatic 5-speed box. From a standstill, ~8s of full -------
   // throttle must upshift through the box (each upshift fires exactly at the
   // gear top, with a 0.35s engine cut): gear >= 3 seen at least once AND speed
-  // still climbing past the gear-1 top (10 m/s). Setup: R-respawn again —
+  // still climbing past the gear-1 top (12 m/s). Setup: R-respawn again —
   // standstill on the centerline (the A/D run can end anywhere). The launch
   // steers: full throttle with centerline pure-pursuit, because the box climbs
   // through the bend past the gate and grass/a wall would end the climb early.
   // Gear is read from telemetry().own.gear, then state().gear; if neither
   // surface exposes it the gear is derived from the speed band — sound on a
   // monotonic climb (upshifts fire exactly at each gear top).
-  const GEAR_TOPS = [10, 16, 22, 27, 30]; // GEARS tops in @kart/shared config
-  await A.keyboard.press('KeyR');
-  await sleep(400);
-  try {
-    await waitFor(async () => {
-      const t = await kartTelemetry(A);
-      const pose = telePose(t);
-      const sp = t !== null && t.own !== null && typeof t.own === 'object' ? t.own.speedMps : null;
-      if (pose === null || typeof sp !== 'number' || Math.abs(sp) >= 0.3) return null;
-      const ci = nearestIndex(track.centerline, pose.x, pose.z);
-      const c = track.centerline[ci];
-      return Math.hypot(c[0] - pose.x, c[1] - pose.z) < 4 ? sp : null;
-    }, 3000, 'A respawned to the gate anchor (standstill, on road)');
-  } catch {
-    console.log('gears: respawn verify failed (not standstill/on-road in 3s) — launching anyway');
+  const GEAR_TOPS = [12, 18, 25, 31, 36]; // GEARS tops in @kart/shared config
+  // Verify the respawn landed (standstill + near the road). The dist bound is
+  // lenient: this script's recomputed centerline can deviate a few meters from
+  // the server's track. One R retry covers a swallowed keypress.
+  let respawned = false;
+  for (let attempt = 0; attempt < 2 && !respawned; attempt++) {
+    await A.keyboard.press('KeyR');
+    await sleep(400);
+    try {
+      await waitFor(async () => {
+        const t = await kartTelemetry(A);
+        const pose = telePose(t);
+        const sp = t !== null && t.own !== null && typeof t.own === 'object' ? t.own.speedMps : null;
+        if (pose === null || typeof sp !== 'number' || Math.abs(sp) >= 0.5) return null;
+        const ci = nearestIndex(track.centerline, pose.x, pose.z);
+        const c = track.centerline[ci];
+        // truthy marker, NOT sp: a settled kart reads exactly 0.0, and waitFor
+        // accepts with `if (v)` — returning 0.0 would poll forever
+        return Math.hypot(c[0] - pose.x, c[1] - pose.z) < 8 ? true : null;
+      }, 3000, 'A respawned to the gate anchor (standstill, on road)');
+      respawned = true;
+    } catch {
+      console.log(`gears: respawn verify failed (attempt ${attempt + 1}/2) — ${attempt === 0 ? 'retrying R' : 'launching anyway'}`);
+    }
   }
   await A.evaluate(() => window.__kart.setInput(1, 0, 0, false));
   let maxGear = 1;
@@ -822,7 +962,7 @@ async function main() {
     await sleep(100);
   }
   await A.evaluate(() => window.__kart.setInput(0, 0, 0, false));
-  const gearsOk = maxGear >= 3 && maxSpeed > 10;
+  const gearsOk = maxGear >= 3 && maxSpeed > 12;
   if (!gearsOk) {
     // dump the room/server side of the story: race end/timeout/restart or a
     // dropped session lands here right when the kart freezes
@@ -831,9 +971,216 @@ async function main() {
     for (const line of tail) console.log(`  [server-log] ${line}`);
   }
   check(
-    'gears: full throttle from standstill reaches gear >= 3 and climbs past gear-1 top (10 m/s)',
+    'gears: full throttle from standstill reaches gear >= 3 and climbs past gear-1 top (12 m/s)',
     gearsOk,
     `maxGear=${maxGear} (${gearSrc}) maxSpeed=${maxSpeed.toFixed(1)} m/s over ~8s`,
+  );
+
+  // -- nitro: 3 charges, a real boost, then empty ---------------------------------
+  // Frozen (docs/KART.md): N sends {t:'nitro'}; the server spends one of
+  // NITRO_CHARGES (3, refilled at GO), silently ignores a press with none
+  // left, and broadcasts the event; the client then boosts +NITRO_BOOST
+  // (10 m/s^2) for NITRO_TIME (1.5s) in stepKart. state() nitroLeft is the
+  // server-authoritative charge count: 3 -> 2 -> 1 -> 0. The boost is proven
+  // by an A/B pair of identical full-throttle launches from the same
+  // R-respawn anchor (each respawn verified at a standstill — a swallowed R
+  // under load must not hand one run a rolling start; centerline pursuit
+  // both runs, same 2.5s window): the boosted run's top speed must beat the
+  // no-boost top at the same throttle.
+  // A same-window A/B is sim-rate-proof: a slow software client slows both
+  // runs equally. Charge counts are read between presses while coasting.
+  const readNitroLeft = async () => ownNitroLeft(await kartState(A));
+  // Last observed charge count, waiting up to timeoutMs for `expected`
+  // (0 is a valid reading, so waitFor's truthy test can't return the number).
+  const awaitNitroLeft = async (expected, timeoutMs) => {
+    let seen = await readNitroLeft();
+    try {
+      await waitFor(async () => {
+        seen = await readNitroLeft();
+        return seen === expected ? true : null;
+      }, timeoutMs, `nitroLeft === ${expected}`);
+    } catch {
+      // seen keeps the last observed value for the detail line
+    }
+    return seen;
+  };
+  // Full-throttle centerline pursuit for windowMs; returns the top speed seen.
+  const launchRun = async (windowMs) => {
+    let top = 0;
+    const t0 = Date.now();
+    while (Date.now() - t0 < windowMs) {
+      const t = await kartTelemetry(A);
+      const sp = t !== null && t.own !== null && typeof t.own === 'object' ? t.own.speedMps : null;
+      if (typeof sp === 'number') top = Math.max(top, sp);
+      const pose = telePose(t);
+      if (pose !== null) {
+        const ci = nearestIndex(track.centerline, pose.x, pose.z);
+        const aim = aheadPoint(track, ci);
+        const diff = wrapPi(Math.atan2(-(aim.x - pose.x), -(aim.z - pose.z)) - pose.yaw);
+        await A.evaluate((st2) => window.__kart.setInput(1, 0, st2, false), Math.max(-1, Math.min(1, -diff * 2.2)));
+      }
+      await sleep(100);
+    }
+    return top;
+  };
+
+  // R-respawn to a VERIFIED standstill (parked input first; a swallowed R
+  // under load leaves the kart rolling and would give one A/B run a rolling
+  // start — the gears section retries R for the same reason).
+  const respawnParked = async () => {
+    await A.evaluate(() => window.__kart.setInput(0, 0, 0, false));
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await A.keyboard.press('KeyR');
+      try {
+        await waitFor(async () => {
+          const t = await kartTelemetry(A);
+          const sp = t !== null && t.own !== null && typeof t.own === 'object' ? t.own.speedMps : null;
+          return typeof sp === 'number' && Math.abs(sp) < 0.5 ? true : null;
+        }, 2000, 'A parked at the respawn anchor');
+        return;
+      } catch {
+        if (attempt === 1) console.log('nitro: standstill not confirmed after 2 R presses — launching anyway');
+      }
+    }
+  };
+
+  const nitroStart = await awaitNitroLeft(3, 5000); // charges refilled at GO
+  await respawnParked();
+  await A.evaluate(() => window.__kart.setInput(1, 0, 0, false));
+  const noBoostTop = await launchRun(2500);
+  await respawnParked(); // same anchor + standstill — the boosted run's twin
+  await A.evaluate(() => window.__kart.setInput(1, 0, 0, false));
+  await A.keyboard.press('KeyN'); // charge 1: boost from the line
+  const boostTop = await launchRun(2500);
+  const nitroAfter1 = await awaitNitroLeft(2, 4000);
+  await A.evaluate(() => window.__kart.setInput(0, 0, 0, false)); // coast for the count checks
+  await A.keyboard.press('KeyN'); // charge 2
+  const nitroAfter2 = await awaitNitroLeft(1, 4000);
+  await A.keyboard.press('KeyN'); // charge 3
+  const nitroAfter3 = await awaitNitroLeft(0, 4000);
+  await A.keyboard.press('KeyN'); // 4th press: no charge left => silently ignored
+  await sleep(800);
+  const nitroAfter4 = await readNitroLeft();
+  check(
+    'nitro: charges go 3->2->1->0 (4th press ignored) and the first boost beats the no-boost top speed at full throttle',
+    nitroStart === 3 &&
+      nitroAfter1 === 2 &&
+      nitroAfter2 === 1 &&
+      nitroAfter3 === 0 &&
+      nitroAfter4 === 0 &&
+      boostTop > noBoostTop + 3,
+    `charges ${nitroStart} -> ${nitroAfter1} -> ${nitroAfter2} -> ${nitroAfter3}, 4th press -> ${nitroAfter4}; ` +
+      `top speed no-boost ${noBoostTop.toFixed(1)} vs boosted ${boostTop.toFixed(1)} m/s (2.5s full-throttle A/B)`,
+  );
+
+  // -- gear stability + top speed: ~20s of centerline pursuit ------------------
+  // The retuned box (GEARS tops 12/18/25/31/36, DOWNSHIFT_HYST 4.5 — wider
+  // than the ~3.5 m/s a SHIFT_TIME cut costs at top gears) must NOT oscillate:
+  // the old tune looped 3-2-3 at every gear top. Sample the gear at 2Hz over
+  // ~20s from a verified standstill and reject any (g, g-1, g) pattern
+  // repeating 3+ times consecutively — a legit corner downshift re-upshifts
+  // once, never three times in a row at 2Hz. Top speed rides the same run
+  // (kept going past the window until it lands, capped): the overdrive 5th
+  // pulls toward TOP_SPEED 36, so >= 28 m/s must show on a straight — the
+  // headless sim rate makes the full 30+ a wall-clock-dependent ask, so 28
+  // is the frozen floor. The drive uses the guided loop's throttle (full on
+  // the straights, modulated by heading error + bend ahead into the turns) —
+  // raw full throttle spears the barrier on the right-side S-bends and the
+  // reverse-out cannot free a kart grinding nose-first along the wall.
+  const STAB_WINDOW_MS = 20000; // gear-sampling window (2Hz)
+  const TOP_SPEED_FLOOR = 28; // m/s — spec floor: > 30 ideal, >= 28 headless
+  const STAB_BUDGET_MS = 45000; // hard cap for the window + the top-speed hunt
+  await respawnParked(); // verified standstill at the last credited gate
+  await A.evaluate(() => window.__kart.setInput(1, 0, 0, false));
+  const gearSeq = []; // 2Hz gear samples; null = unreadable that tick
+  let stabMaxGear = 1;
+  let stabTopSpeed = 0;
+  let stabRecoverPhase = 0; // 0 none, 1 reversing, 2 driving back out
+  let stabRecoverUntil = 0;
+  const stabTrail = []; // [{t,x,z}] — stall detection window
+  let stabTick = 0;
+  let lastStabLog = 0;
+  const stabT0 = Date.now();
+  while (Date.now() - stabT0 < STAB_BUDGET_MS) {
+    const now = Date.now();
+    const inWindow = now - stabT0 < STAB_WINDOW_MS;
+    if (!inWindow && stabTopSpeed >= TOP_SPEED_FLOOR) break; // both proofs in hand
+    const [s, t] = await Promise.all([kartState(A), kartTelemetry(A)]);
+    const own = t !== null && t.own !== null && typeof t.own === 'object' ? t.own : null;
+    const ownSp = own !== null && typeof own.speedMps === 'number' ? Math.abs(own.speedMps) : null;
+    if (ownSp !== null) stabTopSpeed = Math.max(stabTopSpeed, ownSp);
+    if (inWindow && stabTick % 2 === 0) {
+      const ownGear = own !== null && typeof own.gear === 'number' && Number.isFinite(own.gear) ? own.gear : null;
+      const stGear = s !== null && typeof s.gear === 'number' && Number.isFinite(s.gear) ? s.gear : null;
+      let g = ownGear ?? stGear;
+      if (g === null && ownSp !== null) {
+        g = Math.min(GEAR_TOPS.length, 1 + GEAR_TOPS.filter((top) => ownSp >= top).length);
+      }
+      gearSeq.push(g);
+      if (g !== null) stabMaxGear = Math.max(stabMaxGear, g);
+    }
+    // centerline pursuit with the guided loop's throttle (full on straights,
+    // modulated by heading error + bend ahead into turns) and its reverse-out
+    // on a 3s stall (a wedged kart reads gear 1 and would waste the window)
+    const pose = telePose(t);
+    if (pose !== null) {
+      stabTrail.push({ t: now, x: pose.x, z: pose.z });
+      while (stabTrail.length > 0 && now - stabTrail[0].t > 3200) stabTrail.shift();
+      const stalled =
+        stabRecoverPhase === 0 &&
+        stabTrail.length > 1 &&
+        now - stabTrail[0].t >= 3000 &&
+        Math.hypot(pose.x - stabTrail[0].x, pose.z - stabTrail[0].z) < 1;
+      if (stalled) {
+        console.log(
+          `stability t=${((now - stabT0) / 1000).toFixed(0)}s STALLED at (${pose.x.toFixed(1)},${pose.z.toFixed(1)}) — reverse-out`,
+        );
+        stabRecoverPhase = 1;
+        stabRecoverUntil = now + 1300;
+        stabTrail.length = 0;
+      }
+      const ci = nearestIndex(track.centerline, pose.x, pose.z);
+      const aim = aheadPoint(track, ci);
+      const diff = wrapPi(Math.atan2(-(aim.x - pose.x), -(aim.z - pose.z)) - pose.yaw);
+      if (stabRecoverPhase === 1) {
+        // backing up flips the steer response (see the guided loop)
+        await A.evaluate((st2) => window.__kart.setInput(0, 1, st2, false), diff >= 0 ? 1 : -1);
+        if (now >= stabRecoverUntil) {
+          stabRecoverPhase = 2;
+          stabRecoverUntil = now + 1500;
+        }
+      } else if (stabRecoverPhase === 2) {
+        await A.evaluate((st2) => window.__kart.setInput(0.7, 0, st2, false), Math.max(-1, Math.min(1, -diff * 2.2)));
+        if (now >= stabRecoverUntil) stabRecoverPhase = 0;
+      } else {
+        // the guided loop's road-following throttle: full on the straights,
+        // backed off for heading error and the bend ahead (grip-capped turns)
+        const bend = Math.abs(wrapPi(track.travelYaw[(ci + track.lookaheadIdx) % TRACK_SAMPLES] - track.travelYaw[ci]));
+        const thr = Math.max(0.35, Math.min(1, 1 - Math.abs(diff) * 0.6 - bend * 0.25));
+        await A.evaluate((th, st2) => window.__kart.setInput(th, 0, st2, false), thr, Math.max(-1, Math.min(1, -diff * 2.2)));
+      }
+    }
+    if (now - lastStabLog >= 2000) {
+      lastStabLog = now;
+      console.log(
+        `stability t=${((now - stabT0) / 1000).toFixed(0)}s spd=${ownSp !== null ? ownSp.toFixed(1) : '?'} ` +
+          `gear=${gearSeq.length > 0 ? gearSeq[gearSeq.length - 1] : '?'} top=${stabTopSpeed.toFixed(1)}`,
+      );
+    }
+    stabTick++;
+    await sleep(250); // steer at 4Hz; the gear is sampled every 2nd tick = 2Hz
+  }
+  await A.evaluate(() => window.__kart.setInput(0, 0, 0, false));
+  const oscReps = gearOscillationReps(gearSeq);
+  check(
+    'gear stability: ~20s at 2Hz shows no (g,g-1,g) oscillation x3+ and reaches gear >= 3',
+    oscReps < 3 && stabMaxGear >= 3,
+    `samples=${gearSeq.length} maxOscReps=${oscReps} maxGear=${stabMaxGear} seq=[${gearSeq.map((g) => (g === null ? '?' : g)).join(',')}]`,
+  );
+  check(
+    `top speed: >= ${TOP_SPEED_FLOOR} m/s observed on a straight (TOP_SPEED 36 floored for headless)`,
+    stabTopSpeed >= TOP_SPEED_FLOOR,
+    `max observed ${stabTopSpeed.toFixed(1)} m/s over ${((Date.now() - stabT0) / 1000).toFixed(0)}s of centerline pursuit`,
   );
 
   // -- error surface --------------------------------------------------------------------------
