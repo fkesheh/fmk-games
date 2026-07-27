@@ -6,9 +6,9 @@
 // ============================================================================
 import {
   BRAKE, DOWNSHIFT_HYST, DRAG, DRIFT_DECEL, DRIFT_MIN_SPEED, DRIFT_STEER_MUL,
-  ENGINE, GEARS, GRASS_DRAG, GRASS_ENGINE_MUL, GRIP_DRIFT, GRIP_GRASS, GRIP_ROAD,
-  LAT_G, LAT_G_GRASS, MAX_LOCK, MIN_LOCK, NITRO_BOOST, REVERSE_TOP, ROLL,
-  SHIFT_TIME, TOP_SPEED, WHEELBASE,
+  DRIFT_THROTTLE_MUL, ENGINE, GEARS, GRASS_DRAG, GRASS_ENGINE_MUL, GRIP_DRIFT,
+  GRIP_GRASS, GRIP_ROAD, LAT_G, LAT_G_GRASS, MAX_LOCK, MIN_LOCK, NITRO_BOOST,
+  REVERSE_TOP, ROLL, SHIFT_TIME, TOP_SPEED, WHEELBASE,
 } from './config.js';
 
 export type Surface = 'road' | 'grass';
@@ -83,8 +83,10 @@ export function stepKart(s: KartState, inp: KartInput, dt: number, surface: Surf
   if (s.shiftLeft === 0 && throttle > 0 && speedF >= 0 && speedF < gear.top) {
     // flat engine force per gear; REV LIMITER: no engine force at/above the gear top
     // (drag pulls back under it, so speed settles at the top without taper math
-    // that provably could never reach the shift point).
-    speedF += ENGINE * gear.accel * engineMul * throttle * dt;
+    // that provably could never reach the shift point). While the handbrake is on
+    // the clutch slips: throttle keeps only DRIFT_THROTTLE_MUL of its force, so
+    // accelerate+handbrake always decelerates (rear-driven karts fight throttle).
+    speedF += ENGINE * gear.accel * engineMul * (s.drifting ? DRIFT_THROTTLE_MUL : 1) * throttle * dt;
   }
   // upshift at the gear top; downshift only well below it (never below gear 1) —
   // the hysteresis exceeds the speed a shift cut costs, so the box never oscillates

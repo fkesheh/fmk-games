@@ -33,7 +33,8 @@ export const LAT_G = 11; // max lateral acceleration on road, m/s^2 (understeer 
 export const LAT_G_GRASS = 6;
 export const DRIFT_MIN_SPEED = 8; // m/s needed to initiate a drift
 export const DRIFT_STEER_MUL = 1.25; // sharper steering while drifting (was 1.5 = 'magic turns')
-export const DRIFT_DECEL = 7; // m/s^2 of handbrake deceleration while drifting
+export const DRIFT_DECEL = 9; // m/s^2 of handbrake deceleration while drifting
+export const DRIFT_THROTTLE_MUL = 0.25; // clutch slip: engine force while drifting (handbrake fights throttle, never loses)
 export const GRASS_ENGINE_MUL = 0.55;
 export const GRASS_DRAG = 2.5; // extra drag off-road
 export const BARRIER_DAMP = 0.4; // velocity kept along the normal after a barrier hit
