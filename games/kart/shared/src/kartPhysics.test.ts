@@ -257,7 +257,7 @@ describe('drift', () => {
     stepKart(s, input({ drift: true }), DT, 'road');
     expect(s.drifting).toBe(true);
 
-    run(s, input({ drift: true, steer: 0.3 }), 2); // hold the drift well past any old charge window
+    run(s, input({ drift: true, steer: 0.3 }), 1.2); // hold the drift (decel scrubs ~9 m/s)
     expect(s.drifting).toBe(true); // still sliding (speed bled but above the exit floor)
     expect(s.nitroLeft).toBe(0); // nitro is server-granted; drift never touches it
 

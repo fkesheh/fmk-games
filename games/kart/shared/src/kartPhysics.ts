@@ -5,10 +5,10 @@
 // yaw convention matches the platform: forward = (-sin(yaw), -cos(yaw)).
 // ============================================================================
 import {
-  BRAKE, DOWNSHIFT_HYST, DRAG, DRIFT_MIN_SPEED, DRIFT_STEER_MUL, ENGINE, GEARS,
-  GRASS_DRAG, GRASS_ENGINE_MUL, GRIP_DRIFT, GRIP_GRASS, GRIP_ROAD, LAT_G,
-  LAT_G_GRASS, MAX_LOCK, MIN_LOCK, NITRO_BOOST, REVERSE_TOP, ROLL, SHIFT_TIME,
-  TOP_SPEED, WHEELBASE,
+  BRAKE, DOWNSHIFT_HYST, DRAG, DRIFT_DECEL, DRIFT_MIN_SPEED, DRIFT_STEER_MUL,
+  ENGINE, GEARS, GRASS_DRAG, GRASS_ENGINE_MUL, GRIP_DRIFT, GRIP_GRASS, GRIP_ROAD,
+  LAT_G, LAT_G_GRASS, MAX_LOCK, MIN_LOCK, NITRO_BOOST, REVERSE_TOP, ROLL,
+  SHIFT_TIME, TOP_SPEED, WHEELBASE,
 } from './config.js';
 
 export type Surface = 'road' | 'grass';
@@ -98,9 +98,15 @@ export function stepKart(s: KartState, inp: KartInput, dt: number, surface: Surf
     if (speedF > 0.5) speedF -= BRAKE * brake * dt;
     else speedF = Math.max(-REVERSE_TOP, speedF - ENGINE * 0.6 * brake * dt); // reverse
   }
-  // drag + rolling resistance (+ off-road drag)
+  // drag + rolling resistance (+ off-road drag) + handbrake deceleration
   const drag = DRAG + (surface === 'grass' ? GRASS_DRAG : 0);
   speedF -= drag * speedF * dt;
+  if (s.drifting) {
+    // handbrake: real deceleration (locks the rear axle) — drifts scrub speed,
+    // they are not a free rotation button
+    const d = DRIFT_DECEL * dt;
+    speedF = Math.abs(speedF) <= d ? 0 : speedF - Math.sign(speedF) * d;
+  }
   if (Math.abs(speedF) > 0.01) speedF -= Math.sign(speedF) * ROLL * dt;
   if (Math.abs(speedF) < 0.05 && throttle === 0 && brake === 0) speedF = 0;
   speedF = clamp(speedF, -REVERSE_TOP, TOP_SPEED * 1.15);
