@@ -25,20 +25,27 @@
 //   checks close the drive: the steer sign (steer -1 = A must turn LEFT, i.e.
 //   yaw INCREASES; steer +1 = D must turn RIGHT, yaw DECREASES — the frozen
 //   convention is positive steer = RIGHT) and the automatic gearbox (from a
-//   standstill, ~8s of full throttle must reach gear >= 3 and keep climbing
-//   past the gear-1 top of 12 m/s). Two frozen-rule checks bracket the drive:
+//   standstill, ~8 sim-s of full throttle must reach gear >= 3 and keep
+//   climbing past the gear-1 top of 12 m/s). Two frozen-rule checks bracket
+//   the drive:
 //   the PRE-GO FREEZE (full throttle latched through the ready+countdown poll
 //   must move A < 1m — the client sim does not step and the server ignores
 //   pre-GO positions) and NITRO (3 charges per race, refilled at GO: KeyN
 //   spends a charge server-side — state() nitroLeft goes 3->2->1->0 and a 4th
 //   press is ignored — while the client applies +NITRO_BOOST for NITRO_TIME,
 //   proven by an A/B pair of full-throttle launches from the same respawn
-//   anchor, boosted vs no-boost top speed at the same throttle). The physics
-//   tail adds: B's state() gapAheadMs > 0 with A a gate up (gap HUD; 0 is
-//   leader-only), a ~20s centerline pursuit sampling the gearbox at 2Hz
-//   (the retuned DOWNSHIFT_HYST must show no (g,g-1,g) oscillation x3+), and
-//   the same run must top >= 28 m/s on a straight (TOP_SPEED 36, floored for
-//   the headless sim rate).
+//   anchor over the same 2.5 SIM-second window, boosted vs no-boost top speed
+//   at the same throttle). The physics tail adds: B's state() gapAheadMs > 0
+//   with A a gate up (gap HUD; 0 is leader-only), a ~20 SIM-s centerline
+//   pursuit sampling the gearbox at 2Hz (the retuned DOWNSHIFT_HYST must show
+//   no (g,g-1,g) oscillation x3+), and the same run must top >= 28 m/s on a
+//   straight (TOP_SPEED 36, floored for the headless sim rate).
+// SIM TIME: the headless frame loop clamps render dt at 0.05s, so below
+// ~20fps (SwiftShader + the AAA scene) the kart sim runs slower than wall
+// clock at fps×0.05 sim-s per wall-s. Every speed/timing-sensitive window
+// below is therefore measured in kart-sim seconds via telemetry().seq (the
+// 15Hz packet clock only advances by stepped sim time — see teleSimS), and a
+// launch-curve sim-rate probe is logged in the 'A drives' section.
 // Two checks run in a PUBLIC room BEFORE the private-room flow: A createPublic
 // and B joins it by roomId — the id is read from the lobby's creation log
 // (the frozen debug surface exposes no roomId) and B joins through the menu
@@ -51,14 +58,14 @@
 // (server-credited progress > 0) within 60s. Two kids-mode hardening checks
 // follow in the same room: STUCK AUTO-RESPAWN (the kart is pinned nose-first
 // into a barrier with the assist OFF — the guard is assist-only — then the
-// assist is re-enabled while pinned: within ~8s the client must auto-respawn
-// to a gate, proven by a > 15m teleport between poll samples landing within
-// ~GATE_RADIUS of a gate with the speed reset) and WRONG-WAY RECOVERY (spun
-// ~180° by a forward full-lock circle from the anchor, throttle-only with the
-// assist on must return the facing to within ~30° of the track travel
-// direction — the best of the nearest gate tangent and the exact centerline
-// tangent — within ~10s and grow the server-credited progress). Both pages
-// then reload into
+// assist is re-enabled while pinned: within ~8 sim-s the client must auto-
+// respawn to a gate, proven by a > 15m teleport between poll samples landing
+// within ~GATE_RADIUS of a gate with the speed reset) and WRONG-WAY RECOVERY
+// (spun ~180° by a forward full-lock circle from the anchor, throttle-only
+// with the assist on must return the facing to within ~30° of the track
+// travel direction — the best of the nearest gate tangent and the exact
+// centerline tangent — within ~10 sim-s and grow the server-credited
+// progress). Both pages then reload into
 // fresh menu clients for the private-room flow above (the client has no
 // leave-room debug hook; the assist toggle persists to localStorage, so it
 // is verified OFF before the reload).
@@ -200,7 +207,7 @@ async function waitForServer(timeoutMs = 20000) {
 const VIEWPORT = (() => {
   const m = /^(\d{3,4})x(\d{3,4})$/.exec(process.env.E2E_VIEWPORT ?? '');
   return m === null
-    ? { width: 1280, height: 720 }
+    ? { width: 640, height: 360 } // the AAA scene starves SwiftShader; 640x360 doubles the sim rate
     : { width: Number(m[1]), height: Number(m[2]) };
 })();
 const LAUNCH_ARGS = [
@@ -410,7 +417,23 @@ function telePose(t) {
   return { x, z, yaw };
 }
 
+/**
+ * SIM CLOCK (kart-sim seconds): telemetry().seq counts the 15Hz kart_state
+ * packets, and the packet clock only advances by STEPPED sim time (drive.ts
+ * pktClock += the clamped dt). So Δseq/15 = kart-sim seconds between two
+ * reads, regardless of how slowly SwiftShader renders frames — the headless
+ * frame loop clamps dt at 0.05s (app.ts MAX_FRAME_DT), so below 20fps the sim
+ * runs at fps×0.05 sim-s per wall-s. Wall-clock budgets are meaningless under
+ * that starvation; the sensitive windows below are measured in sim seconds
+ * (phase 'racing' only — a frozen sim still ticks the packet clock). Returns
+ * null when seq is unreadable.
+ */
+function teleSimS(t) {
+  return t !== null && typeof t === 'object' && typeof t.seq === 'number' && Number.isFinite(t.seq) ? t.seq / 15 : null;
+}
+
 /** Shortest signed angle from a to b, in (-PI, PI]. */
+
 function wrapPi(a) {
   let w = a % (Math.PI * 2);
   if (w > Math.PI) w -= Math.PI * 2;
@@ -679,16 +702,18 @@ async function main() {
   // a barrier where the pursuit cannot unwind it — zero speed, zero yaw rate) is
   // auto-respawned to the last credited gate with NO R press. The feature is
   // assist-only, so the pin is forced with the assist OFF (it cannot fire early):
-  // a verified R-respawn to the anchor gate, ~3s of centerline pursuit AWAY from
-  // it (so the teleport back is a > 15m jump no standstill kart can fake inside
-  // one poll interval), then a SLOW (brake-capped, < 7 m/s) run at a FIXED aim
-  // point 30m past the barrier — an aim re-derived per tick or a fast arrival
-  // just grinds along the wall — until the position flat-lines (< 1.5m over a
-  // 2.5s window). Then the assist is re-enabled while pinned and the throttle
-  // re-latched: the client must teleport back within ~8s of the confirmed pin,
-  // land by a gate coordinate (<= GATE_RADIUS + 1m), and show a reset speed
-  // (< 10 m/s at the jump sample — gear-1 from rest needs ~1s for that). Both
-  // proofs ride telemetry().own.
+  // a verified R-respawn to the anchor gate, 3 SIM seconds of centerline pursuit
+  // AWAY from it (so the teleport back is a > 15m jump no standstill kart can
+  // fake inside one poll interval), then a SLOW (brake-capped, < 7 m/s) run at a
+  // FIXED aim point 30m past the barrier — an aim re-derived per tick or a fast
+  // arrival just grinds along the wall — until the position flat-lines (< 1.5m
+  // over a 2.5 SIM-second window). Then the assist is re-enabled while pinned and the throttle
+  // re-latched: the client must teleport back within ~8 SIM seconds of the
+  // confirmed pin (its stuck timer, 2.5 sim-s in drive.ts, runs on stepped sim
+  // time — a wall budget over-waits it by 1/sim-rate), land by a gate
+  // coordinate (<= GATE_RADIUS + 1m), and show a reset speed (< 10 m/s at the
+  // jump sample — gear-1 from rest needs ~1 sim-s for that). Both proofs ride
+  // telemetry().own; the sim clock rides telemetry().seq (see teleSimS).
   const kidsTrack = computeTrackData(); // same frozen math — a cheap recompute
   const kidsGates = kidsTrack.gates;
 
@@ -734,36 +759,51 @@ async function main() {
   };
 
   await kidsRespawn();
-  // drive AWAY from the anchor under centerline pursuit (~3s from a standstill
-  // is ~25-35m — far less than the ~85m gate spacing, so no new gate credit)
-  const awayT0 = Date.now();
-  while (Date.now() - awayT0 < 3000) {
-    const pose = telePose(await kartTelemetry(A));
-    if (pose !== null) {
-      const ci = nearestIndex(kidsTrack.centerline, pose.x, pose.z);
-      const aim = aheadPoint(kidsTrack, ci);
-      const diff = wrapPi(Math.atan2(-(aim.x - pose.x), -(aim.z - pose.z)) - pose.yaw);
-      await A.evaluate((st2) => window.__kart.setInput(1, 0, st2, false), Math.max(-1, Math.min(1, -diff * 2.2)));
+  // drive AWAY from the anchor under centerline pursuit — 4 SIM seconds from a
+  // standstill is ~30-45m (well past the > 8m teleport threshold the watch
+  // uses, and far less than the ~75m gate spacing, so no new gate credit).
+  // Sim time: a wall window barely moves a starved sim.
+  {
+    const awaySim0 = teleSimS(await kartTelemetry(A));
+    const awayWall0 = Date.now();
+    while (Date.now() - awayWall0 < 20000) {
+      const t = await kartTelemetry(A);
+      const pose = telePose(t);
+      const simS = teleSimS(t);
+      if (simS !== null && awaySim0 !== null && simS - awaySim0 >= 4) break;
+      if (pose !== null) {
+        const ci = nearestIndex(kidsTrack.centerline, pose.x, pose.z);
+        const aim = aheadPoint(kidsTrack, ci);
+        const diff = wrapPi(Math.atan2(-(aim.x - pose.x), -(aim.z - pose.z)) - pose.yaw);
+        await A.evaluate((st2) => window.__kart.setInput(1, 0, st2, false), Math.max(-1, Math.min(1, -diff * 2.2)));
+      }
+      await sleep(150);
     }
-    await sleep(150);
   }
   // pin: SLOW pure-pursuit of a FIXED aim 30m past the barrier on the
   // left-of-travel normal (the drive.ts collideBarrier convention), computed
   // ONCE — an aim re-derived per tick curves the chase into a wall-grind, and
   // a fast arrival just slides along the barrier. Braking to < 7 m/s first
   // keeps the speed-sensitive lock wide, so the kart spears the wall near-
-  // perpendicular and settles nose-in. The other side is tried after 7s.
-  const pinTrail = []; // [{t,x,z}] — stationary-window detection
+  // perpendicular and settles nose-in. The other side is tried after 7 sim-s.
+  // Everything is SIM-timed — the stationary window too (a creeping kart at
+  // 0.5 sim-m/s covers < 1.5m in 2.5 WALL seconds under starvation and would
+  // false-confirm).
+  const pinTrail = []; // [{simS,x,z}] — stationary-window detection (sim clock)
   let pinPos = null;
-  let pinT0 = 0;
+  let pinSimS = null; // sim clock at the confirmed pin (seq-based)
   let pinSide = 1;
   let pinAim = null; // fixed aim point; recomputed only on the side flip
-  const pinStart = Date.now();
-  while (Date.now() - pinStart < 15000 && pinPos === null) {
+  const pinWall0 = Date.now();
+  const pinSim0 = teleSimS(await kartTelemetry(A));
+  let pinSideFlipAt = null; // sim clock to flip sides (null = not yet flipping)
+  while (Date.now() - pinWall0 < 90000 && pinPos === null) {
     const t = await kartTelemetry(A);
     const pose = telePose(t);
     const sp = t !== null && t.own !== null && typeof t.own === 'object' ? t.own.speedMps : null;
-    if (pose !== null) {
+    const simS = teleSimS(t);
+    if (simS !== null && pinSim0 !== null && simS - pinSim0 > 15) break; // 15 sim-s and no pin: give up
+    if (pose !== null && simS !== null) {
       if (pinAim === null) {
         const ci = nearestIndex(kidsTrack.centerline, pose.x, pose.z);
         const c = kidsTrack.centerline[ci];
@@ -772,6 +812,7 @@ async function main() {
         const dz = c2[1] - c[1];
         const l = Math.hypot(dx, dz) || 1;
         pinAim = { x: c[0] + (-dz / l) * pinSide * 30, z: c[1] + (dx / l) * pinSide * 30 };
+        pinSideFlipAt = simS + 7; // this wall gets 7 sim-s to pin, then the other one
       }
       const diff = wrapPi(Math.atan2(-(pinAim.x - pose.x), -(pinAim.z - pose.z)) - pose.yaw);
       const slow = typeof sp === 'number' && sp > 7;
@@ -781,18 +822,17 @@ async function main() {
         slow ? 1 : 0,
         Math.max(-1, Math.min(1, -diff * 2.2)),
       );
-      const now = Date.now();
-      pinTrail.push({ t: now, x: pose.x, z: pose.z });
-      while (pinTrail.length > 0 && now - pinTrail[0].t > 2600) pinTrail.shift();
+      pinTrail.push({ simS, x: pose.x, z: pose.z });
+      while (pinTrail.length > 0 && simS - pinTrail[0].simS > 2.6) pinTrail.shift();
       if (
         pinTrail.length > 1 &&
-        now - pinTrail[0].t >= 2500 &&
+        simS - pinTrail[0].simS >= 2.5 &&
         Math.hypot(pose.x - pinTrail[0].x, pose.z - pinTrail[0].z) < 1.5
       ) {
         pinPos = { x: pose.x, z: pose.z };
-        pinT0 = now; // the confirmed pin: the ~8s auto-respawn budget starts here
+        pinSimS = simS; // the confirmed pin: the ~8 sim-s auto-respawn budget starts here
       }
-      if (now - pinStart > 7000 && pinSide === 1) {
+      if (pinSideFlipAt !== null && simS >= pinSideFlipAt && pinSide === 1) {
         pinSide = -1; // this wall would not pin — try the other one
         pinAim = null;
         pinTrail.length = 0;
@@ -802,23 +842,32 @@ async function main() {
   }
   // assist ON while pinned, throttle re-latched (the pursuit owns the steer):
   // watch for the teleport — a > 15m move between consecutive ~0.3s samples is
-  // impossible from a standstill (gear-1 accel needs ~1.4s for that)
-  let jumpMs = 0; // ms from the confirmed pin to the teleport (0 = never)
+  // impossible from a standstill (gear-1 accel needs ~1.4s for that). The ~8s
+  // budget is SIM time: the client's stuck timer (2.5 sim-s, drive.ts) runs on
+  // stepped sim time, and below 20fps wall clock over-counts it by 1/rate.
+  let jumpSimS = null; // sim-s from the confirmed pin to the teleport (null = never)
   let jumpGateD = null; // distance from the landing point to the nearest gate
   let jumpSpeed = null; // |speed| at the jump sample (respawn resets it to 0)
   let stuckAssistOn = false;
-  if (pinPos !== null) {
+  if (pinPos !== null && pinSimS !== null) {
     stuckAssistOn = await kidsAssistTo(true);
     let prev = pinPos;
     const watchStart = Date.now();
-    while (Date.now() - watchStart < 12000 && jumpMs === 0) {
+    while (Date.now() - watchStart < 60000 && jumpSimS === null) {
       await A.evaluate(() => window.__kart.setInput(1, 0, 0, false));
       const t = await kartTelemetry(A);
       const pose = telePose(t);
       const sp = t !== null && t.own !== null && typeof t.own === 'object' ? t.own.speedMps : null;
+      const simS = teleSimS(t);
+      if (simS !== null && simS - pinSimS > 10) break; // 10 sim-s and no respawn: dead
       if (pose !== null) {
-        if (Math.hypot(pose.x - prev.x, pose.z - prev.z) > 15) {
-          jumpMs = Date.now() - pinT0;
+        // teleport signature: > 8m between consecutive ~0.15s-wall samples.
+        // From a standstill even gear-1 accel needs ~1 sim-s for that, and at
+        // TOP_SPEED a sample covers ~5m — driving cannot fake it. (The pin is
+        // ~25m+ from the anchor gate after the 4 sim-s drive-away, so the
+        // respawn jump always clears this.)
+        if (Math.hypot(pose.x - prev.x, pose.z - prev.z) > 8) {
+          jumpSimS = simS !== null ? simS - pinSimS : null;
           jumpSpeed = typeof sp === 'number' ? Math.abs(sp) : null;
           let best = Infinity;
           for (const g of kidsGates) best = Math.min(best, Math.hypot(g.x - pose.x, g.z - pose.z));
@@ -831,31 +880,35 @@ async function main() {
   }
   await A.evaluate(() => window.__kart.setInput(0, 0, 0, false));
   check(
-    'kids stuck auto-respawn: pinned nose-first with KIDS MODE on, the client auto-respawns to a gate within ~8s (teleport, speed reset)',
-    pinPos !== null && stuckAssistOn && jumpMs > 0 && jumpMs <= 8500 && jumpGateD !== null && jumpGateD <= 10 && jumpSpeed !== null && jumpSpeed < 10,
-    `pin=${pinPos !== null ? `(${pinPos.x.toFixed(1)},${pinPos.z.toFixed(1)})` : 'never pinned in 15s'} assist-on=${stuckAssistOn} ` +
-      `jump=${jumpMs > 0 ? `${(jumpMs / 1000).toFixed(1)}s after pin` : 'none in 12s'} gateDist=${jumpGateD !== null ? jumpGateD.toFixed(1) : '?'} ` +
+    'kids stuck auto-respawn: pinned nose-first with KIDS MODE on, the client auto-respawns to a gate within ~8 sim-s (teleport, speed reset)',
+    pinPos !== null && stuckAssistOn && jumpSimS !== null && jumpSimS <= 8 && jumpGateD !== null && jumpGateD <= 10 && jumpSpeed !== null && jumpSpeed < 10,
+    `pin=${pinPos !== null ? `(${pinPos.x.toFixed(1)},${pinPos.z.toFixed(1)})` : 'never pinned in 15 sim-s'} assist-on=${stuckAssistOn} ` +
+      `jump=${jumpSimS !== null ? `${jumpSimS.toFixed(1)} sim-s after pin` : 'none within 10 sim-s'} gateDist=${jumpGateD !== null ? jumpGateD.toFixed(1) : '?'} ` +
       `postSpeed=${jumpSpeed !== null ? jumpSpeed.toFixed(1) : '?'}`,
   );
 
   // -- kids wrong-way recovery (KIDS MODE hardening): facing + progress --------
   // Spun ~180° off the travel direction, a kid holding only throttle must be
-  // brought back by the assist: within ~10s the kart's facing returns to within
-  // ~30° of the track travel direction and the server-credited progress
-  // eventually increases (the pursuit then drives on to the next gate). The
-  // facing is measured two ways and the BEST is taken: yaw vs the NEAREST
-  // GATE's tangent (the frozen reference) and yaw vs the centerline tangent at
-  // the kart's nearest sample (the exact travel direction — what the client's
-  // recovery aligns to, drive.ts assistSteer). The gate tangent alone is an
-  // unsound yardstick inside a corner: gate 1's tangent drifts ~28° within
-  // 14m of travel (measured on the frozen track math), which would eat the
-  // whole 30° window. The spin is done by hand (assist OFF — it would own the
-  // steer channel): a forward full-lock circle from the verified anchor
-  // respawn (at ~5 m/s the speed-sensitive lock is wide, the loop fits the
-  // road, yaw climbs ~1.3 rad/s; steer -1 = LEFT = yaw increases), with a
-  // reverse-out (same rotation direction) if the barrier wedges the circle.
-  // Either recovery shape passes: a three-point-turn drive-out restores the
-  // facing on the spot, a wrong-way auto-respawn restores it at the anchor.
+  // brought back by the assist: within ~10 SIM seconds the kart's facing
+  // returns to within ~30° of the track travel direction and the server-
+  // credited progress eventually increases (the pursuit then drives on to the
+  // next gate). Sim time, not wall: the client's wrong-way timer (1.2 sim-s,
+  // drive.ts) and the rotation rate both run on stepped sim time, and the
+  // headless frame loop starves it below 20fps. The facing is measured two
+  // ways and the BEST is taken: yaw vs the NEAREST GATE's tangent (the frozen
+  // reference) and yaw vs the centerline tangent at the kart's nearest sample
+  // (the exact travel direction — what the client's recovery aligns to,
+  // drive.ts assistSteer). The gate tangent alone is an unsound yardstick
+  // inside a corner: gate 1's tangent drifts ~28° within 14m of travel
+  // (measured on the frozen track math), which would eat the whole 30°
+  // window. The spin is done by hand (assist OFF — it would own the steer
+  // channel): a SLOW forward full-lock circle from the verified anchor
+  // respawn (throttle 0.35 → ~3.5 m/s, lock ~0.5 rad → ~3m radius; the loop
+  // fits the 10m road even mid-corner — a faster circle sweeps the barrier
+  // at gate 1's bend and wedges), with a sim-timed reverse-out (same
+  // rotation direction) if it wedges anyway. Either recovery shape passes:
+  // a three-point-turn drive-out restores the facing on the spot, a wrong-
+  // way auto-respawn restores it at the anchor.
   await kidsAssistTo(false); // the spin is manual
   await kidsRespawn(); // standstill at the anchor gate, facing along travel
   const wwPose0 = telePose(await kartTelemetry(A));
@@ -863,49 +916,73 @@ async function main() {
   let spunDeg = null; // rotation actually reached (deg off the anchor yaw)
   if (anchorYaw !== null) {
     let bestDelta = 0;
-    let bestAt = Date.now();
+    let bestAtSim = null; // sim clock of the last rotation improvement
     let retries = 0;
-    const spinT0 = Date.now();
-    await A.evaluate(() => window.__kart.setInput(0.5, 0, -1, false)); // forward full-lock LEFT circle
-    while (Date.now() - spinT0 < 12000) {
-      const pose = telePose(await kartTelemetry(A));
-      if (pose !== null) {
+    const spinSim0 = teleSimS(await kartTelemetry(A));
+    const spinWall0 = Date.now();
+    // slow forward full-lock circle: at ~3.5 m/s the lock is ~0.5 rad → ~3m
+    // radius — the loop fits inside the 10m road even mid-corner (a faster
+    // circle's ~4m radius sweeps the barrier at gate 1's bend and wedges)
+    await A.evaluate(() => window.__kart.setInput(0.35, 0, -1, false));
+    while (Date.now() - spinWall0 < 150000) {
+      const t = await kartTelemetry(A);
+      const pose = telePose(t);
+      const simS = teleSimS(t);
+      if (simS !== null && spinSim0 !== null && simS - spinSim0 > 16) break; // 16 sim-s is plenty for ~180°
+      if (pose !== null && simS !== null) {
         const d = Math.abs(wrapPi(pose.yaw - anchorYaw));
-        if (d > bestDelta + 0.05) {
-          bestDelta = d;
-          bestAt = Date.now();
+        if (bestAtSim === null || d > bestDelta + 0.05) {
+          bestDelta = Math.max(bestDelta, d);
+          bestAtSim = simS;
         }
         if (d >= Math.PI - 0.35) break; // ~160°+ off — squarely wrong-way
-        if (Date.now() - bestAt > 2500 && retries < 4) {
-          retries++; // wedged mid-circle: reverse out (in reverse +1 swings the nose LEFT too)
+        if (simS - bestAtSim > 2.5 && retries < 4) {
+          retries++; // wedged mid-circle: reverse out (in reverse +1 swings the nose LEFT too).
+          // The pulse is SIM time too — a wall pulse barely moves a starved sim.
+          const pulseSim0 = simS;
           await A.evaluate(() => window.__kart.setInput(0, 1, 1, false));
-          await sleep(1200);
-          await A.evaluate(() => window.__kart.setInput(0.5, 0, -1, false));
-          bestAt = Date.now();
+          const pulseWall0 = Date.now();
+          while (Date.now() - pulseWall0 < 6000) {
+            const ps = teleSimS(await kartTelemetry(A));
+            if (ps !== null && ps - pulseSim0 >= 1.2) break;
+            await sleep(150);
+          }
+          await A.evaluate(() => window.__kart.setInput(0.35, 0, -1, false));
+          bestAtSim = teleSimS(await kartTelemetry(A)) ?? simS;
         }
       }
       await sleep(120);
     }
-    await A.evaluate(() => window.__kart.setInput(0, 1, 0, false)); // brake to a stop...
-    await sleep(800);
+    await A.evaluate(() => window.__kart.setInput(0, 1, 0, false)); // brake to a stop (sim pulse)
+    const brakeSim0 = teleSimS(await kartTelemetry(A));
+    const brakeWall0 = Date.now();
+    while (Date.now() - brakeWall0 < 6000) {
+      const bs = teleSimS(await kartTelemetry(A));
+      if (bs !== null && brakeSim0 !== null && bs - brakeSim0 >= 0.6) break;
+      await sleep(150);
+    }
     await A.evaluate(() => window.__kart.setInput(0, 0, 0, false));
     spunDeg = (bestDelta * 180) / Math.PI;
   }
-  // assist ON, throttle only: facing must come back within ~10s; progress must
-  // eventually increase (cap the whole drive at 35s)
+  // assist ON, throttle only: facing must come back within ~10 SIM seconds
+  // (the client's wrong-way timer, 1.2 sim-s, runs on stepped sim time);
+  // progress must eventually increase (cap the whole drive at 35 sim-s)
   const wwBaseline = ownRaceFields(await kartState(A)).progress;
   let wwAssistOn = false;
-  let facingMs = 0; // ms from assist-on when facing first <= 30° (0 = never)
+  let facingSimS = null; // sim-s from assist-on when facing first <= 30° (null = never)
   let facingBestDeg = null; // best min(gate, centerline) reading seen
   let facingBestGateDeg = null; // best gate-tangent-only reading (diagnostics)
   let progressUp = false;
   if (spunDeg !== null && spunDeg >= 150) {
     wwAssistOn = await kidsAssistTo(true);
-    const wwT0 = Date.now();
-    while (Date.now() - wwT0 < 35000 && !(facingMs > 0 && progressUp)) {
+    const wwSim0 = teleSimS(await kartTelemetry(A));
+    const wwWall0 = Date.now();
+    while (Date.now() - wwWall0 < 120000 && !(facingSimS !== null && progressUp)) {
       await A.evaluate(() => window.__kart.setInput(1, 0, 0, false)); // throttle only
       const [s, t] = await Promise.all([kartState(A), kartTelemetry(A)]);
       const pose = telePose(t);
+      const simS = teleSimS(t);
+      if (simS !== null && wwSim0 !== null && simS - wwSim0 > 35) break; // 35 sim-s and not done: dead
       if (pose !== null) {
         let gD = Infinity;
         let gBest = kidsGates[0];
@@ -922,7 +999,7 @@ async function main() {
         const deg = Math.min(gateDeg, clDeg);
         if (facingBestDeg === null || deg < facingBestDeg) facingBestDeg = deg;
         if (facingBestGateDeg === null || gateDeg < facingBestGateDeg) facingBestGateDeg = gateDeg;
-        if (facingMs === 0 && deg <= 30) facingMs = Date.now() - wwT0;
+        if (facingSimS === null && deg <= 30 && simS !== null && wwSim0 !== null) facingSimS = simS - wwSim0;
       }
       const prog = ownRaceFields(s).progress;
       if (prog !== null && (wwBaseline === null ? prog > 0 : prog > wwBaseline)) progressUp = true;
@@ -932,10 +1009,10 @@ async function main() {
   await A.evaluate(() => window.__kart.setInput(0, 0, 0, false));
   const wwAssistOff = await kidsAssistTo(false); // MUST be off before the reload (localStorage persists)
   check(
-    'kids wrong-way recovery: spun ~180° with KIDS MODE on, throttle-only returns the facing to within ~30° of the track travel direction within ~10s and progress increases',
-    spunDeg !== null && spunDeg >= 150 && wwAssistOn && facingMs > 0 && facingMs <= 10500 && progressUp,
+    'kids wrong-way recovery: spun ~180° with KIDS MODE on, throttle-only returns the facing to within ~30° of the track travel direction within ~10 sim-s and progress increases',
+    spunDeg !== null && spunDeg >= 150 && wwAssistOn && facingSimS !== null && facingSimS <= 10.5 && progressUp,
     `spun=${spunDeg !== null ? `${spunDeg.toFixed(0)}°` : 'no pose'} assist-on=${wwAssistOn} ` +
-      `facing=${facingMs > 0 ? `<=30° at ${(facingMs / 1000).toFixed(1)}s` : `never (best min ${facingBestDeg !== null ? facingBestDeg.toFixed(0) : '?'}°, gate-only ${facingBestGateDeg !== null ? facingBestGateDeg.toFixed(0) : '?'}°)`} ` +
+      `facing=${facingSimS !== null ? `<=30° at ${facingSimS.toFixed(1)} sim-s` : `never (best min ${facingBestDeg !== null ? facingBestDeg.toFixed(0) : '?'}°, gate-only ${facingBestGateDeg !== null ? facingBestGateDeg.toFixed(0) : '?'}°)`} ` +
       `progress ${wwBaseline ?? '?'} -> ${progressUp ? 'up' : 'flat'}; assist off=${wwAssistOff}`,
   );
 
@@ -1078,6 +1155,25 @@ async function main() {
     `moved ${freezeMoved.toFixed(2)}m over ${(freezeSpanMs / 1000).toFixed(1)}s latched; phases [${[...freezePhases].join(', ')}]`,
   );
 
+  // -- park B off the racing line ------------------------------------------------
+  // B sits out the whole private-room tail on its grid slot — which is ON the
+  // start/finish straight the top-speed hunt laps at ~28 m/s, and the soft
+  // kart-kart repulsion (2*KART_RADIUS band) plus an occasional clip scrubs
+  // the peak. B spears right into the barrier ~2.5 sim-s downstream and parks
+  // there: ~3m+ off the mid-road pursuit line, outside the repulsion band.
+  // The pulse rides B's own packet clock (sim time), then B coasts to a stop.
+  await B.evaluate(() => window.__kart.setInput(1, 0, 0.8, false));
+  {
+    const bSim0 = teleSimS(await kartTelemetry(B));
+    const bWall0 = Date.now();
+    while (Date.now() - bWall0 < 15000) {
+      const bSim = teleSimS(await kartTelemetry(B));
+      if (bSim !== null && bSim0 !== null && bSim - bSim0 >= 2.5) break;
+      await sleep(200);
+    }
+  }
+  await B.evaluate(() => window.__kart.setInput(0, 0, 0, false));
+
   // -- drive: A full throttle; the streamed position must move > 10m ---------
   // Polled instead of a fixed sleep: the geared model cruises at ~7.7 m/s in
   // gear 1 (no fixed 3s window is guaranteed) and a software-rendered headless
@@ -1092,17 +1188,36 @@ async function main() {
   let aPos1 = null;
   let movedA = 0;
   const driveT0 = Date.now();
-  while (Date.now() - driveT0 < 10000) {
+  const launch = []; // [{wallS, simS, speed}] — sim-rate diagnostic series
+  while (Date.now() - driveT0 < 15000) {
     await sleep(500);
-    aPos1 = statePos(await kartState(A));
+    const [sDrive, tDrive] = await Promise.all([kartState(A), kartTelemetry(A)]);
+    aPos1 = statePos(sDrive);
     movedA = aPos1 !== null ? Math.hypot(aPos1[0] - aPos0[0], aPos1[2] - aPos0[2]) : 0;
+    const simS = teleSimS(tDrive);
+    const spd = tDrive !== null && tDrive.own !== null && typeof tDrive.own === 'object' ? tDrive.own.speedMps : null;
+    if (simS !== null && typeof spd === 'number') launch.push({ wallS: (Date.now() - driveT0) / 1000, simS, speed: spd });
     if (movedA > 10) break;
+  }
+  // sim-rate diagnostic (logged, never asserted): kart-sim seconds per wall
+  // second off the 15Hz packet clock, plus the sampled launch series (sim-s,
+  // speed) — the clean reference is the offline stepKart launch (1s:11, 2s:17,
+  // 3s:25); the grid launch here also fights B's parked-kart repulsion, so it
+  // reads low. The wall-clock windows below only mean something via this rate.
+  if (launch.length >= 2) {
+    const lf = launch[0];
+    const ll = launch[launch.length - 1];
+    const rate = ll.wallS > lf.wallS ? (ll.simS - lf.simS) / (ll.wallS - lf.wallS) : null;
+    console.log(
+      `sim-rate: ${rate !== null ? rate.toFixed(2) : '?'} kart-sim-s/wall-s over ${(ll.wallS - lf.wallS).toFixed(1)}s of full throttle ` +
+        `(launch series: ${launch.map((p) => `${p.simS.toFixed(1)}s→${p.speed.toFixed(1)}`).join(' ')} m/s)`,
+    );
   }
   const driveSecs = ((Date.now() - driveT0) / 1000).toFixed(1);
 
   const bSeesA1 = remoteByName(await kartTelemetry(B), 'Alice');
   check(
-    'A drives: setInput(1,0,0,false) moves the streamed kart > 10m (polled, up to 10s)',
+    'A drives: setInput(1,0,0,false) moves the streamed kart > 10m (polled, up to 15s)',
     aPos1 !== null && movedA > 10,
     `moved ${movedA.toFixed(1)}m in ~${driveSecs}s (${aPos0.map((v) => v.toFixed(1))} -> ${aPos1?.map((v) => v.toFixed(1))})`,
   );
@@ -1257,9 +1372,13 @@ async function main() {
   // credited gate (standstill on the centerline, facing along travel) — the
   // post-guided kart is at 15+ m/s in an unknown spot, and at geared-model
   // speeds a 1s full-lock turn carries it into the barrier (a nose-in kart
-  // wedges: zero speed => zero yaw rate). Launch to ~7 m/s (tight, slow turns
-  // stay clear of the walls), then steer each way for 0.7s at light throttle.
-  // Deltas are wrapPi'd so a heading crossing ±PI still reads right.
+  // wedges: zero speed => zero yaw rate). Launch to ~7 m/s, then steer each
+  // way at light throttle — cutting the pulse as soon as |Δyaw| hits 0.35 rad
+  // (~2.5m of arc at 8 m/s, well clear of the walls). A full 0.7 sim-s pulse
+  // carries the kart into gate 1's inside barrier, and the bounce-back makes
+  // it REVERSE through the second pulse — where the yaw response flips and
+  // the sign reads backwards. Deltas are wrapPi'd so a heading crossing ±PI
+  // still reads right.
   await A.keyboard.press('KeyR'); // client respawn (drive.ts onKeyDown)
   await sleep(400);
   await A.evaluate(() => window.__kart.setInput(1, 0, 0, false));
@@ -1269,20 +1388,36 @@ async function main() {
       const t = await kartTelemetry(A);
       const sp = t !== null && t.own !== null && typeof t.own === 'object' ? t.own.speedMps : null;
       return typeof sp === 'number' && sp >= 7 ? sp : null;
-    }, 5000, 'A reaches 7 m/s after respawn');
+    }, 10000, 'A reaches 7 m/s after respawn');
   } catch {
-    console.log('A/D: 7 m/s entry not reached in 5s — measuring anyway');
+    console.log('A/D: 7 m/s entry not reached in 10s — measuring anyway');
   }
-  const adYaw0 = telePose(await kartTelemetry(A))?.yaw ?? null;
-  await A.evaluate(() => window.__kart.setInput(0.3, 0, -1, false)); // A — expect LEFT
-  await sleep(700);
-  const adYaw1 = telePose(await kartTelemetry(A))?.yaw ?? null;
-  await A.evaluate(() => window.__kart.setInput(0.3, 0, 1, false)); // D — expect RIGHT
-  await sleep(700);
-  const adYaw2 = telePose(await kartTelemetry(A))?.yaw ?? null;
+  // steer at light throttle until |Δyaw| >= 0.35 in the expected direction
+  // (0.8 sim-s cap), then return the yaw — the early cut keeps the arc off
+  // the barrier, so the measurement is the clean forward-steer response.
+  const steerPulse = async (steer, expectSign) => {
+    const t0 = await kartTelemetry(A);
+    const yaw0 = telePose(t0)?.yaw ?? null;
+    const sim0 = teleSimS(t0);
+    await A.evaluate((st2) => window.__kart.setInput(0.3, 0, st2, false), steer);
+    let yaw = yaw0;
+    const wall0 = Date.now();
+    while (Date.now() - wall0 < 6000) {
+      await sleep(120);
+      const t = await kartTelemetry(A);
+      const y = telePose(t)?.yaw ?? null;
+      const simS = teleSimS(t);
+      if (y !== null) yaw = y;
+      if (yaw0 !== null && y !== null && wrapPi(y - yaw0) * expectSign >= 0.35) break;
+      if (simS !== null && sim0 !== null && simS - sim0 >= 0.8) break;
+    }
+    return { yaw0, yaw };
+  };
+  const adL = await steerPulse(-1, 1); // A — expect LEFT (yaw increases)
+  const adR = await steerPulse(1, -1); // D — expect RIGHT (yaw decreases)
   await A.evaluate(() => window.__kart.setInput(0, 0, 0, false));
-  const dLeft = adYaw0 !== null && adYaw1 !== null ? wrapPi(adYaw1 - adYaw0) : null;
-  const dRight = adYaw1 !== null && adYaw2 !== null ? wrapPi(adYaw2 - adYaw1) : null;
+  const dLeft = adL.yaw0 !== null && adL.yaw !== null ? wrapPi(adL.yaw - adL.yaw0) : null;
+  const dRight = adL.yaw !== null && adR.yaw !== null ? wrapPi(adR.yaw - adL.yaw) : null;
   check(
     'A/D direction: steer -1 turns LEFT (yaw increases), steer +1 turns RIGHT (yaw decreases)',
     dLeft !== null && dLeft > 0.15 && dRight !== null && dRight < -0.15,
@@ -1330,9 +1465,15 @@ async function main() {
   let gearSrc = 'none';
   let maxSpeed = 0;
   const gearT0 = Date.now();
+  const gearSim0 = teleSimS(await kartTelemetry(A));
+  let gearElapsed = 0;
   let lastGearLog = 0;
-  while (Date.now() - gearT0 < 8000) {
+  // the window is SIM time: the box upshifts on sim speed, so a wall window
+  // starves the climb below 20fps (offline reference: gear 3 at ~1.8 sim-s)
+  while (Date.now() - gearT0 < 30000 && gearElapsed < 8) {
     const [s, t] = await Promise.all([kartState(A), kartTelemetry(A)]);
+    const gSim = teleSimS(t);
+    gearElapsed = gSim !== null && gearSim0 !== null ? gSim - gearSim0 : (Date.now() - gearT0) / 1000;
     const ownSp = t !== null && t.own !== null && typeof t.own === 'object' ? t.own.speedMps : null;
     const stSp = s !== null && typeof s.speed === 'number' ? s.speed : null;
     const sp = typeof ownSp === 'number' ? Math.abs(ownSp) : typeof stSp === 'number' ? Math.abs(stSp) : null;
@@ -1368,7 +1509,7 @@ async function main() {
       const own = t !== null && t.own !== null && typeof t.own === 'object' ? t.own : null;
       const inp = t !== null && t.input !== null && typeof t.input === 'object' ? t.input : null;
       console.log(
-        `gears t=${((now - gearT0) / 1000).toFixed(1)}s phase=${s !== null ? s.phase : '?'} ` +
+        `gears sim-t=${gearElapsed.toFixed(1)}s phase=${s !== null ? s.phase : '?'} ` +
           `pos=(${own !== null && typeof own.x === 'number' ? own.x.toFixed(1) : '?'},${own !== null && typeof own.z === 'number' ? own.z.toFixed(1) : '?'}) ` +
           `spd=${sp !== null ? sp.toFixed(1) : '?'} gear=${g ?? '?'} ` +
           `input=${inp !== null ? `thr=${inp.throttle} brk=${inp.brake} str=${inp.steer} drift=${inp.drift}` : '?'}`,
@@ -1388,7 +1529,7 @@ async function main() {
   check(
     'gears: full throttle from standstill reaches gear >= 3 and climbs past gear-1 top (12 m/s)',
     gearsOk,
-    `maxGear=${maxGear} (${gearSrc}) maxSpeed=${maxSpeed.toFixed(1)} m/s over ~8s`,
+    `maxGear=${maxGear} (${gearSrc}) maxSpeed=${maxSpeed.toFixed(1)} m/s over ~${gearElapsed.toFixed(1)} sim-s`,
   );
 
   // -- nitro: 3 charges, a real boost, then empty ---------------------------------
@@ -1400,10 +1541,13 @@ async function main() {
   // by an A/B pair of identical full-throttle launches from the same
   // R-respawn anchor (each respawn verified at a standstill — a swallowed R
   // under load must not hand one run a rolling start; centerline pursuit
-  // both runs, same 2.5s window): the boosted run's top speed must beat the
-  // no-boost top at the same throttle.
-  // A same-window A/B is sim-rate-proof: a slow software client slows both
-  // runs equally. Charge counts are read between presses while coasting.
+  // both runs, same 2.0 SIM-second window — the boost lasts NITRO_TIME sim-s,
+  // so a wall-clock window would compare unequal slices under a starved sim;
+  // 2.0 sim-s is where the margin PEAKS: the 1.5 sim-s boost has just ended
+  // while the no-boost kart hasn't caught up — offline stepKart reference
+  // 18.0 vs 25.0 m/s, margin 7.0; it narrows to ~3.6 by 2.5 sim-s): the
+  // boosted run's top speed must beat the no-boost top at the same throttle.
+  // Charge counts are read between presses while coasting.
   const readNitroLeft = async () => ownNitroLeft(await kartState(A));
   // Last observed charge count, waiting up to timeoutMs for `expected`
   // (0 is a valid reading, so waitFor's truthy test can't return the number).
@@ -1419,14 +1563,19 @@ async function main() {
     }
     return seen;
   };
-  // Full-throttle centerline pursuit for windowMs; returns the top speed seen.
-  const launchRun = async (windowMs) => {
+  // Full-throttle centerline pursuit for simS of SIM time (the boost lasts
+  // NITRO_TIME sim-s; a wall window under a starved sim compares unequal
+  // slices of the two runs). Wall-capped as a safety net.
+  const launchRun = async (simS) => {
     let top = 0;
     const t0 = Date.now();
-    while (Date.now() - t0 < windowMs) {
+    const sim0 = teleSimS(await kartTelemetry(A));
+    while (Date.now() - t0 < simS * 4000 + 10000) {
       const t = await kartTelemetry(A);
       const sp = t !== null && t.own !== null && typeof t.own === 'object' ? t.own.speedMps : null;
       if (typeof sp === 'number') top = Math.max(top, sp);
+      const simNow = teleSimS(t);
+      if (simNow !== null && sim0 !== null && simNow - sim0 >= simS) break;
       const pose = telePose(t);
       if (pose !== null) {
         const ci = nearestIndex(track.centerline, pose.x, pose.z);
@@ -1451,7 +1600,7 @@ async function main() {
           const t = await kartTelemetry(A);
           const sp = t !== null && t.own !== null && typeof t.own === 'object' ? t.own.speedMps : null;
           return typeof sp === 'number' && Math.abs(sp) < 0.5 ? true : null;
-        }, 2000, 'A parked at the respawn anchor');
+        }, 4000, 'A parked at the respawn anchor');
         return;
       } catch {
         if (attempt === 1) console.log('nitro: standstill not confirmed after 2 R presses — launching anyway');
@@ -1459,20 +1608,20 @@ async function main() {
     }
   };
 
-  const nitroStart = await awaitNitroLeft(3, 5000); // charges refilled at GO
+  const nitroStart = await awaitNitroLeft(3, 8000); // charges refilled at GO
   await respawnParked();
   await A.evaluate(() => window.__kart.setInput(1, 0, 0, false));
-  const noBoostTop = await launchRun(2500);
+  const noBoostTop = await launchRun(2.0); // 2.0 SIM seconds — margin peaks here
   await respawnParked(); // same anchor + standstill — the boosted run's twin
   await A.evaluate(() => window.__kart.setInput(1, 0, 0, false));
   await A.keyboard.press('KeyN'); // charge 1: boost from the line
-  const boostTop = await launchRun(2500);
-  const nitroAfter1 = await awaitNitroLeft(2, 4000);
+  const boostTop = await launchRun(2.0);
+  const nitroAfter1 = await awaitNitroLeft(2, 8000);
   await A.evaluate(() => window.__kart.setInput(0, 0, 0, false)); // coast for the count checks
   await A.keyboard.press('KeyN'); // charge 2
-  const nitroAfter2 = await awaitNitroLeft(1, 4000);
+  const nitroAfter2 = await awaitNitroLeft(1, 8000);
   await A.keyboard.press('KeyN'); // charge 3
-  const nitroAfter3 = await awaitNitroLeft(0, 4000);
+  const nitroAfter3 = await awaitNitroLeft(0, 8000);
   await A.keyboard.press('KeyN'); // 4th press: no charge left => silently ignored
   await sleep(800);
   const nitroAfter4 = await readNitroLeft();
@@ -1485,7 +1634,7 @@ async function main() {
       nitroAfter4 === 0 &&
       boostTop > noBoostTop + 3,
     `charges ${nitroStart} -> ${nitroAfter1} -> ${nitroAfter2} -> ${nitroAfter3}, 4th press -> ${nitroAfter4}; ` +
-      `top speed no-boost ${noBoostTop.toFixed(1)} vs boosted ${boostTop.toFixed(1)} m/s (2.5s full-throttle A/B)`,
+      `top speed no-boost ${noBoostTop.toFixed(1)} vs boosted ${boostTop.toFixed(1)} m/s (2.0 sim-s full-throttle A/B; offline reference 18.0 vs 25.0)`,
   );
 
   // -- gear stability + top speed: ~20s of centerline pursuit ------------------
@@ -1502,9 +1651,9 @@ async function main() {
   // the straights, modulated by heading error + bend ahead into the turns) —
   // raw full throttle spears the barrier on the right-side S-bends and the
   // reverse-out cannot free a kart grinding nose-first along the wall.
-  const STAB_WINDOW_MS = 20000; // gear-sampling window (2Hz)
+  const STAB_WINDOW_SIM_S = 20; // gear-sampling window in SIM seconds
   const TOP_SPEED_FLOOR = 28; // m/s — spec floor: > 30 ideal, >= 28 headless
-  const STAB_BUDGET_MS = 45000; // hard cap for the window + the top-speed hunt
+  const STAB_BUDGET_SIM_S = 45; // sim-s cap for the window + the top-speed hunt
   await respawnParked(); // verified standstill at the last credited gate
   await A.evaluate(() => window.__kart.setInput(1, 0, 0, false));
   const gearSeq = []; // 2Hz gear samples; null = unreadable that tick
@@ -1516,11 +1665,20 @@ async function main() {
   let stabTick = 0;
   let lastStabLog = 0;
   const stabT0 = Date.now();
-  while (Date.now() - stabT0 < STAB_BUDGET_MS) {
+  const stabSim0 = teleSimS(await kartTelemetry(A));
+  let stabSimElapsed = 0; // last observed sim-s since the run start (for the detail line)
+  // The budgets are SIM time: reaching 28 m/s needs ~5 clean sim-s on a
+  // straight (offline stepKart reference), and the box's oscillation signature
+  // lives in sim time — a wall budget starves both below 20fps.
+  while (Date.now() - stabT0 < 240000) {
     const now = Date.now();
-    const inWindow = now - stabT0 < STAB_WINDOW_MS;
-    if (!inWindow && stabTopSpeed >= TOP_SPEED_FLOOR) break; // both proofs in hand
     const [s, t] = await Promise.all([kartState(A), kartTelemetry(A)]);
+    const simNow = teleSimS(t);
+    const simElapsed = simNow !== null && stabSim0 !== null ? simNow - stabSim0 : (now - stabT0) / 1000;
+    stabSimElapsed = simElapsed;
+    if (simElapsed > STAB_BUDGET_SIM_S) break;
+    const inWindow = simElapsed <= STAB_WINDOW_SIM_S;
+    if (!inWindow && stabTopSpeed >= TOP_SPEED_FLOOR) break; // both proofs in hand
     const own = t !== null && t.own !== null && typeof t.own === 'object' ? t.own : null;
     const ownSp = own !== null && typeof own.speedMps === 'number' ? Math.abs(own.speedMps) : null;
     if (ownSp !== null) stabTopSpeed = Math.max(stabTopSpeed, ownSp);
@@ -1548,7 +1706,7 @@ async function main() {
         Math.hypot(pose.x - stabTrail[0].x, pose.z - stabTrail[0].z) < 1;
       if (stalled) {
         console.log(
-          `stability t=${((now - stabT0) / 1000).toFixed(0)}s STALLED at (${pose.x.toFixed(1)},${pose.z.toFixed(1)}) — reverse-out`,
+          `stability sim-t=${simElapsed.toFixed(1)}s STALLED at (${pose.x.toFixed(1)},${pose.z.toFixed(1)}) — reverse-out`,
         );
         stabRecoverPhase = 1;
         stabRecoverUntil = now + 1300;
@@ -1578,7 +1736,7 @@ async function main() {
     if (now - lastStabLog >= 2000) {
       lastStabLog = now;
       console.log(
-        `stability t=${((now - stabT0) / 1000).toFixed(0)}s spd=${ownSp !== null ? ownSp.toFixed(1) : '?'} ` +
+        `stability sim-t=${simElapsed.toFixed(1)}s spd=${ownSp !== null ? ownSp.toFixed(1) : '?'} ` +
           `gear=${gearSeq.length > 0 ? gearSeq[gearSeq.length - 1] : '?'} top=${stabTopSpeed.toFixed(1)}`,
       );
     }
@@ -1588,14 +1746,14 @@ async function main() {
   await A.evaluate(() => window.__kart.setInput(0, 0, 0, false));
   const oscReps = gearOscillationReps(gearSeq);
   check(
-    'gear stability: ~20s at 2Hz shows no (g,g-1,g) oscillation x3+ and reaches gear >= 3',
+    'gear stability: ~20 sim-s at 2Hz shows no (g,g-1,g) oscillation x3+ and reaches gear >= 3',
     oscReps < 3 && stabMaxGear >= 3,
     `samples=${gearSeq.length} maxOscReps=${oscReps} maxGear=${stabMaxGear} seq=[${gearSeq.map((g) => (g === null ? '?' : g)).join(',')}]`,
   );
   check(
     `top speed: >= ${TOP_SPEED_FLOOR} m/s observed on a straight (TOP_SPEED 36 floored for headless)`,
     stabTopSpeed >= TOP_SPEED_FLOOR,
-    `max observed ${stabTopSpeed.toFixed(1)} m/s over ${((Date.now() - stabT0) / 1000).toFixed(0)}s of centerline pursuit`,
+    `max observed ${stabTopSpeed.toFixed(1)} m/s over ${stabSimElapsed.toFixed(1)} sim-s of centerline pursuit (budget ${STAB_BUDGET_SIM_S} sim-s)`,
   );
 
   // -- error surface --------------------------------------------------------------------------

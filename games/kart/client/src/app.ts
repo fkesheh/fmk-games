@@ -4,7 +4,9 @@
 // game:'kart'; the room list is filtered to it). Race protocol + tuning come
 // from the frozen @kart/shared contract. Driving (./drive.js), rendering
 // (./render.js) and sound (./audio.js) are separate frozen modules — this
-// file codes against their frozen signatures only (docs/KART.md).
+// file codes against their frozen signatures only (docs/KART.md). Juice
+// (skid marks / smoke / dust / sparks / nitro trail / speed lines) lives in
+// ./fx.js — pooled and zero-alloc; this file only feeds it sim facts.
 //
 // Net model: the kart is simulated LOCALLY — drive.ts wraps shared stepKart,
 // owns the keyboard (WASD/arrows/Space, R = respawn) and paces the 15Hz
@@ -25,6 +27,7 @@ import {
   engineRevs,
   forwardSpeed,
   gridSlot,
+  surfaceAt,
 } from '@kart/shared';
 import type {
   KartC2S,
@@ -42,6 +45,7 @@ import type { LobbyC2S, RoomInfo } from '@platform/shared';
 import { KartScene } from './render.js';
 import { DriveController } from './drive.js';
 import { KartAudio } from './audio.js';
+import { KartFx } from './fx.js';
 
 // ---- wire parsing (mirror of the platform style: invalid => null, never throw) ----
 type LobbyMsg =
@@ -339,8 +343,21 @@ const GO_FLASH_MS = 900; // how long the big GO! stays up
 const HINT_HOLD_MS = 5000; // controls hint card stays fully up this long after GO…
 const HINT_FADE_MS = 1000; // …then fades out (gone at ~6s, per docs/KART.md)
 const MSG_MS = 2600; // transient center message lifetime
-const SKID_EVERY_MS = 450; // retrigger cadence for the skid loop while drifting
 const THUD_DROP = 4; // m/s of forward speed lost in one frame => barrier thud
+// ---- fx emit pacing (fx.ts pools; distances in m, rates in s) -----------------
+const SKID_MARK_EVERY = 0.5; // per-wheel mark spacing (fx pool covers ~32m of trail)
+const SKID_MIN_SPEED = 3; // no marks while crawling
+const BRAKE_SKID_DECEL = 14; // m/s² — hard braking lays marks too (BRAKE is 24)
+const BRAKE_SKID_MIN_SPEED = 8; // ...only at real speed
+const SMOKE_EVERY_S = 0.045; // drift smoke cadence — discrete puffs with gaps
+const DUST_EVERY_S = 0.045; // grass dust cadence
+const DUST_MIN_SPEED = 6;
+const TRAIL_EVERY_S = 0.03; // nitro streak cadence
+const WHEEL_REAR = 0.78; // rear axle offset behind the kart origin (kartMesh)
+const WHEEL_HALF = 0.66; // half track width (kartMesh wheel spots)
+const NOSE_AHEAD = 1.4; // spark burst point ahead of the kart origin
+const MINIMAP_EVERY_MS = 250; // 4Hz minimap redraw
+const MINIMAP_SIZE = 140; // css px (2x backing store for retina)
 const NAME_MAX = 16; // lobby cleanName cap (platform protocol)
 const CODE_MAX = 8;
 const KIDS_KEY = 'kart.kids'; // localStorage key for the KIDS MODE assist toggle
@@ -374,6 +391,18 @@ interface RemoteVisual {
   steer: number;
   drift: boolean;
   nitroActive: boolean;
+}
+
+/** Per-remote fx bookkeeping: last laid skid-mark position per rear wheel + emit clocks. */
+interface RemoteFxState {
+  lx: number;
+  lz: number;
+  rx: number;
+  rz: number;
+  init: boolean;
+  smokeAcc: number;
+  trailAcc: number;
+  side: boolean; // smoke/dust puff wheel alternation
 }
 
 function el<K extends keyof HTMLElementTagNameMap>(
@@ -412,6 +441,14 @@ function fmtMs(ms: number): string {
   const ss = String(s).padStart(2, '0');
   const tail = String(mmm).padStart(3, '0');
   return `${m}:${ss}.${tail}`;
+}
+
+/** English ordinal suffix for a 1-based place (grid is ≤ 8, no 11/12/13 case). */
+function ordinalSuffix(place: number): string {
+  if (place === 1) return 'st';
+  if (place === 2) return 'nd';
+  if (place === 3) return 'rd';
+  return 'th';
 }
 
 /** Shortest-arc lerp for wrapped radians (same as the fps interp). */
@@ -520,11 +557,22 @@ export class KartApp {
   private lastLapMs = -1; // our last completed lap (from 'lap' events)
   private frozenLapMs = -1; // lap-time value frozen at our finish
   private wasFinished = false;
-  private prevDrifting = false; // audio edges
   private prevSpeed = 0;
-  private lastSkidAt = 0;
   private lastFrame = 0;
   private assist = false; // KIDS MODE auto-steer (docs/KART.md) — mirrored to localStorage 'kart.kids'
+
+  // ---- fx (./fx.js pools) + minimap ------------------------------------------------
+  private readonly fx: KartFx;
+  private readonly ownFx: RemoteFxState = {
+    lx: 0, lz: 0, rx: 0, rz: 0, init: false, smokeAcc: 0, trailAcc: 0, side: false,
+  };
+  private dustAcc = 0;
+  private readonly remoteFx = new Map<string, RemoteFxState>();
+  private minimapNextAt = 0; // performance.now() of the next 4Hz redraw
+  private readonly mapPath: Path2D; // track outline, precomputed once
+  private readonly mapScale: number; // world -> map px: mx = (x + mapOffX) * mapScale
+  private readonly mapOffX: number;
+  private readonly mapOffZ: number;
 
   // ---- DOM handles (built once in the constructor, updated in place) ----------------
   private readonly menuEl: HTMLDivElement;
@@ -537,8 +585,11 @@ export class KartApp {
   private readonly raceEl: HTMLDivElement;
   private readonly canvas: HTMLCanvasElement;
   private readonly hudEl: HTMLDivElement;
-  private readonly placeEl: HTMLDivElement;
-  private readonly kidsBadgeEl: HTMLDivElement; // small 'KIDS' badge next to the place readout
+  private readonly placeNumEl: HTMLSpanElement; // big ordinal numeral ('2')
+  private readonly placeSufEl: HTMLSpanElement; // ordinal suffix ('nd')
+  private readonly placeTotalEl: HTMLSpanElement; // '/N' field size
+  private readonly placeGapEl: HTMLDivElement; // '+1.8s' / 'LEADER'
+  private readonly kidsBadgeEl: HTMLDivElement; // small 'KIDS' badge in the position chip
   private readonly lapEl: HTMLDivElement;
   private readonly speedNumEl: HTMLSpanElement;
   private readonly gearEl: HTMLSpanElement;
@@ -546,7 +597,12 @@ export class KartApp {
   private readonly bestEl: HTMLSpanElement;
   private readonly nitroEl: HTMLDivElement;
   private readonly nitroPips: HTMLSpanElement[] = []; // NITRO_CHARGES pips, dim when spent
+  private prevNitroPips = NITRO_CHARGES; // spend-edge detection for the pip flash
+  private lastSurface: 'asphalt' | 'grass' = 'asphalt'; // from updateFx, for the skid sfx
+  private readonly minimapEl: HTMLCanvasElement;
+  private readonly gateWrapEl: HTMLDivElement;
   private readonly gateEl: HTMLDivElement;
+  private readonly gateLabelEl: HTMLDivElement;
   private readonly lobbyEl: HTMLDivElement;
   private readonly lobbyPlayersEl: HTMLDivElement;
   private readonly lobbyStatusEl: HTMLDivElement;
@@ -623,42 +679,49 @@ export class KartApp {
     raceTop.appendChild(leaveBtn);
     this.raceEl.appendChild(raceTop);
 
-    // HUD: place + gap + lap (top-left), speed (top-right), times (bottom-left),
-    // nitro pips (bottom-right), next-gate chevron (top-center)
+    // HUD: compact position chip + lap chip (top-left), gear/speed + minimap
+    // (top-right), times (bottom-left), nitro pips (bottom-right), next-gate
+    // chevron (top-center)
     this.hudEl = el('div', 'hud hidden');
     const hudLeft = el('div', 'hud-left');
-    this.placeEl = el('div', 'hud-place', 'P—');
-    hudLeft.appendChild(this.placeEl);
-    // KIDS badge: small, next to the place readout (inline styles: style.css is another owner's file)
+    const pos = el('div', 'hud-pos');
+    const posMain = el('div', 'hud-pos-main');
+    this.placeNumEl = el('span', 'hud-pos-num', '—');
+    this.placeSufEl = el('span', 'hud-pos-suf', '');
+    posMain.appendChild(this.placeNumEl);
+    posMain.appendChild(this.placeSufEl);
+    this.placeTotalEl = el('span', 'hud-pos-total', '');
+    posMain.appendChild(this.placeTotalEl);
+    pos.appendChild(posMain);
+    this.placeGapEl = el('div', 'hud-pos-gap', '');
+    pos.appendChild(this.placeGapEl);
+    // KIDS badge: small, inside the position chip
     this.kidsBadgeEl = el('div', 'hud-kids hidden', 'KIDS');
-    this.kidsBadgeEl.style.marginTop = '4px';
-    this.kidsBadgeEl.style.width = 'fit-content';
-    this.kidsBadgeEl.style.padding = '2px 6px';
-    this.kidsBadgeEl.style.borderRadius = '4px';
-    this.kidsBadgeEl.style.background = 'var(--gold)';
-    this.kidsBadgeEl.style.color = 'var(--ink)';
-    this.kidsBadgeEl.style.fontSize = '11px';
-    this.kidsBadgeEl.style.fontWeight = '800';
-    this.kidsBadgeEl.style.letterSpacing = '0.12em';
-    hudLeft.appendChild(this.kidsBadgeEl);
+    pos.appendChild(this.kidsBadgeEl);
+    hudLeft.appendChild(pos);
     this.lapEl = el('div', 'hud-lap', `LAP 1/${LAPS_TO_WIN}`);
     hudLeft.appendChild(this.lapEl);
     this.hudEl.appendChild(hudLeft);
 
     const hudRight = el('div', 'hud-right');
     const speed = el('div', 'hud-speed');
-    // gear readout next to the speed — inline styles: style.css is another owner's file
+    // gear stacked ABOVE the speed — adjacent big numerals kerned into one read
+    const gearRow = el('div', 'hud-gear-row');
+    gearRow.appendChild(el('span', 'hud-gear-label', 'GEAR'));
     this.gearEl = el('span', 'hud-gear', '1');
-    this.gearEl.style.fontSize = 'clamp(28px, 4.5vw, 44px)';
-    this.gearEl.style.fontWeight = '800';
-    this.gearEl.style.fontVariantNumeric = 'tabular-nums';
-    this.gearEl.style.color = 'var(--gold)';
-    this.gearEl.style.marginRight = '10px';
-    speed.appendChild(this.gearEl);
+    gearRow.appendChild(this.gearEl);
+    speed.appendChild(gearRow);
+    const speedRow = el('div', 'hud-speed-row');
     this.speedNumEl = el('span', 'hud-speed-num', '0');
-    speed.appendChild(this.speedNumEl);
-    speed.appendChild(el('span', 'hud-speed-unit', 'km/h'));
+    speedRow.appendChild(this.speedNumEl);
+    speedRow.appendChild(el('span', 'hud-speed-unit', 'km/h'));
+    speed.appendChild(speedRow);
     hudRight.appendChild(speed);
+    // minimap: track outline + live player dots, redrawn at 4Hz (MINIMAP_EVERY_MS)
+    this.minimapEl = el('canvas', 'hud-minimap');
+    this.minimapEl.width = MINIMAP_SIZE * 2; // 2x backing store — crisp on retina
+    this.minimapEl.height = MINIMAP_SIZE * 2;
+    hudRight.appendChild(this.minimapEl);
     this.hudEl.appendChild(hudRight);
 
     const hudTimes = el('div', 'hud-times');
@@ -674,36 +737,25 @@ export class KartApp {
     hudTimes.appendChild(bestRow);
     this.hudEl.appendChild(hudTimes);
 
-    // nitro pips: NITRO_CHARGES small charges at the bottom-right, dim when spent.
-    // Inline styles: style.css is another owner's file (the hud-turbo-label class exists).
+    // nitro pips: NITRO_CHARGES small charges at the bottom-right, dim when spent
     this.nitroEl = el('div', 'hud-nitro');
-    this.nitroEl.style.position = 'absolute';
-    this.nitroEl.style.right = '16px';
-    this.nitroEl.style.bottom = '16px';
-    this.nitroEl.style.display = 'flex';
-    this.nitroEl.style.flexDirection = 'column';
-    this.nitroEl.style.alignItems = 'flex-end';
-    this.nitroEl.style.gap = '6px';
     this.nitroEl.appendChild(el('div', 'hud-turbo-label', 'NITRO'));
-    const pipRow = el('div');
-    pipRow.style.display = 'flex';
-    pipRow.style.gap = '6px';
+    const pipRow = el('div', 'hud-nitro-pips');
     for (let i = 0; i < NITRO_CHARGES; i++) {
       const pip = el('span', 'hud-nitro-pip');
-      pip.style.width = '22px';
-      pip.style.height = '10px';
-      pip.style.borderRadius = '5px';
-      pip.style.border = '1px solid var(--asphalt)';
-      pip.style.background = 'var(--gold)';
-      pip.style.transition = 'opacity 120ms linear';
       this.nitroPips.push(pip);
       pipRow.appendChild(pip);
     }
     this.nitroEl.appendChild(pipRow);
     this.hudEl.appendChild(this.nitroEl);
 
-    this.gateEl = el('div', 'hud-gate hidden');
-    this.hudEl.appendChild(this.gateEl);
+    // next-gate marker: rotating chevron + distance label in one chip-family wrap
+    this.gateWrapEl = el('div', 'hud-gate-wrap hidden');
+    this.gateEl = el('div', 'hud-gate');
+    this.gateWrapEl.appendChild(this.gateEl);
+    this.gateLabelEl = el('div', 'hud-gate-label', '');
+    this.gateWrapEl.appendChild(this.gateLabelEl);
+    this.hudEl.appendChild(this.gateWrapEl);
     this.raceEl.appendChild(this.hudEl);
 
     // lobby overlay: the grid (player list) + phase status
@@ -719,29 +771,12 @@ export class KartApp {
     this.raceEl.appendChild(this.lobbyEl);
 
     // controls hint card (docs/KART.md "Onboarding hints"): non-modal, bottom-center;
-    // up pre-GO, holds ~5s after GO, then fades. Inline styles: style.css is another
-    // owner's file — the HUD idiom (cream on translucent ink, asphalt border).
+    // up pre-GO, holds ~5s after GO, then fades.
     this.hintEl = el(
       'div',
       'hint-card',
       `WASD/arrows drive · Space/Shift drift · N nitro ×${NITRO_CHARGES} · R respawn at last gate`,
     );
-    this.hintEl.style.position = 'absolute';
-    this.hintEl.style.left = '50%';
-    this.hintEl.style.bottom = '16px';
-    this.hintEl.style.transform = 'translateX(-50%)';
-    this.hintEl.style.maxWidth = '92vw';
-    this.hintEl.style.padding = '8px 16px';
-    this.hintEl.style.border = '1px solid var(--asphalt)';
-    this.hintEl.style.borderRadius = '8px';
-    this.hintEl.style.background = 'rgba(20, 23, 28, 0.6)';
-    this.hintEl.style.color = 'var(--cream)';
-    this.hintEl.style.fontSize = '13px';
-    this.hintEl.style.letterSpacing = '0.08em';
-    this.hintEl.style.textAlign = 'center';
-    this.hintEl.style.textShadow = '0 2px 8px rgba(20, 23, 28, 0.8)';
-    this.hintEl.style.pointerEvents = 'none'; // non-modal: never eats driving input
-    this.hintEl.style.zIndex = '6';
     this.raceEl.appendChild(this.hintEl);
 
     this.countdownEl = el('div', 'countdown-overlay hidden');
@@ -783,6 +818,41 @@ export class KartApp {
       if (this.phase === 'racing') this.send({ t: 'nitro' });
     };
     this.scene.resize();
+
+    // ---- fx pools + minimap precompute -------------------------------------------
+    this.fx = new KartFx(KartFx.sceneRoot(this.scene), this.raceEl);
+    // minimap: fit the centerline bounds into MINIMAP_SIZE px with a small pad;
+    // the outline path is static — only the dots move (4Hz redraw)
+    {
+      const cl = this.track.centerline;
+      let minX = Infinity;
+      let maxX = -Infinity;
+      let minZ = Infinity;
+      let maxZ = -Infinity;
+      for (const c of cl) {
+        if (c[0] < minX) minX = c[0];
+        if (c[0] > maxX) maxX = c[0];
+        if (c[1] < minZ) minZ = c[1];
+        if (c[1] > maxZ) maxZ = c[1];
+      }
+      const pad = 9;
+      const spanX = Math.max(1, maxX - minX);
+      const spanZ = Math.max(1, maxZ - minZ);
+      this.mapScale = Math.min((MINIMAP_SIZE - pad * 2) / spanX, (MINIMAP_SIZE - pad * 2) / spanZ);
+      // center the shorter axis; project: mx = (x + mapOffX) * mapScale
+      this.mapOffX = -minX + (MINIMAP_SIZE / this.mapScale - spanX) / 2;
+      this.mapOffZ = -minZ + (MINIMAP_SIZE / this.mapScale - spanZ) / 2;
+      const path = new Path2D();
+      for (let i = 0; i < cl.length; i++) {
+        const c = cl[i]!;
+        const mx = (c[0] + this.mapOffX) * this.mapScale;
+        const my = (c[1] + this.mapOffZ) * this.mapScale;
+        if (i === 0) path.moveTo(mx, my);
+        else path.lineTo(mx, my);
+      }
+      path.closePath();
+      this.mapPath = path;
+    }
 
     // ---- listeners (driving keys are owned by drive.ts; audio unlocks on clicks) ----
     window.addEventListener('resize', () => {
@@ -1007,6 +1077,9 @@ export class KartApp {
     this.buffers.clear();
     this.visuals.clear();
     this.bestLaps.clear();
+    this.remoteFx.clear();
+    this.ownFx.init = false;
+    this.fx.clear();
     this.debugInput = null;
     this.drive.setInput({ ...ZERO_INPUT }); // clear a latched debug driver
     this.drive.setOthers([]);
@@ -1015,6 +1088,7 @@ export class KartApp {
     this.goActive = false;
     this.goAt = 0;
     this.audio.engine(0, false);
+    this.audio.skid(0); // cut the persistent tire voice so it can't leak onto the menu
     this.clearSceneKarts();
   }
 
@@ -1025,12 +1099,16 @@ export class KartApp {
     this.buffers.clear(); // remotes re-appear at their slots via fresh snapshots
     this.visuals.clear();
     this.bestLaps.clear();
+    this.remoteFx.clear();
+    this.ownFx.init = false;
+    this.dustAcc = 0;
+    this.fx.clear(); // a fresh race starts on a clean track (marks are per-race)
     this.lastYouLap = 1;
     this.lastLapMs = -1;
     this.frozenLapMs = -1;
     this.wasFinished = false;
-    this.prevDrifting = false;
     this.prevSpeed = 0;
+    this.prevNitroPips = NITRO_CHARGES; // charges refill at GO — no flash on the reset
     this.lapStartAt = this.serverNow();
   }
 
@@ -1069,6 +1147,7 @@ export class KartApp {
         this.roster.delete(id);
         this.buffers.delete(id);
         this.visuals.delete(id);
+        this.remoteFx.delete(id);
         this.removeKart(id);
         rosterDirty = true;
       }
@@ -1145,7 +1224,14 @@ export class KartApp {
           if (this.you !== null) this.you.nitroLeft = ev.left; // beats the next snapshot by a tick
           this.audio.sfx('turbo'); // nitro whoosh
         } else {
-          this.audio.sfx('turbo'); // remote whoosh (distance model lives in audio.ts)
+          // remote whoosh, gain scaled by distance to that kart (audio.ts reads opts.distance)
+          const remote = this.players.get(ev.playerId);
+          const s = this.drive.state();
+          const dist =
+            remote !== undefined
+              ? Math.hypot(remote.p[0] - s.x, remote.p[2] - s.z)
+              : 0;
+          this.audio.sfx('turbo', { distance: Math.round(dist) });
         }
         break;
       case 'finish':
@@ -1241,6 +1327,7 @@ export class KartApp {
       const s = this.drive.state(); // module scratch — consume, never retain
       this.scene.updateKart(this.selfId(), s.x, s.y, s.z, s.yaw, s.steer, s.drifting, s.nitroLeft > 0, dt);
       this.updateRemotes(dt);
+      this.updateFx(s, dt); // after remotes: their fx ride the same frame
       this.scene.setCamera(s.x, s.y, s.z, s.yaw, Math.abs(forwardSpeed(s)), dt);
       this.updateHud(s, now);
       this.updateAudio(s, now);
@@ -1256,18 +1343,159 @@ export class KartApp {
       if (v === null) continue;
       this.visuals.set(id, v);
       this.scene.updateKart(id, v.x, v.y, v.z, v.yaw, v.steer, v.drift, v.nitroActive, dt);
+      this.updateRemoteFx(id, v, dt);
+    }
+  }
+
+  // ---- fx emission (fx.ts owns the pools; this only feeds it sim facts) ----------------
+
+  /** Own-kart fx for this frame: skid marks (drift/hard brake, road only), drift
+   *  smoke, grass dust, barrier sparks, nitro trail, camera speed lines. */
+  private updateFx(s: DriveState, dt: number): void {
+    const spd = Math.abs(forwardSpeed(s));
+    const fx = -Math.sin(s.yaw);
+    const fz = -Math.cos(s.yaw);
+    const st = this.ownFx;
+    const onRoad = surfaceAt(this.track, s.x, s.z) === 'road';
+    this.lastSurface = onRoad ? 'asphalt' : 'grass'; // feeds the skid voice character
+    const drifting = s.drifting && spd > SKID_MIN_SPEED;
+    // continuous tire voice (audio.skid): per-frame slip amount 0..1 — the
+    // smoothed driftVisual envelope while drifting at speed, else 0
+    this.audio.skid(drifting ? Math.min(1, Math.max(0, s.driftVisual)) : 0, this.lastSurface);
+    // hard-brake proxy: a big forward-speed loss without the handbrake (a barrier
+    // hit trips it too — crash marks at the wall are the right read)
+    const decel = (this.prevSpeed - spd) / Math.max(dt, 1e-4);
+    const braking = !s.drifting && decel > BRAKE_SKID_DECEL && spd > BRAKE_SKID_MIN_SPEED;
+    if ((drifting || braking) && onRoad) {
+      this.emitSlideFx(st, s.x, s.z, s.yaw, dt, drifting);
+    } else {
+      st.init = false; // next slide starts a fresh streak, not a jump-cut line
+    }
+    if (!onRoad && spd > DUST_MIN_SPEED) {
+      this.dustAcc += dt;
+      while (this.dustAcc >= DUST_EVERY_S) {
+        this.dustAcc -= DUST_EVERY_S;
+        st.side = !st.side;
+        const side = st.side ? 1 : -1;
+        this.fx.dust(
+          s.x - fx * WHEEL_REAR + Math.cos(s.yaw) * WHEEL_HALF * side,
+          0.25,
+          s.z - fz * WHEEL_REAR - Math.sin(s.yaw) * WHEEL_HALF * side,
+        );
+      }
+    }
+    if (this.prevSpeed - spd > THUD_DROP) {
+      this.fx.sparks(s.x + fx * NOSE_AHEAD, 0.45, s.z + fz * NOSE_AHEAD);
+    }
+    if (s.nitroLeft > 0) {
+      st.trailAcc += dt;
+      while (st.trailAcc >= TRAIL_EVERY_S) {
+        st.trailAcc -= TRAIL_EVERY_S;
+        // exhaust tip (kartMesh local (0.28, 0.5, 1.3)): behind + right of the origin
+        this.fx.trail(
+          s.x - fx * 1.3 + Math.cos(s.yaw) * 0.28,
+          0.5,
+          s.z - fz * 1.3 - Math.sin(s.yaw) * 0.28,
+          fx,
+          fz,
+        );
+      }
+    }
+    this.fx.update(dt, spd);
+  }
+
+  /** Remote kart fx from snapshot flags: drift marks + smoke, nitro streak. */
+  private updateRemoteFx(id: string, v: RemoteVisual, dt: number): void {
+    let st = this.remoteFx.get(id);
+    if (st === undefined) {
+      st = { lx: 0, lz: 0, rx: 0, rz: 0, init: false, smokeAcc: 0, trailAcc: 0, side: false };
+      this.remoteFx.set(id, st);
+    }
+    if (v.drift) {
+      this.emitSlideFx(st, v.x, v.z, v.yaw, dt, true);
+    } else {
+      st.init = false;
+    }
+    if (v.nitroActive) {
+      const fx = -Math.sin(v.yaw);
+      const fz = -Math.cos(v.yaw);
+      st.trailAcc += dt;
+      while (st.trailAcc >= TRAIL_EVERY_S) {
+        st.trailAcc -= TRAIL_EVERY_S;
+        this.fx.trail(
+          v.x - fx * 1.3 + Math.cos(v.yaw) * 0.28,
+          0.5,
+          v.z - fz * 1.3 - Math.sin(v.yaw) * 0.28,
+          fx,
+          fz,
+        );
+      }
+    }
+  }
+
+  /**
+   * Skid marks (+ drift smoke when smoke=true) for one kart sliding on the road.
+   * One mark per rear wheel every SKID_MARK_EVERY m of wheel travel, each segment
+   * oriented along the wheel's motion; smoke puffs alternate wheels.
+   */
+  private emitSlideFx(
+    st: RemoteFxState,
+    x: number,
+    z: number,
+    yaw: number,
+    dt: number,
+    smoke: boolean,
+  ): void {
+    const fx = -Math.sin(yaw);
+    const fz = -Math.cos(yaw);
+    const rearX = x - fx * WHEEL_REAR;
+    const rearZ = z - fz * WHEEL_REAR;
+    const wlX = rearX - Math.cos(yaw) * WHEEL_HALF;
+    const wlZ = rearZ + Math.sin(yaw) * WHEEL_HALF;
+    const wrX = rearX + Math.cos(yaw) * WHEEL_HALF;
+    const wrZ = rearZ - Math.sin(yaw) * WHEEL_HALF;
+    if (st.init) {
+      const dxl = wlX - st.lx;
+      const dzl = wlZ - st.lz;
+      const dl = Math.hypot(dxl, dzl);
+      if (dl >= SKID_MARK_EVERY) {
+        this.fx.skid(st.lx, st.lz, dxl / dl, dzl / dl);
+        st.lx = wlX;
+        st.lz = wlZ;
+      }
+      const dxr = wrX - st.rx;
+      const dzr = wrZ - st.rz;
+      const dr = Math.hypot(dxr, dzr);
+      if (dr >= SKID_MARK_EVERY) {
+        this.fx.skid(st.rx, st.rz, dxr / dr, dzr / dr);
+        st.rx = wrX;
+        st.rz = wrZ;
+      }
+    } else {
+      // streak start: record the wheel positions WITHOUT laying a mark — stamping
+      // both wheels at once reads as a symmetric 'H' rung; real marks appear as
+      // each wheel travels SKID_MARK_EVERY, staggered along its own path
+      st.lx = wlX;
+      st.lz = wlZ;
+      st.rx = wrX;
+      st.rz = wrZ;
+      st.init = true;
+    }
+    if (smoke) {
+      st.smokeAcc += dt;
+      while (st.smokeAcc >= SMOKE_EVERY_S) {
+        st.smokeAcc -= SMOKE_EVERY_S;
+        st.side = !st.side;
+        this.fx.smoke(st.side ? wlX : wrX, 0.35, st.side ? wlZ : wrZ);
+      }
     }
   }
 
   private updateAudio(s: DriveState, now: number): void {
     const spd = forwardSpeed(s);
     const on = this.phase === 'ready' || this.phase === 'countdown' || this.phase === 'racing';
-    this.audio.engine(engineRevs(s), on); // per-gear revs: the note drops on every upshift
-    if (s.drifting && (!this.prevDrifting || now - this.lastSkidAt > SKID_EVERY_MS)) {
-      this.audio.sfx('skid'); // edge + slow retrigger = a continuous-ish skid loop
-      this.lastSkidAt = now;
-    }
-    this.prevDrifting = s.drifting;
+    this.audio.engine(engineRevs(s), on, this.drive.throttle()); // revs per gear, load per real throttle
+    // no skid here: the continuous tire voice is driven per frame from updateFx
     // no sim-edge whoosh: nitro is the only boost now, and its sfx rides the race event
     if (this.prevSpeed - spd > THUD_DROP) this.audio.sfx('thud'); // barrier killed our speed
     this.prevSpeed = spd;
@@ -1324,14 +1552,21 @@ export class KartApp {
           : 'BACK TO GRID…';
     }
 
-    // place + gap to the kart one place ahead (docs/KART.md "Gap timing")
+    // position chip: big ordinal + /N, gap to the kart one place ahead
+    // (docs/KART.md "Gap timing"); 'LEADER' for P1
     if (you !== null && you.place > 0) {
-      this.placeEl.textContent =
-        you.place === 1
-          ? 'P1 · LEADER'
-          : `P${you.place} · +${(you.gapAheadMs / 1000).toFixed(1)}s`;
+      this.placeNumEl.textContent = String(you.place);
+      this.placeSufEl.textContent = ordinalSuffix(you.place);
+      this.placeTotalEl.textContent = `/${Math.max(this.players.size, you.place)}`;
+      this.placeGapEl.textContent =
+        you.place === 1 ? 'LEADER' : `+${(you.gapAheadMs / 1000).toFixed(1)}s`;
+      this.placeGapEl.classList.toggle('hud-pos-leader', you.place === 1);
     } else {
-      this.placeEl.textContent = 'P—';
+      this.placeNumEl.textContent = '—';
+      this.placeSufEl.textContent = '';
+      this.placeTotalEl.textContent = '';
+      this.placeGapEl.textContent = '';
+      this.placeGapEl.classList.remove('hud-pos-leader');
     }
     this.kidsBadgeEl.classList.toggle('hidden', !this.assist); // KIDS badge while assist is on
     this.lapEl.textContent = `LAP ${Math.min(you?.lap ?? 1, LAPS_TO_WIN)}/${LAPS_TO_WIN}`;
@@ -1353,15 +1588,31 @@ export class KartApp {
     if (best < 0 && this.playerId !== null) best = this.bestLaps.get(this.playerId) ?? this.lastLapMs;
     this.bestEl.textContent = fmtMs(best);
 
-    // nitro pips: one lit pip per charge left (you.nitroLeft is authoritative), dim when spent
+    // nitro pips: one lit pip per charge left (you.nitroLeft is authoritative),
+    // dim when spent; a fresh spend flashes the lost pip
     const nitroLeft = you?.nitroLeft ?? NITRO_CHARGES;
     this.nitroPips.forEach((pip, i) => {
       pip.style.opacity = i < nitroLeft ? '1' : '0.25';
     });
+    if (nitroLeft < this.prevNitroPips) {
+      const spent = this.nitroPips[nitroLeft]; // the pip that just went dark
+      if (spent !== undefined) {
+        spent.classList.remove('pip-flash');
+        void spent.offsetWidth; // restart the animation on rapid successive spends
+        spent.classList.add('pip-flash');
+      }
+    }
+    this.prevNitroPips = nitroLeft;
 
-    // next-gate chevron: rotate toward the gate relative to our yaw
+    // minimap: outline + gate 0 + live dots, throttled to 4Hz (MINIMAP_EVERY_MS)
+    if (now >= this.minimapNextAt) {
+      this.minimapNextAt = now + MINIMAP_EVERY_MS;
+      this.drawMinimap(s);
+    }
+
+    // next-gate chevron: rotate toward the gate relative to our yaw, distance below
     const showGate = (phase === 'countdown' || phase === 'racing') && you !== null;
-    this.gateEl.classList.toggle('hidden', !showGate);
+    this.gateWrapEl.classList.toggle('hidden', !showGate);
     if (showGate && you !== null) {
       const gates = this.track.gates;
       const gate = gates[((you.nextGate % GATES) + GATES) % GATES]!;
@@ -1371,7 +1622,84 @@ export class KartApp {
       const fwd = dx * -Math.sin(s.yaw) + dz * -Math.cos(s.yaw);
       const right = dx * Math.cos(s.yaw) + dz * -Math.sin(s.yaw);
       this.gateEl.style.transform = `rotate(${(Math.atan2(right, fwd) * 180) / Math.PI}deg)`;
+      const distTxt = `${Math.round(Math.hypot(dx, dz))}m`;
+      if (this.gateLabelEl.textContent !== distTxt) this.gateLabelEl.textContent = distTxt;
     }
+  }
+
+  /** Minimap (top-right): the static track outline (precomputed Path2D) drawn
+   *  cream over a dark under-stroke for full-alpha readability, a start/finish
+   *  tick at gate 0, saturated per-player dots in kart colors, and your kart as
+   *  a filled heading arrow. Redrawn at 4Hz. */
+  private drawMinimap(s: DriveState): void {
+    const ctx = this.minimapEl.getContext('2d');
+    if (ctx === null) return;
+    ctx.setTransform(2, 0, 0, 2, 0, 0); // 2x backing store — draw in css px
+    ctx.clearRect(0, 0, MINIMAP_SIZE, MINIMAP_SIZE);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    // track outline: dark under-stroke then full-alpha cream — reads on any scene
+    ctx.strokeStyle = KPAL.ink;
+    ctx.lineWidth = 6.5;
+    ctx.stroke(this.mapPath);
+    ctx.strokeStyle = KPAL.hudText;
+    ctx.lineWidth = 4;
+    ctx.stroke(this.mapPath);
+    // start/finish tick: perpendicular to the gate-0 tangent
+    const g0 = this.track.gates[0]!;
+    const gx = (g0.x + this.mapOffX) * this.mapScale;
+    const gz = (g0.z + this.mapOffZ) * this.mapScale;
+    const px = -g0.tz * this.mapScale * 0.9;
+    const pz = g0.tx * this.mapScale * 0.9;
+    ctx.strokeStyle = KPAL.gold;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(gx - px, gz - pz);
+    ctx.lineTo(gx + px, gz + pz);
+    ctx.stroke();
+    // player dots: saturated kart colors, dark ring for separation — you LAST
+    const n = KART_COLORS.length;
+    const dot = (px2: number, pz2: number, color: number): void => {
+      ctx.fillStyle = KART_COLORS[((color % n) + n) % n] ?? KPAL.kartRed;
+      ctx.beginPath();
+      ctx.arc(
+        (px2 + this.mapOffX) * this.mapScale,
+        (pz2 + this.mapOffZ) * this.mapScale,
+        3.2,
+        0,
+        TWO_PI,
+      );
+      ctx.fill();
+      ctx.strokeStyle = KPAL.ink;
+      ctx.lineWidth = 0.9;
+      ctx.stroke();
+    };
+    let ownColor = this.colorIdx;
+    for (const p of this.players.values()) {
+      if (p.id === this.playerId) {
+        ownColor = p.color;
+        continue;
+      }
+      dot(p.p[0], p.p[2], p.color);
+    }
+    // you: a filled heading arrow (map y = world z, so fwd = (-sin yaw, -cos yaw))
+    const ox = (s.x + this.mapOffX) * this.mapScale;
+    const oz = (s.z + this.mapOffZ) * this.mapScale;
+    const ang = Math.atan2(-Math.cos(s.yaw), -Math.sin(s.yaw));
+    ctx.save();
+    ctx.translate(ox, oz);
+    ctx.rotate(ang);
+    ctx.fillStyle = KART_COLORS[((ownColor % n) + n) % n] ?? KPAL.kartRed;
+    ctx.strokeStyle = KPAL.hudText;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(7, 0);
+    ctx.lineTo(-4.5, 4);
+    ctx.lineTo(-4.5, -4);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
   }
 
   // ---- scene kart bookkeeping -----------------------------------------------------------------

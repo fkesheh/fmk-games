@@ -260,6 +260,11 @@ export class DriveController {
     return o;
   }
 
+  /** Effective merged throttle 0..1 (keyboard + latched ext) — the audio load axis. */
+  throttle(): number {
+    return this.eff.throttle;
+  }
+
   /**
    * 15Hz kart_state packet for the wire: non-null once per PACKET_DT of stepped
    * sim time. Module scratch — serialize/send immediately, do not retain.

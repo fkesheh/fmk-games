@@ -239,12 +239,15 @@ body {
 
 .race-top {
   position: absolute;
-  top: 12px;
+  top: 50%;
   right: 12px;
+  transform: translateY(-50%);
   z-index: 6;
 }
 
 /* ---- HUD (ready / countdown / racing) ------------------------------------------ */
+/* Chip idiom: translucent ink + subtle backdrop blur, 1px cream-alpha border,
+   consistent 8px radius. Colors stay KPAL-derived (rgba tints of --ink/--cream). */
 
 .hud {
   position: absolute;
@@ -257,20 +260,89 @@ body {
   position: absolute;
   top: 14px;
   left: 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
 }
 
-.hud-place {
-  font-size: clamp(40px, 7vw, 72px);
-  font-weight: 800;
+/* position chip: big ordinal + /N + gap — gold edge bar, 1px top rim highlight */
+.hud-pos {
+  padding: 8px 14px 9px;
+  border: 1px solid rgba(232, 230, 223, 0.12);
+  border-left: 3px solid var(--gold);
+  border-radius: 8px;
+  background: rgba(20, 23, 28, 0.55);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  box-shadow: inset 0 1px 0 rgba(232, 230, 223, 0.16);
+}
+
+.hud-pos-main {
+  display: flex;
+  align-items: baseline;
+  gap: 1px;
   line-height: 1;
+}
+
+.hud-pos-num {
+  font-size: clamp(40px, 6.5vw, 64px);
+  font-weight: 800;
   color: var(--cream);
   text-shadow: 0 2px 0 rgba(20, 23, 28, 0.9), 0 4px 18px rgba(20, 23, 28, 0.7);
   font-variant-numeric: tabular-nums;
 }
 
+.hud-pos-suf {
+  font-size: clamp(16px, 2.2vw, 24px);
+  font-weight: 800;
+  color: var(--gold);
+}
+
+.hud-pos-total {
+  margin-left: 6px;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--steel);
+  font-variant-numeric: tabular-nums;
+}
+
+.hud-pos-gap {
+  margin-top: 3px;
+  min-height: 15px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: var(--steel);
+  font-variant-numeric: tabular-nums;
+}
+
+.hud-pos-gap.hud-pos-leader {
+  color: var(--gold);
+}
+
+.hud-kids {
+  margin-top: 5px;
+  width: fit-content;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--gold);
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+}
+
 .hud-lap {
-  margin-top: 6px;
-  font-size: clamp(16px, 2.4vw, 24px);
+  padding: 4px 10px;
+  border: 1px solid rgba(232, 230, 223, 0.12);
+  border-radius: 8px;
+  background: rgba(20, 23, 28, 0.55);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  box-shadow: inset 0 1px 0 rgba(232, 230, 223, 0.16);
+  font-size: clamp(14px, 2vw, 20px);
   font-weight: 700;
   letter-spacing: 0.18em;
   color: var(--gold);
@@ -281,12 +353,55 @@ body {
   position: absolute;
   top: 14px;
   right: 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
   text-align: right;
 }
 
 .hud-speed {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
+  padding: 7px 14px 9px;
+  border: 1px solid rgba(232, 230, 223, 0.12);
+  border-radius: 8px;
+  background: rgba(20, 23, 28, 0.55);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  box-shadow: inset 0 1px 0 rgba(232, 230, 223, 0.16);
   color: var(--cream);
   text-shadow: 0 2px 0 rgba(20, 23, 28, 0.9), 0 4px 18px rgba(20, 23, 28, 0.7);
+}
+
+/* gear stacked ABOVE the speed — adjacent big numerals kerned into one read */
+.hud-gear-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  line-height: 1;
+}
+
+.hud-gear-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  color: var(--steel);
+}
+
+.hud-gear {
+  font-size: 17px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  color: var(--gold);
+}
+
+.hud-speed-row {
+  display: flex;
+  align-items: baseline;
+  line-height: 1;
 }
 
 .hud-speed-num {
@@ -302,6 +417,19 @@ body {
   color: var(--steel);
 }
 
+/* minimap: 140px canvas, chip-framed (the outline/dots are drawn by app.ts) */
+.hud-minimap {
+  width: 140px;
+  height: 140px;
+  padding: 4px;
+  border: 1px solid rgba(232, 230, 223, 0.12);
+  border-radius: 8px;
+  background: rgba(20, 23, 28, 0.55);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  box-shadow: inset 0 1px 0 rgba(232, 230, 223, 0.16);
+}
+
 .hud-times {
   position: absolute;
   left: 16px;
@@ -309,6 +437,13 @@ body {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  padding: 10px 14px;
+  border: 1px solid rgba(232, 230, 223, 0.12);
+  border-radius: 8px;
+  background: rgba(20, 23, 28, 0.55);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  box-shadow: inset 0 1px 0 rgba(232, 230, 223, 0.16);
 }
 
 .hud-time-row {
@@ -336,7 +471,7 @@ body {
   color: var(--gold);
 }
 
-.hud-turbo {
+.hud-nitro {
   position: absolute;
   right: 16px;
   bottom: 16px;
@@ -344,6 +479,13 @@ body {
   flex-direction: column;
   align-items: flex-end;
   gap: 6px;
+  padding: 10px 14px;
+  border: 1px solid rgba(232, 230, 223, 0.12);
+  border-radius: 8px;
+  background: rgba(20, 23, 28, 0.55);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  box-shadow: inset 0 1px 0 rgba(232, 230, 223, 0.16);
 }
 
 .hud-turbo-label {
@@ -352,43 +494,81 @@ body {
   color: var(--steel);
 }
 
-.hud-turbo-bar {
-  width: 160px;
+.hud-nitro-pips {
+  display: flex;
+  gap: 6px;
+}
+
+.hud-nitro-pip {
+  width: 22px;
   height: 10px;
-  border: 1px solid var(--asphalt);
   border-radius: 5px;
-  background: rgba(20, 23, 28, 0.6);
-  overflow: hidden;
-}
-
-.hud-turbo-fill {
-  height: 100%;
-  width: 0%;
+  border: 1px solid var(--asphalt);
   background: var(--gold);
-  transition: width 80ms linear;
+  box-shadow: 0 0 8px rgba(212, 175, 55, 0.35);
+  transition: opacity 120ms linear;
 }
 
-.hud-turbo.charged .hud-turbo-label {
-  color: var(--teal);
+/* spend flash: the just-consumed pip flares cream + pops scale, then settles dim */
+.hud-nitro-pip.pip-flash {
+  animation: pip-flash 700ms ease-out;
 }
 
-.hud-turbo.charged .hud-turbo-fill {
-  background: var(--teal);
-  box-shadow: 0 0 12px rgba(47, 143, 143, 0.8);
+@keyframes pip-flash {
+  0% {
+    opacity: 1;
+    background: var(--cream);
+    box-shadow: 0 0 20px rgba(232, 230, 223, 1);
+    transform: scale(1.6);
+  }
+  45% {
+    opacity: 1;
+    background: var(--cream);
+    box-shadow: 0 0 14px rgba(232, 230, 223, 0.8);
+    transform: scale(1.25);
+  }
+  100% {
+    opacity: 0.25;
+    background: var(--gold);
+    box-shadow: 0 0 8px rgba(212, 175, 55, 0.35);
+    transform: scale(1);
+  }
 }
 
-/* next-gate chevron: a CSS triangle, rotated inline toward the gate */
-.hud-gate {
+/* next-gate marker: chevron (rotated inline toward the gate) + distance chip */
+.hud-gate-wrap {
   position: absolute;
   top: 12px;
   left: 50%;
-  margin-left: -14px;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+}
+
+.hud-gate {
   width: 0;
   height: 0;
   border-left: 14px solid transparent;
   border-right: 14px solid transparent;
   border-bottom: 22px solid var(--gold);
   filter: drop-shadow(0 2px 6px rgba(20, 23, 28, 0.8));
+}
+
+.hud-gate-label {
+  padding: 2px 9px;
+  border: 1px solid rgba(232, 230, 223, 0.12);
+  border-radius: 8px;
+  background: rgba(20, 23, 28, 0.55);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  box-shadow: inset 0 1px 0 rgba(232, 230, 223, 0.16);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: var(--gold);
+  font-variant-numeric: tabular-nums;
 }
 
 /* ---- lobby overlay (the grid) --------------------------------------------------- */
@@ -522,6 +702,56 @@ body {
   color: var(--cream);
   text-shadow: 0 2px 0 rgba(20, 23, 28, 0.9), 0 4px 20px rgba(20, 23, 28, 0.8);
   pointer-events: none;
+}
+
+/* ---- controls hint card (pre-GO + ~6s after; non-modal) ---------------------------- */
+
+.hint-card {
+  position: absolute;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  max-width: 92vw;
+  padding: 8px 16px;
+  border: 1px solid rgba(232, 230, 223, 0.12);
+  border-radius: 8px;
+  background: rgba(20, 23, 28, 0.55);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  box-shadow: inset 0 1px 0 rgba(232, 230, 223, 0.16);
+  color: var(--cream);
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  text-align: center;
+  text-shadow: 0 2px 8px rgba(20, 23, 28, 0.8);
+  pointer-events: none; /* non-modal: never eats driving input */
+  z-index: 6;
+}
+
+/* ---- camera speed lines (fx.ts; >30 m/s, rim streaks) ------------------------------ */
+
+.fx-speedlines {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 3; /* below the HUD chrome */
+}
+
+.fx-speedline {
+  position: absolute;
+  width: 96px;
+  height: 3px;
+  margin-left: -48px; /* centered on its anchor */
+  margin-top: -1px;
+  border-radius: 2px;
+  background: linear-gradient(
+    90deg,
+    rgba(232, 230, 223, 0),
+    rgba(232, 230, 223, 0.85),
+    rgba(232, 230, 223, 0)
+  );
+  will-change: opacity;
 }
 
 /* ---- results --------------------------------------------------------------------- */
