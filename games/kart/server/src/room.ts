@@ -509,13 +509,25 @@ export class KartRoom implements GameRoomHandle {
     return MAX_PLAYERS - 1; // unreachable: addPlayer guards the cap first
   }
 
-  /** kart_joined payload (frozen): the full seated roster, joiner included. */
-  private joinedFor(you: Player): KartS2C {
+  /**
+   * kart_joined payload (frozen): the full seated roster, joiner included.
+   * `code` is an additive field (same convention as bank_state) so clients can
+   * show the private-room invite code; the frozen KartS2C union is untouched.
+   */
+  private joinedFor(you: Player): KartS2C & { code: string | null } {
     const players: KartPlayerInfo[] = [];
     for (const p of this.players.values()) {
       players.push({ id: p.id, name: p.name, slot: p.slot, color: p.color });
     }
-    return { t: 'kart_joined', you: you.id, slot: you.slot, color: you.color, phase: this.phase, players };
+    return {
+      t: 'kart_joined',
+      code: this.code, // private-room invite code (null for public); everyone in the room may see it
+      you: you.id,
+      slot: you.slot,
+      color: you.color,
+      phase: this.phase,
+      players,
+    };
   }
 
   /**

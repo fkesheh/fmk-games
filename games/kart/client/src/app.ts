@@ -54,7 +54,9 @@ type LobbyMsg =
   | { t: 'pong'; ts: number; serverTime: number }
   | { t: 'error'; code: string; message: string };
 
-type JoinedMsg = Extract<KartS2C, { t: 'kart_joined' }>;
+// the frozen contract carries no code; servers that know the room's invite code
+// piggyback it (private rooms only) — optional on the wire, null when unknown
+type JoinedMsg = Extract<KartS2C, { t: 'kart_joined' }> & { code: string | null };
 type SnapshotMsg = Extract<KartS2C, { t: 'kart_snapshot' }>;
 type RaceEventMsg = Extract<KartS2C, { t: 'race_event' }>;
 
@@ -210,7 +212,15 @@ function parseS2C(raw: unknown): S2C | null {
         if (info === null) return null;
         players.push(info);
       }
-      return { t: 'kart_joined', you: raw.you, slot: raw.slot, color: raw.color, phase: ph, players };
+      return {
+        t: 'kart_joined',
+        you: raw.you,
+        slot: raw.slot,
+        color: raw.color,
+        phase: ph,
+        players,
+        code: str(raw.code) ? raw.code : null,
+      };
     }
     case 'kart_snapshot': {
       const ph = kartPhase(raw.phase);
@@ -268,6 +278,7 @@ interface KartDebugState {
   gapAheadMs: number; // ms behind the player one place ahead; 0 for the leader
   frozen: boolean; // drive sim frozen (pre-GO freeze: every phase but 'racing')
   assist: boolean; // KIDS MODE auto-steer active (drive.setAssist)
+  code: string | null; // private-room invite code (null for public rooms / before join)
 }
 
 interface KartRemoteDebug {
@@ -519,6 +530,7 @@ export class KartApp {
   private joined = false;
   private slot = 0; // our grid slot (join order)
   private colorIdx = 0; // our KART_COLORS index
+  private roomCode: string | null = null; // invite code from kart_joined (private rooms)
   private phase: KartPhase = 'lobby';
   private you: KartYou | null = null;
   private phaseEndsAt = 0; // serverTime ms; 0 when no phase timer
@@ -585,6 +597,7 @@ export class KartApp {
   private readonly raceEl: HTMLDivElement;
   private readonly canvas: HTMLCanvasElement;
   private readonly hudEl: HTMLDivElement;
+  private readonly hudLeftEl: HTMLDivElement; // top-left chip stack (pos + lap; hosts the invite chip mid-race)
   private readonly placeNumEl: HTMLSpanElement; // big ordinal numeral ('2')
   private readonly placeSufEl: HTMLSpanElement; // ordinal suffix ('nd')
   private readonly placeTotalEl: HTMLSpanElement; // '/N' field size
@@ -609,6 +622,10 @@ export class KartApp {
   private readonly countdownEl: HTMLDivElement;
   private readonly msgEl: HTMLDivElement;
   private readonly hintEl: HTMLDivElement;
+  private readonly inviteEl: HTMLDivElement; // private-room invite chip ('CIRCUIT · code XXXXX')
+  private readonly inviteCodeEl: HTMLSpanElement;
+  private readonly copyBtn: HTMLButtonElement;
+  private copiedTimer = 0; // 'COPIED' feedback reset handle
   private readonly resultsEl: HTMLDivElement;
   private readonly resultsBodyEl: HTMLTableSectionElement;
   private readonly resultsNoteEl: HTMLDivElement;
@@ -650,6 +667,12 @@ export class KartApp {
     );
     this.menuEl.appendChild(codeRow);
 
+    // invite link (?code=XXXXX): prefill the private-code input (bank convention)
+    const linkCode = new URLSearchParams(location.search).get('code');
+    if (linkCode !== null && linkCode.trim().length > 0) {
+      this.codeInput.value = linkCode.trim().slice(0, CODE_MAX);
+    }
+
     // KIDS MODE auto-steer assist (docs/KART.md "Kids mode") — persisted in localStorage
     const kidsRow = el('label', 'menu-kids');
     this.kidsInput = el('input');
@@ -684,6 +707,7 @@ export class KartApp {
     // chevron (top-center)
     this.hudEl = el('div', 'hud hidden');
     const hudLeft = el('div', 'hud-left');
+    this.hudLeftEl = hudLeft;
     const pos = el('div', 'hud-pos');
     const posMain = el('div', 'hud-pos-main');
     this.placeNumEl = el('span', 'hud-pos-num', '—');
@@ -784,6 +808,36 @@ export class KartApp {
 
     this.msgEl = el('div', 'race-msg hidden');
     this.raceEl.appendChild(this.msgEl);
+
+    // invite chip (private rooms only): top-left 'CIRCUIT · code XXXXX' + COPY
+    // INVITE. Parks inside hud-left while the HUD is up (the position/lap chips
+    // own the corner then); top-level above the lobby/results overlays otherwise.
+    this.inviteEl = el('div', 'race-invite hidden');
+    this.inviteEl.style.position = 'absolute';
+    this.inviteEl.style.top = '14px';
+    this.inviteEl.style.left = '16px';
+    this.inviteEl.style.zIndex = '9'; // above the lobby (5) and results (8) overlays
+    this.inviteEl.style.display = 'flex';
+    this.inviteEl.style.alignItems = 'center';
+    this.inviteEl.style.gap = '8px';
+    this.inviteEl.style.pointerEvents = 'auto'; // the HUD container is pointer-events:none
+    this.inviteCodeEl = el('span', 'race-invite-code');
+    this.inviteCodeEl.style.padding = '4px 12px';
+    this.inviteCodeEl.style.border = '1px solid var(--gold)';
+    this.inviteCodeEl.style.borderRadius = '999px';
+    this.inviteCodeEl.style.fontSize = '12px';
+    this.inviteCodeEl.style.letterSpacing = '0.18em';
+    this.inviteCodeEl.style.color = 'var(--gold)';
+    this.inviteCodeEl.style.background = 'rgba(20, 23, 28, 0.72)';
+    this.inviteEl.appendChild(this.inviteCodeEl);
+    this.copyBtn = el('button', 'btn btn-small', 'COPY INVITE');
+    this.copyBtn.addEventListener('click', () => {
+      this.audio.resume();
+      this.copyBtn.blur(); // keep SPACE/arrows off the focused button while driving
+      this.copyInvite();
+    });
+    this.inviteEl.appendChild(this.copyBtn);
+    this.raceEl.appendChild(this.inviteEl);
 
     // results overlay: place / name / time / best lap, auto-return note
     this.resultsEl = el('div', 'results-overlay hidden');
@@ -1041,6 +1095,8 @@ export class KartApp {
     this.joined = true;
     this.slot = msg.slot;
     this.colorIdx = msg.color;
+    this.roomCode = msg.code; // private rooms carry their invite code; null = public
+    this.updateInviteChip();
     this.phase = msg.phase; // set directly — joining is not a phase TRANSITION
     this.applyFreeze(); // mid-race joiners drive at once; everyone else waits for GO
     this.drive.setAssist(this.assist); // kids-mode assist follows the stored toggle into the room
@@ -1071,6 +1127,8 @@ export class KartApp {
     this.joined = false;
     this.you = null;
     this.phase = 'lobby';
+    this.roomCode = null;
+    this.updateInviteChip();
     this.phaseEndsAt = 0;
     this.players.clear();
     this.roster.clear();
@@ -1512,6 +1570,16 @@ export class KartApp {
     );
     this.resultsEl.classList.toggle('hidden', phase !== 'results');
 
+    // invite chip parking: while the HUD is up the position/lap chips own the
+    // top-left corner — stack beneath them; overlays leave the corner free
+    // ('ready' shows the lobby overlay ABOVE the hud, so only countdown/racing park)
+    const parkInHud = phase === 'countdown' || phase === 'racing';
+    const inviteParent = parkInHud ? this.hudLeftEl : this.raceEl;
+    if (this.inviteEl.parentElement !== inviteParent) {
+      inviteParent.appendChild(this.inviteEl);
+      this.inviteEl.style.position = parkInHud ? 'static' : 'absolute';
+    }
+
     // countdown big number / GO! flash
     if (this.goActive && now > this.goUntil) this.goActive = false;
     const showCd = this.goActive || (phase === 'countdown' && this.countdownShown > 0);
@@ -1859,6 +1927,56 @@ export class KartApp {
     }
   }
 
+  // ---- invite chip (private rooms) ---------------------------------------------------
+  /** Shows/hides the chip and refreshes its label from the current roomCode. */
+  private updateInviteChip(): void {
+    const code = this.roomCode;
+    this.inviteEl.classList.toggle('hidden', code === null);
+    if (code !== null) this.inviteCodeEl.textContent = `CIRCUIT · code ${code}`;
+  }
+
+  /** Copies the invite link; navigator.clipboard first, textarea fallback. */
+  private copyInvite(): void {
+    const code = this.roomCode;
+    if (code === null) return;
+    const url = `${location.origin}/kart/?code=${code}`;
+    const clip: Clipboard | undefined = navigator.clipboard;
+    if (clip !== undefined) {
+      clip.writeText(url).then(
+        () => this.showCopied(),
+        () => this.copyInviteFallback(url), // denied (permissions/insecure ctx): fallback path
+      );
+    } else {
+      this.copyInviteFallback(url);
+    }
+  }
+
+  /** Pre-clipboard-era path: hidden textarea + execCommand('copy'). */
+  private copyInviteFallback(url: string): void {
+    const ta = el('textarea');
+    ta.value = url;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand('copy');
+    } catch {
+      // copy unsupported — the code is still readable in the chip
+    }
+    ta.remove();
+    this.showCopied();
+  }
+
+  /** Brief 'COPIED' label on the copy button. */
+  private showCopied(): void {
+    this.copyBtn.textContent = 'COPIED';
+    window.clearTimeout(this.copiedTimer);
+    this.copiedTimer = window.setTimeout(() => {
+      this.copyBtn.textContent = 'COPY INVITE';
+    }, 1200);
+  }
+
   // ---- debug surface ------------------------------------------------------------------------------
   private debugState(): KartDebugState {
     const s = this.drive.state();
@@ -1877,6 +1995,7 @@ export class KartApp {
       gapAheadMs: you?.gapAheadMs ?? 0,
       frozen: this.phase !== 'racing',
       assist: this.assist,
+      code: this.roomCode,
     };
   }
 

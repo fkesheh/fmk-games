@@ -403,6 +403,11 @@ export class BankGame {
     this.inviteEl.style.display = 'flex';
     this.inviteEl.style.alignItems = 'center';
     this.inviteEl.style.gap = '8px';
+    // .table-banner (z-10) overlays the whole table while waiting/round-end; the
+    // chip must render above it and stay clickable.
+    this.inviteEl.style.position = 'relative';
+    this.inviteEl.style.zIndex = '20';
+    this.inviteEl.style.pointerEvents = 'auto';
     this.inviteCodeEl = el('span', 'table-invite-code');
     this.inviteCodeEl.style.padding = '4px 12px';
     this.inviteCodeEl.style.border = '1px solid var(--gold-deep)';
@@ -464,6 +469,8 @@ export class BankGame {
     this.tableEl.appendChild(this.logEl);
 
     this.bannerEl = el('div', 'table-banner hidden');
+    // text-only overlay: it must never intercept clicks (invite chip, LEAVE, …)
+    this.bannerEl.style.pointerEvents = 'none';
     this.tableEl.appendChild(this.bannerEl);
 
     root.appendChild(this.menuEl);

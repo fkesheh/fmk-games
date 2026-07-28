@@ -224,6 +224,9 @@ export class Menus {
   private consoleOutEl: HTMLElement | null = null;
   private consoleInputEl: HTMLInputElement | null = null;
   private consoleCmd: ((text: string) => string) | null = null;
+  // ?code= invite prefill: undefined = URL not yet consulted, null = absent/consumed
+  private pendingCode: string | null | undefined = undefined;
+  private copiedTimer = 0; // resets the room chip's 'COPIED' feedback label
 
   constructor(root: HTMLElement, cb: MenuCallbacks) {
     this.cb = cb;
@@ -417,6 +420,17 @@ export class Menus {
       if (e.key === 'Enter') tryJoin();
     });
     join.addEventListener('click', tryJoin);
+    // invite-link prefill: /fps/?code=XXXXX fills the code once; a successful
+    // join (showInRoom) consumes it so later menu visits start empty
+    if (this.pendingCode === undefined) {
+      const fromUrl = new URLSearchParams(location.search).get('code');
+      const clean = fromUrl !== null ? fromUrl.toUpperCase().replace(/[^A-Z0-9]/g, '') : '';
+      this.pendingCode = clean === '' ? null : clean;
+    }
+    if (this.pendingCode !== null) {
+      code.value = this.pendingCode.slice(0, PRIVATE_CODE_LEN);
+      join.disabled = code.value.length !== PRIVATE_CODE_LEN;
+    }
     sec.appendChild(code);
     sec.appendChild(join);
     return sec;
@@ -481,12 +495,61 @@ export class Menus {
 
   // ---- room chip (top-left, non-modal) --------------------------------------
   showInRoom(roomLabel: string, code: string | null): void {
+    this.pendingCode = null; // a successful join consumed any ?code= prefill
     const chip = this.layers.chip;
     chip.textContent = '';
-    chip.appendChild(
-      el('div', 'm9-chip', code !== null ? `${roomLabel} · code ${code} (share)` : roomLabel),
+    const box = el('div', code !== null ? 'm9-chip m9-chip-copy' : 'm9-chip');
+    box.appendChild(
+      el('span', '', code !== null ? `${roomLabel} · code ${code} (share)` : roomLabel),
     );
+    if (code !== null) {
+      const copy = el('button', 'm9-btn m9-btn-small m9-chip-btn', 'COPY INVITE');
+      copy.type = 'button';
+      copy.addEventListener('click', () => this.copyInvite(code, copy));
+      box.appendChild(copy);
+    }
+    chip.appendChild(box);
     this.show('chip');
+  }
+
+  /** Copies the invite link; navigator.clipboard first, textarea fallback. */
+  private copyInvite(code: string, btn: HTMLButtonElement): void {
+    const url = `${location.origin}/fps/?code=${code}`;
+    const clip: Clipboard | undefined = navigator.clipboard;
+    if (clip !== undefined) {
+      clip.writeText(url).then(
+        () => this.showCopied(btn),
+        () => this.copyInviteFallback(url, btn), // denied (permissions/insecure ctx): fallback path
+      );
+    } else {
+      this.copyInviteFallback(url, btn);
+    }
+  }
+
+  /** Pre-clipboard-era path: hidden textarea + execCommand('copy'). */
+  private copyInviteFallback(url: string, btn: HTMLButtonElement): void {
+    const ta = el('textarea', '');
+    ta.value = url;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand('copy');
+    } catch {
+      // copy unsupported — the code is still readable in the chip
+    }
+    ta.remove();
+    this.showCopied(btn);
+  }
+
+  /** Brief 'COPIED' label on the copy button. */
+  private showCopied(btn: HTMLButtonElement): void {
+    btn.textContent = 'COPIED';
+    window.clearTimeout(this.copiedTimer);
+    this.copiedTimer = window.setTimeout(() => {
+      btn.textContent = 'COPY INVITE';
+    }, 1200);
   }
 
   // ---- bot prompt (bottom center-right, non-modal) --------------------------
@@ -1159,8 +1222,12 @@ const CSS = `
 
 .fps-menus .m9-layer-chip{align-items:flex-start;justify-content:flex-start;}
 .m9-chip{margin:14px;background:rgba(var(--m9-ink-rgb),.82);border:1px solid var(--m9-metalDark);
-  border-radius:8px;padding:6px 10px;font-size:12px;letter-spacing:.05em;
+  border-radius:8px;padding:6px 10px;font-size:12px;letter-spacing:.05em;display:flex;
+  align-items:center;gap:8px;
   box-shadow:inset 0 1px 0 rgba(var(--m9-hudText-rgb),.07);}
+/* only the invite chip takes pointer events; the plain chip stays click-through */
+.m9-chip-copy{pointer-events:auto;}
+.m9-chip-btn{padding:3px 8px;font-size:10px;}
 
 .fps-menus .m9-layer-botprompt{align-items:flex-end;justify-content:flex-end;padding:0 6vw 96px;}
 .m9-botprompt{display:flex;flex-direction:column;gap:10px;pointer-events:auto;
