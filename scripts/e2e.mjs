@@ -306,12 +306,28 @@ async function aimAt(page, from, to) {
   return horiz;
 }
 
-/** Semi-auto: the server fires on the rising edge — pulse fire. */
-async function firePulse(page, holdMs = 90, gapMs = 160) {
+/**
+ * Semi-auto, frame-rate-proof: the server fires on the rising edge of the fire
+ * bit, and the bit only reaches the server when a client FRAME transmits it.
+ * A fixed wall-clock hold (70–90ms) assumed ~20fps; the AAA scene drops
+ * headless rAF to ~5fps (~180ms frames), so ~2/3 of edges were silently
+ * swallowed (evidence: ~3 accepted shots from ~16 pulses; B stays hp=100).
+ * Instead HOLD fire until the authoritative mag drops (server accepted the
+ * shot — the bit stays true across as many frames as it takes), then release
+ * for >= 1 degraded frame so the falling edge lands before the next pulse.
+ */
+async function fireOneShot(page) {
+  const before = (await fpsState(page)).mag;
   await page.evaluate(() => window.__fps.debug.press('fire', true));
-  await sleep(holdMs);
+  const t0 = Date.now();
+  for (;;) {
+    await sleep(60);
+    const s = await fpsState(page);
+    if (s !== null && s.mag < before) break; // server accepted the shot
+    if (Date.now() - t0 > 2000) break; // edge lost regardless — release, retry next pulse
+  }
   await page.evaluate(() => window.__fps.debug.press('fire', false));
-  await sleep(gapMs);
+  await sleep(300); // >= 1 frame at ~5fps so the release edge is transmitted
 }
 
 // ---- main -----------------------------------------------------------------------
@@ -417,9 +433,12 @@ async function main() {
   await shot(A, 'hud-live.png');
 
   // -- combat: A and B walk at each other (collide-and-slide rounds box corners);
-  //    once in range A plants and fires controlled semi-auto pulses, reloading as
+  //    once in range A plants and fires frame-rate-proof confirmed shots
+  //    (fireOneShot — see its note on the AAA-scene rAF collapse), reloading as
   //    needed. Firing only starts in range so 60 pistol rounds are never wasted
-  //    on walls from spawn.
+  //    on walls from spawn. Budget is 90s wall-clock: the approach is
+  //    geometry-bound (dustbowl mid walls cost 20-35s of parallel sliding) and
+  //    confirmed shots run ~2/s at degraded fps.
   const combatT0 = Date.now();
   let bHurt = false;
   let bDead = false;
@@ -465,7 +484,7 @@ async function main() {
     return dist;
   }
 
-  while (Date.now() - combatT0 < 60000) {
+  while (Date.now() - combatT0 < 90000) {
     const sa = await fpsState(A);
     const sb = await fpsState(B);
     if (!sb.alive) {
@@ -526,7 +545,7 @@ async function main() {
         continue;
       }
       await aimAt(A, sa.pos, sb.pos);
-      await firePulse(A, 70, 240); // ~3.2/s: bloom mostly recovers between shots
+      await fireOneShot(A); // ~2/s at degraded fps, every shot server-confirmed
     }
   }
   await A.evaluate(() => {
@@ -680,37 +699,72 @@ async function main() {
   // -- (19) crouch: placed before the (14) bots for the same reason as
   //    (12)/(13) — A is still alone in the public crossfire room, so the phase
   //    is warmup (a match needs 2 players), A is alive on flat spawn ground,
-  //    and the movement sim runs (bodies step in warmup/live). Measure travel
+  //    and the movement sim runs (bodies step in warmup/live). Measure SPEED
   //    standing vs crouched on the same heading; the crouch leg walks BACK
   //    (yaw + PI) along the just-proven-clear outbound path, so a wall can
   //    never shrink the crouched sample. True ratio = crouchSpeedMul 0.45
   //    (server sim must honor the bit); assert a conservative < 0.60.
-  const measureTravel = async (yaw) => {
+  //    measureSpeed: slope-based, sim-rate-proof. Wall-clock endpoint travel is
+  //    starved at degraded rAF (the AAA scene: input latency + snapshot lag eat
+  //    25-50% of a 1s leg, biasing readings LOW — walk read 0.29 vs true 0.55).
+  //    The reported pos lags by a roughly CONSTANT delay, which shifts
+  //    endpoints but NOT the slope: sample pos every 100ms over a 2s leg, trim
+  //    the 500ms input-latency head, least-squares per axis (frame quantization
+  //    at ~5fps averages out across ~15 points; sim speed changes are instant).
+  const measureSpeed = async (yaw) => {
     await A.evaluate((y) => window.__fps.debug.setLook(y, 0), yaw);
-    await sleep(150); // let the look input land before sampling pos
-    const before = (await fpsState(A)).pos;
+    await sleep(250); // let the look input land before the leg starts
     await A.evaluate(() => window.__fps.debug.setMove(0, 1));
-    await sleep(1000);
+    const t0 = Date.now();
+    const pts = [];
+    while (Date.now() - t0 < 2000) {
+      const s = await fpsState(A);
+      if (s !== null) pts.push([Date.now() - t0, s.pos[0], s.pos[2]]);
+      await sleep(100);
+    }
     await A.evaluate(() => window.__fps.debug.setMove(0, 0));
-    const after = (await fpsState(A)).pos;
-    return Math.hypot(after[0] - before[0], after[2] - before[2]);
+    const kept = pts.filter(([t]) => t >= 500); // trim the input-latency head
+    if (kept.length < 4) return 0;
+    const slope = (idx) => {
+      const n = kept.length;
+      const mt = kept.reduce((a, p) => a + p[0], 0) / n;
+      const mv = kept.reduce((a, p) => a + p[idx], 0) / n;
+      let num = 0;
+      let den = 0;
+      for (const p of kept) {
+        num += (p[0] - mt) * (p[idx] - mv);
+        den += (p[0] - mt) ** 2;
+      }
+      return den === 0 ? 0 : (num / den) * 1000; // m per second
+    };
+    return Math.hypot(slope(1), slope(2));
   };
   let crouchRatio = null;
   let crouchDetail = '';
+  let best19 = null; // [speed, yaw] — evidence for the no-heading detail
   for (const yaw of [0, Math.PI / 2, Math.PI, -Math.PI / 2]) {
     const s19 = await fpsState(A);
     if (s19 === null || (s19.phase !== 'warmup' && s19.phase !== 'live') || !s19.alive) {
       await sleep(500); // sim not stepping (or A down) — retry on the next heading
       continue;
     }
-    const standing = await measureTravel(yaw);
-    if (standing < 3) continue; // spawn faces a wall — try another heading
+    const standing = await measureSpeed(yaw);
+    if (best19 === null || standing > best19[0]) best19 = [standing, yaw];
+    if (standing < 2.0) continue; // wall-bound heading — try another
+    // adaptive gate: the absolute slope sags under load (dt-clamped prediction
+    // at ~2.5fps reads 2-3.5 m/s even on open ground), so no fixed 3.5 gate —
+    // the RATIO is load-canceling. PAIRING invariant: the modified retrace
+    // runs IMMEDIATELY, from the spot the standing leg just reached (a later
+    // re-measure can walk A into a wall and poison the pair — observed).
     await A.evaluate(() => window.__fps.debug.press('crouch', true));
-    const crouched = await measureTravel(yaw + Math.PI); // retrace the proven-clear path
+    const crouched = await measureSpeed(yaw + Math.PI); // retrace the proven-clear path
     await A.evaluate(() => window.__fps.debug.press('crouch', false));
     crouchRatio = crouched / standing;
-    crouchDetail = `standing ${standing.toFixed(2)}m vs crouched ${crouched.toFixed(2)}m — ratio ${crouchRatio.toFixed(2)} (want < 0.60; crouchSpeedMul 0.45)`;
+    crouchDetail = `standing ${standing.toFixed(2)}m/s vs crouched ${crouched.toFixed(2)}m/s — ratio ${crouchRatio.toFixed(2)} (want < 0.60; crouchSpeedMul 0.45)`;
     break;
+  }
+  if (crouchRatio === null && crouchDetail === '') {
+    crouchDetail = `no clear heading (best=${best19 === null ? 'none' : `${best19[0].toFixed(2)}m/s`})`;
   }
   await A.evaluate(() => window.__fps.debug.press('crouch', false)); // never leak the bit into (14)+
   check(
@@ -729,20 +783,26 @@ async function main() {
   //    the spec band: walked = 45..70% of standing.
   let walkRatio = null;
   let walkDetail = '';
+  let best23 = null; // [speed, yaw] — evidence for the no-heading detail
   for (const yaw of [0, Math.PI / 2, Math.PI, -Math.PI / 2]) {
     const s23 = await fpsState(A);
     if (s23 === null || (s23.phase !== 'warmup' && s23.phase !== 'live') || !s23.alive) {
       await sleep(500); // sim not stepping (or A down) — retry on the next heading
       continue;
     }
-    const standing = await measureTravel(yaw);
-    if (standing < 3) continue; // spawn faces a wall — try another heading
+    const standing = await measureSpeed(yaw);
+    if (best23 === null || standing > best23[0]) best23 = [standing, yaw];
+    if (standing < 2.0) continue; // wall-bound heading — try another
+    // same adaptive gate + immediate pairing as (19)
     await A.evaluate(() => window.__fps.debug.press('walk', true));
-    const walked = await measureTravel(yaw + Math.PI); // retrace the proven-clear path
+    const walked = await measureSpeed(yaw + Math.PI); // retrace the proven-clear path
     await A.evaluate(() => window.__fps.debug.press('walk', false));
     walkRatio = walked / standing;
-    walkDetail = `standing ${standing.toFixed(2)}m vs walked ${walked.toFixed(2)}m — ratio ${walkRatio.toFixed(2)} (want 0.45..0.70; walkSpeedMul 0.55)`;
+    walkDetail = `standing ${standing.toFixed(2)}m/s vs walked ${walked.toFixed(2)}m/s — ratio ${walkRatio.toFixed(2)} (want 0.45..0.70; walkSpeedMul 0.55)`;
     break;
+  }
+  if (walkRatio === null && walkDetail === '') {
+    walkDetail = `no clear heading (best=${best23 === null ? 'none' : `${best23[0].toFixed(2)}m/s`})`;
   }
   await A.evaluate(() => window.__fps.debug.press('walk', false)); // never leak the bit into (14)+
   check(
@@ -973,17 +1033,69 @@ async function main() {
   }
   check('solo bot prompt: visible when alone; ADD 3 BOTS adds 3 players and hides it', ok20, detail20);
 
-  // -- (22) spectate visual sanity: the (20) room is now a 2v2 (A + 3 bots;
-  //    pickTeam pairs 4 players 2v2, so A always has ONE bot teammate).
+  // -- (22 setup) shape A's team to A + 2 bots: addBot lands on the smaller
+  //    team, ties are a server coin flip — re-roll bad flips (removeBot is
+  //    LIFO) until the scoreboard shows A's team at 3. WHY: in a 2v2 the lone
+  //    teammate bot loses its 1v2 before A reaches mid, so A's death ENDS the
+  //    round with no alive teammate (observed: 5 deaths, all phase=roundEnd,
+  //    spectateTarget null, chip hidden). With 2 teammates A's death leaves
+  //    one alive -> spectateTarget set. Team sizes are read off the
+  //    scoreboard DOM (.m9-table per team, one .m9-row per player + 1 col head).
+  const aTeam22 = (await fpsState(A)).team;
+  const myTeamSize22 = async () => {
+    // scoreboard(down) is a ONE-SHOT render (clientGame.scoreboard) — it does
+    // NOT rebuild per snapshot, so re-render before every read or the sizes go
+    // stale (observed: size pinned at 2, every honest flip judged 'bad').
+    await A.evaluate(() => window.__fps.debug.scoreboard(true));
+    const sizes = await A.evaluate(() => {
+      const out = { T: 0, CT: 0 };
+      for (const w of document.querySelectorAll('.fps-menus .m9-layer-score .m9-table')) {
+        const head = w.querySelector('.m9-table-head')?.textContent ?? '';
+        const team = head.startsWith('CT') ? 'CT' : 'T';
+        out[team] = w.querySelectorAll('.m9-row').length - 1; // minus the column-head row
+      }
+      return out;
+    });
+    return sizes[aTeam22] ?? 0;
+  };
+  for (let tries = 0; tries < 6; tries++) {
+    await sleep(800); // roster snapshot + scoreboard rebuild settle
+    if ((await myTeamSize22()) >= 3) break;
+    const beforeAdd = (await fpsState(A)).players;
+    await A.evaluate(() => window.__fps.addBot());
+    await waitFor(async () => {
+      const s = await fpsState(A);
+      return s !== null && s.players === beforeAdd + 1 ? s : null;
+    }, 5000, 'shaping addBot lands').catch(() => null);
+    await sleep(800);
+    if ((await myTeamSize22()) >= 3) break;
+    // bad flip (the bot went to the enemy team): removeBot is LIFO — undo, re-roll
+    const beforeRm = (await fpsState(A)).players;
+    await A.evaluate(() => window.__fps.removeBot());
+    await waitFor(async () => {
+      const s = await fpsState(A);
+      return s !== null && s.players === beforeRm - 1 ? s : null;
+    }, 5000, 'shaping removeBot lands').catch(() => null);
+  }
+  const teamSize22 = await myTeamSize22();
+  await A.evaluate(() => window.__fps.debug.scoreboard(false)); // closed BEFORE the blackout scan
+  console.log(`spectate22 team shaping: A team size=${teamSize22} (want 3)`);
+
+  // -- (22) spectate visual sanity: the setup above shaped the (20) room to a
+  //    3v2 (A + 2 bot teammates; re-rolled coin flips — in a plain 2v2 the lone
+  //    teammate dies its 1v2 first and A's death never gets a spectateTarget).
   //    DEVIATION from the letter of the spec ("B's chip"): the chip can NEVER
   //    appear for B in the private-room 1v1 — the server assigns spectateTarget
   //    as the first alive TEAMMATE (game.ts updateSpectators), so a lone dead
   //    player gets null and the chip stays hidden (see death-spectate.png:
   //    corpse cam, no chip). A's death in this 2v2 is the contract-conformant
-  //    way to observe 'SPECTATING X'. A rushes (defenseless) so it dies EARLY —
-  //    a stationary A is killed last, after the teammate, and never gets a
-  //    target. The chip (#hud .fh-spec, hud.ts) is polled across every death
-  //    window for 150s; once 'SPECTATING <name>' shows, assert nothing blacks
+  //    way to observe 'SPECTATING X'. A is herded INTO THE ENEMY HALF
+  //    (defenseless, target side latched per life) so it dies at the START of
+  //    the fight while every teammate is alive — mid-standing A survives whole
+  //    rounds, and late deaths can follow a teammate's (null target). Bots
+  //    engage only within 45m awareness. The chip (#hud .fh-spec, hud.ts) is
+  //    polled across every death
+  //    window for 240s; once 'SPECTATING <name>' shows, assert nothing blacks
   //    out the view — no #hud/#menu element covering >40% of the viewport with
   //    a near-opaque (alpha >= 0.5) black-ish non-gradient background
   //    (body/#app are the page's opaque ink backdrop by design; the .fh-vig
@@ -996,11 +1108,28 @@ async function main() {
   let specDetail = '';
   let chipSeen = null;
   let blackouts = [];
-  await A.evaluate(() => window.__fps.debug.setMove(0, 1)); // rush; zeroed below
-  const specDeadline = Date.now() + 150000;
+  const specDeadline = Date.now() + 240000;
+  let lastSpecLog = 0;
+  let rushTargetZ = null; // latched per life: the ENEMY side of the map
   while (Date.now() < specDeadline && chipSeen === null) {
     const s = await fpsState(A);
+    if (s !== null && s.alive) {
+      // Push A into the ENEMY half, not just mid: rounds where A stands at mid
+      // end with the teammates winning before A is touched (no death window at
+      // all — observed: 1 death in 180s), and mid-fight deaths can come after
+      // a teammate fell (null target). Dying deep in the enemy rush happens at
+      // the START of the fight, while every teammate is still alive. Bots only
+      // engage within 45m awareness, so A must cross the map. The target side
+      // is latched per life (A respawns on its own side each round).
+      if (rushTargetZ === null) rushTargetZ = s.pos[2] >= 0 ? -23 : 23;
+      const yaw = yawTo(s.pos[0], s.pos[2], 0, rushTargetZ);
+      await A.evaluate((y) => {
+        window.__fps.debug.setLook(y, 0);
+        window.__fps.debug.setMove(0, 1);
+      }, yaw);
+    }
     if (s !== null && !s.alive) {
+      rushTargetZ = null; // relatch on the next respawn
       const buyOpen22 = await A.evaluate(() => {
         const el = document.querySelector('.fps-menus .m9-layer-buy');
         return el !== null && getComputedStyle(el).display !== 'none';
@@ -1020,6 +1149,10 @@ async function main() {
           visible: cs.display !== 'none' && r.width > 0 && r.height > 0,
         };
       });
+      if (Date.now() - lastSpecLog > 4000) {
+        lastSpecLog = Date.now(); // evidence for future flakes (death windows seen)
+        console.log(`spectate22: A dead phase=${s.phase} chip=${JSON.stringify(chip)}`);
+      }
       if (chip !== null && chip.visible && chip.text.toUpperCase().includes('SPECTATING')) {
         chipSeen = chip; // ~within one poll (<=250ms) of the death snapshot
         blackouts = await A.evaluate(() => {
@@ -1047,11 +1180,11 @@ async function main() {
         });
       }
     }
-    await sleep(200);
+    await sleep(150);
   }
   await A.evaluate(() => window.__fps.debug.setMove(0, 0));
   if (chipSeen === null) {
-    specDetail = 'no SPECTATING chip observed across 150s of death windows';
+    specDetail = 'no SPECTATING chip observed across 240s of death windows';
   } else {
     specOk = blackouts.length === 0;
     specDetail =
