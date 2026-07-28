@@ -14,6 +14,7 @@
 //   resize(): void                       — forwards to SceneRig.resize()
 //   buy(w): void / reload(): void        — send the C2S (menu onBuy + e2e debug)
 //   addBot(): void / removeBot(): void   — send the C2S (menu onAddBot/onRemoveBot)
+//   removeAllBots(): number              — kick every bot (menu onRemoveAllBots + console)
 //   switchTeam(team): void               — send the C2S (menu onSwitchTeam + e2e debug)
 //   debugSetLook(yaw, pitch): void       — writes InputController yaw/pitch
 //   debugSetMove(x, z): void             — overrides move axes (0,0 releases)
@@ -319,6 +320,19 @@ export class ClientGame {
     this.conn?.send({ t: 'remove_bot' });
   }
 
+  /**
+   * Menu onRemoveAllBots + console 'removebot all': kick every bot. Sends one
+   * remove_bot per live bot (the server kicks most-recent-first); the roster
+   * — and with it botCount() — only shrinks as the server confirms each kick.
+   * Returns how many kicks were sent.
+   */
+  removeAllBots(): number {
+    if (this.world === null) return 0; // in-room only
+    const n = this.botCount();
+    for (let i = 0; i < n; i++) this.removeBot();
+    return n;
+  }
+
   /** Menu onSwitchTeam + e2e debug: request a team change; server guards balance. */
   switchTeam(team: Team): void {
     if (this.world === null) return; // in-room only
@@ -392,7 +406,7 @@ export class ClientGame {
       case '':
         return "type 'help' for commands";
       case 'help':
-        return 'help · addbot [n] / bot_add [n] · removebot / bot_kick · jointeam t|ct · buy <weapon> · kill';
+        return 'help · addbot [n] / bot_add [n] · removebot [all] / bot_kick [all] · jointeam t|ct · buy <weapon> · kill';
       case 'addbot':
       case 'bot_add': {
         if (this.world === null) return 'not in a room';
@@ -407,6 +421,10 @@ export class ClientGame {
       case 'removebot':
       case 'bot_kick': {
         if (this.world === null) return 'not in a room';
+        if (arg !== undefined) {
+          if (arg.toLowerCase() !== 'all') return `bad argument '${arg}' — usage: removebot [all]`;
+          return `removed ${this.removeAllBots()} bots`;
+        }
         this.removeBot();
         return 'ok';
       }

@@ -12,6 +12,7 @@
 //   game.buy(w: WeaponId): void              — send C2S buy (menu onBuy + debug)
 //   game.addBot(): void                      — send C2S add_bot (menu onAddBot + debug)
 //   game.removeBot(): void                   — send C2S remove_bot (menu onRemoveBot + debug)
+//   game.removeAllBots(): number             — kick every bot (menu onRemoveAllBots + console)
 //   game.switchTeam(team: Team): void        — send C2S switch_team (menu onSwitchTeam + debug)
 //   game.reload(): void                      — send C2S reload (debug)
 //   game.debugSetLook(yaw, pitch): void      — writes InputController yaw/pitch
@@ -137,6 +138,7 @@ function boot(): void {
     onBuy: (weapon) => game?.buy(weapon),
     onAddBot: () => game?.addBot(),
     onRemoveBot: () => game?.removeBot(),
+    onRemoveAllBots: () => game?.removeAllBots(),
     onSwitchTeam: (team) => game?.switchTeam(team),
     onResume: () => {
       // re-request pointer lock on the canvas directly; may reject when the

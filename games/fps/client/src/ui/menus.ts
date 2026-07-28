@@ -26,6 +26,7 @@ export interface MenuCallbacks {
   onBuy(weapon: WeaponId): void;
   onAddBot(): void;
   onRemoveBot(): void;
+  onRemoveAllBots(): void;
   onSwitchTeam(team: Team): void; // request team change (server guards balance)
   onResume(): void; // re-request pointer lock
   onLeave(): void; // leave room -> main menu
@@ -123,6 +124,7 @@ export class Menus {
 
   private nameInput: HTMLInputElement | null = null;
   private removeBotBtn: HTMLButtonElement | null = null;
+  private removeAllBotsBtn: HTMLButtonElement | null = null;
   private teamBtns: Record<Team, { btn: HTMLButtonElement; tag: HTMLElement }> | null = null;
   private roomListEl: HTMLElement | null = null;
   private roomReq = 0; // stale-guard for async room-list refreshes
@@ -668,6 +670,12 @@ export class Menus {
     removeBot.disabled = true;
     removeBot.addEventListener('click', () => this.cb.onRemoveBot());
     this.removeBotBtn = removeBot;
+    // muted-danger variant: destructive like LEAVE ROOM but not its visual twin
+    const removeAllBots = el('button', 'm9-btn m9-btn-danger m9-wide', 'REMOVE ALL BOTS');
+    removeAllBots.type = 'button';
+    removeAllBots.disabled = true;
+    removeAllBots.addEventListener('click', () => this.cb.onRemoveAllBots()); // menu stays open; caller re-shows
+    this.removeAllBotsBtn = removeAllBots;
     // team switch: menu stays open; caller re-shows with the updated team
     const joinT = this.buildTeamBtn('T', 'JOIN T', 'm9-btn-t');
     const joinCT = this.buildTeamBtn('CT', 'JOIN CT', 'm9-btn-ct');
@@ -681,6 +689,7 @@ export class Menus {
     panel.appendChild(resume);
     panel.appendChild(addBot);
     panel.appendChild(removeBot);
+    panel.appendChild(removeAllBots);
     panel.appendChild(joinT.btn);
     panel.appendChild(joinCT.btn);
     panel.appendChild(leave);
@@ -704,6 +713,7 @@ export class Menus {
 
   showPause(botCount: number, youTeam: Team | null): void {
     if (this.removeBotBtn !== null) this.removeBotBtn.disabled = botCount <= 0;
+    if (this.removeAllBotsBtn !== null) this.removeAllBotsBtn.disabled = botCount <= 0;
     if (this.teamBtns !== null) {
       for (const team of ['T', 'CT'] as const) {
         const { btn, tag } = this.teamBtns[team];
