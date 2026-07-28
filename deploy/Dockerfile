@@ -19,7 +19,9 @@ COPY games/bank/client/package.json games/bank/client/package.json
 COPY games/kart/shared/package.json games/kart/shared/package.json
 COPY games/kart/server/package.json games/kart/server/package.json
 COPY games/kart/client/package.json games/kart/client/package.json
-RUN npm ci
+# npm install (not ci): the committed lock skews across platforms (macOS vs linux
+# optional deps) and npm versions — let the image resolve on-platform.
+RUN npm install
 COPY . .
 RUN npm run build && npm run build -w @bank/client && npm run build -w @kart/client
 
@@ -41,7 +43,7 @@ COPY games/bank/client/package.json games/bank/client/package.json
 COPY games/kart/shared/package.json games/kart/shared/package.json
 COPY games/kart/server/package.json games/kart/server/package.json
 COPY games/kart/client/package.json games/kart/client/package.json
-RUN npm ci --omit=dev
+RUN npm install --omit=dev
 
 # ---- runtime. Each game module resolves its clientDist as
 # ../../../games/<id>/client/dist relative to platform/server/dist (bundled
