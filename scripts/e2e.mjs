@@ -18,7 +18,10 @@
 // quick-switch (buy smg -> Digit2 pistol -> KeyQ back to smg, on a third
 // shell page with the pointer-lock observable stubbed — real lock is denied
 // headless), and the developer console (debug.console('addbot 2') adds 2
-// players; an unknown command returns an error string).
+// players; an unknown command returns an error string), the kevlar gear buy
+// (console 'buy kevlar' in a freeze/buy window sets armor to 100), and
+// killbots (console 'killbots' kills every bot in place — roster deaths
+// increment, player count unchanged, bots revive at full hp).
 //
 // Exit 0 only if every assertion passes AND zero page/console/network errors
 // were seen on either page (benign favicon noise excluded).
@@ -37,7 +40,7 @@ const SHOTS_DIR = path.join(ROOT, 'screenshots');
 const MAP_IDS = ['dustbowl', 'crossfire', 'office', 'frostbite', 'urbana', 'bunker'];
 
 const STATE_FIELDS = [
-  'phase', 'roomId', 'code', 'mapId', 'team', 'hp', 'alive', 'pos', 'players',
+  'phase', 'roomId', 'code', 'mapId', 'team', 'hp', 'armor', 'alive', 'pos', 'players',
   'rosterSize', 'ping', 'money', 'mag', 'reserve', 'round', 'scoreT', 'scoreCT', 'weapon',
 ];
 
@@ -590,7 +593,7 @@ async function main() {
   const sFinal = await fpsState(A);
   const missing = STATE_FIELDS.filter((f) => !(f in sFinal));
   const posOk = Array.isArray(sFinal.pos) && sFinal.pos.length === 3 && sFinal.pos.every((v) => Number.isFinite(v));
-  check('state() exposes all 18 contract fields', missing.length === 0 && posOk, missing.length ? `missing: ${missing}` : 'all present, pos finite [x,y,z]');
+  check('state() exposes all 19 contract fields', missing.length === 0 && posOk, missing.length ? `missing: ${missing}` : 'all present, pos finite [x,y,z]');
 
   // -- map tour: 3 vantage shots per map on page A ---------------------------------------
   for (const mapId of MAP_IDS) {
@@ -1335,6 +1338,129 @@ async function main() {
     conDetail = err instanceof Error ? err.message : String(err);
   }
   check('console: addbot 2 adds 2 players; unknown command returns an error string', conOk, conDetail);
+
+  // -- (26)/(27) shared setup: C takes a FRESH private crossfire room (the
+  //    (11) prevRoom pattern; the (24)/(25) room's 3 older bots would muddy
+  //    the per-bot roster assertions) and adds exactly 2 bots. The two add_bot
+  //    frames + the kill_bots one go out in ONE evaluate: ws delivery is FIFO
+  //    and the room handles C2S on receipt (game.ts handleMessage), so both
+  //    bots exist before kill_bots runs, and the room is still in warmup at
+  //    that instant (advancePhase starts the match next tick, when it sees
+  //    players >= MIN_PLAYERS_FOR_MATCH) — the bots' first deaths take the
+  //    warmup death path; the round-1 beginFreeze then revives them.
+  let gearOk = false;
+  let gearDetail = '';
+  let botsOk = false;
+  let botsDetail = '';
+  try {
+    if (C === null) throw new Error('page C unavailable (24 failed at launch)');
+    const prevRoom27 = (await fpsState(C)).roomId;
+    await C.evaluate(() => window.__fps.createPrivate('Carol', 'crossfire'));
+    await waitFor(async () => {
+      const s = await fpsState(C);
+      return s !== null && s.roomId !== null && s.roomId !== prevRoom27 && s.players === 1 ? s : null;
+    }, 15000, 'C solo in a fresh private crossfire room');
+    await C.evaluate(() => {
+      window.__fps.addBot();
+      window.__fps.addBot();
+      window.__fps.debug.console('killbots'); // (27) first wave — see below
+    });
+
+    // -- (26) kevlar: the round-1 freeze (entered the tick after the bots
+    //    join) has ECONOMY.start (800) >= kevlarPrice (650) — no round needs
+    //    to complete. Freeze-only window: C is guaranteed alive there (in
+    //    live the bots can frag C, and the dead cannot buy). armor rides the
+    //    e2e state() surface (main.ts mirrors YouSnap.armor, set server-side
+    //    per the contract's armor rules). If the round-1 freeze is somehow
+    //    missed (a >3s stall), the next freeze is one bot-paced round out —
+    //    hence the (24)-style wide timeout.
+    await waitFor(async () => {
+      const s = await fpsState(C);
+      return s !== null && s.phase === 'freeze' && s.money >= 650 ? s : null;
+    }, 120000, 'freeze with money >= 650 for the kevlar buy');
+    const money26 = (await fpsState(C)).money;
+    await C.evaluate(() => window.__fps.debug.console('buy kevlar'));
+    const armored = await waitFor(async () => {
+      const s = await fpsState(C);
+      return s !== null && s.armor === 100 ? s : null;
+    }, 5000, 'armor === 100 within 5s of console buy kevlar');
+    gearOk = true;
+    gearDetail = `$${money26} -> $${armored.money}, armor=${armored.armor} (phase=${armored.phase})`;
+  } catch (err) {
+    gearDetail = err instanceof Error ? err.message : String(err);
+  }
+  check("kevlar: console 'buy kevlar' in a freeze/buy window sets armor to 100", gearOk, gearDetail);
+
+  // -- (27) killbots: both bots die IN PLACE (kill event with killerId null)
+  //    yet keep their roster slots — players/rosterSize stay 3, unlike
+  //    removeBot. Observable: the roster K/D is tracked client-side per kill
+  //    event, so the scoreboard D column IS the roster-entry view (read off
+  //    the DOM like (22), re-rendered before every read). REVIVE/HP PROOF BY
+  //    PROXY: no client surface carries a REMOTE player's hp or alive flag
+  //    (YouSnap is self-only; RosterEntry has none), and a 3-player room can
+  //    never sit in warmup for the 2s warmup respawn timer (the match starts
+  //    one tick after the second bot joins — the revive actually lands via
+  //    beginFreeze's placeAtSpawn, the same full-hp path the timer uses). So
+  //    'hp resets to 100' is proven structurally: handleKillBots SKIPS
+  //    already-dead bots, meaning a second wave that increments deaths again
+  //    is only possible after a revive, and placeAtSpawn (the only revive
+  //    path) heals to PLAYER.maxHp.
+  try {
+    if (C === null) throw new Error('page C unavailable (24 failed at launch)');
+    // bot rows off the scoreboard DOM: .m9-bot-tag marks them; cells per row
+    // are dot, name, K, D, HS, $ (menus.ts buildTeamTable).
+    const botDeaths = async () => {
+      await C.evaluate(() => window.__fps.debug.scoreboard(true)); // one-shot render — re-issue per read
+      return C.evaluate(() => {
+        const out = [];
+        for (const row of document.querySelectorAll('.fps-menus .m9-layer-score .m9-row')) {
+          if (row.querySelector('.m9-bot-tag') === null) continue; // bot rows only
+          const cells = row.querySelectorAll(':scope > span');
+          const nameCell = row.querySelector('.m9-c-name');
+          out.push({
+            name: (nameCell !== null && nameCell.firstChild !== null
+              ? nameCell.firstChild.textContent ?? '?'
+              : '?').trim(),
+            deaths: cells.length >= 4 ? Number(cells[3].textContent) : NaN,
+          });
+        }
+        return out;
+      });
+    };
+    // first wave (the setup burst): both bots dead in place, count unchanged.
+    const dead27 = await waitFor(async () => {
+      const s = await fpsState(C);
+      if (s === null || s.players !== 3 || s.rosterSize !== 3) return null;
+      const rows = await botDeaths();
+      return rows.length === 2 && rows.every((r) => r.deaths >= 1) ? { s, rows } : null;
+    }, 10000, 'both bots dead in place (D >= 1) with players unchanged at 3');
+    // second wave: fire killbots whenever the bots may be alive again; dead
+    // bots are skipped server-side, so a registering wave proves the revive.
+    let revived27 = null;
+    const t27 = Date.now();
+    while (Date.now() - t27 < 30000 && revived27 === null) {
+      await C.evaluate(() => window.__fps.debug.console('killbots'));
+      try {
+        revived27 = await waitFor(async () => {
+          const rows = await botDeaths();
+          return rows.length === 2 && rows.every((r) => r.deaths >= 2) ? rows : null;
+        }, 4000, 'second kill wave (D >= 2) — proves the bots revived at full hp');
+      } catch {
+        // bots still dead (revive lands at the next beginFreeze) — re-fire
+      }
+    }
+    const still27 = await fpsState(C);
+    botsOk = revived27 !== null && still27.players === 3 && still27.rosterSize === 3;
+    botsDetail =
+      `wave1: ${dead27.rows.map((r) => `${r.name} D${r.deaths}`).join(', ')} players=${dead27.s.players}` +
+      (revived27 !== null
+        ? `; wave2: ${revived27.map((r) => `${r.name} D${r.deaths}`).join(', ')} (revived — 2nd death impossible while dead), players still ${still27.players}`
+        : '; no second kill wave within 30s — bots never revived');
+  } catch (err) {
+    botsDetail = err instanceof Error ? err.message : String(err);
+  }
+  if (C !== null) await C.evaluate(() => window.__fps.debug.scoreboard(false)).catch(() => {});
+  check('killbots: bots die in place (players unchanged) and revive to full hp', botsOk, botsDetail);
 
   // -- error-banner DOM check on C (A/B were probed before their early close) --
   if (C !== null) {

@@ -55,6 +55,13 @@ export const ROUNDS = {
   spawnProtection: 1.5, // s of invulnerability after any (re)spawn
 } as const;
 
+export const GEAR = {
+  kevlarPrice: 650, // CS kevlar vest
+  helmetPrice: 1000, // CS kevlar + helmet total (requires the vest)
+  armorStart: 100, // armor points granted by the vest
+  absorb: 0.5, // fraction of damage the armor soaks (rest hits hp; armor depletes by the soaked part)
+} as const;
+
 export interface WeaponDef {
   id: WeaponId;
   name: string; // display name

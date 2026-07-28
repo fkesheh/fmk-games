@@ -153,6 +153,17 @@ Behavioral invariants (S2, uses S3 helpers):
   resets to knife+pistol. At every freeze (round start), ALL owned weapons of every player refill to
   default mag+reserve for free. Survivors keep their primary into the next round. Warmup deaths
   change nothing (owned list persists).
+- **Armor / gear (frozen):** players may buy `kevlar` ($650 → armor = 100, `hasKevlar = true`) and
+  `helmet` ($1000, requires hasKevlar) via `buy_gear` in the same canBuy window. Damage model:
+  with armor > 0, body shots split — hp loses round(dmg × (1 − GEAR.absorb)) and armor loses
+  round(dmg × GEAR.absorb) (if armor < the soaked part, the remainder rolls into hp); armor never
+  blocks without points left. Headshots BYPASS armor entirely unless the victim owns a helmet
+  (helmet → headshots absorb the same way). Death drops armor and helmet (like primaries); round
+  start does NOT refill armor (survivors keep what's left). `buy_result` covers gear buys
+  (weapon field null, item reported in reason on failure: 'buy time expired' / 'insufficient
+  funds' / 'already owned' (helmet) / 'requires kevlar' (helmet without vest)). `kill_bots` kills
+  every bot in place through the normal death path (killerId null; warmup respawn rules apply),
+  without removing them from the room.
 - **Stats (frozen):** every kill with headshot=true increments the killer's `headshots` (roster).
   Multikill streak: a kill within MULTIKILL_WINDOW seconds of the killer's previous kill increments
   the streak (dying or the window lapsing resets it); on reaching streak 2/3/4/5+ broadcast

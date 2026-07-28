@@ -69,6 +69,11 @@ export function parseC2S(raw: unknown): C2S | null {
     case 'buy':
       if (!WEAPON_IDS.includes(raw.weapon as WeaponId)) return null;
       return { t: 'buy', weapon: raw.weapon as WeaponId };
+    case 'buy_gear':
+      if (raw.item !== 'kevlar' && raw.item !== 'helmet') return null;
+      return { t: 'buy_gear', item: raw.item };
+    case 'kill_bots':
+      return { t: 'kill_bots' };
     case 'ping':
       if (!num(raw.ts)) return null;
       return { t: 'ping', ts: raw.ts };

@@ -5,8 +5,9 @@
 // on the root element. Weapon silhouettes come from hud.ts's procedural
 // weaponIcon() factory (shared with the killfeed).
 // ============================================================================
-import { MAP_LIST, MAPS, PALETTE, PRIVATE_CODE_LEN, WEAPONS } from '@fps/shared';
+import { GEAR, MAP_LIST, MAPS, PALETTE, PRIVATE_CODE_LEN, WEAPONS } from '@fps/shared';
 import type {
+  GearId,
   MapId,
   PlayerId,
   RoomInfo,
@@ -24,6 +25,7 @@ export interface MenuCallbacks {
   onJoinPrivate(name: string, code: string): void;
   onListRooms(): Promise<RoomInfo[]>;
   onBuy(weapon: WeaponId): void;
+  onBuyGear(item: GearId): void; // CS gear: kevlar vest / helmet (buy_gear message)
   onAddBot(): void;
   onRemoveBot(): void;
   onRemoveAllBots(): void;
@@ -53,6 +55,30 @@ const ROLES: Record<WeaponId, string> = {
   rifle: 'The default competitive gun — 1-tap headshot at all ranges.',
   sniper: '1-shot body kill, slowest handling; scope to be lethal.',
 };
+
+// buyable CS gear (armor); prices and absorb values come from the frozen GEAR config
+const GEAR_ITEMS: readonly GearId[] = ['kevlar', 'helmet'];
+
+const GEAR_NAME: Record<GearId, string> = {
+  kevlar: 'KEVLAR VEST',
+  helmet: 'KEVLAR + HELMET',
+};
+
+const GEAR_PRICE: Record<GearId, number> = {
+  kevlar: GEAR.kevlarPrice,
+  helmet: GEAR.helmetPrice,
+};
+
+const GEAR_ROLE: Record<GearId, string> = {
+  kevlar: `Soaks ${Math.round(GEAR.absorb * 100)}% of body-shot damage until depleted.`,
+  helmet: 'Extends the armor to headshots — requires the vest.',
+};
+
+// gear state the caller (C11) derives from the YouSnap armor/helmet fields
+export interface GearState {
+  hasKevlar: boolean;
+  hasHelmet: boolean;
+}
 
 const PHASE_LABEL: Record<RoomPhase, string> = {
   warmup: 'Warmup',
@@ -102,6 +128,70 @@ function hexRgb(hex: string): string {
 // '#rrggbb' + alpha -> 'rgba(r,g,b,a)' — still a PALETTE color, just translucent
 function rgba(hex: string, a: number): string {
   return `rgba(${hexRgb(hex)},${a})`;
+}
+
+// ---- gear glyphs (same procedural style as hud.ts's weaponIcon) -------------
+const GEAR_GLYPH_W = 44;
+const GEAR_GLYPH_H = 18;
+const GEAR_GLYPH_SS = 2; // supersample factor — crisp on retina
+const GEAR_THICK_W = 1.08;
+const GEAR_THICK_H = 1.24;
+
+type GearRects = ReadonlyArray<readonly [number, number, number, number]>;
+
+// silhouettes on the same 44x18 grid: body in hudText, detail in paper
+const GEAR_GLYPH_BODY: Record<GearId, GearRects> = {
+  kevlar: [
+    // shield: wide top tapering to a point
+    [13, 2.5, 18, 3.5], // shoulders
+    [15, 6, 14, 4], // upper body
+    [17, 10, 10, 3], // mid taper
+    [19, 13, 6, 2.5], // lower taper
+    [21, 15.5, 2, 1.5], // point
+  ],
+  helmet: [
+    [14, 3.5, 16, 6], // dome
+    [11, 9.5, 22, 2.5], // brim
+    [12, 11.5, 3, 3], // left ear cover
+    [29, 11.5, 3, 3], // right ear cover
+  ],
+};
+
+const GEAR_GLYPH_DETAIL: Record<GearId, GearRects> = {
+  kevlar: [
+    [21, 4, 2, 10], // center rib
+  ],
+  helmet: [
+    [16, 6.5, 12, 1.6], // visor slit
+  ],
+};
+
+/**
+ * Procedural silhouette icon for a gear item, mirroring hud.ts's weaponIcon():
+ * same logical 44x18 grid, same supersampled backing store, same center-
+ * expanded rects so the glyphs sit naturally beside the weapon cards.
+ */
+function gearIcon(item: GearId, scale = 1): HTMLCanvasElement {
+  const c = document.createElement('canvas');
+  c.width = GEAR_GLYPH_W * GEAR_GLYPH_SS * scale;
+  c.height = GEAR_GLYPH_H * GEAR_GLYPH_SS * scale;
+  c.style.width = `${GEAR_GLYPH_W * scale}px`;
+  c.style.height = `${GEAR_GLYPH_H * scale}px`;
+  const ctx = c.getContext('2d');
+  if (ctx === null) return c; // 2d unavailable — empty icon, layout still holds
+  ctx.scale(GEAR_GLYPH_SS * scale, GEAR_GLYPH_SS * scale);
+  const fill = (rects: GearRects): void => {
+    for (const [x, y, w, h] of rects) {
+      const nw = w * GEAR_THICK_W;
+      const nh = h * GEAR_THICK_H;
+      ctx.fillRect(x - (nw - w) / 2, y - (nh - h) / 2, nw, nh);
+    }
+  };
+  ctx.fillStyle = PALETTE.paper; // bright detail — reads small
+  fill(GEAR_GLYPH_DETAIL[item]);
+  ctx.fillStyle = PALETTE.hudText;
+  fill(GEAR_GLYPH_BODY[item]);
+  return c;
 }
 
 function byScore(a: RosterEntry, b: RosterEntry): number {
@@ -434,7 +524,7 @@ export class Menus {
   }
 
   // ---- buy menu ---------------------------------------------------------------
-  showBuy(money: number, owned: WeaponId[], canBuy: boolean): void {
+  showBuy(money: number, owned: WeaponId[], canBuy: boolean, gear?: GearState): void {
     this.showExclusive('buy');
     const layer = this.layers.buy;
     layer.textContent = '';
@@ -455,6 +545,17 @@ export class Menus {
       grid.appendChild(this.buildBuyCard(id, money, owned.includes(id), canBuy));
     }
     panel.appendChild(grid);
+
+    // CS gear (armor) — kevlar vest + helmet, below the weapon cards
+    const gs: GearState = gear ?? { hasKevlar: false, hasHelmet: false };
+    const gearSec = el('div', 'm9-gear-sec');
+    gearSec.appendChild(el('h2', 'm9-sec-title', 'GEAR'));
+    const gearGrid = el('div', 'm9-gear-grid');
+    for (const item of GEAR_ITEMS) {
+      gearGrid.appendChild(this.buildGearCard(item, money, gs, canBuy));
+    }
+    gearSec.appendChild(gearGrid);
+    panel.appendChild(gearSec);
 
     const issued = el('div', 'm9-issued');
     for (const id of ['knife', 'pistol'] as const) {
@@ -516,6 +617,64 @@ export class Menus {
     card.addEventListener('click', () => {
       if (isOwned || off) return;
       this.cb.onBuy(id); // menu stays open; caller re-shows with updated money
+    });
+    return card;
+  }
+
+  private buildGearCard(item: GearId, money: number, gear: GearState, canBuy: boolean): HTMLElement {
+    const price = GEAR_PRICE[item];
+    const isOwned = item === 'kevlar' ? gear.hasKevlar : gear.hasHelmet;
+    const needsVest = item === 'helmet' && !gear.hasKevlar;
+    const affordable = money >= price;
+    const off = !isOwned && (needsVest || !affordable || !canBuy); // disabled at 40% opacity
+
+    const card = el('button', 'm9-card');
+    card.type = 'button';
+    if (isOwned) card.classList.add('m9-owned');
+    if (off) card.classList.add('m9-off');
+
+    // procedural silhouette, same glyph family as the weapon cards (2x size)
+    const iconWrap = el('div', 'm9-card-icon');
+    const icon = gearIcon(item, 2);
+    icon.setAttribute('role', 'img');
+    icon.setAttribute('aria-label', GEAR_NAME[item]);
+    iconWrap.appendChild(icon);
+    card.appendChild(iconWrap);
+
+    const top = el('div', 'm9-card-top');
+    top.appendChild(el('span', 'm9-card-name', GEAR_NAME[item]));
+    top.appendChild(el('span', 'm9-card-price', `$${price}`));
+    card.appendChild(top);
+
+    card.appendChild(
+      el(
+        'div',
+        'm9-card-stats',
+        item === 'kevlar'
+          ? `ARMOR ${GEAR.armorStart} · ABSORBS ${Math.round(GEAR.absorb * 100)}%`
+          : 'HEAD PROTECTION',
+      ),
+    );
+    card.appendChild(el('div', 'm9-card-role', GEAR_ROLE[item]));
+
+    let tag = '';
+    let bad = false;
+    if (isOwned) tag = 'OWNED';
+    else if (needsVest) {
+      tag = 'REQUIRES VEST';
+      bad = true;
+    } else if (!canBuy) {
+      tag = 'CLOSED';
+      bad = true;
+    } else if (!affordable) {
+      tag = 'TOO EXPENSIVE';
+      bad = true;
+    }
+    if (tag !== '') card.appendChild(el('div', bad ? 'm9-tag m9-bad' : 'm9-tag', tag));
+
+    card.addEventListener('click', () => {
+      if (isOwned || off) return;
+      this.cb.onBuyGear(item); // menu stays open; caller re-shows with updated money
     });
     return card;
   }
@@ -951,8 +1110,9 @@ const CSS = `
 .m9-card-role{font-size:12px;color:var(--m9-concrete);line-height:1.35;min-height:32px;}
 .m9-tag{font-size:12px;font-weight:800;letter-spacing:.12em;color:var(--m9-hudAccent);}
 .m9-tag.m9-bad{color:var(--m9-danger);}
-.m9-issued{display:flex;gap:10px;margin-bottom:10px;}
-.m9-issued-chip{display:flex;align-items:center;gap:10px;border:1px solid var(--m9-metalDark);
+.m9-gear-sec{margin-bottom:12px;}
+.m9-gear-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;}
+.m9-issued{display:flex;gap:10px;margin-bottom:10px;}.m9-issued-chip{display:flex;align-items:center;gap:10px;border:1px solid var(--m9-metalDark);
   border-radius:8px;padding:8px 14px;background:rgba(var(--m9-charcoal-rgb),.6);
   box-shadow:inset 0 1px 0 rgba(var(--m9-hudText-rgb),.05);}
 .m9-issued-name{font-size:13px;font-weight:600;}

@@ -13,6 +13,7 @@
 // frozen table above them is unchanged, do not rename without syncing both):
 //   resize(): void                       — forwards to SceneRig.resize()
 //   buy(w): void / reload(): void        — send the C2S (menu onBuy + e2e debug)
+//   buyGear(item): void                  — send buy_gear (menu onBuyGear + console)
 //   addBot(): void / removeBot(): void   — send the C2S (menu onAddBot/onRemoveBot)
 //   removeAllBots(): number              — kick every bot (menu onRemoveAllBots + console)
 //   switchTeam(team): void               — send the C2S (menu onSwitchTeam + e2e debug)
@@ -28,6 +29,7 @@
 // ============================================================================
 import {
   BASE_FOV,
+  GEAR,
   INPUT_ALT,
   INPUT_CROUCH,
   INPUT_FIRE,
@@ -44,6 +46,7 @@ import {
 import type {
   AABB,
   GameEvent,
+  GearId,
   MapId,
   MatId,
   PlayerId,
@@ -164,7 +167,8 @@ export class ClientGame {
   private scoped = false;
   private bloomDeg = 0; // cosmetic crosshair bloom, mirrors server spread+bloom
   private buyOpen = false;
-  private buySig = ''; // money|weapons|canBuy signature of the open buy menu
+  private buySig = ''; // money|weapons|canBuy|armor|helmet signature of the open buy menu
+  private pendingGear: GearId | null = null; // last buy_gear sent — buy_result carries no item id
   private consoleOpen = false; // `~` dev console overlay visible; pointer unlocked
   private stepAccM = 0; // own footstep distance accumulator
   private lastBodyX = 0;
@@ -192,7 +196,7 @@ export class ClientGame {
   private readonly smokePos: Vec3 = { x: 0, y: 0, z: 0 }; // shot-event muzzle smoke spawn
   private readonly sfxDir: Vec3 = { x: 0, y: 0, z: 0 }; // sfx occlusion raycast direction
   private readonly hudState: HudState = {
-    hp: 100, alive: true, money: 0, canBuy: false,
+    hp: 100, armor: 0, alive: true, money: 0, canBuy: false,
     weapon: 'pistol', weaponName: '', mag: -1, reserve: -1,
     phase: 'warmup', phaseEndsInSec: 0, round: 0, scoreT: 0, scoreCT: 0,
     spreadPx: 0, scoped: false, spectating: null,
@@ -308,6 +312,17 @@ export class ClientGame {
     this.conn?.send({ t: 'buy', weapon });
   }
 
+  /**
+   * Menu onBuyGear + console 'buy kevlar|helmet': send the gear buy request;
+   * server validates (same canBuy window as weapons). buy_result reports no
+   * item id (weapon is null for gear), so remember it for the optimistic
+   * money/armor mirror that re-renders the open buy menu.
+   */
+  buyGear(item: GearId): void {
+    this.pendingGear = item;
+    this.conn?.send({ t: 'buy_gear', item });
+  }
+
   /** Menu onAddBot: ask the server to add a bot to the current room. */
   addBot(): void {
     if (this.world === null) return; // in-room only
@@ -406,7 +421,7 @@ export class ClientGame {
       case '':
         return "type 'help' for commands";
       case 'help':
-        return 'help · addbot [n] / bot_add [n] · removebot [all] / bot_kick [all] · jointeam t|ct · buy <weapon> · kill';
+        return 'help · addbot [n] / bot_add [n] · removebot [all] / bot_kick [all] · jointeam t|ct · buy <weapon|kevlar|helmet> · killbots · kill';
       case 'addbot':
       case 'bot_add': {
         if (this.world === null) return 'not in a room';
@@ -437,10 +452,20 @@ export class ClientGame {
       }
       case 'buy': {
         if (this.world === null) return 'not in a room';
-        if (arg === undefined) return `usage: buy <${WEAPON_ORDER.join('|')}>`;
+        if (arg === undefined) return `usage: buy <${WEAPON_ORDER.join('|')}|kevlar|helmet>`;
         const id = arg.toLowerCase();
-        if (!isWeaponId(id)) return `unknown weapon '${arg}' — ${WEAPON_ORDER.join(' ')}`;
+        // gear before the weapon check: kevlar/helmet are GearIds, not WeaponIds
+        if (id === 'kevlar' || id === 'helmet') {
+          this.buyGear(id);
+          return 'ok';
+        }
+        if (!isWeaponId(id)) return `unknown weapon '${arg}' — ${WEAPON_ORDER.join(' ')} kevlar helmet`;
         this.buy(id);
+        return 'ok';
+      }
+      case 'killbots': {
+        if (this.world === null) return 'not in a room';
+        this.conn?.send({ t: 'kill_bots' }); // server: every bot dies in place, stays in the room
         return 'ok';
       }
       case 'kill': {
@@ -591,6 +616,7 @@ export class ClientGame {
     this.respawnSec = -1;
     this.lastWeapon = null;
     this.prevHeld = null;
+    this.pendingGear = null;
     this.warmupBannerShown = false;
     this.botPromptShown = false;
     this.dbgMove = null;
@@ -953,11 +979,22 @@ export class ClientGame {
             you.money = Math.max(0, you.money - WEAPONS[ev.weapon].price);
             you.weapons = you.weapons.filter((id) => !PRIMARIES.includes(id));
             you.weapons.push(ev.weapon);
+          } else if (you !== null && this.pendingGear !== null) {
+            // gear buy (weapon null carries no item id — buyGear remembered it):
+            // mirror money + armor so the open buy menu re-renders immediately
+            if (this.pendingGear === 'kevlar') {
+              you.money = Math.max(0, you.money - GEAR.kevlarPrice);
+              you.armor = GEAR.armorStart;
+            } else {
+              you.money = Math.max(0, you.money - GEAR.helmetPrice);
+              you.helmet = true;
+            }
           }
           if (this.buyOpen && you !== null) this.refreshBuy(you);
         } else {
           this.audio.sfx('deny');
         }
+        this.pendingGear = null;
         break;
       }
     }
@@ -1143,6 +1180,7 @@ export class ClientGame {
 
     const h = this.hudState;
     h.hp = you?.hp ?? 100;
+    h.armor = you?.armor ?? 0;
     h.alive = alive;
     h.money = you?.money ?? 0;
     h.canBuy = you?.canBuy ?? false;
@@ -1371,8 +1409,11 @@ export class ClientGame {
   private openBuy(you: YouSnap): void {
     if (!you.canBuy) return;
     this.buyOpen = true;
-    this.buySig = `${you.money}|${you.weapons.join(',')}|${you.canBuy}`;
-    this.menus.showBuy(you.money, you.weapons, you.canBuy);
+    this.buySig = `${you.money}|${you.weapons.join(',')}|${you.canBuy}|${you.armor}|${you.helmet}`;
+    this.menus.showBuy(you.money, you.weapons, you.canBuy, {
+      hasKevlar: you.armor > 0, // vest persists while armor points remain (re-buy refills)
+      hasHelmet: you.helmet,
+    });
     if (document.pointerLockElement !== null) document.exitPointerLock();
   }
 
@@ -1384,12 +1425,15 @@ export class ClientGame {
     this.relock();
   }
 
-  /** Re-show the open buy menu only when money/owned/canBuy actually changed. */
+  /** Re-show the open buy menu only when money/owned/canBuy/armor actually changed. */
   private refreshBuy(you: YouSnap): void {
-    const sig = `${you.money}|${you.weapons.join(',')}|${you.canBuy}`;
+    const sig = `${you.money}|${you.weapons.join(',')}|${you.canBuy}|${you.armor}|${you.helmet}`;
     if (sig === this.buySig) return;
     this.buySig = sig;
-    this.menus.showBuy(you.money, you.weapons, you.canBuy);
+    this.menus.showBuy(you.money, you.weapons, you.canBuy, {
+      hasKevlar: you.armor > 0,
+      hasHelmet: you.helmet,
+    });
   }
 
   /** Re-request pointer lock (buy close / pause resume); rejection = browser cooldown. */

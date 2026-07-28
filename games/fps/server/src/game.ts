@@ -8,6 +8,7 @@
 // ============================================================================
 import {
   ECONOMY,
+  GEAR,
   INPUT_ALT,
   INPUT_CROUCH,
   INPUT_FIRE,
@@ -41,6 +42,7 @@ import type {
   BodyState,
   C2S,
   GameEvent,
+  GearId,
   HitscanTarget,
   MapDef,
   MapId,
@@ -61,7 +63,7 @@ import type {
 } from '@fps/shared';
 import { LagBuffer, resolveShot, wallEndPoint } from './combat.js';
 import type { ShotContext, ShotHit } from './combat.js';
-import { killReward, roundRewards, tryBuy } from './economy.js';
+import { killReward, roundRewards, tryBuy, tryBuyGear } from './economy.js';
 import { BotBrain } from './bots.js';
 import type { BotCommand, BotPercept } from './bots.js';
 
@@ -111,6 +113,9 @@ interface PlayerState {
   hp: number;
   alive: boolean;
   money: number;
+  armor: number; // kevlar points 0..100 (0 = no vest); soaks part of incoming damage
+  hasKevlar: boolean; // owns the vest (gates helmet buys); death drops it
+  helmet: boolean; // owns the helmet (armor absorb extends to headshots); death drops it
   kills: number;
   deaths: number;
   headshots: number;
@@ -302,6 +307,7 @@ export class GameRoom {
       weapons: ['pistol', 'knife'], weapon: 'pistol',
       mag: WEAPONS.pistol.mag, reserve: WEAPONS.pistol.reserve,
       canBuy: false, spectateTarget: null, respawnAt: null, vy: 0,
+      armor: 0, helmet: false,
     };
     const snapshotMsg: SnapshotMsg = {
       t: 'snapshot', tick: 0, serverTime: 0, ack: 0,
@@ -318,6 +324,7 @@ export class GameRoom {
       reloadUntil: 0, nextShotAt: 0, bloom: 0, shotSeq: 0,
       hp: PLAYER.maxHp, alive: true,
       money: ECONOMY.start, kills: 0, deaths: 0, headshots: 0,
+      armor: 0, hasKevlar: false, helmet: false,
       lastKillAt: 0, streak: 0,
       spawnProtectedUntil: 0, respawnAt: null, spectateTarget: null,
       snap, you, snapshotMsg,
@@ -408,6 +415,12 @@ export class GameRoom {
         return;
       case 'buy':
         this.handleBuy(id, parsed.weapon);
+        return;
+      case 'buy_gear':
+        this.handleBuyGear(id, parsed.item);
+        return;
+      case 'kill_bots':
+        this.handleKillBots();
         return;
       case 'switch_team':
         this.handleSwitchTeam(id, parsed.team);
@@ -505,6 +518,32 @@ export class GameRoom {
     }
   }
 
+  // Gear buy (C2S buy_gear): CS kevlar vest / helmet in the same canBuy window
+  // as weapons. buy_result carries weapon null; failures report the frozen
+  // reason string ('buy time expired' / 'insufficient funds' / 'already owned'
+  // / 'requires kevlar'). A kevlar buy (rebuy included) refills armor to full;
+  // a helmet buy keeps the armor points the vest already has.
+  handleBuyGear(id: PlayerId, item: GearId): void {
+    try {
+      const p = this.players.get(id);
+      if (p === undefined) return;
+      const res = tryBuyGear(p.money, p.hasKevlar, p.helmet, item, this.canBuyAt(Date.now()));
+      if (!res.ok) {
+        this.sendEvent(id, { t: 'buy_result', ok: false, weapon: null, reason: res.reason });
+        return;
+      }
+      p.money = res.money;
+      p.hasKevlar = res.hasKevlar;
+      p.helmet = res.helmet;
+      // res.armor is GEAR.armorStart for a vest buy, 0 for a helmet buy: the
+      // max refills the vest without letting a helmet purchase wipe points
+      p.armor = Math.max(p.armor, res.armor);
+      this.sendEvent(id, { t: 'buy_result', ok: true, weapon: null, reason: null });
+    } catch (err) {
+      console.error('[game] handleBuyGear failed', err);
+    }
+  }
+
   // Console 'kill' command (C2S suicide): the existing death path with no
   // killer — kill event carries killerId null, weapon 'knife', headshot false,
   // no kill reward / streak for anyone. Only where bodies actually simulate
@@ -517,6 +556,24 @@ export class GameRoom {
       this.kill(p, null, false, WEAPONS.knife, Date.now());
     } catch (err) {
       console.error('[game] handleSuicide failed', err);
+    }
+  }
+
+  // Console 'killbots' command (C2S kill_bots): every bot dies IN PLACE through
+  // the normal death path — kill event with killerId null, weapon 'knife',
+  // headshot false, no reward/streak; bots stay in the room (no removal) and
+  // follow the usual phase rules (warmup: they respawn; rounds: dead until the
+  // next freeze). Already-dead bots are skipped (no double death count).
+  handleKillBots(): void {
+    try {
+      const now = Date.now();
+      for (const botId of this.bots.keys()) {
+        const p = this.players.get(botId);
+        if (p === undefined || !p.alive) continue;
+        this.kill(p, null, false, WEAPONS.knife, now);
+      }
+    } catch (err) {
+      console.error('[game] handleKillBots failed', err);
     }
   }
 
@@ -937,7 +994,21 @@ export class GameRoom {
 
   private applyDamage(victim: PlayerState, shooter: PlayerState, hit: ShotHit, def: WeaponDef, now: number): void {
     if (!victim.alive || now < victim.spawnProtectedUntil) return;
-    victim.hp -= hit.dmg;
+    // frozen armor model: with points left, hp loses round(dmg*(1-absorb)) and
+    // armor loses round(dmg*absorb); when armor runs out mid-hit the unsoaked
+    // remainder rolls into hp. Headshots BYPASS armor unless a helmet is owned.
+    let hpDmg = hit.dmg;
+    if (victim.armor > 0 && (!hit.headshot || victim.helmet)) {
+      const soaked = Math.round(hit.dmg * GEAR.absorb);
+      hpDmg = Math.round(hit.dmg * (1 - GEAR.absorb));
+      if (victim.armor >= soaked) {
+        victim.armor -= soaked;
+      } else {
+        hpDmg += soaked - victim.armor; // armor ran out: unsoaked part rolls into hp
+        victim.armor = 0;
+      }
+    }
+    victim.hp -= hpDmg;
     const killed = victim.hp <= 0;
     this.sendEvent(shooter.id, { t: 'hit', victimId: victim.id, dmg: hit.dmg, headshot: hit.headshot, killed });
     // yaw = world yaw from the victim towards the shooter (inverse of aimDir)
@@ -956,6 +1027,10 @@ export class GameRoom {
     victim.deaths++;
     victim.reloadUntil = 0;
     victim.bloom = 0;
+    // death drops gear (frozen): vest + helmet gone, armor points zeroed
+    victim.armor = 0;
+    victim.hasKevlar = false;
+    victim.helmet = false;
     if (killer !== null) {
       killer.kills++;
       if (headshot) killer.headshots++;
@@ -1065,6 +1140,8 @@ export class GameRoom {
       you.spectateTarget = p.spectateTarget;
       you.respawnAt = p.respawnAt;
       you.vy = p.body.vy;
+      you.armor = p.armor;
+      you.helmet = p.helmet;
       const m = p.snapshotMsg;
       m.tick = this.tickN;
       m.serverTime = now;

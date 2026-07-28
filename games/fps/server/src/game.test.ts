@@ -5,7 +5,7 @@
 // same dustbowl solids the server sim uses — fully deterministic.
 // ============================================================================
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ECONOMY, INPUT_FIRE, MAPS, MULTIKILL_WINDOW, PLAYER, WEAPONS, boxToAABB, hitscan } from '@fps/shared';
+import { ECONOMY, GEAR, INPUT_FIRE, MAPS, MULTIKILL_WINDOW, PLAYER, WEAPONS, boxToAABB, hitscan } from '@fps/shared';
 import type { C2S, GameEvent, HitscanTarget, PlayerId, RoomPhase, S2C, Team, Vec3 } from '@fps/shared';
 import { GameRoom } from './game.js';
 import type { RoomIO } from './game.js';
@@ -373,6 +373,137 @@ function fightUntilKill(
   throw new Error('fight did not resolve within the tick budget');
 }
 
+/**
+ * Drive `shooter` until ONE of its shots damages `target` (an hp or armor drop
+ * on the target's own snapshot), then stop before a second trigger pull. Same
+ * BFS walking + probe discipline as fightUntilKill, minus the lure. Throws if
+ * the target dies (the absorb tests need it alive) or the budget runs out.
+ */
+function fightUntilHit(
+  room: GameRoom,
+  io: FakeIO,
+  feed: InputFeed,
+  shooter: PlayerId,
+  target: PlayerId,
+  opts: FightOpts = {},
+): void {
+  const aimHeight = opts.aimHeight ?? 0.75;
+  const fireDist = opts.fireDist ?? 12;
+  const cadence = opts.cadence ?? 8;
+  const strict = opts.strict ?? false;
+  const needHead = opts.headshot ?? false;
+  let baseHp: number | null = null;
+  let baseArmor: number | null = null;
+  let lastX = 0;
+  let lastZ = 0;
+  let stuck = 0;
+  let path: Array<{ x: number; z: number }> = [];
+  let pathIdx = 0;
+  let lastPathAt = -1000;
+  let dbgDist = -1;
+  let dbgClear = false;
+  let dbgX = 0;
+  let dbgZ = 0;
+  let dbgTX = 0;
+  let dbgTZ = 0;
+  let dbgPhase = '';
+  for (let i = 0; i < 2500; i++) {
+    const snap = io.lastSnap(shooter);
+    const me = snap.players.find((p) => p.id === shooter);
+    const tgt = snap.players.find((p) => p.id === target);
+    if (me === undefined || tgt === undefined) throw new Error('snapshot missing duel players');
+    if (!me.alive) throw new Error('shooter died');
+    if (!tgt.alive) throw new Error('target died: expected exactly one non-lethal hit');
+
+    const tgtYou = io.lastSnap(target).you;
+    if (baseHp === null || baseArmor === null) {
+      baseHp = tgtYou.hp;
+      baseArmor = tgtYou.armor;
+    } else if (tgtYou.hp < baseHp || tgtYou.armor < baseArmor) {
+      return; // first damaging hit observed — stop before a second one lands
+    }
+
+    const eye: Vec3 = { x: me.x, y: me.y + PLAYER.heightStand - PLAYER.eyeOffset, z: me.z };
+    const aim: Vec3 = { x: tgt.x, y: tgt.y + aimHeight, z: tgt.z };
+    const dx = aim.x - eye.x;
+    const dy = aim.y - eye.y;
+    const dz = aim.z - eye.z;
+    const dist = Math.hypot(dx, dz) || 1e-9;
+    const len = Math.hypot(dx, dy, dz) || 1e-9;
+    const dir: Vec3 = { x: dx / len, y: dy / len, z: dz / len };
+    dbgDist = dist;
+    dbgX = me.x;
+    dbgZ = me.z;
+    dbgTX = tgt.x;
+    dbgTZ = tgt.z;
+    dbgPhase = snap.phase;
+    let clear: boolean;
+    if (strict) {
+      // probe everyone: the trigger is pulled only when the TARGET eats the bullet
+      const others: HitscanTarget[] = [];
+      for (const pl of snap.players) {
+        if (pl.id !== shooter && pl.alive) {
+          others.push({ id: pl.id, x: pl.x, y: pl.y, z: pl.z, height: PLAYER.heightStand });
+        }
+      }
+      const probe = hitscan(eye, dir, others, SOLIDS, 200);
+      clear = probe !== null && probe.targetId === target && (!needHead || probe.headshot);
+    } else {
+      clear =
+        hitscan(eye, dir, [{ id: 'tgt', x: tgt.x, y: tgt.y, z: tgt.z, height: PLAYER.heightStand }], SOLIDS, 200) !==
+        null;
+    }
+    dbgClear = clear;
+    // input yaw/pitch so the server's aimDir(yaw,pitch) equals `dir`
+    let yaw = Math.atan2(-dx, -dz);
+    const pitch = Math.atan2(dy, dist);
+
+    const moved = Math.hypot(me.x - lastX, me.z - lastZ);
+    lastX = me.x;
+    lastZ = me.z;
+    const walking = !(clear && dist <= fireDist);
+    if (walking && moved < 0.01) stuck++;
+    else stuck = 0;
+
+    if (pathIdx >= path.length || i - lastPathAt > 120 || stuck > 20) {
+      path = navPath(me.x, me.z, tgt.x, tgt.z);
+      pathIdx = 0;
+      lastPathAt = i;
+      stuck = 0;
+    }
+
+    let moveX = 0;
+    let moveZ = 0;
+    let buttons = 0;
+    if (clear && dist <= fireDist && snap.you.mag !== 0 && i % cadence === 0) {
+      // semi-auto: one edge per shot; mag -1 (knife) never blocks the trigger
+      buttons = INPUT_FIRE;
+    } else if (walking) {
+      const wp = path[pathIdx];
+      if (wp !== undefined && dist > fireDist) {
+        if (Math.hypot(wp.x - me.x, wp.z - me.z) < 0.5) {
+          pathIdx++;
+        } else {
+          yaw = Math.atan2(-(wp.x - me.x), -(wp.z - me.z)); // face the waypoint
+          moveZ = 1;
+        }
+      } else {
+        // close (or path exhausted) but the line is blocked: orbit the target —
+        // forward pressure closes in, alternating strafe circles around cover
+        moveZ = dist > 0.6 ? 1 : 0;
+        moveX = Math.floor(i / 40) % 2 === 0 ? 1 : -1;
+      }
+    }
+    feed.send(room, shooter, { moveX, moveZ, yaw, pitch, buttons });
+    if (i % 30 === 0) feed.send(room, target); // keep the target's input clock fresh
+    tick();
+  }
+  throw new Error(
+    `no hit landed within the tick budget (dist=${dbgDist.toFixed(2)} clear=${dbgClear} ` +
+      `me=(${dbgX.toFixed(1)},${dbgZ.toFixed(1)}) tgt=(${dbgTX.toFixed(1)},${dbgTZ.toFixed(1)}) phase=${dbgPhase})`,
+  );
+}
+
 function teamOf(io: FakeIO, id: PlayerId): Team {
   return io.joined(id).team;
 }
@@ -522,6 +653,153 @@ describe('GameRoom economy', () => {
     expect(you.canBuy).toBe(true);
     room.stop();
   });
+
+  it('gear: kevlar $650 ok at start; helmet needs funds + the vest; death drops gear', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io);
+    const feed = new InputFeed();
+
+    // freeze round 1: kevlar is affordable on the $800 starting money
+    advanceToPhase(io, 'p1', 'freeze');
+    room.handleMessage('p1', { t: 'buy_gear', item: 'kevlar' });
+    let results = eventsOfType(io, 'p1', 'buy_result');
+    expect(results.length).toBe(1);
+    expect(results[0]?.ok).toBe(true);
+    expect(results[0]?.weapon).toBeNull(); // gear buys report weapon null
+    expect(results[0]?.reason).toBeNull();
+
+    tick(); // let a snapshot reflect the purchase
+    let you = io.lastSnap('p1').you;
+    expect(you.money).toBe(ECONOMY.start - GEAR.kevlarPrice);
+    expect(you.armor).toBe(GEAR.armorStart);
+    expect(you.helmet).toBe(false);
+
+    // the vest leaves $150: the $1000 helmet is unaffordable
+    room.handleMessage('p1', { t: 'buy_gear', item: 'helmet' });
+    results = eventsOfType(io, 'p1', 'buy_result');
+    expect(results.length).toBe(2);
+    expect(results[1]?.ok).toBe(false);
+    expect(results[1]?.reason).toBe('insufficient funds');
+    expect(results[1]?.weapon).toBeNull();
+
+    // round 1: p1 eliminates p2 and banks kill + win rewards on top of the $150
+    advanceToPhase(io, 'p1', 'live');
+    fightUntilKill(room, io, feed, 'p1', 'p2');
+    advanceToPhase(io, 'p1', 'freeze'); // round 2 freeze
+    expect(io.lastSnap('p1').you.money).toBe(
+      ECONOMY.start - GEAR.kevlarPrice + ECONOMY.killReward + ECONOMY.winReward,
+    );
+
+    // p1 survived (kevlar kept): the helmet buy now succeeds
+    room.handleMessage('p1', { t: 'buy_gear', item: 'helmet' });
+    results = eventsOfType(io, 'p1', 'buy_result');
+    expect(results.length).toBe(3);
+    expect(results[2]?.ok).toBe(true);
+    expect(results[2]?.weapon).toBeNull();
+    expect(results[2]?.reason).toBeNull();
+    tick();
+    you = io.lastSnap('p1').you;
+    expect(you.helmet).toBe(true);
+    expect(you.armor).toBe(GEAR.armorStart); // untouched in round 1, not refilled
+    expect(you.money).toBe(
+      ECONOMY.start - GEAR.kevlarPrice + ECONOMY.killReward + ECONOMY.winReward - GEAR.helmetPrice,
+    );
+
+    // p2 died in round 1 (death drops gear): its helmet buy is rejected even
+    // though the loss reward covers the price — the vest must come first
+    expect(io.lastSnap('p2').you.money).toBe(ECONOMY.start + ECONOMY.lossReward);
+    room.handleMessage('p2', { t: 'buy_gear', item: 'helmet' });
+    const p2results = eventsOfType(io, 'p2', 'buy_result');
+    expect(p2results.length).toBe(1);
+    expect(p2results[0]?.ok).toBe(false);
+    expect(p2results[0]?.reason).toBe('requires kevlar');
+    expect(p2results[0]?.weapon).toBeNull();
+    room.stop();
+  });
+});
+
+describe('GameRoom armor absorb', () => {
+  it('body splits hp/armor; head bypasses without helmet, splits with it', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io);
+    const feed = new InputFeed();
+
+    // round 1 freeze: the victim-to-be buys the kevlar vest
+    advanceToPhase(io, 'p2', 'freeze');
+    room.handleMessage('p2', { t: 'buy_gear', item: 'kevlar' });
+    expect(eventsOfType(io, 'p2', 'buy_result')[0]?.ok).toBe(true);
+    tick();
+    expect(io.lastSnap('p2').you.armor).toBe(GEAR.armorStart);
+
+    // live: p1 fights with the knife — flat 40 dmg inside 2.2m, zero spread
+    advanceToPhase(io, 'p1', 'live');
+    room.handleSwitch('p1', 'knife');
+
+    const knifeDmg = WEAPONS.knife.damage; // 40
+    const headDmg = Math.round(knifeDmg * WEAPONS.knife.headshotMul); // 60
+    const soak = (dmg: number): number => Math.round(dmg * GEAR.absorb);
+    const through = (dmg: number): number => Math.round(dmg * (1 - GEAR.absorb));
+    const hitsOn = (victim: PlayerId): Array<Extract<GameEvent, { t: 'hit' }>> =>
+      eventsOfType(io, 'p1', 'hit').filter((h) => h.victimId === victim);
+
+    // (1) body shot vs armor 100: hp and armor each soak half of the 40
+    fightUntilHit(room, io, feed, 'p1', 'p2', { aimHeight: 0.75, fireDist: 1.8, strict: true });
+    let you = io.lastSnap('p2').you;
+    expect(you.hp).toBe(PLAYER.maxHp - through(knifeDmg)); // 80
+    expect(you.armor).toBe(GEAR.armorStart - soak(knifeDmg)); // 80
+    expect(you.helmet).toBe(false);
+    let hits = hitsOn('p2');
+    expect(hits.length).toBe(1);
+    expect(hits[0]?.dmg).toBe(knifeDmg);
+    expect(hits[0]?.headshot).toBe(false);
+    expect(hits[0]?.killed).toBe(false);
+
+    // (2) head shot with NO helmet: armor is bypassed — hp eats the full 60
+    fightUntilHit(room, io, feed, 'p1', 'p2', {
+      aimHeight: PLAYER.heightStand - 0.15,
+      fireDist: 1.8,
+      strict: true,
+      headshot: true,
+    });
+    you = io.lastSnap('p2').you;
+    expect(you.hp).toBe(PLAYER.maxHp - through(knifeDmg) - headDmg); // 20
+    expect(you.armor).toBe(GEAR.armorStart - soak(knifeDmg)); // still 80
+    hits = hitsOn('p2');
+    expect(hits.length).toBe(2);
+    expect(hits[1]?.dmg).toBe(headDmg);
+    expect(hits[1]?.headshot).toBe(true);
+    expect(hits[1]?.killed).toBe(false);
+
+    // the victim survives and wins the round: kill + win rewards fund a helmet
+    fightUntilKill(room, io, feed, 'p2', 'p1');
+    advanceToPhase(io, 'p2', 'freeze'); // round 2 freeze
+    room.handleMessage('p2', { t: 'buy_gear', item: 'helmet' });
+    expect(eventsOfType(io, 'p2', 'buy_result')[1]?.ok).toBe(true);
+    tick();
+    const before = io.lastSnap('p2').you;
+    expect(before.helmet).toBe(true);
+    expect(before.hp).toBe(PLAYER.maxHp); // round reset heals hp (armor kept)
+
+    // (3) the SAME head shot now splits like a body shot
+    advanceToPhase(io, 'p1', 'live');
+    room.handleSwitch('p1', 'knife'); // round death reset p1 to the pistol
+    fightUntilHit(room, io, feed, 'p1', 'p2', {
+      aimHeight: PLAYER.heightStand - 0.15,
+      fireDist: 1.8,
+      strict: true,
+      headshot: true,
+    });
+    you = io.lastSnap('p2').you;
+    expect(you.hp).toBe(before.hp - through(headDmg));
+    expect(you.armor).toBe(before.armor - soak(headDmg));
+    expect(you.helmet).toBe(true);
+    hits = hitsOn('p2');
+    expect(hits.length).toBe(3);
+    expect(hits[2]?.dmg).toBe(headDmg);
+    expect(hits[2]?.headshot).toBe(true);
+    expect(hits[2]?.killed).toBe(false);
+    room.stop();
+  });
 });
 
 describe('GameRoom stats', () => {
@@ -632,6 +910,54 @@ describe('GameRoom bots', () => {
     expect(room.removeBot()).toBe(true);
     expect(room.botCount()).toBe(0);
     expect(room.playerCount()).toBe(1);
+    room.stop();
+  });
+
+  it('kill_bots: both bots die in place (killerId null), human untouched, bots stay and respawn', () => {
+    const io = new FakeIO();
+    const room = new GameRoom('dustbowl', 'public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.start();
+    vi.advanceTimersByTime(200); // settle into solo warmup
+    expect(io.lastSnap('p1').phase).toBe('warmup');
+
+    const b1 = room.addBot();
+    const b2 = room.addBot();
+    if (b1 === null || b2 === null) throw new Error('addBot returned null with free slots');
+    expect(room.playerCount()).toBe(3);
+    // the phase machine only advances on ticks: the room is still in warmup
+    expect(room.info().phase).toBe('warmup');
+
+    room.handleMessage('p1', { t: 'kill_bots' });
+
+    // both bots die through the normal death path: kill event with no killer
+    const kills = eventsOfType(io, 'p1', 'kill');
+    expect(kills.length).toBe(2);
+    for (const k of kills) {
+      expect(k.killerId).toBeNull();
+      expect(k.weapon).toBe('knife');
+      expect(k.headshot).toBe(false);
+    }
+    expect(new Set(kills.map((k) => k.victimId))).toEqual(new Set([b1, b2]));
+
+    // the human is untouched: not killed, no damage direction shown
+    expect(eventsOfType(io, 'p1', 'dmg_taken').length).toBe(0);
+    expect(io.lastSnap('p1').you.alive).toBe(true);
+
+    // the bots stay in the room — kill_bots is not a removal
+    expect(room.botCount()).toBe(2);
+    expect(room.playerCount()).toBe(3);
+
+    // 3 players >= MIN_PLAYERS_FOR_MATCH, so the very next tick ends warmup and
+    // the round-1 freeze reset revives everyone (in a sub-MIN room the same
+    // death would instead rejoin via the warmup respawn timer). Advance past
+    // the 2s warmup delay: both bots are back alive and nothing else died.
+    vi.advanceTimersByTime(2200); // still inside the 3s freeze: no combat
+    const snap = io.lastSnap('p1');
+    expect(snap.players.find((p) => p.id === b1)?.alive).toBe(true);
+    expect(snap.players.find((p) => p.id === b2)?.alive).toBe(true);
+    expect(snap.players.find((p) => p.id === 'p1')?.alive).toBe(true);
+    expect(eventsOfType(io, 'p1', 'kill').length).toBe(2);
     room.stop();
   });
 });

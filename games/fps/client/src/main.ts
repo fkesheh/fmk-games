@@ -26,7 +26,7 @@
 // internally-constructed AudioEngine (browsers gate AudioContext on a gesture).
 // ============================================================================
 import { PALETTE } from '@fps/shared';
-import type { MapId, RoomId, RoomPhase, Team, WeaponId } from '@fps/shared';
+import type { GearId, MapId, RoomId, RoomPhase, Team, WeaponId } from '@fps/shared';
 import { ClientState } from './game/state';
 import { ClientGame } from './game/clientGame';
 import { Hud } from './ui/hud';
@@ -44,6 +44,7 @@ interface FpsState {
   mapId: MapId | null;
   team: Team | null;
   hp: number;
+  armor: number; // kevlar points 0..100 (GEAR.armorStart after a vest buy)
   alive: boolean;
   pos: [number, number, number];
   players: number;
@@ -136,6 +137,7 @@ function boot(): void {
     onJoinPrivate: (name, code) => game?.joinPrivate(name, code),
     onListRooms: () => game?.listRooms() ?? Promise.resolve([]),
     onBuy: (weapon) => game?.buy(weapon),
+    onBuyGear: (item: GearId) => game?.buyGear(item),
     onAddBot: () => game?.addBot(),
     onRemoveBot: () => game?.removeBot(),
     onRemoveAllBots: () => game?.removeAllBots(),
@@ -215,6 +217,7 @@ function boot(): void {
         mapId: state.mapId,
         team: state.team,
         hp: you?.hp ?? 100,
+        armor: you?.armor ?? 0,
         alive: you?.alive ?? false,
         pos: [info.pos[0], info.pos[1], info.pos[2]],
         players: info.players,

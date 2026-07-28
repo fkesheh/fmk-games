@@ -48,8 +48,12 @@ export type C2S =
   | { t: 'reload' }
   | { t: 'switch'; weapon: WeaponId }
   | { t: 'buy'; weapon: WeaponId }
+  | { t: 'buy_gear'; item: GearId } // armor items: kevlar vest / helmet (CS gear)
+  | { t: 'kill_bots' } // console 'killbots': kill every bot in place (they stay in the room)
   | { t: 'suicide' } // console 'kill' command: the server kills the sender (killerId null)
   | { t: 'ping'; ts: number };
+
+export type GearId = 'kevlar' | 'helmet';
 
 // ---- server -> client ----
 export interface RoomInfo {
@@ -102,6 +106,8 @@ export interface YouSnap {
   spectateTarget: PlayerId | null; // set while dead in a live round
   respawnAt: number | null; // serverTime ms when warmup respawn happens, else null
   vy: number; // authoritative vertical velocity (client prediction replays gravity from it)
+  armor: number; // 0..100 kevlar points (0 = no vest)
+  helmet: boolean; // owned helmet (protects head with armor absorb)
 }
 
 export type RoundEndReason = 'elimination' | 'time' | 'forfeit';

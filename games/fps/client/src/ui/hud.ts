@@ -11,7 +11,7 @@ import { PALETTE, WEAPONS } from '@fps/shared';
 import type { RoomPhase, Team, WeaponId } from '@fps/shared';
 
 export interface HudState {
-  hp: number; alive: boolean; money: number; canBuy: boolean;
+  hp: number; armor: number; alive: boolean; money: number; canBuy: boolean;
   weapon: WeaponId; weaponName: string; mag: number; reserve: number;
   phase: RoomPhase; phaseEndsInSec: number; round: number; scoreT: number; scoreCT: number;
   spreadPx: number; scoped: boolean;
@@ -298,6 +298,15 @@ const CSS = `
   animation: fh-pulse 1.1s ease-in-out infinite; }
 @keyframes fh-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
 
+/* ---- armor cluster under HP (kevlar vest, CS-style; hidden at 0) ---------- */
+.fh-armor { margin-top: 8px; }
+.fh-armor-num { font-size: 22px; font-weight: 700; line-height: 1;
+  color: var(--fh-text); text-shadow: 0 0 3px var(--fh-ink), 0 1px 3px var(--fh-ink); }
+.fh-armor-bar { width: 220px; height: 6px; margin-top: 4px;
+  background: var(--fh-ink-55); border-radius: 2px; overflow: hidden; }
+.fh-armor-fill { height: 100%; background: var(--fh-armor); border-radius: 2px;
+  transition: width 120ms linear; }
+
 /* ---- money + ammo bottom-right -------------------------------------------- */
 .fh-ammo { position: absolute; right: 24px; bottom: 24px; text-align: right; }
 .fh-money { font-size: 17px; font-weight: 700; color: var(--fh-accent);
@@ -372,10 +381,13 @@ export class Hud {
   private readonly scoreTEl: HTMLDivElement;
   private readonly scoreCTEl: HTMLDivElement;
 
-  // hp / ammo / money
+  // hp / armor / ammo / money
   private readonly hpWrap: HTMLDivElement;
   private readonly hpNum: HTMLDivElement;
   private readonly hpFill: HTMLDivElement;
+  private readonly armorWrap: HTMLDivElement;
+  private readonly armorNum: HTMLDivElement;
+  private readonly armorFill: HTMLDivElement;
   private readonly moneyEl: HTMLDivElement;
   private moneyTimer = 0;
   private readonly wnameEl: HTMLDivElement;
@@ -395,6 +407,7 @@ export class Hud {
 
   // change-detection cache (update() touches DOM only on change)
   private cHp = -1;
+  private cArmor = -1;
   private cLow = false;
   private cAlive = true;
   private cMoney = -1;
@@ -419,6 +432,7 @@ export class Hud {
     st.setProperty('--fh-accent', PALETTE.hudAccent);
     st.setProperty('--fh-danger', PALETTE.danger);
     st.setProperty('--fh-hp', PALETTE.hpGreen);
+    st.setProperty('--fh-armor', PALETTE.steel); // blue-ish shield tone
     st.setProperty('--fh-ink', PALETTE.ink);
     st.setProperty('--fh-ink-55', alpha(PALETTE.ink, 0.55));
     st.setProperty('--fh-ink-70', alpha(PALETTE.ink, 0.72));
@@ -516,13 +530,19 @@ export class Hud {
     top.append(this.scoreTEl, clock, this.scoreCTEl);
     this.layer.appendChild(top);
 
-    // HP bottom-left
+    // HP bottom-left (armor cluster tucked under it, only while armor > 0)
     this.hpWrap = div('fh-hp');
     this.hpNum = div('fh-hp-num');
     const bar = div('fh-hp-bar');
     this.hpFill = div('fh-hp-fill');
     bar.appendChild(this.hpFill);
-    this.hpWrap.append(this.hpNum, bar);
+    this.armorWrap = div('fh-armor fh-hidden');
+    this.armorNum = div('fh-armor-num');
+    const armorBar = div('fh-armor-bar');
+    this.armorFill = div('fh-armor-fill');
+    armorBar.appendChild(this.armorFill);
+    this.armorWrap.append(this.armorNum, armorBar);
+    this.hpWrap.append(this.hpNum, bar, this.armorWrap);
     this.layer.appendChild(this.hpWrap);
 
     // money + ammo bottom-right
@@ -568,6 +588,15 @@ export class Hud {
     if (low !== this.cLow) {
       this.cLow = low;
       this.hpWrap.classList.toggle('fh-low', low);
+    }
+
+    // armor (0..100; cluster hidden entirely at 0 — no vest)
+    const armor = Math.max(0, Math.min(100, Math.round(s.armor)));
+    if (armor !== this.cArmor) {
+      this.cArmor = armor;
+      this.armorWrap.classList.toggle('fh-hidden', armor <= 0);
+      this.armorNum.textContent = String(armor);
+      this.armorFill.style.width = `${armor}%`;
     }
 
     // money (flash green on increase)
