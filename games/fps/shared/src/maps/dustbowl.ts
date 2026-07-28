@@ -39,9 +39,10 @@ export const dustbowl: MapDef = {
     { x: -6.5, y: 1.6, z: 0, w: 9, h: 3.2, d: 12, mat: 'sand' },
     { x: 6.5, y: 1.6, z: 0, w: 9, h: 3.2, d: 12, mat: 'sand' },
 
-    // mid corridor cover
-    { x: 0, y: 0.6, z: 9, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
-    { x: 0, y: 0.6, z: -9, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
+    // mid corridor cover (wood family — the saturated 'crate' read as an
+    // orphan red accent here; teal painted plates now carry the accent)
+    { x: 0, y: 0.6, z: 9, w: 1.2, h: 1.2, d: 1.2, mat: 'wood' },
+    { x: 0, y: 0.6, z: -9, w: 1.2, h: 1.2, d: 1.2, mat: 'wood' },
 
     // ---- left lane divider (gap z[-6,4]) ----
     { x: -14.5, y: 1.6, z: -10, w: 1.5, h: 3.2, d: 8, mat: 'sand' },
@@ -123,5 +124,43 @@ export const dustbowl: MapDef = {
     // corner/dead-zone dressing (style bible: corners get the most dressing)
     { kind: 'cactus', count: 6, x0: -31, z0: 16, x1: -18, z1: 23, minSpacing: 3 },
     { kind: 'shrub', count: 8, x0: 18, z0: -23, x1: 31, z1: -14, minSpacing: 3 },
+    // AAA pass: sandbag fighting positions along the three lanes (appended —
+    // earlier zone indices/seeds unchanged); solids/spawn rejection keeps the
+    // corridor walls, crates and blocks clear
+    { kind: 'sandbag', count: 16, x0: -3.5, z0: -13, x1: 3.5, z1: 13, minSpacing: 3 },
+    { kind: 'sandbag', count: 8, x0: -27, z0: -14, x1: -18, z1: 14, minSpacing: 4 },
+    { kind: 'sandbag', count: 8, x0: 18, z0: -14, x1: 27, z1: 14, minSpacing: 4 },
+  ],
+  // AAA skyline: dune/mesa silhouette ring beyond the outer walls (the sky is
+  // a third of the frame down mid lane — it must not be empty)
+  skyline: {
+    hex: PALETTE.sandDark,
+    capHex: PALETTE.dust,
+    count: 12,
+    minR: 42,
+    maxR: 68,
+    minH: 7,
+    maxH: 13,
+  },
+  // AAA accent: muted steel-teal (screenGlow) — gate frames on both mid-lane
+  // termini, painted plates on the mid crates, tarps on the flank faces:
+  // three deliberate repeats down the mid sightline
+  accents: [
+    // gate frames on the z=-/+15 breaker walls (posts + lintel, visual only)
+    { x: -1.8, y: 1.65, z: -14.35, w: 0.5, h: 3.3, d: 0.3, hex: PALETTE.screenGlow },
+    { x: 1.8, y: 1.65, z: -14.35, w: 0.5, h: 3.3, d: 0.3, hex: PALETTE.screenGlow },
+    { x: 0, y: 3.25, z: -14.35, w: 4.6, h: 0.5, d: 0.4, hex: PALETTE.screenGlow },
+    { x: -1.8, y: 1.65, z: 14.35, w: 0.5, h: 3.3, d: 0.3, hex: PALETTE.screenGlow },
+    { x: 1.8, y: 1.65, z: 14.35, w: 0.5, h: 3.3, d: 0.3, hex: PALETTE.screenGlow },
+    { x: 0, y: 3.25, z: 14.35, w: 4.6, h: 0.5, d: 0.4, hex: PALETTE.screenGlow },
+    // painted teal plates on the mid-lane cover crates (both faces, so the
+    // accent reads from either attack direction)
+    { x: 0, y: 0.62, z: -9.63, w: 1.0, h: 0.7, d: 0.06, hex: PALETTE.screenGlow },
+    { x: 0, y: 0.62, z: -8.37, w: 1.0, h: 0.7, d: 0.06, hex: PALETTE.screenGlow },
+    { x: 0, y: 0.62, z: 8.37, w: 1.0, h: 0.7, d: 0.06, hex: PALETTE.screenGlow },
+    { x: 0, y: 0.62, z: 9.63, w: 1.0, h: 0.7, d: 0.06, hex: PALETTE.screenGlow },
+    // tarps on the mid flank inner faces (corridor eye level)
+    { x: -1.97, y: 1.9, z: 0, w: 0.06, h: 1.1, d: 2.2, hex: PALETTE.screenGlow },
+    { x: 1.97, y: 1.9, z: 0, w: 0.06, h: 1.1, d: 2.2, hex: PALETTE.screenGlow },
   ],
 };

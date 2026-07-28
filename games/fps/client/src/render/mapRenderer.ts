@@ -1,9 +1,32 @@
 // ============================================================================
 // C3 — map renderer: MapDef (pure data) => baked static geometry + solids.
 // Ground slab, sky dome (the ONE raw-geometry/MeshBasicMaterial exception),
-// one box() per BoxDef, and seeded deco prop scatter — everything static is
-// merged by bake() into ~1 mesh per material (<= ~20 draw calls total).
-// Determinism: all scatter/jitter comes from rng(decoSeed(map.id, zoneIndex));
+// BoxDefs rendered as RICH boxes, seeded floor life + ceiling light panels,
+// and seeded deco prop scatter — everything static is merged by bake() into
+// one mesh per material (< 60 draw calls per map).
+//
+// AAA material richness (all tints derived from PALETTE hexes at build time):
+//   - per-box albedo jitter (+-8%, 3 seeded buckets: -8% / base / +8%)
+//   - sun-kissed tops: a flush, slightly outset cap slab ~12% lighter than sides
+//   - ground-standing tall boxes get a darker skirting strip at floor level and
+//     a darker trim band just under the cap (cornice), same mat family
+//   - floor life: seeded patchwork tint zones + darker wear lanes running
+//     T spawn -> CT spawn (and two offset lanes), plus trampled spawn courts
+//   - indoor maps (big overhead slabs) get seeded ceiling light panels:
+//     metalDark frame + emissive glow plate (warm paper, some cool screenGlow,
+//     ~15% dead dark fixtures) with a soft floor pool quad under each lit panel
+//   - wall breakup: pilaster ribs every ~4m on tall long faces (same-family
+//     dark accent) + large-scale +-4% value mottling on big wall faces
+//   - props upgraded: crate lids, barrel lids, pipe end flanges; new kinds:
+//     palletStack, sandbag, icicle, deskChair, waterCooler, sack
+//   - per-map data extras: `skyline` (silhouette mesa ring beyond the walls)
+//     and `accents` (one deliberate accent color repeated: gates, painted
+//     plates, tarps, hazard strips, whiteboards, wayfinding)
+//
+// Visual layers NEVER extend the collision solids: solids come from BoxDefs
+// unchanged (boxToAABB); caps sit flush with the box top, strips protrude
+// <= 3cm (decorative ledges, non-collidable).
+// Determinism: all scatter/jitter comes from rng(decoSeed(map.id, salt));
 // Math.random is never touched. Props are client-only dressing: non-collidable,
 // never inside solids (AABB inflated 0.5m) or within 2.5m of any spawn.
 // ============================================================================
@@ -16,11 +39,12 @@ import {
   rngInt,
   rngRange,
   type AABB,
+  type BoxDef,
   type DecoKind,
   type MapDef,
   type MatId,
 } from '@fps/shared';
-import { at, bake, box, cyl, sphere } from '../contract/visual.js';
+import { at, bake, box, cone, cyl, sphere } from '../contract/visual.js';
 
 // ---- MatId -> PALETTE (frozen mapping, see STYLE_BIBLE.md) -------------------
 export const MAT_COLORS: Record<MatId, string> = {
@@ -51,8 +75,55 @@ const SPAWN_CLEARANCE = 2.5; // min prop distance to any spawn
 const MAX_ATTEMPTS_PER_PROP = 30; // termination cap for rejection sampling
 const DOME_RADIUS = 400;
 
+// ---- richness tuning ----------------------------------------------------------
+// rng stream salts (deco zones use salts 0..zoneCount-1; these stay clear)
+const SALT_BOX_TINT = 1000;
+const SALT_FLOOR = 2000;
+const SALT_LIGHT = 3000;
+const SALT_SKYLINE = 4000;
+
+const JITTER = [0.92, 1.0, 1.08] as const; // per-box albedo buckets (+-8%)
+const TOP_LIGHTEN = 1.12; // cap slabs are this much lighter than their side
+const TRIM_DARKEN = 0.72; // skirting/trim accent within the same mat family
+const CAP_H = 0.035; // top cap slab thickness (flush with the box top)
+const CAP_OUT = 0.02; // cap lateral outset (reads as a sunlit rim, hides seam)
+const SKIRT_H = 0.14; // floor-level skirting band height
+const SKIRT_OUT = 0.024;
+const TRIM_H = 0.15; // wall-top trim band height (sits just under the cap)
+const TRIM_OUT = 0.028;
+const OVERHEAD_BOTTOM = 2.0; // boxes starting above this are "overhead" (plain)
+
+const PATCH_FACTORS = [0.86, 0.93, 1.06] as const; // floor patchwork tints
+const WEAR_FACTOR = 0.85; // trampled lane darkening (subtle, read at a glance)
+const WEAR_TOP_Y = -0.0008; // overlays stack: patches < courts < lanes < feet(0)
+
+// ---- wall breakup --------------------------------------------------------------
+const RIB_EVERY = 4; // pilaster spacing on tall long faces (m)
+const RIB_MIN_FACE = 6; // faces shorter than this get no pilasters
+const RIB_OUT = 0.03; // proudest strip (over trim/skirt so it reads as a rib)
+const MOTTLE_MIN_FACE = 8; // big blockout-tell slabs get value mottling
+const MOTTLE_FACTORS = [0.96, 1.04] as const; // large-scale +-4% value clouds
+const MOTTLE_OUT = 0.008; // tucks behind skirt/trim/ribs
+
+const PANEL_CELL = 2.4; // ceiling light-panel grid pitch (m)
+const PANEL_SKIP = 0.38; // seeded fraction of cells left dark
+const PANEL_DARK = 0.15; // fraction of lit cells that are dead fixtures
+const PANEL_COOL = 0.2; // fraction of lit panels running cool (screenGlow)
+const POOL_OPACITY = 0.62; // floor pool quad alpha (transparent, soft spill)
+
+/** Multiply a PALETTE '#rrggbb' hex by f (clamped). All richness tints derive
+ *  from PALETTE entries here — no ad-hoc hues are ever introduced. */
+function shade(hex: string, f: number): string {
+  const n = parseInt(hex.slice(1), 16);
+  const r = Math.min(255, Math.round(((n >> 16) & 0xff) * f));
+  const g = Math.min(255, Math.round(((n >> 8) & 0xff) * f));
+  const b = Math.min(255, Math.round((n & 0xff) * f));
+  return `#${((r << 16) | (g << 8) | b).toString(16).padStart(6, '0')}`;
+}
+
 /**
- * Build the whole map: ground, sky dome, collidable boxes, deco scatter.
+ * Build the whole map: ground, sky dome, collidable boxes, floor life,
+ * ceiling light panels, deco scatter.
  * Returns the renderable root group and the collision solids (same AABBs the
  * server derives — boxToAABB per BoxDef, order preserved).
  */
@@ -63,10 +134,23 @@ export function buildMap(map: MapDef): { root: THREE.Group; solids: AABB[] } {
   // ---- ground: factory box as a slab; top surface at y=-0.01, 8m apron ----
   statics.add(at(box(map.sizeX + 8, 0.02, map.sizeZ + 8, MAT_COLORS[map.floorMat]), 0, -0.02, 0));
 
-  // ---- collidable boxes at exact BoxDef coords ------------------------------
+  // ---- skyline backdrop: giant ground apron + silhouette landmark ring ------
+  buildSkyline(statics, map);
+
+  // ---- floor life: patchwork tint zones + wear lanes (visual overlays) ------
+  buildFloorLife(statics, map);
+
+  // ---- collidable boxes at exact BoxDef coords (rich materials) --------------
+  const boxTint = rng(decoSeed(map.id, SALT_BOX_TINT));
   for (const b of map.boxes) {
-    statics.add(at(box(b.w, b.h, b.d, MAT_COLORS[b.mat]), b.x, b.y, b.z));
+    buildRichBox(statics, b, boxTint);
   }
+
+  // ---- ceiling light panels (indoor maps only: big overhead slabs) -----------
+  buildLightPanels(statics, map, solids);
+
+  // ---- deliberate accent dressing (per-map data, pure visual overlays) -------
+  buildAccents(statics, map);
 
   // ---- deco scatter: seeded per zone, rejection-sampled ----------------------
   const placed: Array<{ x: number; z: number }> = []; // all zones share spacing knowledge
@@ -92,6 +176,285 @@ export function buildMap(map: MapDef): { root: THREE.Group; solids: AABB[] } {
   root.add(bake(statics)); // one merged mesh per material, shadows on
   root.add(makeSkyDome(map)); // unbaked: must never cast/receive shadows
   return { root, solids };
+}
+
+// ---- rich box rendering -------------------------------------------------------
+
+/**
+ * One BoxDef => jittered side body + flush lighter top cap, plus (for tall
+ * ground-standing boxes) a darker skirting band at floor level and a darker
+ * trim band just under the cap. Long tall faces get pilaster ribs every ~4m;
+ * big slab faces additionally get large-scale +-4% value mottling (the flat
+ * 12m wall is the classic blockout tell). Overhead boxes (ceilings, high
+ * bridges) stay plain jittered slabs — their tops are never seen.
+ */
+function buildRichBox(g: THREE.Group, b: BoxDef, next: () => number): void {
+  const base = MAT_COLORS[b.mat];
+  const f = JITTER[Math.floor(next() * JITTER.length)] ?? 1;
+  const sideHex = shade(base, f);
+  const bottom = b.y - b.h / 2;
+  const top = b.y + b.h / 2;
+  const overhead = bottom > OVERHEAD_BOTTOM;
+
+  if (overhead || b.h <= CAP_H + 0.01) {
+    g.add(at(box(b.w, b.h, b.d, sideHex), b.x, b.y, b.z));
+    return;
+  }
+
+  // body: bottom unchanged, top lowered by CAP_H (cap finishes flush at `top`)
+  g.add(at(box(b.w, b.h - CAP_H, b.d, sideHex), b.x, bottom + (b.h - CAP_H) / 2, b.z));
+  // cap: sun-kissed top face, slight outset so the seam never z-fights
+  g.add(at(box(b.w + CAP_OUT * 2, CAP_H, b.d + CAP_OUT * 2, shade(base, f * TOP_LIGHTEN)), b.x, top - CAP_H / 2, b.z));
+
+  const trimHex = shade(base, TRIM_DARKEN);
+  // skirting: floor-level accent band on ground-standing tall boxes
+  if (b.h >= 1.8 && Math.abs(bottom) <= 0.06 && (b.w >= 0.8 || b.d >= 0.8)) {
+    g.add(
+      at(box(b.w + SKIRT_OUT * 2, SKIRT_H, b.d + SKIRT_OUT * 2, trimHex), b.x, bottom + SKIRT_H / 2, b.z),
+    );
+  }
+  if (b.h >= 2.2) {
+    // trim: wall-top accent band just under the cap (cornice read at distance)
+    g.add(
+      at(box(b.w + TRIM_OUT * 2, TRIM_H, b.d + TRIM_OUT * 2, trimHex), b.x, top - CAP_H - TRIM_H / 2, b.z),
+    );
+    // pilaster ribs along both faces of each long axis
+    if (b.w >= RIB_MIN_FACE) addRibs(g, b, trimHex, 'x');
+    if (b.d >= RIB_MIN_FACE) addRibs(g, b, trimHex, 'z');
+    // value mottling on the big blockout-tell faces
+    if (b.w >= MOTTLE_MIN_FACE) addMottle(g, b, base, next, 'x');
+    if (b.d >= MOTTLE_MIN_FACE) addMottle(g, b, base, next, 'z');
+  }
+}
+
+/** Pilaster ribs: thin vertical strips (same-family dark accent) spaced ~4m
+ *  along both faces of one long axis. `axis` is the face's long direction. */
+function addRibs(g: THREE.Group, b: BoxDef, trimHex: string, axis: 'x' | 'z'): void {
+  const len = axis === 'x' ? b.w : b.d;
+  const n = Math.max(1, Math.round(len / RIB_EVERY));
+  for (let i = 0; i < n; i++) {
+    const c = -len / 2 + (len / n) * (i + 0.5);
+    for (const s of [-1, 1]) {
+      const rib =
+        axis === 'x'
+          ? at(box(0.18, b.h - 0.12, RIB_OUT * 2, trimHex), b.x + c, b.y, b.z + s * (b.d / 2 + RIB_OUT))
+          : at(box(RIB_OUT * 2, b.h - 0.12, 0.18, trimHex), b.x + s * (b.w / 2 + RIB_OUT), b.y, b.z + c);
+      g.add(rib);
+    }
+  }
+}
+
+/** Value mottling: a few large, faint +-4% overlay quads per big face — breaks
+ *  the single-flat-value read of 8m+ slabs without touching the silhouette. */
+function addMottle(g: THREE.Group, b: BoxDef, baseHex: string, next: () => number, axis: 'x' | 'z'): void {
+  const len = axis === 'x' ? b.w : b.d;
+  const q = Math.max(2, Math.round(len / 10));
+  for (const s of [-1, 1]) {
+    for (let i = 0; i < q; i++) {
+      const wq = Math.min(rngRange(next, 2.5, 5.5), len - 1);
+      const hq = rngRange(next, 0.35, 0.65) * b.h;
+      const cq = rngRange(next, -len / 2 + wq / 2 + 0.4, len / 2 - wq / 2 - 0.4);
+      const yq = rngRange(next, hq / 2 + 0.12, Math.max(hq / 2 + 0.13, b.h - hq / 2 - 0.25));
+      const hex = shade(baseHex, MOTTLE_FACTORS[(i + (s > 0 ? 1 : 0)) % MOTTLE_FACTORS.length] ?? 1);
+      const quad =
+        axis === 'x'
+          ? at(box(wq, hq, MOTTLE_OUT * 2, hex), b.x + cq, yq, b.z + s * (b.d / 2 + MOTTLE_OUT))
+          : at(box(MOTTLE_OUT * 2, hq, wq, hex), b.x + s * (b.w / 2 + MOTTLE_OUT), yq, b.z + cq);
+      g.add(quad);
+    }
+  }
+}
+
+// ---- floor life (patchwork tint zones + wear lanes; visual overlays only) -----
+
+function buildFloorLife(g: THREE.Group, map: MapDef): void {
+  const floorHex = MAT_COLORS[map.floorMat];
+  const next = rng(decoSeed(map.id, SALT_FLOOR));
+  const halfX = map.sizeX / 2;
+  const halfZ = map.sizeZ / 2;
+
+  // patchwork tint zones: large soft rectangles, four depth tiers so
+  // overlapping patches never share a plane (no z-fighting)
+  const patchCount = Math.round((map.sizeX * map.sizeZ) / 220);
+  for (let i = 0; i < patchCount; i++) {
+    const w = rngRange(next, 3, 9);
+    const d = rngRange(next, 3, 9);
+    const x = rngRange(next, -halfX + w / 2 + 1, halfX - w / 2 - 1);
+    const z = rngRange(next, -halfZ + d / 2 + 1, halfZ - d / 2 - 1);
+    const f = PATCH_FACTORS[i % PATCH_FACTORS.length] ?? 1;
+    const y = -0.003 - (i % 4) * 0.0012;
+    g.add(at(box(w, 0.002, d, shade(floorHex, f)), x, y, z));
+  }
+
+  // wear lanes: darker trampled strips running T -> CT along the mid axis and
+  // two offset lanes; segmented with a slight seeded wobble so they read worn,
+  // not painted. Spawn courts get a trampled pad as well.
+  const wearHex = shade(floorHex, WEAR_FACTOR);
+  const t = centroid(map.spawns.T);
+  const ct = centroid(map.spawns.CT);
+  for (const off of [0, -halfX * 0.62, halfX * 0.62]) {
+    const p0 = { x: t.x + off, z: t.z };
+    const p3 = { x: ct.x + off, z: ct.z };
+    const pts = [p0];
+    for (const k of [1 / 3, 2 / 3]) {
+      pts.push({
+        x: p0.x + (p3.x - p0.x) * k + rngRange(next, -1.2, 1.2),
+        z: p0.z + (p3.z - p0.z) * k,
+      });
+    }
+    pts.push(p3);
+    for (let i = 0; i + 1 < pts.length; i++) {
+      const a = pts[i];
+      const c = pts[i + 1];
+      if (a === undefined || c === undefined) continue;
+      const dx = c.x - a.x;
+      const dz = c.z - a.z;
+      const len = Math.hypot(dx, dz);
+      if (len < 0.5) continue;
+      const wSeg = rngRange(next, 1.5, 2.1);
+      const seg = at(box(wSeg, 0.002, len + 0.6, wearHex), (a.x + c.x) / 2, WEAR_TOP_Y - 0.001, (a.z + c.z) / 2);
+      seg.rotation.y = Math.atan2(dx, dz);
+      g.add(seg);
+    }
+  }
+  for (const c of [t, ct]) {
+    g.add(at(box(7, 0.002, 3.2, wearHex), c.x, WEAR_TOP_Y - 0.0014, c.z));
+  }
+}
+
+function centroid(pts: ReadonlyArray<{ x: number; z: number }>): { x: number; z: number } {
+  let x = 0;
+  let z = 0;
+  for (const p of pts) {
+    x += p.x;
+    z += p.z;
+  }
+  const n = Math.max(1, pts.length);
+  return { x: x / n, z: z / n };
+}
+
+// ---- skyline backdrop (silhouette ring beyond the outer walls) ----------------
+
+/**
+ * A giant ground apron (so the horizon never shows void) plus a seeded ring of
+ * two-tier mesa/dune silhouettes outside the playable area. Pure backdrop:
+ * non-collidable, outside every solid, fog does the aerial perspective.
+ */
+function buildSkyline(g: THREE.Group, map: MapDef): void {
+  const s = map.skyline;
+  if (s === undefined) return;
+  g.add(at(box(320, 0.02, 320, map.theme.ground), 0, -0.04, 0)); // horizon apron
+  const next = rng(decoSeed(map.id, SALT_SKYLINE));
+  for (let i = 0; i < s.count; i++) {
+    const ang = (i / s.count) * Math.PI * 2 + rngRange(next, -0.15, 0.15);
+    const r = rngRange(next, s.minR, s.maxR);
+    const x = Math.cos(ang) * r;
+    const z = Math.sin(ang) * r;
+    const h = rngRange(next, s.minH, s.maxH);
+    const w = rngRange(next, h * 1.6, h * 2.8);
+    const d = rngRange(next, h * 1.2, h * 2.0);
+    const yaw = next() * Math.PI;
+    const base = at(box(w, h, d, s.hex), x, h / 2 - 0.5, z); // sunk 0.5 into the apron
+    base.rotation.y = yaw;
+    g.add(base);
+    const h2 = h * rngRange(next, 0.35, 0.55);
+    const tier = at(box(w * 0.62, h2, d * 0.62, s.capHex ?? s.hex), x, h - 0.5 + h2 / 2, z);
+    tier.rotation.y = yaw + rngRange(next, -0.2, 0.2);
+    g.add(tier);
+  }
+}
+
+// ---- deliberate accent dressing (data-driven visual overlays) ------------------
+
+function buildAccents(g: THREE.Group, map: MapDef): void {
+  for (const a of map.accents ?? []) {
+    const opts = a.emissive === true ? { emissive: a.hex } : undefined;
+    g.add(at(box(a.w, a.h, a.d, a.hex, opts), a.x, a.y, a.z));
+  }
+}
+
+// ---- ceiling light panels (indoor maps: big mood win) --------------------------
+
+/**
+ * Seeded grid of fluorescent panels hung under ceiling slabs. A map "has a
+ * ceiling" wherever an overhead box (slab bottom in [2.2, 4.5], >= 3m in both
+ * footprint axes) covers the grid point — outdoor maps get nothing, skylight
+ * slots stay dark. Panels never spawn inside tall solids (pillars/walls).
+ * ~15% of lit cells are dead fixtures (dark plate, no glow, no pool); each
+ * live panel spills a soft transparent pool quad onto the floor below.
+ */
+function buildLightPanels(g: THREE.Group, map: MapDef, solids: AABB[]): void {
+  const slabs = map.boxes.filter((b) => {
+    const bottom = b.y - b.h / 2;
+    return bottom >= 2.2 && bottom <= 4.5 && b.w >= 3 && b.d >= 3;
+  });
+  if (slabs.length === 0) return;
+
+  const next = rng(decoSeed(map.id, SALT_LIGHT));
+  const halfX = map.sizeX / 2;
+  const halfZ = map.sizeZ / 2;
+  const cols = Math.floor((map.sizeX - 2.6) / PANEL_CELL) + 1;
+  const rows = Math.floor((map.sizeZ - 2.6) / PANEL_CELL) + 1;
+  const poolHex = shade(MAT_COLORS[map.floorMat], 1.5);
+  const poolGlowHex = shade(MAT_COLORS[map.floorMat], 1.35);
+
+  for (let i = 0; i < cols; i++) {
+    for (let j = 0; j < rows; j++) {
+      const x = -halfX + 1.3 + i * PANEL_CELL;
+      const z = -halfZ + 1.3 + j * PANEL_CELL;
+      let ceil = Number.POSITIVE_INFINITY;
+      for (const s of slabs) {
+        if (Math.abs(x - s.x) <= s.w / 2 && Math.abs(z - s.z) <= s.d / 2) {
+          ceil = Math.min(ceil, s.y - s.h / 2);
+        }
+      }
+      if (!Number.isFinite(ceil)) continue;
+      if (next() < PANEL_SKIP) continue;
+      if (insideTallSolid(x, z, ceil, map.boxes)) continue;
+
+      const alongX = (i + j) % 2 === 0; // alternate orientation per cell
+      const fw = alongX ? 1.3 : 0.7;
+      const fd = alongX ? 0.7 : 1.3;
+      const gw = alongX ? 1.16 : 0.56;
+      const gd = alongX ? 0.56 : 1.16;
+      g.add(at(box(fw, 0.05, fd, PALETTE.metalDark), x, ceil - 0.025, z));
+
+      if (next() < PANEL_DARK) {
+        // dead fixture: dark inset plate, no glow, no pool
+        g.add(at(box(gw, 0.024, gd, PALETTE.charcoal), x, ceil - 0.062, z));
+        continue;
+      }
+      const warm = next() >= PANEL_COOL;
+      const glowHex = warm ? PALETTE.paper : PALETTE.screenGlow;
+      g.add(at(box(gw, 0.024, gd, glowHex, { emissive: glowHex }), x, ceil - 0.062, z));
+      // floor pool: soft emissive-transparent spill on open floor (not under
+      // solids) — the emissive term reads as spilled light even in gloom
+      if (!insideSolid(x, z, solids)) {
+        const pw = alongX ? 2.4 : 1.5;
+        const pd = alongX ? 1.5 : 2.4;
+        g.add(
+          at(
+            box(pw, 0.001, pd, poolHex, { transparent: true, opacity: POOL_OPACITY, emissive: poolGlowHex }),
+            x,
+            -0.001,
+            z,
+          ),
+        );
+      }
+    }
+  }
+}
+
+/** True when (x,z) lies inside a floor-standing solid (padded) whose top
+ *  reaches the panel. Overhead boxes (the ceiling slabs themselves, bottom at
+ *  or above the panel) are not obstructions — panels hang from them. */
+function insideTallSolid(x: number, z: number, ceil: number, boxes: readonly BoxDef[]): boolean {
+  for (const b of boxes) {
+    if (b.y - b.h / 2 >= ceil - 0.5) continue; // overhead slab, not a pillar
+    if (b.y + b.h / 2 < ceil - 0.12) continue; // too low to reach the panel
+    if (Math.abs(x - b.x) <= b.w / 2 + 0.35 && Math.abs(z - b.z) <= b.d / 2 + 0.35) return true;
+  }
+  return false;
 }
 
 // ---- scatter rejections -------------------------------------------------------
@@ -201,13 +564,31 @@ function buildProp(kind: DecoKind, next: () => number): THREE.Group {
     case 'paperStack':
       buildPaperStack(g, next);
       break;
+    case 'palletStack':
+      buildPalletStack(g, next);
+      break;
+    case 'sandbag':
+      buildSandbag(g, next);
+      break;
+    case 'icicle':
+      buildIcicle(g, next);
+      break;
+    case 'deskChair':
+      buildDeskChair(g);
+      break;
+    case 'waterCooler':
+      buildWaterCooler(g);
+      break;
+    case 'sack':
+      buildSack(g, next);
+      break;
   }
   g.rotation.y = next() * Math.PI * 2; // slight organic yaw jitter
   g.scale.setScalar(rngRange(next, 0.85, 1.2));
   return g;
 }
 
-/** crate: wood box + 4 woodDark edge battens. */
+/** crate: wood box + 4 woodDark edge battens + raised lid on a darker rim. */
 function buildCrate(g: THREE.Group): void {
   const S = 0.9;
   const B = 0.09;
@@ -217,9 +598,12 @@ function buildCrate(g: THREE.Group): void {
       g.add(at(box(B, S, B, PALETTE.woodDark), (sx * (S - B)) / 2, S / 2, (sz * (S - B)) / 2));
     }
   }
+  // lid: darker rim plate slightly proud of the body, raised lid panel on top
+  g.add(at(box(S + 0.04, 0.04, S + 0.04, PALETTE.woodDark), 0, S + 0.02, 0));
+  g.add(at(box(S - 0.08, 0.05, S - 0.08, PALETTE.wood), 0, S + 0.065, 0));
 }
 
-/** barrel: cyl (steel or tBrown by rng) + 2 thin rim bands. */
+/** barrel: cyl (steel or tBrown by rng) + 2 ring bands + inset lid disc. */
 function buildBarrel(g: THREE.Group, next: () => number): void {
   const R = 0.34;
   const H = 0.92;
@@ -227,6 +611,7 @@ function buildBarrel(g: THREE.Group, next: () => number): void {
   g.add(at(cyl(R, R, H, 12, body), 0, H / 2, 0));
   g.add(at(cyl(R + 0.03, R + 0.03, 0.07, 12, PALETTE.metalDark), 0, H * 0.28, 0));
   g.add(at(cyl(R + 0.03, R + 0.03, 0.07, 12, PALETTE.metalDark), 0, H * 0.72, 0));
+  g.add(at(cyl(R - 0.04, R - 0.04, 0.05, 12, PALETTE.metalDark), 0, H + 0.025, 0)); // lid
 }
 
 /** pallet: 3 slats over 2 beams. */
@@ -239,7 +624,19 @@ function buildPallet(g: THREE.Group): void {
   }
 }
 
-/** pipe: horizontal steel cyl + 2 ring flanges + vertical elbow riser. */
+/** palletStack: 2-3 pallets piled with slight yaw drift (warehouse dressing). */
+function buildPalletStack(g: THREE.Group, next: () => number): void {
+  const n = rngInt(next, 2, 3);
+  for (let i = 0; i < n; i++) {
+    const layer = new THREE.Group();
+    buildPallet(layer);
+    layer.position.y = i * 0.135;
+    layer.rotation.y = rngRange(next, -0.14, 0.14);
+    g.add(layer);
+  }
+}
+
+/** pipe: horizontal steel cyl + 2 ring bands + 2 end flanges + elbow riser. */
 function buildPipe(g: THREE.Group): void {
   const R = 0.14;
   const L = 1.8;
@@ -251,7 +648,72 @@ function buildPipe(g: THREE.Group): void {
     flange.rotation.z = Math.PI / 2;
     g.add(flange);
   }
+  for (const x of [-L / 2 + 0.05, L / 2 - 0.05]) {
+    const end = at(cyl(R + 0.05, R + 0.05, 0.07, 10, PALETTE.metalDark), x, R, 0);
+    end.rotation.z = Math.PI / 2;
+    g.add(end);
+  }
   g.add(at(cyl(R, R, 0.9, 10, PALETTE.steel), L / 2 - R, R + 0.42, 0)); // elbow up at one end
+}
+
+/** sandbag: brickwork rows of squat bags (field fortification). */
+function buildSandbag(g: THREE.Group, next: () => number): void {
+  const rows = rngInt(next, 2, 3);
+  for (let r = 0; r < rows; r++) {
+    for (let i = 0; i < 3; i++) {
+      const bx = (i - 1) * 0.52 + (r % 2 === 1 ? 0.13 : -0.13);
+      const bag = at(
+        box(0.5, 0.2, 0.34, r % 2 === 0 ? PALETTE.sandDark : PALETTE.dust),
+        bx + rngRange(next, -0.03, 0.03),
+        0.1 + r * 0.19,
+        rngRange(next, -0.03, 0.03),
+      );
+      bag.rotation.y = rngRange(next, -0.15, 0.15);
+      g.add(bag);
+    }
+  }
+}
+
+/** icicle: cluster of small frost shards (short cones, slight lean). */
+function buildIcicle(g: THREE.Group, next: () => number): void {
+  const n = rngInt(next, 3, 5);
+  for (let i = 0; i < n; i++) {
+    const h = rngRange(next, 0.3, 0.9);
+    const r = rngRange(next, 0.05, 0.12);
+    const hex = next() < 0.6 ? PALETTE.ice : PALETTE.snowShadow;
+    const shard = at(cone(r, h, 6, hex), rngRange(next, -0.3, 0.3), h / 2, rngRange(next, -0.3, 0.3));
+    shard.rotation.z = rngRange(next, -0.12, 0.12);
+    shard.rotation.x = rngRange(next, -0.12, 0.12);
+    g.add(shard);
+  }
+}
+
+/** deskChair: post + base disc + seat + back panel (office dressing). */
+function buildDeskChair(g: THREE.Group): void {
+  g.add(at(cyl(0.26, 0.3, 0.04, 8, PALETTE.metalDark), 0, 0.02, 0)); // base disc
+  g.add(at(cyl(0.03, 0.03, 0.42, 6, PALETTE.metalDark), 0, 0.23, 0)); // post
+  g.add(at(box(0.46, 0.06, 0.44, PALETTE.charcoal), 0, 0.47, 0)); // seat
+  g.add(at(box(0.44, 0.5, 0.06, PALETTE.charcoal), 0, 0.75, -0.22)); // back
+}
+
+/** waterCooler: paper-white body + translucent-blue (ice) bottle + neck. */
+function buildWaterCooler(g: THREE.Group): void {
+  g.add(at(box(0.34, 0.95, 0.34, PALETTE.paper), 0, 0.475, 0)); // body
+  g.add(at(box(0.36, 0.05, 0.36, PALETTE.charcoal), 0, 0.975, 0)); // collar trim
+  g.add(at(cyl(0.15, 0.15, 0.42, 10, PALETTE.ice), 0, 1.21, 0)); // bottle
+  g.add(at(cyl(0.05, 0.05, 0.08, 8, PALETTE.ice), 0, 1.46, 0)); // neck
+}
+
+/** sack: 2-3 slumped grain sacks (squashed spheres, market dressing). */
+function buildSack(g: THREE.Group, next: () => number): void {
+  const n = rngInt(next, 2, 3);
+  for (let i = 0; i < n; i++) {
+    const r = rngRange(next, 0.26, 0.36);
+    const hex = next() < 0.5 ? PALETTE.dust : PALETTE.tBrown;
+    const sack = at(sphere(r, 7, hex), rngRange(next, -0.25, 0.25), r * 0.55, rngRange(next, -0.25, 0.25));
+    sack.scale.y = rngRange(next, 0.55, 0.7);
+    g.add(sack);
+  }
 }
 
 /** rock/snowRock core: 2-3 overlapping squashed spheres; returns top y. */

@@ -2,6 +2,18 @@
 // C4 — soldier models + animation. One blocky humanoid per remote player,
 // driven by interpolated PlayerSnaps. See CONTRACT.md "Soldier" model sheet
 // (22–32 prims, two-segment limbs, tapered torso, aim group).
+// Model sheet (30 body prims + 2 flash quads + 1 contact blob). THREE-TONE
+// team script so the side reads at 30m in sun AND shade (critic round 2):
+//   - UNIFORM (waist, chest, thighs, shins, all four arm segments) — the
+//     high-chroma team body (T fire / CT ctBlue), shade-lifted (emissive =
+//     team dark) so the silhouette never dies against same-hue walls or in
+//     shadow, without washing out in full sun;
+//   - LIGHT GEAR (helmet, vest, backpack, shoulder stripes) — the light team
+//     accent (T muzzle / CT ice) that carries the torso read at range;
+//   - DARK GEAR (belt, pouches, pads, chin strap, nape cover) — team dark
+//     (T tBrown / CT ctDark) separating the light pieces.
+// boots/visor ink, head skin. A soft transparent ink disk under the feet
+// grounds the model (fake contact shadow; rides the root).
 // Invariants:
 // - root group sits at FEET with yaw; `body` child carries crouch offset +
 //   death tilt so the two never fight over one Euler.
@@ -19,7 +31,7 @@
 // ============================================================================
 import * as THREE from 'three';
 import { PALETTE, type PlayerId, type PlayerSnap, type Team, type WeaponId } from '@fps/shared';
-import { at, box, mat } from '../contract/visual.js';
+import { at, box, cyl, mat } from '../contract/visual.js';
 import { makeWeaponModel } from './viewModel.js';
 
 // ---- frozen animation tuning (from CONTRACT.md / C4 spec) -------------------
@@ -55,20 +67,29 @@ const HIP_Y = 0.85;
 const THIGH_H = 0.45;
 const SHIN_H = 0.4; // thigh + shin = leg length to the ground
 const SHOULDER_Y = 1.42;
-const SHOULDER_X = 0.31; // just outside the wider chest box
+const SHOULDER_X = 0.34; // just outside the wider chest box (broad shoulders)
 const UPPER_ARM_H = 0.3;
 const FOREARM_H = 0.28;
 const HEAD_Y = 1.58;
 const HELMET_Y = 1.69;
-const BRIM_Y = 1.635; // thin slab at the helmet's lower edge
 const NAMEPLATE_Y = 2.1; // ~0.35u above the head
 const MUZZLE_TIP_Z = -0.55; // gun tip inside weapon-holder space
 
-function chestHex(team: Team): string {
-  return team === 'CT' ? PALETTE.ctBlue : PALETTE.tAmber;
+// ---- three-tone team script (critic round 2: readability in sun + shade) ----
+function uniformHex(team: Team): string {
+  // high-chroma team body: T fire (out of the desert wall hue), CT ctBlue
+  return team === 'CT' ? PALETTE.ctBlue : PALETTE.fire;
+}
+function lightHex(team: Team): string {
+  // light accent on helmet/vest/backpack/stripes — the 30m torso read
+  return team === 'CT' ? PALETTE.ice : PALETTE.muzzle;
 }
 function darkHex(team: Team): string {
+  // dark separator pieces (belt, pouches, pads, helmet straps)
   return team === 'CT' ? PALETTE.ctDark : PALETTE.tBrown;
+}
+function chestHex(team: Team): string {
+  return uniformHex(team); // nameplate team bar follows the uniform
 }
 
 // ---- nameplate (CanvasTexture sprite — contract exception) -------------------
@@ -132,9 +153,10 @@ function disposeNameplate(sprite: THREE.Sprite): void {
 interface Soldier {
   root: THREE.Group; // feet anchor: position + yaw (+ corpse sink)
   body: THREE.Group; // crouch drop + death tilt
-  torsoGroup: THREE.Group; // waist+chest+vest; origin at hip so breathe scales upward
-  chestMeshes: THREE.Mesh[]; // team chest color (retinted on side swap)
-  darkMeshes: THREE.Mesh[]; // team dark: vest, helmet, brim, all limb segments
+  torsoGroup: THREE.Group; // waist+chest+vest+gear; origin at hip so breathe scales upward
+  uniformMeshes: THREE.Mesh[]; // rim-lit team body (retinted on side swap)
+  lightMeshes: THREE.Mesh[]; // light team accent: vest, stripes, backpack, helmet
+  darkMeshes: THREE.Mesh[]; // dark separator gear: belt, pouches, pads, straps
   thighL: THREE.Group; // hip pivots
   thighR: THREE.Group;
   shinL: THREE.Group; // knee pivots (children of the thighs)
@@ -142,7 +164,7 @@ interface Soldier {
   armL: THREE.Group; // shoulder pivots (elbows hold a fixed two-hand pose)
   armR: THREE.Group;
   aim: THREE.Group; // arms + weapon; pitches with snap.pitch
-  headGroup: THREE.Group; // head+helmet+brim+visor; follows pitch at 0.5×
+  headGroup: THREE.Group; // head+helmet kit+visor; follows pitch at 0.5×
   weaponHolder: THREE.Group; // at the right hand; counter-rotated so pitch reads clean
   weaponMesh: THREE.Group;
   weapon: WeaponId;
@@ -180,44 +202,64 @@ export class PlayerModels {
     const body = new THREE.Group();
     root.add(body);
 
-    const chest = chestHex(p.team);
+    const uniform = uniformHex(p.team);
+    const light = lightHex(p.team);
     const dark = darkHex(p.team);
+    // rim pop without shader patches or shell prims: the DARK team tone as
+    // the uniform's emissive — a shade-floor lift that keeps the silhouette
+    // off same-hue walls without washing the body out in full sun
+    const rim = { emissive: dark };
 
-    // tapered torso: waist box narrower than the chest box above it, plus a
-    // team-dark vest plate on the chest front, shoulder pads, and a backpack
-    // on the back (all ride the torso so breathe + hit flinch move them)
+    // soft contact blob: transparent ink disk riding the feet anchor
+    const blob = at(cyl(0.36, 0.36, 0.004, 12, PALETTE.ink, { transparent: true, opacity: 0.5 }), 0, 0.012, 0);
+    blob.scale.z = 1.25; // ellipse, longer along the facing direction
+    root.add(blob);
+
+    // tapered torso: narrow waist, belt band, wider chest (broad shoulders) —
+    // the LIGHT vest plate + dark pouches carry the front read (all ride the
+    // torso so breathe + hit flinch move them)
     const torsoGroup = at(new THREE.Group(), 0, HIP_Y, 0);
-    const waist = at(box(0.4, 0.3, 0.24, chest), 0, 0.15, 0);
-    const chestMesh = at(box(0.5, 0.35, 0.28, chest), 0, 0.475, 0);
-    const vest = at(box(0.34, 0.26, 0.06, dark), 0, 0.47, -0.16);
-    const padL = at(box(0.18, 0.1, 0.22, dark), -SHOULDER_X, 0.6, 0);
-    const padR = at(box(0.18, 0.1, 0.22, dark), SHOULDER_X, 0.6, 0);
-    const backpack = at(box(0.34, 0.36, 0.12, dark), 0, 0.44, 0.2);
-    torsoGroup.add(waist, chestMesh, vest, padL, padR, backpack);
+    const waist = at(box(0.42, 0.26, 0.26, uniform, rim), 0, 0.13, 0);
+    const belt = at(box(0.44, 0.07, 0.28, dark), 0, 0.28, 0); // band between waist and chest
+    const chestMesh = at(box(0.56, 0.34, 0.3, uniform, rim), 0, 0.47, 0);
+    const vest = at(box(0.4, 0.28, 0.08, light), 0, 0.46, -0.17);
+    const pouchL = at(box(0.1, 0.12, 0.07, dark), -0.11, 0.38, -0.215); // mag pouches on the vest front
+    const pouchR = at(box(0.1, 0.12, 0.07, dark), 0.11, 0.38, -0.215);
+    const padL = at(box(0.2, 0.1, 0.26, dark), -SHOULDER_X, 0.62, 0);
+    const padR = at(box(0.2, 0.1, 0.26, dark), SHOULDER_X, 0.62, 0);
+    const stripeL = at(box(0.21, 0.035, 0.27, light), -SHOULDER_X, 0.667, 0); // light stripe caps the pad
+    const stripeR = at(box(0.21, 0.035, 0.27, light), SHOULDER_X, 0.667, 0);
+    const backpack = at(box(0.36, 0.36, 0.13, light), 0, 0.44, 0.215);
+    torsoGroup.add(waist, belt, chestMesh, vest, pouchL, pouchR, padL, padR, stripeL, stripeR, backpack);
 
-    // head group pitches with aim at 0.5×: head + helmet + brim + ink visor
+    // head group pitches with aim at 0.5×: head + LIGHT helmet (long-range
+    // read) with dark chin strap + nape cover + ink visor
     const headGroup = at(new THREE.Group(), 0, HEAD_Y, 0);
     const head = at(box(0.26, 0.26, 0.26, PALETTE.skin), 0, 0, 0);
-    const helmet = at(box(0.3, 0.14, 0.3, dark), 0, HELMET_Y - HEAD_Y, 0);
-    const brim = at(box(0.36, 0.03, 0.36, dark), 0, BRIM_Y - HEAD_Y, 0); // thin slab, wider than the helmet
+    const helmet = at(box(0.3, 0.14, 0.3, light), 0, HELMET_Y - HEAD_Y, 0);
+    const chinStrap = at(box(0.2, 0.03, 0.06, dark), 0, -0.145, -0.16); // strap under the chin, proud of the chest
+    const napeCover = at(box(0.26, 0.12, 0.04, dark), 0, -0.07, 0.15); // flap over the neck, off the helmet back
     const visor = at(box(0.28, 0.05, 0.03, PALETTE.ink), 0, 0.02, -0.14); // goggle strip across the eyes
-    headGroup.add(head, helmet, brim, visor);
+    headGroup.add(head, helmet, chinStrap, napeCover, visor);
     body.add(torsoGroup, headGroup);
 
     // two-segment legs: thigh pivot at the hip, shin pivot at the knee (child
-    // of the thigh so the whole leg swings together), ink boot at the ankle
+    // of the thigh so the whole leg swings together), dark knee pads on the
+    // shin fronts, ink boot at the ankle. Limbs wear the rim-lit UNIFORM.
     const thighL = at(new THREE.Group(), -0.12, HIP_Y, 0);
     const thighR = at(new THREE.Group(), 0.12, HIP_Y, 0);
-    const thighLMesh = at(box(0.17, THIGH_H, 0.19, dark), 0, -THIGH_H / 2, 0);
-    const thighRMesh = at(box(0.17, THIGH_H, 0.19, dark), 0, -THIGH_H / 2, 0);
+    const thighLMesh = at(box(0.17, THIGH_H, 0.19, uniform, rim), 0, -THIGH_H / 2, 0);
+    const thighRMesh = at(box(0.17, THIGH_H, 0.19, uniform, rim), 0, -THIGH_H / 2, 0);
     const shinL = at(new THREE.Group(), 0, -THIGH_H, 0);
     const shinR = at(new THREE.Group(), 0, -THIGH_H, 0);
-    const shinLMesh = at(box(0.14, SHIN_H, 0.16, dark), 0, -SHIN_H / 2, 0);
-    const shinRMesh = at(box(0.14, SHIN_H, 0.16, dark), 0, -SHIN_H / 2, 0);
+    const shinLMesh = at(box(0.14, SHIN_H, 0.16, uniform, rim), 0, -SHIN_H / 2, 0);
+    const shinRMesh = at(box(0.14, SHIN_H, 0.16, uniform, rim), 0, -SHIN_H / 2, 0);
+    const kneePadL = at(box(0.16, 0.12, 0.06, dark), 0, -0.05, -0.1); // rides the shin, caps the knee front
+    const kneePadR = at(box(0.16, 0.12, 0.06, dark), 0, -0.05, -0.1);
     const bootL = at(box(0.15, 0.1, 0.26, PALETTE.ink), 0, -SHIN_H + 0.05, -0.04);
     const bootR = at(box(0.15, 0.1, 0.26, PALETTE.ink), 0, -SHIN_H + 0.05, -0.04);
-    shinL.add(shinLMesh, bootL);
-    shinR.add(shinRMesh, bootR);
+    shinL.add(shinLMesh, kneePadL, bootL);
+    shinR.add(shinRMesh, kneePadR, bootR);
     thighL.add(thighLMesh, shinL);
     thighR.add(thighRMesh, shinR);
     body.add(thighL, thighR);
@@ -226,17 +268,20 @@ export class PlayerModels {
     const aim = at(new THREE.Group(), 0, SHOULDER_Y, 0);
 
     // two-segment arms: upper arm at the shoulder, forearm pivot at the elbow,
-    // posed forward into the two-handed weapon hold
+    // posed forward into the two-handed weapon hold; dark elbow pads ride the
+    // forearms at the elbow point. Arms wear the rim-lit UNIFORM.
     const armL = at(new THREE.Group(), -SHOULDER_X, 0, 0);
     const armR = at(new THREE.Group(), SHOULDER_X, 0, 0);
-    const upperLMesh = at(box(0.12, UPPER_ARM_H, 0.14, dark), 0, -UPPER_ARM_H / 2, 0);
-    const upperRMesh = at(box(0.12, UPPER_ARM_H, 0.14, dark), 0, -UPPER_ARM_H / 2, 0);
+    const upperLMesh = at(box(0.12, UPPER_ARM_H, 0.14, uniform, rim), 0, -UPPER_ARM_H / 2, 0);
+    const upperRMesh = at(box(0.12, UPPER_ARM_H, 0.14, uniform, rim), 0, -UPPER_ARM_H / 2, 0);
     const elbowL = at(new THREE.Group(), 0, -UPPER_ARM_H, 0);
     const elbowR = at(new THREE.Group(), 0, -UPPER_ARM_H, 0);
-    const foreLMesh = at(box(0.11, FOREARM_H, 0.12, dark), 0, -FOREARM_H / 2, 0);
-    const foreRMesh = at(box(0.11, FOREARM_H, 0.12, dark), 0, -FOREARM_H / 2, 0);
-    elbowL.add(foreLMesh);
-    elbowR.add(foreRMesh);
+    const foreLMesh = at(box(0.11, FOREARM_H, 0.12, uniform, rim), 0, -FOREARM_H / 2, 0);
+    const foreRMesh = at(box(0.11, FOREARM_H, 0.12, uniform, rim), 0, -FOREARM_H / 2, 0);
+    const elbowPadL = at(box(0.12, 0.1, 0.06, dark), 0, -0.02, 0.08); // caps the elbow point
+    const elbowPadR = at(box(0.12, 0.1, 0.06, dark), 0, -0.02, 0.08);
+    elbowL.add(foreLMesh, elbowPadL);
+    elbowR.add(foreRMesh, elbowPadR);
     armL.add(upperLMesh, elbowL);
     armR.add(upperRMesh, elbowR);
     armL.rotation.x = ARM_BASE_L;
@@ -272,14 +317,10 @@ export class PlayerModels {
     const nameplate = at(makeNameplate(p.name, p.team), 0, NAMEPLATE_Y, 0);
     body.add(nameplate);
 
-    const chestMeshes = [waist, chestMesh];
-    const darkMeshes = [
-      vest,
-      padL,
-      padR,
-      backpack,
-      helmet,
-      brim,
+    // three-tone team script — retinted on side swap
+    const uniformMeshes = [
+      waist,
+      chestMesh,
       thighLMesh,
       thighRMesh,
       shinLMesh,
@@ -289,7 +330,21 @@ export class PlayerModels {
       foreLMesh,
       foreRMesh,
     ];
-    for (const mesh of [...chestMeshes, ...darkMeshes, head, visor, bootL, bootR]) {
+    const lightMeshes = [vest, stripeL, stripeR, backpack, helmet];
+    const darkMeshes = [
+      belt,
+      pouchL,
+      pouchR,
+      padL,
+      padR,
+      chinStrap,
+      napeCover,
+      kneePadL,
+      kneePadR,
+      elbowPadL,
+      elbowPadR,
+    ];
+    for (const mesh of [...uniformMeshes, ...lightMeshes, ...darkMeshes, head, visor, bootL, bootR]) {
       mesh.castShadow = true;
     }
 
@@ -301,7 +356,8 @@ export class PlayerModels {
       root,
       body,
       torsoGroup,
-      chestMeshes,
+      uniformMeshes,
+      lightMeshes,
       darkMeshes,
       thighL,
       thighR,
@@ -341,10 +397,13 @@ export class PlayerModels {
 
   /** halftime side swap (or roster fixup): retint body + redraw the plate. */
   private retint(m: Soldier, team: Team, name: string): void {
-    const chest = mat(chestHex(team));
-    const dark = mat(darkHex(team));
-    for (const mesh of m.chestMeshes) mesh.material = chest;
-    for (const mesh of m.darkMeshes) mesh.material = dark;
+    const dark = darkHex(team);
+    const body = mat(uniformHex(team), { emissive: dark }); // same rim cache as create()
+    const light = mat(lightHex(team));
+    const darkMat = mat(dark);
+    for (const mesh of m.uniformMeshes) mesh.material = body;
+    for (const mesh of m.lightMeshes) mesh.material = light;
+    for (const mesh of m.darkMeshes) mesh.material = darkMat;
     disposeNameplate(m.nameplate);
     m.body.remove(m.nameplate);
     m.nameplate = at(makeNameplate(name, team), 0, NAMEPLATE_Y, 0);

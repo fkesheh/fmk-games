@@ -44,7 +44,7 @@ export const office: MapDef = {
     sunDir: [0.3, -1, 0.2],
     sunColor: PALETTE.paper,
     sunIntensity: 1.0,
-    hemiIntensity: 1.5,
+    hemiIntensity: 1.8,
   },
   boxes: [
     // ---- outer walls (h=3.5, plaster) ----
@@ -206,5 +206,40 @@ export const office: MapDef = {
     { kind: 'plant', count: 5, x0: -16, z0: -15, x1: 16, z1: -13.6, minSpacing: 5 },
     { kind: 'plant', count: 5, x0: -16, z0: 13.6, x1: 16, z1: 15, minSpacing: 5 },
     { kind: 'plant', count: 6, x0: -13, z0: -2.5, x1: 13, z1: 2.5, minSpacing: 3 },
+    // AAA pass: desk chairs cluster around the cubicle/bullpen desk rows,
+    // water coolers + plants dot the ring corridors and their ends (appended
+    // — earlier zone indices/seeds unchanged; solid/spawn rejection keeps
+    // desks clear)
+    { kind: 'deskChair', count: 16, x0: -13.5, z0: -12.5, x1: 13.5, z1: -4, minSpacing: 2.4 },
+    { kind: 'deskChair', count: 14, x0: -13.5, z0: 4, x1: 13.5, z1: 12.5, minSpacing: 2.4 },
+    { kind: 'waterCooler', count: 3, x0: -19.4, z0: -14, x1: -16.6, z1: 14, minSpacing: 9 },
+    { kind: 'waterCooler', count: 3, x0: 16.6, z0: -14, x1: 19.4, z1: 14, minSpacing: 9 },
+    { kind: 'plant', count: 4, x0: -19.4, z0: 12, x1: -16.6, z1: 15.2, minSpacing: 3 },
+    { kind: 'plant', count: 4, x0: 16.6, z0: -15.2, x1: 19.4, z1: -12, minSpacing: 3 },
+  ],
+  // AAA accent: screenGlow wayfinding (emissive strips + door markers) plus
+  // family-neutral whiteboards/picture frames on corridor and room walls
+  accents: [
+    // wayfinding strips at eye level along both ring corridors (lit signage)
+    { x: -19.45, y: 1.5, z: -10, w: 0.04, h: 0.12, d: 2.4, hex: PALETTE.screenGlow, emissive: true },
+    { x: -19.45, y: 1.5, z: 2, w: 0.04, h: 0.12, d: 2.4, hex: PALETTE.screenGlow, emissive: true },
+    { x: -19.45, y: 1.5, z: 11, w: 0.04, h: 0.12, d: 2.4, hex: PALETTE.screenGlow, emissive: true },
+    { x: 19.45, y: 1.5, z: -6, w: 0.04, h: 0.12, d: 2.4, hex: PALETTE.screenGlow, emissive: true },
+    { x: 19.45, y: 1.5, z: 6, w: 0.04, h: 0.12, d: 2.4, hex: PALETTE.screenGlow, emissive: true },
+    // whiteboards on the corridor jog faces (metalDark frame + paper board)
+    { x: -16.42, y: 1.5, z: -8, w: 0.05, h: 1.2, d: 1.9, hex: PALETTE.metalDark },
+    { x: -16.39, y: 1.5, z: -8, w: 0.05, h: 1.0, d: 1.7, hex: PALETTE.paper },
+    { x: 16.42, y: 1.5, z: 8, w: 0.05, h: 1.2, d: 1.9, hex: PALETTE.metalDark },
+    { x: 16.39, y: 1.5, z: 8, w: 0.05, h: 1.0, d: 1.7, hex: PALETTE.paper },
+    // picture frames on the open-floor end walls
+    { x: -6, y: 1.6, z: -15.45, w: 0.7, h: 0.55, d: 0.05, hex: PALETTE.metalDark },
+    { x: -6, y: 1.6, z: -15.42, w: 0.55, h: 0.4, d: 0.05, hex: PALETTE.paper },
+    { x: 2, y: 1.6, z: 15.45, w: 0.7, h: 0.55, d: 0.05, hex: PALETTE.metalDark },
+    { x: 2, y: 1.6, z: 15.42, w: 0.55, h: 0.4, d: 0.05, hex: PALETTE.paper },
+    // door markers flanking the meeting-room south doors
+    { x: -12.25, y: 1.1, z: 2.93, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.screenGlow },
+    { x: -10.15, y: 1.1, z: 2.93, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.screenGlow },
+    { x: 10.15, y: 1.1, z: 2.93, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.screenGlow },
+    { x: 12.25, y: 1.1, z: 2.93, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.screenGlow },
   ],
 };

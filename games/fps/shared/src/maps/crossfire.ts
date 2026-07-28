@@ -136,5 +136,21 @@ export const crossfire: MapDef = {
     { kind: 'barrel', count: 16, x0: 14, z0: -19, x1: 27, z1: 0, minSpacing: 3.5 },
     { kind: 'pallet', count: 24, x0: -10, z0: 8, x1: 27, z1: 19, minSpacing: 3.5 },
     { kind: 'pipe', count: 22, x0: 2, z0: -19, x1: 27, z1: 19, minSpacing: 4 },
+    // AAA pass: stacked pallets pile up around the warehouse/dock and the SE
+    // container yard (appended — earlier zone indices/seeds unchanged)
+    { kind: 'palletStack', count: 10, x0: -27, z0: -14, x1: -13, z1: 8, minSpacing: 4 },
+    { kind: 'palletStack', count: 8, x0: 12, z0: 4, x1: 27, z1: 19, minSpacing: 4 },
+  ],
+  // AAA accent: safety amber (tAmber) — dock-edge hazard strip, painted
+  // container doors, crane leg stripes: the industrial safety-yellow rhythm
+  accents: [
+    // loading-dock edge hazard strip (front face of the dock platform)
+    { x: -20.5, y: 0.73, z: -2.96, w: 11, h: 0.14, d: 0.05, hex: PALETTE.tAmber },
+    // painted container doors (end faces of two mid-lane containers)
+    { x: 7.5, y: 1.3, z: -7.54, w: 1.8, h: 1.8, d: 0.06, hex: PALETTE.tAmber },
+    { x: -7.5, y: 1.3, z: 8.04, w: 1.8, h: 1.8, d: 0.06, hex: PALETTE.tAmber },
+    // crane leg hazard stripes
+    { x: -3.5, y: 0.9, z: -0.53, w: 1.04, h: 0.3, d: 0.05, hex: PALETTE.tAmber },
+    { x: 3.5, y: 0.9, z: -0.53, w: 1.04, h: 0.3, d: 0.05, hex: PALETTE.tAmber },
   ],
 };

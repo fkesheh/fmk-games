@@ -173,5 +173,21 @@ export const urbana: MapDef = {
     { kind: 'shrub', count: 12, x0: -27, z0: -21, x1: 27, z1: 21, minSpacing: 3 },
     { kind: 'shrub', count: 4, x0: -17, z0: -21.4, x1: 17, z1: -17.5, minSpacing: 2.5 },
     { kind: 'shrub', count: 4, x0: -17, z0: 17.5, x1: 17, z1: 21.4, minSpacing: 2.5 },
+    // AAA pass: grain sacks slumped around the market street, plaza and
+    // courtyard stalls (appended — earlier zone indices/seeds unchanged)
+    { kind: 'sack', count: 14, x0: -4.5, z0: -13, x1: 4.5, z1: 13, minSpacing: 2.2 },
+    { kind: 'sack', count: 8, x0: -13, z0: -9, x1: -5.5, z1: 9, minSpacing: 2.8 },
+    { kind: 'sack', count: 8, x0: 5.5, z0: -11, x1: 13, z1: 3, minSpacing: 2.8 },
+  ],
+  // AAA accent: roofRed is urbana's established accent (awnings + roof caps) —
+  // hanging banners extend the same red rhythm onto the square-house walls
+  accents: [
+    // plaza house east face banner
+    { x: -6.97, y: 2.2, z: -6, w: 0.06, h: 1.6, d: 0.9, hex: PALETTE.roofRed },
+    // courtyard annex west face banner
+    { x: 9.97, y: 2.2, z: -8, w: 0.06, h: 1.6, d: 0.9, hex: PALETTE.roofRed },
+    // street-facing banners on the inner blocks
+    { x: -4.97, y: 2.4, z: -13, w: 0.06, h: 1.6, d: 0.9, hex: PALETTE.roofRed },
+    { x: 4.97, y: 2.4, z: -14, w: 0.06, h: 1.6, d: 0.9, hex: PALETTE.roofRed },
   ],
 };

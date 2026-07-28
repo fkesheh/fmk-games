@@ -31,7 +31,13 @@ export interface SpawnPoint {
 export type DecoKind =
   | 'crate' | 'barrel' | 'pallet' | 'pipe' // industrial
   | 'rock' | 'shrub' | 'cactus' | 'snowRock' // natural
-  | 'plant' | 'paperStack'; // office
+  | 'plant' | 'paperStack' // office
+  // AAA richness pass (additive): stacked/field fortification variants of the
+  // industrial set, frost shards, office furniture, market goods
+  | 'palletStack' | 'sandbag' // industrial / military
+  | 'icicle' // frost
+  | 'deskChair' | 'waterCooler' // office
+  | 'sack'; // market
 
 export interface DecoZone {
   kind: DecoKind;
@@ -52,6 +58,26 @@ export interface MapTheme {
   hemiIntensity: number; // 0.3..2.5 (indoor/dark-albedo maps run 1.5-2.5: the hemisphere IS the light there)
 }
 
+/** AAA accent dressing: deliberate accent-color repeats (painted doors, tarps,
+    hazard plates, wayfinding strips, whiteboards). Thin visual overlays baked
+    by the client renderer — non-collidable, never in `boxes`. */
+export interface AccentDef {
+  x: number; y: number; z: number; // center
+  w: number; h: number; d: number; // full extents
+  hex: string; // PALETTE hex — the map's ONE deliberate accent (or family neutral)
+  emissive?: boolean; // true => glow plate (lit signage); default flat
+}
+
+/** AAA skyline: silhouette landmark ring beyond the outer walls (client-only,
+    non-collidable backdrop — dunes/mesas reading through the fog). */
+export interface SkylineDef {
+  hex: string; // PALETTE hex — body
+  capHex?: string; // PALETTE hex — optional second-tier tint
+  count: number; // landmarks around the ring
+  minR: number; maxR: number; // ring radius band from map center (m)
+  minH: number; maxH: number; // landmark height range (m)
+}
+
 export interface MapDef {
   id: MapId;
   name: string; // display name
@@ -62,4 +88,6 @@ export interface MapDef {
   boxes: BoxDef[]; // collidable + rendered
   spawns: { T: SpawnPoint[]; CT: SpawnPoint[] }; // >= 6 each
   deco: DecoZone[]; // client-only, non-collidable props
+  accents?: AccentDef[]; // client-only accent overlays (optional)
+  skyline?: SkylineDef; // client-only backdrop ring (optional)
 }

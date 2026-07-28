@@ -89,3 +89,14 @@ body {
   color: var(--c11-text, #e8e6df); /* PALETTE.hudText */
   background: var(--c11-danger, #c0392b); /* PALETTE.danger */
 }
+
+/* ---- global interaction polish (menus are DOM; canvas unaffected) ---------- */
+::selection {
+  background: var(--c11-accent, #c8912f); /* PALETTE.hudAccent */
+  color: var(--c11-ink, #14171c); /* PALETTE.ink */
+}
+
+:focus-visible {
+  outline: 2px solid var(--c11-accent, #c8912f); /* PALETTE.hudAccent */
+  outline-offset: 1px;
+}

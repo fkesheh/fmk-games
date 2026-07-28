@@ -38,12 +38,13 @@ import {
   TICK_RATE,
   WEAPONS,
   WEAPON_ORDER,
-  raycastSolids,
+  raycastAABB,
 } from '@fps/shared';
 import type {
   AABB,
   GameEvent,
   MapId,
+  MatId,
   PlayerId,
   PlayerSnap,
   RoomInfo,
@@ -76,6 +77,7 @@ const STEP_EVERY_M = PLAYER.speedRun * 0.38; // one footstep per 1.824m ≈ 0.38
 const STEP_CLAMP_M = 0.5; // teleport/reconcile snaps never trigger footsteps
 const WALK_STEP_VOL = 0.4; // Shift walk: slow AND quiet (PLAYER.walkSpeedMul does the slow)
 const MOVE_MIN_SPEED = 0.5; // m/s — matches PlayerSnap.moving / walk-bob threshold
+const SPRINT_MIN_SPEED = 3.4; // m/s — above this, footsteps kick dust (Shift walk caps ~2.64)
 const LIST_ROOMS_TIMEOUT_MS = 4000;
 const BOT_PROMPT_HIDE_MS = 20000; // solo bot prompt auto-dismiss
 const DEG2RAD = Math.PI / 180;
@@ -124,6 +126,8 @@ interface World {
   viewmodel: ViewModel;
   effects: Effects;
   solids: AABB[]; // map collision — decal wall raycasts on 'shot' events
+  mats: MatId[]; // per-solid material (same order as solids) — impact classification
+  floorMat: MatId; // ground-plane material — ground impacts + footstep dust tint
   mapName: string;
 }
 
@@ -184,6 +188,8 @@ export class ClientGame {
   private readonly camPos: Vec3 = { x: 0, y: 0, z: 0 };
   private readonly fxPoint: Vec3 = { x: 0, y: 0, z: 0 };
   private readonly decalDir: Vec3 = { x: 0, y: 0, z: 0 }; // shot-event wall raycast
+  private readonly smokePos: Vec3 = { x: 0, y: 0, z: 0 }; // shot-event muzzle smoke spawn
+  private readonly sfxDir: Vec3 = { x: 0, y: 0, z: 0 }; // sfx occlusion raycast direction
   private readonly hudState: HudState = {
     hp: 100, alive: true, money: 0, canBuy: false,
     weapon: 'pistol', weaponName: '', mag: -1, reserve: -1,
@@ -518,6 +524,8 @@ export class ClientGame {
       viewmodel: new ViewModel(rig.camera),
       effects: new Effects(rig.scene),
       solids: built.solids,
+      mats: map.boxes.map((b) => b.mat), // aligned with built.solids (boxToAABB per BoxDef)
+      floorMat: map.floorMat,
       mapName: map.name,
     };
     this.input.start();
@@ -655,7 +663,7 @@ export class ClientGame {
     this.hud.show(true);
     this.menus.hideAll();
     this.menus.showInRoom(MAPS[msg.mapId].name, msg.code);
-    this.audio.ambient(!INDOOR_MAPS.has(msg.mapId));
+    this.audio.ambient(msg.mapId); // per-map beds (desert wind / office AC / bunker hum / frost whistle)
     this.maybeShowBotPrompt();
   }
 
@@ -754,10 +762,7 @@ export class ClientGame {
         const w = this.world;
         if (w === null) break;
         w.effects.tracer(ev.from, ev.to);
-        w.effects.impact(ev.to);
-        // wall decal: `to` is a player hit point or the wall endpoint — decals
-        // are for walls only (no floating splats on flesh hits), so raycast the
-        // map solids along the shot; a wall at <= |to-from| + eps owns the mark
+        // shot direction (shared by the muzzle smoke drift + the wall raycast)
         const d = this.decalDir;
         d.x = ev.to.x - ev.from.x;
         d.y = ev.to.y - ev.from.y;
@@ -767,16 +772,43 @@ export class ClientGame {
           d.x /= shotLen;
           d.y /= shotLen;
           d.z /= shotLen;
-          const wallT = raycastSolids(ev.from, d, w.solids, shotLen + 0.05);
-          if (wallT >= 0) {
-            const p = this.fxPoint;
-            p.x = ev.from.x + d.x * wallT;
-            p.y = ev.from.y + d.y * wallT;
-            p.z = ev.from.z + d.z * wallT;
-            w.effects.decal(p);
+        }
+        // muzzle smoke after every shot (own + remote): puffs just past the
+        // muzzle — ~0.55m ahead of the eye, dropped to gun-tip height
+        const mp = this.smokePos;
+        mp.x = ev.from.x + d.x * 0.55;
+        mp.y = ev.from.y + d.y * 0.55 - 0.14;
+        mp.z = ev.from.z + d.z * 0.55;
+        w.effects.muzzleSmoke(mp, d);
+        // wall raycast: `to` is a player hit point or the wall endpoint. The
+        // nearest solid at <= |to-from| + eps owns the wall decal AND the
+        // material-classified impact (sand dust / metal sparks / snow puffs);
+        // decals stay wall-only — no floating splats on flesh hits
+        let wallT = -1;
+        let wallIdx = -1;
+        if (shotLen > 1e-6) {
+          for (let i = 0; i < w.solids.length; i++) {
+            const solid = w.solids[i];
+            if (solid === undefined) continue;
+            const t = raycastAABB(ev.from, d, solid, shotLen + 0.05);
+            if (t >= 0 && (wallT < 0 || t < wallT)) {
+              wallT = t;
+              wallIdx = i;
+            }
           }
         }
-        this.audio.sfx(SHOT_SFX[ev.weapon], { dist: this.distFromCamera(ev.from) });
+        if (wallT >= 0) {
+          const p = this.fxPoint;
+          p.x = ev.from.x + d.x * wallT;
+          p.y = ev.from.y + d.y * wallT;
+          p.z = ev.from.z + d.z * wallT;
+          w.effects.impact(p, w.mats[wallIdx]);
+          w.effects.decal(p);
+        } else {
+          // air/flesh end, or a ground hit (y≈0 takes the floor material)
+          w.effects.impact(ev.to, ev.to.y <= 0.06 ? w.floorMat : undefined);
+        }
+        this.audio.sfx(SHOT_SFX[ev.weapon], this.spatialOpts(w, ev.from));
         // self: viewmodel/shake/bloom already fired on the local input edge —
         // re-firing here would double the kick a full RTT + tick late
         if (ev.shooterId !== s.youId) w.models.muzzle(ev.shooterId);
@@ -788,10 +820,19 @@ export class ClientGame {
         // server only re-sends the roster on joins/halftime — K/D tracked locally
         if (killer !== undefined) killer.kills += 1;
         if (victim !== undefined) victim.deaths += 1;
-        this.hud.killfeed(killer?.name ?? null, victim?.name ?? ev.victimId, ev.weapon, ev.headshot);
+        this.hud.killfeed(
+          killer?.name ?? null,
+          victim?.name ?? ev.victimId,
+          ev.weapon,
+          ev.headshot,
+          killer?.team ?? null,
+          victim?.team ?? null,
+        );
         const pos = this.victimPoint(ev.victimId);
         const w = this.world;
-        if (pos !== null && w !== null) {
+        // first person: no burst at our own feet — the particles would fill
+        // the lens on the death frame (the corpse cam never sees a model)
+        if (pos !== null && w !== null && ev.victimId !== s.youId) {
           w.effects.death(pos, victim?.team ?? 'T');
           w.effects.blood(pos);
           this.audio.sfx('death', { dist: this.distFromCamera(pos) });
@@ -808,8 +849,8 @@ export class ClientGame {
         break;
       }
       case 'hit': {
-        // our shot connected: hitmarker + sound + blood + a tracer to the victim
-        this.hud.hitmarker(ev.headshot, ev.killed);
+        // our shot connected: hitmarker (+dmg number) + sound + blood + a tracer
+        this.hud.hitmarker(ev.headshot, ev.killed, ev.dmg);
         this.audio.sfx(ev.headshot ? 'headshot' : 'hit');
         const w = this.world;
         if (w === null) break;
@@ -1026,7 +1067,22 @@ export class ClientGame {
       if (this.stepAccM >= STEP_EVERY_M) {
         this.stepAccM %= STEP_EVERY_M;
         // Shift walk is slow AND quiet: own steps at the frozen x0.4 volume
-        this.audio.sfx('footstep', { vol: (this.lastButtons & INPUT_WALK) !== 0 ? WALK_STEP_VOL : 1 });
+        const walking = (this.lastButtons & INPUT_WALK) !== 0;
+        const stepOpts: { vol: number; dist: number; bearing: number; occluded: boolean } = {
+          vol: walking ? WALK_STEP_VOL : 1,
+          dist: 0,
+          bearing: 0,
+          occluded: false,
+        };
+        this.audio.sfx('footstep', stepOpts);
+        // sprinting kicks visible dust off the floor (tinted by the floor mat)
+        if (!walking && hSpeed > SPRINT_MIN_SPEED) {
+          const f = this.fxPoint;
+          f.x = body.x;
+          f.y = body.y;
+          f.z = body.z;
+          w.effects.footDust(f, w.floorMat);
+        }
       }
     }
     this.lastBodyX = body.x;
@@ -1039,10 +1095,19 @@ export class ClientGame {
         this.others.set(p.id, t);
       }
       if (p.moving && p.alive) {
-        t.acc += Math.min(Math.hypot(p.x - t.x, p.z - t.z), STEP_CLAMP_M);
+        const stepDist = Math.min(Math.hypot(p.x - t.x, p.z - t.z), STEP_CLAMP_M);
+        t.acc += stepDist;
         if (t.acc >= STEP_EVERY_M) {
           t.acc %= STEP_EVERY_M;
-          this.audio.sfx('footstep', { dist: this.distFromCamera(p) });
+          this.audio.sfx('footstep', this.spatialOpts(w, p));
+          // sprinting remotes kick dust too — speed from this frame's interp delta
+          if (dt > 0 && stepDist / dt > SPRINT_MIN_SPEED) {
+            const f = this.fxPoint;
+            f.x = p.x;
+            f.y = p.y;
+            f.z = p.z;
+            w.effects.footDust(f, w.floorMat);
+          }
         }
       }
       t.x = p.x;
@@ -1150,6 +1215,43 @@ export class ClientGame {
   private distFromCamera(p: Vec3): number {
     const c = this.camPos;
     return Math.hypot(p.x - c.x, p.y - c.y, p.z - c.z);
+  }
+
+  /**
+   * Spatial sfx options for a world-space source: distance, stereo bearing
+   * (radians to the source relative to the camera yaw, + = left, matching the
+   * damage-arc convention), and `occluded` — a wall raycast from the camera
+   * to the source (the same solids table the shot impacts use). Returned as a
+   * typed object (not a literal) so the audio owner's opts extension seam
+   * (surface, and the bearing/occluded stereo work) stays forward-compatible.
+   */
+  private spatialOpts(
+    w: World,
+    p: Vec3,
+  ): { dist: number; bearing: number; occluded: boolean } {
+    const c = this.camPos;
+    const dx = p.x - c.x;
+    const dy = p.y - c.y;
+    const dz = p.z - c.z;
+    const dist = Math.hypot(dx, dy, dz);
+    if (dist < 1e-3) return { dist, bearing: 0, occluded: false };
+    // world yaw of the source direction minus our look yaw -> stereo bearing
+    const bearing = wrapPi(Math.atan2(-dx, -dz) - this.input.yaw);
+    const d = this.sfxDir;
+    d.x = dx / dist;
+    d.y = dy / dist;
+    d.z = dz / dist;
+    // a solid strictly between camera and source occludes; shave the far end
+    // so the wall the source stands against doesn't count
+    const limit = Math.max(0, dist - 0.3);
+    let occluded = false;
+    for (const s of w.solids) {
+      if (raycastAABB(c, d, s, limit) >= 0) {
+        occluded = true;
+        break;
+      }
+    }
+    return { dist, bearing, occluded };
   }
 
   // ---- input edges ---------------------------------------------------------------------

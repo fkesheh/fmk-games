@@ -207,5 +207,27 @@ export const bunker: MapDef = {
     // barrels: flank rooms (no spawns there)
     { kind: 'barrel', count: 5, x0: -14.8, z0: -5, x1: -9.4, z1: 5, minSpacing: 2.5 },
     { kind: 'barrel', count: 5, x0: 9.4, z0: -5, x1: 14.8, z1: 5, minSpacing: 2.5 },
+    // AAA pass: sandbag positions in the spawn rooms (clear of the spawn rows)
+    // + pallet stacks as flank-room stores (appended — earlier zone
+    // indices/seeds unchanged)
+    { kind: 'sandbag', count: 6, x0: -5, z0: -12.6, x1: 5, z1: -9.4, minSpacing: 3 },
+    { kind: 'sandbag', count: 6, x0: -5, z0: 9.4, x1: 5, z1: 12.6, minSpacing: 3 },
+    { kind: 'palletStack', count: 4, x0: -14.8, z0: -5, x1: -9.4, z1: 5, minSpacing: 3.5 },
+    { kind: 'palletStack', count: 4, x0: 9.4, z0: -5, x1: 14.8, z1: 5, minSpacing: 3.5 },
+  ],
+  // AAA accent: safety amber (tAmber) — hub pillar hazard plates + hub door
+  // markers + ring-nub hazard stripes, repeated on every main sightline
+  accents: [
+    // hub pillar hazard plates (N and S faces)
+    { x: -0.5, y: 1.2, z: -1.03, w: 0.34, h: 2.2, d: 0.05, hex: PALETTE.tAmber },
+    { x: 0.5, y: 1.2, z: 1.03, w: 0.34, h: 2.2, d: 0.05, hex: PALETTE.tAmber },
+    // hub door markers (N door x[0.8,2.8] face z=-5.2; S door x[-3,-1] face z=5.2)
+    { x: 0.72, y: 1.1, z: -5.24, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.tAmber },
+    { x: 2.88, y: 1.1, z: -5.24, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.tAmber },
+    { x: -3.08, y: 1.1, z: 5.24, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.tAmber },
+    { x: -0.92, y: 1.1, z: 5.24, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.tAmber },
+    // ring-nub hazard stripes (N/S corridor cover)
+    { x: 0, y: 0.9, z: -7.73, w: 1.0, h: 0.15, d: 0.05, hex: PALETTE.tAmber },
+    { x: 0, y: 0.9, z: 7.73, w: 1.0, h: 0.15, d: 0.05, hex: PALETTE.tAmber },
   ],
 };

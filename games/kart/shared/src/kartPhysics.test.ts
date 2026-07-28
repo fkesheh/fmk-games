@@ -253,11 +253,11 @@ describe('drift', () => {
   it('a long drift at speed charges NOTHING and exits cleanly', () => {
     // Mini-turbo is gone: KartState carries no turbo/charge fields at all (this
     // file compiling against the contract proves it). Drift only rotates.
-    const s = atSpeed(20);
+    const s = atSpeed(24); // high entry speed so the 12 m/s² scrub stays above the exit floor
     stepKart(s, input({ drift: true }), DT, 'road');
     expect(s.drifting).toBe(true);
 
-    run(s, input({ drift: true, steer: 0.3 }), 1.2); // hold the drift (decel scrubs ~9 m/s)
+    run(s, input({ drift: true, steer: 0.3 }), 1.2); // hold the drift (decel scrubs ~15 m/s)
     expect(s.drifting).toBe(true); // still sliding (speed bled but above the exit floor)
     expect(s.nitroLeft).toBe(0); // nitro is server-granted; drift never touches it
 

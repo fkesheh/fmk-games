@@ -1,13 +1,14 @@
 // ============================================================================
 // C8 — HUD. DOM-based overlay, pointer-events none, layered. All colors trace
 // to PALETTE (set as CSS custom props on the root); styling lives in the
-// injected <style> block below (style.css is C11's file — not touched).
-// update() is on the render hot path: DOM is only touched when a cached value
-// actually changes; zero allocation per frame (killfeed/banner/damage are
-// event-driven; damage arcs come from a fixed pool).
+// injected <style> block below. update() is on the render hot path: DOM is
+// only touched when a cached value actually changes; zero allocation per
+// frame (killfeed/banner are event-driven; damage arcs, damage numbers and
+// the kill ring come from fixed pools). Exports weaponIcon(): the procedural
+// canvas weapon-glyph factory shared with the buy menu (C9).
 // ============================================================================
-import { PALETTE } from '@fps/shared';
-import type { RoomPhase, WeaponId } from '@fps/shared';
+import { PALETTE, WEAPONS } from '@fps/shared';
+import type { RoomPhase, Team, WeaponId } from '@fps/shared';
 
 export interface HudState {
   hp: number; alive: boolean; money: number; canBuy: boolean;
@@ -19,11 +20,6 @@ export interface HudState {
   spectating: string | null;
 }
 
-// Killfeed shows the weapon's short designation (from the frozen WEAPONS names).
-const WEAPON_SHORT: Record<WeaponId, string> = {
-  knife: 'KNIFE', pistol: 'P9', smg: 'K90', shotgun: 'M870', rifle: 'AK-4', sniper: 'AWM',
-};
-
 const PHASE_LABEL: Record<RoomPhase, string> = {
   warmup: 'WARMUP', freeze: 'FREEZE', live: 'LIVE', roundEnd: 'ROUND END', matchEnd: 'MATCH END',
 };
@@ -31,10 +27,138 @@ const PHASE_LABEL: Record<RoomPhase, string> = {
 const LOW_HP = 30;          // below this: danger + pulse
 const KILLFEED_MAX = 5;     // rows, newest on top
 const KILLFEED_MS = 5000;   // visible time before fade+remove
-const HITMARK_MS = 120;     // hitmarker flash
+const HITMARK_MS = 130;     // hitmarker flash (kill holds a touch longer)
+const HITMARK_KILL_MS = 210;
 const DAMAGE_MS = 800;      // directional arc fade
+const DNUM_MS = 650;        // floating damage number rise+fade
 const BANNER_MS = 2500;     // banner hold before fade
 const ARC_POOL = 8;         // pooled damage arcs (rapid hits reuse)
+const DNUM_POOL = 8;        // pooled floating damage numbers
+
+// preset offsets (px from screen center) for pooled damage numbers — round-
+// robin, so no rng and no per-spawn style string building beyond two vars
+const DNUM_OFF: ReadonlyArray<readonly [number, number]> = [
+  [-30, -36], [34, -32], [-44, -20], [46, -24], [-16, -46], [22, -44], [-38, -30], [40, -40],
+];
+
+// ============================================================================
+// Procedural weapon glyphs — tiny canvas silhouettes, one per WeaponId, drawn
+// from blocky fillRect paths (matches the flat-shaded art direction). Shared
+// by the killfeed (scale 1) and the buy menu cards (scale 2). All colors
+// trace to PALETTE. Allocation happens per event (killfeed row / menu open),
+// never per frame.
+// ============================================================================
+const GLYPH_W = 44;
+const GLYPH_H = 18;
+const GLYPH_SS = 2; // supersample factor — crisp on retina
+const THICK_W = 1.08; // glyph rect expansion — thicker silhouettes read smaller
+const THICK_H = 1.24;
+
+type Rects = ReadonlyArray<readonly [number, number, number, number]>;
+
+// silhouettes on a 44x18 grid: body in hudText, detail in steel
+const GLYPH_BODY: Record<WeaponId, Rects> = {
+  knife: [
+    [16, 6.5, 18, 3.5], // blade
+    [34, 7.5, 7, 2], // blade tip taper
+    [4, 6.5, 10, 3.5], // handle
+  ],
+  pistol: [
+    [12, 5, 18, 4], // slide
+    [12, 9, 15, 2], // frame
+    [13, 11, 5, 6], // grip
+    [30, 6, 2, 2], // muzzle
+  ],
+  smg: [
+    [1, 7, 4, 4], // stock
+    [5, 6, 19, 5], // receiver
+    [24, 7.5, 11, 2], // barrel
+    [35, 7, 4, 3], // muzzle
+  ],
+  shotgun: [
+    [1, 7, 6, 5], // stock
+    [7, 6.5, 9, 4], // receiver
+    [16, 6.5, 26, 2.5], // barrel
+    [16, 9.5, 22, 1.5], // mag tube
+  ],
+  rifle: [
+    [0, 7, 5, 5], // stock
+    [5, 6, 21, 4], // receiver + handguard
+    [26, 7, 15, 1.8], // barrel
+    [41, 6.5, 2, 2.6], // muzzle
+  ],
+  sniper: [
+    [0, 7, 6, 5], // stock
+    [6, 6.5, 22, 3.5], // body
+    [28, 7.5, 14, 1.6], // barrel
+    [42, 6.5, 2, 3], // muzzle brake
+  ],
+};
+
+const GLYPH_DETAIL: Record<WeaponId, Rects> = {
+  knife: [
+    [14, 5.5, 2, 6], // guard
+    [2.5, 6, 2, 4.5], // pommel
+  ],
+  pistol: [
+    [19, 10.5, 6, 1.2], // trigger guard top
+    [24, 10.5, 1.2, 3], // trigger guard front
+    [13, 3.5, 2, 1.5], // front sight
+  ],
+  smg: [
+    [13, 11, 4, 6.5], // mag
+    [7.5, 11, 3, 4], // grip
+    [9, 4.5, 6, 1.5], // top sight
+  ],
+  shotgun: [
+    [22, 9, 8, 3], // pump
+    [8, 10.5, 3, 4], // grip
+  ],
+  rifle: [
+    [14, 10, 4, 5], // mag
+    [15, 15, 3, 2], // mag curve
+    [8, 10, 3, 5], // grip
+    [6, 4.5, 2, 1.5], // rear sight
+    [37, 5.5, 1.6, 1.5], // front sight
+  ],
+  sniper: [
+    [11, 2.5, 9, 3.2], // scope tube
+    [9.5, 3.5, 2, 1.6], // scope bell
+    [13.5, 5.7, 1.6, 1.2], // mount a
+    [17.5, 5.7, 1.6, 1.2], // mount b
+    [14, 10, 3.5, 4], // mag
+    [8, 10, 3, 4], // grip
+  ],
+};
+
+/**
+ * Draw a procedural silhouette icon for `id`. `scale` multiplies the logical
+ * 44x18 size (killfeed 1, buy cards 2); the backing store is always
+ * supersampled GLYPH_SSx for sharp edges. Rects are expanded around their own
+ * centers (THICK_W/THICK_H) so the glyphs read as guns at killfeed size.
+ */
+export function weaponIcon(id: WeaponId, scale = 1): HTMLCanvasElement {
+  const c = document.createElement('canvas');
+  c.width = GLYPH_W * GLYPH_SS * scale;
+  c.height = GLYPH_H * GLYPH_SS * scale;
+  c.style.width = `${GLYPH_W * scale}px`;
+  c.style.height = `${GLYPH_H * scale}px`;
+  const ctx = c.getContext('2d');
+  if (ctx === null) return c; // 2d unavailable — empty icon, layout still holds
+  ctx.scale(GLYPH_SS * scale, GLYPH_SS * scale);
+  const fill = (rects: Rects): void => {
+    for (const [x, y, w, h] of rects) {
+      const nw = w * THICK_W;
+      const nh = h * THICK_H;
+      ctx.fillRect(x - (nw - w) / 2, y - (nh - h) / 2, nw, nh);
+    }
+  };
+  ctx.fillStyle = PALETTE.paper; // bright detail (mag/scope/sights) — reads small
+  fill(GLYPH_DETAIL[id]);
+  ctx.fillStyle = PALETTE.hudText;
+  fill(GLYPH_BODY[id]);
+  return c;
+}
 
 /** '#rrggbb' -> 'rgba(r,g,b,a)'. Still a PALETTE color, just translucent. */
 function alpha(hex: string, a: number): string {
@@ -65,25 +189,37 @@ const CSS = `
 .fh-ch-t, .fh-ch-b { width: 2px; height: 10px; }
 .fh-ch-l, .fh-ch-r { width: 10px; height: 2px; }
 
-/* ---- scope overlay: radial vignette + thin cross + circle edge ------------ */
+/* ---- scope overlay: soft-edge vignette + fine cross + center dot ---------- */
 .fh-scope { position: absolute; inset: 0; }
 .fh-scope-vig {
   position: absolute; inset: 0;
   background: radial-gradient(circle at 50% 50%,
-    transparent 0, transparent 26vmin, var(--fh-scope-ink) 27vmin, var(--fh-scope-ink) 100%);
+    transparent 0, transparent 23vmin, var(--fh-scope-soft) 25.6vmin,
+    var(--fh-scope-ink) 28vmin, var(--fh-scope-ink) 100%);
 }
 .fh-scope-ring {
   position: absolute; left: 50%; top: 50%; width: 53vmin; height: 53vmin;
   transform: translate(-50%, -50%); border-radius: 50%;
-  border: 1px solid var(--fh-text-dim);
+  border: 1px solid var(--fh-scope-line);
+  box-shadow: 0 0 16px 2px var(--fh-scope-soft);
 }
-.fh-scope-h, .fh-scope-v { position: absolute; background: var(--fh-text-dim); }
-.fh-scope-h { left: 0; right: 0; top: 50%; height: 1px; }
-.fh-scope-v { top: 0; bottom: 0; left: 50%; width: 1px; }
+.fh-scope-h, .fh-scope-v { position: absolute; background: var(--fh-scope-line); }
+.fh-scope-h { top: 50%; height: 1px; width: calc(50% - 5px); }
+.fh-scope-hl { left: 0; }
+.fh-scope-hr { right: 0; }
+.fh-scope-v { left: 50%; width: 1px; height: calc(50% - 5px); }
+.fh-scope-vt { top: 0; }
+.fh-scope-vb { bottom: 0; }
+.fh-scope-dot {
+  position: absolute; left: 50%; top: 50%; width: 2px; height: 2px;
+  transform: translate(-50%, -50%); border-radius: 50%;
+  background: var(--fh-scope-line);
+}
 
-/* ---- hitmarker: 4 diagonal ticks, 120ms flash ----------------------------- */
+/* ---- hitmarker: 4 diagonal ticks; red headshot; kill = pop + ring pulse --- */
 .fh-hit { position: absolute; left: 50%; top: 50%; width: 0; height: 0; opacity: 0; }
 .fh-hit.fh-on { opacity: 1; }
+.fh-hit.fh-kill { animation: fh-killpop ${HITMARK_KILL_MS}ms ease-out; }
 .fh-hit div {
   position: absolute; left: -1px; top: -14px; width: 2px; height: 9px;
   background: var(--fh-text); box-shadow: 0 0 0 1px var(--fh-ink);
@@ -93,6 +229,28 @@ const CSS = `
 .fh-hit .fh-hm2 { transform: rotate(135deg) translateY(-6px); }
 .fh-hit .fh-hm3 { transform: rotate(225deg) translateY(-6px); }
 .fh-hit .fh-hm4 { transform: rotate(315deg) translateY(-6px); }
+@keyframes fh-killpop { 0% { transform: scale(1); } 45% { transform: scale(1.4); } 100% { transform: scale(1.12); } }
+.fh-ring {
+  position: absolute; left: 50%; top: 50%; width: 46px; height: 46px;
+  border: 2px solid var(--fh-danger); border-radius: 50%; opacity: 0;
+}
+.fh-ring.fh-on { animation: fh-ringpulse 340ms ease-out forwards; }
+@keyframes fh-ringpulse {
+  0% { opacity: 0.95; transform: translate(-50%, -50%) scale(0.45); }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(1.5); }
+}
+
+/* ---- floating damage numbers (pooled, WAAPI-restarted CSS animation) ------ */
+.fh-dnum {
+  position: absolute; left: 50%; top: 50%; font-size: 14px; font-weight: 800;
+  letter-spacing: 0.5px; opacity: 0; color: var(--fh-text);
+}
+.fh-dnum.fh-big { color: var(--fh-danger); font-size: 18px; }
+.fh-dnum.fh-on { animation: fh-dnumfloat ${DNUM_MS}ms ease-out forwards; }
+@keyframes fh-dnumfloat {
+  0% { opacity: 1; transform: translate(var(--dx, 0px), var(--dy, 0px)) scale(1); }
+  100% { opacity: 0; transform: translate(var(--dx, 0px), calc(var(--dy, 0px) - 30px)) scale(0.92); }
+}
 
 /* ---- damage direction ring (arcs injected as SVG paths, pooled) ----------- */
 .fh-dmg { position: absolute; left: 50%; top: 50%; width: 160px; height: 160px;
@@ -104,13 +262,21 @@ const CSS = `
 /* ---- top-center: phase, timer, BUY chip, score, round --------------------- */
 .fh-top { position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
   display: flex; align-items: center; gap: 18px; }
-.fh-score { font-size: 24px; font-weight: 700; letter-spacing: 1px;
-  background: var(--fh-ink-85); padding: 4px 12px; border-radius: 3px;
+.fh-score { position: relative; overflow: hidden; font-size: 24px; font-weight: 700;
+  letter-spacing: 1px; background: var(--fh-ink-85); padding: 4px 12px 7px;
+  border: 1px solid var(--fh-edge); border-radius: 4px;
   text-shadow: 0 0 2px var(--fh-ink), 0 1px 2px var(--fh-ink); }
-.fh-score-t { color: var(--fh-t); }
-.fh-score-ct { color: var(--fh-ct); }
-.fh-clock { text-align: center; background: var(--fh-ink-55);
-  padding: 4px 14px 6px; border-radius: 3px; min-width: 96px; }
+.fh-score::before { content: ''; position: absolute; top: 0; left: 0; right: 0;
+  height: 1px; background: var(--fh-rim); }
+.fh-score::after { content: ''; position: absolute; left: 0; right: 0; bottom: 0;
+  height: 2px; background: var(--fh-teambar, transparent); }
+.fh-score-t { color: var(--fh-t); --fh-teambar: var(--fh-t); }
+.fh-score-ct { color: var(--fh-ct); --fh-teambar: var(--fh-ct); }
+.fh-clock { position: relative; overflow: hidden; text-align: center;
+  background: var(--fh-ink-55); padding: 4px 14px 6px; border-radius: 4px;
+  border: 1px solid var(--fh-edge); min-width: 96px; }
+.fh-clock::before { content: ''; position: absolute; top: 0; left: 0; right: 0;
+  height: 1px; background: var(--fh-rim); }
 .fh-phase { font-size: 12px; letter-spacing: 2px; color: var(--fh-text-dim); }
 .fh-timer { font-size: 26px; font-weight: 700; line-height: 1.1; }
 .fh-buy { display: inline-block; margin-top: 2px; font-size: 12px; font-weight: 700;
@@ -122,13 +288,14 @@ const CSS = `
 
 /* ---- HP bottom-left -------------------------------------------------------- */
 .fh-hp { position: absolute; left: 24px; bottom: 24px; }
-.fh-hp-num { font-size: 38px; font-weight: 700; line-height: 1; }
+.fh-hp-num { font-size: 38px; font-weight: 700; line-height: 1;
+  color: var(--fh-text); text-shadow: 0 0 3px var(--fh-ink), 0 1px 3px var(--fh-ink); }
 .fh-hp-bar { width: 220px; height: 8px; margin-top: 6px;
   background: var(--fh-ink-55); border-radius: 2px; overflow: hidden; }
 .fh-hp-fill { height: 100%; background: var(--fh-hp); border-radius: 2px;
   transition: width 120ms linear; }
-.fh-hp.fh-low .fh-hp-fill { background: var(--fh-danger); }
-.fh-hp.fh-low .fh-hp-num { color: var(--fh-danger); animation: fh-pulse 1.1s ease-in-out infinite; }
+.fh-hp.fh-low .fh-hp-fill { background: var(--fh-danger);
+  animation: fh-pulse 1.1s ease-in-out infinite; }
 @keyframes fh-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
 
 /* ---- money + ammo bottom-right -------------------------------------------- */
@@ -145,15 +312,19 @@ const CSS = `
 .fh-reload { font-size: 13px; font-weight: 700; letter-spacing: 2px;
   color: var(--fh-danger); margin-top: 4px; animation: fh-pulse 1.1s ease-in-out infinite; }
 
-/* ---- killfeed top-right ---------------------------------------------------- */
+/* ---- killfeed top-right: team-colored names + procedural weapon glyph ----- */
 .fh-feed { position: absolute; right: 18px; top: 16px; display: flex;
   flex-direction: column; align-items: flex-end; gap: 4px; }
-.fh-row { font-size: 13px; background: var(--fh-ink-55); border-radius: 2px;
+.fh-row { display: flex; align-items: center; font-size: 13px;
+  background: var(--fh-ink-85); border: 1px solid var(--fh-rim); border-radius: 3px;
   padding: 3px 9px; letter-spacing: 0.5px; white-space: nowrap;
-  opacity: 1; transition: opacity 400ms; }
+  opacity: 1; transition: opacity 400ms; animation: fh-rowin 160ms ease-out; }
 .fh-row.fh-fade { opacity: 0; }
-.fh-row .fh-w { color: var(--fh-text-dim); margin: 0 7px; font-size: 12px; }
-.fh-row .fh-hs { color: var(--fh-danger); font-weight: 700; margin-left: 4px; }
+.fh-row .fh-wicon { margin: 0 7px; opacity: 0.95; display: block; }
+.fh-row .fh-n-t { color: var(--fh-t); font-weight: 700; }
+.fh-row .fh-n-ct { color: var(--fh-ct); font-weight: 700; }
+.fh-row .fh-hs { color: var(--fh-danger); font-weight: 700; margin-left: 5px; }
+@keyframes fh-rowin { from { transform: translateX(10px); opacity: 0; } to { transform: none; opacity: 1; } }
 
 /* ---- banner (round start/end), queued -------------------------------------- */
 .fh-banner { position: absolute; left: 50%; top: 26%; transform: translateX(-50%);
@@ -182,13 +353,16 @@ export class Hud {
   private readonly chR: HTMLDivElement;
   private readonly scope: HTMLDivElement;
 
-  // hitmarker
+  // hitmarker (+ kill confirmation ring)
   private readonly hit: HTMLDivElement;
+  private readonly ring: HTMLDivElement;
   private hitTimer = 0;
 
-  // damage ring (pooled arcs)
+  // damage ring (pooled arcs) + floating damage numbers (pooled divs)
   private readonly arcs: SVGPathElement[] = [];
   private arcNext = 0;
+  private readonly dnums: HTMLDivElement[] = [];
+  private dnumNext = 0;
 
   // top center
   private readonly phaseEl: HTMLDivElement;
@@ -250,6 +424,10 @@ export class Hud {
     st.setProperty('--fh-ink-70', alpha(PALETTE.ink, 0.72));
     st.setProperty('--fh-ink-85', alpha(PALETTE.ink, 0.85));
     st.setProperty('--fh-scope-ink', alpha(PALETTE.ink, 0.97));
+    st.setProperty('--fh-scope-soft', alpha(PALETTE.ink, 0.55));
+    st.setProperty('--fh-scope-line', alpha(PALETTE.hudText, 0.5));
+    st.setProperty('--fh-rim', alpha(PALETTE.hudText, 0.16));
+    st.setProperty('--fh-edge', alpha(PALETTE.hudText, 0.09));
     st.setProperty('--fh-t', PALETTE.tAmber);
     st.setProperty('--fh-ct', PALETTE.ctBlue);
 
@@ -285,6 +463,16 @@ export class Hud {
     }
     this.layer.appendChild(svg);
 
+    // floating damage numbers — fixed pool of divs, reused round-robin
+    for (let i = 0; i < DNUM_POOL; i++) {
+      const d = div('fh-dnum fh-on');
+      const [ox, oy] = DNUM_OFF[i % DNUM_OFF.length]!;
+      d.style.setProperty('--dx', `${ox}px`);
+      d.style.setProperty('--dy', `${oy}px`);
+      this.layer.appendChild(d);
+      this.dnums.push(d);
+    }
+
     // crosshair
     this.cross = div('fh-cross');
     this.chT = div('fh-ch-t');
@@ -294,15 +482,25 @@ export class Hud {
     this.cross.append(this.chT, this.chB, this.chL, this.chR);
     this.layer.appendChild(this.cross);
 
-    // scope overlay
+    // scope overlay (soft vignette, fine cross with center gap + dot)
     this.scope = div('fh-scope fh-hidden');
-    this.scope.append(div('fh-scope-vig'), div('fh-scope-h'), div('fh-scope-v'), div('fh-scope-ring'));
+    this.scope.append(
+      div('fh-scope-vig'),
+      div('fh-scope-h fh-scope-hl'),
+      div('fh-scope-h fh-scope-hr'),
+      div('fh-scope-v fh-scope-vt'),
+      div('fh-scope-v fh-scope-vb'),
+      div('fh-scope-dot'),
+      div('fh-scope-ring'),
+    );
     this.layer.appendChild(this.scope);
 
-    // hitmarker
+    // hitmarker + kill confirmation ring
     this.hit = div('fh-hit');
     this.hit.append(div('fh-hm1'), div('fh-hm2'), div('fh-hm3'), div('fh-hm4'));
     this.layer.appendChild(this.hit);
+    this.ring = div('fh-ring fh-on');
+    this.layer.appendChild(this.ring);
 
     // top center: score T | clock | score CT, round beneath
     const top = div('fh-top');
@@ -468,17 +666,36 @@ export class Hud {
     }
   }
 
-  /** ≤5 rows, newest on top, each fades out after 5s. */
-  killfeed(killer: string | null, victim: string, weapon: WeaponId, headshot: boolean): void {
+  /**
+   * ≤5 rows, newest on top, each fades out after 5s. Killer/victim names are
+   * team-colored when the caller supplies roster teams (additive optional
+   * args — the frozen 4-arg call still works and renders neutral names).
+   */
+  killfeed(
+    killer: string | null,
+    victim: string,
+    weapon: WeaponId,
+    headshot: boolean,
+    killerTeam?: Team | null,
+    victimTeam?: Team | null,
+  ): void {
     const row = div('fh-row');
     const k = document.createElement('span');
     k.textContent = killer ?? '—';
-    const w = document.createElement('span');
-    w.className = 'fh-w';
-    w.textContent = `[${WEAPON_SHORT[weapon]}]`;
+    if (killerTeam === 'T' || killerTeam === 'CT') {
+      k.className = killerTeam === 'T' ? 'fh-n-t' : 'fh-n-ct';
+    }
+    const icon = weaponIcon(weapon);
+    icon.className = 'fh-wicon';
+    icon.title = WEAPONS[weapon].name;
+    icon.setAttribute('role', 'img');
+    icon.setAttribute('aria-label', WEAPONS[weapon].name);
     const v = document.createElement('span');
     v.textContent = victim;
-    row.append(k, w, v);
+    if (victimTeam === 'T' || victimTeam === 'CT') {
+      v.className = victimTeam === 'T' ? 'fh-n-t' : 'fh-n-ct';
+    }
+    row.append(k, icon, v);
     if (headshot) {
       const hs = document.createElement('span');
       hs.className = 'fh-hs';
@@ -495,12 +712,33 @@ export class Hud {
     }, KILLFEED_MS);
   }
 
-  /** 4 diagonal ticks flash 120ms; red on headshot or kill. */
-  hitmarker(headshot: boolean, killed: boolean): void {
+  /**
+   * 4 diagonal ticks flash: white on a body hit, red on a headshot; a kill
+   * pops the ticks and fires one expanding confirmation ring. `dmg` (additive
+   * optional) also floats a pooled damage number next to the marker.
+   */
+  hitmarker(headshot: boolean, killed: boolean, dmg?: number): void {
     this.hit.classList.toggle('fh-red', headshot || killed);
+    this.hit.classList.toggle('fh-kill', killed);
     this.hit.classList.add('fh-on');
     window.clearTimeout(this.hitTimer);
-    this.hitTimer = window.setTimeout(() => this.hit.classList.remove('fh-on'), HITMARK_MS);
+    this.hitTimer = window.setTimeout(
+      () => this.hit.classList.remove('fh-on'),
+      killed ? HITMARK_KILL_MS : HITMARK_MS,
+    );
+    if (killed) {
+      // restart the ring pulse via WAAPI — no layout read on the combat path
+      this.ring.getAnimations().forEach((a) => { a.cancel(); a.play(); });
+    }
+    if (dmg !== undefined && dmg > 0) {
+      const d = this.dnums[this.dnumNext];
+      if (d !== undefined) {
+        this.dnumNext = (this.dnumNext + 1) % DNUM_POOL;
+        d.textContent = String(dmg);
+        d.classList.toggle('fh-big', killed);
+        d.getAnimations().forEach((a) => { a.cancel(); a.play(); });
+      }
+    }
   }
 
   /** Red arc pointing at the damage source. yawRelative 0 = ahead, positive =

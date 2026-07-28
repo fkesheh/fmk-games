@@ -80,6 +80,12 @@ export function stepKart(s: KartState, inp: KartInput, dt: number, surface: Surf
     s.nitroLeft = Math.max(0, s.nitroLeft - dt);
     speedF += NITRO_BOOST * engineMul * dt;
   }
+  if (s.shiftLeft === 0 && throttle > 0 && speedF < 0) {
+    // reversing: throttle brakes the reverse motion FIRST (no "must fully stop to
+    // go forward") — symmetric to brake engaging reverse from a standstill
+    speedF += BRAKE * throttle * dt;
+    if (speedF > 0) speedF = 0;
+  }
   if (s.shiftLeft === 0 && throttle > 0 && speedF >= 0 && speedF < gear.top) {
     // flat engine force per gear; REV LIMITER: no engine force at/above the gear top
     // (drag pulls back under it, so speed settles at the top without taper math

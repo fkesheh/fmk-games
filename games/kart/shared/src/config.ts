@@ -24,16 +24,18 @@ export const GEARS: ReadonlyArray<{ readonly top: number; readonly accel: number
   { top: 31, accel: 0.85 },
   { top: 36, accel: 1.25 }, // overdrive: enough pull to actually reach the top
 ];
-export const SHIFT_TIME = 0.35; // s of engine cut during an upshift
+export const SHIFT_TIME = 0.12; // s of engine cut during an upshift (short — long cuts feel like phantom braking)
 export const DOWNSHIFT_HYST = 4.5; // m/s below previous top before a downshift
 export const GRIP_ROAD = 8; // lateral velocity decay /s
 export const GRIP_GRASS = 3;
 export const GRIP_DRIFT = 1.5; // handbrake slides but doesn't pirouette
-export const LAT_G = 11; // max lateral acceleration on road, m/s^2 (understeer cap)
+export const LAT_G = 12.5; // max lateral acceleration on road, m/s^2 (understeer cap —
+// raised so standard cornering stays competitive with the handbrake)
 export const LAT_G_GRASS = 6;
 export const DRIFT_MIN_SPEED = 8; // m/s needed to initiate a drift
 export const DRIFT_STEER_MUL = 1.25; // sharper steering while drifting (was 1.5 = 'magic turns')
-export const DRIFT_DECEL = 9; // m/s^2 of handbrake deceleration while drifting
+export const DRIFT_DECEL = 12; // m/s^2 of handbrake deceleration while drifting (drifting a
+// corner must cost REAL speed — it is a rotation tool, not a better brake pedal)
 export const DRIFT_THROTTLE_MUL = 0.25; // clutch slip: engine force while drifting (handbrake fights throttle, never loses)
 export const GRASS_ENGINE_MUL = 0.55;
 export const GRASS_DRAG = 2.5; // extra drag off-road

@@ -144,5 +144,25 @@ export const frostbite: MapDef = {
     { kind: 'snowRock', count: 10, x0: -13, z0: -21, x1: 13, z1: 21, minSpacing: 5 },
     { kind: 'snowRock', count: 10, x0: -13, z0: -20, x1: 13, z1: 20, minSpacing: 5 },
     { kind: 'shrub', count: 48, x0: -29, z0: -21, x1: 29, z1: 21, minSpacing: 3.5 },
+    // AAA pass: frost-shard clusters at the ice-ridge feet and along the
+    // frozen creek banks (appended — earlier zone indices/seeds unchanged;
+    // solid rejection keeps the ridges themselves clear)
+    { kind: 'icicle', count: 16, x0: -14.5, z0: -16, x1: -9.5, z1: 17, minSpacing: 3 },
+    { kind: 'icicle', count: 16, x0: 9.5, z0: -16, x1: 14.5, z1: 17, minSpacing: 3 },
+    { kind: 'icicle', count: 10, x0: -28, z0: -10, x1: 28, z1: 1, minSpacing: 5 },
+  ],
+  // AAA accent: rescue amber (tAmber) — dam marker plate, gap-spike markers,
+  // creek-crossing step stripes: safety color against the snowfield
+  accents: [
+    // dam rock marker (south face, visible up the creek lane)
+    { x: 0, y: 1.3, z: -0.56, w: 1.6, h: 1.0, d: 0.06, hex: PALETTE.tAmber },
+    // south-gap spike markers (south faces)
+    { x: -14.5, y: 1.4, z: 11.04, w: 1.8, h: 0.8, d: 0.06, hex: PALETTE.tAmber },
+    { x: 14.5, y: 1.4, z: 11.04, w: 1.8, h: 0.8, d: 0.06, hex: PALETTE.tAmber },
+    // creek step-crossing edge stripes (south steps)
+    { x: -21, y: 0.42, z: 0.23, w: 2.44, h: 0.1, d: 0.06, hex: PALETTE.tAmber },
+    { x: -6, y: 0.42, z: 0.23, w: 2.44, h: 0.1, d: 0.06, hex: PALETTE.tAmber },
+    { x: 6, y: 0.42, z: 0.23, w: 2.44, h: 0.1, d: 0.06, hex: PALETTE.tAmber },
+    { x: 21, y: 0.42, z: 0.23, w: 2.44, h: 0.1, d: 0.06, hex: PALETTE.tAmber },
   ],
 };

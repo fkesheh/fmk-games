@@ -1,10 +1,11 @@
 // ============================================================================
 // C9 — Menus (main / buy / scoreboard / match end / joining / pause / room chip / dev console).
 // DOM overlays mounted on the #menu root handed in by C11. Styles are injected
-// here (style.css belongs to C11). Every color traces to PALETTE via CSS custom
-// properties (--m9-*) set on the root element.
+// here. Every color traces to PALETTE via CSS custom properties (--m9-*) set
+// on the root element. Weapon silhouettes come from hud.ts's procedural
+// weaponIcon() factory (shared with the killfeed).
 // ============================================================================
-import { MAP_LIST, PALETTE, PRIVATE_CODE_LEN, WEAPONS } from '@fps/shared';
+import { MAP_LIST, MAPS, PALETTE, PRIVATE_CODE_LEN, WEAPONS } from '@fps/shared';
 import type {
   MapId,
   PlayerId,
@@ -14,6 +15,7 @@ import type {
   Team,
   WeaponId,
 } from '@fps/shared';
+import { weaponIcon } from './hud.js';
 
 export interface MenuCallbacks {
   onQuickJoin(name: string): void;
@@ -94,6 +96,11 @@ function el<K extends keyof HTMLElementTagNameMap>(
 function hexRgb(hex: string): string {
   const v = parseInt(hex.slice(1), 16);
   return `${(v >> 16) & 255},${(v >> 8) & 255},${v & 255}`;
+}
+
+// '#rrggbb' + alpha -> 'rgba(r,g,b,a)' — still a PALETTE color, just translucent
+function rgba(hex: string, a: number): string {
+  return `rgba(${hexRgb(hex)},${a})`;
 }
 
 function byScore(a: RosterEntry, b: RosterEntry): number {
@@ -182,7 +189,11 @@ export class Menus {
     const panel = el('div', 'm9-panel m9-main-panel');
     panel.setAttribute('role', 'dialog');
     panel.setAttribute('aria-label', 'Main menu');
-    panel.appendChild(el('h1', 'm9-title', 'STRICKEN'));
+    // hero band: wordmark + tagline over a bold diagonal ink/amber accent
+    const hero = el('div', 'm9-hero');
+    hero.appendChild(el('h1', 'm9-title', 'STRICKEN'));
+    hero.appendChild(el('div', 'm9-tagline', 'TACTICAL ROUND-BASED FPS'));
+    panel.appendChild(hero);
     panel.appendChild(el('div', 'm9-rule'));
 
     // name (persisted)
@@ -237,7 +248,25 @@ export class Menus {
 
     panel.appendChild(this.buildControls());
     layer.appendChild(panel);
+    this.applyMainTint();
     this.loadRooms();
+  }
+
+  /**
+   * Main-menu hero backdrop: a map-themed tint behind the panel, built from
+   * the selected map's frozen theme colors (sky glow from the top, horizon
+   * warmth mid-frame, fog haze low) over the standard ink dim. Re-applied
+   * live when the map picker selection changes.
+   */
+  private applyMainTint(): void {
+    const theme = MAPS[this.selectedMap].theme;
+    this.layers.main.style.background =
+      // top layer: vignette so the panel edges fall off into ink
+      `radial-gradient(ellipse at 50% 42%, transparent 48%, ${rgba(PALETTE.ink, 0.6)} 100%), ` +
+      // under it: the selected map's theme tint
+      `radial-gradient(135% 105% at 50% -12%, ${rgba(theme.sky, 0.36)} 0%, ` +
+      `${rgba(theme.horizon, 0.2)} 38%, ${rgba(theme.fog, 0.1)} 62%, ` +
+      `${rgba(PALETTE.ink, 0.88)} 100%)`;
   }
 
   private buildCreateCol(): HTMLElement {
@@ -252,6 +281,7 @@ export class Menus {
       b.addEventListener('click', () => {
         this.selectedMap = m.id;
         for (const other of buttons) other.classList.toggle('m9-sel', other === b);
+        this.applyMainTint(); // hero backdrop follows the picked map's theme
       });
       buttons.push(b);
       grid.appendChild(b);
@@ -427,6 +457,10 @@ export class Menus {
     const issued = el('div', 'm9-issued');
     for (const id of ['knife', 'pistol'] as const) {
       const chip = el('div', 'm9-issued-chip');
+      const icon = weaponIcon(id);
+      icon.setAttribute('role', 'img');
+      icon.setAttribute('aria-label', WEAPONS[id].name);
+      chip.appendChild(icon);
       chip.appendChild(el('span', 'm9-issued-name', WEAPONS[id].name));
       chip.appendChild(el('span', 'm9-tag', 'ISSUED'));
       issued.appendChild(chip);
@@ -445,6 +479,14 @@ export class Menus {
     card.type = 'button';
     if (isOwned) card.classList.add('m9-owned');
     if (off) card.classList.add('m9-off');
+
+    // procedural silhouette, same glyph family as the killfeed (2x size)
+    const iconWrap = el('div', 'm9-card-icon');
+    const icon = weaponIcon(id, 2);
+    icon.setAttribute('role', 'img');
+    icon.setAttribute('aria-label', def.name);
+    iconWrap.appendChild(icon);
+    card.appendChild(iconWrap);
 
     const top = el('div', 'm9-card-top');
     top.appendChild(el('span', 'm9-card-name', def.name));
@@ -611,6 +653,7 @@ export class Menus {
     panel.setAttribute('role', 'dialog');
     panel.setAttribute('aria-label', 'Paused');
     panel.appendChild(el('h2', 'm9-pause-title', 'PAUSED'));
+    panel.appendChild(el('div', 'm9-rule'));
     const resume = el('button', 'm9-btn m9-btn-primary m9-wide', 'RESUME');
     resume.type = 'button';
     resume.addEventListener('click', () => {
@@ -792,15 +835,17 @@ const CSS = `
 .fps-menus *{box-sizing:border-box;}
 .fps-menus .m9-layer{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:16px;}
 .fps-menus .m9-modal{pointer-events:auto;background:rgba(var(--m9-ink-rgb),.78);}
+/* the buy menu keeps the world readable behind the cards */
+.fps-menus .m9-layer-buy.m9-modal{background:rgba(var(--m9-ink-rgb),.52);}
 
 .fps-menus .m9-panel{background:rgba(var(--m9-ink-rgb),.97);border:1px solid var(--m9-metalDark);
   border-radius:10px;padding:22px 26px;max-height:94vh;overflow-y:auto;
-  box-shadow:0 14px 44px rgba(var(--m9-ink-rgb),.7);}
+  box-shadow:0 14px 44px rgba(var(--m9-ink-rgb),.7), inset 0 1px 0 rgba(var(--m9-hudText-rgb),.06);}
 .m9-main-panel{width:min(760px,94vw);}
 
 .fps-menus .m9-btn{font:inherit;font-size:14px;font-weight:700;letter-spacing:.06em;
   text-transform:uppercase;cursor:pointer;color:var(--m9-hudText);
-  background:var(--m9-charcoal);border:1px solid var(--m9-metalDark);border-radius:6px;padding:10px 16px;}
+  background:var(--m9-charcoal);border:1px solid var(--m9-metalDark);border-radius:8px;padding:10px 16px;}
 .fps-menus .m9-btn:hover:not(:disabled){border-color:var(--m9-hudAccent);}
 .fps-menus .m9-btn:disabled{opacity:.4;cursor:default;}
 .fps-menus .m9-btn-primary{background:var(--m9-hudAccent);border-color:var(--m9-hudAccent);color:var(--m9-ink);}
@@ -810,18 +855,43 @@ const CSS = `
 .m9-wide{width:100%;}
 
 .fps-menus .m9-input{font:inherit;width:100%;background:var(--m9-charcoal);color:var(--m9-hudText);
-  border:1px solid var(--m9-metalDark);border-radius:6px;padding:10px 12px;font-size:15px;outline:none;}
+  border:1px solid var(--m9-metalDark);border-radius:8px;padding:10px 12px;font-size:15px;outline:none;}
 .fps-menus .m9-input:focus{border-color:var(--m9-hudAccent);}
 
-.m9-title{margin:0;font-size:42px;font-weight:800;letter-spacing:.24em;text-align:center;}
-.m9-rule{height:3px;width:88px;margin:10px auto 18px;background:var(--m9-hudAccent);border-radius:2px;}
+/* hero: gradient-sheen title + tagline + sweeping rule over a diagonal accent */
+.m9-hero{position:relative;overflow:hidden;margin:-8px -10px 0;padding:10px 0 6px;}
+.m9-hero::before{content:'';position:absolute;left:-22%;right:-22%;top:14%;height:62%;
+  transform:rotate(-13deg);
+  background:linear-gradient(90deg,
+    rgba(var(--m9-hudAccent-rgb),0) 0%, rgba(var(--m9-hudAccent-rgb),.14) 24%,
+    rgba(var(--m9-hudAccent-rgb),.32) 50%, rgba(var(--m9-hudAccent-rgb),.14) 76%,
+    rgba(var(--m9-hudAccent-rgb),0) 100%);
+  border-top:1px solid rgba(var(--m9-ink-rgb),.85);
+  border-bottom:1px solid rgba(var(--m9-ink-rgb),.85);}
+.m9-hero .m9-title{position:relative;}
+.m9-hero .m9-tagline{position:relative;}
+.m9-title{margin:0;font-size:46px;font-weight:800;letter-spacing:.24em;text-align:center;
+  background:linear-gradient(105deg,
+    var(--m9-hudText) 30%, var(--m9-hudAccent) 46%, var(--m9-paper) 50%,
+    var(--m9-hudAccent) 54%, var(--m9-hudText) 70%);
+  background-size:250% 100%;background-position:112% 0;
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+  animation:m9sheen 6s ease-in-out infinite;}
+@keyframes m9sheen{0%{background-position:112% 0;}55%{background-position:-112% 0;}100%{background-position:-112% 0;}}
+.m9-tagline{text-align:center;font-size:11px;letter-spacing:.42em;color:var(--m9-steel);margin-top:3px;}
+.m9-rule{position:relative;overflow:hidden;height:3px;width:88px;margin:10px auto 18px;
+  background:rgba(var(--m9-hudAccent-rgb),.3);border-radius:2px;}
+.m9-rule::after{content:'';position:absolute;top:0;bottom:0;width:34px;left:-40px;
+  background:var(--m9-hudAccent);border-radius:2px;animation:m9rulesweep 2.8s ease-in-out infinite;}
+@keyframes m9rulesweep{0%{left:-40px;}55%{left:100%;}100%{left:100%;}}
 .m9-field{margin-bottom:12px;}
 .m9-label{display:block;font-size:12px;letter-spacing:.14em;color:var(--m9-steel);margin-bottom:6px;}
 .m9-quick{width:100%;padding:14px;font-size:17px;margin-bottom:4px;}
 .m9-error{color:var(--m9-danger);font-size:13px;margin:8px 0 10px;text-align:center;}
 
 .m9-cols{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;}
-.m9-sec{border:1px solid var(--m9-metalDark);border-radius:8px;padding:12px;}
+.m9-sec{border:1px solid var(--m9-metalDark);border-radius:8px;padding:12px;
+  box-shadow:inset 0 1px 0 rgba(var(--m9-hudText-rgb),.04);}
 .m9-sec-title{margin:0 0 10px;font-size:12px;font-weight:700;letter-spacing:.16em;color:var(--m9-steel);}
 .m9-map-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:10px;}
 .m9-map{padding:8px 2px;font-size:12px;font-weight:600;letter-spacing:.02em;text-transform:none;}
@@ -835,7 +905,7 @@ const CSS = `
 .m9-rooms-head .m9-sec-title{margin:0;}
 .m9-room-list{display:flex;flex-direction:column;gap:4px;max-height:168px;overflow-y:auto;}
 .m9-room-row{display:grid;grid-template-columns:1fr 64px 84px;gap:8px;align-items:center;
-  padding:7px 10px;background:var(--m9-charcoal);border:1px solid var(--m9-metalDark);border-radius:6px;
+  padding:7px 10px;background:var(--m9-charcoal);border:1px solid var(--m9-metalDark);border-radius:8px;
   color:var(--m9-hudText);font:inherit;font-size:13px;cursor:pointer;text-align:left;}
 .m9-room-row:hover{border-color:var(--m9-hudAccent);}
 .m9-room-players,.m9-room-phase{color:var(--m9-steel);font-variant-numeric:tabular-nums;}
@@ -855,11 +925,15 @@ const CSS = `
 .m9-buy-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:12px;}
 .m9-card{display:flex;flex-direction:column;gap:6px;text-align:left;background:var(--m9-charcoal);
   border:1px solid var(--m9-metalDark);border-radius:8px;padding:12px;color:var(--m9-hudText);
-  font:inherit;cursor:pointer;}
-.m9-card:hover{border-color:var(--m9-hudAccent);}
-.m9-card.m9-owned{border-color:var(--m9-hudAccent);cursor:default;}
+  font:inherit;cursor:pointer;box-shadow:inset 0 1px 0 rgba(var(--m9-hudText-rgb),.05);}
+.m9-card:hover:not(.m9-off){border-color:var(--m9-hudAccent);transform:translateY(-1px);}
+.m9-card.m9-owned{border-color:var(--m9-hudAccent);cursor:default;
+  box-shadow:inset 0 1px 0 rgba(var(--m9-hudText-rgb),.05), inset 0 -2px 0 var(--m9-hudAccent);}
 .m9-card.m9-off{opacity:.4;cursor:default;}
 .m9-card.m9-off:hover{border-color:var(--m9-metalDark);}
+.m9-card-icon{display:flex;align-items:center;justify-content:center;height:52px;
+  background:rgba(var(--m9-ink-rgb),.55);border:1px solid rgba(var(--m9-metalDark-rgb),.8);
+  border-radius:6px;}
 .m9-card-top{display:flex;justify-content:space-between;align-items:baseline;gap:6px;}
 .m9-card-name{font-weight:700;font-size:14px;}
 .m9-card-price{color:var(--m9-hudAccent);font-weight:700;font-variant-numeric:tabular-nums;}
@@ -868,8 +942,9 @@ const CSS = `
 .m9-tag{font-size:12px;font-weight:800;letter-spacing:.12em;color:var(--m9-hudAccent);}
 .m9-tag.m9-bad{color:var(--m9-danger);}
 .m9-issued{display:flex;gap:10px;margin-bottom:10px;}
-.m9-issued-chip{display:flex;align-items:center;gap:8px;border:1px solid var(--m9-metalDark);
-  border-radius:6px;padding:8px 12px;background:rgba(var(--m9-charcoal-rgb),.6);}
+.m9-issued-chip{display:flex;align-items:center;gap:10px;border:1px solid var(--m9-metalDark);
+  border-radius:8px;padding:8px 14px;background:rgba(var(--m9-charcoal-rgb),.6);
+  box-shadow:inset 0 1px 0 rgba(var(--m9-hudText-rgb),.05);}
 .m9-issued-name{font-size:13px;font-weight:600;}
 .m9-hint{font-size:12px;color:var(--m9-steel);text-align:center;}
 
@@ -903,7 +978,7 @@ const CSS = `
 .m9-end-score{font-size:24px;font-weight:800;letter-spacing:.1em;font-variant-numeric:tabular-nums;}
 .m9-top3{display:flex;flex-direction:column;gap:6px;min-width:280px;}
 .m9-top3-row{display:grid;grid-template-columns:36px 32px 1fr auto;gap:8px;align-items:center;
-  background:rgba(var(--m9-ink-rgb),.9);border:1px solid var(--m9-metalDark);border-radius:6px;
+  background:rgba(var(--m9-ink-rgb),.9);border:1px solid var(--m9-metalDark);border-radius:8px;
   padding:8px 14px;font-size:14px;}
 .m9-top3-rank{color:var(--m9-hudAccent);font-weight:800;}
 .m9-top3-name{text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
@@ -914,16 +989,18 @@ const CSS = `
 
 .fps-menus .m9-layer-chip{align-items:flex-start;justify-content:flex-start;}
 .m9-chip{margin:14px;background:rgba(var(--m9-ink-rgb),.82);border:1px solid var(--m9-metalDark);
-  border-radius:6px;padding:6px 10px;font-size:12px;letter-spacing:.05em;}
+  border-radius:8px;padding:6px 10px;font-size:12px;letter-spacing:.05em;
+  box-shadow:inset 0 1px 0 rgba(var(--m9-hudText-rgb),.07);}
 
 .fps-menus .m9-layer-botprompt{align-items:flex-end;justify-content:flex-end;padding:0 6vw 96px;}
 .m9-botprompt{display:flex;flex-direction:column;gap:10px;pointer-events:auto;
   background:rgba(var(--m9-ink-rgb),.82);border:1px solid var(--m9-metalDark);
-  border-radius:6px;padding:10px 14px;font-size:12px;letter-spacing:.05em;}
+  border-radius:8px;padding:10px 14px;font-size:12px;letter-spacing:.05em;
+  box-shadow:inset 0 1px 0 rgba(var(--m9-hudText-rgb),.07);}
 .m9-botprompt-btns{display:flex;gap:6px;flex-wrap:wrap;}
 
 .m9-pause-panel{width:min(320px,92vw);display:flex;flex-direction:column;gap:10px;text-align:center;}
-.m9-pause-title{margin:0 0 6px;font-size:24px;letter-spacing:.2em;}
+.m9-pause-title{margin:0;font-size:24px;letter-spacing:.2em;}
 .fps-menus .m9-btn-t{border-color:var(--m9-tAmber);color:var(--m9-tAmber);}
 .fps-menus .m9-btn-t:hover:not(:disabled){border-color:var(--m9-tAmber);background:rgba(var(--m9-tAmber-rgb),.15);}
 .fps-menus .m9-btn-ct{border-color:var(--m9-ctBlue);color:var(--m9-ctBlue);}

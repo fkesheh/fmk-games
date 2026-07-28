@@ -702,12 +702,13 @@ async function main() {
   // a barrier where the pursuit cannot unwind it — zero speed, zero yaw rate) is
   // auto-respawned to the last credited gate with NO R press. The feature is
   // assist-only, so the pin is forced with the assist OFF (it cannot fire early):
-  // a verified R-respawn to the anchor gate, 3 SIM seconds of centerline pursuit
-  // AWAY from it (so the teleport back is a > 15m jump no standstill kart can
-  // fake inside one poll interval), then a SLOW (brake-capped, < 7 m/s) run at a
-  // FIXED aim point 30m past the barrier — an aim re-derived per tick or a fast
-  // arrival just grinds along the wall — until the position flat-lines (< 1.5m
-  // over a 2.5 SIM-second window). Then the assist is re-enabled while pinned and the throttle
+  // a verified R-respawn to the anchor gate, 4 SIM seconds of centerline pursuit
+  // AWAY from it (so the teleport back is a > 8m jump no driving can fake
+  // inside one poll interval), then a PERPENDICULAR servo into the barrier —
+  // the aim is re-derived every tick as the kart's position + the wall normal
+  // × 12m, so at LAT_G 12.5 the kart cannot complete the turn early and grind
+  // along the wall — until the position flat-lines (< 1.5m over a 2.5 SIM-
+  // second window). Then the assist is re-enabled while pinned and the throttle
   // re-latched: the client must teleport back within ~8 SIM seconds of the
   // confirmed pin (its stuck timer, 2.5 sim-s in drive.ts, runs on stepped sim
   // time — a wall budget over-waits it by 1/sim-rate), land by a gate
@@ -780,20 +781,21 @@ async function main() {
       await sleep(150);
     }
   }
-  // pin: SLOW pure-pursuit of a FIXED aim 30m past the barrier on the
-  // left-of-travel normal (the drive.ts collideBarrier convention), computed
-  // ONCE — an aim re-derived per tick curves the chase into a wall-grind, and
-  // a fast arrival just slides along the barrier. Braking to < 7 m/s first
-  // keeps the speed-sensitive lock wide, so the kart spears the wall near-
-  // perpendicular and settles nose-in. The other side is tried after 7 sim-s.
-  // Everything is SIM-timed — the stationary window too (a creeping kart at
-  // 0.5 sim-m/s covers < 1.5m in 2.5 WALL seconds under starvation and would
-  // false-confirm).
+  // pin: servo onto a PERPENDICULAR heading into the barrier and drive
+  // straight in. The aim is re-derived EVERY tick as the kart's position +
+  // the left-of-travel normal × 12m (the drive.ts collideBarrier convention):
+  // always dead-perpendicular from the kart's current spot — never a lead
+  // down the wall the kart can arc toward. The old fixed far aim (30m past
+  // the barrier, computed once) was cornerable: at LAT_G 12.5 the kart
+  // completes the turn early and grinds along the wall instead of wedging.
+  // Braking above 9 m/s keeps the arrival firm but quick to settle; the
+  // other side is tried after 7 sim-s. Everything is SIM-timed — the
+  // stationary window too (a creeping kart at 0.5 sim-m/s covers < 1.5m in
+  // 2.5 WALL seconds under starvation and would false-confirm).
   const pinTrail = []; // [{simS,x,z}] — stationary-window detection (sim clock)
   let pinPos = null;
   let pinSimS = null; // sim clock at the confirmed pin (seq-based)
   let pinSide = 1;
-  let pinAim = null; // fixed aim point; recomputed only on the side flip
   const pinWall0 = Date.now();
   const pinSim0 = teleSimS(await kartTelemetry(A));
   let pinSideFlipAt = null; // sim clock to flip sides (null = not yet flipping)
@@ -804,22 +806,20 @@ async function main() {
     const simS = teleSimS(t);
     if (simS !== null && pinSim0 !== null && simS - pinSim0 > 15) break; // 15 sim-s and no pin: give up
     if (pose !== null && simS !== null) {
-      if (pinAim === null) {
-        const ci = nearestIndex(kidsTrack.centerline, pose.x, pose.z);
-        const c = kidsTrack.centerline[ci];
-        const c2 = kidsTrack.centerline[(ci + 1) % TRACK_SAMPLES];
-        const dx = c2[0] - c[0];
-        const dz = c2[1] - c[1];
-        const l = Math.hypot(dx, dz) || 1;
-        pinAim = { x: c[0] + (-dz / l) * pinSide * 30, z: c[1] + (dx / l) * pinSide * 30 };
-        pinSideFlipAt = simS + 7; // this wall gets 7 sim-s to pin, then the other one
-      }
-      const diff = wrapPi(Math.atan2(-(pinAim.x - pose.x), -(pinAim.z - pose.z)) - pose.yaw);
-      const slow = typeof sp === 'number' && sp > 7;
+      if (pinSideFlipAt === null) pinSideFlipAt = simS + 7; // this wall gets 7 sim-s, then the other one
+      const ci = nearestIndex(kidsTrack.centerline, pose.x, pose.z);
+      const c = kidsTrack.centerline[ci];
+      const c2 = kidsTrack.centerline[(ci + 1) % TRACK_SAMPLES];
+      const dx = c2[0] - c[0];
+      const dz = c2[1] - c[1];
+      const l = Math.hypot(dx, dz) || 1;
+      const aim = { x: pose.x + (-dz / l) * pinSide * 12, z: pose.z + (dx / l) * pinSide * 12 };
+      const diff = wrapPi(Math.atan2(-(aim.x - pose.x), -(aim.z - pose.z)) - pose.yaw);
+      const fast = typeof sp === 'number' && sp > 9;
       await A.evaluate(
         (th, br, st2) => window.__kart.setInput(th, br, st2, false),
-        slow ? 0 : 0.6,
-        slow ? 1 : 0,
+        fast ? 0 : 0.7,
+        fast ? 1 : 0,
         Math.max(-1, Math.min(1, -diff * 2.2)),
       );
       pinTrail.push({ simS, x: pose.x, z: pose.z });
@@ -834,7 +834,7 @@ async function main() {
       }
       if (pinSideFlipAt !== null && simS >= pinSideFlipAt && pinSide === 1) {
         pinSide = -1; // this wall would not pin — try the other one
-        pinAim = null;
+        pinSideFlipAt = simS + 7;
         pinTrail.length = 0;
       }
     }
@@ -1201,9 +1201,8 @@ async function main() {
   }
   // sim-rate diagnostic (logged, never asserted): kart-sim seconds per wall
   // second off the 15Hz packet clock, plus the sampled launch series (sim-s,
-  // speed) — the clean reference is the offline stepKart launch (1s:11, 2s:17,
-  // 3s:25); the grid launch here also fights B's parked-kart repulsion, so it
-  // reads low. The wall-clock windows below only mean something via this rate.
+  // speed) — the clean reference is the offline stepKart launch (1s:14, 2s:21,
+  // 3s:25). The wall-clock windows below only mean something via this rate.
   if (launch.length >= 2) {
     const lf = launch[0];
     const ll = launch[launch.length - 1];
@@ -1545,7 +1544,7 @@ async function main() {
   // so a wall-clock window would compare unequal slices under a starved sim;
   // 2.0 sim-s is where the margin PEAKS: the 1.5 sim-s boost has just ended
   // while the no-boost kart hasn't caught up — offline stepKart reference
-  // 18.0 vs 25.0 m/s, margin 7.0; it narrows to ~3.6 by 2.5 sim-s): the
+  // 21.3 vs 27.0 m/s, margin 5.7; it narrows toward ~3 by 2.5 sim-s): the
   // boosted run's top speed must beat the no-boost top at the same throttle.
   // Charge counts are read between presses while coasting.
   const readNitroLeft = async () => ownNitroLeft(await kartState(A));
@@ -1634,7 +1633,7 @@ async function main() {
       nitroAfter4 === 0 &&
       boostTop > noBoostTop + 3,
     `charges ${nitroStart} -> ${nitroAfter1} -> ${nitroAfter2} -> ${nitroAfter3}, 4th press -> ${nitroAfter4}; ` +
-      `top speed no-boost ${noBoostTop.toFixed(1)} vs boosted ${boostTop.toFixed(1)} m/s (2.0 sim-s full-throttle A/B; offline reference 18.0 vs 25.0)`,
+      `top speed no-boost ${noBoostTop.toFixed(1)} vs boosted ${boostTop.toFixed(1)} m/s (2.0 sim-s full-throttle A/B; offline reference 21.3 vs 27.0)`,
   );
 
   // -- gear stability + top speed: ~20s of centerline pursuit ------------------
@@ -1667,7 +1666,7 @@ async function main() {
   const stabT0 = Date.now();
   const stabSim0 = teleSimS(await kartTelemetry(A));
   let stabSimElapsed = 0; // last observed sim-s since the run start (for the detail line)
-  // The budgets are SIM time: reaching 28 m/s needs ~5 clean sim-s on a
+  // The budgets are SIM time: reaching 28 m/s needs ~4 clean sim-s on a
   // straight (offline stepKart reference), and the box's oscillation signature
   // lives in sim time — a wall budget starves both below 20fps.
   while (Date.now() - stabT0 < 240000) {
