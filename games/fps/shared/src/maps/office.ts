@@ -226,11 +226,22 @@ export const office: MapDef = {
     { x: -19.45, y: 1.5, z: 11, w: 0.04, h: 0.12, d: 2.4, hex: PALETTE.screenGlow, emissive: true },
     { x: 19.45, y: 1.5, z: -6, w: 0.04, h: 0.12, d: 2.4, hex: PALETTE.screenGlow, emissive: true },
     { x: 19.45, y: 1.5, z: 6, w: 0.04, h: 0.12, d: 2.4, hex: PALETTE.screenGlow, emissive: true },
-    // whiteboards on the corridor jog faces (metalDark frame + paper board)
+    // whiteboards on the corridor jog faces (metalDark frame + paper board +
+    // faint gray grid lines on the paper)
     { x: -16.42, y: 1.5, z: -8, w: 0.05, h: 1.2, d: 1.9, hex: PALETTE.metalDark },
     { x: -16.39, y: 1.5, z: -8, w: 0.05, h: 1.0, d: 1.7, hex: PALETTE.paper },
+    { x: -16.36, y: 1.25, z: -8, w: 0.02, h: 0.02, d: 1.55, hex: PALETTE.concrete },
+    { x: -16.36, y: 1.5, z: -8, w: 0.02, h: 0.02, d: 1.55, hex: PALETTE.concrete },
+    { x: -16.36, y: 1.75, z: -8, w: 0.02, h: 0.02, d: 1.55, hex: PALETTE.concrete },
+    { x: -16.36, y: 1.5, z: -8.4, w: 0.02, h: 0.85, d: 0.02, hex: PALETTE.concrete },
+    { x: -16.36, y: 1.5, z: -7.6, w: 0.02, h: 0.85, d: 0.02, hex: PALETTE.concrete },
     { x: 16.42, y: 1.5, z: 8, w: 0.05, h: 1.2, d: 1.9, hex: PALETTE.metalDark },
     { x: 16.39, y: 1.5, z: 8, w: 0.05, h: 1.0, d: 1.7, hex: PALETTE.paper },
+    { x: 16.36, y: 1.25, z: 8, w: 0.02, h: 0.02, d: 1.55, hex: PALETTE.concrete },
+    { x: 16.36, y: 1.5, z: 8, w: 0.02, h: 0.02, d: 1.55, hex: PALETTE.concrete },
+    { x: 16.36, y: 1.75, z: 8, w: 0.02, h: 0.02, d: 1.55, hex: PALETTE.concrete },
+    { x: 16.36, y: 1.5, z: 7.6, w: 0.02, h: 0.85, d: 0.02, hex: PALETTE.concrete },
+    { x: 16.36, y: 1.5, z: 8.4, w: 0.02, h: 0.85, d: 0.02, hex: PALETTE.concrete },
     // picture frames on the open-floor end walls
     { x: -6, y: 1.6, z: -15.45, w: 0.7, h: 0.55, d: 0.05, hex: PALETTE.metalDark },
     { x: -6, y: 1.6, z: -15.42, w: 0.55, h: 0.4, d: 0.05, hex: PALETTE.paper },

@@ -81,6 +81,7 @@ const SALT_BOX_TINT = 1000;
 const SALT_FLOOR = 2000;
 const SALT_LIGHT = 3000;
 const SALT_SKYLINE = 4000;
+const SALT_DESK = 5000;
 
 const JITTER = [0.92, 1.0, 1.08] as const; // per-box albedo buckets (+-8%)
 const TOP_LIGHTEN = 1.12; // cap slabs are this much lighter than their side
@@ -102,14 +103,16 @@ const RIB_EVERY = 4; // pilaster spacing on tall long faces (m)
 const RIB_MIN_FACE = 6; // faces shorter than this get no pilasters
 const RIB_OUT = 0.03; // proudest strip (over trim/skirt so it reads as a rib)
 const MOTTLE_MIN_FACE = 8; // big blockout-tell slabs get value mottling
-const MOTTLE_FACTORS = [0.96, 1.04] as const; // large-scale +-4% value clouds
+const MOTTLE_FACTORS = [0.95, 1.05] as const; // large-scale +-5% value clouds
 const MOTTLE_OUT = 0.008; // tucks behind skirt/trim/ribs
+const GRIME_H = 0.32; // base grime band height (soft dirt over the skirting)
+const GRIME_OUT = 0.026; // between skirt (0.024) and trim (0.028): no coplanar
 
 const PANEL_CELL = 2.4; // ceiling light-panel grid pitch (m)
 const PANEL_SKIP = 0.38; // seeded fraction of cells left dark
 const PANEL_DARK = 0.15; // fraction of lit cells that are dead fixtures
 const PANEL_COOL = 0.2; // fraction of lit panels running cool (screenGlow)
-const POOL_OPACITY = 0.62; // floor pool quad alpha (transparent, soft spill)
+const POOL_OPACITY = 0.55; // floor pool quad alpha (transparent, warm spill)
 
 /** Multiply a PALETTE '#rrggbb' hex by f (clamped). All richness tints derive
  *  from PALETTE entries here — no ad-hoc hues are ever introduced. */
@@ -146,6 +149,9 @@ export function buildMap(map: MapDef): { root: THREE.Group; solids: AABB[] } {
     buildRichBox(statics, b, boxTint);
   }
 
+  // ---- desktop dressing: monitors/keyboards/papers on desk-row boxes --------
+  buildDesktopDressing(statics, map);
+
   // ---- ceiling light panels (indoor maps only: big overhead slabs) -----------
   buildLightPanels(statics, map, solids);
 
@@ -166,7 +172,7 @@ export function buildMap(map: MapDef): { root: THREE.Group; solids: AABB[] } {
       if (tooClose(x, z, placed, zone.minSpacing)) continue;
       placed.push({ x, z });
       placedInZone++;
-      const prop = buildProp(zone.kind, next);
+      const prop = buildProp(zone.kind, next, zone.hex);
       prop.position.set(x, 0, z);
       statics.add(prop);
     }
@@ -207,10 +213,22 @@ function buildRichBox(g: THREE.Group, b: BoxDef, next: () => number): void {
   g.add(at(box(b.w + CAP_OUT * 2, CAP_H, b.d + CAP_OUT * 2, shade(base, f * TOP_LIGHTEN)), b.x, top - CAP_H / 2, b.z));
 
   const trimHex = shade(base, TRIM_DARKEN);
-  // skirting: floor-level accent band on ground-standing tall boxes
+  // skirting + grime: floor-level accent band and a soft dark dirt overlay
+  // rising past it (surface truth: wall bases collect grime)
   if (b.h >= 1.8 && Math.abs(bottom) <= 0.06 && (b.w >= 0.8 || b.d >= 0.8)) {
     g.add(
       at(box(b.w + SKIRT_OUT * 2, SKIRT_H, b.d + SKIRT_OUT * 2, trimHex), b.x, bottom + SKIRT_H / 2, b.z),
+    );
+    g.add(
+      at(
+        box(b.w + GRIME_OUT * 2, GRIME_H, b.d + GRIME_OUT * 2, shade(base, 0.55), {
+          transparent: true,
+          opacity: 0.35,
+        }),
+        b.x,
+        bottom + GRIME_H / 2,
+        b.z,
+      ),
     );
   }
   if (b.h >= 2.2) {
@@ -248,7 +266,7 @@ function addRibs(g: THREE.Group, b: BoxDef, trimHex: string, axis: 'x' | 'z'): v
  *  the single-flat-value read of 8m+ slabs without touching the silhouette. */
 function addMottle(g: THREE.Group, b: BoxDef, baseHex: string, next: () => number, axis: 'x' | 'z'): void {
   const len = axis === 'x' ? b.w : b.d;
-  const q = Math.max(2, Math.round(len / 10));
+  const q = Math.max(2, Math.round(len / 8));
   for (const s of [-1, 1]) {
     for (let i = 0; i < q; i++) {
       const wq = Math.min(rngRange(next, 2.5, 5.5), len - 1);
@@ -373,6 +391,71 @@ function buildAccents(g: THREE.Group, map: MapDef): void {
   }
 }
 
+// ---- desktop dressing (showroom -> workplace) -----------------------------------
+
+/**
+ * Seeded workplace props ON 'desk'-material BoxDefs (the bullpen sightlines
+ * were bare white desktops): monitors with lit/dark screens + keyboards, and
+ * paper piles. Everything sits on the desk top; all non-collidable overlays.
+ */
+function buildDesktopDressing(g: THREE.Group, map: MapDef): void {
+  const next = rng(decoSeed(map.id, SALT_DESK));
+  for (const b of map.boxes) {
+    if (b.mat !== 'desk' || b.w < 2 || b.d < 0.6) continue;
+    const top = b.y + b.h / 2;
+    const items = rngInt(next, 1, 2);
+    for (let i = 0; i < items; i++) {
+      const px = b.x + rngRange(next, -b.w / 2 + 0.5, b.w / 2 - 0.5);
+      const pz = b.z + rngRange(next, -b.d / 2 + 0.2, b.d / 2 - 0.2);
+      if (next() < 0.6) {
+        // monitors within ~9m of a spawn-adjacent sightline are always lit —
+        // the hero frames must never show a dead black screen at eye level
+        buildMonitor(g, next, px, top, pz, withinSpawnRadius(px, pz, map, 9));
+      } else {
+        const pile = new THREE.Group();
+        buildPaperStack(pile, next);
+        pile.position.set(px, top, pz);
+        g.add(pile);
+      }
+    }
+  }
+}
+
+/** True when (x,z) is within r meters of any spawn point (either team). */
+function withinSpawnRadius(x: number, z: number, map: MapDef, r: number): boolean {
+  const r2 = r * r;
+  for (const team of [map.spawns.T, map.spawns.CT]) {
+    for (const s of team) {
+      const dx = s.x - x;
+      const dz = s.z - z;
+      if (dx * dx + dz * dz < r2) return true;
+    }
+  }
+  return false;
+}
+
+/** monitor: stand + foot + bezel + screen face (~95% lit screenGlow; always
+ *  lit when forceLit) + keyboard. */
+function buildMonitor(g: THREE.Group, next: () => number, x: number, topY: number, z: number, forceLit: boolean): void {
+  const m = new THREE.Group();
+  m.add(at(box(0.3, 0.03, 0.2, PALETTE.charcoal), 0, 0.015, 0)); // foot
+  m.add(at(box(0.06, 0.22, 0.06, PALETTE.charcoal), 0, 0.13, 0)); // stand
+  m.add(at(box(0.56, 0.36, 0.05, PALETTE.charcoal), 0, 0.42, 0)); // bezel
+  const lit = forceLit || next() < 0.95;
+  m.add(
+    at(
+      box(0.5, 0.3, 0.02, PALETTE.screenGlow, lit ? { emissive: PALETTE.screenGlow } : undefined),
+      0,
+      0.42,
+      0.037,
+    ),
+  ); // screen face (+z of group)
+  m.add(at(box(0.36, 0.02, 0.13, PALETTE.charcoal), 0, 0.01, 0.28)); // keyboard
+  m.rotation.y = (next() < 0.5 ? 0 : Math.PI) + rngRange(next, -0.25, 0.25);
+  m.position.set(x, topY, z);
+  g.add(m);
+}
+
 // ---- ceiling light panels (indoor maps: big mood win) --------------------------
 
 /**
@@ -395,8 +478,8 @@ function buildLightPanels(g: THREE.Group, map: MapDef, solids: AABB[]): void {
   const halfZ = map.sizeZ / 2;
   const cols = Math.floor((map.sizeX - 2.6) / PANEL_CELL) + 1;
   const rows = Math.floor((map.sizeZ - 2.6) / PANEL_CELL) + 1;
-  const poolHex = shade(MAT_COLORS[map.floorMat], 1.5);
-  const poolGlowHex = shade(MAT_COLORS[map.floorMat], 1.35);
+  const poolHex = shade(PALETTE.paper, 0.82); // warm fixture light on any floor
+  const poolGlowHex = shade(PALETTE.paper, 0.5);
 
   for (let i = 0; i < cols; i++) {
     for (let j = 0; j < rows; j++) {
@@ -427,11 +510,11 @@ function buildLightPanels(g: THREE.Group, map: MapDef, solids: AABB[]): void {
       const warm = next() >= PANEL_COOL;
       const glowHex = warm ? PALETTE.paper : PALETTE.screenGlow;
       g.add(at(box(gw, 0.024, gd, glowHex, { emissive: glowHex }), x, ceil - 0.062, z));
-      // floor pool: soft emissive-transparent spill on open floor (not under
-      // solids) — the emissive term reads as spilled light even in gloom
+      // floor pool: soft warm emissive-transparent spill on open floor (not
+      // under solids) — every live panel gets a visible floor response
       if (!insideSolid(x, z, solids)) {
-        const pw = alongX ? 2.4 : 1.5;
-        const pd = alongX ? 1.5 : 2.4;
+        const pw = alongX ? 2.8 : 1.8;
+        const pd = alongX ? 1.8 : 2.8;
         g.add(
           at(
             box(pw, 0.001, pd, poolHex, { transparent: true, opacity: POOL_OPACITY, emissive: poolGlowHex }),
@@ -531,14 +614,14 @@ function smooth01(t: number): number {
 // ---- deco prop recipes (CONTRACT model sheets: 3-10 prims, PALETTE only) ------
 // Every builder fills a group sitting on y=0; buildProp adds yaw + scale jitter.
 
-function buildProp(kind: DecoKind, next: () => number): THREE.Group {
+function buildProp(kind: DecoKind, next: () => number, hex?: string): THREE.Group {
   const g = new THREE.Group();
   switch (kind) {
     case 'crate':
       buildCrate(g);
       break;
     case 'barrel':
-      buildBarrel(g, next);
+      buildBarrel(g, next, hex);
       break;
     case 'pallet':
       buildPallet(g);
@@ -603,11 +686,13 @@ function buildCrate(g: THREE.Group): void {
   g.add(at(box(S - 0.08, 0.05, S - 0.08, PALETTE.wood), 0, S + 0.065, 0));
 }
 
-/** barrel: cyl (steel or tBrown by rng) + 2 ring bands + inset lid disc. */
-function buildBarrel(g: THREE.Group, next: () => number): void {
+/** barrel: cyl + 2 ring bands + inset lid disc. Body: steel/tBrown industrial
+ *  by default, or two tones of the zone's family hex when one is set (e.g.
+ *  dustbowl's sand family — the gray-blue steel read off-palette there). */
+function buildBarrel(g: THREE.Group, next: () => number, hex?: string): void {
   const R = 0.34;
   const H = 0.92;
-  const body = next() < 0.5 ? PALETTE.steel : PALETTE.tBrown;
+  const body = hex !== undefined ? shade(hex, next() < 0.5 ? 1 : 0.85) : next() < 0.5 ? PALETTE.steel : PALETTE.tBrown;
   g.add(at(cyl(R, R, H, 12, body), 0, H / 2, 0));
   g.add(at(cyl(R + 0.03, R + 0.03, 0.07, 12, PALETTE.metalDark), 0, H * 0.28, 0));
   g.add(at(cyl(R + 0.03, R + 0.03, 0.07, 12, PALETTE.metalDark), 0, H * 0.72, 0));

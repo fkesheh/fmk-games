@@ -835,7 +835,7 @@ export class ClientGame {
         if (pos !== null && w !== null && ev.victimId !== s.youId) {
           w.effects.death(pos, victim?.team ?? 'T');
           w.effects.blood(pos);
-          this.audio.sfx('death', { dist: this.distFromCamera(pos) });
+          this.audio.sfx('death', this.spatialOpts(w, pos));
         } else {
           this.audio.sfx('death');
         }

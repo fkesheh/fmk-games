@@ -192,10 +192,11 @@ function buildRifle(g: THREE.Group): void {
 }
 
 function buildSniper(g: THREE.Group): void {
-  const barrel = cyl(0.011, 0.011, 0.7, 10, PALETTE.ink);
+  // gunmetal (metalDark) for every metal surface — separates from the ink mag
+  const barrel = cyl(0.011, 0.011, 0.7, 10, PALETTE.metalDark);
   barrel.rotation.x = Math.PI / 2;
   g.add(at(barrel, 0, 0.08, -0.5)); // longest, thinnest barrel
-  g.add(at(box(0.055, 0.07, 0.24, PALETTE.ink), 0, BARREL_Y, -0.02)); // receiver
+  g.add(at(box(0.055, 0.07, 0.24, PALETTE.metalDark), 0, BARREL_Y, -0.02)); // receiver
   const forend = box(0.05, 0.05, 0.2, PALETTE.woodDark);
   forend.add(at(box(0.04, 0.008, 0.16, PALETTE.crate), 0, 0.027, 0)); // grain panel along the forend
   forend.add(at(box(0.008, 0.028, 0.16, PALETTE.crate), -0.026, 0, 0)); // side grain (camera side)
@@ -205,29 +206,29 @@ function buildSniper(g: THREE.Group): void {
   stock.add(at(box(0.04, 0.008, 0.2, PALETTE.crate), 0, 0.052, 0)); // grain panel along the stock
   stock.add(at(box(0.008, 0.05, 0.2, PALETTE.crate), -0.026, 0, 0)); // side grain (camera side)
   g.add(at(stock, 0, 0.02, 0.22));
-  const scope = cyl(0.018, 0.018, 0.16, 10, PALETTE.ink);
+  const scope = cyl(0.018, 0.018, 0.16, 10, PALETTE.metalDark);
   scope.rotation.x = Math.PI / 2;
   g.add(at(scope, 0, 0.125, -0.02)); // scope tube
   // scope rings: thin bands wrapping the tube, tied to the receiver by a rail
-  const ringF = cyl(0.024, 0.024, 0.014, 8, PALETTE.ink);
+  const ringF = cyl(0.024, 0.024, 0.014, 8, PALETTE.metalDark);
   ringF.rotation.x = Math.PI / 2;
   g.add(at(ringF, 0, 0.125, 0.03));
-  const ringR = cyl(0.024, 0.024, 0.014, 8, PALETTE.ink);
+  const ringR = cyl(0.024, 0.024, 0.014, 8, PALETTE.metalDark);
   ringR.rotation.x = Math.PI / 2;
   g.add(at(ringR, 0, 0.125, -0.07));
-  g.add(at(box(0.03, 0.012, 0.14, PALETTE.ink), 0, 0.099, -0.02)); // mount rail under the rings
-  const bipodL = cyl(0.006, 0.006, 0.09, 6, PALETTE.ink);
+  g.add(at(box(0.03, 0.012, 0.14, PALETTE.metalDark), 0, 0.099, -0.02)); // mount rail under the rings
+  const bipodL = cyl(0.006, 0.006, 0.09, 6, PALETTE.metalDark);
   bipodL.rotation.z = 0.3;
   g.add(at(bipodL, 0.025, 0.02, -0.55));
-  const bipodR = cyl(0.006, 0.006, 0.09, 6, PALETTE.ink);
+  const bipodR = cyl(0.006, 0.006, 0.09, 6, PALETTE.metalDark);
   bipodR.rotation.z = -0.3;
   g.add(at(bipodR, -0.025, 0.02, -0.55));
-  // bolt handle: pin out the right side, bent arm down to a round knob
-  const bolt = cyl(0.008, 0.008, 0.04, 6, PALETTE.ink);
+  // bolt handle: pin out the right side, bent arm down to a steel knob
+  const bolt = cyl(0.008, 0.008, 0.04, 6, PALETTE.metalDark);
   bolt.rotation.z = Math.PI / 2;
   g.add(at(bolt, 0.045, BARREL_Y, 0.05));
-  g.add(at(box(0.012, 0.04, 0.014, PALETTE.ink), 0.062, 0.045, 0.05)); // bent arm
-  g.add(at(sphere(0.015, 6, PALETTE.ink), 0.062, 0.022, 0.05)); // knob
+  g.add(at(box(0.012, 0.04, 0.014, PALETTE.metalDark), 0.062, 0.045, 0.05)); // bent arm
+  g.add(at(sphere(0.015, 6, PALETTE.steel), 0.062, 0.022, 0.05)); // knob
   // mag: loose box ahead of the trigger guard
   g.add(markMag(at(box(0.04, 0.06, 0.08, PALETTE.ink), 0, -0.01, -0.05)));
 }
@@ -336,14 +337,18 @@ export class ViewModel {
     // ink cuff rings for contrast, charcoal forearm sleeves trailing toward
     // the screen edge — the rifle is HELD, not floating. Cuffs/sleeves are
     // children of the hands: they follow layouts and the reload choreography.
-    this.handR = box(0.075, 0.075, 0.1, PALETTE.concrete);
-    this.handR.position.set(0.02, -0.062, 0.02); // on the grip (origin), proud of the stock
-    this.handR.add(at(box(0.08, 0.022, 0.105, PALETTE.ink), 0, -0.03, 0.03)); // cuff ring
-    const sleeveR = box(0.08, 0.075, 0.3, PALETTE.charcoal);
-    sleeveR.rotation.x = 0.2; // angles down-back, off the screen edge
-    this.handR.add(at(sleeveR, 0.03, -0.02, 0.22));
+    this.handR = box(0.085, 0.085, 0.11, PALETTE.concrete);
+    this.handR.position.set(0.055, -0.105, 0.035); // low C-grip: clears the stock silhouette
+    this.handR.rotation.x = -0.25; // top face tilts toward the camera
+    this.handR.add(at(box(0.09, 0.024, 0.115, PALETTE.carpet), 0, -0.038, 0.045)); // cuff tone break
+    // forearm sleeve: short + thick, running to the bottom-right screen corner
+    // where a right-handed forearm actually comes from (not a blade fin)
+    const sleeveR = box(0.095, 0.09, 0.2, PALETTE.charcoal);
+    sleeveR.rotation.x = 0.25;
+    sleeveR.rotation.y = -0.55;
+    this.handR.add(at(sleeveR, 0.045, -0.015, 0.16));
     this.handL = box(0.07, 0.06, 0.085, PALETTE.concrete);
-    this.handL.add(at(box(0.075, 0.02, 0.09, PALETTE.ink), 0, -0.024, 0.028)); // cuff ring
+    this.handL.add(at(box(0.075, 0.02, 0.09, PALETTE.carpet), 0, -0.024, 0.028)); // cuff tone break
     const sleeveL = box(0.075, 0.07, 0.18, PALETTE.charcoal);
     sleeveL.rotation.x = 0.35; // down-left off the screen edge
     sleeveL.rotation.z = 0.25;

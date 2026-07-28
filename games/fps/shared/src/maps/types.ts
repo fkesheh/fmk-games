@@ -44,6 +44,7 @@ export interface DecoZone {
   count: number;
   x0: number; z0: number; x1: number; z1: number; // scatter rect
   minSpacing: number; // min distance between prop centers
+  hex?: string; // PALETTE hex — optional body-color override (barrel family tone)
 }
 
 export interface MapTheme {

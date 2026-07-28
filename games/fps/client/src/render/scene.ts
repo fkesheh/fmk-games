@@ -38,17 +38,22 @@ const SHAKE_SPEED = 18; // noise clock rate (rad/s of noise input)
 // OUTDOOR: golden-hour art direction. The theme's sunDir sits at ~58 deg
 // (midday: shadows hide under their casters — the "no shadows" read). The rig
 // keeps the theme's azimuth but drops the sun to SUN_ELEVATION so shadows rake
-// ~2.3x object height and agree with the visible disc. The 2048 ortho cascade
-// FOLLOWS the watched player at ±SHADOW_EXTENT_OUTDOOR (tighter than the old
-// fixed ±40 window = sharper texels), snapped to the shadow-texel grid so the
-// window never crawls. INDOOR keeps the frozen origin-centered rig (the
-// ceiling slab shadows the whole floor anyway).
-const SHADOW_EXTENT_INDOOR = 40;
-const SHADOW_EXTENT_OUTDOOR = 30; // follow-cam ortho half-extent (m)
+// ~2.3x object height and agree with the visible disc. ONE static 2048
+// origin-centered cascade at ±SHADOW_EXTENT covers every outdoor map's
+// interior — a player-following window was tried and rejected: edge
+// structures (gate gantry legs, big crate stacks) fell out of it and stopped
+// casting, and integrity beats the marginal texel gain.
+// The near plane is the skyline guard: backdrop-ring landmarks (the maps'
+// SkylineDef ring starts at r=SKYLINE_INNER_RADIUS=42) must never shadow the
+// playable area, so the cascade's near plane starts just inside the ring's
+// depth and clips it while every interior wall top (deepest ~21.4) still
+// casts. INDOOR keeps near=1 (the ceiling slab shadows everything anyway).
+const SHADOW_EXTENT = 40;
 const SHADOW_FAR = 160;
 const SUN_DISTANCE = 60; // light sits this far along the sun direction
 const SUN_ELEVATION = 0.42; // rad (~24 deg) — the golden-hour art direction
-const SHADOW_FOLLOW_AHEAD = 12; // cascade centers this far ahead of the view
+const SKYLINE_INNER_RADIUS = 42; // maps' backdrop ring starts here (SkylineDef.minR)
+const SHADOW_NEAR_OUTDOOR = SUN_DISTANCE - SKYLINE_INNER_RADIUS * Math.cos(SUN_ELEVATION) - 0.5;
 
 // ---- ambient floor (STYLE_BIBLE: "min ambient floor: players always clearly lit") ----
 // Effective hemi fill = relative luminance(sky color) x hemiIntensity; setTheme
@@ -77,7 +82,7 @@ const SKY_DOME_RADIUS = 395; // the map renderer's dome is r=400
 const SKY_ZENITH_PALE = 0.5; // zenith lerp -> paper (pale, not white)
 const SUN_DISC_DISTANCE = 380; // inside the rig dome
 const SUN_DISC_SIZE = 150; // halo spans the full quad
-const SUN_DISC_INTENSITY = 1.0;
+const SUN_DISC_INTENSITY = 1.3; // punch through the bright horizon band
 
 // ---- indoor fake light pools ----------------------------------------------------
 // Bright floor patches "baked" under the ceiling light panels the map renderer
@@ -93,6 +98,33 @@ const POOL_JITTER = 2.2; // seeded jitter per candidate (m)
 const POOL_PROBE_Y = 2.55; // below every indoor ceiling, above all furniture (h <= 2.2)
 const POOL_LATERAL_CLEAR = 0.7; // reject candidates this close to a tall face
 const POOL_OPACITY = 0.3; // additive — reads as a soft baked brightness pool
+
+// ---- indoor floor tonal wear (corridor paths) ------------------------------------
+// The pool grid is sparse points; real interiors read through PATHS. A
+// frame-sliced open-floor scan (2 rays per 2.5m cell, ~45 cells/frame so the
+// join frame never hitches) maps the walkable floor; maximal open runs of 3+
+// cells become soft additive wear strips — the lighter traffic lanes the
+// critic asked for. Deterministic: the grid is fixed, raycasts do the layout.
+const PATH_CELL = 2.5; // scan pitch (m)
+const PATH_COLS = 15; // x from -17.5..17.5 (covers office 40m + bunker 32m)
+const PATH_ROWS = 12; // z from -13.75..13.75
+const PATH_SCAN_PER_FRAME = 45; // cells validated per render (2 rays each)
+const PATH_MIN_RUN = 3; // cells (7.5m) — corridors qualify, isolated blobs don't
+const PATH_MAX_STRIPS = 10; // longest runs win
+const PATH_STRIP_W = 2.6; // strip width (m) — overlaps the 2.5m cell pitch
+const PATH_OPACITY = 0.16; // additive — a clear traffic-lane lift, under the pools
+
+// ---- sky artifact strip (outdoor themes) -------------------------------------------
+// The maps' backdrop ring (silhouette mesas at r=42-68) pokes tall pale tops
+// over its own front ranks — through the haze those tips read as floating
+// pale-yellow DIAMONDS in the sky, which the critic flagged as rendering
+// artifacts. Interior content never matches the test: outer walls top out at
+// exactly h=5 (centroids stay at/below SKYCAP_MIN_Y), and every structure
+// taller than that sits at r<=35.6 (urbana bricks, crossfire warehouse) —
+// inside SKYCAP_MIN_R. So the rig drops exactly the ring's tip triangles at
+// runtime; the ring survives as a low dune band on the horizon.
+const SKYCAP_MIN_Y = 5.5;
+const SKYCAP_MIN_R = 36;
 
 // ---- outdoor golden-hour grade (keyed by the theme's sky color) ---------------
 interface OutdoorGrade {
@@ -247,8 +279,15 @@ export class SceneRig {
 
   private pools: THREE.Group | null = null; // fake indoor light pools (once placed)
   private poolMat: THREE.MeshBasicMaterial | null = null; // shared by all pool decals
+  private stripMat: THREE.MeshBasicMaterial | null = null; // shared by all wear strips
   private poolTex: THREE.CanvasTexture | null = null;
   private poolsPending = false; // place on the first render after an indoor setTheme
+  private pathScan: { // frame-sliced indoor open-floor scan (null = idle/done)
+    cells: boolean[]; // PATH_COLS x PATH_ROWS row-major
+    index: number; // next cell to validate
+    group: THREE.Group; // strips land here as runs complete
+  } | null = null;
+  private skyCapsStripped = false; // one-time per rig: backdrop cap tiers dropped
   private readonly raycaster = new THREE.Raycaster();
   private readonly rayOrigin = new THREE.Vector3();
 
@@ -261,9 +300,6 @@ export class SceneRig {
   private readonly gradeScratchA = new THREE.Color(); // theme grading, per setTheme
   private readonly gradeScratchB = new THREE.Color();
   private readonly sunDirScratch = new THREE.Vector3(); // art-directed dir TOWARD scene, per theme
-  private readonly shadowTargetScratch = new THREE.Vector3(); // follow-cam snap, per frame
-  private readonly shadowRightScratch = new THREE.Vector3();
-  private readonly shadowUpScratch = new THREE.Vector3();
 
   private trauma = 0; // 0..1 shake energy
   private shakeT = 0; // accumulated noise clock
@@ -302,19 +338,19 @@ export class SceneRig {
     this.sun.castShadow = true;
     this.sun.shadow.mapSize.set(2048, 2048);
     const sc = this.sun.shadow.camera;
-    sc.left = -SHADOW_EXTENT_INDOOR;
-    sc.right = SHADOW_EXTENT_INDOOR;
-    sc.top = SHADOW_EXTENT_INDOOR;
-    sc.bottom = -SHADOW_EXTENT_INDOOR;
+    sc.left = -SHADOW_EXTENT;
+    sc.right = SHADOW_EXTENT;
+    sc.top = SHADOW_EXTENT;
+    sc.bottom = -SHADOW_EXTENT;
     sc.near = 1;
     sc.far = SHADOW_FAR;
     sc.updateProjectionMatrix();
     // long-shadow tuning: at golden-hour incidence the ground plane is the
-    // acne surface — normalBias ~2 texels (60m/2048 = 0.029m) pushes samples
+    // acne surface — normalBias ~2 texels (80m/2048 = 0.039m) pushes samples
     // off the surface without peter-panning crates; a whisper of negative
     // depth bias stops speckle along the shadow terminator
     this.sun.shadow.bias = -0.00015;
-    this.sun.shadow.normalBias = 0.06;
+    this.sun.shadow.normalBias = 0.07;
     this.sun.shadow.radius = 4; // soften staircase edges (ignored by PCFSoft — harmless safeguard)
     this.scene.add(this.sun);
     this.scene.add(this.sun.target); // target defaults to origin
@@ -434,7 +470,7 @@ export class SceneRig {
       );
       this.sun.target.position.set(0, 0, 0);
       this.sun.target.updateMatrixWorld();
-      this.setShadowExtent(SHADOW_EXTENT_INDOOR);
+      this.setShadowRig(SHADOW_EXTENT, 1); // frozen indoor rig: full depth range
     } else {
       // golden-hour grade keyed by the theme's sky color
       let grade = GRADE_FALLBACK;
@@ -451,8 +487,8 @@ export class SceneRig {
       const fog = this.gradeScratchA.set(fogHex).lerp(this.gradeScratchB.set(PALETTE.fogDusk), grade.fogWarm);
       fogHex = `#${fog.getHexString()}`;
 
-      // art-directed sun: the theme's azimuth, golden-hour elevation. Kept in
-      // sunDirScratch — the follow-cam cascade re-seats the light every frame.
+      // art-directed sun: the theme's azimuth, golden-hour elevation. Static
+      // origin-centered cascade from here on (see the rig note up top).
       const azimuth = Math.atan2(-theme.sunDir[0], -theme.sunDir[2]);
       const cosE = Math.cos(SUN_ELEVATION);
       this.sunDirScratch.set(
@@ -463,7 +499,7 @@ export class SceneRig {
       this.sun.position.copy(this.sunDirScratch).multiplyScalar(-SUN_DISTANCE);
       this.sun.target.position.set(0, 0, 0);
       this.sun.target.updateMatrixWorld();
-      this.setShadowExtent(SHADOW_EXTENT_OUTDOOR);
+      this.setShadowRig(SHADOW_EXTENT, SHADOW_NEAR_OUTDOOR); // near clips the backdrop ring
 
       // cool sky bounce opposite the sun: shade faces keep their modeling
       this.bounce.color.set(theme.sky).lerp(this.gradeScratchA.set(PALETTE.skyCold), BOUNCE_COOL);
@@ -534,27 +570,6 @@ export class SceneRig {
     this.fillTarget.position.copy(this.camera.position).addScaledVector(this.forwardScratch, FILL_AHEAD);
     this.fillTarget.updateMatrixWorld();
 
-    if (this.outdoor) {
-      // the shadow cascade follows the watched player: window centered ahead
-      // of the view, snapped to the shadow-texel grid in the light's ortho
-      // basis so the map never crawls or shimmers as the camera moves
-      const d = this.sunDirScratch; // unit, TOWARD the scene
-      const right = this.shadowRightScratch.set(-d.z, 0, d.x).normalize();
-      const up = this.shadowUpScratch.crossVectors(right, d);
-      const t = this.shadowTargetScratch
-        .copy(this.camera.position)
-        .addScaledVector(this.forwardScratch, SHADOW_FOLLOW_AHEAD);
-      t.y = 0;
-      const texel = (2 * SHADOW_EXTENT_OUTDOOR) / this.sun.shadow.mapSize.x;
-      const rx = Math.round(t.dot(right) / texel) * texel;
-      const uy = Math.round(t.dot(up) / texel) * texel;
-      const rz = t.dot(d);
-      t.set(0, 0, 0).addScaledVector(right, rx).addScaledVector(up, uy).addScaledVector(d, rz);
-      this.sun.target.position.copy(t);
-      this.sun.position.copy(t).addScaledVector(d, -SUN_DISTANCE);
-      this.sun.target.updateMatrixWorld();
-    }
-
     if (this.camera.fov !== fovDeg) {
       this.camera.fov = fovDeg;
       this.camera.updateProjectionMatrix();
@@ -581,6 +596,11 @@ export class SceneRig {
   render(): void {
     if (this.poolsPending && this.placeLightPools()) {
       this.poolsPending = false; // placed — never again for this theme
+      this.startPathScan(); // corridor wear scan rides the next few frames
+    }
+    if (this.pathScan !== null) this.advancePathScan(); // one slice per frame
+    if (!this.skyCapsStripped && this.outdoor) {
+      this.skyCapsStripped = this.stripSkylineCaps(); // drop the sky-diamond tiers
     }
     const r = this.renderer;
     r.autoClear = false;
@@ -597,6 +617,8 @@ export class SceneRig {
     this.poolTex = null;
     this.poolMat?.dispose();
     this.poolMat = null;
+    this.stripMat?.dispose();
+    this.stripMat = null;
     this.scene.traverse((obj) => {
       if (obj instanceof THREE.Mesh || obj instanceof THREE.Points || obj instanceof THREE.Line) {
         obj.geometry.dispose();
@@ -636,15 +658,17 @@ export class SceneRig {
     this.sunDisc.visible = true;
   }
 
-  /** Fit the shadow cascade's ortho extent to the current theme family. */
-  private setShadowExtent(extent: number): void {
+  /** Fit the shadow cascade's ortho extent + near depth to the theme family. */
+  private setShadowRig(extent: number, near: number): void {
     const sc = this.sun.shadow.camera;
-    if (sc.left === -extent && sc.right === extent) return;
-    sc.left = -extent;
-    sc.right = extent;
-    sc.top = extent;
-    sc.bottom = -extent;
-    sc.updateProjectionMatrix();
+    if (sc.left !== -extent || sc.right !== extent || sc.near !== near) {
+      sc.left = -extent;
+      sc.right = extent;
+      sc.top = extent;
+      sc.bottom = -extent;
+      sc.near = near;
+      sc.updateProjectionMatrix();
+    }
   }
 
   /**
@@ -727,12 +751,199 @@ export class SceneRig {
 
   /** Drop the current pool decals (their small geometries die with them). */
   private clearPools(): void {
+    this.pathScan = null; // any in-flight corridor scan dies with the theme
     if (this.pools === null) return;
     this.scene.remove(this.pools);
     this.pools.traverse((obj) => {
       if (obj instanceof THREE.Mesh) obj.geometry.dispose();
     });
     this.pools = null;
+  }
+
+  /**
+   * Drop the backdrop ring's tall tips (the "sky diamonds"): triangles that
+   * are both elevated (centroid y > SKYCAP_MIN_Y) and out past the playable
+   * area (centroid r > SKYCAP_MIN_R). Interior content never matches: outer
+   * walls top out at exactly h=5 (centroids stay at/below the y bar) and the
+   * only taller structures (urbana bricks, crossfire warehouse) sit at
+   * r <= 35.6 — inside the r bar. The ring bakes into the merged statics, so
+   * this filters triangle ranges out of the position/normal arrays directly,
+   * leaving a low dune band on the horizon. Returns true once attempted.
+   */
+  private stripSkylineCaps(): boolean {
+    const targets: THREE.Mesh[] = [];
+    this.scene.traverse((obj) => {
+      if (obj instanceof THREE.Mesh && obj.castShadow && obj.receiveShadow) targets.push(obj);
+    });
+    if (targets.length === 0) return false; // map not in the graph yet — retry next frame
+    for (const mesh of targets) {
+      const pos = mesh.geometry.getAttribute('position');
+      const nor = mesh.geometry.getAttribute('normal');
+      if (pos === undefined || nor === undefined) continue;
+      const index = mesh.geometry.getIndex();
+      const triCount = (index !== null ? index.count : pos.count) / 3;
+      const keep: number[] = [];
+      let dropped = 0;
+      for (let t = 0; t < triCount; t++) {
+        const a = index !== null ? index.getX(t * 3) : t * 3;
+        const b = index !== null ? index.getX(t * 3 + 1) : t * 3 + 1;
+        const c = index !== null ? index.getX(t * 3 + 2) : t * 3 + 2;
+        const cy = (pos.getY(a) + pos.getY(b) + pos.getY(c)) / 3;
+        const cx = (pos.getX(a) + pos.getX(b) + pos.getX(c)) / 3;
+        const cz = (pos.getZ(a) + pos.getZ(b) + pos.getZ(c)) / 3;
+        if (cy > SKYCAP_MIN_Y && Math.hypot(cx, cz) > SKYCAP_MIN_R) {
+          dropped++;
+          continue;
+        }
+        keep.push(a, b, c);
+      }
+      if (dropped === 0) continue;
+      const np = new Float32Array(keep.length * 3);
+      const nn = new Float32Array(keep.length * 3);
+      for (let k = 0; k < keep.length; k++) {
+        const src = keep[k];
+        if (src === undefined) continue;
+        np[k * 3] = pos.getX(src);
+        np[k * 3 + 1] = pos.getY(src);
+        np[k * 3 + 2] = pos.getZ(src);
+        nn[k * 3] = nor.getX(src);
+        nn[k * 3 + 1] = nor.getY(src);
+        nn[k * 3 + 2] = nor.getZ(src);
+      }
+      mesh.geometry.setAttribute('position', new THREE.BufferAttribute(np, 3));
+      mesh.geometry.setAttribute('normal', new THREE.BufferAttribute(nn, 3));
+      mesh.geometry.setIndex(null);
+      mesh.geometry.deleteAttribute('uv'); // array lengths changed; Lambert needs no uv
+      mesh.geometry.computeBoundingSphere();
+    }
+    return true;
+  }
+
+  /** Begin the frame-sliced indoor open-floor scan (after pools are in). */
+  private startPathScan(): void {
+    if (this.pools === null) return;
+    this.pathScan = {
+      cells: new Array<boolean>(PATH_COLS * PATH_ROWS).fill(false),
+      index: 0,
+      group: this.pools, // strips join the pools' group (shared lifecycle)
+    };
+  }
+
+  /**
+   * Validate ~PATH_SCAN_PER_FRAME cells of the 2.5m grid per call; on
+   * completion, turn maximal open runs of >= PATH_MIN_RUN cells into soft
+   * additive wear strips (the lighter traffic lanes). Runs compete by
+   * length; the longest PATH_MAX_STRIPS win.
+   */
+  private advancePathScan(): void {
+    const scan = this.pathScan;
+    if (scan === null || this.pools === null) {
+      this.pathScan = null;
+      return;
+    }
+    const targets: THREE.Object3D[] = [];
+    this.scene.traverse((obj) => {
+      if (obj instanceof THREE.Mesh && obj.castShadow && obj.receiveShadow) targets.push(obj);
+    });
+    const total = PATH_COLS * PATH_ROWS;
+    const end = Math.min(scan.index + PATH_SCAN_PER_FRAME, total);
+    for (let i = scan.index; i < end; i++) {
+      const col = i % PATH_COLS;
+      const row = Math.floor(i / PATH_COLS);
+      const x = (col - (PATH_COLS - 1) / 2) * PATH_CELL;
+      const z = (row - (PATH_ROWS - 1) / 2) * PATH_CELL;
+      scan.cells[i] = this.openCellAt(x, z, targets);
+    }
+    scan.index = end;
+    if (end < total) return;
+    this.pathScan = null;
+    this.buildWearStrips(scan.cells, scan.group);
+  }
+
+  /** Cheap pool-grade floor test for one scan cell (no lateral probes). */
+  private openCellAt(x: number, z: number, targets: THREE.Object3D[]): boolean {
+    const rc = this.raycaster;
+    rc.set(this.rayOrigin.set(x, POOL_PROBE_Y, z), SceneRig.DOWN);
+    rc.far = POOL_PROBE_Y + 0.2;
+    const floor = rc.intersectObjects(targets, false)[0];
+    if (floor === undefined || floor.point.y > 0.06) return false;
+    rc.set(this.rayOrigin.set(x, -0.5, z), SceneRig.UP);
+    rc.far = 0.6;
+    const under = rc.intersectObjects(targets, false)[0];
+    return under !== undefined && under.point.y <= -0.02;
+  }
+
+  /** Turn the scanned open-floor grid into additive wear strips. */
+  private buildWearStrips(cells: boolean[], group: THREE.Group): void {
+    if (this.poolTex === null) this.poolTex = SceneRig.makePoolTexture();
+    if (this.stripMat === null) {
+      this.stripMat = new THREE.MeshBasicMaterial({
+        map: this.poolTex,
+        color: PALETTE.paper,
+        transparent: true,
+        opacity: PATH_OPACITY,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        polygonOffset: true,
+        polygonOffsetFactor: -2,
+      });
+    }
+    interface Run {
+      cx: number;
+      cz: number;
+      len: number; // cells
+      horizontal: boolean;
+    }
+    const runs: Run[] = [];
+    for (let row = 0; row < PATH_ROWS; row++) {
+      let start = -1;
+      for (let col = 0; col <= PATH_COLS; col++) {
+        const open = col < PATH_COLS && cells[row * PATH_COLS + col] === true;
+        if (open && start < 0) start = col;
+        if (!open && start >= 0) {
+          const len = col - start;
+          if (len >= PATH_MIN_RUN) {
+            runs.push({
+              cx: (start + (len - 1) / 2 - (PATH_COLS - 1) / 2) * PATH_CELL,
+              cz: (row - (PATH_ROWS - 1) / 2) * PATH_CELL,
+              len,
+              horizontal: true,
+            });
+          }
+          start = -1;
+        }
+      }
+    }
+    for (let col = 0; col < PATH_COLS; col++) {
+      let start = -1;
+      for (let row = 0; row <= PATH_ROWS; row++) {
+        const open = row < PATH_ROWS && cells[row * PATH_COLS + col] === true;
+        if (open && start < 0) start = row;
+        if (!open && start >= 0) {
+          const len = row - start;
+          if (len >= PATH_MIN_RUN) {
+            runs.push({
+              cx: (col - (PATH_COLS - 1) / 2) * PATH_CELL,
+              cz: (start + (len - 1) / 2 - (PATH_ROWS - 1) / 2) * PATH_CELL,
+              len,
+              horizontal: false,
+            });
+          }
+          start = -1;
+        }
+      }
+    }
+    runs.sort((a, b) => b.len - a.len);
+    for (const run of runs.slice(0, PATH_MAX_STRIPS)) {
+      const len = run.len * PATH_CELL + 1.2;
+      const strip = new THREE.Mesh(
+        new THREE.PlaneGeometry(run.horizontal ? len : PATH_STRIP_W, run.horizontal ? PATH_STRIP_W : len),
+        this.stripMat,
+      );
+      strip.rotation.x = -Math.PI / 2;
+      strip.position.set(run.cx, 0.011, run.cz);
+      group.add(strip);
+    }
   }
 
   /** Soft radial white gradient — the pool falloff. Deterministic (no rng). */

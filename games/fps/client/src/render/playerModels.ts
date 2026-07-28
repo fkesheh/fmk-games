@@ -8,10 +8,11 @@
 //     high-chroma team body (T fire / CT ctBlue), shade-lifted (emissive =
 //     team dark) so the silhouette never dies against same-hue walls or in
 //     shadow, without washing out in full sun;
-//   - LIGHT GEAR (helmet, vest, backpack, shoulder stripes) — the light team
-//     accent (T muzzle / CT ice) that carries the torso read at range;
-//   - DARK GEAR (belt, pouches, pads, chin strap, nape cover) — team dark
-//     (T tBrown / CT ctDark) separating the light pieces.
+//   - LIGHT GEAR (helmet, backpack, shoulder stripes) — the light team
+//     accent (T muzzle / CT ice) that carries the long-range read;
+//   - DARK GEAR (chest rig + pouches, belt, pads, chin strap, nape cover) —
+//     team dark (T tBrown / CT ctDark) crossing the torso so the uniform
+//     isn't one flat tone neck-to-shin at close range.
 // boots/visor ink, head skin. A soft transparent ink disk under the feet
 // grounds the model (fake contact shadow; rides the root).
 // Invariants:
@@ -216,13 +217,13 @@ export class PlayerModels {
     root.add(blob);
 
     // tapered torso: narrow waist, belt band, wider chest (broad shoulders) —
-    // the LIGHT vest plate + dark pouches carry the front read (all ride the
-    // torso so breathe + hit flinch move them)
+    // the DARK chest rig + pouches breaks the uniform across the torso (all
+    // ride the torso so breathe + hit flinch move them)
     const torsoGroup = at(new THREE.Group(), 0, HIP_Y, 0);
     const waist = at(box(0.42, 0.26, 0.26, uniform, rim), 0, 0.13, 0);
     const belt = at(box(0.44, 0.07, 0.28, dark), 0, 0.28, 0); // band between waist and chest
     const chestMesh = at(box(0.56, 0.34, 0.3, uniform, rim), 0, 0.47, 0);
-    const vest = at(box(0.4, 0.28, 0.08, light), 0, 0.46, -0.17);
+    const vest = at(box(0.44, 0.3, 0.08, dark), 0, 0.46, -0.17); // chest rig crossing the torso
     const pouchL = at(box(0.1, 0.12, 0.07, dark), -0.11, 0.38, -0.215); // mag pouches on the vest front
     const pouchR = at(box(0.1, 0.12, 0.07, dark), 0.11, 0.38, -0.215);
     const padL = at(box(0.2, 0.1, 0.26, dark), -SHOULDER_X, 0.62, 0);
@@ -330,8 +331,9 @@ export class PlayerModels {
       foreLMesh,
       foreRMesh,
     ];
-    const lightMeshes = [vest, stripeL, stripeR, backpack, helmet];
+    const lightMeshes = [stripeL, stripeR, backpack, helmet];
     const darkMeshes = [
+      vest,
       belt,
       pouchL,
       pouchR,

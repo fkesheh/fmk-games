@@ -120,7 +120,7 @@ export const dustbowl: MapDef = {
     { kind: 'cactus', count: 14, x0: -31, z0: -23, x1: -16, z1: 23, minSpacing: 4 },
     { kind: 'rock', count: 8, x0: 16, z0: -23, x1: 31, z1: 23, minSpacing: 6 },
     { kind: 'shrub', count: 30, x0: -31, z0: -23, x1: 31, z1: 23, minSpacing: 3 },
-    { kind: 'barrel', count: 14, x0: -16, z0: -23, x1: 16, z1: 23, minSpacing: 3 },
+    { kind: 'barrel', count: 14, x0: -16, z0: -23, x1: 16, z1: 23, minSpacing: 3, hex: PALETTE.dust },
     // corner/dead-zone dressing (style bible: corners get the most dressing)
     { kind: 'cactus', count: 6, x0: -31, z0: 16, x1: -18, z1: 23, minSpacing: 3 },
     { kind: 'shrub', count: 8, x0: 18, z0: -23, x1: 31, z1: -14, minSpacing: 3 },

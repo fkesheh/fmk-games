@@ -6,14 +6,21 @@
 // Math.random is a contract violation everywhere.
 //
 // AAA layering model (references: CoD gunfire tails, Valorant clean foley):
-// - firearms = crack (fast noise transient) + body (low-mid osc thump) + tail
-//   (filtered decay echo). Crack/body use the standard 45m distance law; the
-//   tail runs the SAME law against a 1.8x radius and stretches + muffles with
-//   distance, so past 45m only the echo remains — distant fire reads as
+// - firearms = crack (fast noise transient) + body (triangle thump + detuned
+//   sine shadow) + tail (filtered decay echo) + slapback (a second quieter
+//   tail tap 70ms out). Crack/body use the standard 45m distance law; the
+//   tail/slapback run the SAME law against a 1.8x radius and stretch + muffle
+//   with distance, so past 45m only the echo remains — distant fire reads as
 //   rolling reports while close fire keeps its snap.
+// - spatial: every one-shot is routed through a per-call StereoPannerNode
+//   (pan = sin(bearing), clamped ±0.85) and, when the client reports a wall
+//   between source and listener (occluded), an ~800Hz lowpass + gain cut.
+// - glue: a DynamicsCompressorNode (threshold -12dB, ratio 4, fast attack)
+//   sits on the master bus, with a direct-connect fallback.
 // - foley: reload is a timed 3-element sequence (mag-out click / mag-in click
-//   / rack slide), footsteps alternate two variants per surface family (hard
-//   taps with a heel click vs soft muffled thuds), knife whoosh is 3-layer.
+//   / rack slide), footsteps cycle THREE variants per surface family with
+//   ±10% seeded playbackRate jitter (no machine-gun repetition), knife
+//   whoosh is 3-layer.
 // - ambient beds are per-map (desert wind / shimmer / cold whistle /
 //   industrial hum / office AC) behind the generic outdoor/indoor fallbacks;
 //   the resolved theme also picks the footstep surface family.
@@ -32,6 +39,17 @@ export type AmbientTheme = MapId | 'outdoor' | 'indoor';
 /** Footstep surface family: hard (concrete/metal) vs soft (carpet/sand/snow). */
 export type StepSurface = 'hard' | 'soft';
 
+/** One-shot options. bearing: radians relative to the look direction
+    (0 = ahead, +right), panned sin(bearing) clamped ±0.85. occluded: a wall
+    blocks source->listener — muffles (lowpass ~800Hz) and cuts gain. */
+export interface SfxOpts {
+  dist?: number;
+  vol?: number;
+  surface?: StepSurface;
+  bearing?: number;
+  occluded?: boolean;
+}
+
 // ---- tuning constants -------------------------------------------------------
 const MASTER_GAIN = 0.5;
 const SHOT_CAP = 0.8; // shot sounds never exceed this post-attenuation gain
@@ -39,6 +57,12 @@ const DIST_FULL = 10; // m — unattenuated inside this radius
 const DIST_ZERO = 45; // m — silent at/ beyond this radius (linear between)
 const TAIL_REACH = 1.8; // gunfire tail distance-law multiplier (audible to ~81m)
 const TAIL_OFFSET = 0.02; // s — echo sits a hair behind the report
+const SLAP_OFFSET = 0.07; // s — second tail tap (slapback) after the report
+const SLAP_PEAK = 0.3; // slapback level relative to the tail peak
+const PAN_MAX = 0.85; // stereo clamp — never hard-panned (keeps center image)
+const OCC_CUTOFF = 800; // Hz — occlusion lowpass when a wall blocks the path
+const OCC_OPEN = 20000; // Hz — transparent lowpass when the path is clear
+const OCC_GAIN = 0.55; // extra gain cut on occluded one-shots
 const XFADE = 0.5; // ambient crossfade seconds
 const ENV_FLOOR = 0.0001; // exponential ramps may never target 0
 
@@ -64,6 +88,20 @@ const BED_LEVELS: Record<AmbientTheme, number> = {
     MapId resolves every map exactly (bunker/crossfire/urbana stay hard). */
 const SOFT_STEP_THEMES: ReadonlySet<AmbientTheme> = new Set(['office', 'dustbowl', 'frostbite', 'indoor']);
 
+/** Footstep variants: three per family (cycled) — filter pitch + level, plus
+    the heel-click pitch on hard surfaces. ±10% playbackRate jitter per step
+    (seeded rng) kills the machine-gun repetition. */
+const STEP_HARD = [
+  { f0: 980, peak: 0.5, click: 2900 },
+  { f0: 820, peak: 0.46, click: 2600 },
+  { f0: 890, peak: 0.48, click: 3100 },
+] as const;
+const STEP_SOFT = [
+  { f0: 340, peak: 0.55 },
+  { f0: 280, peak: 0.5 },
+  { f0: 310, peak: 0.52 },
+] as const;
+
 interface AmbientPatch {
   key: AmbientTheme;
   gain: GainNode;
@@ -77,10 +115,10 @@ interface BeepOpts {
 
 interface BurstOpts {
   type: BiquadFilterType; f0: number; f1?: number; q?: number;
-  t0: number; dur: number; peak: number;
+  t0: number; dur: number; peak: number; rate?: number;
 }
 
-/** Layered firearm recipe: crack transient + body thump + tail echo. */
+/** Layered firearm recipe: crack transient + body thump + tail echo + slap. */
 interface GunRecipe {
   crack: { f0: number; q: number; dur: number; peak: number };
   body: { f0: number; f1: number; dur: number; peak: number };
@@ -138,8 +176,9 @@ export class AudioEngine {
   private noiseBuf: AudioBuffer | null = null;
   private amb: AmbientPatch | null = null;
   private pendingAmb: boolean | AmbientTheme | null = null; // ambient() deferred while ctx suspended
-  private stepFlip = false; // footstep alternates between two slight variants
+  private stepVariant = 0; // footstep cycles three variants per surface family
   private stepSurface: StepSurface = 'hard'; // derived from the ambient theme
+  private readonly jitterNext: () => number = rng(0xf017e); // seeded ±10% step-rate jitter
 
   /** Create/unlock the AudioContext. Called on first user gesture; idempotent. */
   resume(): void {
@@ -160,7 +199,25 @@ export class AudioEngine {
     this.ctx = ctx;
     this.master = ctx.createGain();
     this.master.gain.value = MASTER_GAIN;
-    this.master.connect(ctx.destination);
+    // bus glue: master -> compressor -> destination. If the host has no
+    // DynamicsCompressorNode (or it throws), fall back to a direct connect.
+    let comp: DynamicsCompressorNode | null = null;
+    try {
+      comp = ctx.createDynamicsCompressor();
+      comp.threshold.value = -12;
+      comp.knee.value = 20;
+      comp.ratio.value = 4;
+      comp.attack.value = 0.003; // fast: catches shot transients, not the beds
+      comp.release.value = 0.2;
+    } catch {
+      comp = null;
+    }
+    if (comp) {
+      this.master.connect(comp);
+      comp.connect(ctx.destination);
+    } else {
+      this.master.connect(ctx.destination);
+    }
     // shared 1s white-noise buffer, seeded (determinism rule; reused by all beds/bursts)
     const buf = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
     const data = buf.getChannelData(0);
@@ -172,121 +229,139 @@ export class AudioEngine {
   }
 
   /** One-shot effect. dist attenuates linearly: full ≤10m → 0 at 45m. Gunfire
-      keeps a far echo: the tail layer runs the same law against a 1.8x radius,
-      stretches and muffles with distance, and is all that remains past 45m. */
-  sfx(kind: SfxKind, opts?: { dist?: number; vol?: number; surface?: StepSurface }): void {
+      keeps a far echo: the tail + slapback layers run the same law against a
+      1.8x radius, stretch and muffle with distance, and are all that remains
+      past 45m. bearing pans the whole one-shot (sin, clamped ±0.85); occluded
+      muffles it (~800Hz lowpass) and cuts its gain. */
+  sfx(kind: SfxKind, opts?: SfxOpts): void {
     const ctx = this.ctx;
     const master = this.master;
     const nbuf = this.noiseBuf;
     if (!ctx || !master || !nbuf || ctx.state !== 'running') return;
     const vol = opts?.vol ?? 1;
     const dist = opts?.dist;
-    const g0 = vol * attenuate(dist);
+    const occluded = opts?.occluded === true;
+    const g0 = vol * attenuate(dist) * (occluded ? OCC_GAIN : 1);
     const gun = GUN_KINDS.has(kind);
-    const gFar = Math.min(SHOT_CAP, vol * attenuate(dist === undefined ? undefined : dist / TAIL_REACH));
+    const gFar = Math.min(SHOT_CAP, vol * attenuate(dist === undefined ? undefined : dist / TAIL_REACH))
+      * (occluded ? OCC_GAIN : 1);
     if (g0 <= 0 && (!gun || gFar <= 0)) return;
     // 0 near .. 1 at/beyond 45m — drives tail stretch + muffle
     const dist01 = dist === undefined ? 0 : Math.min(1, Math.max(0, (dist - DIST_FULL) / (DIST_ZERO - DIST_FULL)));
     const t0 = ctx.currentTime;
     const shot = Math.min(SHOT_CAP, g0); // shot_* kinds share the 0.8 cap
     try {
+      // per-call spatial chain: stereo pan -> occlusion lowpass -> master bus.
+      // Every layer of the one-shot shares it (one source = one direction).
+      const bearing = opts?.bearing;
+      const pan = bearing !== undefined && Number.isFinite(bearing)
+        ? Math.max(-PAN_MAX, Math.min(PAN_MAX, Math.sin(bearing)))
+        : 0;
+      const panner = ctx.createStereoPanner();
+      panner.pan.value = pan;
+      const occ = ctx.createBiquadFilter();
+      occ.type = 'lowpass';
+      occ.frequency.value = occluded ? OCC_CUTOFF : OCC_OPEN;
+      panner.connect(occ);
+      occ.connect(master);
+      const chain: AudioNode = panner;
       switch (kind) {
-        // ---- weapons: crack + body + tail, per-weapon character -------------
+        // ---- weapons: crack + body + tail + slapback, per-weapon character --
         case 'shot_pistol':
         case 'shot_smg':
         case 'shot_rifle':
         case 'shot_sniper':
         case 'shot_shotgun':
-          this.gunfire(ctx, nbuf, master, t0, shot, gFar, dist01, GUN_RECIPES[kind]);
+          this.gunfire(ctx, nbuf, chain, t0, shot, gFar, dist01, GUN_RECIPES[kind]);
           break;
         case 'shot_knife': // richer whoosh: low body + main sweep + air sheen
-          this.burst(ctx, nbuf, master, { type: 'bandpass', f0: 480, f1: 2800, q: 1.4, t0, dur: 0.17, peak: 0.5 * shot });
-          this.burst(ctx, nbuf, master, { type: 'highpass', f0: 2600, f1: 4200, t0: t0 + 0.02, dur: 0.11, peak: 0.13 * shot });
-          this.burst(ctx, nbuf, master, { type: 'bandpass', f0: 240, f1: 900, q: 1, t0, dur: 0.15, peak: 0.18 * shot });
+          this.burst(ctx, nbuf, chain, { type: 'bandpass', f0: 480, f1: 2800, q: 1.4, t0, dur: 0.17, peak: 0.5 * shot });
+          this.burst(ctx, nbuf, chain, { type: 'highpass', f0: 2600, f1: 4200, t0: t0 + 0.02, dur: 0.11, peak: 0.13 * shot });
+          this.burst(ctx, nbuf, chain, { type: 'bandpass', f0: 240, f1: 900, q: 1, t0, dur: 0.15, peak: 0.18 * shot });
           break;
         // ---- feedback / UI --------------------------------------------------
         case 'reload': // foley sequence: mag-out click, mag-in click, rack slide
           // mag-out: release tick + spring thunk
-          this.burst(ctx, nbuf, master, { type: 'highpass', f0: 2400, t0, dur: 0.02, peak: 0.28 * g0 });
-          this.beep(ctx, master, { type: 'sine', f0: 260, f1: 175, t0, dur: 0.045, peak: 0.16 * g0 });
+          this.burst(ctx, nbuf, chain, { type: 'highpass', f0: 2400, t0, dur: 0.02, peak: 0.28 * g0 });
+          this.beep(ctx, chain, { type: 'sine', f0: 260, f1: 175, t0, dur: 0.045, peak: 0.16 * g0 });
           // mag-in: heavier seat tick + handling rustle
-          this.burst(ctx, nbuf, master, { type: 'highpass', f0: 1900, t0: t0 + 0.17, dur: 0.022, peak: 0.3 * g0 });
-          this.beep(ctx, master, { type: 'sine', f0: 215, f1: 150, t0: t0 + 0.17, dur: 0.05, peak: 0.18 * g0 });
-          this.burst(ctx, nbuf, master, { type: 'bandpass', f0: 900, q: 0.9, t0: t0 + 0.155, dur: 0.03, peak: 0.1 * g0 });
+          this.burst(ctx, nbuf, chain, { type: 'highpass', f0: 1900, t0: t0 + 0.17, dur: 0.022, peak: 0.3 * g0 });
+          this.beep(ctx, chain, { type: 'sine', f0: 215, f1: 150, t0: t0 + 0.17, dur: 0.05, peak: 0.18 * g0 });
+          this.burst(ctx, nbuf, chain, { type: 'bandpass', f0: 900, q: 0.9, t0: t0 + 0.155, dur: 0.03, peak: 0.1 * g0 });
           // rack slide: metallic travel, then the bolt-close clack
-          this.burst(ctx, nbuf, master, { type: 'bandpass', f0: 2000, f1: 950, q: 1.3, t0: t0 + 0.37, dur: 0.09, peak: 0.24 * g0 });
-          this.burst(ctx, nbuf, master, { type: 'highpass', f0: 3200, t0: t0 + 0.46, dur: 0.018, peak: 0.26 * g0 });
-          this.beep(ctx, master, { type: 'sine', f0: 320, f1: 205, t0: t0 + 0.46, dur: 0.032, peak: 0.12 * g0 });
+          this.burst(ctx, nbuf, chain, { type: 'bandpass', f0: 2000, f1: 950, q: 1.3, t0: t0 + 0.37, dur: 0.09, peak: 0.24 * g0 });
+          this.burst(ctx, nbuf, chain, { type: 'highpass', f0: 3200, t0: t0 + 0.46, dur: 0.018, peak: 0.26 * g0 });
+          this.beep(ctx, chain, { type: 'sine', f0: 320, f1: 205, t0: t0 + 0.46, dur: 0.032, peak: 0.12 * g0 });
           break;
         case 'hit': // crisp tick: 1.65kHz 28ms + a bright 2.5k edge
-          this.beep(ctx, master, { type: 'square', f0: 1650, t0, dur: 0.028, peak: 0.24 * g0 });
-          this.beep(ctx, master, { type: 'sine', f0: 2500, t0, dur: 0.018, peak: 0.1 * g0 });
+          this.beep(ctx, chain, { type: 'square', f0: 1650, t0, dur: 0.028, peak: 0.24 * g0 });
+          this.beep(ctx, chain, { type: 'sine', f0: 2500, t0, dur: 0.018, peak: 0.1 * g0 });
           break;
         case 'headshot': // shorter, brighter ding: 2.1k/3.15k + noise attack tick
-          this.beep(ctx, master, { type: 'sine', f0: 2100, t0, dur: 0.055, peak: 0.32 * g0 });
-          this.beep(ctx, master, { type: 'sine', f0: 3150, t0, dur: 0.04, peak: 0.15 * g0 });
-          this.burst(ctx, nbuf, master, { type: 'highpass', f0: 5200, t0, dur: 0.008, peak: 0.12 * g0 });
+          this.beep(ctx, chain, { type: 'sine', f0: 2100, t0, dur: 0.055, peak: 0.32 * g0 });
+          this.beep(ctx, chain, { type: 'sine', f0: 3150, t0, dur: 0.04, peak: 0.15 * g0 });
+          this.burst(ctx, nbuf, chain, { type: 'highpass', f0: 5200, t0, dur: 0.008, peak: 0.12 * g0 });
           break;
         case 'death': // low thud 150ms
-          this.beep(ctx, master, { type: 'sine', f0: 140, f1: 55, t0, dur: 0.15, peak: 0.55 * g0 });
-          this.burst(ctx, nbuf, master, { type: 'lowpass', f0: 300, t0, dur: 0.1, peak: 0.25 * g0 });
+          this.beep(ctx, chain, { type: 'sine', f0: 140, f1: 55, t0, dur: 0.15, peak: 0.55 * g0 });
+          this.burst(ctx, nbuf, chain, { type: 'lowpass', f0: 300, t0, dur: 0.1, peak: 0.25 * g0 });
           break;
-        case 'footstep': { // two alternating variants per surface family
+        case 'footstep': { // three cycled variants per family + seeded rate jitter
           // level note: filtered noise keeps only ~15% RMS of a same-peak osc,
           // so the burst peak must sit well above the beep levels to read at
           // all — and above the ambient bed out to the 45m cutoff
-          this.stepFlip = !this.stepFlip;
+          this.stepVariant = (this.stepVariant + 1) % 3;
           const surface = opts?.surface ?? this.stepSurface;
           if (surface === 'soft') {
             // carpet/sand/snow: muffled low thud, no heel click
-            const f = this.stepFlip ? 340 : 280;
-            this.burst(ctx, nbuf, master, { type: 'lowpass', f0: f, t0, dur: 0.055, peak: (this.stepFlip ? 0.55 : 0.5) * g0 });
+            const v = STEP_SOFT[this.stepVariant] ?? STEP_SOFT[0];
+            this.burst(ctx, nbuf, chain, { type: 'lowpass', f0: v.f0, t0, dur: 0.055, peak: v.peak * g0, rate: this.stepRate() });
           } else {
             // concrete/metal: brighter tap + faint heel click
-            const f = this.stepFlip ? 980 : 820;
-            this.burst(ctx, nbuf, master, { type: 'bandpass', f0: f, q: 0.8, t0, dur: 0.035, peak: (this.stepFlip ? 0.5 : 0.46) * g0 });
-            this.burst(ctx, nbuf, master, { type: 'highpass', f0: 2900, t0, dur: 0.012, peak: 0.14 * g0 });
+            const v = STEP_HARD[this.stepVariant] ?? STEP_HARD[0];
+            this.burst(ctx, nbuf, chain, { type: 'bandpass', f0: v.f0, q: 0.8, t0, dur: 0.035, peak: v.peak * g0, rate: this.stepRate() });
+            this.burst(ctx, nbuf, chain, { type: 'highpass', f0: v.click, t0, dur: 0.012, peak: 0.14 * g0, rate: this.stepRate() });
           }
           break;
         }
         // ---- round / match stingers ----------------------------------------
         case 'round_start': // 3-note chime over a low root+fifth bed
-          this.beep(ctx, master, { type: 'sine', f0: 130.81, t0, dur: 0.7, peak: 0.1 * g0 }); // C3 bed
-          this.beep(ctx, master, { type: 'sine', f0: 196, t0, dur: 0.7, peak: 0.07 * g0 }); // G3 fifth
-          this.beep(ctx, master, { type: 'triangle', f0: 523.25, t0, dur: 0.15, peak: 0.28 * g0 });
-          this.beep(ctx, master, { type: 'triangle', f0: 659.25, t0: t0 + 0.13, dur: 0.15, peak: 0.28 * g0 });
-          this.beep(ctx, master, { type: 'triangle', f0: 783.99, t0: t0 + 0.26, dur: 0.3, peak: 0.3 * g0 });
+          this.beep(ctx, chain, { type: 'sine', f0: 130.81, t0, dur: 0.7, peak: 0.1 * g0 }); // C3 bed
+          this.beep(ctx, chain, { type: 'sine', f0: 196, t0, dur: 0.7, peak: 0.07 * g0 }); // G3 fifth
+          this.beep(ctx, chain, { type: 'triangle', f0: 523.25, t0, dur: 0.15, peak: 0.28 * g0 });
+          this.beep(ctx, chain, { type: 'triangle', f0: 659.25, t0: t0 + 0.13, dur: 0.15, peak: 0.28 * g0 });
+          this.beep(ctx, chain, { type: 'triangle', f0: 783.99, t0: t0 + 0.26, dur: 0.3, peak: 0.3 * g0 });
           break;
         case 'round_end': // low resolve note
-          this.beep(ctx, master, { type: 'triangle', f0: 220, t0, dur: 0.5, peak: 0.3 * g0 });
+          this.beep(ctx, chain, { type: 'triangle', f0: 220, t0, dur: 0.5, peak: 0.3 * g0 });
           break;
         case 'multikill': // heroic sting: ascending fifth A4→E5 on sawtooth (brassy —
           // deliberately not the triangle chime of the round stingers), octave sheen on the top note
-          this.beep(ctx, master, { type: 'sawtooth', f0: 440, t0, dur: 0.11, peak: 0.26 * g0 });
-          this.beep(ctx, master, { type: 'sawtooth', f0: 659.25, t0: t0 + 0.1, dur: 0.28, peak: 0.3 * g0 });
-          this.beep(ctx, master, { type: 'sawtooth', f0: 1318.5, t0: t0 + 0.1, dur: 0.28, peak: 0.1 * g0 });
+          this.beep(ctx, chain, { type: 'sawtooth', f0: 440, t0, dur: 0.11, peak: 0.26 * g0 });
+          this.beep(ctx, chain, { type: 'sawtooth', f0: 659.25, t0: t0 + 0.1, dur: 0.28, peak: 0.3 * g0 });
+          this.beep(ctx, chain, { type: 'sawtooth', f0: 1318.5, t0: t0 + 0.1, dur: 0.28, peak: 0.1 * g0 });
           break;
         case 'buy': // cash blip 1kHz
-          this.beep(ctx, master, { type: 'sine', f0: 1000, t0, dur: 0.06, peak: 0.28 * g0 });
-          this.beep(ctx, master, { type: 'sine', f0: 1500, t0: t0 + 0.05, dur: 0.05, peak: 0.16 * g0 });
+          this.beep(ctx, chain, { type: 'sine', f0: 1000, t0, dur: 0.06, peak: 0.28 * g0 });
+          this.beep(ctx, chain, { type: 'sine', f0: 1500, t0: t0 + 0.05, dur: 0.05, peak: 0.16 * g0 });
           break;
         case 'deny': // buzz 180Hz (two detuned squares read harsher than one)
-          this.beep(ctx, master, { type: 'square', f0: 180, t0, dur: 0.2, peak: 0.2 * g0 });
-          this.beep(ctx, master, { type: 'square', f0: 184, t0, dur: 0.2, peak: 0.13 * g0 });
+          this.beep(ctx, chain, { type: 'square', f0: 180, t0, dur: 0.2, peak: 0.2 * g0 });
+          this.beep(ctx, chain, { type: 'square', f0: 184, t0, dur: 0.2, peak: 0.13 * g0 });
           break;
         case 'win': // rising 3-note over a low root+fifth bed
-          this.beep(ctx, master, { type: 'sine', f0: 130.81, t0, dur: 0.95, peak: 0.11 * g0 }); // C3 bed
-          this.beep(ctx, master, { type: 'sine', f0: 196, t0, dur: 0.95, peak: 0.08 * g0 }); // G3 fifth
-          this.beep(ctx, master, { type: 'triangle', f0: 523.25, t0, dur: 0.18, peak: 0.3 * g0 });
-          this.beep(ctx, master, { type: 'triangle', f0: 659.25, t0: t0 + 0.14, dur: 0.18, peak: 0.3 * g0 });
-          this.beep(ctx, master, { type: 'triangle', f0: 783.99, t0: t0 + 0.28, dur: 0.34, peak: 0.32 * g0 });
+          this.beep(ctx, chain, { type: 'sine', f0: 130.81, t0, dur: 0.95, peak: 0.11 * g0 }); // C3 bed
+          this.beep(ctx, chain, { type: 'sine', f0: 196, t0, dur: 0.95, peak: 0.08 * g0 }); // G3 fifth
+          this.beep(ctx, chain, { type: 'triangle', f0: 523.25, t0, dur: 0.18, peak: 0.3 * g0 });
+          this.beep(ctx, chain, { type: 'triangle', f0: 659.25, t0: t0 + 0.14, dur: 0.18, peak: 0.3 * g0 });
+          this.beep(ctx, chain, { type: 'triangle', f0: 783.99, t0: t0 + 0.28, dur: 0.34, peak: 0.32 * g0 });
           break;
         case 'lose': // falling 2-note
-          this.beep(ctx, master, { type: 'triangle', f0: 392, t0, dur: 0.28, peak: 0.3 * g0 });
-          this.beep(ctx, master, { type: 'triangle', f0: 311.13, t0: t0 + 0.24, dur: 0.42, peak: 0.3 * g0 });
+          this.beep(ctx, chain, { type: 'triangle', f0: 392, t0, dur: 0.28, peak: 0.3 * g0 });
+          this.beep(ctx, chain, { type: 'triangle', f0: 311.13, t0: t0 + 0.24, dur: 0.42, peak: 0.3 * g0 });
           break;
         case 'click': // UI tick
-          this.beep(ctx, master, { type: 'sine', f0: 2000, t0, dur: 0.025, peak: 0.15 * g0 });
+          this.beep(ctx, chain, { type: 'sine', f0: 2000, t0, dur: 0.025, peak: 0.15 * g0 });
           break;
       }
     } catch {
@@ -373,8 +448,8 @@ export class AudioEngine {
 
   // ---- synth primitives ------------------------------------------------------
 
-  /** Oscillator with fast-attack / exponential-decay envelope into master. */
-  private beep(ctx: AudioContext, master: GainNode, o: BeepOpts): void {
+  /** Oscillator with fast-attack / exponential-decay envelope into `dest`. */
+  private beep(ctx: AudioContext, dest: AudioNode, o: BeepOpts): void {
     const osc = ctx.createOscillator();
     osc.type = o.type;
     osc.frequency.setValueAtTime(o.f0, o.t0);
@@ -384,15 +459,17 @@ export class AudioEngine {
     g.gain.exponentialRampToValueAtTime(Math.max(o.peak, ENV_FLOOR), o.t0 + 0.006);
     g.gain.exponentialRampToValueAtTime(ENV_FLOOR, o.t0 + o.dur);
     osc.connect(g);
-    g.connect(master);
+    g.connect(dest);
     osc.start(o.t0);
     osc.stop(o.t0 + o.dur + 0.02);
   }
 
-  /** Filtered noise burst (from the shared buffer) with the same envelope. */
-  private burst(ctx: AudioContext, nbuf: AudioBuffer, master: GainNode, o: BurstOpts): void {
+  /** Filtered noise burst (from the shared buffer) with the same envelope.
+      rate jitters playbackRate (footstep de-repeat); default 1. */
+  private burst(ctx: AudioContext, nbuf: AudioBuffer, dest: AudioNode, o: BurstOpts): void {
     const src = ctx.createBufferSource();
     src.buffer = nbuf;
+    src.playbackRate.value = o.rate ?? 1;
     const flt = ctx.createBiquadFilter();
     flt.type = o.type;
     flt.frequency.setValueAtTime(o.f0, o.t0);
@@ -404,27 +481,31 @@ export class AudioEngine {
     g.gain.exponentialRampToValueAtTime(ENV_FLOOR, o.t0 + o.dur);
     src.connect(flt);
     flt.connect(g);
-    g.connect(master);
+    g.connect(dest);
     src.start(o.t0);
     src.stop(o.t0 + o.dur + 0.02);
   }
 
-  /** Firearm layer stack: crack transient + body thump (near field only) and
-      the tail echo — started a hair late, stretched and muffled by distance,
-      gained by the 1.8x-reach law so it dominates at range. */
+  /** Firearm layer stack: crack transient + body (triangle thump + detuned
+      sine shadow, near field only), the tail echo — started a hair late,
+      stretched and muffled by distance, gained by the 1.8x-reach law — and a
+      quieter slapback tap 70ms out (early reflection off far walls). */
   private gunfire(
-    ctx: AudioContext, nbuf: AudioBuffer, master: GainNode, t0: number,
+    ctx: AudioContext, nbuf: AudioBuffer, dest: AudioNode, t0: number,
     near: number, far: number, dist01: number, r: GunRecipe,
   ): void {
     if (near > 0) {
-      this.burst(ctx, nbuf, master, {
+      this.burst(ctx, nbuf, dest, {
         type: 'bandpass', f0: r.crack.f0, q: r.crack.q, t0, dur: r.crack.dur, peak: r.crack.peak * near,
       });
-      this.beep(ctx, master, {
-        type: 'sine', f0: r.body.f0, f1: r.body.f1, t0, dur: r.body.dur, peak: r.body.peak * near,
+      this.beep(ctx, dest, {
+        type: 'triangle', f0: r.body.f0, f1: r.body.f1, t0, dur: r.body.dur, peak: r.body.peak * near,
+      });
+      this.beep(ctx, dest, { // detuned shadow thickens the body (~14 cents up)
+        type: 'sine', f0: r.body.f0 * 1.008, f1: r.body.f1 * 1.008, t0, dur: r.body.dur, peak: r.body.peak * 0.5 * near,
       });
     }
-    this.burst(ctx, nbuf, master, {
+    this.burst(ctx, nbuf, dest, {
       type: r.tail.type,
       f0: r.tail.f0 * (1 - dist01 * 0.3), // distant echo muffle
       f1: r.tail.f1,
@@ -433,6 +514,20 @@ export class AudioEngine {
       dur: r.tail.dur * (1 + dist01 * 0.7), // distant echo stretch
       peak: r.tail.peak * far,
     });
+    this.burst(ctx, nbuf, dest, { // slapback: second, quieter tail tap at +70ms
+      type: r.tail.type,
+      f0: r.tail.f0 * 0.5 * (1 - dist01 * 0.3),
+      f1: r.tail.f1,
+      q: r.tail.q,
+      t0: t0 + SLAP_OFFSET,
+      dur: r.tail.dur * 0.55 * (1 + dist01 * 0.7),
+      peak: r.tail.peak * SLAP_PEAK * far,
+    });
+  }
+
+  /** Seeded ±10% playbackRate jitter — kills machine-gun footstep repetition. */
+  private stepRate(): number {
+    return 1 + (this.jitterNext() * 0.2 - 0.1);
   }
 
   // ---- ambient beds ----------------------------------------------------------
