@@ -110,10 +110,10 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
   },
   shotgun: {
     id: 'shotgun', name: 'M870 Breacher', price: 1100,
-    damage: 12, headshotMul: 1.5, interval: 0.9, auto: false,
+    damage: 14, headshotMul: 1.5, interval: 0.9, auto: false,
     mag: 7, reserve: 32, reload: 3.2,
-    spreadDeg: 4.5, scopedSpreadDeg: null, spreadPerShot: 1.0, maxSpreadDeg: 7, spreadRecover: 6,
-    pellets: 9, rangeStart: 6, rangeEnd: 18, minDmgMul: 0.2, moveMul: 0.92, zoomFov: null,
+    spreadDeg: 2.8, scopedSpreadDeg: null, spreadPerShot: 1.0, maxSpreadDeg: 7, spreadRecover: 6,
+    pellets: 9, rangeStart: 8, rangeEnd: 18, minDmgMul: 0.3, moveMul: 0.92, zoomFov: null,
   },
   rifle: {
     id: 'rifle', name: 'AK-4 Rifle', price: 2700,

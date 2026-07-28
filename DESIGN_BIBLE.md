@@ -27,7 +27,7 @@ Match end → back to warmup with reset money/scores. Warmup: free respawn, no s
 - knife: desperation/speed (fastest move), meme kills in warmup.
 - pistol: free default; wins vs nothing at range, fine up close; headshot×3 rewards aim.
 - smg ($1500): close-range shredder, anti-eco, falls off hard past 14m.
-- shotgun ($1100): one-pump burst ≤ 6m, useless past 18m; hold tight corners (office/bunker).
+- shotgun ($1100): 1-pump burst ≤ 8m on center mass, 2-pump threat to ~12m, useless past 18m; hold tight corners (office/bunker).
 - rifle ($2700): the default competitive gun, 1-tap headshot at all ranges, manageable spray.
 - sniper ($4750): 1-shot body kill, slowest handling, hip-fire lottery (8°), scope to be lethal.
 
