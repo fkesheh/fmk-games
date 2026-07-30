@@ -58,6 +58,104 @@ export function at<T extends THREE.Object3D>(obj: T, x: number, y: number, z: nu
   return obj;
 }
 
+// ---- articulation helpers (VISUAL_UPGRADE.md §3b) ----------------------------
+// Every wall over 3m currently renders as one flat untextured quad — the single
+// biggest reason the game reads as blockout. These build the trim that breaks
+// the span. Flat shading turns every added edge into a free value break, and
+// `bake()` merges it all away, so articulation costs draw calls NOTHING.
+
+export interface ArticulateOpts {
+  /** Plinth height in metres. 0 disables. Default 0.32. */
+  plinthH?: number;
+  /** Cornice height in metres. 0 disables. Default 0.18. */
+  corniceH?: number;
+  /** Pilaster spacing in metres along the wall's long axis. 0 disables. Default 5. */
+  pilasterEvery?: number;
+  /** How far trim stands proud of the wall face, in metres. Default 0.05. */
+  proud?: number;
+  /** Add a mid rail. Auto-enabled for walls taller than 4m. */
+  midRail?: boolean;
+}
+
+/**
+ * Build the trim set for a wall of full extents `w x h x d`, centred on the
+ * origin — add it as a SIBLING of the wall box at the same position.
+ *
+ * `bodyHex` is the wall's own colour; `trimHex` must be >= 8 L* above it
+ * (use `TRIM_MAT`); `contactHex` must be >= 8 L* below the GROUND
+ * (use `CONTACT_MAT`). Those two rules are the value ladder law's L2 and L3.
+ *
+ * Long axis is inferred: pilasters and rails run along whichever of w/d is
+ * larger, and stand proud on the two long faces.
+ */
+export function articulate(
+  w: number,
+  h: number,
+  d: number,
+  trimHex: string,
+  contactHex: string,
+  opts: ArticulateOpts = {},
+): THREE.Group {
+  const plinthH = opts.plinthH ?? 0.32;
+  const corniceH = opts.corniceH ?? 0.18;
+  const every = opts.pilasterEvery ?? 5;
+  const proud = opts.proud ?? 0.05;
+  const midRail = opts.midRail ?? h > 4;
+  const g = new THREE.Group();
+  const alongX = w >= d;
+  const span = alongX ? w : d;
+  const thick = alongX ? d : w;
+  const p2 = proud * 2;
+
+  // plinth — the contact band. This is what stops the wall from floating.
+  if (plinthH > 0) {
+    const pl = alongX ? box(w + p2, plinthH, d + p2, contactHex) : box(w + p2, plinthH, d + p2, contactHex);
+    g.add(at(pl, 0, -h / 2 + plinthH / 2, 0));
+  }
+  // cornice — catches the sun, reads the wall's top edge at distance.
+  if (corniceH > 0) {
+    const cr = box(w + p2 * 1.4, corniceH, d + p2 * 1.4, trimHex);
+    g.add(at(cr, 0, h / 2 - corniceH / 2, 0));
+  }
+  // mid rail — breaks tall spans horizontally.
+  if (midRail) {
+    const rl = box(w + proud, 0.12, d + proud, trimHex);
+    g.add(at(rl, 0, -h / 2 + plinthH + (h - plinthH - corniceH) * 0.55, 0));
+  }
+  // pilasters — vertical ribs that break the span and self-shadow.
+  if (every > 0 && span > every) {
+    const bodyH = h - plinthH - corniceH;
+    if (bodyH > 0.2) {
+      const yC = -h / 2 + plinthH + bodyH / 2;
+      const n = Math.max(1, Math.floor(span / every) - 1);
+      for (let i = 1; i <= n; i++) {
+        const t = (i / (n + 1) - 0.5) * span;
+        const pil = alongX
+          ? box(0.3, bodyH, thick + p2, trimHex)
+          : box(thick + p2, bodyH, 0.3, trimHex);
+        g.add(at(pil, alongX ? t : 0, yC, alongX ? 0 : t));
+      }
+    }
+  }
+  return g;
+}
+
+/**
+ * A flat contact-shadow quad to sit under a prop, at `y` just above the ground
+ * plane. The cheap, texture-free replacement for ambient occlusion: without one
+ * of these, props visibly float. Every scattered prop gets one.
+ */
+export function contactShadow(radius: number, hex: string, opacity = 0.38): THREE.Mesh {
+  const m = new THREE.Mesh(
+    new THREE.CircleGeometry(radius, 12),
+    mat(hex, { transparent: true, opacity }),
+  );
+  m.rotation.x = -Math.PI / 2;
+  m.receiveShadow = false;
+  m.castShadow = false;
+  return m;
+}
+
 // ---- bake helper -------------------------------------------------------------
 /**
  * Merge all Mesh descendants of `root` into one mesh per material, preserving

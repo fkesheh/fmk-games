@@ -8,13 +8,31 @@
 // ============================================================================
 import type { MapId } from '../types.js';
 
+// Value-tiered material set (VISUAL_UPGRADE.md §1/§2). Each family carries
+// …Lit (trim) / base (main surface) / …Dark / …Deep (CONTACT BAND) so the
+// value ladder law is expressible in map data by name. `MAT_COLORS`,
+// `CONTACT_MAT` and `TRIM_MAT` in ../matColors.ts resolve these.
 export type MatId =
-  | 'sand' | 'sandDark' | 'concrete' | 'concreteDark'
-  | 'metal' | 'metalDark' | 'wood' | 'crate'
-  | 'brick' | 'plaster' | 'roofRed'
-  | 'carpet' | 'desk' | 'paper'
-  | 'snow' | 'ice' | 'rock'
-  | 'leaf' | 'cactus';
+  // desert
+  | 'sandLit' | 'sand' | 'sandDark' | 'sandDeep' | 'dust' | 'dustDeep'
+  // hard outdoor ground
+  | 'tarmac' | 'tarmacDeep'
+  // concrete
+  | 'concreteLit' | 'concrete' | 'concreteDark' | 'concreteDeep'
+  // metal
+  | 'metalLit' | 'metal' | 'metalDark' | 'metalDeep'
+  // wood
+  | 'woodLit' | 'wood' | 'woodDark' | 'woodDeep' | 'crate' | 'crateLit'
+  // urban
+  | 'brickLit' | 'brick' | 'brickDeep'
+  | 'plasterLit' | 'plaster' | 'plasterDeep'
+  | 'roofRed' | 'roofRedDeep'
+  // office
+  | 'carpet' | 'carpetDeep' | 'desk' | 'paper'
+  // snow / rock
+  | 'snowLit' | 'snow' | 'snowShadow' | 'snowDeep' | 'ice' | 'rock' | 'rockDeep'
+  // foliage
+  | 'leafLit' | 'leaf' | 'leafDark' | 'cactus';
 
 export interface BoxDef {
   x: number; y: number; z: number; // center
@@ -48,7 +66,11 @@ export interface DecoZone {
 }
 
 export interface MapTheme {
-  sky: string; // PALETTE hex — sky dome top
+  // 3-stop sky gradient: skyHigh (zenith) -> sky (mid) -> horizon.
+  // VISUAL_UPGRADE.md §1 S1: `skyHigh` MUST be cooler AND >= 12 L* darker than
+  // `horizon`. A flat sky wash is a review failure.
+  skyHigh: string; // PALETTE hex — sky dome zenith
+  sky: string; // PALETTE hex — sky dome mid
   horizon: string; // PALETTE hex — sky dome horizon
   ground: string; // PALETTE hex — ground plane tint (under floorMat overlay)
   fog: string; // PALETTE hex — MUST read as matched to sky/horizon

@@ -46,28 +46,11 @@ import {
 } from '@fps/shared';
 import { at, bake, box, cone, cyl, sphere } from '../contract/visual.js';
 
-// ---- MatId -> PALETTE (frozen mapping, see STYLE_BIBLE.md) -------------------
-export const MAT_COLORS: Record<MatId, string> = {
-  sand: PALETTE.sand,
-  sandDark: PALETTE.sandDark,
-  concrete: PALETTE.concrete,
-  concreteDark: PALETTE.concreteDark,
-  metal: PALETTE.steel,
-  metalDark: PALETTE.metalDark,
-  wood: PALETTE.wood,
-  crate: PALETTE.crate,
-  brick: PALETTE.brick,
-  plaster: PALETTE.plaster,
-  roofRed: PALETTE.roofRed,
-  carpet: PALETTE.carpet,
-  desk: PALETTE.deskTop,
-  paper: PALETTE.paper,
-  snow: PALETTE.snow,
-  ice: PALETTE.ice,
-  rock: PALETTE.rockDark,
-  leaf: PALETTE.leaf,
-  cactus: PALETTE.cactus,
-};
+// ---- MatId -> PALETTE ---------------------------------------------------------
+// The mapping now lives in the shared contract (@fps/shared/matColors.ts) so
+// map authors and the renderer never contend for this file. Re-exported here
+// for compatibility with existing importers. DO NOT redefine it locally.
+export { MAT_COLORS, CONTACT_MAT, TRIM_MAT } from '@fps/shared';
 
 // ---- scatter tuning (frozen by CONTRACT/C3 spec) ------------------------------
 const SOLID_PAD = 0.5; // solids inflated by this when rejecting prop points
