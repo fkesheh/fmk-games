@@ -98,6 +98,21 @@ Let **L** = perceptual lightness (CIE L*, 0–100), from `L()` in `@platform/sha
 - **S4 — GROUND ≠ HORIZON.** A map’s `theme.ground` must not be the same hex as `theme.horizon`.
   Identical values collapse the ground plane into the backdrop and erase the horizon line.
 
+- **L5 — BRIGHTNESS FLOOR (readability).** No map may set a ground below `L 22`, and no L1
+  reference wall below `L 30`. The ladder law sets a floor on *contrast* but originally set no
+  ceiling on *darkness*, and the first fan-out crushed half of Crossfire to near-black — in a
+  competitive shooter that is a gameplay regression, not a mood choice. **Readability wins every
+  tie.** Enforced by `valueLadder.test.ts`.
+
+- **L6 — SILHOUETTE SEPARATION (judge axis, NOT yet a frozen rule).** A team colour should clear the
+  ground and the main wall it is seen against by `>= 18 L` **or** `>= 30°` of hue. Measured today,
+  **6 of 12 map/team pairs fail**: `ctBlue` sits 4–10 L* and ~8° from the cool grey floors
+  (tarmac, carpet, metalDeep), and `tAmber` is warm-on-warm against sand and plaster. This is a
+  PRE-EXISTING weakness, not a regression from this round. It is deliberately **not** frozen as a
+  test, because satisfying it requires re-tuning `ctBlue`/`tAmber` themselves — a palette change
+  that ripples into nameplates, HUD, minimap and killfeed, and that must not be rushed. The
+  art-director judge scores it and reports the gap; fixing it is a scoped follow-on.
+
 ### Sky law
 
 - **S1 — ZENITH SEPARATION.** The sky dome's zenith stop must be **cooler and ≥ 12 L darker** than

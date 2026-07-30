@@ -221,6 +221,26 @@ describe('per-map ladder + sky law', () => {
       ).toBeGreaterThanOrEqual(min);
     });
 
+    // L5 — brightness floor. The ladder sets a floor on CONTRAST but originally
+    // none on DARKNESS, and the first fan-out crushed half of Crossfire to
+    // near-black. In a competitive shooter that is a gameplay regression:
+    // you cannot shoot what you cannot see. Readability wins every tie.
+    it('L5 — ground is not crushed to black (readability floor)', () => {
+      const b = L(groundHex);
+      expect(
+        b,
+        `L5 ${map.id}: ground ${map.floorMat} is L=${n(b)}, below the readability floor of 22`,
+      ).toBeGreaterThanOrEqual(22);
+    });
+
+    it('L5 — main wall is not crushed to black (readability floor)', () => {
+      const a = L(wallHex);
+      expect(
+        a,
+        `L5 ${map.id}: main wall ${wall} is L=${n(a)}, below the readability floor of 30`,
+      ).toBeGreaterThanOrEqual(30);
+    });
+
     if (mono) {
       it('L4 — exempt (monochrome by design), so L1 >= 28 does the work', () => {
         const a = L(wallHex);
