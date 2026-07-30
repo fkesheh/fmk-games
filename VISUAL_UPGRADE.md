@@ -370,3 +370,127 @@ through this clause, not with each other.
 
 **JS-driven properties that must keep working:** `.timer-fill { width }` (set every 100 ms) and the
 public-room `.room-row` hover handlers.
+
+---
+
+## §9 — KART DOM CLASS CONTRACT (frozen)
+
+K5 (`style.css`) and K6 (`app.ts`) run in parallel and are coupled only through these names. K6 may
+add elements using the **reserved** names below; K5 styles every name here. **Neither may rename or
+delete an existing class.**
+
+### Structure
+
+Two sibling `screen` divs are appended to `#app`. Visibility is `classList.add/remove('hidden')` on
+`.screen.menu` / `.screen.race` (`showMenu` 1823, `showRace` 1831); every in-race overlay is toggled
+once per frame in `updateHud` (1563). No element has an `id`. All elements come from the factory
+`el(tag, className?, text?)` at **app.ts:419-428** — it assigns `node.className` wholesale, so
+multi-class strings like `'screen race hidden'` are literal.
+
+```
+div.screen.menu
+  h1.menu-title · p.menu-sub · div.menu-notice(.hidden) · input.menu-name
+  div.menu-actions > button.btn.btn-gold ×1, button.btn ×2
+  div.menu-code   > input.menu-code-input, button.btn
+  label.menu-kids > input[checkbox], span.menu-kids-label
+  h2.menu-rooms-title
+  div.menu-rooms  > div.room-empty | div.room-row > span.room-title, span.room-label, span.room-meta
+
+div.screen.race(.hidden)
+  canvas.race-canvas
+  div.race-top > button.btn.btn-small
+  div.hud(.hidden)
+    div.hud-left
+      div.hud-pos > div.hud-pos-main > span.hud-pos-num, span.hud-pos-suf, span.hud-pos-total
+                  > div.hud-pos-gap(.hud-pos-leader)
+                  > div.hud-kids(.hidden)
+      div.hud-lap
+      [div.race-invite parks here during countdown/racing]
+    div.hud-right
+      div.hud-speed > div.hud-gear-row  > span.hud-gear-label, span.hud-gear
+                    > div.hud-speed-row > span.hud-speed-num, span.hud-speed-unit
+      canvas.hud-minimap
+    div.hud-times > div.hud-time-row ×2 > span.hud-time-label, span.hud-time-value(.hud-best)
+    div.hud-nitro > div.hud-turbo-label
+                  > div.hud-nitro-pips > span.hud-nitro-pip ×NITRO_CHARGES (.pip-flash)
+    div.hud-gate-wrap(.hidden) > div.hud-gate, div.hud-gate-label
+  div.lobby-overlay(.hidden) > div.lobby-panel
+      div.lobby-title · div.lobby-players > div.player-chip(.you) > span.player-color,
+        span.player-name > span.player-you, span.player-slot
+      div.lobby-status · div.lobby-hint
+  div.hint-card(.hidden) · div.countdown-overlay(.hidden) · div.race-msg(.hidden)
+  div.race-invite(.hidden) > span.race-invite-code, button.btn.btn-small
+  div.results-overlay(.hidden) > div.results-panel
+      div.results-title
+      table.results-table > thead > tr > th ×4 (no class) ; tbody > tr(.you) >
+        td.result-place, td.result-name, td.result-time, td.result-best
+      div.results-note
+  div.fx-speedlines > div.fx-speedline ×N   (built by fx.ts:230-244 into .race)
+body > div.error-banner                     (main.ts:11, boot failure only)
+```
+
+**Conditional classes.** `hidden` on: `.menu-notice` (1860) · `.lobby-overlay` (1566) · `.hud`
+(1567) · `.results-overlay` (1571) · `.countdown-overlay` (1586) · `.race-msg` (1589) ·
+`.hint-card` (1596) · `.hud-kids` (1639) · `.hud-gate-wrap` (1683) · `.race-invite` (1934) ·
+`.screen.menu`/`.screen.race` (1825-1834). Also `hud-pos-leader` on `.hud-pos-gap` when place === 1
+(1631/1637) · `you` on `.player-chip` (1896) and results `tr` (1914) · `pip-flash` re-added to the
+just-spent `.hud-nitro-pip` with a forced reflow (1668-1670).
+
+**Canvases.** `canvas.race-canvas` — the Three.js target. `canvas.hud-minimap` — 2D, backing store
+`MINIMAP_SIZE*2`, redrawn at 4 Hz by `drawMinimap` (1702). Offscreen texture canvases in `fx.ts:95`,
+`render.ts:192/211`, `kartMesh.ts:87` are not in the DOM.
+
+### Existing — must keep working
+
+`hidden` · `screen` · `menu` · `menu-title` · `menu-sub` · `menu-notice` · `menu-name` ·
+`menu-actions` · `menu-code` · `menu-code-input` · `menu-kids` · `menu-kids-label` ·
+`menu-rooms-title` · `menu-rooms` · `room-empty` · `room-row` · `room-title` · `room-label` ·
+`room-meta` · `btn` · `btn-gold` · `btn-small` · `race` · `race-canvas` · `race-top` · `hud` ·
+`hud-left` · `hud-right` · `hud-pos` · `hud-pos-main` · `hud-pos-num` · `hud-pos-suf` ·
+`hud-pos-total` · `hud-pos-gap` · `hud-pos-leader` · `hud-kids` · `hud-lap` · `hud-speed` ·
+`hud-gear-row` · `hud-gear-label` · `hud-gear` · `hud-speed-row` · `hud-speed-num` ·
+`hud-speed-unit` · `hud-minimap` · `hud-times` · `hud-time-row` · `hud-time-label` ·
+`hud-time-value` · `hud-best` · `hud-nitro` · `hud-turbo-label` · `hud-nitro-pips` ·
+`hud-nitro-pip` · `pip-flash` · `hud-gate-wrap` · `hud-gate` · `hud-gate-label` · `lobby-overlay` ·
+`lobby-panel` · `lobby-title` · `lobby-players` · `lobby-status` · `lobby-hint` · `player-chip` ·
+`player-color` · `player-name` · `player-you` · `player-slot` · `you` · `hint-card` ·
+`countdown-overlay` · `race-msg` · `race-invite` · `race-invite-code` · `results-overlay` ·
+`results-panel` · `results-title` · `results-table` · `result-place` · `result-name` ·
+`result-time` · `result-best` · `results-note` · `error-banner`
+
+FX-internal (owned by `fx.ts`, styled in `style.css` §speed-lines — **K6 must not emit these**):
+`fx-speedlines` · `fx-speedline`
+
+**No CSS rule today** — K5 must add rules; these currently render unstyled or inline-only:
+`menu-kids` · `menu-kids-label` · `race-invite` · `race-invite-code` · `result-name` ·
+`result-time` · `result-best`
+
+### Reserved for this upgrade
+
+K6 may emit, K5 must style: `hud-chip` (shared chip surface under pos/lap/times/nitro) ·
+`hud-chip-lo` · `hud-chip-hi` (two-tier value ladder) · `hud-scrim` (corner gradient so chips read
+over any track) · `hud-corner-tl` · `hud-corner-tr` · `hud-corner-bl` · `hud-corner-br` ·
+`hud-rule` (hairline divider) · `hud-pos-crown` (P1 accent) · `hud-speed-bar` (meter fill) ·
+`hud-nitro-pip-full` (lit pip — replaces the inline opacity write) · `race-invite-chip` (real pill
+class replacing the inline block) · `results-row-you`.
+
+### Inline-style hazard
+
+24 JS-set inline styles in `app.ts` beat any stylesheet rule. K6 strips all but the data-driven
+ones; K5 supplies real rules.
+
+**Strip — pure static styling** (the `.race-invite` block, 816-831): `position` 816 · `top` 817 ·
+`left` 818 · `zIndex` 819 · `display` 820 · `alignItems` 821 · `gap` 822 · `pointerEvents` 823 ·
+`inviteCodeEl.padding` 825 · `border` 826 · `borderRadius` 827 · `fontSize` 828 · `letterSpacing`
+829 · `color` 830 · `background` 831. Plus `row.cursor='pointer'` on `.room-row` 1876.
+
+**Convert to class toggles:** `inviteEl.position` static/absolute per parent 1580 →
+parked/floating classes · `gearEl.opacity` upshift flash 1647 → animation class ·
+`pip.style.opacity` per pip per frame 1663 → `hud-nitro-pip-full` toggle.
+
+**Keep — genuinely dynamic:** `hintEl.opacity` fade 1600 · `gateEl.transform = rotate(…)` 1692 ·
+`sw.style.background = KART_COLORS[…]` 1899. **Transient, out of scope:** clipboard textarea
+1958-1959.
+
+Also outside `app.ts`: `fx.ts:237-240` writes `left`/`top`/`transform`/`opacity` on every
+`.fx-speedline` — **K5 must not set those four properties on that class.**
