@@ -419,11 +419,22 @@ export class BankGame {
     this.tableEl.appendChild(topBar);
 
     // ---- stage: the viewport-filling play area --------------------------------
-    // `.table-stage` is the growth region between the fixed top bar and the
-    // fixed rail/actions footer. It owns the whole middle of the screen, which
-    // is what stops the table from hugging the top and leaving the bottom third
-    // as dead black space. It carries the felt and the event log side by side.
+    // `.table-stage` wraps EVERYTHING on the table screen except `.table-top`,
+    // and is the growth region that claims every pixel the top bar leaves. It is
+    // a two-column grid (VISUAL_UPGRADE §5 / the frozen B1↔B2 layout contract):
+    //
+    //   .table-stage
+    //     .stage-main   felt (dominant) + player-rail + table-actions
+    //     .stage-side    log-panel > log-title + event-log
+    //     .table-banner  overlay, centred over the whole stage
+    //
+    // Rail and actions live in the SAME column as the felt and directly beneath
+    // it, so there is no orphan gap between the felt and the rail — that band was
+    // BANK's single biggest compositional flaw. The log sits in the side column,
+    // so its height is tied to the main column instead of being a tall empty box.
     const stage = el('div', 'table-stage');
+    const stageMain = el('div', 'stage-main');
+    const stageSide = el('aside', 'stage-side');
 
     // felt-rail (wood/leather surround) > felt (green surface) >
     //   felt-stitch (decorative inset stitch line) + felt-inner (content well)
@@ -446,19 +457,13 @@ export class BankGame {
     feltInner.appendChild(timerBar);
     felt.appendChild(feltInner);
     feltRail.appendChild(felt);
-    stage.appendChild(feltRail);
+    stageMain.appendChild(feltRail);
 
-    // the log gets a real home beside the felt instead of floating under it
-    const logPanel = el('div', 'log-panel');
-    logPanel.appendChild(el('div', 'log-title', 'TABLE LOG'));
-    this.logEl = el('div', 'event-log');
-    logPanel.appendChild(this.logEl);
-    stage.appendChild(logPanel);
-
-    this.tableEl.appendChild(stage);
-
+    // Rail and actions are siblings of the felt inside `.stage-main`, in document
+    // order felt → rail → actions, so they flow directly under the felt with no
+    // dead band between them.
     this.playersEl = el('div', 'player-rail');
-    this.tableEl.appendChild(this.playersEl);
+    stageMain.appendChild(this.playersEl);
 
     const actions = el('div', 'table-actions');
     this.rollBtn = el('button', 'btn btn-roll hidden', 'ROLL');
@@ -475,7 +480,17 @@ export class BankGame {
     });
     actions.appendChild(this.rollBtn);
     actions.appendChild(this.bankBtn);
-    this.tableEl.appendChild(actions);
+    stageMain.appendChild(actions);
+    stage.appendChild(stageMain);
+
+    // the log gets a real home beside the felt instead of floating under it;
+    // `<aside>` because it is complementary to the play area, not part of it
+    const logPanel = el('div', 'log-panel');
+    logPanel.appendChild(el('div', 'log-title', 'TABLE LOG'));
+    this.logEl = el('div', 'event-log');
+    logPanel.appendChild(this.logEl);
+    stageSide.appendChild(logPanel);
+    stage.appendChild(stageSide);
 
     this.bannerEl = el('div', 'table-banner hidden');
     // Text-only overlay: it must never intercept clicks (invite chip, LEAVE, …).
@@ -487,7 +502,11 @@ export class BankGame {
     this.bannerEl.appendChild(this.bannerMainEl);
     this.bannerSubEl = el('div', 'banner-sub');
     this.bannerEl.appendChild(this.bannerSubEl);
-    this.tableEl.appendChild(this.bannerEl);
+    // the banner is a child of `.table-stage` so it can centre over the whole
+    // stage (felt + rail + actions + log), not just one column
+    stage.appendChild(this.bannerEl);
+
+    this.tableEl.appendChild(stage);
 
     root.appendChild(this.menuEl);
     root.appendChild(this.tableEl);

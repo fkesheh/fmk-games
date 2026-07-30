@@ -1,7 +1,7 @@
 // ============================================================================
 // C3 — map renderer: MapDef (pure data) => baked static geometry + solids.
-// Ground slab, sky dome (the ONE raw-geometry/MeshBasicMaterial exception),
-// BoxDefs rendered as RICH boxes, seeded floor life + ceiling light panels,
+// Ground slab, skyline backdrop + cloud bands, BoxDefs rendered as RICH boxes,
+// seeded floor life + ceiling light panels,
 // and seeded deco prop scatter — everything static is merged by bake() into
 // one mesh per material (< 60 draw calls per map).
 //
@@ -27,12 +27,28 @@
 //     cushions, coolers get spigots and a drip tray, sacks and paper piles get
 //     banding, sandbags get a ground pad and sun-hit crests, and so on. Deco
 //     counts are scaled up per §3c on top of that.
-//   - SKYLINE (§3c): TWO depth tiers — a near ring in full value and a far ring
-//     pushed out and faded toward the fog with `mix()` (atmospheric perspective
-//     is free depth; both mix endpoints stay palette entries, §0 rule 7).
-//   - CLOUDS (§1 S3): the replacement for the deleted "sky diamonds" — two
-//     layered bands of flattened, clustered, horizon-hugging blocks, the far
-//     band faded toward the fog. Never cast or receive shadows.
+//   - NO SKY DOME (§1 S3 — this is where the "floating diamonds" actually came
+//     from). There used to be a SECOND dome here: a raw r=400 SphereGeometry with
+//     a 2-stop vertex gradient, added on top of the rig's own opaque r=395 shader
+//     dome (scene.ts). The rig dome is re-centred on the CAMERA every frame; this
+//     one sat at the world origin. The moment the player walked away from the
+//     centre the two spheres INTERPENETRATED — the origin-centred one poked
+//     through on the near side at 400-|p| < 395 — and the r=400 dome's 24x12
+//     facets showed through the rig dome in pale, hard-edged, corner-on patches:
+//     the diamonds and wedges in screenshots/v2/fps-{dustbowl,crossfire}-a.png.
+//     They tracked the CAMERA, not the world, which is why retuning every map's
+//     SkylineDef never touched them. Verified by capture: with this dome removed
+//     and the skyline ring untouched, the sky is clean. §7 seam rule 1 gives F8
+//     exactly this choice ("either delete the now-covered makeSkyDome() or leave
+//     it strictly alone"); it is deleted, and the rig now owns the sky outright.
+//   - SKYLINE (§3c + §1 S3): TWO depth tiers — a near ring in full value and a far
+//     ring pushed out and faded toward the fog with `mix()` (atmospheric
+//     perspective is free depth; both mix endpoints stay palette entries, §0
+//     rule 7). The ring is generated in ANGLE space so that landmark height is a
+//     function of landmark distance and neighbours always overlap — see
+//     buildSkyline() for why that makes a floating tip impossible.
+//   - CLOUDS (§3c): two layered bands of flattened, clustered, horizon-hugging
+//     blocks, the far band faded toward the fog. Never cast or receive shadows.
 //   - BOX ALBEDO IS THE PALETTE, EXACTLY (§1 + §0 rule 7): a box body is
 //     MAT_COLORS[mat] with no derived tint. The old per-box albedo jitter
 //     multiplied the BODY while articulate()'s trim/plinth stayed on the
@@ -102,7 +118,6 @@ const SOLID_PAD = 0.5; // solids inflated by this when rejecting prop points
 const FLOOR_OCCUPIED_Y = 1.2; // a solid whose underside is above this is walk-under
 const SPAWN_CLEARANCE = 2.5; // min prop distance to any spawn
 const MAX_ATTEMPTS_PER_PROP = 30; // termination cap for rejection sampling
-const DOME_RADIUS = 400;
 
 // ---- richness tuning ----------------------------------------------------------
 // rng stream salts (deco zones use salts 0..zoneCount-1; these stay clear)
@@ -172,6 +187,23 @@ const SKYLINE_FAR_OUT = 1.75;
 const SKYLINE_FAR_COUNT = 0.85; // far tier landmark count, relative to s.count
 const SKYLINE_FAR_FADE = 0.5; // mix() toward theme.fog — atmospheric perspective
 const CLOUD_FAR_FADE = 0.55;
+
+// ---- the anti-diamond geometry (§1 S3) ------------------------------------------
+// The floating pale diamonds were never a colour problem: they were the skyline
+// ring's SHAPE. Three independent generator bugs produced them, and all three
+// are fixed by the constants below (see buildSkyline/addSkylineRing).
+const SKY_EYE = 1.62; // player eye height — the y of the horizon line
+const SKY_MAX_ANG = 0.22; // rad (12.6 deg): hard ceiling on any landmark's top
+const SKY_RELIEF = 0.62; // shortest landmark, as a fraction of the tallest angle
+const SKY_WIDTH_SLOTS = 1.5; // landmark angular width in slot widths: > 1 = overlap
+const SKY_ANG_JITTER = 0.08; // slot fractions — small enough to keep the overlap
+const SKY_YAW_JITTER = 0.12; // rad off the ring tangent (never corner-on)
+const SKY_DEPTH_MIN = 0.28; // landmark depth, as a fraction of its width
+const SKY_DEPTH_MAX = 0.5;
+const SKY_CAP_FRAC = 0.72; // the cap step starts this far up the landmark
+const SKY_CAP_W = 0.8; // cap footprint, as a fraction of the body's
+const SKY_CAP_D = 0.62;
+const SKY_SINK = 0.6; // sunk into the apron so no base gap can ever show
 
 const PANEL_CELL = 2.4; // ceiling light-panel grid pitch (m)
 const PANEL_SKIP = 0.38; // seeded fraction of cells left dark
@@ -257,7 +289,8 @@ export function buildMap(map: MapDef): { root: THREE.Group; solids: AABB[] } {
   root.add(bake(statics)); // one merged mesh per material, shadows on
   root.add(shadowless(bake(propShadows))); // AO stand-in: casts nothing itself
   root.add(buildClouds(map)); // horizon-hugging bands, unshadowed (§1 S3)
-  root.add(makeSkyDome(map)); // unbaked: must never cast/receive shadows
+  // NO SKY DOME HERE. See the "TWO DOMES" note in this file's header and §7 seam
+  // rule 1: the rig owns the visible sky, and this one was actively harmful.
   return { root, solids };
 }
 
@@ -605,66 +638,138 @@ function centroid(pts: ReadonlyArray<{ x: number; z: number }>): { x: number; z:
 
 /**
  * A giant ground apron (so the horizon never shows void) plus TWO DEPTH TIERS
- * of mesa/dune silhouettes outside the playable area (VISUAL_UPGRADE.md §3c).
+ * of mesa/dune silhouettes outside the playable area (VISUAL_UPGRADE.md §3c),
+ * built so that a FLOATING TIP IS GEOMETRICALLY IMPOSSIBLE (§1 S3).
  *
- * The near ring keeps the map's own `SkylineDef` colours. The far ring sits at
- * 1.3-1.75x the radius and is mixed halfway toward `theme.fog`: atmospheric
- * perspective is free depth, and it is what turns a flat cardboard cutout into
- * a landscape that recedes. Both `mix()` endpoints are palette entries, so the
- * result stays traceable (§0 rule 7).
+ * ---- why the old ring produced "sky diamonds" -----------------------------
+ * The previous generator drew each landmark independently: a free height from
+ * `[minH, maxH]`, a free radius from `[minR, maxR]`, a free yaw, and a narrower
+ * second block dropped on top with a yaw of its own. Three consequences, all of
+ * them visible in screenshots/v2:
  *
- * The height band is NOT raised for the far ring — distance alone lowers its
- * apparent height, which keeps the S3 "no floating diamonds" tuning that each
- * map's `SkylineDef` was authored against intact.
+ *   1. HEIGHT WAS INDEPENDENT OF DISTANCE, so a FARTHER landmark could easily be
+ *      TALLER on screen than the nearer one standing in front of it. Its body was
+ *      hidden, its top was not: a pale shape with sky on every side.
+ *   2. THE RING HAD GAPS. `count` landmarks of width `h*1.6..2.8` at radius
+ *      `r` cover `count * w / r` radians; on Crossfire (16 x ~25 m at r 60-76)
+ *      that is barely 2*PI with the angular jitter routinely opening real holes,
+ *      so the ring read as separated spikes rather than a horizon.
+ *   3. EVERY BLOCK WAS FREELY YAWED, so it was regularly seen corner-on — and a
+ *      box seen corner-on, clipped to its tip, is literally a diamond.
+ *
+ * ---- what replaces it -----------------------------------------------------
+ * The ring is now generated in ANGLE space, not in metres:
+ *
+ *   - HEIGHT IS DERIVED FROM DISTANCE. The map's authored `[minH, maxH]` is read
+ *     ONCE, at the ring's own mid radius, as an apparent-elevation band above the
+ *     horizon line at eye height (`SKY_EYE`). Every landmark then gets its height
+ *     back from ITS OWN radius as `y = SKY_EYE + r * tan(theta)`. Nearer landmarks
+ *     are therefore SHORTER, by construction, and the whole ring is clamped to
+ *     `SKY_MAX_ANG` no matter what a map asks for. A landmark can no longer
+ *     out-top something in front of it just by being further away.
+ *   - THE RING IS CONTINUOUS. Landmarks sit in fixed angular slots and are cut
+ *     `SKY_WIDTH_SLOTS` (1.5) slots wide, so every one overlaps both neighbours
+ *     even at the worst angular jitter. There is no sky under a tip because
+ *     there is no gap between the ranks.
+ *   - LANDMARKS FACE THE PLAYER. Yaw is the ring TANGENT plus at most
+ *     `SKY_YAW_JITTER`, so the broad face is what is seen: never a corner.
+ *   - THE CAP IS A STEP, NOT A HAT. It shares its body's yaw and footprint centre
+ *     and its top IS the clamped top, so it reads as the upper terrace of one
+ *     mass instead of a separate object that can survive its body's occlusion.
+ *
+ * ---- the two tiers --------------------------------------------------------
+ * The near ring keeps the map's own `SkylineDef` colours AT FULL VALUE — pre-fading
+ * it toward the fog as well collapses the whole backdrop to within a few L* of the
+ * sky and it stops reading as anything. Only the FAR ring (1.32-1.75x the radius)
+ * is mixed halfway toward `theme.fog`. Both `mix()` endpoints are palette entries,
+ * so the result stays traceable (§0 rule 7).
  */
 function buildSkyline(g: THREE.Group, map: MapDef): void {
   const s = map.skyline;
   if (s === undefined) return;
   g.add(at(box(320, 0.02, 320, map.theme.ground), 0, -0.04, 0)); // horizon apron
   const next = rng(decoSeed(map.id, SALT_SKYLINE));
+
+  // The authored height band, read at the ring's mid radius, becomes the ring's
+  // ELEVATION band. `SKY_MAX_ANG` is the hard S3 ceiling; `SKY_RELIEF` opens the
+  // bottom of the band back up, because a ridge whose tops all sit within ~1.5
+  // deg of each other reads as a wall, not as a landscape. Neither end can make
+  // a landmark taller than the clamp, which is the property S3 needs.
+  const rMid = (s.minR + s.maxR) / 2;
+  const angHi = Math.min(SKY_MAX_ANG, Math.atan(Math.max(0.5, s.maxH - SKY_EYE) / rMid));
+  const angLo = Math.min(angHi * SKY_RELIEF, Math.atan(Math.max(0.4, s.minH - SKY_EYE) / rMid));
+
+  const farCount = Math.max(3, Math.round(s.count * SKYLINE_FAR_COUNT));
   addSkylineRing(
     g,
     next,
-    s,
-    Math.max(3, Math.round(s.count * SKYLINE_FAR_COUNT)),
+    farCount,
     s.maxR * SKYLINE_FAR_IN,
     s.maxR * SKYLINE_FAR_OUT,
+    angLo,
+    angHi,
     mix(s.hex, map.theme.fog, SKYLINE_FAR_FADE),
     mix(s.capHex ?? s.hex, map.theme.fog, SKYLINE_FAR_FADE),
-    Math.PI / Math.max(1, s.count), // offset so the two rings never line up
+    Math.PI / farCount, // half a slot: the far ranks sit behind the near seams
   );
-  addSkylineRing(g, next, s, s.count, s.minR, s.maxR, s.hex, s.capHex ?? s.hex, 0);
+  addSkylineRing(g, next, s.count, s.minR, s.maxR, angLo, angHi, s.hex, s.capHex ?? s.hex, 0);
 }
 
-/** One ring of two-block landmarks. Pure backdrop: non-collidable, outside
- *  every solid, fog does the rest of the aerial perspective. */
+/**
+ * One ring of stepped mesa landmarks, generated in angle space.
+ *
+ * `angLo`/`angHi` are apparent elevations above the horizon line, NOT heights:
+ * the height of each landmark is recovered from its own radius, which is what
+ * makes "nearer ring landmarks are shorter" an invariant of the generator rather
+ * than a tuning value a map can violate.
+ *
+ * Widths are cut from the same angle space (`SKY_WIDTH_SLOTS` slots wide against
+ * a `2*PI/count` slot), so the ring stays continuous at ANY radius or count a map
+ * chooses — every landmark overlaps both neighbours, and each still keeps roughly
+ * a fifth of a slot of exclusive silhouette running all the way down to the
+ * horizon. That exclusive span is the guarantee: a shape that reaches the ground
+ * somewhere cannot read as floating.
+ *
+ * Pure backdrop: non-collidable, outside every solid, well beyond the tightened
+ * shadow frustum; fog does the rest of the aerial perspective.
+ */
 function addSkylineRing(
   g: THREE.Group,
   next: () => number,
-  s: NonNullable<MapDef['skyline']>,
   count: number,
   r0: number,
   r1: number,
+  angLo: number,
+  angHi: number,
   bodyHex: string,
   capHex: string,
   angOffset: number,
 ): void {
+  const slot = (Math.PI * 2) / count;
+  const halfW = (slot * SKY_WIDTH_SLOTS) / 2;
   for (let i = 0; i < count; i++) {
-    const ang = (i / count) * Math.PI * 2 + angOffset + rngRange(next, -0.15, 0.15);
+    const ang = i * slot + angOffset + rngRange(next, -SKY_ANG_JITTER, SKY_ANG_JITTER) * slot;
     const r = rngRange(next, r0, r1);
     const x = Math.cos(ang) * r;
     const z = Math.sin(ang) * r;
-    const h = rngRange(next, s.minH, s.maxH);
-    const w = rngRange(next, h * 1.6, h * 2.8);
-    const d = rngRange(next, h * 1.2, h * 2.0);
-    const yaw = next() * Math.PI;
-    const base = at(box(w, h, d, bodyHex), x, h / 2 - 0.5, z); // sunk 0.5 into the apron
-    base.rotation.y = yaw;
-    g.add(base);
-    const h2 = h * rngRange(next, 0.35, 0.55);
-    const tier = at(box(w * 0.62, h2, d * 0.62, capHex), x, h - 0.5 + h2 / 2, z);
-    tier.rotation.y = yaw + rngRange(next, -0.2, 0.2);
-    g.add(tier);
+    // TOP FROM DISTANCE — the whole S3 fix in one line.
+    const top = SKY_EYE + r * Math.tan(rngRange(next, angLo, angHi));
+    const w = 2 * r * Math.tan(halfW); // >= 1.5 slots wide: neighbours always overlap
+    const d = w * rngRange(next, SKY_DEPTH_MIN, SKY_DEPTH_MAX);
+    // tangent-aligned: rotation.y = phi sends local +x to world (cos phi, -sin phi),
+    // so -ang - PI/2 puts the broad face across the line of sight from the centre.
+    const yaw = -ang - Math.PI / 2 + rngRange(next, -SKY_YAW_JITTER, SKY_YAW_JITTER);
+    const bodyTop = top * SKY_CAP_FRAC;
+    const bodyH = bodyTop + SKY_SINK;
+    const body = at(box(w, bodyH, d, bodyHex), x, bodyH / 2 - SKY_SINK, z);
+    body.rotation.y = yaw;
+    g.add(body);
+    // the cap is the upper TERRACE of the same mass: same centre, same yaw, and
+    // its top is the clamped top — it can never outlive the body that carries it
+    const capH = top - bodyTop;
+    const cap = at(box(w * SKY_CAP_W, capH, d * SKY_CAP_D, capHex), x, bodyTop + capH / 2, z);
+    cap.rotation.y = yaw;
+    g.add(cap);
   }
 }
 
@@ -692,7 +797,10 @@ function buildClouds(map: MapDef): THREE.Group {
   const next = rng(decoSeed(map.id, SALT_CLOUD));
   const R = s.maxR;
   const g = new THREE.Group();
-  // far band first, so the near band's clusters bake over the top of it
+  // far band first, so the near band's clusters bake over the top of it. Counts,
+  // radii and heights are held at the values this band was tuned to: raising the
+  // count makes the RING legible as a ring, which is a worse read than a few
+  // large clusters.
   addCloudBand(
     g,
     next,
@@ -709,9 +817,11 @@ function buildClouds(map: MapDef): THREE.Group {
   return shadowless(bake(g));
 }
 
-/** One ring of cloud clusters: a flat `baseHex` underside slab carrying 3-5
- *  `topHex` puffs. `scale` stretches the whole band for the far tier, so the
- *  further clusters stay the same apparent size. */
+/** One ring of cloud clusters: a `baseHex` underside slab, NARROWER than the
+ *  cluster, carrying 4-6 `topHex` puffs that overhang it on every side, so the
+ *  silhouette is a lumpy mass rather than a plate with bumps on it. `scale`
+ *  stretches the whole band for the far tier, so the further clusters stay the
+ *  same apparent size. */
 function addCloudBand(
   g: THREE.Group,
   next: () => number,
@@ -730,24 +840,28 @@ function addCloudBand(
     const len = rngRange(next, 16, 30) * scale;
     const dep = rngRange(next, 7, 12) * scale;
     const cluster = new THREE.Group();
-    cluster.add(at(box(len, 1.1 * scale, dep, baseHex), 0, 0, 0)); // flat underside
-    const puffs = rngInt(next, 3, 5);
+    cluster.add(at(box(len * 0.76, 1.7 * scale, dep * 0.78, baseHex), 0, 0, 0)); // shaded underside
+    const puffs = rngInt(next, 4, 6);
     for (let p = 0; p < puffs; p++) {
-      const w = rngRange(next, 0.28, 0.48) * len;
-      const ph = rngRange(next, 1.4, 2.6) * scale;
-      const pd = rngRange(next, 0.55, 0.9) * dep;
+      const w = rngRange(next, 0.34, 0.6) * len;
+      const ph = rngRange(next, 1.6, 3.2) * scale;
+      const pd = rngRange(next, 0.7, 1.05) * dep;
       cluster.add(
         at(
           box(w, ph, pd, topHex),
           rngRange(next, -len / 2 + w / 2, len / 2 - w / 2),
-          0.55 * scale + ph / 2,
-          rngRange(next, -dep * 0.12, dep * 0.12),
+          rngRange(next, 0.1, 0.7) * scale + ph / 2, // puffs bed INTO the slab
+          rngRange(next, -dep * 0.18, dep * 0.18),
         ),
       );
     }
     cluster.position.set(Math.cos(ang) * r, rngRange(next, y0, y1), Math.sin(ang) * r);
-    // long axis tangential to the ring, so no cluster points end-on at the map
-    cluster.rotation.y = ang + Math.PI / 2 + rngRange(next, -0.3, 0.3);
+    // Long axis tangential to the ring, so no cluster points end-on at the map —
+    // a band seen end-on is a short floating bar, which is the same read the S3
+    // skyline diamonds had. `rotation.y = phi` sends local +x to (cos phi, -sin phi),
+    // so the tangent at `ang` is `-ang - PI/2`; the old `ang + PI/2` only happened
+    // to be tangential on the four cardinal bearings and was radial in between.
+    cluster.rotation.y = -ang - Math.PI / 2 + rngRange(next, -0.3, 0.3);
     g.add(cluster);
   }
 }
@@ -957,38 +1071,6 @@ function tooClose(x: number, z: number, placed: ReadonlyArray<{ x: number; z: nu
     if (dx * dx + dz * dz < d2) return true;
   }
   return false;
-}
-
-// ---- sky dome (factory exception, CONTRACT rule 5) -----------------------------
-// Raw SphereGeometry + MeshBasicMaterial with manual vertex colors: the single
-// non-Lambert surface in the game. Gradient theme.sky (top) -> theme.horizon.
-
-function makeSkyDome(map: MapDef): THREE.Mesh {
-  const geo = new THREE.SphereGeometry(DOME_RADIUS, 24, 12);
-  const pos = geo.getAttribute('position');
-  const colors = new Float32Array(pos.count * 3);
-  const top = new THREE.Color(map.theme.sky); // linear work-space, same as mat()
-  const bottom = new THREE.Color(map.theme.horizon);
-  const c = new THREE.Color();
-  for (let i = 0; i < pos.count; i++) {
-    const t = smooth01(pos.getY(i) / DOME_RADIUS / 2 + 0.5);
-    c.copy(bottom).lerp(top, t);
-    colors[i * 3] = c.r;
-    colors[i * 3 + 1] = c.g;
-    colors[i * 3 + 2] = c.b;
-  }
-  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-  const dome = new THREE.Mesh(
-    geo,
-    new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide, fog: false }),
-  );
-  dome.frustumCulled = false; // the dome always encloses the camera
-  return dome;
-}
-
-function smooth01(t: number): number {
-  const x = Math.min(1, Math.max(0, t));
-  return x * x * (3 - 2 * x);
 }
 
 // ---- deco prop recipes (VISUAL_UPGRADE.md §3c: 8-16 prims, PALETTE only) ------

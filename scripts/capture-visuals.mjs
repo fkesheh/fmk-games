@@ -45,9 +45,12 @@
 //   kart-results  — the race must END for the results table to exist: page A
 //                   drives its 3 laps (the 2nd page leaves once racing starts,
 //                   so A finishing ends the race) and the server's 300s
-//                   RACE_TIMEOUT_S backstops it. This wait runs CONCURRENTLY
-//                   with the bank + fps captures — the results phase only lasts
-//                   RESULTS_SECONDS (10s), so a background watcher polls for it.
+//                   RACE_TIMEOUT_S backstops it — measured from the OBSERVED GO,
+//                   which makes the results screen reachable even when the
+//                   assisted drive never completes the distance. This wait runs
+//                   CONCURRENTLY with the bank + fps captures — the results
+//                   phase only lasts RESULTS_SECONDS (10s), so a background
+//                   watcher polls for it every 400ms.
 //   bank-table    — 2 pages, private room, mid-round with pot > 0, dice settled.
 //   bank-roll     — a roll captured mid-tumble (verified: the die transform is
 //                   still animating when the capture returns; up to 3 attempts).
@@ -60,9 +63,19 @@
 // --allow-dev-server (capture even when the platform server is proxying a game
 // to its vite dev server — normally a hard error, see assertProductionMounts).
 //
+// PARTIAL-SAFE. A shot that cannot be reached costs ONLY itself: every capture
+// step runs inside attempt()/section(), which records WHY it failed against the
+// shots it owned and lets the run continue. One broken pose no longer takes the
+// other 30 shots down with it, and the kart page (whose results watcher is the
+// long pole) outlives a bank or fps failure. Two deliberate fallbacks keep whole
+// groups alive: fps-hud/buy/scoreboard drop to a bot-filled match when the
+// 3-page room will not seat, and kart-results rides the server's own race
+// timeout when the assisted drive cannot finish the laps.
+//
 // Exit 0 only if EVERY required shot landed as a non-trivial PNG and zero
 // console/page/request errors were seen on any page. A missing shot is named
-// explicitly — this harness never silently skips.
+// explicitly, WITH the reason it is missing — this harness never silently skips,
+// and being partial-safe never turns a missing shot into a pass.
 // ============================================================================
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, statSync } from 'node:fs';
@@ -140,14 +153,94 @@ const manifest = [];
 const pageErrors = [];
 const browsers = [];
 let serverChild = null;
+let serverExit = null; // { code, signal } once the child is gone — every waiter can name it
+let tearingDown = false; // suppresses the socket noise every page emits while we kill the server
 let mapData = null; // { [mapId]: MapDef } or null when the bundle could not be built
 let mapDataNote = 'not loaded';
 
+const T0 = Date.now();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const log = (msg) => console.log(msg);
+const elapsed = () => `${((Date.now() - T0) / 1000).toFixed(0).padStart(4)}s`;
+const log = (msg) => console.log(`[${elapsed()}] ${msg}`);
 const wrapPi = (a) => Math.atan2(Math.sin(a), Math.cos(a));
+const errText = (err) => (err instanceof Error ? err.message : String(err));
 
-async function waitFor(fn, timeoutMs, label) {
+// ---- partial-safe failure bookkeeping ----------------------------------------
+// A shot that cannot be reached must cost ONLY itself. Every capture step runs
+// inside step()/attempt(); the reason a step failed is attributed to the shots
+// it owned, so the epilogue can say WHY each missing shot is missing instead of
+// just naming it. The run still exits non-zero — this buys diagnosis, not mercy.
+const shotFailures = new Map(); // shot name -> reason string
+
+function blame(names, reason) {
+  for (const n of names) if (!shotFailures.has(n)) shotFailures.set(n, reason);
+}
+
+/**
+ * Run one capture step. On failure the reason is recorded against `names` (the
+ * shots this step owned) and the caller continues with the next step.
+ * Returns true on success. Steps that own no wanted shot are skipped.
+ */
+async function attempt(names, label, fn) {
+  if (!wantAny(...names)) return false;
+  if (serverExit !== null) {
+    // Nothing downstream of a dead server can succeed; burning each step's full
+    // budget on a guaranteed timeout only delays the report.
+    blame(names, serverDeadReason());
+    return false;
+  }
+  try {
+    await fn();
+    return true;
+  } catch (err) {
+    const reason = errText(err);
+    log(`[FAILED] ${label}: ${reason}`);
+    blame(names, reason);
+    return false;
+  }
+}
+
+/** attempt() for a whole game section: same contract, returns fn's value or null. */
+async function section(names, label, fn) {
+  if (!wantAny(...names)) return null;
+  if (serverExit !== null) {
+    blame(names, serverDeadReason());
+    return null;
+  }
+  try {
+    return await fn();
+  } catch (err) {
+    const reason = errText(err);
+    log(`[FAILED] ${label}: ${reason}`);
+    blame(names, reason);
+    return null;
+  }
+}
+
+/**
+ * Why this wording is specific: the platform server installs SIGTERM/SIGINT
+ * handlers that exit 0 (platform/server/src/index.ts), so an external SIGTERM
+ * shows up here as `code 0, signal null` and an external SIGKILL as
+ * `code null, signal SIGKILL`. This harness signals the server ONLY during
+ * teardown (after `tearingDown` is set), so either shape seen mid-run means
+ * something outside this process reaped it — a concurrent e2e/capture run on
+ * the same machine, a stray `pkill node`, or the OS under memory pressure.
+ * Naming that explicitly is the difference between one honest line and a
+ * cascade of unexplained timeouts.
+ */
+const serverDeadReason = () =>
+  `the platform server exited mid-run (code ${serverExit?.code}, signal ${serverExit?.signal}) — every page lost its socket (see the [server] EXITED line above)`;
+
+function assertServerAlive() {
+  if (serverExit !== null) throw new Error(serverDeadReason());
+}
+
+/**
+ * Poll `fn` until truthy. `onTimeout` (optional) turns the timeout into a
+ * diagnostic: it is awaited and its string appended, so a waiter can report the
+ * live state that failed the predicate rather than just the label.
+ */
+async function waitFor(fn, timeoutMs, label, onTimeout = null) {
   const t0 = Date.now();
   for (;;) {
     try {
@@ -156,7 +249,16 @@ async function waitFor(fn, timeoutMs, label) {
     } catch {
       // page mid-navigation / socket reconnect — keep polling
     }
-    if (Date.now() - t0 > timeoutMs) throw new Error(`timeout (${timeoutMs}ms) waiting for ${label}`);
+    if (Date.now() - t0 > timeoutMs) {
+      assertServerAlive(); // a dead server explains every timeout downstream of it
+      let detail = '';
+      if (onTimeout !== null) {
+        detail = await Promise.resolve()
+          .then(onTimeout)
+          .then((d) => (d ? ` — ${d}` : ''), (e) => ` — (diagnostic failed: ${errText(e)})`);
+      }
+      throw new Error(`timeout (${timeoutMs}ms) waiting for ${label}${detail}`);
+    }
     await sleep(150);
   }
 }
@@ -182,8 +284,22 @@ async function startServer() {
   // server chatter goes to STDERR: stdout must end with the manifest line
   child.stdout.on('data', (d) => process.stderr.write(`[server] ${d}`));
   child.stderr.on('data', (d) => process.stderr.write(`[server!] ${d}`));
-  child.on('exit', (code) => {
-    if (code !== null && code !== 0) process.stderr.write(`[server] exited with code ${code}\n`);
+  child.on('exit', (code, signal) => {
+    serverExit = { code, signal };
+    // ALWAYS reported, once, in full: a server that dies mid-run is the single
+    // cause of every downstream failure, and the old handler stayed silent on a
+    // signal death (and on the clean exit(0) its own SIGTERM handler produces),
+    // which is how this turned into a pile of unexplained timeouts.
+    if (!tearingDown) {
+      process.stderr.write(
+        `[server] EXITED mid-run (code ${code}, signal ${signal}) — every page just lost its socket.\n` +
+          '[server] platform/server installs SIGTERM/SIGINT handlers that exit 0, so `code 0` means an\n' +
+          '[server] external SIGTERM and `signal SIGKILL` an external kill. This harness signals the\n' +
+          '[server] server ONLY during teardown, so either shape here means something outside this run\n' +
+          '[server] reaped it: a concurrent e2e/capture run on this machine, a stray kill, or the OS\n' +
+          '[server] under memory pressure. Every shot below this point failed for that one reason.\n',
+      );
+    }
   });
   return child;
 }
@@ -227,6 +343,14 @@ async function assertProductionMounts(gameIds) {
 }
 
 // ---- browser -----------------------------------------------------------------
+// The run holds up to four of these open at once (the kart page races for five
+// minutes while bank and then fps capture), and each one is a full browser with
+// a live WebGL context. Measured peak on a real run: 42 Chrome processes and
+// 4.1 GB resident, with the machine down to ~65 MB free — at which point macOS
+// SIGKILLs something, and on one run it picked the platform server, which loses
+// every remaining shot. The second block trims the services this harness never
+// uses (extensions, sync, background networking, translate, bfcache) purely to
+// keep that peak down; none of them affect what is rendered.
 const LAUNCH_ARGS = [
   `--window-size=${VIEWPORT.width},${VIEWPORT.height}`,
   '--mute-audio',
@@ -234,6 +358,14 @@ const LAUNCH_ARGS = [
   '--disable-renderer-backgrounding',
   '--disable-backgrounding-occluded-windows',
   '--enable-unsafe-swiftshader',
+  '--disable-background-networking',
+  '--disable-component-extensions-with-background-pages',
+  '--disable-default-apps',
+  '--disable-extensions',
+  '--disable-sync',
+  '--no-first-run',
+  '--no-default-browser-check',
+  '--disable-features=Translate,BackForwardCache,MediaRouter,OptimizationHints',
 ];
 const LAUNCH_OPTS = {
   headless: 'shell', // same rationale as e2e.mjs: the shell's software pipeline never wedges
@@ -246,6 +378,13 @@ function trackErrors(page, tag) {
     if (m.type() !== 'error') return;
     const url = m.location()?.url ?? '';
     if (/favicon/.test(url) || /favicon/.test(m.text())) return;
+    // Shutdown noise, not a defect: a server that is gone makes every client log
+    // a WebSocket failure and then retry once a second, so a few seconds of it
+    // produces hundreds of lines that bury the real errors. Suppressed only when
+    // the server is KNOWN to be gone — during our own teardown, or after a death
+    // that is already reported separately and loudly. While the server is up, a
+    // WebSocket error is a genuine defect and still fails the run.
+    if ((tearingDown || serverExit !== null) && /WebSocket connection to .* failed/.test(m.text())) return;
     pageErrors.push(`[${tag}] console.error: ${m.text()} (${url})`);
   });
   page.on('pageerror', (e) => pageErrors.push(`[${tag}] pageerror: ${e.message}`));
@@ -771,51 +910,65 @@ async function captureLauncher() {
 // ---- section: fps --------------------------------------------------------------
 async function captureFpsMaps(page, mapIds) {
   for (const mapId of mapIds) {
-    const t0 = Date.now();
-    const prevRoom = (await fpsState(page))?.roomId ?? null;
-    await page.evaluate((m) => window.__fps.createPrivate('Cam', m), mapId);
-    await waitFor(async () => {
-      const s = await fpsState(page);
-      return s !== null && s.mapId === mapId && s.roomId !== null && s.roomId !== prevRoom ? s : null;
-    }, 20000, `join private ${mapId}`);
-    const spawned = await waitFor(async () => {
-      const s = await fpsState(page);
-      return s !== null && s.alive && s.pos.every((v) => Number.isFinite(v)) ? s : null;
-    }, 20000, `alive spawn on ${mapId}`);
-    await sleep(1400); // world build + deco scatter + first shadow-casting frames
-    await closeBuyMenu(page);
-    await clearBotPrompt(page);
-    const map = mapData === null ? null : mapData[mapId] ?? null;
-
-    // pose a — the longest sightline from the spawn (the main lane)
-    let s = await fpsState(page);
-    const poseA = planLongSightline(map, s.pos[0], s.pos[2]);
-    await setLook(page, poseA.yaw, poseA.pitch);
-    await settle(page, { frames: 4, ms: 450 });
-    if (want(`fps-${mapId}-a`)) await shot(page, `fps-${mapId}-a`);
-
-    // walk that lane, then frame an articulated wall + prop cluster
-    await walkFor(page, 2000);
-    s = (await fpsState(page)) ?? s;
-    const poseB = planWallCloseup(map, s.pos[0], s.pos[2]);
-    await setLook(page, poseB.yaw, poseB.pitch);
-    await settle(page, { frames: 4, ms: 450 });
-    if (want(`fps-${mapId}-b`)) await shot(page, `fps-${mapId}-b`);
-
-    // strafe off the wall, crouch, look low into the sun
-    await walkFor(page, 1200, 1, 0);
-    s = (await fpsState(page)) ?? s;
-    const poseC = planSunLow(map, s.pos[0], s.pos[2]);
-    await setLook(page, poseC.yaw, poseC.pitch);
-    await page.evaluate(() => window.__fps.debug.press('crouch', true));
-    await settle(page, { frames: 4, ms: 550 });
-    if (want(`fps-${mapId}-c`)) await shot(page, `fps-${mapId}-c`);
-    await page.evaluate(() => window.__fps.debug.press('crouch', false));
-
-    log(
-      `map ${mapId}: ${((Date.now() - t0) / 1000).toFixed(1)}s — a: ${poseA.detail} · b: ${poseB.detail} · c: ${poseC.detail} (spawn ${spawned.pos.map((v) => v.toFixed(1)).join(',')})`,
+    // Per-map isolation: every map re-enters through createPrivate, which tears
+    // the old world down first, so a map that fails cannot poison the next one.
+    await attempt(
+      [`fps-${mapId}-a`, `fps-${mapId}-b`, `fps-${mapId}-c`],
+      `fps map tour ${mapId}`,
+      () => captureFpsOneMap(page, mapId),
     );
   }
+}
+
+async function captureFpsOneMap(page, mapId) {
+  const t0 = Date.now();
+  const prevRoom = (await fpsState(page))?.roomId ?? null;
+  await page.evaluate((m) => window.__fps.createPrivate('Cam', m), mapId);
+  await waitFor(async () => {
+    const s = await fpsState(page);
+    return s !== null && s.mapId === mapId && s.roomId !== null && s.roomId !== prevRoom ? s : null;
+  }, 20000, `join private ${mapId}`);
+  const spawned = await waitFor(async () => {
+    const s = await fpsState(page);
+    return s !== null && s.alive && s.pos.every((v) => Number.isFinite(v)) ? s : null;
+  }, 20000, `alive spawn on ${mapId}`);
+  await sleep(1400); // world build + deco scatter + first shadow-casting frames
+  await closeBuyMenu(page);
+  await clearBotPrompt(page);
+  const map = mapData === null ? null : mapData[mapId] ?? null;
+
+  // pose a — the longest sightline from the spawn (the main lane)
+  let s = await fpsState(page);
+  const poseA = planLongSightline(map, s.pos[0], s.pos[2]);
+  await setLook(page, poseA.yaw, poseA.pitch);
+  await settle(page, { frames: 4, ms: 450 });
+  if (want(`fps-${mapId}-a`)) await shot(page, `fps-${mapId}-a`);
+
+  // walk that lane, then frame an articulated wall + prop cluster
+  await walkFor(page, 2000);
+  s = (await fpsState(page)) ?? s;
+  const poseB = planWallCloseup(map, s.pos[0], s.pos[2]);
+  await setLook(page, poseB.yaw, poseB.pitch);
+  await settle(page, { frames: 4, ms: 450 });
+  if (want(`fps-${mapId}-b`)) await shot(page, `fps-${mapId}-b`);
+
+  // strafe off the wall, crouch, look low into the sun
+  await walkFor(page, 1200, 1, 0);
+  s = (await fpsState(page)) ?? s;
+  const poseC = planSunLow(map, s.pos[0], s.pos[2]);
+  await setLook(page, poseC.yaw, poseC.pitch);
+  await page.evaluate(() => window.__fps.debug.press('crouch', true));
+  try {
+    await settle(page, { frames: 4, ms: 550 });
+    if (want(`fps-${mapId}-c`)) await shot(page, `fps-${mapId}-c`);
+  } finally {
+    // a latched crouch must never leak into the next map's tour
+    await page.evaluate(() => window.__fps.debug.press('crouch', false)).catch(() => {});
+  }
+
+  log(
+    `map ${mapId}: ${((Date.now() - t0) / 1000).toFixed(1)}s — a: ${poseA.detail} · b: ${poseB.detail} · c: ${poseC.detail} (spawn ${spawned.pos.map((v) => v.toFixed(1)).join(',')})`,
+  );
 }
 
 /**
@@ -990,23 +1143,38 @@ async function captureFpsChar(pages, mapId) {
   log(`fps-char: pair ${posed.pairDist.toFixed(1)}m apart, camera ${posed.camDist.toFixed(1)}m out`);
 }
 
+/**
+ * fps-hud / fps-buy / fps-scoreboard need ONE page inside a running match —
+ * they do not need the 3-player pair fps-char needs. Each is its own attempt()
+ * so a buy layer that will not open cannot cost the scoreboard.
+ */
 async function captureFpsRoomUi(page) {
   // HUD: a live round with no modal layer over the scene
-  if (want('fps-hud')) {
-    await waitFor(async () => {
-      const s = await fpsState(page);
-      return s !== null && s.phase === 'live' ? s : null;
-    }, 140000, "phase 'live' for fps-hud");
+  await attempt(['fps-hud'], 'fps-hud', async () => {
+    await waitFor(
+      async () => {
+        const s = await fpsState(page);
+        return s !== null && s.phase === 'live' ? s : null;
+      },
+      140000,
+      "phase 'live' for fps-hud",
+      () => describeFpsPage(page, 'cam'),
+    );
     await closeBuyMenu(page);
     await settle(page, { frames: 4, ms: 500 });
     await shot(page, 'fps-hud');
-  }
+  });
   // Buy menu: auto-opens on the freeze snapshot
-  if (want('fps-buy')) {
-    await waitFor(async () => {
-      const s = await fpsState(page);
-      return s !== null && s.phase === 'freeze' ? s : null;
-    }, 140000, "phase 'freeze' for fps-buy");
+  await attempt(['fps-buy'], 'fps-buy', async () => {
+    await waitFor(
+      async () => {
+        const s = await fpsState(page);
+        return s !== null && s.phase === 'freeze' ? s : null;
+      },
+      140000,
+      "phase 'freeze' for fps-buy",
+      () => describeFpsPage(page, 'cam'),
+    );
     const shown = await waitFor(() => layerVisible(page, 'buy'), 4000, 'buy layer visible').catch(() => false);
     if (!shown) {
       await page.keyboard.press('KeyB');
@@ -1015,21 +1183,130 @@ async function captureFpsRoomUi(page) {
     await settle(page, { frames: 3, ms: 450 });
     await shot(page, 'fps-buy');
     await closeBuyMenu(page);
-  }
+  });
   // Scoreboard: the frozen Tab-edge mirror
-  if (want('fps-scoreboard')) {
-    await closeBuyMenu(page);
-    await page.evaluate(() => window.__fps.debug.scoreboard(true));
-    await waitFor(() => layerVisible(page, 'score'), 5000, 'scoreboard layer visible');
-    await settle(page, { frames: 3, ms: 450 });
-    await shot(page, 'fps-scoreboard');
-    await page.evaluate(() => window.__fps.debug.scoreboard(false));
+  await attempt(['fps-scoreboard'], 'fps-scoreboard', async () => {
+    try {
+      await closeBuyMenu(page);
+      await page.evaluate(() => window.__fps.debug.scoreboard(true));
+      await waitFor(() => layerVisible(page, 'score'), 5000, 'scoreboard layer visible');
+      await settle(page, { frames: 3, ms: 450 });
+      await shot(page, 'fps-scoreboard');
+    } finally {
+      await page.evaluate(() => window.__fps.debug.scoreboard(false)).catch(() => {});
+    }
+  });
+}
+
+/** One page's full join-relevant state, for a seating diagnostic. */
+async function describeFpsPage(page, tag) {
+  try {
+    const s = await fpsState(page);
+    if (s === null) return `${tag}: window.__fps.state() is null (client not in a room / not booted)`;
+    const menu = await page
+      .evaluate(() => {
+        const el = document.querySelector('.fps-menus');
+        if (el === null) return 'no .fps-menus';
+        const shown = [...el.querySelectorAll('[class*="m9-layer-"]')]
+          .filter((n) => getComputedStyle(n).display !== 'none')
+          .map((n) => [...n.classList].find((c) => c.startsWith('m9-layer-')) ?? '?');
+        return shown.length === 0 ? 'no layer' : shown.join('+');
+      })
+      .catch((e) => `layer probe failed: ${errText(e)}`);
+    return `${tag}: room=${s.roomId ?? 'none'} code=${s.code ?? 'none'} map=${s.mapId ?? 'none'} phase=${s.phase} team=${s.team} alive=${s.alive} snapshotPlayers=${s.players} roster=${s.rosterSize} ping=${s.ping}ms layers=[${menu}]`;
+  } catch (err) {
+    return `${tag}: state probe threw (${errText(err)}) — page detached or crashed?`;
   }
+}
+
+const fpsSeatDiag = (pages, room) =>
+  Promise.all(pages.map((p, i) => describeFpsPage(p, `page${'ABC'[i] ?? i}`))).then(
+    (lines) => `target room ${room.roomId} (code ${room.code}) · ${lines.join(' | ')}`,
+  );
+
+/**
+ * Seat every page in `pages[0]`'s room.
+ *
+ * Why this needs a real budget and a recovery loop rather than one 30s wait:
+ *   - MIN_PLAYERS_FOR_MATCH is 2, so the match STARTS the instant the second
+ *     page lands. The third page therefore always joins mid-match, into a
+ *     freeze/live round, and its world build, first snapshot and roster all
+ *     land behind a round transition.
+ *   - `state().players` is not the room's player count: it is the length of the
+ *     interpolated snapshot sample, which is 0 until that page has built its
+ *     world AND has two snapshots to interpolate between. On a machine already
+ *     running the kart race plus two other browsers that is seconds, not
+ *     milliseconds — and the old 30s ceiling was shared with the join itself.
+ *   - clientGame.startJoin() closes the socket and rebuilds the world whenever
+ *     a join is issued from inside a room, so a blind re-join is destructive:
+ *     it un-seats a page that had already made it. Re-joins here are issued
+ *     ONLY to a page whose roomId still does not match.
+ * On failure the thrown error names every page and its exact state.
+ */
+async function seatFpsPages(pages, names, room, budgetMs = 150000) {
+  const t0 = Date.now();
+  let lastPoke = 0;
+  let lastLog = 0;
+  for (;;) {
+    const ss = await Promise.all(pages.map((p) => fpsState(p).catch(() => null)));
+    const n = pages.length;
+    if (ss.every((s) => s !== null && s.roomId === room.roomId && s.rosterSize === n && s.players === n)) {
+      log(`fps: all ${n} pages seated in ${room.code} after ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+      return ss;
+    }
+    if (Date.now() - t0 > budgetMs) {
+      assertServerAlive();
+      throw new Error(
+        `${n} fps pages never all seated within ${(budgetMs / 1000).toFixed(0)}s — ${await fpsSeatDiag(pages, room)}`,
+      );
+    }
+    // Recovery: re-issue the join ONLY for pages still outside the room. The
+    // lobby drops a join sent before the socket's welcome lands, and that is
+    // the one failure a re-join actually fixes.
+    if (Date.now() - lastPoke > 8000) {
+      lastPoke = Date.now();
+      for (let i = 1; i < pages.length; i++) {
+        const s = ss[i];
+        if (s !== null && s.roomId === room.roomId) continue;
+        log(`fps: re-issuing joinPrivate for ${names[i]} (room=${s?.roomId ?? 'none'})`);
+        await pages[i]
+          .evaluate((nm, c) => window.__fps.joinPrivate(nm, c), names[i], room.code)
+          .catch(() => {});
+      }
+    }
+    if (Date.now() - lastLog > 15000) {
+      lastLog = Date.now();
+      log(`fps seating… ${await fpsSeatDiag(pages, room)}`);
+    }
+    await sleep(500);
+  }
+}
+
+/** Deterministic fallback to a running match on ONE page: fill with bots. */
+async function startMatchWithBots(page) {
+  for (let i = 0; i < 2; i++) {
+    const s = await fpsState(page);
+    if (s !== null && (s.phase === 'freeze' || s.phase === 'live')) return true;
+    await page.evaluate(() => window.__fps.addBot()).catch(() => {});
+    await sleep(1200);
+  }
+  return (
+    (await waitFor(
+      async () => {
+        const s = await fpsState(page);
+        return s !== null && (s.phase === 'freeze' || s.phase === 'live') ? s : null;
+      },
+      45000,
+      'a bot-filled match to start (freeze/live)',
+      () => describeFpsPage(page, 'cam'),
+    ).catch(() => null)) !== null
+  );
 }
 
 async function captureFps() {
   const mapsWanted = MAP_IDS.filter((m) => wantAny(`fps-${m}-a`, `fps-${m}-b`, `fps-${m}-c`));
-  const roomWanted = wantAny('fps-char', 'fps-hud', 'fps-buy', 'fps-scoreboard');
+  const roomShots = ['fps-char', 'fps-hud', 'fps-buy', 'fps-scoreboard'];
+  const roomWanted = wantAny(...roomShots);
   if (mapsWanted.length === 0 && !roomWanted) return;
 
   const A = await launchOne('fpsA');
@@ -1041,42 +1318,52 @@ async function captureFps() {
     if (!roomWanted) return;
 
     // a shared private room: 3 players => teams split 2/1 => a CT and a T pair
-    const B = await launchOne('fpsB');
-    pages.push(B);
-    await B.goto(`${BASE}/fps/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await waitFor(() => B.evaluate(() => !!window.__fps), 20000, '__fps on fpsB');
-    const C = await launchOne('fpsC');
-    pages.push(C);
-    await C.goto(`${BASE}/fps/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await waitFor(() => C.evaluate(() => !!window.__fps), 20000, '__fps on fpsC');
+    const names = ['Alice', 'Bob', 'Cara'];
+    for (const tag of ['fpsB', 'fpsC']) {
+      const p = await launchOne(tag);
+      pages.push(p);
+      await p.goto(`${BASE}/fps/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await waitFor(() => p.evaluate(() => !!window.__fps), 20000, `__fps on ${tag}`);
+    }
 
     await A.evaluate(() => window.__fps.createPrivate('Alice', 'dustbowl'));
-    const room = await waitFor(async () => {
-      const s = await fpsState(A);
-      return s !== null && s.roomId !== null && s.code !== null && s.mapId === 'dustbowl' ? s : null;
-    }, 20000, 'A createPrivate(dustbowl)');
-    // the lobby drops a join sent before the socket's welcome lands — retry
-    for (const [page, name] of [[B, 'Bob'], [C, 'Cara']]) {
-      let seated = null;
-      for (let attempt = 0; attempt < 3 && seated === null; attempt++) {
-        await page.evaluate((n, c) => window.__fps.joinPrivate(n, c), name, room.code);
-        seated = await waitFor(async () => {
-          const s = await fpsState(page);
-          return s !== null && s.roomId === room.roomId ? s : null;
-        }, 12000, `${name} joins ${room.code}`).catch(() => null);
-      }
-      if (seated === null) throw new Error(`fps: ${name} never joined room ${room.code}`);
+    const room = await waitFor(
+      async () => {
+        const s = await fpsState(A);
+        return s !== null && s.roomId !== null && s.code !== null && s.mapId === 'dustbowl' ? s : null;
+      },
+      20000,
+      'A createPrivate(dustbowl)',
+      () => describeFpsPage(A, 'pageA'),
+    );
+    for (let i = 1; i < pages.length; i++) {
+      await pages[i].evaluate((nm, c) => window.__fps.joinPrivate(nm, c), names[i], room.code);
+      await sleep(400); // stagger: two joins in the same tick race the same round transition
     }
-    await waitFor(async () => {
-      const ss = await Promise.all(pages.map((p) => fpsState(p)));
-      return ss.every((s) => s !== null && s.roomId === room.roomId && s.players === 3 && s.rosterSize === 3) ? ss : null;
-    }, 30000, 'all three pages seated in the room');
-    await waitFor(async () => {
-      const s = await fpsState(A);
-      return s !== null && (s.phase === 'live' || s.phase === 'freeze') ? s : null;
-    }, 60000, 'the match starts (freeze/live)');
 
-    if (want('fps-char')) await captureFpsChar(pages, 'dustbowl');
+    // Seating owns fps-char only: it is the one shot that genuinely needs three
+    // humans (two posed soldiers plus a third camera). hud/buy/scoreboard need
+    // a live match on ONE page, so when seating fails they fall back to a
+    // bot-filled room and are still captured.
+    const seated = await attempt(['fps-char'], 'fps 3-page seating + fps-char', async () => {
+      await seatFpsPages(pages, names, room);
+      await waitFor(
+        async () => {
+          const s = await fpsState(A);
+          return s !== null && (s.phase === 'live' || s.phase === 'freeze') ? s : null;
+        },
+        90000,
+        'the match starts (freeze/live)',
+        () => fpsSeatDiag(pages, room),
+      );
+      await captureFpsChar(pages, 'dustbowl');
+    });
+
+    if (!seated) {
+      log('fps: falling back to a bot-filled match on page A for the HUD shots');
+      const running = await startMatchWithBots(A);
+      if (!running) log('[warn] fps: the bot fallback did not reach freeze/live either');
+    }
     await captureFpsRoomUi(A);
   } finally {
     for (const p of pages) await closePage(p);
@@ -1112,17 +1399,43 @@ async function kartYawRate(page, ms = 350) {
   return { rate: wrapPi(t2.own.yaw - t1.own.yaw) / dt, speed: t2.own.speedMps, tele: t2 };
 }
 
+// The kart server's own guarantees (games/kart/shared/src/config.ts) — the
+// deterministic backstop this watcher is built on.
+const KART_RACE_TIMEOUT_MS = 300000; // RACE_TIMEOUT_S: the server ENDS the race here, finished or not
+const KART_RESULTS_MS = 10000; // RESULTS_SECONDS: how long the results screen exists
+
 /**
  * The results table only exists once the race ENDS, and it is on screen for
  * RESULTS_SECONDS (10s) only — so this watcher runs concurrently with the
  * bank/fps captures instead of blocking on a possibly 5-minute race.
+ *
+ * The completion path is deterministic, and does NOT depend on the assisted
+ * drive actually finishing three laps:
+ *   1. FAST path — the assist finishes the 3 laps; the last connected racer
+ *      finishing is `allFinished()`, which enters results immediately.
+ *   2. FALLBACK — the server's RACE_TIMEOUT_S (300s, armed at GO) enters
+ *      results whether anyone finished or not. So the deadline is anchored to
+ *      the OBSERVED GO time, not to when this watcher happened to start: a slow
+ *      chase/hud/corner search used to eat the margin and the watcher could
+ *      time out BEFORE the server's own backstop had fired.
+ *   3. UNSTICK — if gate progress stalls for 30s the kart is wedged against
+ *      scenery; the assist is re-armed and a short reverse-and-turn is applied
+ *      so path 1 can still happen. Purely additive; path 2 still backstops it.
+ * Polling is 400ms so the 10s results window can never be missed.
  */
-function watchKartResults(page, deadlineMs) {
+function watchKartResults(page, goAtMs) {
   return (async () => {
     const t0 = Date.now();
+    const deadline = goAtMs + KART_RACE_TIMEOUT_MS + 45000; // server backstop + results window + slack
     let lastLog = 0;
-    while (Date.now() - t0 < deadlineMs) {
+    let lastProgress = -1;
+    let lastProgressAt = Date.now();
+    let unsticks = 0;
+    let last = null;
+    while (Date.now() < deadline) {
+      assertServerAlive(); // the race cannot advance without it; do not wait out the backstop
       const s = await kartState(page).catch(() => null);
+      if (s !== null) last = s;
       if (s !== null && s.phase === 'results') {
         await settle(page, { frames: 3, ms: 500 });
         await shot(page, 'kart-results');
@@ -1130,13 +1443,36 @@ function watchKartResults(page, deadlineMs) {
       }
       if (s !== null && Date.now() - lastLog > 20000) {
         lastLog = Date.now();
-        log(`kart race t=${((Date.now() - t0) / 1000).toFixed(0)}s phase=${s.phase} lap=${s.lap} progress=${s.progress}`);
+        log(
+          `kart race t=${((Date.now() - t0) / 1000).toFixed(0)}s phase=${s.phase} lap=${s.lap} progress=${s.progress} (server backstop in ${(((goAtMs + KART_RACE_TIMEOUT_MS) - Date.now()) / 1000).toFixed(0)}s)`,
+        );
       }
-      // keep the throttle latched (a respawn/reset can clear the debug input)
-      if (s !== null && s.phase === 'racing') await kartInput(page, 1, 0, 0, false).catch(() => {});
-      await sleep(700);
+      if (s !== null && s.phase === 'racing') {
+        // keep the throttle latched (a respawn/reset can clear the debug input)
+        await kartInput(page, 1, 0, 0, false).catch(() => {});
+        if (s.progress !== lastProgress) {
+          lastProgress = s.progress;
+          lastProgressAt = Date.now();
+        } else if (Date.now() - lastProgressAt > 30000) {
+          lastProgressAt = Date.now();
+          unsticks++;
+          log(`kart: no gate progress for 30s at progress=${s.progress} — unstick #${unsticks}`);
+          await setAssist(page, false).catch(() => {});
+          await kartInput(page, 0, 1, unsticks % 2 === 0 ? 0.9 : -0.9, false).catch(() => {}); // reverse out
+          await sleep(1400);
+          await kartInput(page, 1, 0, 0, false).catch(() => {});
+          await setAssist(page, true).catch(() => {});
+        }
+      }
+      await sleep(400);
     }
-    return false;
+    const where =
+      last === null
+        ? 'the kart page never reported a state'
+        : `last state: phase=${last.phase} lap=${last.lap} progress=${last.progress} players=${last.players}`;
+    throw new Error(
+      `the race never reached the results phase — the server's RACE_TIMEOUT_S backstop (${KART_RACE_TIMEOUT_MS / 1000}s after GO) plus a ${KART_RESULTS_MS / 1000}s results window both elapsed; ${where}`,
+    );
   })();
 }
 
@@ -1161,18 +1497,22 @@ async function captureKart() {
   }, 20000, 'both karts seated');
 
   // grid: the countdown beats (3-2-1) over the painted grid slots
-  if (want('kart-grid')) {
+  await attempt(['kart-grid'], 'kart-grid', async () => {
     await waitFor(async () => {
       const s = await kartState(A);
       return s !== null && (s.phase === 'countdown' || s.phase === 'racing') ? s : null;
     }, 40000, "phase 'countdown'");
     await settle(A, { frames: 2, ms: 120 });
     await shot(A, 'kart-grid');
-  }
+  });
   await waitFor(async () => {
     const s = await kartState(A);
     return s !== null && s.phase === 'racing' ? s : null;
   }, 40000, "phase 'racing'");
+  // GO is the anchor for the server's RACE_TIMEOUT_S backstop; everything after
+  // this point (chase/hud/corner searching) eats into it, so kart-results must
+  // measure its budget from HERE, not from when its watcher starts.
+  const goAt = Date.now();
 
   // KIDS MODE: the client pure-pursues the centerline, so throttle is all the
   // harness has to supply to get a real racing line (docs/KART.md).
@@ -1190,71 +1530,93 @@ async function captureKart() {
 
   // chase: at speed on a straight (a corner needs braking, so >16 m/s with a
   // near-zero yaw rate IS a straight)
-  if (want('kart-chase')) {
+  await attempt(['kart-chase'], 'kart-chase', async () => {
     const t0 = Date.now();
-    let got = false;
+    let best = null;
     while (Date.now() - t0 < 90000) {
       const y = await kartYawRate(A, 300);
+      if (y !== null && (best === null || y.speed > best.speed)) best = y;
       if (y !== null && y.speed > 16 && Math.abs(y.rate) < 0.15) {
         await shot(A, 'kart-chase');
-        got = true;
-        break;
+        return;
       }
       await sleep(250);
     }
-    if (!got) throw new Error('kart-chase: never reached >16 m/s on a straight within 90s');
-  }
+    throw new Error(
+      `never reached >16 m/s on a straight within 90s (best sample: ${best === null ? 'no telemetry at all' : `${best.speed.toFixed(1)} m/s at ${best.rate.toFixed(2)} rad/s`})`,
+    );
+  });
 
   // hud at speed: fire a nitro so the HUD shows the boost + the trail FX
-  if (want('kart-hud')) {
+  await attempt(['kart-hud'], 'kart-hud', async () => {
     const t0 = Date.now();
-    let got = false;
+    let best = null;
     while (Date.now() - t0 < 60000) {
       const y = await kartYawRate(A, 250);
+      if (y !== null && (best === null || y.speed > best.speed)) best = y;
       if (y !== null && y.speed > 14) {
         await A.keyboard.press('KeyN');
         await sleep(320);
         await shot(A, 'kart-hud');
-        got = true;
-        break;
+        return;
       }
       await sleep(250);
     }
-    if (!got) throw new Error('kart-hud: never reached 14 m/s within 60s');
-  }
+    throw new Error(
+      `never reached 14 m/s within 60s (best: ${best === null ? 'no telemetry at all' : `${best.speed.toFixed(1)} m/s`})`,
+    );
+  });
 
   // corner: wait until the assist is actually mid-corner, then take the steer
   // back with the handbrake down so the drift FX (smoke + marks) fire
-  if (want('kart-corner')) {
+  await attempt(['kart-corner'], 'kart-corner', async () => {
     const t0 = Date.now();
-    let got = false;
-    while (Date.now() - t0 < 120000) {
-      const y = await kartYawRate(A, 300);
-      if (y !== null && Math.abs(y.rate) > 0.28 && y.speed > 9) {
-        const steer = y.rate < 0 ? 0.8 : -0.8; // positive steer = RIGHT = yaw decreasing
-        await setAssist(A, false); // the assist owns the steer channel
-        await kartInput(A, 0.7, 0, steer, true);
-        await sleep(280); // long enough for the grip to break and the FX to spawn,
-        const t = await kartTele(A); // short enough that the kart is still IN the corner
-        await shot(A, 'kart-corner');
-        got = true;
-        await kartInput(A, 1, 0, 0, false);
-        await setAssist(A, true);
-        if (t === null || !t.own.drifting) log('[warn] kart-corner: handbrake set but the drifting flag was not latched at capture');
-        break;
+    let best = null;
+    try {
+      while (Date.now() - t0 < 120000) {
+        const y = await kartYawRate(A, 300);
+        if (y !== null && (best === null || Math.abs(y.rate) > Math.abs(best.rate))) best = y;
+        // After 70s of watching for a natural corner, FORCE one: full lock plus
+        // handbrake produces the same drift state the assist would have found,
+        // and the alternative is losing the shot to a lap that happens to be
+        // all straights (or to a low frame rate flattening the yaw samples).
+        const forced = Date.now() - t0 > 70000 && y !== null && y.speed > 9;
+        if (forced || (y !== null && Math.abs(y.rate) > 0.28 && y.speed > 9)) {
+          if (forced) log('[warn] kart-corner: no natural corner in 70s — forcing a handbrake turn');
+          const steer = (y.rate < 0 ? 0.8 : -0.8) * (forced && Math.abs(y.rate) < 0.05 ? -1 : 1);
+          await setAssist(A, false); // the assist owns the steer channel
+          await kartInput(A, 0.7, 0, steer, true);
+          await sleep(forced ? 700 : 280); // grip has to break; a forced turn starts from straight
+          const t = await kartTele(A); // short enough that the kart is still IN the corner
+          await shot(A, 'kart-corner');
+          if (t === null || !t.own.drifting) log('[warn] kart-corner: handbrake set but the drifting flag was not latched at capture');
+          return;
+        }
+        await sleep(250);
       }
-      await sleep(250);
+    } finally {
+      // the drive must go back to the assist no matter how this ended, or the
+      // race stops progressing and kart-results dies with it
+      await kartInput(A, 1, 0, 0, false).catch(() => {});
+      await setAssist(A, true).catch(() => {});
     }
-    if (!got) throw new Error('kart-corner: the assist never entered a corner (yaw rate > 0.28 rad/s) within 120s');
-  }
+    throw new Error(
+      `never entered a corner (yaw rate > 0.28 rad/s) within 120s, and the forced-turn fallback found no sample above 9 m/s (best rate: ${best === null ? 'no telemetry at all' : `${best.rate.toFixed(2)} rad/s at ${best.speed.toFixed(1)} m/s`})`,
+    );
+  });
 
+  await setAssist(A, true).catch(() => {});
   await kartInput(A, 1, 0, 0, false);
   if (!want('kart-results')) {
     await closePage(A);
     return null;
   }
-  // RACE_TIMEOUT_S is 300s, so the race always ends inside this window
-  const watcher = watchKartResults(A, 340000);
+  const watcher = watchKartResults(A, goAt);
+  // The watcher runs unawaited while bank + fps capture. Attaching a no-op
+  // handler now marks the rejection as handled, so a race that never finishes
+  // reports through the awaited `watcher` instead of killing the whole process
+  // with an unhandled rejection.
+  watcher.catch(() => {});
   return { page: A, watcher };
 }
 
@@ -1305,7 +1667,7 @@ async function captureBank() {
     };
 
     // table: mid-round with a pot on the felt and the dice settled
-    if (want('bank-table')) {
+    await attempt(['bank-table'], 'bank-table', async () => {
       const t0 = Date.now();
       let potUp = false;
       while (Date.now() - t0 < 60000) {
@@ -1318,16 +1680,16 @@ async function captureBank() {
         if (cur !== null) await cur.page.evaluate(() => window.__bank.roll());
         await sleep(400);
       }
-      if (!potUp) throw new Error('bank-table: the pot never grew above 0 within 60s');
+      if (!potUp) throw new Error('the pot never grew above 0 within 60s');
       await sleep(900); // the ~600ms tumble settles on the rolled faces
       await settle(A, { frames: 2, ms: 200 });
       await shot(A, 'bank-table');
-    }
+    });
 
     // roll: captured while the dice are still tumbling
-    if (want('bank-roll')) {
+    await attempt(['bank-roll'], 'bank-roll', async () => {
       let got = false;
-      for (let attempt = 0; attempt < 4 && !got; attempt++) {
+      for (let tries = 0; tries < 4 && !got; tries++) {
         const cur = await waitFor(async () => await currentPage(), 45000, 'a page whose turn it is');
         await cur.page.evaluate(() => window.__bank.roll());
         const capture = shot(cur.page, 'bank-roll');
@@ -1336,15 +1698,15 @@ async function captureBank() {
         if (stillRolling) {
           got = true;
         } else {
-          log(`[warn] bank-roll: attempt ${attempt + 1} landed after the tumble settled — re-rolling`);
+          log(`[warn] bank-roll: attempt ${tries + 1} landed after the tumble settled — re-rolling`);
           await sleep(800);
         }
       }
-      if (!got) throw new Error('bank-roll: could not land a capture inside the ~600ms dice tumble after 4 rolls');
-    }
+      if (!got) throw new Error('could not land a capture inside the ~600ms dice tumble after 4 rolls');
+    });
 
     // results: bank every round out until the 10-round match ends
-    if (want('bank-results')) {
+    await attempt(['bank-results'], 'bank-results', async () => {
       const t0 = Date.now();
       let ended = false;
       while (Date.now() - t0 < 240000) {
@@ -1369,10 +1731,15 @@ async function captureBank() {
         }
         await sleep(400);
       }
-      if (!ended) throw new Error('bank-results: no matchEnd within 240s of banking every round out');
+      if (!ended) {
+        const s = await bankState(A);
+        throw new Error(
+          `no matchEnd within 240s of banking every round out (last: phase=${s?.phase ?? 'null'} round=${s?.round ?? '?'} pot=${s?.pot ?? '?'})`,
+        );
+      }
       await settle(A, { frames: 2, ms: 400 });
       await shot(A, 'bank-results');
-    }
+    });
   } finally {
     for (const p of pages) await closePage(p);
   }
@@ -1397,16 +1764,27 @@ async function main() {
   const games = [...new Set(REQUIRED.map((s) => s.game))].filter((g) => g !== 'launcher');
   await assertProductionMounts(games);
 
+  // Every game runs in its own section(): a game that cannot be captured costs
+  // only its own shots. The kart page in particular must OUTLIVE a bank or fps
+  // failure — its results watcher is the long pole and used to be torn down by
+  // the first exception thrown anywhere downstream of it.
   let kart = null;
   try {
-    if (want('launcher')) await captureLauncher();
-    kart = await captureKart(); // returns a live page + a background results watcher
-    await captureBank();
-    await captureFps();
+    await section(['launcher'], 'launcher', captureLauncher);
+    kart = await section(
+      ['kart-grid', 'kart-chase', 'kart-corner', 'kart-hud', 'kart-results'],
+      'kart',
+      captureKart,
+    ); // returns a live page + a background results watcher
+    await section(['bank-table', 'bank-roll', 'bank-results'], 'bank', captureBank);
+    await section(
+      SHOT_LIST.filter((s) => s.game === 'fps').map((s) => s.name),
+      'fps',
+      captureFps,
+    );
     if (kart !== null) {
       log('waiting on the kart race to finish (results watcher)…');
-      const ok = await kart.watcher;
-      if (!ok) throw new Error('kart-results: the race never reached the results phase within 340s');
+      await section(['kart-results'], 'kart-results', () => kart.watcher);
     }
   } finally {
     if (kart !== null) await closePage(kart.page);
@@ -1418,8 +1796,11 @@ let failure = null;
 try {
   await main();
 } catch (err) {
-  failure = err instanceof Error ? err.message : String(err);
+  // main() only throws on setup faults (no build, port in use, dead server) —
+  // every per-shot failure is already recorded by attempt()/section().
+  failure = errText(err);
 } finally {
+  tearingDown = true; // from here the pages' socket errors are OUR doing, not defects
   for (const b of browsers) {
     try {
       await b.close();
@@ -1434,8 +1815,10 @@ try {
 const missing = REQUIRED.filter((s) => !manifest.some((m) => m.name === s.name));
 if (failure !== null) process.stderr.write(`\nFAIL: ${failure}\n`);
 if (missing.length > 0) {
-  process.stderr.write(`\nFAIL: ${missing.length} required shot(s) were never captured:\n`);
-  for (const s of missing) process.stderr.write(`  - ${s.name} (${s.game})\n`);
+  process.stderr.write(`\nFAIL: ${missing.length} of ${REQUIRED.length} required shot(s) were never captured:\n`);
+  for (const s of missing) {
+    process.stderr.write(`  - ${s.name} (${s.game}): ${shotFailures.get(s.name) ?? 'never attempted (an earlier step in its section aborted)'}\n`);
+  }
 }
 if (pageErrors.length > 0) {
   process.stderr.write(`\nFAIL: ${pageErrors.length} console/page error(s):\n`);
@@ -1443,6 +1826,8 @@ if (pageErrors.length > 0) {
 }
 if (failure === null && missing.length === 0 && pageErrors.length === 0) {
   process.stderr.write(`\nOK: ${manifest.length}/${REQUIRED.length} shots, zero page errors\n`);
+} else {
+  process.stderr.write(`\n${manifest.length}/${REQUIRED.length} shots captured before the failures above.\n`);
 }
 // LAST stdout line: the judge's manifest
 console.log(JSON.stringify(manifest));

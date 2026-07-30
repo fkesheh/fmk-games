@@ -75,9 +75,23 @@
     var(--rail-deep) 100%
   );
 
-  /* ---- layout tokens ---- */
-  --stage-w: min(1200px, 96vw);
-  --felt-w: min(820px, 94vw);
+  /* ---- layout tokens ----
+     `--top-bar-h` is the ONE number the stage height is derived from: the table
+     screen is `top bar + stage` and nothing else, so the stage can claim
+     `calc(100dvh - var(--top-bar-h))` exactly and no pixel is left over to
+     become a void. `.table-top` is pinned to the same token — if one changes
+     the other must, which is why they share it. */
+  --top-bar-h: clamp(46px, 6vh, 60px);
+  --stage-w: min(1440px, 97vw);
+  --felt-w: min(1120px, 100%);
+  --log-w: clamp(238px, 21vw, 326px);
+  /* Portrait / narrow: the log collapses to a strip UNDER the felt. This is a
+     hard ceiling, not a preference — the strip is the only thing between the
+     felt and the bottom of the stage, so a strip that is allowed to grow with
+     its content is a strip that eats the felt. Sized so that even at 360x640
+     (the smallest supported viewport) `felt min-content + rail + actions +
+     strip` still fits inside the stage. The list scrolls inside it. */
+  --log-strip-h: clamp(76px, 15vh, 180px);
   --serif: Georgia, 'Times New Roman', serif;
 
   color-scheme: dark;
@@ -95,6 +109,9 @@ body {
 /* The room, not a black void: a low warm pool of light under the table and a
    cool ink falloff to the corners. Fixed so it never scrolls with content. */
 body {
+  /* the table screen is sized to the viewport; a horizontal scrollbar there is
+     always a layout bug, never content */
+  overflow-x: hidden;
   background:
     radial-gradient(ellipse 90% 70% at 50% 44%, var(--ink-lit) 0%, var(--ink) 58%, var(--ink-deep) 100%)
     fixed;
@@ -379,69 +396,214 @@ body {
 
 /* ---- table screen ------------------------------------------------------------ */
 
+/*  THE COMPOSITION FIX (VISUAL_UPGRADE.md §5, first row of the table).
+
+    The old sheet let the table screen be a scrolling flex column: the felt
+    stacked into the top two thirds and the bottom ~35 % of the viewport was
+    black nothing. The screen is now EXACTLY two bands —
+
+        .table-top   fixed  var(--top-bar-h)
+        .table-stage         calc(100dvh - var(--top-bar-h))
+
+    — so there is no leftover height for a void to occupy. The stage is a grid:
+    a dominant main column (felt on a `1fr` row, with the player rail and the
+    action buttons pinned tight beneath it on `auto` rows) and a side column
+    holding the log at full stage height. Below 900 px, or in portrait, it
+    collapses to one column with the log as a short strip underneath. */
 .table {
   position: relative;
+  height: 100dvh;
+  max-height: 100dvh;
   justify-content: flex-start;
-  padding: clamp(10px, 2vh, 20px) 18px clamp(12px, 2.4vh, 26px);
-  gap: clamp(8px, 1.6vh, 18px);
-}
-
-/* Fallback for a build where `table-stage` is absent: spread the column down the
-   viewport instead of stacking it into the top two thirds. */
-.table:not(:has(.table-stage)) {
-  justify-content: space-evenly;
-}
-
-/*  THE COMPOSITION FIX (§5, first row of the table).
-    `table-stage` claims every pixel the top bar leaves and centres the table in
-    it. On wide viewports the log becomes a full-height right-hand column, so the
-    dead space at the bottom of the screen stops existing entirely. */
-.table-stage {
-  flex: 1 1 auto;
-  min-height: 0;
-  width: var(--stage-w);
-  box-sizing: border-box;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  align-content: center;
-  justify-items: center;
-  gap: clamp(10px, 2.2vh, 26px);
-}
-
-.table-stage > * {
-  width: 100%;
-  max-width: var(--felt-w);
-}
-
-@media (min-width: 980px) {
-  .table-stage:has(> .log-panel) {
-    grid-template-columns: minmax(0, 1fr) clamp(260px, 24vw, 340px);
-    align-content: center;
-    column-gap: clamp(18px, 2.4vw, 34px);
-  }
-
-  .table-stage:has(> .log-panel) > :not(.log-panel) {
-    grid-column: 1;
-  }
-
-  .table-stage:has(> .log-panel) > .log-panel {
-    grid-column: 2;
-    grid-row: 1 / -1;
-    align-self: stretch;
-    max-width: none;
-  }
+  align-items: center;
+  padding: 0 clamp(10px, 1.6vw, 22px);
+  gap: 0;
+  /* the two bands are sized to the viewport; nothing may scroll the screen */
+  overflow: hidden;
 }
 
 .table-top {
+  flex: 0 0 var(--top-bar-h);
+  box-sizing: border-box;
+  height: var(--top-bar-h);
   width: var(--stage-w);
   max-width: 100%;
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding-bottom: 8px;
+  padding-bottom: 6px;
   border-bottom: 1px solid color-mix(in srgb, var(--gold) 16%, transparent);
+}
+
+.table-top > * {
+  flex: 0 0 auto;
+}
+
+/*  Narrow: the top bar needs two rows. It is re-budgeted rather than allowed to
+    wrap freely, because `--top-bar-h` is what the stage height is subtracted
+    from — a top bar that grows without telling the token would push the bottom
+    of the stage off-screen. */
+@media (max-width: 780px) {
+  .table {
+    --top-bar-h: 86px;
+  }
+
+  .table-top {
+    flex-wrap: wrap;
+    justify-content: center;
+    align-content: center;
+    row-gap: 6px;
+  }
+}
+
+.table-stage {
+  /* containing block for `.table-banner`, so the end-of-round overlay centres
+     over the play area and leaves the top bar legible */
+  position: relative;
+  box-sizing: border-box;
+  width: var(--stage-w);
+  max-width: 100%;
+  height: calc(100dvh - var(--top-bar-h));
+  min-height: 0;
+  padding: clamp(8px, 1.5vh, 20px) 0 clamp(10px, 1.8vh, 24px);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  /*  ROW PRIORITY — the felt wins, the log yields.
+      Row 1 (`.stage-main`) is `minmax(min-content, 1fr)`, NOT `minmax(0, 1fr)`:
+      a 0-floor row lets an `auto` sibling row take whatever it likes and squeeze
+      the main column to a sliver, which is exactly how the felt used to end up
+      301 px tall at 430x880 (and 155 px at 360x640) with its own `overflow:
+      hidden` slicing the POT caption in half. The `min-content` floor makes the
+      felt's own content the row's hard minimum, so the log can never buy height
+      from it. Row 2 is `minmax(0, auto)` and is capped by `--log-strip-h`, so
+      the strip is bounded from above and shrinkable from below — it scrolls
+      internally (`.log-panel .event-log`) instead of growing. */
+  grid-template-rows: minmax(min-content, 1fr) minmax(0, auto);
+  align-items: stretch;
+  justify-items: stretch;
+  gap: clamp(9px, 1.5vh, 18px);
+}
+
+/*  Transitional guard: until the rail and the actions live inside `.stage-main`
+    they are siblings of the stage, and a stage that claimed the full remaining
+    height would push them off-screen. In that shape the stage flexes instead —
+    same composition, one band shorter. */
+.table:not(:has(.stage-main)) .table-stage {
+  height: auto;
+  flex: 1 1 auto;
+}
+
+.table > .player-rail {
+  flex: 0 0 auto;
+  margin-top: clamp(4px, 0.8vh, 10px);
+}
+
+.table > .table-actions {
+  flex: 0 0 auto;
+  margin: clamp(8px, 1.2vh, 15px) 0 clamp(10px, 1.8vh, 22px);
+}
+
+/* Fallback for a build where `table-stage` is absent entirely. */
+.table:not(:has(.table-stage)) {
+  justify-content: space-evenly;
+  padding-bottom: clamp(12px, 2.4vh, 26px);
+}
+
+/*  MAIN COLUMN — felt takes the `1fr` row and therefore every pixel the rail and
+    the buttons do not need. That is what makes the felt the dominant object on
+    the page rather than a card floating on a background, and it is also what
+    removes the orphan gap: rail and actions are grid rows immediately under the
+    felt, separated by one small gap and nothing else. */
+.stage-main {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  /* same priority rule one level down: the felt row's floor is the felt's own
+     min-content, so the rail and the buttons can never crush it either */
+  grid-template-rows: minmax(min-content, 1fr) auto auto;
+  align-items: stretch;
+  justify-items: center;
+  gap: clamp(6px, 1.1vh, 14px);
+}
+
+.stage-main > .felt,
+.stage-main > .felt-rail {
+  width: 100%;
+  max-width: var(--felt-w);
+  justify-self: center;
+}
+
+/*  Inside a stage the fixed `clamp(240px, 34vh, 420px)` floor is wrong in both
+    directions: too tall to fit a 360x640 stage, and (as `0`) no floor at all.
+    `min-content` is the adaptive version — the felt is never shorter than the
+    pot column it has to draw, and never taller than it needs to be. This is
+    what makes `overflow: hidden` below a corner-clip for the gradient rather
+    than a guillotine for the type. */
+.table-stage .felt {
+  min-height: min-content;
+}
+
+.table-stage .felt-rail {
+  /* the rail's floor comes from the felt inside it, not from a number here */
+  min-height: 0;
+}
+
+/*  SIDE COLUMN — the log panel fills its column height; the list scrolls inside
+    it (see `.log-panel .event-log`) so the panel never grows past the stage. */
+.stage-side {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.stage-side > .log-panel {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/*  Narrow / portrait: one column. The log becomes a short strip under the main
+    column so the felt keeps the lion's share of the height. `--log-strip-h` is
+    a ceiling AND the strip is allowed to shrink below it (`min-height: 0`), so
+    a log with 6 entries and a log with 60 occupy exactly the same band and the
+    felt's height is independent of how long the round has been running. */
+.table-stage > .stage-side,
+.table-stage:not(:has(> .stage-main)) > .log-panel {
+  max-height: var(--log-strip-h);
+  min-height: 0;
+}
+
+@media (min-width: 900px) and (orientation: landscape) {
+  .table-stage:has(> .stage-side),
+  .table-stage:not(:has(> .stage-main)):has(> .log-panel) {
+    grid-template-columns: minmax(0, 1fr) var(--log-w);
+    /*  Deliberately `minmax(0, 1fr)` and NOT the `min-content` floor row 1 uses
+        in the stacked layout. Here the single row spans BOTH columns, so a
+        min-content floor would be floored by the LOG's min-content as well —
+        i.e. by the full unscrolled height of every entry — and a long log would
+        stretch the row to ~1500 px and blow the felt and the buttons clean off
+        a 900 px stage. In this layout the felt is not competing with the log for
+        height at all (they are side by side), so the floor is not needed: the
+        felt's own floor lives on `.stage-main`'s internal row. */
+    grid-template-rows: minmax(0, 1fr);
+    column-gap: clamp(14px, 1.8vw, 30px);
+  }
+
+  .table-stage > .stage-main,
+  .table-stage:not(:has(> .stage-main)) > :not(.log-panel) {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .table-stage > .stage-side,
+  .table-stage:not(:has(> .stage-main)) > .log-panel {
+    grid-column: 2;
+    grid-row: 1;
+    max-height: none;
+    align-self: stretch;
+  }
 }
 
 .table-round {
@@ -496,8 +658,8 @@ body {
   box-sizing: border-box;
   width: 100%;
   max-width: var(--felt-w);
-  min-height: clamp(270px, 42vh, 460px);
-  padding: clamp(20px, 3.4vh, 38px) clamp(18px, 3vw, 34px) clamp(18px, 3vh, 32px);
+  min-height: clamp(240px, 34vh, 420px);
+  padding: clamp(18px, 3vh, 36px) clamp(18px, 3vw, 34px) clamp(16px, 2.6vh, 30px);
   border: clamp(10px, 1.5vh, 16px) solid transparent;
   border-radius: 34px;
   background:
@@ -517,7 +679,13 @@ body {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: clamp(6px, 1.2vh, 14px);
+  /* the felt now owns most of the stage, so the pot column breathes across it
+     instead of clustering into a small block in the middle of a big table */
+  gap: clamp(6px, 2.2vh, 28px);
+  /* defensive: the felt's height comes from its grid row, so on a viewport too
+     short for the pot column the type is clipped by the felt rather than drawn
+     across the wooden rail */
+  overflow: hidden;
 }
 
 .felt > * {
@@ -532,7 +700,10 @@ body {
   box-sizing: border-box;
   width: 100%;
   max-width: var(--felt-w);
-  padding: clamp(12px, 1.8vh, 20px);
+  /* flex, so the felt inside stretches to the rail's full height and the rail
+     in turn stretches to its grid row — the felt is never a fixed-size card */
+  display: flex;
+  padding: clamp(11px, 1.7vh, 20px);
   border-radius: 48px;
   background: var(--rail-wood);
   box-shadow:
@@ -554,7 +725,9 @@ body {
 }
 
 .felt-rail > .felt {
+  flex: 1 1 auto;
   max-width: none;
+  min-width: 0;
   border: 0;
   border-radius: 32px;
   background: var(--felt-surface);
@@ -573,6 +746,34 @@ body {
   flex-direction: column;
   align-items: center;
   gap: inherit;
+}
+
+/*  As a content wrapper it fills the felt and centres the pot column in it. Its
+    floor is `min-content`, NOT 0: a 0 floor let the flex box be squeezed below
+    the height of the column it contains, and because the column is centred the
+    overflow spilled out of BOTH ends of an `overflow: hidden` felt at once —
+    the POT caption sheared off the top while the timer bar sheared off the
+    bottom. With a min-content floor the wrapper reports its true height up
+    through the felt to the grid row, which is where the space is actually
+    negotiated. */
+.felt > .felt-inner:not(:empty) {
+  flex: 1 1 auto;
+  min-height: min-content;
+  justify-content: center;
+}
+
+/*  Every item in the pot column keeps its own height. Flex items default to
+    shrinkable, and the timer bar (an 8 px box whose only child is height: 100 %)
+    has a content-based minimum of 0 — so under pressure it silently flattened
+    to a 0 px line and the bar disappeared. Nothing in this column should ever
+    pay for a shortage of height; the grid row above pays instead. */
+.felt-inner > *,
+.felt > .pot-label,
+.felt > .pot-value,
+.felt > .pot-flash,
+.felt > .dice-area,
+.felt > .timer-bar {
+  flex: 0 0 auto;
 }
 
 .felt > .felt-inner:empty {
@@ -615,7 +816,7 @@ body {
 
 .pot-value {
   font-family: var(--serif);
-  font-size: clamp(48px, 11vh, 96px);
+  font-size: clamp(46px, 11.5vh, 116px);
   font-weight: 700;
   line-height: 1;
   color: var(--gold-bright);
@@ -642,9 +843,9 @@ body {
   justify-content: center;
   align-items: center;
   gap: 18px;
-  min-height: clamp(84px, 13vh, 120px);
-  width: min(360px, 88%);
-  margin: clamp(2px, 0.8vh, 8px) 0;
+  min-height: clamp(80px, 14vh, 146px);
+  width: min(400px, 88%);
+  margin: clamp(2px, 1vh, 12px) 0;
   border-radius: 999px;
   background: radial-gradient(
     ellipse 70% 62% at 50% 58%,
@@ -687,6 +888,71 @@ body {
   }
   50% {
     opacity: 0.55;
+  }
+}
+
+/*  PORTRAIT / SHORT-LANDSCAPE RE-BUDGET.
+    In portrait the felt gets roughly half the stage height instead of ~78 %, so
+    the pot column is re-costed to fit inside it — smaller numerals, tighter
+    gaps, a shallower roll zone. Every declaration here is a plain single-class
+    selector, exactly as specific as the base rule it is meant to beat, so this
+    block MUST stay physically below `.pot-value` / `.pot-flash` / `.dice-area`
+    or the cascade hands the win to the base rule on source order and the whole
+    re-budget silently does nothing. (It used to sit above them and did exactly
+    that: at 430x880 `.pot-value` was still rendering at 11.5vh.) Keep it last.
+    Because the felt's grid row is floored at its own `min-content`, this block
+    is what sets that floor — it is the difference between a felt that asks for
+    300 px on a phone and one that asks for 500 px it cannot have. */
+@media (orientation: portrait), (max-height: 640px) {
+  .felt {
+    gap: clamp(4px, 1.2vh, 15px);
+    padding: clamp(14px, 2.2vh, 26px) clamp(14px, 3vw, 30px) clamp(12px, 2vh, 22px);
+  }
+
+  .pot-label {
+    font-size: 12px;
+    letter-spacing: 0.42em;
+    text-indent: 0.42em;
+  }
+
+  .pot-value {
+    font-size: clamp(38px, 8vh, 88px);
+  }
+
+  .pot-flash {
+    min-height: 16px;
+    font-size: clamp(13px, 1.8vh, 18px);
+  }
+
+  .dice-area {
+    min-height: clamp(70px, 10vh, 112px);
+    margin: 0;
+  }
+
+  .timer-bar {
+    width: min(420px, 92%);
+  }
+}
+
+/*  Short LANDSCAPE (a 900x500 laptop, a phone turned sideways) is caught by the
+    `max-height: 640px` arm above, but it is not the case that arm is budgeting
+    for: here the log is a side COLUMN, not a strip under the felt, so the felt
+    still owns ~70 % of the stage and the phone-sized numerals it just inherited
+    leave a third of the table empty. Give the height back. Must stay below the
+    block above — same specificity, source order decides. */
+@media (min-width: 900px) and (orientation: landscape) and (max-height: 640px) {
+  .pot-label {
+    font-size: 13px;
+    letter-spacing: 0.5em;
+    text-indent: 0.5em;
+  }
+
+  .pot-value {
+    font-size: clamp(44px, 11vh, 92px);
+  }
+
+  .pot-flash {
+    min-height: 18px;
   }
 }
 
@@ -957,7 +1223,10 @@ body {
   box-sizing: border-box;
   display: flex;
   flex-direction: column;
-  min-height: 0;
+  /* fills its column; the list inside it scrolls (`.log-panel .event-log`) so
+     the panel is never the thing that grows */
+  height: 100%;
+  min-height: 108px;
   padding: 12px 14px 14px;
   border: 1px solid color-mix(in srgb, var(--gold) 18%, transparent);
   border-radius: 14px;

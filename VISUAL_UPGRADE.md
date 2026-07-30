@@ -83,7 +83,7 @@ Let **L** = perceptual lightness (CIE L*, 0–100), from `L()` in `@platform/sha
   shadow over the ground is `≥ 8 L` below the ground — verify with `composite()`, not the raw hex.
   `composite()` blends in **linear light**, as three.js does; an 8-bit sRGB lerp overstates the
   darkening by ~13 L* and will tell you a failing shadow passes.
-  Exempt where the ground is below `L 20` (Bunker only): no alpha can darken a near-black floor,
+  Exempt where the ground is below `L 20` (no map qualifies since Bunker was lifted for L5; kept for future dark maps): no alpha can darken a near-black floor,
   and grounding is carried by plinth geometry instead.
   *(These two were a single incoherent rule in the first draft — it defined the band relative to
   the ground but keyed the table by the wall, and failed on 4 of 6 maps. Do not merge them again.)*
@@ -156,7 +156,7 @@ value in `games/fps/shared/src/valueLadder.test.ts`, and every one is **F1–F6'
 | office | S1 |
 | frostbite | L1, L4-exempt, S1, S2, S4 — `floorMat` is `snow`, the same MatId as its main wall; §3a says `snowShadow` |
 | urbana | S2, S4 |
-| bunker | L1, L4-exempt, S1, S2 — `floorMat` should be `metalDeep`, not `metalDark` |
+| bunker | L1, L4-exempt, S1, S2 — `floorMat` became `metalDark` and the main wall `concrete`, forced by L5 |
 
 All 17 are reachable inside the frozen palette — this is tuning, not a contract gap.
 
@@ -212,7 +212,7 @@ every tie: enemies must pop harder after this pass, never less.
 | Office | `carpet` (darkened) | `plaster` | `carpetDeep` | cool blue-grey carpet ⇄ warm plaster; screens are the only saturated light |
 | Frostbite | `snowShadow` (dropped) | **`snow`** is the L1 reference — `concrete` is NOT a main wall here (it is 13 L *below* the ground and would recreate the Urbana inversion); use `rock`/`rockDeep` as the dark anchor for masses only | `snowDeep` | **monochrome by design** — exempt from L4, must clear `L1 ≥ 28` |
 | Urbana | `tarmac` (**stop using `plaster`** — the inversion) | **`plaster`** is the L1 reference; `brick` is a secondary facade mass and must still clear `tarmac` by 20 | `plasterDeep` / `brickDeep` | cool street ⇄ warm plaster/brick facades |
-| Bunker | `metalDeep` | `concreteDark` | `metalDeep` | **monochrome by design** — exempt from L4, must clear `L1 ≥ 28`. Carry interest with **saturated skylight shafts** and warm emergency accents against cold concrete. Also L2b-exempt: the floor is below L 25, so props are grounded by geometry, not by shadow quads |
+| Bunker | `metalDark` | `concrete` | `metalDeep` | **monochrome by design** — exempt from L4, must clear `L1 ≥ 28`. Carry interest with **saturated skylight shafts** and warm emergency accents against cold concrete. Lifted from `metalDeep`/`concreteDark` when L5 landed: that pairing became UNSATISFIABLE (L5 wants ground >= 22, monochrome L1 wants <= 18.2). No longer L2b-exempt either — the floor is now L 27.7, so contact shadows work again |
 
 ### 3b. Wall articulation — the second-biggest lever
 

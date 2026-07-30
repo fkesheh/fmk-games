@@ -30,7 +30,12 @@ const L1_REFERENCE_WALL: Record<MapId, MatId> = {
   office: 'plaster',
   frostbite: 'snow',
   urbana: 'plaster',
-  bunker: 'concreteDark',
+  // Bunker's reference wall was 'concreteDark' (L*46.2) while its floor was
+  // 'metalDeep' (L*14.5). Adding the L5 readability floor made that pairing
+  // UNSATISFIABLE: L5 wants ground >= 22, monochrome L1 wants ground <= 18.2,
+  // and no MatId lies in an empty interval. The map lifts to 'concrete'/'metalDark'
+  // (58.4 - 27.7 = 30.7 >= 28), which clears both.
+  bunker: 'concrete',
 };
 
 // §1 L4 monochrome exemption: declared monochrome-by-design in §3a. Exempt from
