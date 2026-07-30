@@ -1,20 +1,119 @@
 /* ============================================================================
-   KART GP client — paddock theme (docs/KART.md): ink background, charcoal
-   panels, gold accents. EVERY color traces to KPAL (@kart/shared palette) —
-   the CSS vars below are the palette, rgba() tints are alpha variants of the
-   same entries. Screens + HUD chrome live here; the 3D scene is drawn by
-   render.ts onto the canvas. No external assets or fonts.
+   KART GP client — paddock theme. EVERY colour traces to KPAL
+   (games/kart/shared/src/palette.ts) by name.
+
+   COLOUR RULE (VISUAL_UPGRADE.md §0 + seam rule 7): the `:root` block below is
+   the ONE permitted place in this file for hex literals, and every literal
+   there mirrors a KPAL entry EXACTLY. K7 (main.ts) rewrites the same custom
+   properties at boot from the real KPAL object, so these declarations are the
+   pre-boot fallback, not a second source of truth. Every other colour in this
+   file is `var(--x)` or `color-mix(in srgb, var(--x) N%, transparent)` — an
+   alpha variant of a named palette entry, which keeps tints tracking the
+   runtime mirror instead of freezing a stale rgba() triple.
+
+   NAMING: camelCase KPAL key -> `--kebab-case`, the same convention BANK's
+   frozen `BPAL_CSS_VARS` uses. `--cream` and `--teal` survive as aliases of
+   `--hud-text` / `--kart-teal` for continuity; note `--asphalt` is now
+   KPAL.asphalt (it used to hold asphaltLight) — use `--asphalt-light`.
+
+   HUD IDIOM (VISUAL_UPGRADE.md §4): the HUD was flat grey boxes. It is now a
+   chip system with a two-tier value ladder — `.hud-chip-hi` for the reads a
+   driver takes at 200 km/h (place, speed), `.hud-chip-lo` for reference data
+   (lap times, nitro, minimap). Every chip is a lit top face falling to an ink
+   bottom face, a 1 px steel edge, a cream rim highlight and a cast shadow, so
+   it sits ON the track rather than floating in it. Corner scrims darken the
+   backdrop underneath so the chips read over bright grass AND over sky.
+
+   Screens + HUD chrome live here; the 3D scene is drawn by render.ts onto the
+   canvas. No external assets or fonts.
    ============================================================================ */
 
 :root {
-  --ink: #14171c; /* KPAL.ink */
-  --charcoal: #23282f; /* KPAL.charcoal */
-  --gold: #d4af37; /* KPAL.gold */
-  --steel: #9aa3ad; /* KPAL.steel */
-  --cream: #e8e6df; /* KPAL.hudText */
-  --danger: #c0392b; /* KPAL.danger */
-  --teal: #2f8f8f; /* KPAL.kartTeal */
-  --asphalt: #4a5058; /* KPAL.asphaltLight */
+  /* ---- KPAL mirror: road ---- */
+  --asphalt-lit: #5b626b;
+  --asphalt-light: #4a5058;
+  --asphalt: #3a3f45;
+  --asphalt-deep: #24282c;
+  --curb-red: #c0392b;
+  --curb-white: #e8e6df;
+  --start-line: #e8e6df;
+  --line-white: #d8d6cf;
+
+  /* ---- KPAL mirror: terrain ---- */
+  --grass-lit: #6a9c52;
+  --grass: #4a7a3d;
+  --grass-dark: #3d6a31;
+  --grass-deep: #2a4a22;
+  --dirt: #7a5a39;
+  --dirt-deep: #4a3722;
+  --rock: #6e6e66;
+  --rock-deep: #3f3f39;
+  --ridge-near: #4f7444;
+  --ridge-far: #7d97a3;
+
+  /* ---- KPAL mirror: sky ---- */
+  --sky-high: #4d78ae;
+  --sky: #7fa4c9;
+  --horizon: #c8d8e8;
+  --fog: #c8d8e8;
+  --cloud: #eef4f9;
+  --cloud-shade: #b8c6d4;
+
+  /* ---- KPAL mirror: vegetation ---- */
+  --tree-trunk: #5d3a1a;
+  --tree-trunk-deep: #38230f;
+  --tree-leaf-light: #3e7c2f;
+  --tree-leaf: #2d5e23;
+  --tree-leaf-deep: #1b3d15;
+
+  /* ---- KPAL mirror: trackside furniture ---- */
+  --barrier-white: #e8e6df;
+  --barrier-red: #a03028;
+  --ink: #14171c;
+  --charcoal: #23282f;
+  --gold: #d4af37;
+  --steel: #9aa3ad;
+  --steel-deep: #5a616a;
+  --tire: #1d2126;
+  --concrete: #8d8d83;
+  --concrete-deep: #43443e;
+
+  /* ---- KPAL mirror: HUD ---- */
+  --hud-text: #e8e6df;
+  --danger: #c0392b;
+
+  /* ---- KPAL mirror: player karts ---- */
+  --kart-red: #c0392b;
+  --kart-blue: #3d5a9b;
+  --kart-green: #4a7a3d;
+  --kart-yellow: #c8912f;
+  --kart-purple: #7a4a9b;
+  --kart-orange: #c86a2f;
+  --kart-teal: #2f8f8f;
+  --kart-pink: #c86a9b;
+
+  /* ---- legacy aliases (kept so nothing that already reads them breaks) ---- */
+  --cream: var(--hud-text);
+  --teal: var(--kart-teal);
+
+  /* ---- chip surface tokens: the base tier of the HUD value ladder ----------
+     Tier classes below reassign these custom properties instead of fighting
+     the cascade, so `.hud-chip-hi` / `.hud-chip-lo` win over the element
+     defaults regardless of rule order. */
+  --chip-face-top: color-mix(in srgb, var(--charcoal) 76%, transparent);
+  --chip-face-bot: color-mix(in srgb, var(--ink) 80%, transparent);
+  --chip-edge: color-mix(in srgb, var(--steel) 30%, transparent);
+  --chip-rim: color-mix(in srgb, var(--hud-text) 16%, transparent);
+  --chip-floor: color-mix(in srgb, var(--ink) 60%, transparent);
+  --chip-cast: color-mix(in srgb, var(--ink) 48%, transparent);
+  --chip-radius: 10px;
+  --chip-blur: blur(7px);
+
+  /* ---- shared type shadows: HUD text must survive a white sky ---- */
+  --text-cast: 0 1px 0 color-mix(in srgb, var(--ink) 88%, transparent),
+    0 2px 10px color-mix(in srgb, var(--ink) 72%, transparent);
+  --text-cast-big: 0 2px 0 color-mix(in srgb, var(--ink) 92%, transparent),
+    0 5px 20px color-mix(in srgb, var(--ink) 78%, transparent);
 }
 
 html,
@@ -22,9 +121,11 @@ body {
   margin: 0;
   height: 100%;
   background: var(--ink);
-  color: var(--cream);
+  color: var(--hud-text);
+  color-scheme: dark;
   font-family:
     -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
 }
 
 #app {
@@ -42,9 +143,12 @@ body {
   right: 0;
   padding: 10px 16px;
   background: var(--danger);
-  color: var(--cream);
+  color: var(--hud-text);
   font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
   text-align: center;
+  box-shadow: 0 4px 18px color-mix(in srgb, var(--ink) 70%, transparent);
   z-index: 99;
 }
 
@@ -59,12 +163,26 @@ body {
   overflow-y: auto;
 }
 
-/* ---- menu (same idiom as the bank menu) --------------------------------------- */
+/* ---- menu -------------------------------------------------------------------- */
+/* The paddock: an ink page lit by a single warm pool behind the title, so the
+   menu has a focal point instead of reading as a form on a black rectangle. */
 
 .menu {
+  position: relative;
   justify-content: center;
   gap: 14px;
   padding: 32px 20px;
+  background:
+    radial-gradient(
+      120% 62% at 50% 8%,
+      color-mix(in srgb, var(--gold) 9%, transparent),
+      transparent 62%
+    ),
+    radial-gradient(
+      100% 80% at 50% 108%,
+      color-mix(in srgb, var(--asphalt) 42%, transparent),
+      transparent 70%
+    );
 }
 
 .menu-title {
@@ -72,8 +190,11 @@ body {
   font-size: clamp(48px, 11vw, 88px);
   font-weight: 800;
   letter-spacing: 0.14em;
+  line-height: 1;
   color: var(--gold);
-  text-shadow: 0 2px 0 rgba(20, 23, 28, 0.9), 0 6px 24px rgba(212, 175, 55, 0.25);
+  text-shadow:
+    0 2px 0 color-mix(in srgb, var(--ink) 90%, transparent),
+    0 6px 26px color-mix(in srgb, var(--gold) 26%, transparent);
 }
 
 .menu-sub {
@@ -88,22 +209,30 @@ body {
   padding: 6px 14px;
   border: 1px solid var(--gold);
   border-radius: 6px;
+  background: color-mix(in srgb, var(--gold) 10%, transparent);
   color: var(--gold);
   font-size: 14px;
+  letter-spacing: 0.04em;
 }
 
 .menu-name,
 .menu-code-input {
   box-sizing: border-box;
   padding: 12px 14px;
-  border: 1px solid var(--asphalt);
+  border: 1px solid var(--asphalt-light);
   border-radius: 8px;
-  background: var(--charcoal);
-  color: var(--cream);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--charcoal) 92%, transparent),
+    color-mix(in srgb, var(--ink) 88%, transparent)
+  );
+  box-shadow: inset 0 2px 6px color-mix(in srgb, var(--ink) 70%, transparent);
+  color: var(--hud-text);
   font-size: 16px;
   text-align: center;
   letter-spacing: 0.06em;
   outline: none;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
 }
 
 .menu-name {
@@ -113,6 +242,9 @@ body {
 .menu-name:focus,
 .menu-code-input:focus {
   border-color: var(--gold);
+  box-shadow:
+    inset 0 2px 6px color-mix(in srgb, var(--ink) 70%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--gold) 22%, transparent);
 }
 
 .menu-actions {
@@ -130,6 +262,52 @@ body {
 .menu-code-input {
   width: 120px;
   text-transform: uppercase;
+}
+
+/* kids-mode toggle: a real togglable pill (it had no rule at all before, so it
+   rendered as a bare checkbox and a stray word). Whole label is the hit area. */
+.menu-kids {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--steel) 34%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--charcoal) 62%, transparent);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--hud-text) 10%, transparent);
+  cursor: pointer;
+  user-select: none;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.menu-kids:hover {
+  border-color: color-mix(in srgb, var(--gold) 60%, transparent);
+  background: color-mix(in srgb, var(--charcoal) 82%, transparent);
+}
+
+.menu-kids input[type='checkbox'] {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--gold);
+  cursor: pointer;
+}
+
+.menu-kids:has(input:checked) {
+  border-color: var(--gold);
+  background: color-mix(in srgb, var(--gold) 12%, transparent);
+}
+
+.menu-kids-label {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  color: var(--steel);
+  transition: color 120ms ease;
+}
+
+.menu-kids:has(input:checked) .menu-kids-label {
+  color: var(--gold);
 }
 
 .menu-rooms-title {
@@ -153,20 +331,39 @@ body {
   font-style: italic;
 }
 
+/* row is clickable — the cursor used to come from a JS inline style (§9) */
 .room-row {
   display: flex;
   align-items: baseline;
   gap: 10px;
-  padding: 8px 12px;
-  border: 1px solid rgba(74, 80, 88, 0.6);
+  padding: 9px 13px;
+  border: 1px solid color-mix(in srgb, var(--asphalt-light) 60%, transparent);
+  border-left: 3px solid color-mix(in srgb, var(--gold) 45%, transparent);
   border-radius: 8px;
-  background: rgba(35, 40, 47, 0.6);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--charcoal) 66%, transparent),
+    color-mix(in srgb, var(--ink) 58%, transparent)
+  );
   font-size: 14px;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease, transform 120ms ease;
+}
+
+.room-row:hover {
+  border-color: var(--gold);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--charcoal) 92%, transparent),
+    color-mix(in srgb, var(--ink) 74%, transparent)
+  );
+  transform: translateX(2px);
 }
 
 .room-title {
   color: var(--gold);
   font-weight: 600;
+  letter-spacing: 0.04em;
 }
 
 .room-label {
@@ -186,7 +383,11 @@ body {
   padding: 12px 20px;
   border: 1px solid var(--gold);
   border-radius: 8px;
-  background: transparent;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--gold) 10%, transparent),
+    transparent
+  );
   color: var(--gold);
   font-size: 15px;
   font-weight: 700;
@@ -196,7 +397,8 @@ body {
 }
 
 .btn:hover:not(:disabled) {
-  background: rgba(212, 175, 55, 0.12);
+  background: color-mix(in srgb, var(--gold) 20%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--gold) 16%, transparent);
 }
 
 .btn:disabled {
@@ -205,14 +407,22 @@ body {
 }
 
 .btn-gold {
-  background: var(--gold);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--hud-text) 26%, var(--gold)),
+    var(--gold) 55%,
+    color-mix(in srgb, var(--ink) 16%, var(--gold))
+  );
   color: var(--ink);
   border-color: var(--gold);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--hud-text) 55%, transparent),
+    0 4px 14px color-mix(in srgb, var(--gold) 24%, transparent);
 }
 
 .btn-gold:hover:not(:disabled) {
-  background: var(--cream);
-  border-color: var(--cream);
+  background: var(--hud-text);
+  border-color: var(--hud-text);
   color: var(--ink);
 }
 
@@ -245,9 +455,7 @@ body {
   z-index: 6;
 }
 
-/* ---- HUD (ready / countdown / racing) ------------------------------------------ */
-/* Chip idiom: translucent ink + subtle backdrop blur, 1px cream-alpha border,
-   consistent 8px radius. Colors stay KPAL-derived (rgba tints of --ink/--cream). */
+/* ---- HUD ---------------------------------------------------------------------- */
 
 .hud {
   position: absolute;
@@ -256,26 +464,134 @@ body {
   z-index: 4;
 }
 
+/* corner scrims: the track behind the HUD swings from near-black asphalt to a
+   near-white sky within one corner. A soft ink wash under each cluster keeps
+   the chips legible over both without painting a visible box. */
+.hud-scrim {
+  position: absolute;
+  width: 40%;
+  height: 34%;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.hud-corner-tl,
+.hud-corner-tr,
+.hud-corner-bl,
+.hud-corner-br {
+  position: absolute;
+}
+
+.hud-corner-tl {
+  top: 14px;
+  left: 16px;
+}
+
+.hud-corner-tr {
+  top: 14px;
+  right: 16px;
+}
+
+.hud-corner-bl {
+  bottom: 16px;
+  left: 16px;
+}
+
+.hud-corner-br {
+  bottom: 16px;
+  right: 16px;
+}
+
+.hud-scrim.hud-corner-tl {
+  top: 0;
+  left: 0;
+  background: radial-gradient(
+    120% 120% at 0% 0%,
+    color-mix(in srgb, var(--ink) 58%, transparent),
+    transparent 72%
+  );
+}
+
+.hud-scrim.hud-corner-tr {
+  top: 0;
+  right: 0;
+  background: radial-gradient(
+    120% 120% at 100% 0%,
+    color-mix(in srgb, var(--ink) 58%, transparent),
+    transparent 72%
+  );
+}
+
+.hud-scrim.hud-corner-bl {
+  bottom: 0;
+  left: 0;
+  background: radial-gradient(
+    120% 120% at 0% 100%,
+    color-mix(in srgb, var(--ink) 58%, transparent),
+    transparent 72%
+  );
+}
+
+.hud-scrim.hud-corner-br {
+  bottom: 0;
+  right: 0;
+  background: radial-gradient(
+    120% 120% at 100% 100%,
+    color-mix(in srgb, var(--ink) 58%, transparent),
+    transparent 72%
+  );
+}
+
+/* the chip surface — one idiom, applied to every HUD panel */
+.hud-chip,
+.hud-pos,
+.hud-lap,
+.hud-speed,
+.hud-minimap,
+.hud-times,
+.hud-nitro,
+.hud-gate-label,
+.hint-card {
+  border: 1px solid var(--chip-edge);
+  border-radius: var(--chip-radius);
+  background: linear-gradient(180deg, var(--chip-face-top), var(--chip-face-bot));
+  box-shadow:
+    inset 0 1px 0 var(--chip-rim),
+    inset 0 -1px 0 var(--chip-floor),
+    0 6px 18px var(--chip-cast);
+  backdrop-filter: var(--chip-blur);
+  -webkit-backdrop-filter: var(--chip-blur);
+}
+
+/* hairline divider inside a chip */
+.hud-rule {
+  align-self: stretch;
+  height: 1px;
+  margin: 5px 0;
+  border: 0;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in srgb, var(--hud-text) 24%, transparent),
+    transparent
+  );
+}
+
 .hud-left {
   position: absolute;
   top: 14px;
   left: 16px;
+  z-index: 1;
   display: flex;
   flex-direction: column;
   align-items: flex-start;
   gap: 8px;
 }
 
-/* position chip: big ordinal + /N + gap — gold edge bar, 1px top rim highlight */
+/* position chip — top of the value ladder: gold edge bar, biggest numeral */
 .hud-pos {
   padding: 8px 14px 9px;
-  border: 1px solid rgba(232, 230, 223, 0.12);
   border-left: 3px solid var(--gold);
-  border-radius: 8px;
-  background: rgba(20, 23, 28, 0.55);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
-  box-shadow: inset 0 1px 0 rgba(232, 230, 223, 0.16);
 }
 
 .hud-pos-main {
@@ -285,11 +601,38 @@ body {
   line-height: 1;
 }
 
-.hud-pos-num {
-  font-size: clamp(40px, 6.5vw, 64px);
+/* P1 accent. Empty by default (K6 may leave it textless), so it draws its own
+   mark; with content it reads as a gold badge in the `.hud-kids` idiom. */
+.hud-pos-crown {
+  display: inline-block;
+  min-width: 16px;
+  height: 15px;
+  margin-bottom: 3px;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--hud-text) 40%, var(--gold)),
+    var(--gold)
+  );
+  color: var(--ink);
+  font-size: 10px;
   font-weight: 800;
-  color: var(--cream);
-  text-shadow: 0 2px 0 rgba(20, 23, 28, 0.9), 0 4px 18px rgba(20, 23, 28, 0.7);
+  line-height: 15px;
+  letter-spacing: 0.12em;
+  text-align: center;
+  box-shadow: 0 0 10px color-mix(in srgb, var(--gold) 45%, transparent);
+}
+
+.hud-pos-crown:empty::before {
+  content: '\2605';
+}
+
+.hud-pos-num {
+  font-size: clamp(42px, 6.8vw, 68px);
+  font-weight: 800;
+  color: var(--hud-text);
+  text-shadow: var(--text-cast-big);
   font-variant-numeric: tabular-nums;
 }
 
@@ -297,6 +640,7 @@ body {
   font-size: clamp(16px, 2.2vw, 24px);
   font-weight: 800;
   color: var(--gold);
+  text-shadow: var(--text-cast);
 }
 
 .hud-pos-total {
@@ -316,6 +660,7 @@ body {
   letter-spacing: 0.14em;
   color: var(--steel);
   font-variant-numeric: tabular-nums;
+  text-shadow: var(--text-cast);
 }
 
 .hud-pos-gap.hud-pos-leader {
@@ -335,24 +680,19 @@ body {
 }
 
 .hud-lap {
-  padding: 4px 10px;
-  border: 1px solid rgba(232, 230, 223, 0.12);
-  border-radius: 8px;
-  background: rgba(20, 23, 28, 0.55);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
-  box-shadow: inset 0 1px 0 rgba(232, 230, 223, 0.16);
+  padding: 5px 11px;
   font-size: clamp(14px, 2vw, 20px);
   font-weight: 700;
   letter-spacing: 0.18em;
   color: var(--gold);
-  text-shadow: 0 2px 8px rgba(20, 23, 28, 0.8);
+  text-shadow: var(--text-cast);
 }
 
 .hud-right {
   position: absolute;
   top: 14px;
   right: 16px;
+  z-index: 1;
   display: flex;
   flex-direction: column;
   align-items: flex-end;
@@ -366,14 +706,9 @@ body {
   align-items: flex-end;
   gap: 1px;
   padding: 7px 14px 9px;
-  border: 1px solid rgba(232, 230, 223, 0.12);
-  border-radius: 8px;
-  background: rgba(20, 23, 28, 0.55);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
-  box-shadow: inset 0 1px 0 rgba(232, 230, 223, 0.16);
-  color: var(--cream);
-  text-shadow: 0 2px 0 rgba(20, 23, 28, 0.9), 0 4px 18px rgba(20, 23, 28, 0.7);
+  border-right: 3px solid var(--gold);
+  color: var(--hud-text);
+  text-shadow: var(--text-cast-big);
 }
 
 /* gear stacked ABOVE the speed — adjacent big numerals kerned into one read */
@@ -398,6 +733,22 @@ body {
   color: var(--gold);
 }
 
+/* upshift flash — replaces the per-shift inline opacity write */
+.hud-gear.gear-flash {
+  animation: gear-flash 240ms ease-out;
+}
+
+@keyframes gear-flash {
+  0% {
+    color: var(--hud-text);
+    transform: translateY(-2px) scale(1.35);
+  }
+  100% {
+    color: var(--gold);
+    transform: none;
+  }
+}
+
 .hud-speed-row {
   display: flex;
   align-items: baseline;
@@ -405,9 +756,10 @@ body {
 }
 
 .hud-speed-num {
-  font-size: clamp(36px, 6vw, 60px);
+  font-size: clamp(38px, 6.4vw, 64px);
   font-weight: 800;
   font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
 }
 
 .hud-speed-unit {
@@ -417,33 +769,43 @@ body {
   color: var(--steel);
 }
 
+/* speed meter fill: grows left->right across the chip, gold shading to cream at
+   the top of the range so peak speed is a colour event as well as a number. */
+.hud-speed-bar {
+  align-self: stretch;
+  height: 5px;
+  min-width: 5px;
+  margin-top: 6px;
+  border-radius: 3px;
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--gold) 55%, var(--asphalt-lit)),
+    var(--gold) 68%,
+    var(--hud-text)
+  );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--hud-text) 40%, transparent),
+    0 0 10px color-mix(in srgb, var(--gold) 40%, transparent);
+  transition: width 90ms linear;
+  will-change: width;
+}
+
 /* minimap: 140px canvas, chip-framed (the outline/dots are drawn by app.ts) */
 .hud-minimap {
   width: 140px;
   height: 140px;
   padding: 4px;
-  border: 1px solid rgba(232, 230, 223, 0.12);
-  border-radius: 8px;
-  background: rgba(20, 23, 28, 0.55);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
-  box-shadow: inset 0 1px 0 rgba(232, 230, 223, 0.16);
 }
 
 .hud-times {
   position: absolute;
   left: 16px;
   bottom: 16px;
+  z-index: 1;
   display: flex;
   flex-direction: column;
   gap: 4px;
   padding: 10px 14px;
-  border: 1px solid rgba(232, 230, 223, 0.12);
-  border-radius: 8px;
-  background: rgba(20, 23, 28, 0.55);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
-  box-shadow: inset 0 1px 0 rgba(232, 230, 223, 0.16);
 }
 
 .hud-time-row {
@@ -462,9 +824,9 @@ body {
 .hud-time-value {
   font-size: clamp(18px, 3vw, 28px);
   font-weight: 700;
-  color: var(--cream);
+  color: var(--hud-text);
   font-variant-numeric: tabular-nums;
-  text-shadow: 0 2px 8px rgba(20, 23, 28, 0.8);
+  text-shadow: var(--text-cast);
 }
 
 .hud-best {
@@ -475,17 +837,12 @@ body {
   position: absolute;
   right: 16px;
   bottom: 16px;
+  z-index: 1;
   display: flex;
   flex-direction: column;
   align-items: flex-end;
   gap: 6px;
   padding: 10px 14px;
-  border: 1px solid rgba(232, 230, 223, 0.12);
-  border-radius: 8px;
-  background: rgba(20, 23, 28, 0.55);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
-  box-shadow: inset 0 1px 0 rgba(232, 230, 223, 0.16);
 }
 
 .hud-turbo-label {
@@ -499,38 +856,52 @@ body {
   gap: 6px;
 }
 
+/* base pip = SPENT (an empty socket). `hud-nitro-pip-full` is the charge —
+   it replaces the per-frame inline opacity write (§9). */
 .hud-nitro-pip {
   width: 22px;
   height: 10px;
   border-radius: 5px;
-  border: 1px solid var(--asphalt);
-  background: var(--gold);
-  box-shadow: 0 0 8px rgba(212, 175, 55, 0.35);
-  transition: opacity 120ms linear;
+  border: 1px solid color-mix(in srgb, var(--steel-deep) 70%, transparent);
+  background: color-mix(in srgb, var(--ink) 55%, transparent);
+  box-shadow: inset 0 1px 2px color-mix(in srgb, var(--ink) 80%, transparent);
+  transition: background 140ms ease, box-shadow 140ms ease, border-color 140ms ease;
 }
 
-/* spend flash: the just-consumed pip flares cream + pops scale, then settles dim */
+.hud-nitro-pip.hud-nitro-pip-full {
+  border-color: var(--gold);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--hud-text) 34%, var(--gold)),
+    var(--gold)
+  );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--hud-text) 55%, transparent),
+    0 0 9px color-mix(in srgb, var(--gold) 45%, transparent);
+}
+
+/* spend flash: the just-consumed pip flares cream, pops scale, settles empty */
 .hud-nitro-pip.pip-flash {
   animation: pip-flash 700ms ease-out;
 }
 
 @keyframes pip-flash {
   0% {
-    opacity: 1;
-    background: var(--cream);
-    box-shadow: 0 0 20px rgba(232, 230, 223, 1);
+    background: var(--hud-text);
+    border-color: var(--hud-text);
+    box-shadow: 0 0 20px var(--hud-text);
     transform: scale(1.6);
   }
   45% {
-    opacity: 1;
-    background: var(--cream);
-    box-shadow: 0 0 14px rgba(232, 230, 223, 0.8);
+    background: var(--hud-text);
+    border-color: var(--hud-text);
+    box-shadow: 0 0 14px color-mix(in srgb, var(--hud-text) 80%, transparent);
     transform: scale(1.25);
   }
   100% {
-    opacity: 0.25;
-    background: var(--gold);
-    box-shadow: 0 0 8px rgba(212, 175, 55, 0.35);
+    background: color-mix(in srgb, var(--ink) 55%, transparent);
+    border-color: color-mix(in srgb, var(--steel-deep) 70%, transparent);
+    box-shadow: inset 0 1px 2px color-mix(in srgb, var(--ink) 80%, transparent);
     transform: scale(1);
   }
 }
@@ -541,6 +912,7 @@ body {
   top: 12px;
   left: 50%;
   transform: translateX(-50%);
+  z-index: 1;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -553,22 +925,92 @@ body {
   border-left: 14px solid transparent;
   border-right: 14px solid transparent;
   border-bottom: 22px solid var(--gold);
-  filter: drop-shadow(0 2px 6px rgba(20, 23, 28, 0.8));
+  filter: drop-shadow(0 2px 6px color-mix(in srgb, var(--ink) 80%, transparent));
 }
 
 .hud-gate-label {
   padding: 2px 9px;
-  border: 1px solid rgba(232, 230, 223, 0.12);
-  border-radius: 8px;
-  background: rgba(20, 23, 28, 0.55);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
-  box-shadow: inset 0 1px 0 rgba(232, 230, 223, 0.16);
   font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.12em;
   color: var(--gold);
   font-variant-numeric: tabular-nums;
+}
+
+/* ---- the two-tier chip ladder -------------------------------------------------
+   Declared LAST so an explicit K6 class always beats the element defaults. */
+
+.hud-chip-hi {
+  --chip-face-top: color-mix(in srgb, var(--charcoal) 90%, transparent);
+  --chip-face-bot: color-mix(in srgb, var(--ink) 90%, transparent);
+  --chip-edge: color-mix(in srgb, var(--steel) 46%, transparent);
+  --chip-rim: color-mix(in srgb, var(--hud-text) 24%, transparent);
+  --chip-cast: color-mix(in srgb, var(--ink) 62%, transparent);
+}
+
+.hud-chip-lo {
+  --chip-face-top: color-mix(in srgb, var(--charcoal) 58%, transparent);
+  --chip-face-bot: color-mix(in srgb, var(--ink) 64%, transparent);
+  --chip-edge: color-mix(in srgb, var(--steel) 20%, transparent);
+  --chip-rim: color-mix(in srgb, var(--hud-text) 11%, transparent);
+  --chip-cast: color-mix(in srgb, var(--ink) 40%, transparent);
+}
+
+/* ---- invite chip (private rooms) ------------------------------------------------
+   Two homes, no JS positioning needed: parked inside `.hud-left` it flows with
+   the position/lap chips; promoted to the race screen it pins the top-left
+   corner above the lobby (5) and results (8) overlays. */
+
+.race-invite {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  pointer-events: auto; /* the HUD container is pointer-events:none */
+}
+
+.hud-left > .race-invite {
+  position: static;
+  margin-top: 2px;
+}
+
+.race > .race-invite {
+  position: absolute;
+  top: 14px;
+  left: 16px;
+  z-index: 9;
+}
+
+.race-invite-code,
+.race-invite-chip {
+  padding: 5px 13px;
+  border: 1px solid var(--gold);
+  border-radius: 999px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--charcoal) 82%, transparent),
+    color-mix(in srgb, var(--ink) 88%, transparent)
+  );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--hud-text) 14%, transparent),
+    0 4px 14px color-mix(in srgb, var(--ink) 55%, transparent);
+  backdrop-filter: var(--chip-blur);
+  -webkit-backdrop-filter: var(--chip-blur);
+  color: var(--gold);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  white-space: nowrap;
+}
+
+/* when `race-invite-chip` is used as the row wrapper rather than the pill, it
+   must lay out like the row — the layout properties win over the pill padding */
+.race-invite.race-invite-chip {
+  padding: 0;
+  border: 0;
+  background: none;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 /* ---- lobby overlay (the grid) --------------------------------------------------- */
@@ -580,15 +1022,26 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(20, 23, 28, 0.62);
+  background: radial-gradient(
+    100% 80% at 50% 50%,
+    color-mix(in srgb, var(--ink) 52%, transparent),
+    color-mix(in srgb, var(--ink) 78%, transparent)
+  );
 }
 
 .lobby-panel {
   min-width: min(420px, 92vw);
   padding: 22px 26px;
   border: 1px solid var(--gold);
-  border-radius: 12px;
-  background: rgba(35, 40, 47, 0.92);
+  border-radius: 14px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--charcoal) 96%, transparent),
+    color-mix(in srgb, var(--ink) 94%, transparent)
+  );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--hud-text) 18%, transparent),
+    0 22px 60px color-mix(in srgb, var(--ink) 78%, transparent);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -614,7 +1067,7 @@ body {
   font-size: 16px;
   font-weight: 700;
   letter-spacing: 0.14em;
-  color: var(--cream);
+  color: var(--hud-text);
 }
 
 .lobby-hint {
@@ -630,21 +1083,32 @@ body {
   align-items: center;
   gap: 10px;
   padding: 8px 12px;
-  border: 1px solid rgba(74, 80, 88, 0.6);
+  border: 1px solid color-mix(in srgb, var(--asphalt-light) 60%, transparent);
   border-radius: 999px;
-  background: rgba(20, 23, 28, 0.5);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--charcoal) 52%, transparent),
+    color-mix(in srgb, var(--ink) 60%, transparent)
+  );
   font-size: 14px;
 }
 
 .player-chip.you {
   border-color: var(--gold);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--gold) 14%, transparent),
+    color-mix(in srgb, var(--ink) 60%, transparent)
+  );
 }
 
 .player-color {
   width: 14px;
   height: 14px;
   border-radius: 4px;
-  box-shadow: 0 0 0 2px rgba(20, 23, 28, 0.8);
+  box-shadow:
+    0 0 0 2px color-mix(in srgb, var(--ink) 80%, transparent),
+    inset 0 1px 0 color-mix(in srgb, var(--hud-text) 35%, transparent);
 }
 
 .player-name {
@@ -684,7 +1148,9 @@ body {
   font-size: clamp(120px, 30vw, 260px);
   font-weight: 800;
   color: var(--gold);
-  text-shadow: 0 4px 0 rgba(20, 23, 28, 0.9), 0 10px 50px rgba(20, 23, 28, 0.8);
+  text-shadow:
+    0 4px 0 color-mix(in srgb, var(--ink) 92%, transparent),
+    0 12px 60px color-mix(in srgb, var(--ink) 85%, transparent);
 }
 
 /* ---- transient race message (lap / finish) --------------------------------------- */
@@ -699,8 +1165,8 @@ body {
   font-size: clamp(20px, 4vw, 36px);
   font-weight: 800;
   letter-spacing: 0.16em;
-  color: var(--cream);
-  text-shadow: 0 2px 0 rgba(20, 23, 28, 0.9), 0 4px 20px rgba(20, 23, 28, 0.8);
+  color: var(--hud-text);
+  text-shadow: var(--text-cast-big);
   pointer-events: none;
 }
 
@@ -712,23 +1178,18 @@ body {
   bottom: 16px;
   transform: translateX(-50%);
   max-width: 92vw;
-  padding: 8px 16px;
-  border: 1px solid rgba(232, 230, 223, 0.12);
-  border-radius: 8px;
-  background: rgba(20, 23, 28, 0.55);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
-  box-shadow: inset 0 1px 0 rgba(232, 230, 223, 0.16);
-  color: var(--cream);
+  padding: 9px 18px;
+  color: var(--hud-text);
   font-size: 13px;
   letter-spacing: 0.08em;
   text-align: center;
-  text-shadow: 0 2px 8px rgba(20, 23, 28, 0.8);
+  text-shadow: var(--text-cast);
   pointer-events: none; /* non-modal: never eats driving input */
   z-index: 6;
 }
 
-/* ---- camera speed lines (fx.ts; >30 m/s, rim streaks) ------------------------------ */
+/* ---- camera speed lines (fx.ts; >30 m/s, rim streaks) ------------------------------
+   fx.ts owns left/top/transform/opacity on `.fx-speedline` — never set them here. */
 
 .fx-speedlines {
   position: absolute;
@@ -747,9 +1208,9 @@ body {
   border-radius: 2px;
   background: linear-gradient(
     90deg,
-    rgba(232, 230, 223, 0),
-    rgba(232, 230, 223, 0.85),
-    rgba(232, 230, 223, 0)
+    transparent,
+    color-mix(in srgb, var(--hud-text) 85%, transparent),
+    transparent
   );
   will-change: opacity;
 }
@@ -763,15 +1224,26 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(20, 23, 28, 0.72);
+  background: radial-gradient(
+    100% 80% at 50% 50%,
+    color-mix(in srgb, var(--ink) 62%, transparent),
+    color-mix(in srgb, var(--ink) 86%, transparent)
+  );
 }
 
 .results-panel {
   min-width: min(520px, 94vw);
   padding: 24px 28px;
   border: 1px solid var(--gold);
-  border-radius: 12px;
-  background: rgba(35, 40, 47, 0.94);
+  border-radius: 14px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--charcoal) 97%, transparent),
+    color-mix(in srgb, var(--ink) 95%, transparent)
+  );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--hud-text) 18%, transparent),
+    0 26px 70px color-mix(in srgb, var(--ink) 82%, transparent);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -783,6 +1255,7 @@ body {
   font-weight: 800;
   letter-spacing: 0.4em;
   color: var(--gold);
+  text-shadow: 0 0 22px color-mix(in srgb, var(--gold) 30%, transparent);
 }
 
 .results-table {
@@ -797,23 +1270,61 @@ body {
   letter-spacing: 0.24em;
   text-align: left;
   color: var(--steel);
-  border-bottom: 1px solid var(--asphalt);
+  border-bottom: 1px solid var(--asphalt-light);
 }
 
 .results-table td {
-  padding: 8px 10px;
+  padding: 9px 10px;
   font-size: 15px;
-  color: var(--cream);
-  border-bottom: 1px solid rgba(74, 80, 88, 0.4);
-}
-
-.results-table tr.you td {
-  color: var(--gold);
-  font-weight: 700;
+  color: var(--hud-text);
+  border-bottom: 1px solid color-mix(in srgb, var(--asphalt-light) 42%, transparent);
 }
 
 .result-place {
+  width: 3.5em;
   font-weight: 800;
+  letter-spacing: 0.08em;
+  color: var(--steel);
+}
+
+.result-name {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  max-width: 16em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.result-time {
+  width: 6.5em;
+  font-weight: 700;
+}
+
+.result-best {
+  width: 6.5em;
+  color: var(--steel);
+}
+
+/* the player's own row: gold type AND a gold edge + tint, so it is never
+   colour-alone */
+.results-table tr.you td,
+.results-table tr.results-row-you td {
+  color: var(--gold);
+  font-weight: 700;
+  background: color-mix(in srgb, var(--gold) 10%, transparent);
+}
+
+.results-table tr.you td.result-place,
+.results-table tr.you td.result-best,
+.results-table tr.results-row-you td.result-place,
+.results-table tr.results-row-you td.result-best {
+  color: var(--gold);
+}
+
+.results-table tr.you td:first-child,
+.results-table tr.results-row-you td:first-child {
+  box-shadow: inset 3px 0 0 var(--gold);
 }
 
 .results-note {
@@ -821,4 +1332,18 @@ body {
   font-size: 13px;
   letter-spacing: 0.18em;
   color: var(--steel);
+}
+
+/* ---- motion preference ------------------------------------------------------------ */
+
+@media (prefers-reduced-motion: reduce) {
+  .hud-nitro-pip.pip-flash,
+  .hud-gear.gear-flash {
+    animation: none;
+  }
+
+  .room-row,
+  .hud-speed-bar {
+    transition: none;
+  }
 }

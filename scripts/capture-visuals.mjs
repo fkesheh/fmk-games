@@ -28,9 +28,11 @@
 //                   If the map bundle cannot be built the harness falls back to
 //                   a fixed yaw triple (and says so) rather than skipping.
 //   fps-char      — THREE pages in one private room: the two on opposite teams
-//                   walk to each other (e2e-style wall-following approach), the
-//                   third walks to ~8m and aims at their midpoint, so one CT and
-//                   one T soldier are in frame with the camera's own viewmodel.
+//                   walk to each other and the third walks to ~8m and aims at
+//                   their midpoint, so one CT and one T soldier are in frame
+//                   with the camera's own viewmodel. Walking uses the same map
+//                   raycaster (steerToward) — a straight line deadlocks on the
+//                   mid walls.
 //   fps-hud       — same room during 'live' with the buy layer closed.
 //   fps-buy       — the buy layer that auto-opens on the freeze snapshot.
 //   fps-scoreboard— debug.scoreboard(true) (the Tab edge).
@@ -54,7 +56,9 @@
 //
 // Flags: --out <dir> (default screenshots/v2) · --only <prefix> (capture just
 // the shots whose name starts with <prefix>; the other games are never even
-// launched) · --keep-server (leave the server up for debugging).
+// launched) · --keep-server (leave the server up for debugging) ·
+// --allow-dev-server (capture even when the platform server is proxying a game
+// to its vite dev server — normally a hard error, see assertProductionMounts).
 //
 // Exit 0 only if EVERY required shot landed as a non-trivial PNG and zero
 // console/page/request errors were seen on any page. A missing shot is named
@@ -76,7 +80,6 @@ const SERVER_ENTRY = path.join(ROOT, 'platform/server/dist/server.js');
 const VIEWPORT = { width: 1600, height: 900, deviceScaleFactor: 1 };
 const MAP_IDS = ['dustbowl', 'crossfire', 'office', 'frostbite', 'urbana', 'bunker'];
 const EYE_Y = 1.62; // standing eye height (PLAYER height 1.8 - 0.18 crouch-free eye drop)
-const SUN_ELEVATION = 0.42; // rad — SceneRig's art-directed golden-hour sun (render/scene.ts)
 const MIN_PNG_BYTES = 5000; // a real 1600x900 capture is far bigger; a blank/failed one is not
 
 // ---- the frozen §6 shot list -------------------------------------------------
@@ -102,6 +105,7 @@ function parseArgs(argv) {
   let out = 'screenshots/v2';
   let only = null;
   let keepServer = false;
+  let allowDevServer = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--out') {
@@ -114,11 +118,15 @@ function parseArgs(argv) {
       only = v;
     } else if (a === '--keep-server') {
       keepServer = true;
+    } else if (a === '--allow-dev-server') {
+      allowDevServer = true; // escape hatch: capture the vite dev build anyway (see assertProductionMounts)
     } else {
-      throw new Error(`unknown argument '${a}' — usage: capture-visuals.mjs [--out <dir>] [--only <prefix>] [--keep-server]`);
+      throw new Error(
+        `unknown argument '${a}' — usage: capture-visuals.mjs [--out <dir>] [--only <prefix>] [--keep-server] [--allow-dev-server]`,
+      );
     }
   }
-  return { out, only, keepServer };
+  return { out, only, keepServer, allowDevServer };
 }
 
 const ARGS = parseArgs(process.argv.slice(2));
@@ -154,10 +162,17 @@ async function waitFor(fn, timeoutMs, label) {
 }
 
 // ---- server ------------------------------------------------------------------
-function startServer() {
+async function startServer() {
   if (!existsSync(SERVER_ENTRY)) {
     throw new Error(`missing ${path.relative(ROOT, SERVER_ENTRY)} — run 'npm run build' first`);
   }
+  // a stale server on the port would answer every probe and silently serve a
+  // DIFFERENT build than the one under test
+  const inUse = await fetch(BASE, { signal: AbortSignal.timeout(1500) }).then(
+    () => true,
+    () => false,
+  );
+  if (inUse) throw new Error(`something is already listening on :${PORT} — kill it or set E2E_PORT`);
   const child = spawn(process.execPath, [SERVER_ENTRY], {
     cwd: ROOT,
     env: { ...process.env, PORT: String(PORT) },
@@ -185,6 +200,29 @@ async function waitForServer(timeoutMs = 20000) {
     }
     if (Date.now() - t0 > timeoutMs) throw new Error(`server did not listen on :${PORT} within ${timeoutMs}ms`);
     await sleep(250);
+  }
+}
+
+/**
+ * The platform server proxies /<game>/ to that game's vite dev server whenever
+ * one answers (platform/server/src/index.ts resolveMounts). Capturing through
+ * it is invalid twice over: HMR full-reloads every page the moment anyone saves
+ * a file (mid-capture pages drop back to the menu) and the served source can be
+ * a half-finished edit rather than the reviewed build. Detect and refuse.
+ */
+async function assertProductionMounts(gameIds) {
+  const devPorts = { fps: 5173, bank: 5174, kart: 5175 };
+  for (const id of gameIds) {
+    const res = await fetch(`${BASE}/${id}/`, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) throw new Error(`GET /${id}/ returned ${res.status} — is the client built? (npm run build)`);
+    const html = await res.text();
+    if (html.includes('/@vite/client')) {
+      const msg =
+        `/${id}/ is being served by the vite dev server on :${devPorts[id]} (the platform server proxies to it when it answers). ` +
+        'HMR reloads every page mid-capture and the source may be mid-edit — stop the dev server for that game and re-run after `npm run build`.';
+      if (!ARGS.allowDevServer) throw new Error(msg);
+      log(`[warn] ${msg} (--allow-dev-server: continuing anyway)`);
+    }
   }
 }
 
@@ -403,6 +441,193 @@ function sunYaw(map) {
 
 const FALLBACK_YAWS = { a: 0, b: 2.1, c: 4.2 };
 
+// ---- navigation grid ------------------------------------------------------------
+// Greedy "walk at the target, strafe when wedged" navigation CANNOT cross these
+// maps: dustbowl's spawns sit on opposite sides of 12m-deep buildings, and
+// every local rule (strafe, clearest-ray, best-aligned-clear-ray) parks the
+// walker against a wall forever (measured: pinned 80s at 22.1m apart). So the
+// harness builds a real walkability grid from the map boxes and BFS-floods a
+// distance field from the target — the walker then always has a true shortest
+// path around the geometry.
+const NAV_CELL = 0.5; // m
+const PLAYER_RADIUS = 0.3; // PLAYER.radius (games/fps/shared/src/config.ts)
+const STEP_UP = 0.42; // PLAYER.stepUp — anything lower is walked over, not around
+const STAND_HEIGHT = 1.8; // PLAYER.heightStand — a box starting above it is an overhead
+const navGrids = new Map();
+
+function navGrid(map) {
+  const cached = navGrids.get(map.id);
+  if (cached !== undefined) return cached;
+  const nx = Math.ceil(map.sizeX / NAV_CELL) + 1;
+  const nz = Math.ceil(map.sizeZ / NAV_CELL) + 1;
+  const x0 = -map.sizeX / 2;
+  const z0 = -map.sizeZ / 2;
+  const blocked = new Uint8Array(nx * nz);
+  // a cell is blocked when its CENTRE lies inside the box grown by the player's
+  // half-extent. Rounding the range outward instead (floor/ceil) over-inflates
+  // by a full cell each side, which plugs 3m gaps with 1.2m crates and walls
+  // the rendezvous corridor off entirely (measured on dustbowl: 87 reachable
+  // cells out of 12513).
+  const pad = PLAYER_RADIUS + 0.05;
+  for (const b of map.boxes) {
+    const top = b.y + b.h / 2;
+    const bottom = b.y - b.h / 2;
+    if (top <= STEP_UP) continue; // a curb: walked over
+    if (bottom >= STAND_HEIGHT) continue; // overhead beam: walked under
+    const minI = Math.max(0, Math.floor((b.x - b.w / 2 - pad - x0) / NAV_CELL));
+    const maxI = Math.min(nx - 1, Math.ceil((b.x + b.w / 2 + pad - x0) / NAV_CELL));
+    const minJ = Math.max(0, Math.floor((b.z - b.d / 2 - pad - z0) / NAV_CELL));
+    const maxJ = Math.min(nz - 1, Math.ceil((b.z + b.d / 2 + pad - z0) / NAV_CELL));
+    for (let j = minJ; j <= maxJ; j++) {
+      const cz = z0 + j * NAV_CELL;
+      if (Math.abs(cz - b.z) > b.d / 2 + pad) continue;
+      for (let i = minI; i <= maxI; i++) {
+        const cx = x0 + i * NAV_CELL;
+        if (Math.abs(cx - b.x) <= b.w / 2 + pad) blocked[j * nx + i] = 1;
+      }
+    }
+  }
+  const grid = { nx, nz, x0, z0, blocked, field: null, fieldKey: '' };
+  navGrids.set(map.id, grid);
+  return grid;
+}
+
+const navIndex = (g, x, z) => {
+  const i = Math.min(g.nx - 1, Math.max(0, Math.round((x - g.x0) / NAV_CELL)));
+  const j = Math.min(g.nz - 1, Math.max(0, Math.round((z - g.z0) / NAV_CELL)));
+  return { i, j };
+};
+
+/** BFS distance field (in cells) to the target, cached per target cell. */
+function navField(g, tx, tz) {
+  const { i: ti, j: tj } = navIndex(g, tx, tz);
+  const key = `${ti},${tj}`;
+  if (g.fieldKey === key && g.field !== null) return g.field;
+  const field = new Int32Array(g.nx * g.nz).fill(-1);
+  const queue = [];
+  // a target standing inside inflated geometry still needs a reachable seed
+  for (let r = 0; r <= 6 && queue.length === 0; r++) {
+    for (let dj = -r; dj <= r; dj++) {
+      for (let di = -r; di <= r; di++) {
+        if (Math.max(Math.abs(di), Math.abs(dj)) !== r) continue;
+        const i = ti + di;
+        const j = tj + dj;
+        if (i < 0 || j < 0 || i >= g.nx || j >= g.nz) continue;
+        if (g.blocked[j * g.nx + i] === 1) continue;
+        field[j * g.nx + i] = 0;
+        queue.push(j * g.nx + i);
+      }
+    }
+  }
+  for (let head = 0; head < queue.length; head++) {
+    const cur = queue[head];
+    const ci = cur % g.nx;
+    const cj = (cur - ci) / g.nx;
+    for (const [di, dj] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const i = ci + di;
+      const j = cj + dj;
+      if (i < 0 || j < 0 || i >= g.nx || j >= g.nz) continue;
+      const idx = j * g.nx + i;
+      if (g.blocked[idx] === 1 || field[idx] !== -1) continue;
+      field[idx] = field[cur] + 1;
+      queue.push(idx);
+    }
+  }
+  g.field = field;
+  g.fieldKey = key;
+  return field;
+}
+
+/** Nearest walkable point to (x,z) — a rendezvous must be standable. */
+function nearestFree(map, x, z) {
+  if (map === null) return [x, z];
+  const g = navGrid(map);
+  const { i: ci, j: cj } = navIndex(g, x, z);
+  for (let r = 0; r < 40; r++) {
+    for (let dj = -r; dj <= r; dj++) {
+      for (let di = -r; di <= r; di++) {
+        if (Math.max(Math.abs(di), Math.abs(dj)) !== r) continue;
+        const i = ci + di;
+        const j = cj + dj;
+        if (i < 0 || j < 0 || i >= g.nx || j >= g.nz) continue;
+        if (g.blocked[j * g.nx + i] === 1) continue;
+        return [g.x0 + i * NAV_CELL, g.z0 + j * NAV_CELL];
+      }
+    }
+  }
+  return [x, z];
+}
+
+/**
+ * A standable spot `radius` from (mx,mz) with a clear eye-height line of sight
+ * to it — where the camera has to stand for both soldiers to be in frame.
+ */
+function cameraSpot(map, mx, mz, radius) {
+  if (map === null) return [mx, mz + radius];
+  const g = navGrid(map);
+  let fallback = null;
+  for (let k = 0; k < 36; k++) {
+    const a = (k / 36) * Math.PI * 2;
+    const cx = mx + Math.sin(a) * radius;
+    const cz = mz + Math.cos(a) * radius;
+    const { i, j } = navIndex(g, cx, cz);
+    if (i <= 0 || j <= 0 || i >= g.nx - 1 || j >= g.nz - 1) continue;
+    if (g.blocked[j * g.nx + i] === 1) continue;
+    if (fallback === null) fallback = [cx, cz];
+    const { dist } = freeDist(map, cx, cz, yawTo(cx, cz, mx, mz), radius + 2);
+    if (dist >= radius - 0.5) return [cx, cz]; // clear sightline to the rendezvous
+  }
+  return fallback ?? [mx, mz + radius];
+}
+
+/**
+ * Look-ahead WAYPOINT on the shortest walkable path to (tx,tz): descend the BFS
+ * field a few cells and return that point (a point, not a yaw — the caller
+ * COMMITS to it for a couple of seconds; on a symmetric map the two ways around
+ * a wall tie exactly and a per-tick heading flip-flops on the spot, which is
+ * what pinned the walkers at |z|=15.8 for four minutes). Falls back to the
+ * target itself when the map data is unavailable.
+ */
+function pathWaypoint(map, sx, sz, tx, tz) {
+  if (map === null) return [tx, tz];
+  const g = navGrid(map);
+  const field = navField(g, tx, tz);
+  let { i, j } = navIndex(g, sx, sz);
+  if (field[j * g.nx + i] < 0) {
+    // standing in an inflated cell (against a wall): take the best neighbour
+    let best = null;
+    for (let dj = -2; dj <= 2; dj++) {
+      for (let di = -2; di <= 2; di++) {
+        const ni = i + di;
+        const nj = j + dj;
+        if (ni < 0 || nj < 0 || ni >= g.nx || nj >= g.nz) continue;
+        const d = field[nj * g.nx + ni];
+        if (d < 0) continue;
+        if (best === null || d < best.d) best = { i: ni, j: nj, d };
+      }
+    }
+    if (best === null) return [tx, tz];
+    i = best.i;
+    j = best.j;
+  }
+  for (let step = 0; step < 8; step++) {
+    let best = null;
+    for (const [di, dj] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]]) {
+      const ni = i + di;
+      const nj = j + dj;
+      if (ni < 0 || nj < 0 || ni >= g.nx || nj >= g.nz) continue;
+      const d = field[nj * g.nx + ni];
+      if (d < 0) continue;
+      if (di !== 0 && dj !== 0 && (g.blocked[j * g.nx + ni] === 1 || g.blocked[nj * g.nx + i] === 1)) continue;
+      if (best === null || d < best.d) best = { i: ni, j: nj, d };
+    }
+    if (best === null || field[j * g.nx + i] === 0) break;
+    i = best.i;
+    j = best.j;
+  }
+  return [g.x0 + i * NAV_CELL, g.z0 + j * NAV_CELL];
+}
+
 /** Longest sightline from (x,z) — the "main lane" read. */
 function planLongSightline(map, x, z) {
   if (map === null) return { yaw: FALLBACK_YAWS.a, pitch: -0.05, detail: 'fallback yaw' };
@@ -445,14 +670,22 @@ function planWallCloseup(map, x, z) {
 /** Low crouched angle toward the sun; nudged off a face-planted wall. */
 function planSunLow(map, x, z) {
   if (map === null) return { yaw: FALLBACK_YAWS.c, pitch: 0.24, detail: 'fallback yaw' };
+  // sun-ward, but never nose-first into a wall: every heading is scored by its
+  // clearance with a penalty for straying off the sun azimuth, so an enclosed
+  // spot swings round to the open side instead of shooting a blank wall.
   const target = sunYaw(map);
   let best = null;
-  for (let i = -8; i <= 8; i++) {
-    const yaw = wrapPi(target + (i / 8) * 0.6); // stay within ~34 deg of the sun
+  let widest = null;
+  for (let i = 0; i < 96; i++) {
+    const yaw = wrapPi((i / 96) * Math.PI * 2);
+    const off = Math.abs(wrapPi(yaw - target));
     const { dist } = freeDist(map, x, z, yaw);
-    const score = Math.min(dist, 14) - Math.abs(i) * 0.25;
+    if (widest === null || dist > widest.dist) widest = { yaw, dist };
+    if (dist < 5) continue;
+    const score = Math.min(dist, 14) * 0.35 - off * 2.4;
     if (best === null || score > best.score) best = { yaw, dist, score };
   }
+  if (best === null) best = widest ?? { yaw: target, dist: 0 };
   return {
     yaw: best.yaw,
     pitch: 0.24, // low: the sun disc sits at SUN_ELEVATION, so the horizon stays in frame
@@ -484,28 +717,31 @@ async function closeBuyMenu(page) {
 
 /**
  * The solo bot prompt ('Alone in this room — add some bots?') parks a panel in
- * the lower-right for 20s and would sit in every map shot: dismiss it through
- * its real 'NO THANKS' button.
+ * the lower-right of every map shot for 20s. Its NO THANKS button is wired to a
+ * no-op onDismiss in the client (ui/menus.ts showBotPrompt), so clicking it
+ * changes nothing — the prompt only hides on a roster/phase change or the 20s
+ * timeout. Adding a bot and removing it again is the cheap honest trigger: the
+ * roster passes 1, hideBotPrompt fires, and the prompt is latched off for this
+ * join (botPromptShown), leaving the player alone again for the tour.
  */
-async function dismissBotPrompt(page) {
-  for (let i = 0; i < 12; i++) {
-    const clicked = await page.evaluate(() => {
-      const btn = Array.from(document.querySelectorAll('button')).find((b) =>
-        (b.textContent ?? '').toUpperCase().includes('NO THANKS'),
-      );
-      if (btn === undefined) return false;
-      const r = btn.getBoundingClientRect();
-      if (r.width === 0 || r.height === 0) return false;
-      btn.click();
-      return true;
-    });
-    if (clicked) {
-      await sleep(250);
-      return true;
-    }
-    await sleep(250);
-  }
-  return false;
+async function clearBotPrompt(page) {
+  const before = (await fpsState(page))?.players ?? 1;
+  await page.evaluate(() => window.__fps.addBot());
+  const grew = await waitFor(async () => {
+    const s = await fpsState(page);
+    return s !== null && s.players > before ? s : null;
+  }, 6000, 'bot added (bot-prompt clear)').catch(() => null);
+  if (grew === null) return false;
+  await page.evaluate(() => window.__fps.removeBot());
+  await waitFor(async () => {
+    const s = await fpsState(page);
+    return s !== null && s.players === before ? s : null;
+  }, 6000, 'bot removed').catch(() => null);
+  await waitFor(async () => {
+    const s = await fpsState(page);
+    return s !== null && s.phase === 'warmup' && s.alive ? s : null;
+  }, 12000, 'back to warmup, alone').catch(() => null);
+  return true;
 }
 
 async function walkFor(page, ms, x = 0, z = 1) {
@@ -548,7 +784,7 @@ async function captureFpsMaps(page, mapIds) {
     }, 20000, `alive spawn on ${mapId}`);
     await sleep(1400); // world build + deco scatter + first shadow-casting frames
     await closeBuyMenu(page);
-    await dismissBotPrompt(page);
+    await clearBotPrompt(page);
     const map = mapData === null ? null : mapData[mapId] ?? null;
 
     // pose a — the longest sightline from the spawn (the main lane)
@@ -601,40 +837,75 @@ async function captureFpsChar(pages, mapId) {
   const cam = others[1];
   log(`fps-char: subjects ${teams[lone]} + ${teams[pages.indexOf(subjB)]}, camera ${teams[pages.indexOf(cam)]}`);
 
+  // MOVEMENT IS FRAME-RATE BOUND: the client ships one input frame per rAF and
+  // the server integrates one tick per input, so three 1600x900 WebGL clients
+  // on a software rasterizer (~2 fps each) crawl at ~0.1 m/s and never meet.
+  // Walking therefore runs at a tiny viewport (30+ fps); the frame is restored
+  // to the contract's 1600x900 before the capture.
+  const WALK_VIEWPORT = { width: 480, height: 270, deviceScaleFactor: 1 };
+  for (const p of pages) await p.setViewport(WALK_VIEWPORT);
+
+  const map = mapData === null ? null : mapData[mapId] ?? null;
   const walkers = new Map();
-  /** e2e-style committed wall-following approach: strafe out of a wedge. */
-  async function approach(page, selfPos, targetPos, initDir) {
-    const yaw = yawTo(selfPos[0], selfPos[2], targetPos[0], targetPos[2]);
-    await setLook(page, yaw, 0);
+  /**
+   * Walk `page` at `targetPos` along the BFS path. The look-ahead waypoint is
+   * held until it is reached (or 2.5s), so the walker commits to ONE way around
+   * a wall instead of flip-flopping where the two routes tie. A 4s stall nudges
+   * it sideways for 1s (the 0.5m grid can still catch a shoulder on a corner).
+   */
+  async function approach(page, selfPos, targetPos) {
+    const now = Date.now();
+    const dist = Math.hypot(targetPos[0] - selfPos[0], targetPos[2] - selfPos[2]);
     let w = walkers.get(page);
     if (w === undefined) {
-      w = { lastPos: null, wedgedSince: 0, dir: initDir };
+      w = { bestDist: dist, improvedAt: now, nudgeUntil: 0, dir: 1, wp: null, wpAt: 0 };
       walkers.set(page, w);
     }
-    const now = Date.now();
-    const moved = w.lastPos === null ? 1 : Math.hypot(selfPos[0] - w.lastPos[0], selfPos[2] - w.lastPos[2]);
-    w.lastPos = selfPos;
-    let mx = 0;
-    if (moved > 0.35) {
-      w.wedgedSince = 0;
-    } else {
-      if (w.wedgedSince === 0) w.wedgedSince = now;
-      const wedged = now - w.wedgedSince;
-      if (wedged > 5000) {
-        w.dir = -w.dir;
-        w.wedgedSince = now;
-        mx = w.dir;
-      } else if (wedged > 800) {
-        mx = w.dir;
-      }
+    if (dist < w.bestDist - 0.6) {
+      w.bestDist = dist;
+      w.improvedAt = now;
+    } else if (now - w.improvedAt > 4000 && now >= w.nudgeUntil) {
+      w.nudgeUntil = now + 1000;
+      w.dir = -w.dir;
+      w.improvedAt = now;
     }
-    await setMove(page, mx, 1);
+    const wpDist = w.wp === null ? Infinity : Math.hypot(w.wp[0] - selfPos[0], w.wp[1] - selfPos[2]);
+    if (w.wp === null || wpDist < 1.2 || now - w.wpAt > 2500) {
+      w.wp = pathWaypoint(map, selfPos[0], selfPos[2], targetPos[0], targetPos[2]);
+      w.wpAt = now;
+    }
+    await setLook(page, yawTo(selfPos[0], selfPos[2], w.wp[0], w.wp[1]), 0);
+    await setMove(page, now < w.nudgeUntil ? w.dir : 0, 1);
   }
+
+  const PAIR_MAX = 7; // two soldiers this far apart still frame together at ~8m
+  const CAM_NEAR = 5.5;
+  const CAM_FAR = 11;
+  // FIXED rendezvous, not "walk at each other": chasing a moving target makes
+  // both walkers dither where two routes around a building tie, and they park
+  // on the wall between them. A standable meeting point plus a standable camera
+  // spot with a clear line of sight to it are computed ONCE from the geometry.
+  const start = await Promise.all([fpsState(subjA), fpsState(subjB)]);
+  const rvRaw = [(start[0].pos[0] + start[1].pos[0]) / 2, (start[0].pos[2] + start[1].pos[2]) / 2];
+  const [mx, mz] = nearestFree(map, rvRaw[0], rvRaw[1]);
+  const [cx, cz] = cameraSpot(map, mx, mz, 8);
+  // the two soldiers stand SIDE BY SIDE across the camera's view axis: walking
+  // both to the same point puts one behind the other and the shot shows a
+  // single silhouette (measured: 1.5m apart, the CT hidden by the T).
+  const axLen = Math.max(1e-6, Math.hypot(mx - cx, mz - cz));
+  const px = -(mz - cz) / axLen;
+  const pz = (mx - cx) / axLen;
+  const standA = nearestFree(map, mx + px * 1.8, mz + pz * 1.8);
+  const standB = nearestFree(map, mx - px * 1.8, mz - pz * 1.8);
+  log(
+    `fps-char: rendezvous ${mx.toFixed(1)},${mz.toFixed(1)} · camera spot ${cx.toFixed(1)},${cz.toFixed(1)} · ` +
+      `stands ${standA.map((v) => v.toFixed(1)).join(',')} / ${standB.map((v) => v.toFixed(1)).join(',')}`,
+  );
 
   const t0 = Date.now();
   let posed = null;
   let lastLog = 0;
-  while (Date.now() - t0 < 180000) {
+  while (Date.now() - t0 < 240000) {
     const [sa, sb, sc] = await Promise.all([fpsState(subjA), fpsState(subjB), fpsState(cam)]);
     if (sa === null || sb === null || sc === null) {
       await sleep(300);
@@ -655,39 +926,56 @@ async function captureFpsChar(pages, mapId) {
     const camDist = Math.hypot(mid[0] - sc.pos[0], mid[2] - sc.pos[2]);
     if (Date.now() - lastLog > 4000) {
       lastLog = Date.now();
-      log(`fps-char t=${((Date.now() - t0) / 1000).toFixed(0)}s pairDist=${pairDist.toFixed(1)} camDist=${camDist.toFixed(1)} phase=${sa.phase}`);
+      const at = (s) => `${s.pos[0].toFixed(1)},${s.pos[1].toFixed(1)},${s.pos[2].toFixed(1)}`;
+      log(
+        `fps-char t=${((Date.now() - t0) / 1000).toFixed(0)}s pairDist=${pairDist.toFixed(1)} camDist=${camDist.toFixed(1)} ` +
+          `phase=${sa.phase} A(${at(sa)}) B(${at(sb)}) C(${at(sc)})`,
+      );
     }
-    if (pairDist > 5) {
-      await approach(subjA, sa.pos, sb.pos, 1);
-      await approach(subjB, sb.pos, sa.pos, -1);
-      // the camera closes on the pair the whole time so it arrives with them
-      if (camDist > 8.5) await approach(cam, sc.pos, mid, 1);
-      else await setMove(cam, 0, 0);
+    // each walker has its OWN fixed destination; they stop 2.5m short of the
+    // rendezvous so the two soldiers end up beside each other, not inside
+    const dA = Math.hypot(standA[0] - sa.pos[0], standA[1] - sa.pos[2]);
+    const dB = Math.hypot(standB[0] - sb.pos[0], standB[1] - sb.pos[2]);
+    const dC = Math.hypot(cx - sc.pos[0], cz - sc.pos[2]);
+    let walking = false;
+    if (dA > 1.2) {
+      await approach(subjA, sa.pos, [standA[0], 0, standA[1]]);
+      walking = true;
+    } else await setMove(subjA, 0, 0);
+    if (dB > 1.2) {
+      await approach(subjB, sb.pos, [standB[0], 0, standB[1]]);
+      walking = true;
+    } else await setMove(subjB, 0, 0);
+    if (dC > 1.5) {
+      await approach(cam, sc.pos, [cx, 0, cz]);
+      walking = true;
+    } else await setMove(cam, 0, 0);
+    if (walking || pairDist > PAIR_MAX || pairDist < 2 || camDist > CAM_FAR || camDist < CAM_NEAR) {
       await sleep(200);
       continue;
     }
-    await Promise.all([setMove(subjA, 0, 0), setMove(subjB, 0, 0)]);
-    if (camDist > 9.5 || camDist < 5.5) {
-      if (camDist > 9.5) await approach(cam, sc.pos, mid, 1);
-      else {
-        // too close: back off along the same bearing
-        await setLook(cam, yawTo(sc.pos[0], sc.pos[2], mid[0], mid[2]), 0);
-        await setMove(cam, 0, -1);
-      }
-      await sleep(200);
-      continue;
-    }
-    await setMove(cam, 0, 0);
     posed = { pairDist, camDist, mid, camPos: sc.pos };
     break;
   }
-  for (const p of pages) await setMove(p, 0, 0);
+  for (const p of pages) {
+    await setMove(p, 0, 0);
+    await p.setViewport(VIEWPORT); // back to the contract's capture resolution
+  }
+  await sleep(600); // the scene rebuilds its render target at the new size
   if (posed === null) {
     throw new Error(
-      "fps-char: the two soldiers never met at <= 5m with the camera 5.5-9.5m away within 180s (map " + mapId + ')',
+      `fps-char: the two soldiers never got within ${PAIR_MAX}m of each other with the camera ${CAM_NEAR}-${CAM_FAR}m away, within 240s on ${mapId}`,
     );
   }
-  // aim at the pair's chests, then hold still for a clean frame
+  // both soldiers turn to face the camera (front silhouettes read best), then
+  // the camera aims at their chests and everything holds still for the frame
+  const camPos = posed.camPos;
+  for (const [p, s] of [
+    [subjA, await fpsState(subjA)],
+    [subjB, await fpsState(subjB)],
+  ]) {
+    if (s !== null) await setLook(p, yawTo(s.pos[0], s.pos[2], camPos[0], camPos[2]), 0);
+  }
   const eye = posed.camPos[1] + EYE_Y;
   const chest = posed.mid[1] + 1.2;
   const horiz = Math.hypot(posed.mid[0] - posed.camPos[0], posed.mid[2] - posed.camPos[2]);
@@ -767,12 +1055,22 @@ async function captureFps() {
       const s = await fpsState(A);
       return s !== null && s.roomId !== null && s.code !== null && s.mapId === 'dustbowl' ? s : null;
     }, 20000, 'A createPrivate(dustbowl)');
-    await B.evaluate((c) => window.__fps.joinPrivate('Bob', c), room.code);
-    await C.evaluate((c) => window.__fps.joinPrivate('Cara', c), room.code);
+    // the lobby drops a join sent before the socket's welcome lands — retry
+    for (const [page, name] of [[B, 'Bob'], [C, 'Cara']]) {
+      let seated = null;
+      for (let attempt = 0; attempt < 3 && seated === null; attempt++) {
+        await page.evaluate((n, c) => window.__fps.joinPrivate(n, c), name, room.code);
+        seated = await waitFor(async () => {
+          const s = await fpsState(page);
+          return s !== null && s.roomId === room.roomId ? s : null;
+        }, 12000, `${name} joins ${room.code}`).catch(() => null);
+      }
+      if (seated === null) throw new Error(`fps: ${name} never joined room ${room.code}`);
+    }
     await waitFor(async () => {
       const ss = await Promise.all(pages.map((p) => fpsState(p)));
       return ss.every((s) => s !== null && s.roomId === room.roomId && s.players === 3 && s.rosterSize === 3) ? ss : null;
-    }, 25000, 'all three pages seated in the room');
+    }, 30000, 'all three pages seated in the room');
     await waitFor(async () => {
       const s = await fpsState(A);
       return s !== null && (s.phase === 'live' || s.phase === 'freeze') ? s : null;
@@ -933,22 +1231,16 @@ async function captureKart() {
     while (Date.now() - t0 < 120000) {
       const y = await kartYawRate(A, 300);
       if (y !== null && Math.abs(y.rate) > 0.28 && y.speed > 9) {
-        const steer = y.rate < 0 ? 1 : -1; // positive steer = RIGHT = yaw decreasing
+        const steer = y.rate < 0 ? 0.8 : -0.8; // positive steer = RIGHT = yaw decreasing
         await setAssist(A, false); // the assist owns the steer channel
-        await kartInput(A, 0.75, 0, steer, true);
-        const drifting = await waitFor(
-          async () => {
-            const t = await kartTele(A);
-            return t !== null && t.own.drifting ? t : null;
-          },
-          2500,
-          'kart drifting',
-        ).catch(() => null);
+        await kartInput(A, 0.7, 0, steer, true);
+        await sleep(280); // long enough for the grip to break and the FX to spawn,
+        const t = await kartTele(A); // short enough that the kart is still IN the corner
         await shot(A, 'kart-corner');
         got = true;
         await kartInput(A, 1, 0, 0, false);
         await setAssist(A, true);
-        if (drifting === null) log('[warn] kart-corner: handbrake set but drifting flag never latched');
+        if (t === null || !t.own.drifting) log('[warn] kart-corner: handbrake set but the drifting flag was not latched at capture');
         break;
       }
       await sleep(250);
@@ -1093,14 +1385,17 @@ async function main() {
   if (REQUIRED.length === 0) throw new Error(`--only ${ARGS.only} matches no shot in the §6 list`);
   await mkdir(OUT_DIR, { recursive: true });
 
-  if (MAP_IDS.some((m) => wantAny(`fps-${m}-a`, `fps-${m}-b`, `fps-${m}-c`))) {
+  // every FPS shot needs it: the map poses raycast it and fps-char navigates it
+  if (REQUIRED.some((s) => s.game === 'fps')) {
     mapData = await loadMapData();
     log(`fps poses: ${mapDataNote}`);
   }
 
-  startServer();
+  await startServer();
   await waitForServer();
   log(`server up on ${BASE}`);
+  const games = [...new Set(REQUIRED.map((s) => s.game))].filter((g) => g !== 'launcher');
+  await assertProductionMounts(games);
 
   let kart = null;
   try {

@@ -23,6 +23,7 @@ import {
   LAPS_TO_WIN,
   MIN_PLAYERS,
   NITRO_CHARGES,
+  TOP_SPEED,
   buildTrack,
   engineRevs,
   forwardSpeed,
@@ -602,10 +603,14 @@ export class KartApp {
   private readonly placeSufEl: HTMLSpanElement; // ordinal suffix ('nd')
   private readonly placeTotalEl: HTMLSpanElement; // '/N' field size
   private readonly placeGapEl: HTMLDivElement; // '+1.8s' / 'LEADER'
+  private readonly crownEl: HTMLDivElement; // P1 accent badge, hidden off the lead
   private readonly kidsBadgeEl: HTMLDivElement; // small 'KIDS' badge in the position chip
   private readonly lapEl: HTMLDivElement;
   private readonly speedNumEl: HTMLSpanElement;
+  private readonly speedBarEl: HTMLDivElement; // speed meter fill (width is the only JS-set style)
+  private prevSpeedPct = -1; // last written meter width, to skip no-op style writes
   private readonly gearEl: HTMLSpanElement;
+  private prevShifting = false; // upshift rising edge, for the one-shot gear flash
   private readonly lapTimeEl: HTMLSpanElement;
   private readonly bestEl: HTMLSpanElement;
   private readonly nitroEl: HTMLDivElement;
@@ -706,9 +711,21 @@ export class KartApp {
     // (top-right), times (bottom-left), nitro pips (bottom-right), next-gate
     // chevron (top-center)
     this.hudEl = el('div', 'hud hidden');
+    // corner scrims: a soft ink wash under each chip cluster so the HUD reads
+    // over near-black asphalt AND over a white sky. Decorative only, appended
+    // first so they sit behind every cluster.
+    for (const corner of ['hud-corner-tl', 'hud-corner-tr', 'hud-corner-bl', 'hud-corner-br']) {
+      this.hudEl.appendChild(el('div', `hud-scrim ${corner}`));
+    }
     const hudLeft = el('div', 'hud-left');
     this.hudLeftEl = hudLeft;
-    const pos = el('div', 'hud-pos');
+    // top of the HUD value ladder: place and speed are the two reads a driver
+    // takes at 200 km/h, so they carry the 'hi' chip tier; everything else is
+    // reference data on 'lo'
+    const pos = el('div', 'hud-pos hud-chip hud-chip-hi');
+    // P1 accent — textless, so the stylesheet draws its own mark
+    this.crownEl = el('div', 'hud-pos-crown hidden');
+    pos.appendChild(this.crownEl);
     const posMain = el('div', 'hud-pos-main');
     this.placeNumEl = el('span', 'hud-pos-num', '—');
     this.placeSufEl = el('span', 'hud-pos-suf', '');
@@ -723,12 +740,12 @@ export class KartApp {
     this.kidsBadgeEl = el('div', 'hud-kids hidden', 'KIDS');
     pos.appendChild(this.kidsBadgeEl);
     hudLeft.appendChild(pos);
-    this.lapEl = el('div', 'hud-lap', `LAP 1/${LAPS_TO_WIN}`);
+    this.lapEl = el('div', 'hud-lap hud-chip hud-chip-lo', `LAP 1/${LAPS_TO_WIN}`);
     hudLeft.appendChild(this.lapEl);
     this.hudEl.appendChild(hudLeft);
 
     const hudRight = el('div', 'hud-right');
-    const speed = el('div', 'hud-speed');
+    const speed = el('div', 'hud-speed hud-chip hud-chip-hi');
     // gear stacked ABOVE the speed — adjacent big numerals kerned into one read
     const gearRow = el('div', 'hud-gear-row');
     gearRow.appendChild(el('span', 'hud-gear-label', 'GEAR'));
@@ -740,20 +757,24 @@ export class KartApp {
     speedRow.appendChild(this.speedNumEl);
     speedRow.appendChild(el('span', 'hud-speed-unit', 'km/h'));
     speed.appendChild(speedRow);
+    // speed meter: fraction of the physics ceiling, so only nitro pegs it
+    this.speedBarEl = el('div', 'hud-speed-bar');
+    speed.appendChild(this.speedBarEl);
     hudRight.appendChild(speed);
     // minimap: track outline + live player dots, redrawn at 4Hz (MINIMAP_EVERY_MS)
-    this.minimapEl = el('canvas', 'hud-minimap');
+    this.minimapEl = el('canvas', 'hud-minimap hud-chip hud-chip-lo');
     this.minimapEl.width = MINIMAP_SIZE * 2; // 2x backing store — crisp on retina
     this.minimapEl.height = MINIMAP_SIZE * 2;
     hudRight.appendChild(this.minimapEl);
     this.hudEl.appendChild(hudRight);
 
-    const hudTimes = el('div', 'hud-times');
+    const hudTimes = el('div', 'hud-times hud-chip hud-chip-lo');
     const lapRow = el('div', 'hud-time-row');
     lapRow.appendChild(el('span', 'hud-time-label', 'LAP'));
     this.lapTimeEl = el('span', 'hud-time-value', '—');
     lapRow.appendChild(this.lapTimeEl);
     hudTimes.appendChild(lapRow);
+    hudTimes.appendChild(el('div', 'hud-rule')); // hairline between current and best
     const bestRow = el('div', 'hud-time-row');
     bestRow.appendChild(el('span', 'hud-time-label', 'BEST'));
     this.bestEl = el('span', 'hud-time-value hud-best', '—');
@@ -762,11 +783,13 @@ export class KartApp {
     this.hudEl.appendChild(hudTimes);
 
     // nitro pips: NITRO_CHARGES small charges at the bottom-right, dim when spent
-    this.nitroEl = el('div', 'hud-nitro');
+    this.nitroEl = el('div', 'hud-nitro hud-chip hud-chip-lo');
     this.nitroEl.appendChild(el('div', 'hud-turbo-label', 'NITRO'));
+    this.nitroEl.appendChild(el('div', 'hud-rule'));
     const pipRow = el('div', 'hud-nitro-pips');
     for (let i = 0; i < NITRO_CHARGES; i++) {
-      const pip = el('span', 'hud-nitro-pip');
+      // pips start FULL — the base class is the empty socket, the modifier is the charge
+      const pip = el('span', 'hud-nitro-pip hud-nitro-pip-full');
       this.nitroPips.push(pip);
       pipRow.appendChild(pip);
     }
@@ -812,23 +835,11 @@ export class KartApp {
     // invite chip (private rooms only): top-left 'CIRCUIT · code XXXXX' + COPY
     // INVITE. Parks inside hud-left while the HUD is up (the position/lap chips
     // own the corner then); top-level above the lobby/results overlays otherwise.
+    // Both homes — and the pill itself — are styled from style.css by parent
+    // selector (`.hud-left > .race-invite` / `.race > .race-invite`); this file
+    // sets no geometry (VISUAL_UPGRADE.md §9 inline-style hazard).
     this.inviteEl = el('div', 'race-invite hidden');
-    this.inviteEl.style.position = 'absolute';
-    this.inviteEl.style.top = '14px';
-    this.inviteEl.style.left = '16px';
-    this.inviteEl.style.zIndex = '9'; // above the lobby (5) and results (8) overlays
-    this.inviteEl.style.display = 'flex';
-    this.inviteEl.style.alignItems = 'center';
-    this.inviteEl.style.gap = '8px';
-    this.inviteEl.style.pointerEvents = 'auto'; // the HUD container is pointer-events:none
-    this.inviteCodeEl = el('span', 'race-invite-code');
-    this.inviteCodeEl.style.padding = '4px 12px';
-    this.inviteCodeEl.style.border = '1px solid var(--gold)';
-    this.inviteCodeEl.style.borderRadius = '999px';
-    this.inviteCodeEl.style.fontSize = '12px';
-    this.inviteCodeEl.style.letterSpacing = '0.18em';
-    this.inviteCodeEl.style.color = 'var(--gold)';
-    this.inviteCodeEl.style.background = 'rgba(20, 23, 28, 0.72)';
+    this.inviteCodeEl = el('span', 'race-invite-code race-invite-chip');
     this.inviteEl.appendChild(this.inviteCodeEl);
     this.copyBtn = el('button', 'btn btn-small', 'COPY INVITE');
     this.copyBtn.addEventListener('click', () => {
@@ -1573,12 +1584,11 @@ export class KartApp {
     // invite chip parking: while the HUD is up the position/lap chips own the
     // top-left corner — stack beneath them; overlays leave the corner free
     // ('ready' shows the lobby overlay ABOVE the hud, so only countdown/racing park)
+    // the two homes are styled by parent selector in style.css — reparenting is
+    // the whole toggle, no inline position write
     const parkInHud = phase === 'countdown' || phase === 'racing';
     const inviteParent = parkInHud ? this.hudLeftEl : this.raceEl;
-    if (this.inviteEl.parentElement !== inviteParent) {
-      inviteParent.appendChild(this.inviteEl);
-      this.inviteEl.style.position = parkInHud ? 'static' : 'absolute';
-    }
+    if (this.inviteEl.parentElement !== inviteParent) inviteParent.appendChild(this.inviteEl);
 
     // countdown big number / GO! flash
     if (this.goActive && now > this.goUntil) this.goActive = false;
@@ -1629,22 +1639,38 @@ export class KartApp {
       this.placeGapEl.textContent =
         you.place === 1 ? 'LEADER' : `+${(you.gapAheadMs / 1000).toFixed(1)}s`;
       this.placeGapEl.classList.toggle('hud-pos-leader', you.place === 1);
+      this.crownEl.classList.toggle('hidden', you.place !== 1);
     } else {
       this.placeNumEl.textContent = '—';
       this.placeSufEl.textContent = '';
       this.placeTotalEl.textContent = '';
       this.placeGapEl.textContent = '';
       this.placeGapEl.classList.remove('hud-pos-leader');
+      this.crownEl.classList.add('hidden');
     }
     this.kidsBadgeEl.classList.toggle('hidden', !this.assist); // KIDS badge while assist is on
     this.lapEl.textContent = `LAP ${Math.min(you?.lap ?? 1, LAPS_TO_WIN)}/${LAPS_TO_WIN}`;
 
-    // speed
-    this.speedNumEl.textContent = String(Math.round(Math.abs(forwardSpeed(s)) * 3.6));
+    // speed: numeral + meter. The meter is normalised to the physics ceiling
+    // (TOP_SPEED * 1.15, the nitro overspeed clamp) so only a boost pegs it.
+    const spdAbs = Math.abs(forwardSpeed(s));
+    this.speedNumEl.textContent = String(Math.round(spdAbs * 3.6));
+    const pct = Math.round(Math.min(1, spdAbs / (TOP_SPEED * 1.15)) * 100);
+    if (pct !== this.prevSpeedPct) {
+      this.prevSpeedPct = pct;
+      this.speedBarEl.style.width = `${pct}%`; // the meter fill — data-driven, like BANK's timer
+    }
 
-    // gear: big number beside the speed; flashes while the upshift cuts the engine
+    // gear: big number above the speed; the upshift fires a one-shot flash
+    // animation (class, not a per-frame opacity write)
     this.gearEl.textContent = String(s.gear);
-    this.gearEl.style.opacity = s.shiftLeft > 0 && Math.floor(now / 90) % 2 === 0 ? '0.25' : '1';
+    const shifting = s.shiftLeft > 0;
+    if (shifting && !this.prevShifting) {
+      this.gearEl.classList.remove('gear-flash');
+      void this.gearEl.offsetWidth; // restart the animation on back-to-back shifts
+      this.gearEl.classList.add('gear-flash');
+    }
+    this.prevShifting = shifting;
 
     // current lap time (frozen at our finish) + best lap
     let current = -1;
@@ -1656,11 +1682,11 @@ export class KartApp {
     if (best < 0 && this.playerId !== null) best = this.bestLaps.get(this.playerId) ?? this.lastLapMs;
     this.bestEl.textContent = fmtMs(best);
 
-    // nitro pips: one lit pip per charge left (you.nitroLeft is authoritative),
-    // dim when spent; a fresh spend flashes the lost pip
+    // nitro pips: one lit pip per charge left (you.nitroLeft is authoritative);
+    // a spent pip falls back to the empty-socket base class and flashes
     const nitroLeft = you?.nitroLeft ?? NITRO_CHARGES;
     this.nitroPips.forEach((pip, i) => {
-      pip.style.opacity = i < nitroLeft ? '1' : '0.25';
+      pip.classList.toggle('hud-nitro-pip-full', i < nitroLeft);
     });
     if (nitroLeft < this.prevNitroPips) {
       const spent = this.nitroPips[nitroLeft]; // the pip that just went dark
@@ -1872,8 +1898,7 @@ export class KartApp {
       return;
     }
     for (const room of this.rooms) {
-      const row = el('div', 'room-row');
-      row.style.cursor = 'pointer'; // hover affordance (inline: style.css is another owner's file)
+      const row = el('div', 'room-row'); // the click affordance is `.room-row { cursor }` in style.css
       row.addEventListener('click', () => {
         this.audio.resume(); // same gesture unlock as the menu buttons
         this.joinPublic(this.menuName(), room.id);
@@ -1911,7 +1936,7 @@ export class KartApp {
     this.resultsBodyEl.replaceChildren();
     for (const p of rows) {
       const tr = el('tr');
-      if (p.id === this.playerId) tr.classList.add('you');
+      if (p.id === this.playerId) tr.classList.add('you', 'results-row-you');
       tr.appendChild(el('td', 'result-place', `P${p.place}`));
       tr.appendChild(el('td', 'result-name', p.name));
       tr.appendChild(

@@ -13,6 +13,16 @@
 // Landmarks: warehouse block + 0.8 loading dock with a 0.4 step (west, CT half),
 // mid crane gantry (legs + bridge + trolley) parked over a ground container,
 // double-stacked containers in the east yard, pipe runs and pallet piles.
+//
+// VALUE LADDER (VISUAL_UPGRADE.md §1/§3a) — this map's assigned read:
+//   ground  `tarmac`   L 34.7  (cool blue-grey asphalt; was `concrete`, the
+//                               same hex as the walls — the map's L1/L4 defect)
+//   wall    `concrete` L 58.4  (warm-neutral, the L1 reference)  -> L1 = 23.7
+//   contact `concreteDeep`     (plinths are F8's articulate(), not map data)
+//   hue split: hueDistance(tarmac, concrete) = 153 deg  -> L4 clears easily.
+// Every box position, extent and spawn below is UNCHANGED — this pass moves
+// `floorMat`, `theme`, `mat` ids, deco density and the backdrop ring only, so
+// collision, lane widths, sightlines and cover spacing are bit-identical.
 import { PALETTE } from '../palette.js';
 import type { MapDef } from './types.js';
 
@@ -24,81 +34,92 @@ export const crossfire: MapDef = {
   name: 'Crossfire',
   sizeX: W,
   sizeZ: D,
-  floorMat: 'concrete',
+  // §3a: cool asphalt yard under warm-neutral concrete architecture.
+  floorMat: 'tarmac',
   theme: {
-    skyHigh: PALETTE.skyDayHigh, // S1: zenith — retune with the rest of the theme
+    skyHigh: PALETTE.skyDayHigh, // S1: zenith, 25.7 L below the horizon + cooler
     sky: PALETTE.skyDay,
     horizon: PALETTE.fogDay,
-    ground: PALETTE.concrete,
-    fog: PALETTE.fogDay,
-    fogDensity: 0.007,
-    sunDir: [0.55, -0.62, 0.5],
-    sunColor: PALETTE.paper,
-    sunIntensity: 1.6,
-    hemiIntensity: 1.35,
+    ground: PALETTE.tarmac, // S4: never the horizon hex
+    fog: PALETTE.fogDay, // S2: fog === horizon, never the zenith
+    fogDensity: 0.009, // hazes the 60-76m skyline ring; ~12% at 40m combat range
+    // §3d: sun dropped from ~40deg to ~31deg elevation — long raking shadows
+    // off the containers and the gantry are this map's value structure.
+    sunDir: [0.62, -0.45, 0.42],
+    sunColor: PALETTE.sandLit, // warm afternoon key against the cool tarmac
+    sunIntensity: 1.75,
+    hemiIntensity: 0.65, // §3d: down hard from 1.35 so the sun's shadows register
   },
   boxes: [
-    // ---- outer walls ----
+    // ---- outer walls (the `concrete` L1 reference mass) ----
     { x: 0, y: 2.5, z: -D / 2, w: W + 2, h: 5, d: 1, mat: 'concrete' },
     { x: 0, y: 2.5, z: D / 2, w: W + 2, h: 5, d: 1, mat: 'concrete' },
     { x: -W / 2, y: 2.5, z: 0, w: 1, h: 5, d: D + 2, mat: 'concrete' },
     { x: W / 2, y: 2.5, z: 0, w: 1, h: 5, d: D + 2, mat: 'concrete' },
 
     // ---- spawn sightline slabs (x[-11,11], z +/-[13,15]) ----
-    { x: 0, y: 1.5, z: 14, w: 22, h: 3, d: 2, mat: 'concrete' },
-    { x: 0, y: 1.5, z: -14, w: 22, h: 3, d: 2, mat: 'concrete' },
+    // secondary mass: a step DOWN from the outer walls (L 46 vs 58) so the
+    // spawn courts read as a separate plane instead of one concrete soup
+    { x: 0, y: 1.5, z: 14, w: 22, h: 3, d: 2, mat: 'concreteDark' },
+    { x: 0, y: 1.5, z: -14, w: 22, h: 3, d: 2, mat: 'concreteDark' },
 
     // ---- spawn yard dividers (cut the long z~+/-17.5 horizontal) ----
-    { x: 14, y: 1, z: 17, w: 1.5, h: 2, d: 5, mat: 'concrete' },
-    { x: -14, y: 1, z: 17, w: 1.5, h: 2, d: 5, mat: 'concrete' },
-    { x: 14, y: 1, z: -17, w: 1.5, h: 2, d: 5, mat: 'concrete' },
-    { x: -14, y: 1, z: -17, w: 1.5, h: 2, d: 5, mat: 'concrete' },
+    { x: 14, y: 1, z: 17, w: 1.5, h: 2, d: 5, mat: 'concreteDark' },
+    { x: -14, y: 1, z: 17, w: 1.5, h: 2, d: 5, mat: 'concreteDark' },
+    { x: 14, y: 1, z: -17, w: 1.5, h: 2, d: 5, mat: 'concreteDark' },
+    { x: -14, y: 1, z: -17, w: 1.5, h: 2, d: 5, mat: 'concreteDark' },
 
     // ---- warehouse block (x[-26,-15], z[-13,-5]) + loading dock ----
     { x: -20.5, y: 3, z: -9, w: 11, h: 6, d: 8, mat: 'concrete' },
-    // dock platform top y=0.8 against the south face; single 0.4 step up
+    // dock platform top y=0.8 against the south face; single 0.4 step up.
+    // Three-value stair: ground 34.7 -> platform 46.2 -> lit step nosing 58.4.
     { x: -20.5, y: 0.4, z: -4, w: 11, h: 0.8, d: 2, mat: 'concreteDark' },
-    { x: -20.5, y: 0.2, z: -2.5, w: 6, h: 0.4, d: 1, mat: 'concreteDark' },
+    { x: -20.5, y: 0.2, z: -2.5, w: 6, h: 0.4, d: 1, mat: 'concrete' },
 
     // ---- mid lane container dividers (rotation gap z(-0.5,2) = 2.5m) ----
+    // alternating light/dark steel: a painted container yard, not one grey mass
     { x: -7.5, y: 1.3, z: -4, w: 2.4, h: 2.6, d: 7, mat: 'metal' },
-    { x: -7.5, y: 1.3, z: 5, w: 2.4, h: 2.6, d: 6, mat: 'metal' },
-    { x: 7.5, y: 1.3, z: -4, w: 2.4, h: 2.6, d: 7, mat: 'metal' },
+    { x: -7.5, y: 1.3, z: 5, w: 2.4, h: 2.6, d: 6, mat: 'metalDark' },
+    { x: 7.5, y: 1.3, z: -4, w: 2.4, h: 2.6, d: 7, mat: 'metalDark' },
     { x: 7.5, y: 1.3, z: 5, w: 2.4, h: 2.6, d: 6, mat: 'metal' },
 
     // ---- mid crane gantry: legs + bridge (underside 3.2) + trolley ----
     { x: -3.5, y: 1.6, z: 0, w: 1, h: 3.2, d: 1, mat: 'metalDark' },
     { x: 3.5, y: 1.6, z: 0, w: 1, h: 3.2, d: 1, mat: 'metalDark' },
     { x: 0, y: 3.4, z: 0, w: 11, h: 0.4, d: 1.4, mat: 'metalDark' },
-    { x: 0, y: 2.95, z: 0, w: 1.4, h: 0.5, d: 1.4, mat: 'metalDark' },
+    { x: 0, y: 2.95, z: 0, w: 1.4, h: 0.5, d: 1.4, mat: 'metal' }, // trolley reads bright on the dark bridge
     // container parked under the crane (mid cover, splits the plaza 2 ways)
     { x: 0, y: 1.3, z: 1.5, w: 2.4, h: 2.6, d: 6, mat: 'metal' },
 
     // ---- mid approach containers (plug the z +/-[7,13] bands) ----
-    { x: 2, y: 1.3, z: 10, w: 2.4, h: 2.6, d: 6, mat: 'metal' },
+    { x: 2, y: 1.3, z: 10, w: 2.4, h: 2.6, d: 6, mat: 'metalDark' },
     { x: -2, y: 1.3, z: -10, w: 2.4, h: 2.6, d: 6, mat: 'metal' },
 
     // ---- east container yard (stack A is double, top y=5.2) ----
-    { x: 20, y: 1.3, z: -8, w: 6, h: 2.6, d: 2.4, mat: 'metal' },
+    // dark base / light top: the stack lifts instead of reading as one slab
+    { x: 20, y: 1.3, z: -8, w: 6, h: 2.6, d: 2.4, mat: 'metalDark' },
     { x: 20, y: 3.9, z: -8, w: 6, h: 2.6, d: 2.4, mat: 'metal' },
     { x: 24.5, y: 1.3, z: 1, w: 2.4, h: 2.6, d: 6, mat: 'metal' },
-    { x: 18, y: 1.3, z: 8, w: 2.4, h: 2.6, d: 6, mat: 'metal' },
+    { x: 18, y: 1.3, z: 8, w: 2.4, h: 2.6, d: 6, mat: 'metalDark' },
     { x: 24, y: 1.3, z: 11, w: 6, h: 2.6, d: 2.4, mat: 'metal' },
 
     // ---- pipe runs (low cover, h=0.9) ----
+    // kept `metal` (L 66.6): 32 L above the tarmac, so low cover stays readable
     { x: 14, y: 0.45, z: 12, w: 8, h: 0.9, d: 1, mat: 'metal' },
     { x: -12, y: 0.45, z: -11, w: 6, h: 0.9, d: 1, mat: 'metal' },
     { x: 26, y: 0.45, z: -12, w: 1, h: 0.9, d: 8, mat: 'metal' },
 
     // ---- pallet piles (0.6 base + 0.3 top = 0.9 cover) ----
+    // base `wood` / top `woodLit`: the sun-hit top plank layer lifts 11 L
     { x: -18, y: 0.3, z: 8, w: 3, h: 0.6, d: 2, mat: 'wood' },
-    { x: -18, y: 0.75, z: 8, w: 2.2, h: 0.3, d: 1.5, mat: 'wood' },
+    { x: -18, y: 0.75, z: 8, w: 2.2, h: 0.3, d: 1.5, mat: 'woodLit' },
     { x: -18, y: 0.3, z: 0, w: 3, h: 0.6, d: 2, mat: 'wood' },
-    { x: -18, y: 0.75, z: 0, w: 2.2, h: 0.3, d: 1.5, mat: 'wood' },
+    { x: -18, y: 0.75, z: 0, w: 2.2, h: 0.3, d: 1.5, mat: 'woodLit' },
     { x: -12, y: 0.3, z: 5, w: 2.6, h: 0.6, d: 2, mat: 'wood' },
-    { x: -12, y: 0.75, z: 5, w: 1.8, h: 0.3, d: 1.4, mat: 'wood' },
+    { x: -12, y: 0.75, z: 5, w: 1.8, h: 0.3, d: 1.4, mat: 'woodLit' },
 
     // ---- crates (head-glitch 1.2 lane cover) ----
+    // `crate` stays the map's warm accent mass against the cool ground
     { x: -22, y: 0.6, z: 16, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
     { x: 22, y: 0.6, z: 16, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
     { x: -22, y: 0.6, z: -16, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
@@ -132,18 +153,62 @@ export const crossfire: MapDef = {
       { x: 9, z: -17.5, yaw: Math.PI },
     ],
   },
+  // §3c deco density: +96% (73 -> 143 props ACTUALLY placed; counts are
+  // requests, and the renderer's rejection sampler shares one `placed` list
+  // across all zones, so a zone's `count` is an upper bound, not a yield).
+  //
+  // Zones 0-5 keep their rect, kind and rng salt (= array index). Their
+  // minSpacing is loosened where it was starving the sampler: zones 4 and 5
+  // (palletStack, minSpacing 4) placed literally ZERO props before this pass —
+  // the ~73 props from zones 0-3 already covered their rects at a 4 m radius,
+  // so the warehouse and SE-yard pallet piles the map data asks for never
+  // existed. At 2.4 m they nestle between the barrels and place 7 and 8.
+  //
+  // Zones 6-12 are new clusters, deliberately tight (1.6-2.0 m) so they read as
+  // piles rather than a uniform sprinkle. Every one of them is pinned to a dead
+  // corner, one of the two long blank outer walls, or the dock apron — none
+  // sits in a lane. Spacing still exceeds each prop's own footprint (crate 1.13
+  // m, pallet 1.38 m, barrel 0.82 m, sack ~1.1 m at max scale jitter), so props
+  // never interpenetrate. The renderer's insideSolid + SPAWN_CLEARANCE
+  // rejection keeps every prop out of solids and off the spawn courts, and deco
+  // is non-collidable, so none of this touches cover spacing or sightlines.
   deco: [
     { kind: 'barrel', count: 28, x0: -27, z0: -19, x1: -12, z1: 19, minSpacing: 3 },
-    { kind: 'barrel', count: 16, x0: 14, z0: -19, x1: 27, z1: 0, minSpacing: 3.5 },
-    { kind: 'pallet', count: 24, x0: -10, z0: 8, x1: 27, z1: 19, minSpacing: 3.5 },
-    { kind: 'pipe', count: 22, x0: 2, z0: -19, x1: 27, z1: 19, minSpacing: 4 },
-    // AAA pass: stacked pallets pile up around the warehouse/dock and the SE
-    // container yard (appended — earlier zone indices/seeds unchanged)
-    { kind: 'palletStack', count: 10, x0: -27, z0: -14, x1: -13, z1: 8, minSpacing: 4 },
-    { kind: 'palletStack', count: 8, x0: 12, z0: 4, x1: 27, z1: 19, minSpacing: 4 },
+    { kind: 'barrel', count: 15, x0: 14, z0: -19, x1: 27, z1: 0, minSpacing: 3 },
+    { kind: 'pallet', count: 20, x0: -10, z0: 8, x1: 27, z1: 19, minSpacing: 3 },
+    { kind: 'pipe', count: 13, x0: 2, z0: -19, x1: 27, z1: 19, minSpacing: 2.8 },
+    // stacked pallets around the warehouse/dock and the SE container yard
+    { kind: 'palletStack', count: 10, x0: -27, z0: -14, x1: -13, z1: 8, minSpacing: 2.4 },
+    { kind: 'palletStack', count: 8, x0: 12, z0: 4, x1: 27, z1: 19, minSpacing: 2.4 },
+    // ---- §3c density pass: dead-corner and blank-wall clusters ----
+    // NW dead pocket, west of the CT spawn court
+    { kind: 'crate', count: 10, x0: -27, z0: -19.5, x1: -13, z1: -14, minSpacing: 1.8 },
+    // NE dead pocket, east of the CT spawn court
+    { kind: 'crate', count: 8, x0: 13, z0: -19.5, x1: 27, z1: -14.5, minSpacing: 1.8 },
+    // long blank east outer wall: a rust-drum run hugging it (§3a rust accent)
+    {
+      kind: 'barrel',
+      count: 9,
+      x0: 24,
+      z0: -12,
+      x1: 26.8,
+      z1: 19,
+      minSpacing: 1.6,
+      hex: PALETTE.roofRed,
+    },
+    // long blank west outer wall
+    { kind: 'pallet', count: 10, x0: -26.8, z0: -19, x1: -24, z1: 19, minSpacing: 2 },
+    // loading-dock apron: cargo piled off the dock face
+    { kind: 'sack', count: 9, x0: -26, z0: -2.5, x1: -14, z1: 3, minSpacing: 1.6 },
+    // SW dead corner, west of the T spawn court
+    { kind: 'sack', count: 7, x0: -27, z0: 13.5, x1: -12, z1: 19, minSpacing: 1.6 },
+    // SE dead corner, east of the T spawn court
+    { kind: 'crate', count: 8, x0: 12, z0: 14, x1: 27, z1: 19, minSpacing: 1.8 },
   ],
   // AAA accent: safety amber (tAmber) — dock-edge hazard strip, painted
-  // container doors, crane leg stripes: the industrial safety-yellow rhythm
+  // container doors, crane leg stripes: the industrial safety-yellow rhythm.
+  // Both painted doors now sit on `metalDark` containers, so the amber gains
+  // ~34 L of contrast instead of the ~4 it had against `metal`.
   accents: [
     // loading-dock edge hazard strip (front face of the dock platform)
     { x: -20.5, y: 0.73, z: -2.96, w: 11, h: 0.14, d: 0.05, hex: PALETTE.tAmber },
@@ -154,4 +219,26 @@ export const crossfire: MapDef = {
     { x: -3.5, y: 0.9, z: -0.53, w: 1.04, h: 0.3, d: 0.05, hex: PALETTE.tAmber },
     { x: 3.5, y: 0.9, z: -0.53, w: 1.04, h: 0.3, d: 0.05, hex: PALETTE.tAmber },
   ],
+  // §1 S3 — skyline height band. Crossfire had NO SkylineDef, so the sky above
+  // the 5 m outer walls was empty and the ground stopped at the 64x48 slab.
+  // The band is tuned so tips can never read as detached "floating diamonds":
+  //   * minR 60 clears the map's 35.1 m corner radius by more than the widest
+  //     landmark's bounding radius (h=13 -> w<=36.4, d<=26 -> r<=22.4), so no
+  //     silhouette can ever poke through an outer wall into the playable yard;
+  //   * the 9-13 m height band is narrow, and at r 60-76 every landmark's top
+  //     lands just above the wall line from mid-map, so the ring reads as one
+  //     continuous industrial roofline rather than isolated caps over their own
+  //     front ranks. count 16 at r~68 gives ~27 m spacing against 14-36 m
+  //     widths, so the ranks overlap into a band by construction.
+  //   * capHex is the LIGHTER tier: the upper mass lifts toward the pale
+  //     horizon, which is free atmospheric perspective.
+  skyline: {
+    hex: PALETTE.concreteDark,
+    capHex: PALETTE.concrete,
+    count: 16,
+    minR: 60,
+    maxR: 76,
+    minH: 9,
+    maxH: 13,
+  },
 };

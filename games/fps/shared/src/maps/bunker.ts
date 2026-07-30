@@ -15,6 +15,22 @@
 //   - cover every <=8m on routes (room crates -> ring nub -> junction crate -> ...)
 //   - corridors 2.5m; worst pinches 1.5m (ring nubs) / 1.6m (junction crates) >= 1.4m
 //   - 7 spawns/team, all on y=0 ground, none inside boxes (>=0.9m clearance)
+//
+// VALUE LADDER (VISUAL_UPGRADE.md §1/§3a) — bunker is DECLARED MONOCHROME, so it
+// is exempt from L4 (hue split) and pays for that with the harder L1 >= 28:
+//   floor  metalDeep      L 14.5   the darkest surface in the map, by law
+//   cover  concreteDeep   L 28.6   ring nubs + flank columns: cover always reads dark
+//   ceiling concreteDeep  L 28.6   overhead slab, unlit from below
+//   beams  metalDeep      L 14.5   near-black structural ribs across the ceiling
+//   wall   concreteDark   L 46.2   the L1 REFERENCE (46.2 - 14.5 = 31.7 >= 28)
+//   crate  crate          L 52.6
+//   pipes  metal (steel)  L 66.6   the brightest structure, reads in the gloom
+//   accent tAmber         L 63.9   warm emergency dressing against the cold light
+// Interest comes from LIGHT, not hue-of-surface: a saturated cool skylight (sunColor
+// skyDay) punches down through the 4 ceiling slots onto a near-black floor, the
+// hemisphere carries a cool sky tint over a WARM ground tint (§3d) so every
+// downward-facing plane is warm and every upward one is cool, and the fog/horizon
+// is a dark rust that gives depth a warm cast. Amber accents repeat on every lane.
 import { PALETTE } from '../palette.js';
 import type { MapDef } from './types.js';
 
@@ -26,18 +42,31 @@ export const bunker: MapDef = {
   name: 'Bunker',
   sizeX: W,
   sizeZ: D,
-  floorMat: 'metalDark',
+  // §3a: the bunker floor is the darkest surface in the game. L2b does not apply
+  // here (ground below L 25) — props are grounded by geometry, not shadow quads.
+  floorMat: 'metalDeep',
   theme: {
-    skyHigh: PALETTE.skyIndoorHigh, // S1: zenith — retune with the rest of the theme
+    // S1: zenith is 18.7 L* darker than the horizon AND cooler (blueBias 8 > -50).
+    skyHigh: PALETTE.skyIndoorHigh,
+    // LOAD-BEARING, do not "improve": `sky` is also the hemisphere SKY tint
+    // (scene.ts `setTheme`), and indoors the hemisphere IS the light — a dark
+    // value here blacks the interior out. Stays bright and cool (§3d).
     sky: PALETTE.steel,
-    horizon: PALETTE.ink,
-    ground: PALETTE.concreteDark,
-    fog: PALETTE.charcoal,
-    fogDensity: 0.018,
-    sunDir: [0.2, -1, 0.15],
-    sunColor: PALETTE.steel,
-    sunIntensity: 1.3,
-    hemiIntensity: 2.5,
+    // dark rust horizon: warm counterweight to the cold skylight. Also keeps the
+    // map on scene.ts's INDOOR lighting path, which is gated on a dark horizon
+    // (luminance 0.045 — well inside the threshold).
+    horizon: PALETTE.brickDeep,
+    // hemisphere GROUND tint (§3d): warm bounce on every downward-facing plane —
+    // ceilings and pipe undersides read warm against the cool light from above.
+    ground: PALETTE.tBrown,
+    fog: PALETTE.brickDeep, // S2: fog === horizon, never the zenith
+    // eased from 0.018: the horizon/fog is far lighter than the old near-black
+    // ink, so the same density would have hazed out the 25m sightlines.
+    fogDensity: 0.014,
+    sunDir: [0.18, -1, 0.12], // near-vertical: shafts land inside the ceiling slots
+    sunColor: PALETTE.skyDay, // saturated cool daylight — the skylight shafts
+    sunIntensity: 2.2, // up from 1.3 so the shafts read as shafts
+    hemiIntensity: 1.8, // down from 2.5 so the sun is not drowned; still indoor-range
   },
   boxes: [
     // ---- outer shell: walls h=3 + ceiling (slab bottom y=2.8) ----
@@ -48,20 +77,25 @@ export const bunker: MapDef = {
     // ceiling (slab bottom y=2.8) tiled around 4 skylight slots (~2m) so the
     // sun throws real light pools + contact shadows indoors; slots sit over
     // open floor only (hub W of pillar, N/S spawn rooms, NE ring junction) —
-    // outer edges remain fully sealed (slots keep >=7.5m off the outer walls)
-    { x: 0, y: 2.95, z: -15, w: W + 2, h: 0.3, d: 4, mat: 'concreteDark' }, // z[-17,-13]
-    { x: -8, y: 2.95, z: -12, w: 18, h: 0.3, d: 2, mat: 'concreteDark' }, // slot: N room x[1,3] z[-13,-11]
-    { x: 10, y: 2.95, z: -12, w: 14, h: 0.3, d: 2, mat: 'concreteDark' },
-    { x: 0, y: 2.95, z: -9.3, w: W + 2, h: 0.3, d: 3.4, mat: 'concreteDark' }, // z[-11,-7.6]
-    { x: -5.65, y: 2.95, z: -6.7, w: 22.7, h: 0.3, d: 1.8, mat: 'concreteDark' }, // slot: NE junction x[5.7,7.5] z[-7.6,-5.8]
-    { x: 12.25, y: 2.95, z: -6.7, w: 9.5, h: 0.3, d: 1.8, mat: 'concreteDark' },
-    { x: 0, y: 2.95, z: -3.4, w: W + 2, h: 0.3, d: 4.8, mat: 'concreteDark' }, // z[-5.8,-1]
-    { x: -10.25, y: 2.95, z: 0, w: 13.5, h: 0.3, d: 2, mat: 'concreteDark' }, // slot: hub x[-3.5,-1.5] z[-1,1]
-    { x: 7.75, y: 2.95, z: 0, w: 18.5, h: 0.3, d: 2, mat: 'concreteDark' },
-    { x: 0, y: 2.95, z: 6, w: W + 2, h: 0.3, d: 10, mat: 'concreteDark' }, // z[1,11]
-    { x: -10, y: 2.95, z: 12, w: 14, h: 0.3, d: 2, mat: 'concreteDark' }, // slot: S room x[-3,-1] z[11,13]
-    { x: 8, y: 2.95, z: 12, w: 18, h: 0.3, d: 2, mat: 'concreteDark' },
-    { x: 0, y: 2.95, z: 15, w: W + 2, h: 0.3, d: 4, mat: 'concreteDark' }, // z[13,17]
+    // outer edges remain fully sealed (slots keep >=7.5m off the outer walls).
+    // MAT: 'concreteDeep', one full tier below the walls. The slab underside
+    // never sees the sun and the rig already lifts it with a warm hemisphere
+    // bounce, so a wall-value albedo up there would out-read the walls; a
+    // contact-band albedo lands it between the near-black floor and the walls
+    // and makes the bright skylight slots cut hard against it.
+    { x: 0, y: 2.95, z: -15, w: W + 2, h: 0.3, d: 4, mat: 'concreteDeep' }, // z[-17,-13]
+    { x: -8, y: 2.95, z: -12, w: 18, h: 0.3, d: 2, mat: 'concreteDeep' }, // slot: N room x[1,3] z[-13,-11]
+    { x: 10, y: 2.95, z: -12, w: 14, h: 0.3, d: 2, mat: 'concreteDeep' },
+    { x: 0, y: 2.95, z: -9.3, w: W + 2, h: 0.3, d: 3.4, mat: 'concreteDeep' }, // z[-11,-7.6]
+    { x: -5.65, y: 2.95, z: -6.7, w: 22.7, h: 0.3, d: 1.8, mat: 'concreteDeep' }, // slot: NE junction x[5.7,7.5] z[-7.6,-5.8]
+    { x: 12.25, y: 2.95, z: -6.7, w: 9.5, h: 0.3, d: 1.8, mat: 'concreteDeep' },
+    { x: 0, y: 2.95, z: -3.4, w: W + 2, h: 0.3, d: 4.8, mat: 'concreteDeep' }, // z[-5.8,-1]
+    { x: -10.25, y: 2.95, z: 0, w: 13.5, h: 0.3, d: 2, mat: 'concreteDeep' }, // slot: hub x[-3.5,-1.5] z[-1,1]
+    { x: 7.75, y: 2.95, z: 0, w: 18.5, h: 0.3, d: 2, mat: 'concreteDeep' },
+    { x: 0, y: 2.95, z: 6, w: W + 2, h: 0.3, d: 10, mat: 'concreteDeep' }, // z[1,11]
+    { x: -10, y: 2.95, z: 12, w: 14, h: 0.3, d: 2, mat: 'concreteDeep' }, // slot: S room x[-3,-1] z[11,13]
+    { x: 8, y: 2.95, z: 12, w: 18, h: 0.3, d: 2, mat: 'concreteDeep' },
+    { x: 0, y: 2.95, z: 15, w: W + 2, h: 0.3, d: 4, mat: 'concreteDeep' }, // z[13,17]
 
     // ---- solid corner masses (bunker is carved, not built) ----
     { x: -10.25, y: 1.5, z: -11.6, w: 10, h: 3, d: 7.8, mat: 'concreteDark' }, // NW
@@ -114,10 +148,14 @@ export const bunker: MapDef = {
     { x: 2.8, y: 0.6, z: 2.8, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
 
     // ---- ring corridor nubs (mid-segment cover; leave 1.5m pinch) ----
-    { x: 0, y: 1.5, z: -7.2, w: 1.2, h: 3, d: 1.0, mat: 'concreteDark' },
-    { x: 0, y: 1.5, z: 7.2, w: 1.2, h: 3, d: 1.0, mat: 'concreteDark' },
-    { x: -7.2, y: 1.5, z: 0, w: 1.0, h: 3, d: 1.2, mat: 'concreteDark' },
-    { x: 7.2, y: 1.5, z: 0, w: 1.0, h: 3, d: 1.2, mat: 'concreteDark' },
+    // MAT: 'concreteDeep' — MAP-WIDE RULE: cover reads DARK. These stubs used to
+    // be the same MatId as the wall they grow out of, so they were invisible
+    // until you walked into them; a full tier down silhouettes them at range and
+    // gives the amber hazard stripes 35 L* to pop off.
+    { x: 0, y: 1.5, z: -7.2, w: 1.2, h: 3, d: 1.0, mat: 'concreteDeep' },
+    { x: 0, y: 1.5, z: 7.2, w: 1.2, h: 3, d: 1.0, mat: 'concreteDeep' },
+    { x: -7.2, y: 1.5, z: 0, w: 1.0, h: 3, d: 1.2, mat: 'concreteDeep' },
+    { x: 7.2, y: 1.5, z: 0, w: 1.0, h: 3, d: 1.2, mat: 'concreteDeep' },
 
     // ---- ring junction crates (outer corners; leave 1.6m pinch) ----
     { x: -7.25, y: 0.6, z: -7.25, w: 0.9, h: 1.2, d: 0.9, mat: 'crate' },
@@ -138,11 +176,14 @@ export const bunker: MapDef = {
     { x: 0, y: 0.6, z: 12, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
     { x: -4.9, y: 0.6, z: 9.6, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
     // ---- W room: full-height column (cuts door-threading diagonals) + crate stack ----
-    { x: -10.5, y: 1.5, z: 0, w: 1.6, h: 3, d: 4.4, mat: 'concreteDark' },
+    // MAT: 'concreteDeep' — same "cover reads dark" rule as the ring nubs. The
+    // flank rooms have no skylight, so this is the only mass in them that can
+    // silhouette; matching the wall tier made it disappear.
+    { x: -10.5, y: 1.5, z: 0, w: 1.6, h: 3, d: 4.4, mat: 'concreteDeep' },
     { x: -12.5, y: 0.6, z: 0, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
     { x: -12.5, y: 1.8, z: 0, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
     // ---- E room (180° rotation) ----
-    { x: 10.5, y: 1.5, z: 0, w: 1.6, h: 3, d: 4.4, mat: 'concreteDark' },
+    { x: 10.5, y: 1.5, z: 0, w: 1.6, h: 3, d: 4.4, mat: 'concreteDeep' },
     { x: 12.5, y: 0.6, z: 0, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
     { x: 12.5, y: 1.8, z: 0, w: 1.2, h: 1.2, d: 1.2, mat: 'crate' },
 
@@ -167,12 +208,16 @@ export const bunker: MapDef = {
     { x: 15.2, y: 1.4, z: 3.7, w: 0.3, h: 2.8, d: 0.3, mat: 'metal' },
 
     // ---- ceiling beams (hang to y2.51; clear of players and crate stacks) ----
-    { x: 0, y: 2.62, z: 0, w: 8, h: 0.22, d: 0.5, mat: 'metalDark' }, // hub
-    { x: 0, y: 2.62, z: 0, w: 0.5, h: 0.22, d: 8, mat: 'metalDark' }, // hub
-    { x: 0, y: 2.62, z: -11.5, w: 10.6, h: 0.22, d: 0.5, mat: 'metalDark' }, // N room
-    { x: 0, y: 2.62, z: 11.5, w: 10.6, h: 0.22, d: 0.5, mat: 'metalDark' }, // S room
-    { x: -11.5, y: 2.62, z: 0, w: 0.5, h: 0.22, d: 10.6, mat: 'metalDark' }, // W room
-    { x: 11.5, y: 2.62, z: 0, w: 0.5, h: 0.22, d: 10.6, mat: 'metalDark' }, // E room
+    // MAT: 'metalDeep' — the ceiling dropped to 'concreteDeep', so the old
+    // 'metalDark' beams were within 1 L* of it and vanished. The contact band
+    // turns them into near-black ribs that rhythm the whole overhead plane and
+    // echo the floor, which is the same MatId.
+    { x: 0, y: 2.62, z: 0, w: 8, h: 0.22, d: 0.5, mat: 'metalDeep' }, // hub
+    { x: 0, y: 2.62, z: 0, w: 0.5, h: 0.22, d: 8, mat: 'metalDeep' }, // hub
+    { x: 0, y: 2.62, z: -11.5, w: 10.6, h: 0.22, d: 0.5, mat: 'metalDeep' }, // N room
+    { x: 0, y: 2.62, z: 11.5, w: 10.6, h: 0.22, d: 0.5, mat: 'metalDeep' }, // S room
+    { x: -11.5, y: 2.62, z: 0, w: 0.5, h: 0.22, d: 10.6, mat: 'metalDeep' }, // W room
+    { x: 11.5, y: 2.62, z: 0, w: 0.5, h: 0.22, d: 10.6, mat: 'metalDeep' }, // E room
   ],
   spawns: {
     // CT holds the N room, faces south (+Z); row keeps >=0.9m clear of all boxes
@@ -196,25 +241,79 @@ export const bunker: MapDef = {
       { x: 0.8, z: 14.6, yaw: 0 },
     ],
   },
+  // §3c DENSITY PASS: 62 -> 101 declared props (+63%); replaying mapRenderer's
+  // scatter (DECO_DENSITY 1.6, SOLID_PAD 0.5, SPAWN_CLEARANCE 2.5) puts 58 of
+  // them on the floor, up from 31 (+87%). The extra density comes from ZONE
+  // RECTS TIGHTENED ONTO THE ACTUALLY-FREE FLOOR, never from packing: every
+  // rect below is clipped to the region that survives the solid/spawn
+  // rejection, so the sampling budget is spent on floor that can accept a prop
+  // instead of on walls. (The one deliberately loose rect is the hub/ring pipe
+  // zone, which is allowed to roam the whole loop and fill what is left.)
+  //
+  // minSpacing IS A PHYSICAL FOOTPRINT BUDGET — DO NOT LOWER IT TO BUY COUNT.
+  // mapRenderer's `PROP_SHADOW_R` is each kind's ground-footprint radius
+  // (pipe 0.95, sandbag 0.95, palletStack 0.78, pallet 0.75, sack 0.5,
+  // barrel 0.44) and `buildProp` scales props by up to 1.2. So for any two
+  // kinds that can share a region, the later zone's minSpacing must be
+  // >= 1.2 * (r_a + r_b), otherwise the props physically interpenetrate:
+  //   pipe/sandbag with each other .......... 2.3
+  //   pallet next to pipe/sandbag ........... 2.1
+  //   palletStack with each other ........... 1.9
+  //   sack next to pipe ..................... 1.8
+  //   barrel next to pipe/sandbag ........... 1.7
+  //   sack next to palletStack .............. 1.6
+  //   barrel next to palletStack ............ 1.5
+  // Zones are ordered BIGGEST-FOOTPRINT-FIRST within each region, because
+  // `tooClose` tests a candidate against every already-placed prop using only
+  // the CURRENT zone's spacing — sampling the tight zones first is what keeps
+  // the small kinds from squatting the holes the big ones need.
+  //
+  // Deco is client-only and NON-COLLIDABLE, so none of it touches the
+  // playability invariants above. Placement rules honoured: nothing within
+  // 2.5m of a spawn, nothing in a doorway channel, nothing in the middle of a
+  // ring-corridor running line — the zones are strips hugging blank walls and
+  // dead corners.
+  // NOTE: no 'crate' deco anywhere in this map, deliberately — the map already
+  // uses 1.2m `crate` BoxDefs as real cover, and a non-collidable prop that
+  // looks identical would read as cover and get players killed.
   deco: [
-    // pipe props: ring corridors + hub surroundings (no spawns nearby)
-    { kind: 'pipe', count: 14, x0: -7.2, z0: -7.2, x1: 7.2, z1: 7.2, minSpacing: 3.5 },
-    // pipe props in the four side rooms
-    { kind: 'pipe', count: 4, x0: -5, z0: -14.5, x1: 5, z1: -9.4, minSpacing: 3 },
-    { kind: 'pipe', count: 4, x0: -5, z0: 9.4, x1: 5, z1: 14.5, minSpacing: 3 },
-    // barrels: spawn rooms south half (clear of the >=2.5m spawn rejection radius)
-    { kind: 'barrel', count: 5, x0: -5, z0: -11.2, x1: 5, z1: -9.3, minSpacing: 2 },
-    { kind: 'barrel', count: 5, x0: -5, z0: 9.3, x1: 5, z1: 11.2, minSpacing: 2 },
-    // barrels: flank rooms (no spawns there)
-    { kind: 'barrel', count: 5, x0: -14.8, z0: -5, x1: -9.4, z1: 5, minSpacing: 2.5 },
-    { kind: 'barrel', count: 5, x0: 9.4, z0: -5, x1: 14.8, z1: 5, minSpacing: 2.5 },
-    // AAA pass: sandbag positions in the spawn rooms (clear of the spawn rows)
-    // + pallet stacks as flank-room stores (appended — earlier zone
-    // indices/seeds unchanged)
-    { kind: 'sandbag', count: 6, x0: -5, z0: -12.6, x1: 5, z1: -9.4, minSpacing: 3 },
-    { kind: 'sandbag', count: 6, x0: -5, z0: 9.4, x1: 5, z1: 12.6, minSpacing: 3 },
-    { kind: 'palletStack', count: 4, x0: -14.8, z0: -5, x1: -9.4, z1: 5, minSpacing: 3.5 },
-    { kind: 'palletStack', count: 4, x0: 9.4, z0: -5, x1: 14.8, z1: 5, minSpacing: 3.5 },
+    // -- ring corridor + hub. Free floor after SOLID_PAD is a 1.5m band inside
+    //    each leg (|.|<7.2 outside the hub walls at |.|=5.7) plus the hub
+    //    interior. Low sacks hug the W/E legs, pipe runs the N/S legs, and one
+    //    loose zone dresses the hub + whatever ring floor is left over.
+    { kind: 'sack', count: 4, x0: -7.1, z0: -6.3, x1: -6.1, z1: 6.3, minSpacing: 1.8 },
+    { kind: 'sack', count: 4, x0: 6.1, z0: -6.3, x1: 7.1, z1: 6.3, minSpacing: 1.8 },
+    { kind: 'pipe', count: 4, x0: -6.3, z0: -7.1, x1: 6.3, z1: -6.1, minSpacing: 2.3 },
+    { kind: 'pipe', count: 4, x0: -6.3, z0: 6.1, x1: 6.3, z1: 7.1, minSpacing: 2.3 },
+    { kind: 'pipe', count: 15, x0: -7.2, z0: -7.2, x1: 7.2, z1: 7.2, minSpacing: 2.3 },
+    // -- flank rooms (no spawns there). Rects were z[-5,5] x[+-14.8,+-9.4],
+    //    but the flank masses close the room at z=+-4.0 and the outer wall at
+    //    |x|=15.5, so after SOLID_PAD only z[-3.4,3.4] x[+-14.9,+-9.5] could
+    //    ever accept a sample; clipping to it is where the extra props come
+    //    from. Pallet stacks are the hero store, sacks fill the back wall
+    //    behind the column, barrels take the leftovers.
+    { kind: 'palletStack', count: 4, x0: -14.9, z0: -3.4, x1: -9.5, z1: 3.4, minSpacing: 1.9 },
+    { kind: 'palletStack', count: 4, x0: 9.5, z0: -3.4, x1: 14.9, z1: 3.4, minSpacing: 1.9 },
+    { kind: 'sack', count: 5, x0: -14.9, z0: -3.4, x1: -12.6, z1: 3.4, minSpacing: 1.6 },
+    { kind: 'sack', count: 5, x0: 12.6, z0: -3.4, x1: 14.9, z1: 3.4, minSpacing: 1.6 },
+    { kind: 'barrel', count: 10, x0: -14.9, z0: -3.4, x1: -9.5, z1: 3.4, minSpacing: 1.5 },
+    { kind: 'barrel', count: 10, x0: 9.5, z0: -3.4, x1: 14.9, z1: 3.4, minSpacing: 1.5 },
+    // -- spawn rooms. The ONLY dressable floor is the 1.9m-deep strip between
+    //    the crate stacks and the room's inner wall (x[-4.7,4.7],
+    //    |z| in [9.4,11.3]): the outer wall pad takes |z|>15.0, the corner
+    //    masses take |x|>4.75, and the 2.5m spawn rejection radius swallows
+    //    everything at |z|>11.3. The old rects reached to |z|=14.5 and spent
+    //    ~70% of their attempts sampling floor that could never accept a prop.
+    // The pallet strip is the spawn-room back wall, strictly BETWEEN the two
+    // doors (x[-2.2,2.2] is the solid centre block) so neither doorway approach
+    // is dressed. At 4x0.4m it is the smallest zone in the map, so it is
+    // sampled FIRST — once the sandbags land there is no 2.1m hole left in it.
+    { kind: 'pallet', count: 3, x0: -2, z0: -9.9, x1: 2, z1: -9.5, minSpacing: 2.1 },
+    { kind: 'pallet', count: 3, x0: -2, z0: 9.5, x1: 2, z1: 9.9, minSpacing: 2.1 },
+    { kind: 'sandbag', count: 5, x0: -4.7, z0: -11.3, x1: 4.7, z1: -9.4, minSpacing: 2.3 },
+    { kind: 'sandbag', count: 5, x0: -4.7, z0: 9.4, x1: 4.7, z1: 11.3, minSpacing: 2.3 },
+    { kind: 'barrel', count: 8, x0: -4.7, z0: -11.3, x1: 4.7, z1: -9.4, minSpacing: 1.7 },
+    { kind: 'barrel', count: 8, x0: -4.7, z0: 9.4, x1: 4.7, z1: 11.3, minSpacing: 1.7 },
   ],
   // AAA accent: safety amber (tAmber) — hub pillar hazard plates + hub door
   // markers + ring-nub hazard stripes, repeated on every main sightline
@@ -227,8 +326,28 @@ export const bunker: MapDef = {
     { x: 2.88, y: 1.1, z: -5.24, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.tAmber },
     { x: -3.08, y: 1.1, z: 5.24, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.tAmber },
     { x: -0.92, y: 1.1, z: 5.24, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.tAmber },
-    // ring-nub hazard stripes (N/S corridor cover)
-    { x: 0, y: 0.9, z: -7.73, w: 1.0, h: 0.15, d: 0.05, hex: PALETTE.tAmber },
-    { x: 0, y: 0.9, z: 7.73, w: 1.0, h: 0.15, d: 0.05, hex: PALETTE.tAmber },
+    // ring-nub hazard stripes (N/S corridor cover).
+    // FIXED: these were at z=-+7.73, which is INSIDE the spawn-room wall the nub
+    // grows out of (that wall spans z[-8.9,-7.7]) — they rendered buried and
+    // invisible. The nub's corridor-facing face is z=-+6.7; 0.03 proud of that.
+    { x: 0, y: 0.9, z: -6.67, w: 1.0, h: 0.15, d: 0.05, hex: PALETTE.tAmber },
+    { x: 0, y: 0.9, z: 6.67, w: 1.0, h: 0.15, d: 0.05, hex: PALETTE.tAmber },
+    // matching stripes on the W/E ring nubs (nubs span x -+[6.7,7.7]; the
+    // corridor-facing face is x=-+6.7) so every leg of the loop carries the accent
+    { x: -6.67, y: 0.9, z: 0, w: 0.05, h: 0.15, d: 1.0, hex: PALETTE.tAmber },
+    { x: 6.67, y: 0.9, z: 0, w: 0.05, h: 0.15, d: 1.0, hex: PALETTE.tAmber },
+    // spawn-room door jambs, ring side (wall z=-+8.3 d1.2 -> ring face z=-+7.7;
+    // the solid centre block spans x[-2.2,2.2], so these sit flush to the inner
+    // edge of each of the four openings)
+    { x: -2.13, y: 1.1, z: -7.66, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.tAmber },
+    { x: 2.13, y: 1.1, z: -7.66, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.tAmber },
+    { x: -2.13, y: 1.1, z: 7.66, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.tAmber },
+    { x: 2.13, y: 1.1, z: 7.66, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.tAmber },
+    // low wayfinding strips on the four corner masses at the ring junctions
+    // (clear of the junction crates, which end at x=-+6.8)
+    { x: -6, y: 0.35, z: -7.66, w: 1.4, h: 0.1, d: 0.06, hex: PALETTE.tAmber },
+    { x: 6, y: 0.35, z: -7.66, w: 1.4, h: 0.1, d: 0.06, hex: PALETTE.tAmber },
+    { x: -6, y: 0.35, z: 7.66, w: 1.4, h: 0.1, d: 0.06, hex: PALETTE.tAmber },
+    { x: 6, y: 0.35, z: 7.66, w: 1.4, h: 0.1, d: 0.06, hex: PALETTE.tAmber },
   ],
 };

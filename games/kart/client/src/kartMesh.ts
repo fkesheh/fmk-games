@@ -8,15 +8,25 @@
 // turns, and a small exhaust flame flickers while nitro is active. Faces
 // local -z so root.rotation.y = platform yaw works.
 //
-// 39 prims/kart: floor tray, chassis tub, nose cone, front-wing assembly
-// (blade + 2 endplates merged), 2 side pods, center stripe, seat back,
-// steering column + torus wheel, engine block, bright rear-deck air box, dual
-// exhausts (merged), roll bar, rear wing (charcoal blade + supports merged;
-// accent endplates merged), number roundels (pod L/R + nose, one merged
-// mesh), driver (torso + back stripe, 2 arms, gloves merged, helmet + wrap
-// visor), 2 flame cones, 4x (lathe tire + recessed white rim + spokes), brake
-// disc. All static colors are KPAL; the livery accent is a small
-// deterministic hue/lightness shift of the player color.
+// 46 prims/kart: under-shadow band (merged spine + pod pad), floor tray,
+// chassis tub, nose cone, front-wing assembly (blade + 2 endplates merged),
+// 2 side pods, merged pod skirts, merged lit pod rails, center stripe, cockpit
+// coaming, seat back, steering column + torus wheel, engine block, bright
+// rear-deck air box, dual exhausts (merged), roll bar, rear wing (charcoal
+// blade + supports merged; accent endplates merged), merged lit aero strips
+// (front + rear wing tops), number roundels (pod L/R + nose, one merged mesh),
+// driver (torso + back stripe, 2 arms, gloves merged, helmet + wrap visor +
+// brow peak + crown stripe), 2 flame cones, 4x (lathe tire + recessed white
+// rim + spokes), brake disc. All static colors are KPAL; the livery accent is
+// a small deterministic hue/lightness shift of the player color.
+//
+// VALUE LADDER (VISUAL_UPGRADE.md §1/§4 — "kart is low-contrast at distance"):
+//   ink L 8   under-shadow band (deepest; the kart no longer floats)
+//   tire L 13 tyres
+//   charcoal L 16  floor tray, pod skirts, aero blades  (>= 8 above the band)
+//   color L 39-64  chassis tub + driver suit             (>= 23 above charcoal)
+//   accent L 52-87 side pods + helmet                    (>= 10 above color)
+//   curbWhite L 91 pod rails, wing tops, rims, gloves, stripes (lit trim)
 // ============================================================================
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
@@ -85,19 +95,23 @@ function roundelMat(hex: string): THREE.MeshLambertMaterial {
   let m = roundelCache.get(hex);
   if (m) return m;
   const canvas = document.createElement('canvas');
-  canvas.width = 128;
-  canvas.height = 128;
+  canvas.width = 256; // 128 -> 256: the roundel is read at chase-cam distance
+  canvas.height = 256;
   const ctx = canvas.getContext('2d')!;
-  ctx.clearRect(0, 0, 128, 128);
+  ctx.clearRect(0, 0, 256, 256);
+  ctx.fillStyle = KPAL.ink; // dark ring: the disc must read on a LIGHT livery too
+  ctx.beginPath();
+  ctx.arc(128, 128, 124, 0, Math.PI * 2);
+  ctx.fill();
   ctx.fillStyle = KPAL.curbWhite; // the roundel disc
   ctx.beginPath();
-  ctx.arc(64, 64, 60, 0, Math.PI * 2);
+  ctx.arc(128, 128, 111, 0, Math.PI * 2);
   ctx.fill();
   ctx.fillStyle = KPAL.ink; // the race number
-  ctx.font = 'bold 64px system-ui, sans-serif';
+  ctx.font = 'bold 150px system-ui, sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(String(roundelNumber(hex)), 64, 68);
+  ctx.fillText(String(roundelNumber(hex)), 128, 137);
   const tex = new THREE.CanvasTexture(canvas);
   tex.colorSpace = THREE.SRGBColorSpace;
   m = new THREE.MeshLambertMaterial({ map: tex, transparent: true, flatShading: true });
@@ -195,6 +209,30 @@ export class KartVisual {
       return mesh;
     };
 
+    // ---- under-shadow band (grounding) ------------------------------------------
+    // Nothing used to sit between the floor tray and the road, so the kart read
+    // as floating. A ground-hugging `ink` slab (the palette's deepest value, a
+    // full 8 L under the charcoal tray) is the kart's contact band. It lives on
+    // ROOT, not body, so it stays parallel to the ground while the chassis rolls
+    // and pitches. Two merged parts: a narrow spine threaded between the wheels,
+    // and a wider pad under the side pods where there is lateral clearance.
+    //
+    // HEIGHT: the band must clear the whole road-decal stack in `trackMesh.ts`.
+    // The topmost layer there is PAINT_Y (0.03) carrying 0.02-tall boxes — the
+    // start/finish checker and the grid-stall paint — whose top faces land at
+    // y 0.040, and karts spawn standing on exactly those stalls. So the band is
+    // thin (0.014) and centred at 0.050: it occupies y 0.043..0.057, entirely
+    // above the paint with a 3 mm gap, and with no face coplanar with y 0.040
+    // (a shared plane z-fights just as badly as an overlap). Thin rather than
+    // tall so the side faces stay a sliver — it must read as a shadow pressed
+    // into the road, not as a slab floating over it.
+    const shadowSpine = new THREE.BoxGeometry(0.98, 0.014, 2.5);
+    shadowSpine.translate(0, 0.05, 0.05);
+    const shadowPad = new THREE.BoxGeometry(1.58, 0.014, 0.84);
+    shadowPad.translate(0, 0.05, 0.1);
+    const underShadow = new THREE.Mesh(mergeGeometries([shadowSpine, shadowPad])!, matFn(KPAL.ink));
+    root.add(underShadow); // no castShadow: this IS the shadow read
+
     // ---- chassis & aero ---------------------------------------------------------
     put(box(matFn, 1.3, 0.06, 2.3, KPAL.charcoal), 0, 0.14, 0.05); // floor tray
     put(box(matFn, 0.95, 0.18, 1.5, color), 0, 0.3, 0.15); // chassis tub (livery)
@@ -211,7 +249,25 @@ export class KartVisual {
     put(new THREE.Mesh(mergeGeometries([wingBlade, endL, endR])!, matFn(KPAL.charcoal)), 0, 0.12, -1.45);
     put(box(matFn, 0.32, 0.22, 1.0, accent), -0.62, 0.33, 0.05); // side pod L (accent)
     put(box(matFn, 0.32, 0.22, 1.0, accent), 0.62, 0.33, 0.05); // side pod R (accent)
-    put(box(matFn, 0.16, 0.03, 1.5, accent), 0, 0.4, 0.1); // center stripe (accent)
+    // pod skirts: the shaded lower flank, flush with the pod's outer face. One
+    // merged charcoal part — a hard value break between the accent pods and the
+    // tray, so the pods stop merging into the body mass at distance.
+    const skirtL = new THREE.BoxGeometry(0.34, 0.09, 1.02);
+    skirtL.translate(-0.62, 0.185, 0.05);
+    const skirtR = new THREE.BoxGeometry(0.34, 0.09, 1.02);
+    skirtR.translate(0.62, 0.185, 0.05);
+    put(new THREE.Mesh(mergeGeometries([skirtL, skirtR])!, matFn(KPAL.charcoal)), 0, 0, 0);
+    // pod rails: the lit top edge (curbWhite), the ladder's top rung. Two thin
+    // slivers, but they draw the kart's widest horizontal line against the road.
+    const railL = new THREE.BoxGeometry(0.36, 0.035, 1.04);
+    railL.translate(-0.62, 0.4525, 0.05);
+    const railR = new THREE.BoxGeometry(0.36, 0.035, 1.04);
+    railR.translate(0.62, 0.4525, 0.05);
+    put(new THREE.Mesh(mergeGeometries([railL, railR])!, matFn(KPAL.curbWhite)), 0, 0, 0);
+    put(box(matFn, 0.16, 0.03, 0.66, accent), 0, 0.4, -0.3); // nose-deck center stripe (accent)
+    // cockpit coaming: an ink slot around the driver so the suit does not sit
+    // straight on the same-value tub. Sunk 0.02 into the tub to avoid coplanar faces.
+    put(box(matFn, 0.56, 0.12, 0.62, KPAL.ink), 0, 0.43, 0.34);
 
     // ---- number roundels (pod flanks + nose top; one merged mesh, one canvas) ---
     const rdPodL = new THREE.CircleGeometry(0.13, 12);
@@ -263,6 +319,15 @@ export class KartVisual {
     const rwEndR = new THREE.BoxGeometry(0.04, 0.16, 0.28);
     rwEndR.translate(0.5, 0.84, 1.18);
     put(new THREE.Mesh(mergeGeometries([rwEndL, rwEndR])!, matFn(accent)), 0, 0, 0);
+    // lit aero: curbWhite skins on the two wing tops, merged into one part. The
+    // charcoal blades vanished against the road; a sun-facing top surface gives
+    // the kart a bright leading and trailing line (the chase cam stares at the
+    // rear one all race).
+    const wingLitFront = new THREE.BoxGeometry(1.28, 0.02, 0.28);
+    wingLitFront.translate(0, 0.145, -1.45);
+    const wingLitRear = new THREE.BoxGeometry(0.94, 0.02, 0.2);
+    wingLitRear.translate(0, 0.905, 1.18);
+    put(new THREE.Mesh(mergeGeometries([wingLitFront, wingLitRear])!, matFn(KPAL.curbWhite)), 0, 0, 0);
 
     // nitro flame at the right exhaust tip: outer orange cone + smaller hot
     // core, apexes pointing rearward (+z). Hidden until boost. Emissive fx —
@@ -292,12 +357,15 @@ export class KartVisual {
       driver.add(mesh);
       return mesh;
     };
-    dput(box(matFn, 0.44, 0.5, 0.26, accent), 0, 0.28, 0); // torso — livery racing suit
+    // Suit is the PLAYER colour (who is driving is legible from the suit), helmet
+    // is the lifted accent — 10-27 L above the suit, so the head reads as a
+    // separate mass against the seat back instead of one livery-coloured blob.
+    dput(box(matFn, 0.44, 0.5, 0.26, color), 0, 0.28, 0); // torso — livery racing suit
     dput(box(matFn, 0.42, 0.12, 0.03, KPAL.curbWhite), 0, 0.42, 0.14); // back stripe high on the torso — clears the seat top from behind
-    const armL = dput(box(matFn, 0.09, 0.09, 0.42, accent), -0.14, 0.26, -0.25);
+    const armL = dput(box(matFn, 0.09, 0.09, 0.42, color), -0.14, 0.26, -0.25);
     armL.rotation.x = -0.25; // hands down to the wheel
     armL.rotation.y = 0.1; // hands in towards the column
-    const armR = dput(box(matFn, 0.09, 0.09, 0.42, accent), 0.14, 0.26, -0.25);
+    const armR = dput(box(matFn, 0.09, 0.09, 0.42, color), 0.14, 0.26, -0.25);
     armR.rotation.x = -0.25;
     armR.rotation.y = -0.1;
     // white gloves on the wheel grips — one merged rigid part
@@ -308,9 +376,12 @@ export class KartVisual {
     gloveGeoR.rotateX(-0.25);
     gloveGeoR.translate(0.13, 0.2, -0.51);
     dput(new THREE.Mesh(mergeGeometries([gloveGeoL, gloveGeoR])!, matFn(KPAL.curbWhite)), 0, 0, 0);
-    dput(sphere(matFn, 0.21, 8, color), 0, 0.62, 0.02); // helmet — player color
+    dput(sphere(matFn, 0.21, 8, accent), 0, 0.62, 0.02); // helmet — lifted livery accent
     const visor = dput(box(matFn, 0.36, 0.09, 0.08, KPAL.ink), 0, 0.63, -0.155);
     visor.rotation.x = -0.1; // wide stripe, corners wrap the helmet sides
+    const peak = dput(box(matFn, 0.32, 0.03, 0.12, KPAL.charcoal), 0, 0.575, -0.185);
+    peak.rotation.x = -0.15; // brow proud of the shell — casts the visor into shade
+    dput(box(matFn, 0.075, 0.06, 0.2, KPAL.curbWhite), 0, 0.795, 0.02); // crown stripe, read from behind
 
     // ---- wheels: lathe tire (rounded shoulders) + recessed white rim + spokes -----
     const tireGeo = tireGeometry();

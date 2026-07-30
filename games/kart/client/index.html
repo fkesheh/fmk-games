@@ -4,13 +4,19 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>KART GP</title>
+    <meta name="color-scheme" content="dark" />
     <!-- Pre-boot paint guard only; the real stylesheet is src/style.css.
-         Ink background (KPAL.ink), no external assets/fonts. -->
+         The background MUST stay byte-equal to `:root`'s page colour in
+         style.css (VISUAL_UPGRADE.md §7 seam rule 6) — that is KPAL.ink,
+         #14171c — or the pre-boot flash diverges from the app. This inline
+         hex and the `:root` mirror in style.css are the only hex literals
+         permitted outside the palette file. No external assets/fonts. -->
     <style>
       html,
       body {
         margin: 0;
         background: #14171c;
+        color-scheme: dark;
       }
     </style>
     <link rel="stylesheet" href="/src/style.css" />

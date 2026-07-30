@@ -236,6 +236,22 @@ const DICE_TUMBLE_MS = 600; // tumble frames before the dice settle on d1/d2
 const RESUME_KEY = 'bank.resume'; // localStorage: { playerId, code } rejoin record
 const NAME_KEY = 'bank.name'; // localStorage: last joined name (invite-link auto-join)
 
+/**
+ * Event-log entry kinds. These map 1:1 onto the frozen `log-kind-*` classes
+ * (VISUAL_UPGRADE §8) so the stylesheet can accent each event type: 'roll' for
+ * dice activity, 'bank' for value secured, 'bust' for the 7, and 'join' for
+ * neutral system lines (seating, match wrap-up).
+ */
+type LogKind = 'roll' | 'bank' | 'bust' | 'join';
+
+interface LogEntry {
+  text: string;
+  kind: LogKind;
+}
+
+/** Result banner tone; drives the frozen `banner-win` / `banner-lose` classes. */
+type BannerTone = 'none' | 'win' | 'lose';
+
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
   className?: string,
@@ -270,8 +286,10 @@ export class BankGame {
   private copiedTimer = 0; // 'COPIED' feedback reset handle
   private rooms: RoomInfo[] = [];
   private screen: 'menu' | 'table' = 'menu';
-  private readonly logLines: string[] = [];
+  private readonly logLines: LogEntry[] = [];
   private bannerText = '';
+  private bannerSub = '';
+  private bannerTone: BannerTone = 'none';
   private potShown = 0; // animated value; eases UP toward state.pot, snaps down
   private potTarget = 0;
   private offset = 0; // serverNow = Date.now() + offset (min-RTT would be nicer; rtt/2 estimate)
@@ -299,6 +317,8 @@ export class BankGame {
   private readonly playersEl: HTMLDivElement;
   private readonly logEl: HTMLDivElement;
   private readonly bannerEl: HTMLDivElement;
+  private readonly bannerMainEl: HTMLDivElement;
+  private readonly bannerSubEl: HTMLDivElement;
   private readonly rollBtn: HTMLButtonElement;
   private readonly bankBtn: HTMLButtonElement;
 
@@ -317,36 +337,20 @@ export class BankGame {
     this.menuEl.appendChild(this.nameInput);
 
     // ---- create-section variant picker (docs/BANK.md "VARIANT UI") -----------
+    // Zero inline styling here: `.menu-options` and its label/checkbox/select
+    // are styled entirely from style.css. Inline rules outrank the stylesheet,
+    // so writing them here would make the sheet's `.menu-options` rules dead.
     const options = el('div', 'menu-options');
-    options.style.display = 'flex';
-    options.style.flexWrap = 'wrap';
-    options.style.justifyContent = 'center';
-    options.style.alignItems = 'center';
-    options.style.gap = '14px';
-    options.style.fontSize = '14px';
-    options.style.color = 'var(--cream-dim)';
 
     const sevenLabel = el('label');
-    sevenLabel.style.display = 'flex';
-    sevenLabel.style.alignItems = 'center';
-    sevenLabel.style.gap = '6px';
-    sevenLabel.style.cursor = 'pointer';
     this.sevenBonusInput = el('input');
     this.sevenBonusInput.type = 'checkbox';
     this.sevenBonusInput.checked = true; // canonical default (DEFAULT_SETTINGS)
-    this.sevenBonusInput.style.accentColor = 'var(--gold)';
     sevenLabel.appendChild(this.sevenBonusInput);
     sevenLabel.appendChild(document.createTextNode('7 = 70 in first 3 rolls'));
     options.appendChild(sevenLabel);
 
     this.lengthSelect = el('select');
-    this.lengthSelect.style.padding = '8px 10px';
-    this.lengthSelect.style.border = '1px solid var(--gold-deep)';
-    this.lengthSelect.style.borderRadius = '8px';
-    this.lengthSelect.style.background = '#101c15';
-    this.lengthSelect.style.color = 'var(--cream)';
-    this.lengthSelect.style.fontSize = '14px';
-    this.lengthSelect.style.outline = 'none';
     for (const [value, text] of [
       ['10', '10 rounds'],
       ['20', '20 rounds'],
@@ -390,31 +394,14 @@ export class BankGame {
     this.roundEl = el('div', 'table-round', 'ROUND 1/10');
     topBar.appendChild(this.roundEl);
     this.variantEl = el('div', 'table-variant');
-    this.variantEl.style.padding = '4px 12px';
-    this.variantEl.style.border = '1px solid var(--gold-deep)';
-    this.variantEl.style.borderRadius = '999px';
-    this.variantEl.style.fontSize = '12px';
-    this.variantEl.style.letterSpacing = '0.18em';
-    this.variantEl.style.color = 'var(--gold-bright)';
-    this.variantEl.style.textTransform = 'uppercase';
     topBar.appendChild(this.variantEl);
-    // invite chip (private rooms only): 'CODE XXXXX' + copyable invite link
+    // Invite chip (private rooms only): 'CODE XXXXX' + copyable invite link.
+    // `.table-banner` overlays the whole table while waiting/round-end, but it
+    // is `pointer-events: none`, so this chip stays clickable underneath it
+    // without any inline stacking rules — all four of `.table-invite`'s former
+    // inline styles now live in style.css.
     this.inviteEl = el('div', 'table-invite hidden');
-    this.inviteEl.style.display = 'flex';
-    this.inviteEl.style.alignItems = 'center';
-    this.inviteEl.style.gap = '8px';
-    // .table-banner (z-10) overlays the whole table while waiting/round-end; the
-    // chip must render above it and stay clickable.
-    this.inviteEl.style.position = 'relative';
-    this.inviteEl.style.zIndex = '20';
-    this.inviteEl.style.pointerEvents = 'auto';
     this.inviteCodeEl = el('span', 'table-invite-code');
-    this.inviteCodeEl.style.padding = '4px 12px';
-    this.inviteCodeEl.style.border = '1px solid var(--gold-deep)';
-    this.inviteCodeEl.style.borderRadius = '999px';
-    this.inviteCodeEl.style.fontSize = '12px';
-    this.inviteCodeEl.style.letterSpacing = '0.18em';
-    this.inviteCodeEl.style.color = 'var(--gold-bright)';
     this.inviteEl.appendChild(this.inviteCodeEl);
     this.copyBtn = el('button', 'btn btn-small', 'COPY INVITE');
     this.copyBtn.addEventListener('click', () => {
@@ -431,19 +418,44 @@ export class BankGame {
     topBar.appendChild(leaveBtn);
     this.tableEl.appendChild(topBar);
 
+    // ---- stage: the viewport-filling play area --------------------------------
+    // `.table-stage` is the growth region between the fixed top bar and the
+    // fixed rail/actions footer. It owns the whole middle of the screen, which
+    // is what stops the table from hugging the top and leaving the bottom third
+    // as dead black space. It carries the felt and the event log side by side.
+    const stage = el('div', 'table-stage');
+
+    // felt-rail (wood/leather surround) > felt (green surface) >
+    //   felt-stitch (decorative inset stitch line) + felt-inner (content well)
+    const feltRail = el('div', 'felt-rail');
     const felt = el('div', 'felt');
-    felt.appendChild(el('div', 'pot-label', 'POT'));
+    const feltStitch = el('div', 'felt-stitch');
+    feltStitch.setAttribute('aria-hidden', 'true'); // pure decoration
+    felt.appendChild(feltStitch);
+    const feltInner = el('div', 'felt-inner');
+    feltInner.appendChild(el('div', 'pot-label', 'POT'));
     this.potEl = el('div', 'pot-value', '0');
-    felt.appendChild(this.potEl);
+    feltInner.appendChild(this.potEl);
     this.potFlashEl = el('div', 'pot-flash');
-    felt.appendChild(this.potFlashEl);
+    feltInner.appendChild(this.potFlashEl);
     const diceArea = el('div', 'dice-area');
-    felt.appendChild(diceArea);
+    feltInner.appendChild(diceArea);
     const timerBar = el('div', 'timer-bar');
     this.timerFillEl = el('div', 'timer-fill');
     timerBar.appendChild(this.timerFillEl);
-    felt.appendChild(timerBar);
-    this.tableEl.appendChild(felt);
+    feltInner.appendChild(timerBar);
+    felt.appendChild(feltInner);
+    feltRail.appendChild(felt);
+    stage.appendChild(feltRail);
+
+    // the log gets a real home beside the felt instead of floating under it
+    const logPanel = el('div', 'log-panel');
+    logPanel.appendChild(el('div', 'log-title', 'TABLE LOG'));
+    this.logEl = el('div', 'event-log');
+    logPanel.appendChild(this.logEl);
+    stage.appendChild(logPanel);
+
+    this.tableEl.appendChild(stage);
 
     this.playersEl = el('div', 'player-rail');
     this.tableEl.appendChild(this.playersEl);
@@ -465,12 +477,16 @@ export class BankGame {
     actions.appendChild(this.bankBtn);
     this.tableEl.appendChild(actions);
 
-    this.logEl = el('div', 'event-log');
-    this.tableEl.appendChild(this.logEl);
-
     this.bannerEl = el('div', 'table-banner hidden');
-    // text-only overlay: it must never intercept clicks (invite chip, LEAVE, …)
+    // Text-only overlay: it must never intercept clicks (invite chip, LEAVE, …).
+    // This is the ONE inline style the table keeps, deliberately: it is the
+    // guarantee that every control under the banner stays usable regardless of
+    // what stacking context the stylesheet ends up creating.
     this.bannerEl.style.pointerEvents = 'none';
+    this.bannerMainEl = el('div'); // headline; inherits `.table-banner` type
+    this.bannerEl.appendChild(this.bannerMainEl);
+    this.bannerSubEl = el('div', 'banner-sub');
+    this.bannerEl.appendChild(this.bannerSubEl);
     this.tableEl.appendChild(this.bannerEl);
 
     root.appendChild(this.menuEl);
@@ -744,7 +760,7 @@ export class BankGame {
         this.onBank(msg);
         break;
       case 'auto_roll':
-        this.pushLog(`${this.nameOf(msg.playerId)} timed out — auto-roll`);
+        this.pushLog(`${this.nameOf(msg.playerId)} timed out — auto-roll`, 'roll');
         break;
       case 'round_end':
         this.onRoundEnd(msg);
@@ -764,7 +780,7 @@ export class BankGame {
     if (first) {
       this.showTable();
       this.potShown = s.pot; // no count-up animation on the very first snapshot
-      this.pushLog('You joined the table');
+      this.pushLog('You joined the table', 'join');
       if (s.lastRoll !== null) this.settleDice(s.lastRoll.d1, s.lastRoll.d2);
       if (this.playerId !== null) {
         // joined: a rebind makes the CURRENT session id the valid rejoin token
@@ -793,19 +809,19 @@ export class BankGame {
     const sum = e.d1 + e.d2;
     switch (e.effect) {
       case 'bonus70':
-        this.pushLog(`${name} rolled 7 → +70 bonus (pot ${e.potAfter})`);
+        this.pushLog(`${name} rolled 7 → +70 bonus (pot ${e.potAfter})`, 'roll');
         this.flash('+70');
         break;
       case 'double':
-        this.pushLog(`${name} rolled doubles → pot doubled to ${e.potAfter}`);
+        this.pushLog(`${name} rolled doubles → pot doubled to ${e.potAfter}`, 'roll');
         this.flash('×2');
         break;
       case 'bust7':
-        this.pushLog(`${name} rolled 7!`);
+        this.pushLog(`${name} rolled 7!`, 'bust');
         this.flash('7!');
         break;
       default:
-        this.pushLog(`${name} rolled ${sum} → pot ${e.potAfter}`);
+        this.pushLog(`${name} rolled ${sum} → pot ${e.potAfter}`, 'roll');
         this.flash(`+${sum}`);
         break;
     }
@@ -814,31 +830,38 @@ export class BankGame {
   }
 
   private onBank(e: Extract<BankEvent, { t: 'bank' }>): void {
-    this.pushLog(`${this.nameOf(e.playerId)} BANKED ${e.amount}`);
+    this.pushLog(`${this.nameOf(e.playerId)} BANKED ${e.amount}`, 'bank');
     this.audio.sfx('bank');
   }
 
   private onRoundEnd(e: Extract<BankEvent, { t: 'round_end' }>): void {
+    this.bannerTone = 'none';
     if (e.reason === 'bust7') {
-      this.pushLog('7! Round over — the pot is lost');
+      this.pushLog('7! Round over — the pot is lost', 'bust');
       this.bannerText = '7! POT LOST';
+      this.bannerSub = 'everything unbanked is gone';
       this.flash('BUST');
       this.audio.sfx('bust');
     } else {
-      this.pushLog('Everyone banked — round over');
+      this.pushLog('Everyone banked — round over', 'bank');
       this.bannerText = 'ROUND OVER';
+      this.bannerSub = 'everyone banked out';
     }
   }
 
   private onMatchEnd(e: Extract<BankEvent, { t: 'match_end' }>): void {
     if (e.winnerId === null) {
-      this.pushLog('Match over — no winner');
+      this.pushLog('Match over — no winner', 'join');
       this.bannerText = 'MATCH OVER';
+      this.bannerSub = 'nobody took the table';
+      this.bannerTone = 'lose';
     } else {
       const name = this.nameOf(e.winnerId);
       const me = e.winnerId === this.playerId;
-      this.pushLog(`${name} WINS THE MATCH`);
+      this.pushLog(`${name} WINS THE MATCH`, 'bank');
       this.bannerText = me ? 'YOU WIN!' : `${name.toUpperCase()} WINS!`;
+      this.bannerSub = me ? 'you take the table' : 'better luck next hand';
+      this.bannerTone = me ? 'win' : 'lose';
       this.audio.sfx(me ? 'win' : 'lose');
     }
   }
@@ -851,6 +874,8 @@ export class BankGame {
     this.stateCode = null;
     this.logLines.length = 0;
     this.bannerText = '';
+    this.bannerSub = '';
+    this.bannerTone = 'none';
     this.showMenu(notice);
     if (this.welcomed) this.send({ t: 'list_rooms' });
   }
@@ -913,16 +938,9 @@ export class BankGame {
       row.appendChild(el('span', 'room-meta', `${room.players}/${room.maxPlayers} · ${room.phase}`));
       if (room.visibility === 'public') {
         // public rows join by id (join_public); private ones need the code flow
+        // hover treatment lives in .room-row / .room-row:hover (style.css) — palette vars only,
+        // no inline colour here (VISUAL_UPGRADE §0: no hex/rgba literals outside the palettes)
         row.style.cursor = 'pointer';
-        row.style.transition = 'border-color 120ms ease, background 120ms ease';
-        row.addEventListener('mouseenter', () => {
-          row.style.borderColor = 'rgba(216, 180, 90, 0.6)';
-          row.style.background = 'rgba(29, 92, 63, 0.45)';
-        });
-        row.addEventListener('mouseleave', () => {
-          row.style.borderColor = '';
-          row.style.background = '';
-        });
         row.addEventListener('click', () => {
           this.audio.resume(); // browsers gate AudioContext on a user gesture
           this.joinPublic(this.menuName(), room.id);
@@ -959,45 +977,73 @@ export class BankGame {
     this.bankBtn.disabled = !canBank;
 
     if (s.phase === 'roundEnd' || s.phase === 'matchEnd') {
-      this.bannerEl.textContent = this.bannerText;
-      this.bannerEl.classList.remove('hidden');
-      this.bannerEl.classList.toggle('banner-win', s.phase === 'matchEnd');
+      // matchEnd tone comes from the state when the event was missed (a client
+      // that joined mid-banner still gets the right win/lose treatment).
+      let tone = this.bannerTone;
+      if (s.phase === 'matchEnd' && tone === 'none') {
+        tone = s.winnerId !== null && s.winnerId === this.playerId ? 'win' : 'lose';
+      }
+      this.setBanner(this.bannerText, this.bannerSub, s.phase === 'matchEnd' ? tone : 'none');
     } else if (s.phase === 'lobby') {
       const connected = s.players.filter((p) => p.connected).length;
-      this.bannerEl.textContent = `WAITING FOR PLAYERS ${connected}/${MIN_PLAYERS}`;
-      this.bannerEl.classList.remove('hidden');
-      this.bannerEl.classList.remove('banner-win');
+      this.setBanner('WAITING FOR PLAYERS', `${connected} of ${MIN_PLAYERS} seated`, 'none');
     } else {
       this.bannerEl.classList.add('hidden');
       this.bannerEl.classList.remove('banner-win');
+      this.bannerEl.classList.remove('banner-lose');
     }
+  }
+
+  /** Headline + sub-line + win/lose tone on the result banner. */
+  private setBanner(main: string, sub: string, tone: BannerTone): void {
+    this.bannerMainEl.textContent = main;
+    this.bannerSubEl.textContent = sub;
+    this.bannerSubEl.classList.toggle('hidden', sub.length === 0);
+    this.bannerEl.classList.toggle('banner-win', tone === 'win');
+    this.bannerEl.classList.toggle('banner-lose', tone === 'lose');
+    this.bannerEl.classList.remove('hidden');
   }
 
   private renderPlayers(s: BankState): void {
     this.playersEl.replaceChildren();
     for (const p of s.players) {
+      const isTurn = p.id === s.currentId && s.phase === 'playing';
       const chip = el('div', 'player-chip');
-      chip.classList.toggle('current', p.id === s.currentId && s.phase === 'playing');
+      chip.classList.toggle('current', isTurn);
       chip.classList.toggle('you', p.id === this.playerId);
       chip.classList.toggle('offline', !p.connected);
+
+      // avatar: the name's initial, so a chip reads as a seat even at a glance
+      chip.appendChild(el('span', 'player-avatar', p.name.trim().charAt(0).toUpperCase() || '?'));
+
       const name = el('span', 'player-name', p.name);
       if (p.id === this.playerId) name.appendChild(el('span', 'player-you', 'YOU'));
       chip.appendChild(name);
+
+      // decorative chip stack sitting beside the banked total
+      const stack = el('span', 'chip-stack');
+      stack.setAttribute('aria-hidden', 'true');
+      chip.appendChild(stack);
       chip.appendChild(el('span', 'player-score', String(p.score)));
       chip.appendChild(el('span', p.banked ? 'player-banked on' : 'player-banked', p.banked ? '✓' : ''));
+
+      // second, non-colour cue for turn/banked/offline (accessibility, §5)
+      const stateText = !p.connected ? 'AWAY' : isTurn ? 'TURN' : p.banked ? 'BANKED' : 'IN';
+      chip.appendChild(el('span', 'player-state', stateText));
+
       this.playersEl.appendChild(chip);
     }
   }
 
   private renderLog(): void {
     this.logEl.replaceChildren();
-    for (const line of this.logLines) {
-      this.logEl.appendChild(el('div', 'log-line', line));
+    for (const entry of this.logLines) {
+      this.logEl.appendChild(el('div', `log-line log-kind-${entry.kind}`, entry.text));
     }
   }
 
-  private pushLog(text: string): void {
-    this.logLines.unshift(text); // newest first
+  private pushLog(text: string, kind: LogKind): void {
+    this.logLines.unshift({ text, kind }); // newest first
     if (this.logLines.length > LOG_MAX) this.logLines.length = LOG_MAX;
     if (this.screen === 'table') this.renderLog();
   }

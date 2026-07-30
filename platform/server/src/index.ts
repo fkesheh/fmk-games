@@ -51,52 +51,289 @@ function escapeHtml(s: string): string {
     .replaceAll('"', '&quot;');
 }
 
+// ---------------------------------------------------------------------------
+// LAUNCHER PAGE (VISUAL_UPGRADE.md §7, task P1) — the product's front door.
+//
+// COLOUR SOURCING. This file is the platform composition root's sibling and
+// must NOT import a game's shared package (package.json here depends on the
+// three game SERVER packages only, and platform code does not reach into game
+// internals). §0 still bans ad-hoc hex, so the launcher's small colour set is
+// declared ONCE below as named constants, each MIRRORING an exact entry of a
+// frozen game palette — the source entry is named in the comment. This is the
+// same discipline as the `:root` palette mirrors in the game stylesheets
+// (§7 seam rule 7): every value is traceable, nothing is eyeballed.
+//
+// Where a colour needs transparency, an 8-digit hex is built by suffixing an
+// alpha pair onto one of these constants (e.g. `${LPAL.paper}14`). The RGB
+// always comes from a named entry; only the alpha is authored here.
+// ---------------------------------------------------------------------------
+
+const LPAL = {
+  // ---- room (mirrors games/fps/shared/src/palette.ts) ----
+  ink: '#14171c', //        PALETTE.ink      — page floor
+  inkDeep: '#070a08', //    BPAL.inkDeep     — vignette / drop-shadow floor
+  charcoal: '#23282f', //   PALETTE.charcoal — raised surface
+  metalDark: '#3c4249', //  PALETTE.metalDark— hairline borders
+  metalDeep: '#21252a', //  PALETTE.metalDeep— card body
+  paper: '#e8e6df', //      PALETTE.paper    — primary type
+  steel: '#9aa3ad', //      PALETTE.steel    — secondary type
+  steelDeep: '#5a616a', //  KPAL.steelDeep   — tertiary type
+
+  // ---- per-game identity accents (each game's own signature colour) ----
+  fpsAccent: '#e5b055', //  PALETTE.tLit     — STRICKEN: dusk amber
+  fpsTint: '#8a7550', //    PALETTE.dust     — STRICKEN: packed-earth ground
+  bankAccent: '#d8b45a', // BPAL.gold        — BANK: table gold
+  bankTint: '#1d5c3f', //   BPAL.felt        — BANK: felt
+  kartAccent: '#7fa4c9', // KPAL.sky         — KART GP: arcade sky
+  kartTint: '#4a7a3d', //   KPAL.grass       — KART GP: verge green
+
+  // ---- fallback identity for a game with no launcher copy yet ----
+  neutralAccent: '#9aa3ad', // PALETTE.steel
+  neutralTint: '#3c4249', //   PALETTE.metalDark
+} as const;
+
+interface GameCopy {
+  genre: string;
+  blurb: string;
+  tags: readonly string[];
+}
+
 /**
- * The launcher page, generated inline (no build step): a dark arcade menu
- * with one card per registered game linking to its /<id>/ client.
+ * Launcher copy per registered game id. A module missing from this map still
+ * gets a card (neutral identity, generic copy) — the launcher never hides a
+ * registered game.
+ */
+const COPY: Record<string, GameCopy | undefined> = {
+  fps: {
+    genre: 'Tactical FPS',
+    blurb:
+      'Round-based 5v5. Buy your loadout, hold the angle, one life per round — across six hand-built maps.',
+    tags: ['2–10 players', '6 maps'],
+  },
+  bank: {
+    genre: 'Push-your-luck dice',
+    blurb: 'Roll to grow the pot, bank before it busts. One bad die wipes the table clean.',
+    tags: ['2–8 players', 'Party'],
+  },
+  kart: {
+    genre: 'Arcade racer',
+    blurb: 'Eight karts, drift boost and nitro. Three laps, and the brake is a suggestion.',
+    tags: ['2–8 players', 'Drift + nitro'],
+  },
+};
+
+/**
+ * The launcher page at `/`, generated inline (no build step): a product page
+ * for the platform — wordmark, then one identity-coloured card per registered
+ * game linking to its /<id>/ client. Responsive down to one column; all colour
+ * comes from `LPAL`.
  */
 function launcherHtml(modules: readonly GameModule[]): string {
   const cards = modules
-    .map(
-      (m) =>
-        `      <a class="card" href="/${escapeHtml(m.id)}/">\n` +
-        `        <span class="name">${escapeHtml(m.name)}</span>\n` +
-        `        <span class="id">${escapeHtml(m.id)}</span>\n` +
-        `      </a>`,
-    )
+    .map((m) => {
+      const known = Object.prototype.hasOwnProperty.call(COPY, m.id);
+      const copy = COPY[m.id];
+      const id = escapeHtml(m.id);
+      const kind = known ? ` card--${id}` : '';
+      const mark = known ? ` mark--${id}` : '';
+      const tags = (copy?.tags ?? [])
+        .map((t) => `<span class="tag">${escapeHtml(t)}</span>`)
+        .join('');
+      return (
+        `      <a class="card${kind}" href="/${id}/">\n` +
+        `        <span class="mark${mark}" aria-hidden="true"></span>\n` +
+        `        <span class="head">\n` +
+        `          <span class="name">${escapeHtml(m.name)}</span>\n` +
+        `          <span class="genre">${escapeHtml(copy?.genre ?? 'Multiplayer')}</span>\n` +
+        `        </span>\n` +
+        `        <span class="blurb">${escapeHtml(copy?.blurb ?? 'Jump in and play.')}</span>\n` +
+        `        <span class="tags">${tags}<span class="tag path">/${id}/</span></span>\n` +
+        `        <span class="cta"><span>Enter</span><span class="arrow">&rarr;</span></span>\n` +
+        `      </a>`
+      );
+    })
     .join('\n');
   return `<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>ARCADE</title>
+    <meta name="color-scheme" content="dark" />
+    <meta name="description" content="Three browser multiplayer games on one server: STRICKEN, BANK and KART GP." />
+    <title>ARCADE — STRICKEN · BANK · KART GP</title>
     <style>
       * { box-sizing: border-box; }
+      html { -webkit-text-size-adjust: 100%; }
       body {
         margin: 0; min-height: 100vh; display: flex; flex-direction: column;
-        align-items: center; justify-content: center; gap: 48px;
-        background: #0b0e14; color: #e8eaf0;
-        font-family: system-ui, -apple-system, sans-serif;
+        color: ${LPAL.paper};
+        background-color: ${LPAL.ink};
+        background-image:
+          radial-gradient(90ch 52ch at 18% -12%, ${LPAL.fpsTint}2e, transparent 62%),
+          radial-gradient(80ch 46ch at 84% 6%, ${LPAL.kartTint}26, transparent 60%),
+          radial-gradient(120ch 70ch at 50% 118%, ${LPAL.bankTint}26, transparent 64%),
+          linear-gradient(180deg, ${LPAL.charcoal} 0%, ${LPAL.ink} 46%, ${LPAL.inkDeep} 100%);
+        background-attachment: fixed;
+        font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+        font-size: 16px; line-height: 1.5;
+        -webkit-font-smoothing: antialiased;
       }
-      h1 { margin: 0; font-size: 40px; font-weight: 800; letter-spacing: 0.5em; text-indent: 0.5em; color: #f5c542; }
-      .grid { display: flex; flex-wrap: wrap; justify-content: center; gap: 24px; padding: 0 24px; }
+      .page {
+        margin: auto; width: 100%; max-width: 1060px;
+        padding: clamp(36px, 7vh, 88px) clamp(16px, 4vw, 32px);
+        display: flex; flex-direction: column; gap: clamp(26px, 4.4vh, 46px);
+      }
+
+      /* ---- hero ---- */
+      .hero { text-align: center; display: flex; flex-direction: column; align-items: center; gap: 14px; }
+      .eyebrow {
+        margin: 0; font-size: clamp(10px, 1.5vw, 12px); font-weight: 600;
+        letter-spacing: 0.42em; text-indent: 0.42em; text-transform: uppercase;
+        color: ${LPAL.steel};
+      }
+      h1 {
+        margin: 0; font-size: clamp(40px, 11vw, 82px); font-weight: 900; line-height: 0.98;
+        letter-spacing: 0.18em; text-indent: 0.18em;
+        color: ${LPAL.paper};
+        background-image: linear-gradient(96deg, ${LPAL.fpsAccent} 6%, ${LPAL.bankAccent} 46%, ${LPAL.kartAccent} 94%);
+        -webkit-background-clip: text; background-clip: text;
+        -webkit-text-fill-color: transparent;
+      }
+      .rule {
+        width: min(320px, 70%); height: 1px; border: 0; margin: 2px 0 0;
+        background: linear-gradient(90deg, transparent, ${LPAL.paper}3d, transparent);
+      }
+      .lede {
+        margin: 0; max-width: 54ch; font-size: clamp(14px, 1.9vw, 17px); color: ${LPAL.steel};
+      }
+
+      /* ---- cards ---- */
+      .grid {
+        display: grid; gap: clamp(14px, 2vw, 20px);
+        grid-template-columns: repeat(auto-fit, minmax(248px, 1fr));
+      }
       .card {
-        display: flex; flex-direction: column; align-items: center; gap: 8px;
-        width: 220px; padding: 32px 16px; border: 1px solid #2a3142; border-radius: 12px;
-        background: #131826; color: inherit; text-decoration: none;
-        transition: border-color 120ms, transform 120ms;
+        --accent: ${LPAL.neutralAccent};
+        --tint: ${LPAL.neutralTint};
+        --wash: ${LPAL.neutralTint}2b;
+        --halo: ${LPAL.neutralAccent}1f;
+        position: relative; overflow: hidden;
+        display: flex; flex-direction: column; align-items: flex-start; gap: 13px;
+        padding: 22px 20px 18px;
+        border: 1px solid ${LPAL.metalDark}; border-radius: 16px;
+        background-image:
+          radial-gradient(72ch 30ch at 12% -18%, var(--wash), transparent 66%),
+          linear-gradient(168deg, ${LPAL.charcoal} 0%, ${LPAL.metalDeep} 58%, ${LPAL.ink} 100%);
+        box-shadow: 0 1px 0 ${LPAL.paper}0f inset, 0 14px 30px -18px ${LPAL.inkDeep};
+        color: inherit; text-decoration: none;
+        transition: transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
       }
-      .card:hover { border-color: #f5c542; transform: translateY(-2px); }
-      .card .name { font-size: 20px; font-weight: 700; letter-spacing: 0.15em; }
-      .card .id { font-size: 12px; color: #8a93a8; }
+      .card::before {
+        content: ''; position: absolute; inset: 0 0 auto; height: 2px;
+        background: linear-gradient(90deg, transparent, var(--accent), transparent);
+        opacity: 0.8;
+      }
+      .card--fps { --accent: ${LPAL.fpsAccent}; --tint: ${LPAL.fpsTint}; --wash: ${LPAL.fpsTint}3d; --halo: ${LPAL.fpsAccent}2b; }
+      .card--bank { --accent: ${LPAL.bankAccent}; --tint: ${LPAL.bankTint}; --wash: ${LPAL.bankTint}4d; --halo: ${LPAL.bankAccent}2b; }
+      .card--kart { --accent: ${LPAL.kartAccent}; --tint: ${LPAL.kartTint}; --wash: ${LPAL.kartTint}3d; --halo: ${LPAL.kartAccent}2b; }
+
+      .mark {
+        width: 50px; height: 50px; border-radius: 13px; flex: none;
+        border: 1px solid var(--halo);
+        background-color: var(--wash);
+        background-repeat: no-repeat;
+        box-shadow: 0 0 0 1px ${LPAL.inkDeep}66 inset;
+      }
+      /* Each mark is pure CSS gradient geometry — no assets, no fonts. */
+      .mark--fps {
+        background-image:
+          linear-gradient(var(--accent), var(--accent)),
+          linear-gradient(var(--accent), var(--accent)),
+          radial-gradient(circle at 50% 50%, transparent 30%, var(--accent) 31%, var(--accent) 36%, transparent 37%);
+        background-size: 2px 62%, 62% 2px, 100% 100%;
+        background-position: 50% 50%, 50% 50%, 50% 50%;
+      }
+      .mark--bank {
+        background-image:
+          linear-gradient(var(--accent), var(--accent)),
+          linear-gradient(var(--accent), var(--accent)),
+          linear-gradient(var(--accent), var(--accent));
+        background-size: 62% 5px, 50% 5px, 38% 5px;
+        background-position: 50% 74%, 50% 52%, 50% 30%;
+      }
+      .mark--kart {
+        background-image: repeating-linear-gradient(72deg, var(--accent) 0 3px, transparent 3px 11px);
+        background-size: 74% 62%;
+        background-position: 50% 50%;
+      }
+
+      .head { display: flex; flex-direction: column; gap: 3px; }
+      .name { font-size: clamp(19px, 2.6vw, 23px); font-weight: 800; letter-spacing: 0.14em; }
+      .genre {
+        font-size: 11px; font-weight: 600; letter-spacing: 0.24em; text-transform: uppercase;
+        color: var(--accent);
+      }
+      .blurb { font-size: 13.5px; line-height: 1.55; color: ${LPAL.steel}; }
+      .tags { display: flex; flex-wrap: wrap; gap: 6px; }
+      .tag {
+        font-size: 10.5px; letter-spacing: 0.1em; text-transform: uppercase;
+        padding: 3px 8px; border-radius: 999px;
+        border: 1px solid ${LPAL.metalDark}; color: ${LPAL.steel};
+        background: ${LPAL.ink}80;
+      }
+      .path {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        text-transform: none; letter-spacing: 0.04em; color: ${LPAL.steelDeep};
+      }
+      .cta {
+        margin-top: auto; width: 100%; padding-top: 13px;
+        display: flex; align-items: center; justify-content: space-between;
+        border-top: 1px solid ${LPAL.metalDark};
+        font-size: 12px; font-weight: 700; letter-spacing: 0.26em; text-transform: uppercase;
+        color: var(--accent);
+      }
+      .arrow { font-size: 15px; transition: transform 160ms ease; }
+
+      .card:hover, .card:focus-visible {
+        transform: translateY(-3px);
+        border-color: var(--accent);
+        box-shadow: 0 1px 0 ${LPAL.paper}1a inset, 0 22px 40px -20px ${LPAL.inkDeep},
+                    0 0 0 1px var(--halo);
+      }
+      .card:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+      .card:hover .arrow, .card:focus-visible .arrow { transform: translateX(4px); }
+      .card:active { transform: translateY(-1px); }
+
+      /* ---- footer ---- */
+      .foot {
+        text-align: center; font-size: 11.5px; letter-spacing: 0.14em; text-transform: uppercase;
+        color: ${LPAL.steelDeep};
+      }
+
+      @media (max-width: 560px) {
+        .card { padding: 18px 16px 15px; gap: 11px; }
+        .mark { width: 42px; height: 42px; border-radius: 11px; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .card, .arrow { transition: none; }
+        .card:hover, .card:focus-visible, .card:active { transform: none; }
+        .card:hover .arrow, .card:focus-visible .arrow { transform: none; }
+      }
     </style>
   </head>
   <body>
-    <h1>ARCADE</h1>
-    <main class="grid">
+    <div class="page">
+      <header class="hero">
+        <p class="eyebrow">Three games &middot; one tab &middot; no install</p>
+        <h1>ARCADE</h1>
+        <hr class="rule" />
+        <p class="lede">Real-time multiplayer, straight from the browser. Pick a game, grab a room, send the invite link.</p>
+      </header>
+      <main class="grid">
 ${cards}
-    </main>
+      </main>
+      <footer class="foot">Browser multiplayer &middot; instant rooms &middot; invite by link</footer>
+    </div>
   </body>
 </html>
 `;

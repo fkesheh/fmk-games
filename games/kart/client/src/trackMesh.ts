@@ -1,15 +1,21 @@
 // ============================================================================
 // KART GP — track/environment mesh builder (split out of render.ts; the frozen
 // KartScene export still owns the public API). Everything static on the circuit:
-//   road ribbon (banded asphalt: worn edges, rubber lines, seeded albedo drift)
+//   road ribbon (tier-banded asphalt: asphaltDeep edge wear, longitudinal seams,
+//     rubbered racing lines, asphaltLight crown, seeded albedo grain)
 //   painted markings (dashes, start line, grid stalls) + repair patches/grime
-//   curbs, dirt shoulders, barrier posts, grass slab + seeded tone blobs
-//   furniture: start gantry ('KART GP'), apex tire stacks + skid decals, pit
-//     building + cones, billboards, lamp posts
-//   scatter (3 tree silhouettes in seeded clusters / rocks), mid-distance tree
-//     line, two-layer ridgeline horizon (near dark + far hazy)
+//   curbs, dirt shoulders + the asphaltDeep contact band where road meets grass
+//   ground: a tier-mottled grass field (NEVER one uncut green), mown stripe
+//     bands along the verge, seeded tone patches and track-edge dirt wear
+//   barrier posts, furniture: start gantry ('KART GP'), apex tire stacks + skid
+//     decals, pit building + cones, billboards, lamp posts, packed grandstand
+//   scatter (3 two-tier-canopy tree species in seeded clusters / rocks),
+//     mid-distance tree line, three-layer ridgeline horizon hazing toward fog
+// Every prop, post and tree sits on a `…Deep` contact pad — this round's stand-in
+// for ambient occlusion (VISUAL_UPGRADE.md §4), and what stops trackside
+// furniture reading as decals pasted on the grass.
 // All statics are baked into ~1 mesh per material to keep draw calls flat
-// (~25 world draw calls total). All scatter is seeded (@platform/shared rng) —
+// (~35 world draw calls total). All scatter is seeded (@platform/shared rng) —
 // Math.random is never touched. The cached material factory (mat) stays in
 // render.ts and is threaded through here as MatFn so both modules share the one
 // material cache. NOTHING here feeds closestOnTrack/barrier math: every add-on
@@ -17,8 +23,9 @@
 // ============================================================================
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
-import { decoSeed, rng, rngInt, rngRange } from '@platform/shared';
+import { decoSeed, mix, rng, rngInt, rngRange } from '@platform/shared';
 import {
+  CROWD_COLORS,
   KPAL,
   MAX_PLAYERS,
   closestOnTrack,
@@ -55,21 +62,67 @@ const CLUSTER_R = 13; // max tree offset from the cluster center
 const RIDGE_SEGS = 180; // segments per ridgeline ring
 const RIDGE_NEAR_R = 202; // near ridge: dark, low
 const RIDGE_NEAR_PEAK = 22;
-const RIDGE_FAR_R = 248; // far ridge: tall, hazier
+const RIDGE_MID_R = 224; // mid ridge: the middle rung of the distance ladder
+const RIDGE_MID_PEAK = 33;
+const RIDGE_FAR_R = 248; // far ridge: tall, hazed toward the fog
 const RIDGE_FAR_PEAK = 46;
-// -- asphalt banding: column offsets (fractions of halfW) + per-column tone.
-// Edge bands read as worn/darkened, the two mid bands as rubbered-in lines.
-const ROAD_COLS: readonly number[] = [-1, -0.82, -0.54, -0.22, 0.22, 0.54, 0.82, 1];
-const ROAD_TONES: readonly number[] = [0.55, 0.9, 0.55, 1.12, 1.12, 0.55, 0.9, 0.55];
+// -- asphalt banding (VISUAL_UPGRADE.md §4: "road is a uniform black ribbon").
+// One entry per longitudinal column across the road, sorted by lateral offset
+// (fraction of halfW). `hex` is the NAMED ladder tier the column is painted
+// from — every value step comes from the tier, never from a multiplier; `tone`
+// is grain only. `rubber` columns darken further where karts fight for grip.
+// Reads outward-in: asphaltDeep edge wear -> asphalt body -> a thin asphaltDeep
+// longitudinal seam under each racing line -> asphaltLight centre crown.
+interface RoadBand {
+  readonly off: number;
+  readonly hex: string;
+  readonly tone: number;
+  readonly rubber: boolean;
+}
+const ROAD_BANDS: readonly RoadBand[] = [
+  { off: -1.0, hex: KPAL.asphaltDeep, tone: 1.0, rubber: false },
+  { off: -0.93, hex: KPAL.asphaltDeep, tone: 1.14, rubber: false },
+  { off: -0.86, hex: KPAL.asphalt, tone: 0.88, rubber: false },
+  { off: -0.64, hex: KPAL.asphalt, tone: 1.0, rubber: false },
+  { off: -0.6, hex: KPAL.asphaltDeep, tone: 1.18, rubber: false },
+  { off: -0.56, hex: KPAL.asphalt, tone: 0.94, rubber: true },
+  { off: -0.4, hex: KPAL.asphalt, tone: 1.02, rubber: true },
+  { off: -0.22, hex: KPAL.asphaltLight, tone: 0.97, rubber: false },
+  { off: 0, hex: KPAL.asphaltLight, tone: 1.03, rubber: false },
+  { off: 0.22, hex: KPAL.asphaltLight, tone: 0.97, rubber: false },
+  { off: 0.4, hex: KPAL.asphalt, tone: 1.02, rubber: true },
+  { off: 0.56, hex: KPAL.asphalt, tone: 0.94, rubber: true },
+  { off: 0.6, hex: KPAL.asphaltDeep, tone: 1.18, rubber: false },
+  { off: 0.64, hex: KPAL.asphalt, tone: 1.0, rubber: false },
+  { off: 0.86, hex: KPAL.asphalt, tone: 0.88, rubber: false },
+  { off: 0.93, hex: KPAL.asphaltDeep, tone: 1.14, rubber: false },
+  { off: 1.0, hex: KPAL.asphaltDeep, tone: 1.0, rubber: false },
+];
 const GRIME_Y = 0.013; // road-edge dirt accumulation (road < grime < curb paint)
 const SKID_Y = 0.016; // apex skid decals (below repair patches)
 const PATCH_Y = 0.017; // repair rectangles (below the dashes)
-const PATCH_COUNT = 16;
+const PATCH_COUNT = 22;
 const SHOULDER_W = 0.8; // dirt ring just outside the curbs
-const SHOULDER_Y = -0.004; // on the grass slab (top -0.02), under the road plane
-const BLOB_Y = -0.008; // grass tone blobs sit on the slab, under the road plane
-const BLOB_BIG = 26; // broad faint mottling
-const BLOB_SMALL = 150; // distinct two-tone patches
+const SHOULDER_DEEP_W = 0.55; // asphaltDeep CONTACT BAND: road assembly -> grass
+const SHOULDER_Y = -0.004; // on the grass field (top -0.02), under the road plane
+const BLOB_Y = -0.008; // grass tone blobs sit on the field, under the road plane
+const BLOB_BIG = 30; // broad faint mottling
+const BLOB_SMALL = 190; // distinct four-tier patches
+const BLOB_SPACING = 3.4; // min center distance between grass patches
+const EDGE_WEAR_Y = -0.005; // dirt scuffed off the shoulder onto the grass
+const GROUND_Y = -0.02; // the grass field plane (was a flat slab, now mottled)
+const GROUND_CELLS = 32; // field subdivisions; per-vertex tier = soft patchwork
+const MOWN_Y = -0.006; // mown stripe bands ride over the field, under the dirt
+const MOWN_SEGS = 5; // segments per mown stripe (~11 m at 256 samples)
+// Mown stripe bands: lateral offsets past the contact band, each alternating
+// between two named grass tiers. §4: "mown-stripe bands running along the track".
+const MOWN_BANDS: ReadonlyArray<{ from: number; to: number; a: string; b: string }> = [
+  { from: 0, to: 2.4, a: KPAL.grassLit, b: KPAL.grassDark },
+  { from: 2.4, to: 5.3, a: KPAL.grass, b: KPAL.grassLit },
+  { from: 5.3, to: 9.0, a: KPAL.grassDark, b: KPAL.grass },
+];
+const APRON_FOLD_MIN = 0.3; // min arc factor for offset apron layers (see apronLimits)
+const PAD_H = 0.024; // …Deep contact pad thickness under every prop
 const TREELINE_COUNT = 64; // mid-distance tree band between track and hills
 const TREELINE_R_MIN = 108;
 const TREELINE_R_MAX = 150;
@@ -186,11 +239,12 @@ function frameTangent(f: SampleFrame): [number, number] {
 }
 
 // ---- flat ribbon geometry ---------------------------------------------------------
-// Road strip: ROAD_COLS shared vertices per sample across the width, indices
-// wound to face +y. Normals are set straight up — the road is flat by
-// construction. Vertex colors carry the asphalt banding (worn dark edges,
-// rubbered tire lines that deepen where karts fight through corners, brighter
-// crown) x a seeded patchwork albedo drift (4-sample groups + fine grain).
+// Road strip: one shared vertex per ROAD_BANDS column per sample, indices wound
+// to face +y. Normals are set straight up — the road is flat by construction.
+// Vertex colors carry the asphalt TIER banding (asphaltDeep edge wear and
+// longitudinal seams, asphalt body, rubbered lines that deepen where karts fight
+// through corners, asphaltLight crown) x a seeded albedo grain (4-sample groups
+// + fine drift). The tiers do the value work; the grain only breaks up flatness.
 
 function roadGeometry(
   frames: SampleFrame[],
@@ -199,13 +253,13 @@ function roadGeometry(
   next: () => number,
 ): THREE.BufferGeometry {
   const n = frames.length;
-  const cols = ROAD_COLS.length;
-  const base = new THREE.Color(KPAL.asphalt);
-  // patchwork: per 4-sample group multiplier, ~18% of groups strongly shifted
+  const cols = ROAD_BANDS.length;
+  const bandCol = ROAD_BANDS.map((b) => new THREE.Color(b.hex));
+  // patchwork: per 4-sample group multiplier, ~18% of groups noticeably shifted
   const groups = Math.ceil(n / 4);
   const groupMul: number[] = [];
   for (let g = 0; g < groups; g++) {
-    groupMul.push(next() < 0.2 ? (next() < 0.5 ? 0.78 : 1.22) : 0.93 + next() * 0.14);
+    groupMul.push(next() < 0.18 ? (next() < 0.5 ? 0.86 : 1.14) : 0.95 + next() * 0.1);
   }
   const pos = new Float32Array(n * cols * 3);
   const nrm = new Float32Array(n * cols * 3);
@@ -216,17 +270,18 @@ function roadGeometry(
     // rubber lines deepen where the karts fight (braking/turn-in zones)
     const cornerGrip = Math.min(0.3, Math.abs(turn[i]!) * 0.8);
     for (let c = 0; c < cols; c++) {
-      const off = ROAD_COLS[c]! * halfW;
+      const band = ROAD_BANDS[c]!;
+      const off = band.off * halfW;
       const k = (i * cols + c) * 3;
       pos[k] = f.cx + f.lx * off;
       pos[k + 1] = 0;
       pos[k + 2] = f.cz + f.lz * off;
       nrm[k + 1] = 1;
-      const isRubber = c === 2 || c === 5; // the two tire-line columns
-      const tone = (isRubber ? ROAD_TONES[c]! * (1 - cornerGrip) : ROAD_TONES[c]!) * jitter;
-      col[k] = base.r * tone;
-      col[k + 1] = base.g * tone;
-      col[k + 2] = base.b * tone;
+      const tone = (band.rubber ? band.tone * (1 - cornerGrip) : band.tone) * jitter;
+      const base = bandCol[c]!;
+      col[k] = Math.min(1, base.r * tone);
+      col[k + 1] = Math.min(1, base.g * tone);
+      col[k + 2] = Math.min(1, base.b * tone);
     }
   }
   const idx: number[] = [];
@@ -337,10 +392,11 @@ function roadDetailGeometry(
     );
   };
 
-  // grime strips: lat in [halfW-0.85, halfW-0.15] on both sides, ~62% coverage
+  // grime strips: lat in [halfW-0.85, halfW-0.15] on both sides, ~62% coverage,
+  // alternating the two dirt tiers so the road edge is never one flat smear
   for (let i = 0; i < n; i++) {
     if (next() < 0.38) continue;
-    const c = shade(KPAL.dirt, 0.68 + next() * 0.3);
+    const c = shade(next() < 0.45 ? KPAL.dirtDeep : KPAL.dirt, 0.9 + next() * 0.2);
     for (const side of [1, -1]) {
       strip(i, side * (halfW - 0.15), side * (halfW - 0.85), GRIME_Y, c);
     }
@@ -357,7 +413,7 @@ function roadDetailGeometry(
         if (next() < 0.15) continue; // broken marks, not a solid band
         const lat = latBase + rngRange(next, -0.3, 0.3) + apex.side * s * 0.12; // drift outward on exit
         const w2 = rngRange(next, 0.2, 0.35);
-        strip((start + s + n) % n, lat + w2, lat - w2, SKID_Y, shade(KPAL.asphalt, rngRange(next, 0.35, 0.5)));
+        strip((start + s + n) % n, lat + w2, lat - w2, SKID_Y, shade(KPAL.asphaltDeep, rngRange(next, 0.62, 0.86)));
       }
     }
   }
@@ -372,8 +428,12 @@ function roadDetailGeometry(
     const halfWid = rngRange(next, 0.7, 1.5);
     const latLim = halfW - 1.0 - halfWid;
     const lat = rngRange(next, -latLim, latLim);
-    const dark = next() < 0.6;
-    const c = shade(KPAL.asphalt, dark ? rngRange(next, 0.55, 0.68) : rngRange(next, 1.15, 1.3));
+    // fresh dark repaves in asphaltDeep, bleached old ones in asphaltLit — the
+    // patch value comes from the named tier, the jitter is grain only (§4).
+    const dark = next() < 0.5;
+    const c = dark
+      ? shade(KPAL.asphaltDeep, rngRange(next, 0.94, 1.14))
+      : shade(KPAL.asphaltLit, rngRange(next, 0.9, 1.06));
     const px = f.cx + f.lx * lat;
     const pz = f.cz + f.lz * lat;
     quad(
@@ -396,10 +456,172 @@ function roadDetailGeometry(
 }
 
 /**
- * Grass tone layer: broad faint mottling + smaller two-tone blobs (irregular
- * seeded fans, flat on the slab, never on the road/shoulder). One draw call.
+ * The grass field itself. THE worst thing in KART was one flat uniform green
+ * slab covering the whole world (VISUAL_UPGRADE.md §4), so the slab is gone:
+ * this is a subdivided plane whose PER-VERTEX colour is a named grass tier
+ * chosen by a seeded harmonic field. The GPU interpolates between neighbouring
+ * tier vertices, so the ground reads as soft organic patches of grassDeep /
+ * grassDark / grass / grassLit and never as one uncut colour. Flat, one draw
+ * call, no texture — the colour attribute of the pre-existing vertex-colour
+ * Lambert is doing all of the work.
  */
-function grassPatchGeometry(track: TrackDef, halfW: number, next: () => number): THREE.BufferGeometry {
+function groundGeometry(next: () => number): THREE.BufferGeometry {
+  const cells = GROUND_CELLS;
+  const half = GROUND_SIZE / 2;
+  const step = GROUND_SIZE / cells;
+  const tiers = [KPAL.grassDeep, KPAL.grassDark, KPAL.grass, KPAL.grassLit].map((h) => new THREE.Color(h));
+  // three broad harmonics: big soft regions, not a checkerboard
+  const wave = [
+    { fx: rngRange(next, 0.008, 0.017), fz: rngRange(next, 0.008, 0.017), p: next() * Math.PI * 2, a: 0.46 },
+    { fx: rngRange(next, 0.02, 0.035), fz: rngRange(next, 0.02, 0.035), p: next() * Math.PI * 2, a: 0.33 },
+    { fx: rngRange(next, 0.05, 0.08), fz: rngRange(next, 0.05, 0.08), p: next() * Math.PI * 2, a: 0.21 },
+  ];
+  const verts = (cells + 1) * (cells + 1);
+  const pos = new Float32Array(verts * 3);
+  const nrm = new Float32Array(verts * 3);
+  const col = new Float32Array(verts * 3);
+  for (let ix = 0; ix <= cells; ix++) {
+    for (let iz = 0; iz <= cells; iz++) {
+      const x = -half + ix * step;
+      const z = -half + iz * step;
+      let f = 0;
+      for (const w of wave) f += w.a * Math.sin(w.fx * x + w.p) * Math.cos(w.fz * z + w.p * 0.5);
+      // ragged tier boundaries: without the jitter the field bands too cleanly
+      f = 0.5 + f * 0.5 + rngRange(next, -0.09, 0.09);
+      const tier = f < 0.2 ? 0 : f < 0.44 ? 1 : f < 0.84 ? 2 : 3;
+      const c = tiers[tier]!;
+      const k = ((ix * (cells + 1)) + iz) * 3;
+      pos[k] = x;
+      pos[k + 1] = GROUND_Y;
+      pos[k + 2] = z;
+      nrm[k + 1] = 1;
+      col[k] = c.r;
+      col[k + 1] = c.g;
+      col[k + 2] = c.b;
+    }
+  }
+  const idx: number[] = [];
+  const vid = (ix: number, iz: number): number => ix * (cells + 1) + iz;
+  for (let ix = 0; ix < cells; ix++) {
+    for (let iz = 0; iz < cells; iz++) {
+      const a = vid(ix, iz + 1);
+      const b = vid(ix + 1, iz + 1);
+      const c = vid(ix, iz);
+      const d = vid(ix + 1, iz);
+      idx.push(a, b, c, c, b, d); // same winding convention as ribbonGeometry (+y)
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  geo.setIndex(idx);
+  return geo;
+}
+
+/**
+ * Per-sample cap on how far a flat apron layer may be offset to each side before
+ * the parallel curve folds back through the corner's centre of curvature. A
+ * ribbon at lateral offset `o` has arc factor (1 - k*o) for signed curvature k
+ * (+ = turning left); keeping that above APRON_FOLD_MIN makes the apron PINCH
+ * SHUT on the inside of a hairpin instead of self-intersecting. This circuit
+ * drops to a ~9 m radius, so a fixed-width apron would fold on ~24 samples.
+ * Returns [maxLeftOffset, maxRightOffset] per sample.
+ */
+function apronLimits(frames: SampleFrame[]): Array<[number, number]> {
+  const n = frames.length;
+  const cap = 1 - APRON_FOLD_MIN;
+  const out: Array<[number, number]> = [];
+  for (let i = 0; i < n; i++) {
+    const a = frames[(i - 2 + n) % n]!;
+    const b = frames[(i + 2) % n]!;
+    const [tax, taz] = frameTangent(a);
+    const [tbx, tbz] = frameTangent(b);
+    let arc = 0;
+    for (let s = -2; s < 2; s++) {
+      const p = frames[(i + s + n) % n]!;
+      const q = frames[(i + s + 1 + n) % n]!;
+      arc += Math.hypot(q.cx - p.cx, q.cz - p.cz);
+    }
+    const dth = Math.atan2(tax * tbz - taz * tbx, tax * tbx + taz * tbz);
+    const k = arc > 0 ? dth / arc : 0;
+    out.push([k > 1e-6 ? cap / k : Infinity, k < -1e-6 ? cap / -k : Infinity]);
+  }
+  return out;
+}
+
+/**
+ * Mown stripe bands running ALONG the track (§4). Three lateral bands per side
+ * outside the contact band, each alternating between two named grass tiers every
+ * MOWN_SEGS segments with a per-band phase, so the verge reads as cut turf with
+ * a mower's rhythm instead of a flat green apron. Offsets are clamped by
+ * apronLimits so the bands taper through tight corners. One vertex-colour
+ * geometry, wound to face +y like every other paint layer.
+ */
+function mownStripeGeometry(frames: SampleFrame[], halfW: number, next: () => number): THREE.BufferGeometry {
+  const n = frames.length;
+  const inner = halfW + CURB_W + SHOULDER_W + SHOULDER_DEEP_W;
+  const stripes = Math.ceil(n / MOWN_SEGS);
+  const limits = apronLimits(frames);
+  const pos: number[] = [];
+  const nrm: number[] = [];
+  const col: number[] = [];
+  const idx: number[] = [];
+  for (const band of MOWN_BANDS) {
+    const ca = new THREE.Color(band.a);
+    const cb = new THREE.Color(band.b);
+    const phase = rngInt(next, 0, 1);
+    const tone: number[] = [];
+    for (let s = 0; s < stripes; s++) tone.push(rngRange(next, 0.93, 1.07));
+    for (const side of [1, -1]) {
+      const li = side > 0 ? 0 : 1; // which apron limit this side is bounded by
+      for (let i = 0; i < n; i++) {
+        const j = (i + 1) % n;
+        const cap = Math.min(limits[i]![li], limits[j]![li]);
+        const from = Math.min(inner + band.from, cap);
+        const to = Math.min(inner + band.to, cap);
+        if (to - from < 0.06) continue; // pinched shut through the apex
+        const s = Math.floor(i / MOWN_SEGS) % stripes;
+        const c = (s + phase) % 2 === 0 ? ca : cb;
+        const t = tone[s]!;
+        const a = frames[i]!;
+        const b = frames[j]!;
+        const lo = side > 0 ? to : -from;
+        const ro = side > 0 ? from : -to;
+        const base = pos.length / 3;
+        for (const v of [
+          [a.cx + a.lx * lo, MOWN_Y, a.cz + a.lz * lo],
+          [b.cx + b.lx * lo, MOWN_Y, b.cz + b.lz * lo],
+          [a.cx + a.lx * ro, MOWN_Y, a.cz + a.lz * ro],
+          [b.cx + b.lx * ro, MOWN_Y, b.cz + b.lz * ro],
+        ] as ReadonlyArray<readonly [number, number, number]>) {
+          pos.push(v[0], v[1], v[2]);
+          nrm.push(0, 1, 0);
+          col.push(Math.min(1, c.r * t), Math.min(1, c.g * t), Math.min(1, c.b * t));
+        }
+        idx.push(base, base + 1, base + 2, base + 2, base + 1, base + 3);
+      }
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute('normal', new THREE.Float32BufferAttribute(nrm, 3));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  geo.setIndex(idx);
+  return geo;
+}
+
+/**
+ * Grass tone layer: broad tier mottling + smaller four-tier patches + the dirt
+ * WEAR scuffed off the shoulder onto the verge (irregular seeded fans, flat on
+ * the field, never on the road/shoulder). One draw call.
+ */
+function grassPatchGeometry(
+  track: TrackDef,
+  frames: SampleFrame[],
+  halfW: number,
+  next: () => number,
+): THREE.BufferGeometry {
   const pos: number[] = [];
   const nrm: number[] = [];
   const col: number[] = [];
@@ -429,25 +651,41 @@ function grassPatchGeometry(track: TrackDef, halfW: number, next: () => number):
     }
   };
 
-  // broad mottling: large, very subtle shifts
+  // broad mottling: large, soft tier shifts over the whole apron
   for (let p = 0; p < BLOB_BIG; p++) {
-    const x = rngRange(next, -SCATTER_X, SCATTER_X);
-    const z = rngRange(next, -SCATTER_Z, SCATTER_Z);
+    const x = rngRange(next, -SCATTER_X - 30, SCATTER_X + 30);
+    const z = rngRange(next, -SCATTER_Z - 30, SCATTER_Z + 30);
     if (Math.abs(closestOnTrack(track, x, z).lateral) <= halfW + PROP_CLEARANCE) continue;
-    blob(x, z, rngRange(next, 10, 24), BLOB_Y - 0.006, shade(KPAL.grass, rngRange(next, 0.85, 1.1)));
+    const hex = next() < 0.5 ? KPAL.grassDark : KPAL.grassLit;
+    blob(x, z, rngRange(next, 10, 26), BLOB_Y - 0.006, shade(hex, rngRange(next, 0.95, 1.05)));
   }
 
-  // distinct patches: darker + lighter two-tone
+  // distinct patches: all four grass tiers, weighted toward the mid two
   for (let attempt = 0, done = 0; attempt < BLOB_SMALL * 20 && done < BLOB_SMALL; attempt++) {
     const x = rngRange(next, -SCATTER_X - 15, SCATTER_X + 15);
     const z = rngRange(next, -SCATTER_Z - 15, SCATTER_Z + 15);
     if (Math.abs(closestOnTrack(track, x, z).lateral) <= halfW + CURB_W + 2.0) continue;
-    if (tooClose(x, z, placed)) continue;
+    if (tooCloseR(x, z, placed, BLOB_SPACING)) continue;
     placed.push({ x, z });
-    const dark = next() < 0.55;
-    const c = dark ? shade(KPAL.grassDark, rngRange(next, 0.85, 1.02)) : shade(KPAL.grass, rngRange(next, 1.1, 1.24));
-    blob(x, z, rngRange(next, 1.8, 5.5), BLOB_Y, c);
-    done++;
+    const pick = next();
+    const hex =
+      pick < 0.14 ? KPAL.grassDeep : pick < 0.46 ? KPAL.grassDark : pick < 0.82 ? KPAL.grassLit : KPAL.grass;
+    blob(x, z, rngRange(next, 1.6, 5.5), BLOB_Y, shade(hex, rngRange(next, 0.94, 1.06)));
+  }
+
+  // track-edge wear: dirt scuffed off the shoulder onto the grass, broken so the
+  // road never meets the verge on a clean machined line (§4)
+  const wearFrom = halfW + CURB_W + SHOULDER_W + SHOULDER_DEEP_W;
+  for (let i = 0; i < frames.length; i += 2) {
+    for (const side of [1, -1]) {
+      if (next() < 0.62) continue;
+      const f = frames[i]!;
+      const lat = side * (wearFrom + rngRange(next, -0.15, 1.3));
+      const x = f.cx + f.lx * lat;
+      const z = f.cz + f.lz * lat;
+      const hex = next() < 0.42 ? KPAL.dirtDeep : KPAL.dirt;
+      blob(x, z, rngRange(next, 0.5, 1.5), EDGE_WEAR_Y, shade(hex, rngRange(next, 0.92, 1.08)));
+    }
   }
 
   const geo = new THREE.BufferGeometry();
@@ -577,15 +815,25 @@ interface AvoidZone {
   r: number;
 }
 
-/** Min center distance to every already-placed prop. */
-function tooClose(x: number, z: number, placed: ReadonlyArray<{ x: number; z: number }>): boolean {
-  const d2 = PROP_SPACING * PROP_SPACING;
+/** Min center distance `minDist` to every already-placed point. */
+function tooCloseR(
+  x: number,
+  z: number,
+  placed: ReadonlyArray<{ x: number; z: number }>,
+  minDist: number,
+): boolean {
+  const d2 = minDist * minDist;
   for (const p of placed) {
     const dx = p.x - x;
     const dz = p.z - z;
     if (dx * dx + dz * dz < d2) return true;
   }
   return false;
+}
+
+/** Min center distance to every already-placed prop (PROP_SPACING). */
+function tooClose(x: number, z: number, placed: ReadonlyArray<{ x: number; z: number }>): boolean {
+  return tooCloseR(x, z, placed, PROP_SPACING);
 }
 
 /** Inside any furniture keep-clear disc (buildings, billboards, lamps, stacks)? */
@@ -649,67 +897,121 @@ function addBlockText(
 
 // ---- seeded prop recipes (KPAL only) -------------------------------------------------
 
-/** seeded leaf tone: per-tree hue variance across the three KPAL greens. */
+/**
+ * Flat `…Deep` contact band under a prop. Every prop, post and tree gets one:
+ * it is this round's stand-in for ambient occlusion (VISUAL_UPGRADE.md §4) and
+ * is what stops trackside furniture reading as a decal pasted on the verge.
+ * `hex` must be the Deep tier of whatever the prop is standing ON — grassDeep
+ * out on the field, dirtDeep on the shoulder, concreteDeep under a footing.
+ */
+function contactPad(matFn: MatFn, w: number, d: number, hex: string): THREE.Mesh {
+  return at(box(matFn, w, PAD_H, d, hex), 0, PAD_H / 2, 0);
+}
+
+/**
+ * Seeded canopy trio for one tree: [lit, body, deep]. Every species gets a
+ * TWO-TIER canopy plus a deep underside so it stops reading as broccoli (§4) —
+ * the tiers always come from the frozen treeLeaf ladder, never a multiplier.
+ */
+function canopyTiers(next: () => number): [string, string, string] {
+  // half the trees run the ladder one rung lower: grove-to-grove tone variance
+  return next() < 0.5
+    ? [KPAL.treeLeafLight, KPAL.treeLeaf, KPAL.treeLeafDeep]
+    : [KPAL.treeLeaf, KPAL.treeLeafDeep, KPAL.treeLeafDeep];
+}
+
+/** seeded leaf tone for low scatter bushes: the canopy ladder, one pick. */
 function leafTone(next: () => number): string {
   const r = next();
-  return r < 0.45 ? KPAL.treeLeaf : r < 0.8 ? KPAL.treeLeafLight : KPAL.grassDark;
+  return r < 0.4 ? KPAL.treeLeaf : r < 0.75 ? KPAL.treeLeafLight : KPAL.treeLeafDeep;
 }
 
-/** broadleaf: trunk + 2 leaf blobs, organic yaw + scale. */
+/** broadleaf: trunk (+ deep root flare) + a lit crown over a deep underside. */
 function buildBroadleaf(matFn: MatFn, next: () => number): THREE.Group {
   const g = new THREE.Group();
+  const [lit, body, deep] = canopyTiers(next);
   const h = rngRange(next, 1.0, 1.6);
   g.add(at(cyl(matFn, 0.12, 0.18, h, 6, KPAL.treeTrunk), 0, h / 2, 0));
+  g.add(at(cyl(matFn, 0.19, 0.26, 0.16, 6, KPAL.treeTrunkDeep), 0, 0.08, 0)); // root flare
   const r1 = rngRange(next, 0.9, 1.3);
-  g.add(at(sphere(matFn, r1, 7, leafTone(next)), 0, h + r1 * 0.55, 0));
+  const under = sphere(matFn, r1 * 0.92, 6, deep); // shaded underside of the mass
+  under.scale.set(1, 0.55, 1);
+  g.add(at(under, 0, h + r1 * 0.4, 0));
+  g.add(at(sphere(matFn, r1, 7, body), 0, h + r1 * 0.62, 0));
   const r2 = r1 * rngRange(next, 0.55, 0.7);
-  g.add(at(sphere(matFn, r2, 6, leafTone(next)), rngRange(next, -0.25, 0.25), h + r1 * 0.55 + r2 * 0.9, rngRange(next, -0.25, 0.25)));
+  g.add(
+    at(
+      sphere(matFn, r2, 6, lit),
+      rngRange(next, -0.25, 0.25),
+      h + r1 * 0.62 + r2 * 0.85,
+      rngRange(next, -0.25, 0.25),
+    ),
+  );
   return g;
 }
 
-/** pine: short trunk + 2 stacked cones. */
+/** pine: short trunk + 3 stacked cones, deep skirt -> body -> lit tip. */
 function buildPine(matFn: MatFn, next: () => number): THREE.Group {
   const g = new THREE.Group();
+  const [lit, body, deep] = canopyTiers(next);
   const h = rngRange(next, 0.7, 1.1);
   g.add(at(cyl(matFn, 0.1, 0.16, h, 6, KPAL.treeTrunk), 0, h / 2, 0));
-  const tone = leafTone(next);
+  g.add(at(cyl(matFn, 0.17, 0.24, 0.14, 6, KPAL.treeTrunkDeep), 0, 0.07, 0)); // root flare
   const r1 = rngRange(next, 0.75, 1.05);
-  g.add(at(cone(matFn, r1, rngRange(next, 1.3, 1.7), 7, tone), 0, h + 0.6, 0));
-  g.add(at(cone(matFn, r1 * 0.62, rngRange(next, 0.9, 1.2), 7, leafTone(next)), 0, h + 0.6 + r1 * 0.85, 0));
+  g.add(at(cone(matFn, r1 * 1.12, rngRange(next, 1.0, 1.3), 7, deep), 0, h + 0.34, 0));
+  g.add(at(cone(matFn, r1, rngRange(next, 1.3, 1.7), 7, body), 0, h + 0.72, 0));
+  g.add(at(cone(matFn, r1 * 0.6, rngRange(next, 0.9, 1.2), 7, lit), 0, h + 0.72 + r1 * 0.85, 0));
   return g;
 }
 
-/** poplar: tall trunk + a stretched ellipsoid crown (+ tip blob). */
+/** poplar: tall trunk + a stretched crown, deep skirt under a lit tip. */
 function buildPoplar(matFn: MatFn, next: () => number): THREE.Group {
   const g = new THREE.Group();
+  const [lit, body, deep] = canopyTiers(next);
   const h = rngRange(next, 1.5, 2.2);
   g.add(at(cyl(matFn, 0.09, 0.14, h, 6, KPAL.treeTrunk), 0, h / 2, 0));
+  g.add(at(cyl(matFn, 0.15, 0.21, 0.13, 6, KPAL.treeTrunkDeep), 0, 0.065, 0)); // root flare
   const r = rngRange(next, 0.5, 0.75);
-  const crown = sphere(matFn, r, 7, leafTone(next));
+  const skirt = sphere(matFn, r * 1.02, 6, deep);
+  skirt.scale.set(1, rngRange(next, 0.9, 1.15), 1);
+  g.add(at(skirt, 0, h + r * 0.85, 0));
+  const crown = sphere(matFn, r, 7, body);
   crown.scale.set(1, rngRange(next, 1.9, 2.4), 1);
-  crown.position.y = h + r * 1.5;
+  crown.position.y = h + r * 1.65;
   g.add(crown);
-  g.add(at(sphere(matFn, r * 0.5, 6, leafTone(next)), 0, h + r * 3.1, 0));
+  g.add(at(sphere(matFn, r * 0.5, 6, lit), 0, h + r * 3.1, 0));
   return g;
 }
 
-/** one of the three silhouettes + per-instance scale/yaw jitter. */
+/**
+ * One of the three silhouettes + a grassDeep contact pad, per-instance yaw and
+ * a +-30 % scale spread (§4). Placed on the grass field only.
+ */
 function buildAnyTree(matFn: MatFn, next: () => number): THREE.Group {
   const r = next();
   const g = r < 0.34 ? buildPine(matFn, next) : r < 0.67 ? buildBroadleaf(matFn, next) : buildPoplar(matFn, next);
+  g.add(contactPad(matFn, rngRange(next, 0.95, 1.35), rngRange(next, 0.95, 1.35), KPAL.grassDeep));
   g.rotation.y = next() * Math.PI * 2;
-  g.scale.setScalar(rngRange(next, 0.7, 1.45));
+  g.scale.setScalar(rngRange(next, 0.7, 1.3));
   return g;
 }
 
-/** rock: 1-2 overlapping squashed spheres. */
+/** rock: 1-2 overlapping squashed spheres over a rockDeep base + grass pad. */
 function buildRock(matFn: MatFn, next: () => number): THREE.Group {
   const g = new THREE.Group();
+  g.add(contactPad(matFn, rngRange(next, 1.1, 1.5), rngRange(next, 1.1, 1.5), KPAL.grassDeep));
   const n = rngInt(next, 1, 2);
   for (let i = 0; i < n; i++) {
     const r = rngRange(next, 0.4, 0.9);
-    const m = at(sphere(matFn, r, 7, KPAL.rock), rngRange(next, -0.4, 0.4), r * 0.45, rngRange(next, -0.4, 0.4));
-    m.scale.set(rngRange(next, 0.9, 1.4), rngRange(next, 0.4, 0.65), rngRange(next, 0.9, 1.4));
+    const ox = rngRange(next, -0.4, 0.4);
+    const oz = rngRange(next, -0.4, 0.4);
+    const sx = rngRange(next, 0.9, 1.4);
+    const sz = rngRange(next, 0.9, 1.4);
+    const skirt = at(sphere(matFn, r * 1.05, 6, KPAL.rockDeep), ox, r * 0.16, oz); // bedded-in base
+    skirt.scale.set(sx, 0.22, sz);
+    g.add(skirt);
+    const m = at(sphere(matFn, r, 7, KPAL.rock), ox, r * 0.5, oz);
+    m.scale.set(sx, rngRange(next, 0.4, 0.65), sz);
     m.rotation.y = next() * Math.PI;
     g.add(m);
   }
@@ -719,21 +1021,27 @@ function buildRock(matFn: MatFn, next: () => number): THREE.Group {
 /** tire stack: 3 painted torus rings (red or white), apex furniture. */
 function buildTireStack(matFn: MatFn, hex: string): THREE.Group {
   const g = new THREE.Group();
+  g.add(contactPad(matFn, 1.0, 1.0, KPAL.grassDeep));
+  g.add(at(cyl(matFn, 0.44, 0.48, 0.06, 10, KPAL.tire), 0, 0.05, 0)); // dark base ring
   for (let k = 0; k < 3; k++) {
     const t = new THREE.Mesh(new THREE.TorusGeometry(0.3, 0.13, 7, 12), matFn(hex));
     t.rotation.x = Math.PI / 2; // lie flat, hole up
-    t.position.y = 0.14 + k * 0.26;
+    t.position.y = 0.2 + k * 0.26;
     g.add(t);
   }
   return g;
 }
 
-/** traffic cone: orange body + white reflective collar. */
+/**
+ * Traffic cone: charcoal contact base (cones live on the dirt shoulder, so the
+ * contact band is a dark plate rather than a grassDeep pad) + orange body +
+ * white reflective collar.
+ */
 function buildCone(matFn: MatFn): THREE.Group {
   const g = new THREE.Group();
-  g.add(at(box(matFn, 0.3, 0.04, 0.3, KPAL.kartOrange), 0, 0.02, 0));
-  g.add(at(cone(matFn, 0.16, 0.44, 8, KPAL.kartOrange), 0, 0.26, 0));
-  g.add(at(cyl(matFn, 0.085, 0.105, 0.09, 8, KPAL.curbWhite), 0, 0.28, 0));
+  g.add(at(box(matFn, 0.34, 0.045, 0.34, KPAL.charcoal), 0, 0.022, 0));
+  g.add(at(cone(matFn, 0.16, 0.44, 8, KPAL.kartOrange), 0, 0.28, 0));
+  g.add(at(cyl(matFn, 0.085, 0.105, 0.09, 8, KPAL.curbWhite), 0, 0.3, 0));
   return g;
 }
 
@@ -751,7 +1059,8 @@ function buildGantry(matFn: MatFn, track: TrackDef): THREE.Group {
 
   for (const side of [1, -1]) {
     const x = side * (w + GANTRY_OFF);
-    g.add(at(box(matFn, 0.9, 0.18, 0.9, KPAL.steel), x, 0.09, 0)); // base plate
+    g.add(at(box(matFn, 1.25, PAD_H, 1.25, KPAL.concreteDeep), x, PAD_H / 2, 0)); // footing pad
+    g.add(at(box(matFn, 0.9, 0.18, 0.9, KPAL.steel), x, 0.11, 0)); // base plate
     g.add(at(box(matFn, 0.34, 5.7, 0.34, KPAL.charcoal), x, 2.94, 0)); // column
     const brace = box(matFn, 0.16, 1.7, 0.16, KPAL.steel); // angled brace inward
     brace.position.set(side * (w + GANTRY_OFF - 0.45), 4.75, 0);
@@ -795,7 +1104,9 @@ function buildGantry(matFn: MatFn, track: TrackDef): THREE.Group {
  */
 function buildBillboard(matFn: MatFn, design: number): THREE.Group {
   const g = new THREE.Group();
+  g.add(contactPad(matFn, 3.6, 1.0, KPAL.grassDeep));
   for (const x of [-1.4, 1.4]) {
+    g.add(at(box(matFn, 0.42, 0.16, 0.42, KPAL.concreteDeep), x, 0.08, 0)); // footing
     g.add(at(box(matFn, 0.16, 2.6, 0.16, KPAL.steel), x, 1.3, 0));
   }
   const fields = [KPAL.kartRed, KPAL.charcoal, KPAL.grassDark, KPAL.ink, KPAL.curbWhite];
@@ -848,10 +1159,12 @@ function rotX<T extends THREE.Object3D>(obj: T, x: number, y: number, z: number)
 /** lamp post: steel pole + arm reaching over the barrier + head with lens. */
 function buildLamp(matFn: MatFn): THREE.Group {
   const g = new THREE.Group(); // local +z = toward the road
-  g.add(at(cyl(matFn, 0.07, 0.1, 5.6, 7, KPAL.steel), 0, 2.8, 0));
-  g.add(at(box(matFn, 0.1, 0.1, 1.7, KPAL.steel), 0, 5.42, 0.75));
-  g.add(at(box(matFn, 0.34, 0.12, 0.66, KPAL.charcoal), 0, 5.32, 1.55));
-  g.add(at(box(matFn, 0.26, 0.03, 0.5, KPAL.curbWhite), 0, 5.25, 1.55));
+  g.add(contactPad(matFn, 0.85, 0.85, KPAL.grassDeep));
+  g.add(at(cyl(matFn, 0.16, 0.2, 0.22, 8, KPAL.steelDeep), 0, 0.11, 0)); // base collar
+  g.add(at(cyl(matFn, 0.07, 0.1, 5.6, 7, KPAL.steel), 0, 2.9, 0));
+  g.add(at(box(matFn, 0.1, 0.1, 1.7, KPAL.steel), 0, 5.52, 0.75));
+  g.add(at(box(matFn, 0.34, 0.12, 0.66, KPAL.charcoal), 0, 5.42, 1.55));
+  g.add(at(box(matFn, 0.26, 0.03, 0.5, KPAL.curbWhite), 0, 5.35, 1.55));
   return g;
 }
 
@@ -861,70 +1174,84 @@ function buildLamp(matFn: MatFn): THREE.Group {
  */
 function buildPitBuilding(matFn: MatFn): THREE.Group {
   const g = new THREE.Group();
-  g.add(at(box(matFn, 10.5, 3.4, 5.0, KPAL.curbWhite), 0, 1.7, 0));
-  g.add(at(box(matFn, 11.3, 0.28, 5.9, KPAL.charcoal), 0, 3.55, 0));
-  g.add(at(box(matFn, 11.3, 0.46, 0.12, KPAL.kartRed), 0, 3.28, 2.92)); // fascia
-  addBlockText(g, matFn, 'PIT', 0.13, KPAL.curbWhite, 3.28, 3.0, false);
+  g.add(contactPad(matFn, 13.5, 8.0, KPAL.grassDeep)); // grounding band on the verge
+  g.add(at(box(matFn, 11.0, 0.34, 5.5, KPAL.concreteDeep), 0, 0.17, 0)); // plinth
+  g.add(at(box(matFn, 10.5, 3.4, 5.0, KPAL.curbWhite), 0, 2.04, 0));
+  g.add(at(box(matFn, 10.9, 0.14, 5.4, KPAL.concrete), 0, 3.78, 0)); // eaves band
+  g.add(at(box(matFn, 11.3, 0.28, 5.9, KPAL.charcoal), 0, 3.99, 0));
+  g.add(at(box(matFn, 11.3, 0.46, 0.12, KPAL.kartRed), 0, 3.62, 2.92)); // fascia
+  addBlockText(g, matFn, 'PIT', 0.13, KPAL.curbWhite, 3.62, 3.0, false);
   for (const x of [-3.8, -1.3, 1.2]) {
-    g.add(at(box(matFn, 1.5, 1.1, 0.1, KPAL.ink), x, 1.9, 2.52)); // windows
+    g.add(at(box(matFn, 1.5, 1.1, 0.1, KPAL.ink), x, 2.24, 2.52)); // windows
+    g.add(at(box(matFn, 1.66, 0.1, 0.08, KPAL.concreteDeep), x, 1.63, 2.54)); // sill
   }
-  g.add(at(box(matFn, 1.1, 2.2, 0.1, KPAL.charcoal), 3.9, 1.1, 2.52)); // door
-  g.add(at(box(matFn, 3.6, 2.4, 3.4, KPAL.steel), -7.6, 1.2, -0.4)); // annex
-  g.add(at(box(matFn, 0.9, 0.4, 0.9, KPAL.steel), -2.5, 3.9, 0.8)); // roof clutter
-  g.add(at(box(matFn, 0.9, 0.4, 0.9, KPAL.charcoal), 1.8, 3.9, -1.2));
+  g.add(at(box(matFn, 1.1, 2.2, 0.1, KPAL.charcoal), 3.9, 1.44, 2.52)); // door
+  g.add(at(box(matFn, 4.0, 0.3, 3.8, KPAL.concreteDeep), -7.6, 0.15, -0.4)); // annex plinth
+  g.add(at(box(matFn, 3.6, 2.4, 3.4, KPAL.steel), -7.6, 1.5, -0.4)); // annex
+  g.add(at(box(matFn, 3.8, 0.16, 3.6, KPAL.steelDeep), -7.6, 2.78, -0.4)); // annex cap
+  g.add(at(box(matFn, 0.9, 0.4, 0.9, KPAL.steel), -2.5, 4.34, 0.8)); // roof clutter
+  g.add(at(box(matFn, 0.9, 0.4, 0.9, KPAL.charcoal), 1.8, 4.34, -1.2));
   return g;
 }
 
 /**
- * Grandstand silhouette: base plinth + 4 ascending terraces with seeded crowd
- * blocks (palette colors), back wall, roof slab on posts. Faces the track
- * (local +z). ~20m long, sits along the start straight.
+ * Grandstand: grassDeep contact band + concreteDeep plinth, 5 ascending
+ * terraces PACKED with a seeded crowd (body block from the frozen CROWD_COLORS
+ * cycle + a darker head, two staggered rows per terrace, varied stature so a
+ * few stand), back wall, roof slab on posts. An empty stand reads as a dead
+ * world (VISUAL_UPGRADE.md §4), so density here is the whole point. Faces the
+ * track (local +z). ~20m long, sits along the start straight.
  */
 function buildGrandstand(matFn: MatFn, next: () => number): THREE.Group {
   const g = new THREE.Group();
   const LEN = 20;
-  const CROWD = [
-    KPAL.kartRed,
-    KPAL.kartBlue,
-    KPAL.kartYellow,
-    KPAL.curbWhite,
-    KPAL.kartTeal,
-    KPAL.kartOrange,
-    KPAL.steel,
-    KPAL.kartGreen,
-  ];
-  g.add(at(box(matFn, LEN, 0.4, 7, KPAL.steel), 0, 0.2, 0)); // plinth
-  for (let k = 0; k < 4; k++) {
-    const y = 0.4 + k * 0.55;
-    const z = 2.3 - k * 1.5;
-    g.add(at(box(matFn, LEN, 0.5, 1.6, KPAL.asphaltLight), 0, y + 0.25, z)); // terrace
-    let x = -LEN / 2 + 0.7; // crowd row: seeded palette blocks with gaps
-    while (x < LEN / 2 - 0.7) {
-      if (next() < 0.85) {
-        g.add(
-          at(
-            box(matFn, 0.5, 0.5, 0.5, CROWD[rngInt(next, 0, CROWD.length - 1)]!),
-            x + rngRange(next, -0.1, 0.1),
-            y + 0.75,
-            z + rngRange(next, -0.15, 0.15),
-          ),
-        );
+  const TIERS = 5;
+  g.add(contactPad(matFn, LEN + 3.4, 10.4, KPAL.grassDeep));
+  g.add(at(box(matFn, LEN + 0.6, 0.34, 7.6, KPAL.concreteDeep), 0, 0.17, 0)); // plinth
+  g.add(at(box(matFn, LEN, 0.28, 7, KPAL.steel), 0, 0.48, 0)); // deck
+  let seat = rngInt(next, 0, CROWD_COLORS.length - 1);
+  for (let k = 0; k < TIERS; k++) {
+    const y = 0.62 + k * 0.55;
+    const z = 2.5 - k * 1.35;
+    // terraces overlap in y (0.62 tall on a 0.55 rise) so no slit shows between steps
+    g.add(at(box(matFn, LEN, 0.62, 1.45, KPAL.asphaltLight), 0, y + 0.19, z));
+    g.add(at(box(matFn, LEN, 0.12, 0.1, KPAL.concreteDeep), 0, y + 0.06, z + 0.72)); // riser shadow
+    // two staggered crowd rows per terrace: front row sits, back row often stands
+    for (let row = 0; row < 2; row++) {
+      const rz = z + (row === 0 ? 0.34 : -0.3);
+      let x = -LEN / 2 + 0.55 + (row === 0 ? 0 : 0.38);
+      while (x < LEN / 2 - 0.55) {
+        if (next() < 0.9) {
+          const hex = CROWD_COLORS[seat % CROWD_COLORS.length]!;
+          seat += rngInt(next, 1, 3); // cycle the palette, never two identical runs
+          const stand = row === 1 && next() < 0.35;
+          const bh = stand ? 0.72 : 0.5;
+          const cx = x + rngRange(next, -0.08, 0.08);
+          const cz = rz + rngRange(next, -0.12, 0.12);
+          g.add(at(box(matFn, 0.44, bh, 0.42, hex), cx, y + 0.5 + bh / 2, cz));
+          g.add(at(box(matFn, 0.26, 0.24, 0.26, KPAL.charcoal), cx, y + 0.5 + bh + 0.12, cz)); // head
+        }
+        x += rngRange(next, 0.62, 0.92);
       }
-      x += rngRange(next, 0.65, 1.0);
     }
   }
-  g.add(at(box(matFn, LEN, 2.4, 0.35, KPAL.charcoal), 0, 1.6, -3.3)); // back wall
+  g.add(at(box(matFn, LEN, 2.4, 0.35, KPAL.charcoal), 0, 1.8, -3.4)); // back wall
+  g.add(at(box(matFn, LEN, 0.16, 0.42, KPAL.steelDeep), 0, 0.68, -3.4)); // wall footing
   for (const px of [-LEN / 2 + 0.6, LEN / 2 - 0.6]) {
-    g.add(at(box(matFn, 0.3, 3.4, 0.3, KPAL.charcoal), px, 1.7, 2.9)); // roof posts
+    g.add(at(box(matFn, 0.3, 3.0, 0.3, KPAL.charcoal), px, 2.3, 2.9)); // roof posts (meet the slab)
+    g.add(at(box(matFn, 0.46, 0.2, 0.46, KPAL.steelDeep), px, 0.72, 2.9)); // post base
   }
-  g.add(at(box(matFn, LEN + 0.8, 0.22, 7.6, KPAL.ink), 0, 3.55, -0.2)); // roof slab
+  g.add(at(box(matFn, LEN + 0.8, 0.22, 7.6, KPAL.ink), 0, 3.85, -0.2)); // roof slab
+  g.add(at(box(matFn, LEN + 0.9, 0.14, 0.18, KPAL.gold), 0, 3.7, 3.5)); // roof edge trim
   return g;
 }
 
 /** brake board: white post + board with a dark block numeral ('3'/'2'/'1'). */
 function buildBrakeBoard(matFn: MatFn, numeral: string): THREE.Group {
   const g = new THREE.Group(); // local +z faces approaching traffic
-  g.add(at(box(matFn, 0.08, 1.05, 0.08, KPAL.curbWhite), 0, 0.52, 0)); // post
+  g.add(contactPad(matFn, 0.46, 0.46, KPAL.dirtDeep)); // boards stand on the shoulder
+  g.add(at(box(matFn, 0.16, 0.14, 0.16, KPAL.steelDeep), 0, 0.07, 0)); // foot
+  g.add(at(box(matFn, 0.08, 1.05, 0.08, KPAL.curbWhite), 0, 0.55, 0)); // post
   g.add(at(box(matFn, 0.62, 0.48, 0.06, KPAL.curbWhite), 0, 1.1, 0)); // board
   addBlockText(g, matFn, numeral, 0.052, KPAL.ink, 1.1, 0.045, false);
   addBlockText(g, matFn, numeral, 0.052, KPAL.ink, 1.1, -0.045, true);
@@ -946,6 +1273,18 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
   // curvature drives the road's rubber lines, the apex skids/stacks, billboards
   const turn = smoothedTurn(frames);
   const apexes = findApexes(frames, turn);
+
+  // ---- the grass field: a tier-mottled plane, NOT a flat slab ---------------
+  const groundNext = rng(decoSeed('kart-circuit', 18));
+  const ground = new THREE.Mesh(groundGeometry(groundNext), vertexPaintMaterial());
+  ground.receiveShadow = true;
+  root.add(ground);
+
+  // mown stripe bands along the verge (over the field, under the dirt wear)
+  const mownNext = rng(decoSeed('kart-circuit', 19));
+  const mown = new THREE.Mesh(mownStripeGeometry(frames, w, mownNext), vertexPaintMaterial());
+  mown.receiveShadow = true;
+  root.add(mown);
 
   // ---- road ribbon + painted markings (flat, receive shadows only) -----------
   const roadNext = rng(decoSeed('kart-circuit', 10));
@@ -978,16 +1317,30 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
     root.add(curb);
   }
 
-  // dirt shoulder ring: narrow, desaturated toward the asphalt/dirt midpoint
+  // dirt shoulder ring (the two dirt tiers, alternating in runs) followed by the
+  // asphaltDeep CONTACT BAND where the whole road assembly meets the grass —
+  // that band is KART's L2 contact rule (VISUAL_UPGRADE.md §4).
   const dirtNext = rng(decoSeed('kart-circuit', 11));
-  const dirtMix = new THREE.Color(KPAL.asphalt).lerp(new THREE.Color(KPAL.dirt), 0.55);
-  const dirtColor = (): [number, number, number] => {
-    const j = 0.85 + dirtNext() * 0.3;
-    return [Math.min(1, dirtMix.r * j), Math.min(1, dirtMix.g * j), Math.min(1, dirtMix.b * j)];
+  const dirtCols = [new THREE.Color(KPAL.dirt), new THREE.Color(KPAL.dirtDeep)];
+  const dirtColor = (seg: number): [number, number, number] => {
+    const c = dirtCols[Math.floor(seg / 3) % 2]!;
+    const j = 0.92 + dirtNext() * 0.16;
+    return [Math.min(1, c.r * j), Math.min(1, c.g * j), Math.min(1, c.b * j)];
   };
-  const dirtA = ribbonGeometry(frames, w + CURB_W + SHOULDER_W, w + CURB_W, SHOULDER_Y, dirtColor, () => false);
-  const dirtB = ribbonGeometry(frames, -(w + CURB_W), -(w + CURB_W + SHOULDER_W), SHOULDER_Y, dirtColor, () => false);
-  const dirtMerged = mergeGeometries([dirtA, dirtB], false);
+  const deepBand = new THREE.Color(KPAL.asphaltDeep);
+  const deepColor = (): [number, number, number] => {
+    const j = 0.92 + dirtNext() * 0.16;
+    return [Math.min(1, deepBand.r * j), Math.min(1, deepBand.g * j), Math.min(1, deepBand.b * j)];
+  };
+  const shOuter = w + CURB_W + SHOULDER_W;
+  const shDeep = shOuter + SHOULDER_DEEP_W;
+  const shoulderParts = [
+    ribbonGeometry(frames, shOuter, w + CURB_W, SHOULDER_Y, dirtColor, () => false),
+    ribbonGeometry(frames, -(w + CURB_W), -shOuter, SHOULDER_Y, dirtColor, () => false),
+    ribbonGeometry(frames, shDeep, shOuter, SHOULDER_Y, deepColor, () => false),
+    ribbonGeometry(frames, -shOuter, -shDeep, SHOULDER_Y, deepColor, () => false),
+  ];
+  const dirtMerged = mergeGeometries(shoulderParts, false);
   if (dirtMerged) {
     const dirt = new THREE.Mesh(dirtMerged, vertexPaintMaterial());
     dirt.receiveShadow = true;
@@ -1000,9 +1353,9 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
   detail.receiveShadow = true;
   root.add(detail);
 
-  // grass tone blobs: two-tone patches + broad mottling (one vertex-color mesh)
+  // grass tone patches: four-tier blobs + broad mottling + track-edge dirt wear
   const blobNext = rng(decoSeed('kart-circuit', 13));
-  const blobs = new THREE.Mesh(grassPatchGeometry(track, w, blobNext), vertexPaintMaterial());
+  const blobs = new THREE.Mesh(grassPatchGeometry(track, frames, w, blobNext), vertexPaintMaterial());
   blobs.receiveShadow = true;
   root.add(blobs);
 
@@ -1010,22 +1363,21 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
   const statics = new THREE.Group();
   const avoid: AvoidZone[] = []; // furniture keep-clear discs for the scatter
 
-  // ground: grass slab, top surface just below the road ribbon
-  statics.add(at(box(matFn, GROUND_SIZE, 0.04, GROUND_SIZE, KPAL.grass), 0, -0.04, 0));
+  // (the ground is the vertex-coloured field mesh above — there is deliberately
+  // no flat grass slab here any more: one uncut green was KART's worst flaw)
 
-  // barrier posts: every BARRIER_EVERY segments at roadHalfW + BARRIER_OFF
+  // barrier posts: every BARRIER_EVERY segments at roadHalfW + BARRIER_OFF, each
+  // socketed on a charcoal collar over a dirtDeep pad — the posts stand on the
+  // dirt shoulder, so their contact band is the dirt ladder's Deep tier.
   for (let i = 0; i < frames.length; i += BARRIER_EVERY) {
     const f = frames[i]!;
     const hex = (i / BARRIER_EVERY) % 2 === 0 ? KPAL.barrierWhite : KPAL.barrierRed;
     for (const side of [1, -1]) {
-      statics.add(
-        at(
-          cyl(matFn, 0.09, 0.09, BARRIER_H, 8, hex),
-          f.cx + f.lx * (w + BARRIER_OFF) * side,
-          BARRIER_H / 2,
-          f.cz + f.lz * (w + BARRIER_OFF) * side,
-        ),
-      );
+      const px = f.cx + f.lx * (w + BARRIER_OFF) * side;
+      const pz = f.cz + f.lz * (w + BARRIER_OFF) * side;
+      statics.add(at(box(matFn, 0.42, PAD_H, 0.42, KPAL.dirtDeep), px, PAD_H / 2, pz));
+      statics.add(at(cyl(matFn, 0.13, 0.15, 0.1, 8, KPAL.charcoal), px, 0.07, pz));
+      statics.add(at(cyl(matFn, 0.09, 0.09, BARRIER_H, 8, hex), px, BARRIER_H / 2 + 0.11, pz));
     }
   }
 
@@ -1207,17 +1559,26 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
       if (pick < 0.45) {
         // flower tuft: dark stem cube + palette bloom cube
         const fl = new THREE.Group();
-        fl.add(at(box(matFn, 0.07, 0.22, 0.07, KPAL.grassDark), 0, 0.11, 0));
-        fl.add(at(box(matFn, 0.17, 0.12, 0.17, FLOWERS[rngInt(gsNext, 0, FLOWERS.length - 1)]!), 0, 0.27, 0));
+        fl.add(at(box(matFn, 0.26, PAD_H, 0.26, KPAL.grassDeep), 0, PAD_H / 2, 0));
+        fl.add(at(box(matFn, 0.07, 0.22, 0.07, KPAL.grassDark), 0, 0.13, 0));
+        fl.add(at(box(matFn, 0.17, 0.12, 0.17, FLOWERS[rngInt(gsNext, 0, FLOWERS.length - 1)]!), 0, 0.29, 0));
         fl.position.set(x, 0, z);
         statics.add(fl);
       } else if (pick < 0.8) {
-        // low bush: squashed leaf-tone blob
-        const bush = sphere(matFn, rngRange(gsNext, 0.28, 0.55), 6, leafTone(gsNext));
-        bush.scale.set(rngRange(gsNext, 0.9, 1.3), rngRange(gsNext, 0.5, 0.7), rngRange(gsNext, 0.9, 1.3));
-        bush.position.set(x, 0.18, z);
-        bush.rotation.y = gsNext() * Math.PI;
-        statics.add(bush);
+        // low bush: squashed leaf-tone blob over its own deep underside
+        const bg = new THREE.Group();
+        const br = rngRange(gsNext, 0.28, 0.55);
+        const sx = rngRange(gsNext, 0.9, 1.3);
+        const sz = rngRange(gsNext, 0.9, 1.3);
+        const skirt = sphere(matFn, br * 1.06, 6, KPAL.treeLeafDeep);
+        skirt.scale.set(sx, 0.34, sz);
+        bg.add(at(skirt, 0, 0.08, 0));
+        const bush = sphere(matFn, br, 6, leafTone(gsNext));
+        bush.scale.set(sx, rngRange(gsNext, 0.5, 0.7), sz);
+        bg.add(at(bush, 0, 0.21, 0));
+        bg.rotation.y = gsNext() * Math.PI;
+        bg.position.set(x, 0, z);
+        statics.add(bg);
       } else {
         // pebble: small squashed rock
         const r = rngRange(gsNext, 0.14, 0.3);
@@ -1316,16 +1677,23 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
     lineTrees++;
   }
 
-  // horizon: two ridgeline layers — dark near ridge, taller hazier far ridge.
-  // Vertex-color gradients + fog do the atmospheric depth; no cone hills.
+  // horizon: THREE ridgeline layers on a distance ladder — a dark green near
+  // ridge, a ridgeNear->ridgeFar mid ridge, and a tall far ridge faded toward
+  // the fog with mix() (the one sanctioned use: atmospheric perspective, §0.7).
+  // Vertex-color gradients + fog do the depth; no cone hills.
   const ridgeNext = rng(decoSeed('kart-circuit', 15));
   const ridgeFar = new THREE.Mesh(
-    ridgelineGeometry(RIDGE_FAR_R, RIDGE_FAR_PEAK, ridgeNext, KPAL.rock, KPAL.steel),
+    ridgelineGeometry(RIDGE_FAR_R, RIDGE_FAR_PEAK, ridgeNext, KPAL.ridgeFar, mix(KPAL.ridgeFar, KPAL.fog, 0.55)),
     vertexPaintMaterial(),
   );
   root.add(ridgeFar);
+  const ridgeMid = new THREE.Mesh(
+    ridgelineGeometry(RIDGE_MID_R, RIDGE_MID_PEAK, ridgeNext, KPAL.ridgeNear, KPAL.ridgeFar),
+    vertexPaintMaterial(),
+  );
+  root.add(ridgeMid);
   const ridgeNear = new THREE.Mesh(
-    ridgelineGeometry(RIDGE_NEAR_R, RIDGE_NEAR_PEAK, ridgeNext, KPAL.grassDark, KPAL.treeLeaf),
+    ridgelineGeometry(RIDGE_NEAR_R, RIDGE_NEAR_PEAK, ridgeNext, KPAL.grassDeep, KPAL.ridgeNear),
     vertexPaintMaterial(),
   );
   root.add(ridgeNear);

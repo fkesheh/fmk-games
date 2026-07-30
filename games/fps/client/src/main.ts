@@ -1,9 +1,11 @@
 // ============================================================================
 // C11 — app shell + boot + debug surface. Builds the DOM-side roots (index.html
-// provides #app/#game/#hud/#menu), constructs ClientState/Hud/Menus/ClientGame,
-// runs the rAF loop (dt-clamped), forwards resize, unlocks audio on the first
-// gesture, shows a ?debug overlay, exposes the frozen window.__fps surface used
-// by e2e, and guards every failure path with a visible error banner.
+// provides #app/#game/#hud/#menu/#boot), mirrors PALETTE onto the --c11-* CSS
+// custom properties style.css consumes, constructs ClientState/Hud/Menus/
+// ClientGame, runs the rAF loop (dt-clamped), forwards resize, unlocks audio on
+// the first gesture, shows a ?debug overlay, exposes the frozen window.__fps
+// surface used by e2e, dismisses the boot splash, and guards every failure path
+// with a visible error banner.
 //
 // C10/C11 SEAM (specs/C11.md — ClientGame's frozen table has no audio, resize,
 // buy, or debug hooks, so these are additive public methods C10 implements and
@@ -87,6 +89,7 @@ declare global {
 
 const MAX_FRAME_MS = 100; // dt clamp: background-tab gaps must not teleport the sim
 const DEBUG_HZ_MS = 250; // ?debug overlay refresh (4Hz)
+const BOOT_FADE_MS = 260; // must cover .boot-splash's opacity transition
 
 function must<T extends HTMLElement>(selector: string): T {
   const el = document.querySelector<T>(selector);
@@ -94,9 +97,59 @@ function must<T extends HTMLElement>(selector: string): T {
   return el;
 }
 
+// ---- PALETTE -> CSS custom properties (single source of truth) --------------
+// style.css consumes these and carries NO hex fallbacks: a fallback is a second
+// source of truth that silently diverges (that is exactly how --c11-accent came
+// to be read but never written). This table must therefore stay a SUPERSET of
+// every --c11-* var style.css reads. Applied at module load, before any DOM is
+// built and before window.onerror can paint the error banner.
+const PALETTE_CSS_VARS: ReadonlyArray<readonly [name: string, hex: string]> = [
+  ['--c11-ink', PALETTE.ink], //             page + shell base
+  ['--c11-shell', PALETTE.charcoal], //      shell gradient lift
+  ['--c11-text', PALETTE.hudText], //        body copy
+  ['--c11-accent', PALETTE.hudAccent], //    focus ring, selection, boot bar
+  ['--c11-accent-lit', PALETTE.tLit], //     accent highlight
+  ['--c11-danger', PALETTE.danger], //       fatal banner
+  ['--c11-danger-deep', PALETTE.blood], //   fatal banner floor
+];
+
+// Alpha companions: rgba() needs channels, and mixing in a literal rgb() would
+// reintroduce the hex this pass removes. Only the three used with opacity.
+const PALETTE_CSS_RGB_VARS: ReadonlyArray<readonly [name: string, hex: string]> = [
+  ['--c11-ink-rgb', PALETTE.ink],
+  ['--c11-text-rgb', PALETTE.hudText],
+  ['--c11-accent-rgb', PALETTE.hudAccent],
+];
+
+function rgbChannels(hex: string): string {
+  const n = Number.parseInt(hex.slice(1), 16);
+  return `${(n >> 16) & 0xff}, ${(n >> 8) & 0xff}, ${n & 0xff}`;
+}
+
+function applyPaletteVars(): void {
+  const rootStyle = document.documentElement.style;
+  for (const [name, hex] of PALETTE_CSS_VARS) rootStyle.setProperty(name, hex);
+  for (const [name, hex] of PALETTE_CSS_RGB_VARS) rootStyle.setProperty(name, rgbChannels(hex));
+}
+
+applyPaletteVars();
+
+// ---- boot splash (index.html #boot): removed once the shell is live ---------
+function dismissBootSplash(immediate: boolean): void {
+  const el = document.getElementById('boot');
+  if (el === null) return;
+  if (immediate) {
+    el.remove();
+    return;
+  }
+  el.classList.add('is-dismissed');
+  window.setTimeout(() => el.remove(), BOOT_FADE_MS);
+}
+
 // ---- fatal error surface (CONTRACT RULE 9) ----------------------------------
 let bannerEl: HTMLDivElement | null = null;
 function showError(text: string): void {
+  dismissBootSplash(true); // a failure must never hide behind a loading spinner
   if (bannerEl === null) {
     bannerEl = document.createElement('div');
     bannerEl.className = 'error-banner';
@@ -115,12 +168,6 @@ window.addEventListener('unhandledrejection', (ev: PromiseRejectionEvent) => {
 function boot(): void {
   const app = must<HTMLDivElement>('#app');
   const canvas = must<HTMLCanvasElement>('#game');
-
-  // PALETTE -> CSS custom properties consumed by style.css (single source of truth).
-  const rootStyle = document.documentElement.style;
-  rootStyle.setProperty('--c11-ink', PALETTE.ink);
-  rootStyle.setProperty('--c11-text', PALETTE.hudText);
-  rootStyle.setProperty('--c11-danger', PALETTE.danger);
 
   const state = new ClientState();
   const hud = new Hud(must<HTMLElement>('#hud'));
@@ -251,6 +298,7 @@ function boot(): void {
   };
 
   menus.showMain();
+  dismissBootSplash(false); // shell is live: fade the loading state out
 }
 
 try {

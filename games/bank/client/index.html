@@ -5,12 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>BANK</title>
     <!-- Pre-boot paint guard only; the real stylesheet is src/style.css.
-         Ink background, no external assets/fonts. -->
+         The colour below MUST stay equal to `:root { --ink }` / BPAL.ink
+         (#0e130f) in src/style.css, or the pre-boot flash diverges from the app
+         (VISUAL_UPGRADE.md §7 seam rule 6). No external assets/fonts. -->
     <style>
       html,
       body {
         margin: 0;
         background: #0e130f;
+        color-scheme: dark;
       }
     </style>
     <link rel="stylesheet" href="/src/style.css" />

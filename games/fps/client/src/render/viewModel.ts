@@ -5,14 +5,38 @@
 // Static parts bake to one mesh per material; the MAGAZINE stays a loose
 // child (userData.mag === true) so the viewmodel can drop it out and seat it
 // back during the reload choreography (it just sits at rest on soldiers).
-// Detail sheet: iron sights (rear notch + front post with ears) on rifle/smg,
-// a curved 3-segment wood mag on the rifle, scope rings + bolt handle with
-// knob on the sniper, and a slightly lighter wood-tone accent panel (crate)
-// laid along the grain on wooden furniture. The rifle splits materials:
-// woodDark butt plate + grip cap, steel rear-sight block + charging-handle
-// nub against the gunmetal (metalDark) receiver. Hands: mid-value gloves
-// with ink cuff rings and charcoal forearm sleeves (children of the hands,
-// so they ride the reload choreography).
+// The mag is itself baked internally (`looseMag`) so its own primitives are
+// free too — only the group transform has to stay animatable.
+//
+// DRAW-CALL BUDGET — READ BEFORE ADDING A COLOUR. `bake()` emits ONE MESH PER
+// DISTINCT MATERIAL, and playerModels instantiates a weapon model per player,
+// so every extra PALETTE entry used here costs one draw call PER PLAYER at the
+// CONTRACT.md peak of 10. Primitives are free; materials are not. Cap: SIX
+// palette entries per weapon. Need another value break? Reuse a tone already
+// on that weapon, or express it with geometry.
+//
+// Detail sheet (VISUAL_UPGRADE.md §3c — 25-40 primitives per weapon, and a
+// MANDATORY three-value break so no weapon reads as one dark blob):
+//   LOWER / BODY   metalDark (L26)  receivers, frames, guards, barrels, butt
+//                                   plates, grip/forend caps
+//   UPPER          steel (L66)      slides, dust covers, receiver tops, rails,
+//                                   triggers, sling bails — the light plane
+//   HIGHLIGHT      steelLit (L80)   sight posts, port lips, bolt/charging knobs
+//   CREVICE        one tone per weapon, shared by metal AND wood recesses:
+//                  metalDeep (L14) on the steel/wood guns, ink (L8) on the
+//                  polymer ones (it also has to read against charcoal L16)
+//   FURNITURE      wood + woodLit (rifle, shotgun), woodDark + crate (sniper,
+//                  knife grip), charcoal + ink (pistol, smg polymer)
+// Every weapon carries: front sight post (+ protective ears where the real
+// gun has them) and a rear notch built from two prongs with a visible gap, a
+// charging handle (pump on the shotgun, bolt on the sniper), a flared mag-well
+// lip, a 3-prim sling bail with a real gap under the crossbar, and a recessed
+// ejection port with a lit top lip. Ports, charging handles and selectors sit
+// on the -X flank because that is the side the camera sees at the bottom-right
+// viewmodel offset. Silhouettes are unchanged: long thin sniper, curved-mag
+// rifle, tube shotgun, stubby smg, compact pistol, blade knife.
+// Hands: mid-value gloves with ink cuff rings and charcoal forearm sleeves
+// (children of the hands, so they ride the reload choreography).
 // ViewModel: camera-attached group, bottom-right, scale 0.6 (camera-space =>
 // fov-independent). Animations: walk bob / idle breathing sway, lower-raise
 // swap, recoil spring + 40ms muzzle flash, reload dip+tilt with mag
@@ -48,127 +72,338 @@ const HAND_L: Record<WeaponId, { y: number; z: number } | null> = {
   sniper: { y: 0.01, z: -0.3 },
 };
 
-// ---- weapon model sheets (8–20 prims each, palette only) --------------------
+// ---- weapon model sheets (25–40 prims each, <= 6 palette entries each) ------
 /** Flag a loose magazine part; makeWeaponModel keeps it unbaked (animatable). */
 function markMag<T extends THREE.Object3D>(o: T): T {
   o.userData['mag'] = true;
   return o;
 }
 
+/**
+ * Merge a magazine's primitives to one mesh per material and hand it back as
+ * the loose, animatable child at its rest pose. `parts` MUST still be at
+ * identity when it arrives: `bake()` folds child world matrices into the
+ * geometry, so the rest transform is applied to the RESULT — that keeps
+ * `magObj.position` / `magObj.rotation.x` meaning exactly what the reload
+ * choreography (and `applyLayout`'s rest-pose capture) expects.
+ */
+function looseMag(parts: THREE.Group, x: number, y: number, z: number, rx = 0): THREE.Group {
+  const mag = bake(parts);
+  mag.position.set(x, y, z);
+  mag.rotation.x = rx;
+  return markMag(mag);
+}
+
+/**
+ * Sling bail: two steel posts and a crossbar, so there is a real gap between
+ * the mounting face and the bar — it reads as a loop, not a stud. 3 prims.
+ * Caller positions it on the surface it hangs off; the loop opens towards +Y.
+ */
+function slingBail(): THREE.Group {
+  const g = new THREE.Group();
+  g.add(at(box(0.006, 0.018, 0.006, PALETTE.steel), 0, 0, -0.011));
+  g.add(at(box(0.006, 0.018, 0.006, PALETTE.steel), 0, 0, 0.011));
+  g.add(at(box(0.006, 0.006, 0.028, PALETTE.steel), 0, 0.012, 0));
+  return g;
+}
+
+/**
+ * Blade knife — 26 prims, 6 materials. steel blade / steelLit edge / woodDark
+ * grip with crate grain / metalDark furniture / metalDeep crevices.
+ */
 function buildKnife(g: THREE.Group): void {
   const tilt = new THREE.Group();
   tilt.rotation.x = 0.18; // held tilted, tip up
   tilt.add(at(box(0.018, 0.075, 0.36, PALETTE.steel), 0, 0, -0.28)); // blade
+  // sharpened edge: the brightest strip on the weapon, runs the whole belly
+  tilt.add(at(box(0.02, 0.018, 0.36, PALETTE.steelLit), 0, -0.032, -0.28));
+  tilt.add(at(box(0.021, 0.014, 0.24, PALETTE.metalDark), 0, 0.004, -0.30)); // fuller groove
+  tilt.add(at(box(0.02, 0.012, 0.34, PALETTE.metalDark), 0, 0.037, -0.28)); // spine
   const tip = cone(0.04, 0.1, 4, PALETTE.steel);
   tip.rotation.x = -Math.PI / 2; // apex towards -Z
   tip.scale.x = 0.35; // flattened like the blade
   tilt.add(at(tip, 0, 0, -0.51));
-  tilt.add(at(box(0.02, 0.012, 0.34, PALETTE.metalDark), 0, 0.037, -0.28)); // spine
+  // saw teeth along the spine + jimping on the thumb ramp
+  tilt.add(at(box(0.022, 0.011, 0.014, PALETTE.metalDeep), 0, 0.042, -0.13));
+  tilt.add(at(box(0.022, 0.011, 0.014, PALETTE.metalDeep), 0, 0.042, -0.163));
+  tilt.add(at(box(0.022, 0.011, 0.014, PALETTE.metalDeep), 0, 0.042, -0.196));
+  tilt.add(at(box(0.022, 0.011, 0.014, PALETTE.metalDeep), 0, 0.042, -0.229));
+  tilt.add(at(box(0.022, 0.008, 0.034, PALETTE.metalDeep), 0, 0.044, -0.088));
   tilt.add(at(box(0.04, 0.09, 0.018, PALETTE.metalDark), 0, 0, -0.095)); // guard
+  tilt.add(at(box(0.05, 0.016, 0.02, PALETTE.steel), 0, -0.038, -0.095)); // quillon
+  tilt.add(at(box(0.019, 0.05, 0.04, PALETTE.metalDark), 0, 0, -0.066)); // ricasso
   const grip = box(0.032, 0.05, 0.16, PALETTE.woodDark);
-  // grain hint: lighter wood-tone panel along the grip's long axis
+  // grain hint: lighter wood-tone panels along the grip's long axis
   grip.add(at(box(0.034, 0.02, 0.11, PALETTE.crate), 0, 0.002, 0));
+  grip.add(at(box(0.006, 0.03, 0.12, PALETTE.crate), -0.016, 0, 0)); // camera-side panel
+  // cord wrap rings: dark bands that break the grip into three. metalDeep is
+  // this weapon's one crevice tone (see the draw-call budget in the header) —
+  // it already carries the saw teeth and jimping, and reads deeper against
+  // woodDark (L29) than charcoal (L16) did.
+  grip.add(at(box(0.035, 0.009, 0.014, PALETTE.metalDeep), 0, 0, 0.045));
+  grip.add(at(box(0.035, 0.009, 0.014, PALETTE.metalDeep), 0, 0, 0));
+  grip.add(at(box(0.035, 0.009, 0.014, PALETTE.metalDeep), 0, 0, -0.045));
   tilt.add(at(grip, 0, -0.01, -0.005));
   tilt.add(at(box(0.04, 0.06, 0.025, PALETTE.metalDark), 0, -0.012, 0.078)); // pommel
-  tilt.add(at(box(0.036, 0.01, 0.01, PALETTE.metalDark), 0, -0.008, 0.025)); // rivet
-  tilt.add(at(box(0.036, 0.01, 0.01, PALETTE.metalDark), 0, -0.008, -0.045)); // rivet
+  tilt.add(at(box(0.042, 0.012, 0.028, PALETTE.steel), 0, 0.014, 0.078)); // pommel cap
+  tilt.add(at(box(0.024, 0.018, 0.009, PALETTE.steel), 0, -0.03, 0.092)); // lanyard tab
+  tilt.add(at(box(0.013, 0.009, 0.012, PALETTE.metalDeep), 0, -0.03, 0.093)); // lanyard hole
+  const breaker = cone(0.011, 0.028, 4, PALETTE.metalDeep);
+  breaker.rotation.x = Math.PI / 2; // apex towards +Z, out of the pommel
+  tilt.add(at(breaker, 0, -0.012, 0.104)); // glass breaker
+  tilt.add(at(box(0.036, 0.01, 0.01, PALETTE.steel), 0, -0.008, 0.025)); // rivet
+  tilt.add(at(box(0.036, 0.01, 0.01, PALETTE.steel), 0, -0.008, -0.045)); // rivet
   g.add(tilt);
 }
 
+/**
+ * Compact pistol — 36 prims, 5 materials. steel slide / metalDark frame /
+ * charcoal polymer grip. Crevice tone is `ink`, not `metalDeep`: it doubles as
+ * the grip's checkering panel, where metalDeep (L14) would sit 2 L off the
+ * charcoal (L16) grip and vanish. One tone, two jobs, one draw call.
+ */
 function buildPistol(g: THREE.Group): void {
-  g.add(at(box(0.05, 0.06, 0.26, PALETTE.charcoal), 0, BARREL_Y, -0.1)); // slide
-  g.add(at(box(0.045, 0.04, 0.2, PALETTE.charcoal), 0, 0.015, -0.09)); // frame
-  const barrel = cyl(0.012, 0.012, 0.06, 8, PALETTE.steel);
+  // ---- slide: the light plane, and the reason this gun stops being a blob
+  g.add(at(box(0.052, 0.055, 0.235, PALETTE.steel), 0, BARREL_Y, -0.105));
+  g.add(at(box(0.03, 0.008, 0.235, PALETTE.steelLit), 0, 0.088, -0.105)); // top strap
+  g.add(at(box(0.052, 0.05, 0.03, PALETTE.steel), 0, 0.058, -0.235)); // nose block
+  g.add(at(box(0.01, 0.028, 0.085, PALETTE.ink), -0.023, 0.066, -0.06)); // ejection port
+  g.add(at(box(0.009, 0.006, 0.09, PALETTE.steelLit), -0.024, 0.083, -0.06)); // port lip
+  // cocking serrations at the rear of the slide
+  g.add(at(box(0.008, 0.044, 0.008, PALETTE.ink), -0.0245, 0.058, 0.0));
+  g.add(at(box(0.008, 0.044, 0.008, PALETTE.ink), -0.0245, 0.058, -0.016));
+  g.add(at(box(0.008, 0.044, 0.008, PALETTE.ink), -0.0245, 0.058, -0.032));
+  g.add(at(box(0.008, 0.044, 0.008, PALETTE.ink), -0.0245, 0.058, -0.048));
+  // ---- frame + dust cover
+  g.add(at(box(0.046, 0.036, 0.2, PALETTE.metalDark), 0, 0.018, -0.09));
+  g.add(at(box(0.032, 0.014, 0.1, PALETTE.ink), 0, 0.003, -0.145)); // dust cover
+  g.add(at(box(0.026, 0.008, 0.09, PALETTE.steel), 0, -0.004, -0.145)); // accessory rail
+  g.add(at(box(0.008, 0.012, 0.05, PALETTE.steel), -0.026, 0.028, -0.02)); // slide stop
+  const pin = cyl(0.006, 0.006, 0.009, 6, PALETTE.steelLit);
+  pin.rotation.z = Math.PI / 2;
+  g.add(at(pin, -0.026, 0.03, -0.062)); // takedown pin
+  const barrel = cyl(0.0115, 0.0115, 0.06, 8, PALETTE.steelLit);
   barrel.rotation.x = Math.PI / 2;
-  g.add(at(barrel, 0, BARREL_Y, -0.24));
+  g.add(at(barrel, 0, BARREL_Y, -0.245));
+  const crown = cyl(0.0135, 0.0135, 0.014, 8, PALETTE.ink);
+  crown.rotation.x = Math.PI / 2;
+  g.add(at(crown, 0, BARREL_Y, -0.272)); // muzzle crown
+  // ---- sights: front post + a rear notch you can actually see through
+  g.add(at(box(0.016, 0.008, 0.022, PALETTE.metalDark), 0, 0.089, -0.2));
+  g.add(at(box(0.008, 0.016, 0.012, PALETTE.steelLit), 0, 0.098, -0.2)); // front post
+  g.add(at(box(0.034, 0.014, 0.018, PALETTE.metalDark), 0, 0.092, 0.0)); // rear block
+  g.add(at(box(0.01, 0.016, 0.015, PALETTE.steel), -0.012, 0.099, 0.0)); // notch prong
+  g.add(at(box(0.01, 0.016, 0.015, PALETTE.steel), 0.012, 0.099, 0.0)); // notch prong
+  g.add(at(box(0.012, 0.022, 0.014, PALETTE.steel), 0, 0.077, 0.036)); // hammer
+  g.add(at(box(0.032, 0.012, 0.028, PALETTE.metalDark), 0, 0.048, 0.042)); // beavertail
+  // ---- grip: polymer furniture, ink side panels for the third value
   const grip = box(0.045, 0.13, 0.06, PALETTE.charcoal);
   grip.rotation.x = -0.12; // raked back
+  grip.add(at(box(0.006, 0.1, 0.05, PALETTE.ink), -0.024, 0, 0.001)); // checkered panel
+  grip.add(at(box(0.006, 0.1, 0.05, PALETTE.ink), 0.024, 0, 0.001));
+  grip.add(at(box(0.03, 0.12, 0.008, PALETTE.metalDark), 0, 0, 0.031)); // backstrap
+  grip.add(at(box(0.052, 0.014, 0.068, PALETTE.steel), 0, -0.068, 0.002)); // mag-well lip
+  const bail = slingBail();
+  bail.rotation.x = Math.PI; // hangs off the heel, loop opening downwards
+  grip.add(at(bail, 0, -0.058, 0.034)); // lanyard loop (3 prims)
   g.add(at(grip, 0, -0.055, 0.015));
-  // mag: loose — body hidden inside the grip, baseplate proud at the heel
+  // mag: loose — body hidden inside the grip, baseplate proud at the heel.
+  // body + baseplate share metalDark so the baked mag is 2 meshes, not 3; the
+  // steel lip is what actually reads when it drops out during the reload.
   const mag = new THREE.Group();
-  mag.position.set(0, -0.055, 0.015);
-  mag.rotation.x = -0.12; // same rake as the grip
   mag.add(at(box(0.04, 0.1, 0.05, PALETTE.metalDark), 0, -0.005, 0.003)); // body (in the grip)
   mag.add(at(box(0.05, 0.015, 0.07, PALETTE.metalDark), 0, -0.064, 0.01)); // baseplate
-  g.add(markMag(mag));
-  g.add(at(box(0.04, 0.008, 0.07, PALETTE.metalDark), 0, -0.012, -0.05)); // trigger guard
-  g.add(at(box(0.008, 0.015, 0.01, PALETTE.steel), 0, 0.097, -0.21)); // front sight
-  g.add(at(box(0.03, 0.012, 0.01, PALETTE.charcoal), 0, 0.095, 0.02)); // rear sight
-  g.add(at(box(0.012, 0.02, 0.015, PALETTE.metalDark), 0, 0.075, 0.035)); // hammer
+  mag.add(at(box(0.052, 0.006, 0.072, PALETTE.steel), 0, -0.073, 0.01)); // floorplate lip
+  g.add(looseMag(mag, 0, -0.055, 0.015, -0.12)); // same rake as the grip
+  g.add(at(box(0.038, 0.009, 0.062, PALETTE.metalDark), 0, -0.014, -0.05)); // trigger guard
+  g.add(at(box(0.038, 0.03, 0.009, PALETTE.metalDark), 0, -0.002, -0.077)); // guard bow
+  g.add(at(box(0.011, 0.026, 0.008, PALETTE.steel), 0, -0.002, -0.045)); // trigger
 }
 
+/**
+ * Stubby smg — 38 prims, 5 materials. steel upper / metalDark lower / charcoal
+ * polymer. Same crevice choice as the pistol: `ink` carries the recesses AND
+ * the stipple panel, so the polymer furniture keeps its value break for free.
+ */
 function buildSmg(g: THREE.Group): void {
-  g.add(at(box(0.055, 0.07, 0.3, PALETTE.charcoal), 0, 0.05, -0.08)); // stubby receiver
-  g.add(at(box(0.05, 0.008, 0.16, PALETTE.charcoal), 0, 0.095, -0.28)); // shroud top
-  g.add(at(box(0.008, 0.05, 0.16, PALETTE.charcoal), 0.028, BARREL_Y, -0.28)); // shroud side
-  g.add(at(box(0.008, 0.05, 0.16, PALETTE.charcoal), -0.028, BARREL_Y, -0.28)); // shroud side
-  const barrel = cyl(0.011, 0.011, 0.1, 8, PALETTE.metalDark);
+  // ---- receiver: dark lower, light upper, dark rail on top (three planes)
+  g.add(at(box(0.055, 0.058, 0.3, PALETTE.metalDark), 0, 0.042, -0.08)); // lower
+  g.add(at(box(0.056, 0.032, 0.3, PALETTE.steel), 0, 0.087, -0.08)); // upper
+  g.add(at(box(0.026, 0.008, 0.2, PALETTE.ink), 0, 0.106, -0.1)); // top rail
+  g.add(at(box(0.009, 0.026, 0.075, PALETTE.ink), -0.029, 0.062, -0.06)); // ejection port
+  g.add(at(box(0.008, 0.006, 0.08, PALETTE.steelLit), -0.03, 0.077, -0.06)); // port lip
+  g.add(at(box(0.012, 0.014, 0.05, PALETTE.steel), -0.032, 0.092, 0.02)); // charging handle
+  const chKnob = cyl(0.008, 0.008, 0.022, 6, PALETTE.steelLit);
+  chKnob.rotation.z = Math.PI / 2;
+  g.add(at(chKnob, -0.044, 0.092, 0.03)); // charging-handle knob
+  // ---- barrel shroud + muzzle
+  g.add(at(box(0.05, 0.012, 0.16, PALETTE.steel), 0, 0.096, -0.28)); // shroud top
+  g.add(at(box(0.008, 0.05, 0.16, PALETTE.steel), 0.028, BARREL_Y, -0.28)); // shroud side
+  g.add(at(box(0.008, 0.05, 0.16, PALETTE.steel), -0.028, BARREL_Y, -0.28)); // shroud side
+  g.add(at(box(0.006, 0.024, 0.022, PALETTE.ink), -0.031, BARREL_Y, -0.245)); // vent
+  g.add(at(box(0.006, 0.024, 0.022, PALETTE.ink), -0.031, BARREL_Y, -0.315)); // vent
+  const barrel = cyl(0.011, 0.011, 0.1, 8, PALETTE.steelLit);
   barrel.rotation.x = Math.PI / 2;
   g.add(at(barrel, 0, BARREL_Y, -0.4));
+  const brake = cyl(0.017, 0.017, 0.04, 8, PALETTE.metalDark);
+  brake.rotation.x = Math.PI / 2;
+  g.add(at(brake, 0, BARREL_Y, -0.442)); // muzzle brake
+  // ---- mag well + loose curved mag
+  g.add(at(box(0.044, 0.05, 0.056, PALETTE.metalDark), 0, 0.008, -0.06)); // mag well
+  g.add(at(box(0.05, 0.016, 0.064, PALETTE.steel), 0, -0.018, -0.06)); // mag-well lip
   // mag: loose, two segments — bottom sweeps forward for the curved read
   const mag = new THREE.Group();
-  mag.position.set(0, -0.04, -0.06);
   const magA = box(0.035, 0.1, 0.05, PALETTE.metalDark);
   magA.rotation.x = 0.18;
+  magA.add(at(box(0.037, 0.006, 0.052, PALETTE.ink), 0, 0.02, 0)); // witness rib
   mag.add(at(magA, 0, -0.04, 0));
   const magB = box(0.035, 0.09, 0.045, PALETTE.metalDark);
   magB.rotation.x = 0.5;
+  magB.add(at(box(0.038, 0.008, 0.048, PALETTE.steel), 0, -0.048, 0)); // floorplate
   mag.add(at(magB, 0, -0.12, -0.018));
-  g.add(markMag(mag));
-  g.add(at(box(0.04, 0.05, 0.14, PALETTE.charcoal), 0, 0.045, 0.13)); // stock
+  g.add(looseMag(mag, 0, -0.04, -0.06));
+  // ---- furniture: collapsible stock, cheek strut, polymer grip
+  const stockTube = cyl(0.014, 0.014, 0.12, 8, PALETTE.metalDark);
+  stockTube.rotation.x = Math.PI / 2;
+  g.add(at(stockTube, 0, 0.055, 0.12));
+  g.add(at(box(0.036, 0.014, 0.12, PALETTE.charcoal), 0, 0.082, 0.12)); // top strut
+  g.add(at(box(0.042, 0.062, 0.022, PALETTE.charcoal), 0, 0.05, 0.185)); // butt pad
+  g.add(at(box(0.044, 0.012, 0.026, PALETTE.ink), 0, 0.077, 0.185)); // pad edge (crevice tone)
   const grip = box(0.04, 0.1, 0.05, PALETTE.charcoal);
   grip.rotation.x = -0.15;
+  grip.add(at(box(0.006, 0.07, 0.04, PALETTE.ink), -0.019, 0, 0)); // stipple panel
   g.add(at(grip, 0, -0.03, 0.03));
-  g.add(at(box(0.01, 0.024, 0.01, PALETTE.metalDark), 0, 0.115, -0.33)); // front sight post
-  // rear notch: two prongs with a gap that reads from behind
-  g.add(at(box(0.008, 0.024, 0.01, PALETTE.metalDark), -0.014, 0.098, 0.04));
-  g.add(at(box(0.008, 0.024, 0.01, PALETTE.metalDark), 0.014, 0.098, 0.04));
+  g.add(at(box(0.036, 0.008, 0.058, PALETTE.metalDark), 0, -0.008, -0.005)); // trigger guard
+  g.add(at(box(0.036, 0.026, 0.008, PALETTE.metalDark), 0, 0.004, -0.03)); // guard bow
+  g.add(at(box(0.01, 0.024, 0.008, PALETTE.steel), 0, 0.005, 0.0)); // trigger
+  // ---- sights: post with ears up front, two-prong notch at the rear
+  g.add(at(box(0.018, 0.01, 0.02, PALETTE.metalDark), 0, 0.106, -0.33)); // post base
+  g.add(at(box(0.008, 0.022, 0.008, PALETTE.steelLit), 0, 0.117, -0.33)); // front post
+  g.add(at(box(0.006, 0.02, 0.01, PALETTE.metalDark), -0.014, 0.115, -0.33)); // ear
+  g.add(at(box(0.006, 0.02, 0.01, PALETTE.metalDark), 0.014, 0.115, -0.33)); // ear
+  g.add(at(box(0.03, 0.01, 0.02, PALETTE.metalDark), 0, 0.1, 0.04)); // rear base
+  g.add(at(box(0.008, 0.02, 0.012, PALETTE.steel), -0.013, 0.111, 0.04)); // notch prong
+  g.add(at(box(0.008, 0.02, 0.012, PALETTE.steel), 0.013, 0.111, 0.04)); // notch prong
+  const bail = slingBail();
+  bail.rotation.z = Math.PI / 2; // hangs off the camera-side flank
+  g.add(at(bail, -0.032, 0.02, 0.085)); // sling loop (3 prims)
 }
 
+/**
+ * Tube shotgun — 36 prims, 6 materials. metalDark barrels + caps + butt plate /
+ * steel rib+top / steelLit highlights / wood + woodLit furniture / metalDeep
+ * for EVERY recess, metal and wood alike (a groove is a shadow line; it does
+ * not need its own hue, and a second dark tone would cost a draw call per
+ * player).
+ */
 function buildShotgun(g: THREE.Group): void {
   const barrel = cyl(0.016, 0.016, 0.55, 10, PALETTE.metalDark);
   barrel.rotation.x = Math.PI / 2;
   g.add(at(barrel, 0, 0.085, -0.3));
+  g.add(at(box(0.016, 0.008, 0.5, PALETTE.steel), 0, 0.102, -0.3)); // vent rib along the top
   const tube = cyl(0.014, 0.014, 0.5, 10, PALETTE.metalDark);
   tube.rotation.x = Math.PI / 2;
   g.add(at(tube, 0, 0.045, -0.28)); // magazine tube under the barrel
-  g.add(at(box(0.055, 0.08, 0.16, PALETTE.metalDark), 0, 0.05, 0.03)); // receiver
+  const cap = cyl(0.018, 0.018, 0.03, 8, PALETTE.steel);
+  cap.rotation.x = Math.PI / 2;
+  g.add(at(cap, 0, 0.045, -0.525)); // tube cap
+  g.add(at(box(0.042, 0.05, 0.02, PALETTE.metalDeep), 0, 0.065, -0.5)); // barrel band
+  // ---- receiver: dark body, light top, recessed port with a lit lip
+  g.add(at(box(0.055, 0.075, 0.17, PALETTE.metalDark), 0, 0.05, 0.03));
+  g.add(at(box(0.05, 0.018, 0.17, PALETTE.steel), 0, 0.093, 0.03)); // receiver top
+  g.add(at(box(0.009, 0.03, 0.08, PALETTE.metalDeep), -0.029, 0.05, 0.02)); // ejection port
+  g.add(at(box(0.008, 0.007, 0.085, PALETTE.steelLit), -0.03, 0.067, 0.02)); // port lip
+  g.add(at(box(0.03, 0.016, 0.06, PALETTE.metalDeep), 0, 0.014, 0.02)); // loading gate
+  // ---- pump: the charging handle of a pump gun. Wood with grooves + cap.
   const pump = box(0.06, 0.05, 0.12, PALETTE.wood);
-  pump.add(at(box(0.05, 0.008, 0.1, PALETTE.crate), 0, 0.027, 0)); // grain panel along the pump
-  pump.add(at(box(0.008, 0.03, 0.1, PALETTE.crate), -0.031, 0, 0)); // side grain (camera side)
+  pump.add(at(box(0.05, 0.008, 0.1, PALETTE.woodLit), 0, 0.027, 0)); // grain panel along the pump
+  pump.add(at(box(0.008, 0.03, 0.1, PALETTE.woodLit), -0.031, 0, 0)); // side grain (camera side)
+  pump.add(at(box(0.062, 0.008, 0.014, PALETTE.metalDeep), 0, 0.0, -0.03)); // finger groove
+  pump.add(at(box(0.062, 0.008, 0.014, PALETTE.metalDeep), 0, 0.0, 0.03)); // finger groove
+  pump.add(at(box(0.062, 0.052, 0.014, PALETTE.metalDark), 0, 0, -0.065)); // steel front cap
   g.add(at(pump, 0, 0.045, -0.28));
+  // ---- stock
   const stock = box(0.05, 0.09, 0.2, PALETTE.wood);
   stock.rotation.x = -0.1;
-  stock.add(at(box(0.04, 0.008, 0.16, PALETTE.crate), 0, 0.047, 0)); // grain panel along the stock
-  stock.add(at(box(0.008, 0.05, 0.16, PALETTE.crate), -0.026, 0, 0)); // side grain (camera side)
+  stock.add(at(box(0.04, 0.008, 0.16, PALETTE.woodLit), 0, 0.047, 0)); // comb highlight
+  stock.add(at(box(0.008, 0.05, 0.16, PALETTE.woodLit), -0.026, 0, 0)); // side grain (camera side)
+  stock.add(at(box(0.052, 0.012, 0.03, PALETTE.metalDeep), 0, -0.043, -0.06)); // wrist groove
   g.add(at(stock, 0, 0.02, 0.2));
-  g.add(at(box(0.055, 0.1, 0.015, PALETTE.metalDark), 0, 0.012, 0.3)); // butt plate
+  g.add(at(box(0.055, 0.1, 0.015, PALETTE.metalDark), 0, 0.012, 0.3)); // steel butt plate
+  g.add(at(box(0.057, 0.028, 0.018, PALETTE.metalDeep), 0, -0.028, 0.3)); // recoil pad
+  // ---- shell saddle with three loaded hulls (woodLit L55 = the hull red,
+  // and it is already on this gun as the grain tone)
   g.add(at(box(0.06, 0.02, 0.1, PALETTE.metalDark), 0, 0.095, 0.03)); // shell saddle
+  for (let i = 0; i < 3; i++) {
+    const shell = cyl(0.009, 0.009, 0.055, 6, PALETTE.woodLit);
+    shell.rotation.x = Math.PI / 2;
+    g.add(at(shell, -0.018 + i * 0.018, 0.112, 0.03));
+  }
   g.add(at(box(0.04, 0.008, 0.06, PALETTE.metalDark), 0, 0.0, 0.03)); // trigger guard
-  g.add(at(box(0.008, 0.012, 0.008, PALETTE.steel), 0, 0.11, -0.56)); // bead sight
+  g.add(at(box(0.04, 0.024, 0.008, PALETTE.metalDark), 0, 0.012, 0.002)); // guard bow
+  g.add(at(box(0.01, 0.022, 0.008, PALETTE.steel), 0, 0.012, 0.03)); // trigger
+  // ---- sights: brass-less bead up front, notch on the receiver top
+  g.add(at(box(0.012, 0.006, 0.016, PALETTE.metalDark), 0, 0.106, -0.56)); // bead base
+  g.add(at(box(0.008, 0.012, 0.008, PALETTE.steelLit), 0, 0.113, -0.56)); // bead sight
+  g.add(at(box(0.028, 0.01, 0.02, PALETTE.metalDark), 0, 0.104, 0.09)); // rear base
+  g.add(at(box(0.008, 0.018, 0.012, PALETTE.steel), -0.012, 0.116, 0.09)); // notch prong
+  g.add(at(box(0.008, 0.018, 0.012, PALETTE.steel), 0.012, 0.116, 0.09)); // notch prong
+  const bail = slingBail();
+  bail.rotation.x = Math.PI; // hangs under the mag tube, loop opening down
+  g.add(at(bail, 0, 0.028, -0.47)); // sling loop (3 prims)
 }
 
+/**
+ * Curved-mag rifle — 39 prims, 6 materials. metalDark body + steel-fitting caps
+ * (butt plate, grip cap, mag floorplate) / steel dust cover / steelLit
+ * highlights / wood + woodLit furniture / metalDeep for every recess and the
+ * recoil pad.
+ */
 function buildRifle(g: THREE.Group): void {
   const barrel = cyl(0.013, 0.013, 0.45, 10, PALETTE.metalDark);
   barrel.rotation.x = Math.PI / 2;
   g.add(at(barrel, 0, 0.075, -0.42)); // long barrel
+  const gasTube = cyl(0.009, 0.009, 0.2, 8, PALETTE.steel);
+  gasTube.rotation.x = Math.PI / 2;
+  g.add(at(gasTube, 0, 0.104, -0.36)); // gas tube above the barrel
+  g.add(at(box(0.032, 0.045, 0.045, PALETTE.metalDark), 0, 0.092, -0.47)); // gas block
+  const nut = cyl(0.018, 0.018, 0.045, 8, PALETTE.metalDark);
+  nut.rotation.x = Math.PI / 2;
+  g.add(at(nut, 0, 0.075, -0.625)); // muzzle nut
+  // ---- handguard: wood body, lit grain, deep finger grooves
   const handguard = box(0.055, 0.055, 0.28, PALETTE.wood);
-  handguard.add(at(box(0.008, 0.032, 0.24, PALETTE.crate), -0.0285, 0, 0)); // side grain (camera side)
+  handguard.add(at(box(0.008, 0.032, 0.24, PALETTE.woodLit), -0.0285, 0, 0)); // side grain (camera side)
+  handguard.add(at(box(0.057, 0.012, 0.014, PALETTE.metalDeep), 0, -0.012, 0.0)); // finger groove
   g.add(at(handguard, 0, BARREL_Y, -0.2));
+  g.add(at(box(0.05, 0.05, 0.02, PALETTE.metalDark), 0, BARREL_Y, -0.335)); // handguard cap
+  // ---- receiver: dark lower, steel dust cover on top, recessed port
   g.add(at(box(0.055, 0.07, 0.22, PALETTE.metalDark), 0, 0.05, 0.02)); // receiver (gunmetal)
+  g.add(at(box(0.056, 0.024, 0.21, PALETTE.steel), 0, 0.088, 0.02)); // dust cover
+  g.add(at(box(0.009, 0.03, 0.09, PALETTE.metalDeep), -0.029, 0.062, 0.0)); // ejection port
+  g.add(at(box(0.008, 0.007, 0.095, PALETTE.steelLit), -0.03, 0.079, 0.0)); // port lip
+  g.add(at(box(0.013, 0.014, 0.045, PALETTE.steel), -0.033, 0.076, 0.06)); // charging handle
+  const chKnob = cyl(0.008, 0.008, 0.022, 6, PALETTE.steelLit);
+  chKnob.rotation.z = Math.PI / 2;
+  g.add(at(chKnob, -0.045, 0.076, 0.07)); // charging-handle knob
+  g.add(at(box(0.008, 0.055, 0.022, PALETTE.steel), -0.031, 0.04, 0.05)); // selector lever
+  g.add(at(box(0.05, 0.016, 0.072, PALETTE.steel), 0, -0.012, -0.03)); // mag-well lip
+  g.add(at(box(0.038, 0.008, 0.06, PALETTE.metalDark), 0, -0.02, 0.02)); // trigger guard
+  g.add(at(box(0.038, 0.026, 0.008, PALETTE.metalDark), 0, -0.008, -0.008)); // guard bow
+  g.add(at(box(0.011, 0.024, 0.008, PALETTE.steel), 0, -0.008, 0.02)); // trigger
+  // ---- furniture
   const stock = box(0.05, 0.09, 0.22, PALETTE.wood);
   stock.rotation.x = -0.08;
-  stock.add(at(box(0.04, 0.008, 0.18, PALETTE.crate), 0, 0.047, 0)); // grain panel along the stock
-  stock.add(at(box(0.008, 0.05, 0.18, PALETTE.crate), -0.026, 0, 0)); // side grain (camera side)
-  stock.add(at(box(0.052, 0.095, 0.015, PALETTE.woodDark), 0, 0, 0.115)); // butt plate caps the heel
+  stock.add(at(box(0.04, 0.008, 0.18, PALETTE.woodLit), 0, 0.047, 0)); // comb highlight
+  stock.add(at(box(0.008, 0.05, 0.18, PALETTE.woodLit), -0.026, 0, 0)); // side grain (camera side)
+  stock.add(at(box(0.052, 0.095, 0.015, PALETTE.metalDark), 0, 0, 0.115)); // butt plate caps the heel
+  stock.add(at(box(0.054, 0.03, 0.018, PALETTE.metalDeep), 0, -0.033, 0.117)); // recoil pad
   g.add(at(stock, 0, 0.02, 0.21));
   const grip = box(0.04, 0.1, 0.05, PALETTE.wood);
   grip.rotation.x = -0.2;
-  grip.add(at(box(0.042, 0.012, 0.052, PALETTE.woodDark), 0, -0.053, 0)); // grip cap
+  grip.add(at(box(0.042, 0.012, 0.052, PALETTE.metalDark), 0, -0.053, 0)); // grip cap
   g.add(at(grip, 0, -0.035, 0.06));
   // mag: loose, three segments at rising tilt — the AK curve reads in profile
   const mag = new THREE.Group();
-  mag.position.set(0, -0.025, -0.03);
   const magA = box(0.035, 0.08, 0.06, PALETTE.wood);
   magA.rotation.x = 0.15;
   mag.add(at(magA, 0, -0.03, 0));
@@ -177,60 +412,104 @@ function buildRifle(g: THREE.Group): void {
   mag.add(at(magB, 0, -0.1, -0.02));
   const magC = box(0.033, 0.075, 0.05, PALETTE.wood);
   magC.rotation.x = 0.95; // tip completes the sweep forward
+  magC.add(at(box(0.036, 0.012, 0.052, PALETTE.metalDark), 0, -0.038, 0)); // floorplate
   mag.add(at(magC, 0, -0.165, -0.055));
-  g.add(markMag(mag));
-  g.add(at(box(0.008, 0.035, 0.008, PALETTE.metalDark), 0, 0.112, -0.6)); // front sight post
-  g.add(at(box(0.006, 0.022, 0.006, PALETTE.metalDark), -0.012, 0.108, -0.6)); // post guard ear
-  g.add(at(box(0.006, 0.022, 0.006, PALETTE.metalDark), 0.012, 0.108, -0.6)); // post guard ear
-  // rear sight: steel block (metal read vs the wood) + two prongs with a gap
-  g.add(at(box(0.034, 0.02, 0.035, PALETTE.steel), 0, 0.093, 0.02));
-  g.add(at(box(0.008, 0.026, 0.012, PALETTE.metalDark), -0.016, 0.108, 0.02));
-  g.add(at(box(0.008, 0.026, 0.012, PALETTE.metalDark), 0.016, 0.108, 0.02));
-  const chHandle = cyl(0.006, 0.006, 0.03, 6, PALETTE.steel);
-  chHandle.rotation.z = Math.PI / 2;
-  g.add(at(chHandle, 0.038, 0.055, 0.07)); // charging-handle nub off the receiver
+  g.add(looseMag(mag, 0, -0.025, -0.03)); // 3 wood segments bake to one mesh
+  // ---- sights: hooded front post, two-prong rear notch on a steel block
+  g.add(at(box(0.03, 0.03, 0.03, PALETTE.metalDark), 0, 0.1, -0.6)); // front sight base
+  g.add(at(box(0.008, 0.03, 0.008, PALETTE.steelLit), 0, 0.122, -0.6)); // front sight post
+  g.add(at(box(0.006, 0.026, 0.008, PALETTE.metalDark), -0.013, 0.118, -0.6)); // post guard ear
+  g.add(at(box(0.006, 0.026, 0.008, PALETTE.metalDark), 0.013, 0.118, -0.6)); // post guard ear
+  g.add(at(box(0.034, 0.018, 0.04, PALETTE.metalDark), 0, 0.096, -0.09)); // rear sight base
+  g.add(at(box(0.008, 0.022, 0.014, PALETTE.steel), -0.015, 0.113, -0.09)); // notch prong
+  g.add(at(box(0.008, 0.022, 0.014, PALETTE.steel), 0.015, 0.113, -0.09)); // notch prong
+  const bail = slingBail();
+  bail.rotation.x = Math.PI; // hangs under the handguard, loop opening down
+  g.add(at(bail, 0, 0.026, -0.325)); // sling loop (3 prims)
 }
 
+/**
+ * Long thin sniper — 39 prims, 6 materials. metalDark body + butt plate / steel
+ * receiver top / steelLit highlights / woodDark stock with crate grain /
+ * metalDeep for every recess and the recoil pad.
+ */
 function buildSniper(g: THREE.Group): void {
-  // gunmetal (metalDark) for every metal surface — separates from the ink mag
   const barrel = cyl(0.011, 0.011, 0.7, 10, PALETTE.metalDark);
   barrel.rotation.x = Math.PI / 2;
   g.add(at(barrel, 0, 0.08, -0.5)); // longest, thinnest barrel
+  const brake = cyl(0.016, 0.016, 0.05, 8, PALETTE.metalDark);
+  brake.rotation.x = Math.PI / 2;
+  g.add(at(brake, 0, 0.08, -0.845)); // muzzle brake
+  // ---- receiver: dark body, steel top, recessed port with a lit lip
   g.add(at(box(0.055, 0.07, 0.24, PALETTE.metalDark), 0, BARREL_Y, -0.02)); // receiver
+  g.add(at(box(0.056, 0.02, 0.24, PALETTE.steel), 0, 0.098, -0.02)); // receiver top
+  g.add(at(box(0.03, 0.008, 0.16, PALETTE.metalDeep), 0, 0.111, -0.02)); // mount rail
+  g.add(at(box(0.009, 0.028, 0.07, PALETTE.metalDeep), -0.029, 0.07, -0.02)); // ejection port
+  g.add(at(box(0.008, 0.006, 0.075, PALETTE.steelLit), -0.03, 0.085, -0.02)); // port lip
+  g.add(at(box(0.05, 0.014, 0.07, PALETTE.steel), 0, 0.022, -0.05)); // mag-well lip
+  g.add(at(box(0.038, 0.01, 0.055, PALETTE.metalDark), 0, 0.006, 0.032)); // trigger guard
+  g.add(at(box(0.038, 0.026, 0.008, PALETTE.metalDark), 0, 0.014, 0.008)); // guard bow
+  g.add(at(box(0.01, 0.02, 0.008, PALETTE.steel), 0, 0.014, 0.032)); // trigger
+  // ---- furniture: forend, cheek-piece stock, pistol grip
   const forend = box(0.05, 0.05, 0.2, PALETTE.woodDark);
   forend.add(at(box(0.04, 0.008, 0.16, PALETTE.crate), 0, 0.027, 0)); // grain panel along the forend
   forend.add(at(box(0.008, 0.028, 0.16, PALETTE.crate), -0.026, 0, 0)); // side grain (camera side)
+  forend.add(at(box(0.052, 0.012, 0.014, PALETTE.metalDeep), 0, -0.012, -0.05)); // finger groove
   g.add(at(forend, 0, 0.05, -0.28));
   const stock = box(0.05, 0.1, 0.26, PALETTE.woodDark);
   stock.rotation.x = -0.08;
   stock.add(at(box(0.04, 0.008, 0.2, PALETTE.crate), 0, 0.052, 0)); // grain panel along the stock
   stock.add(at(box(0.008, 0.05, 0.2, PALETTE.crate), -0.026, 0, 0)); // side grain (camera side)
+  stock.add(at(box(0.044, 0.022, 0.14, PALETTE.crate), 0, 0.062, -0.03)); // cheek riser
+  stock.add(at(box(0.052, 0.105, 0.016, PALETTE.metalDark), 0, 0, 0.135)); // steel butt plate
+  stock.add(at(box(0.054, 0.03, 0.02, PALETTE.metalDeep), 0, -0.038, 0.137)); // recoil pad
   g.add(at(stock, 0, 0.02, 0.22));
+  const grip = box(0.04, 0.09, 0.05, PALETTE.woodDark);
+  grip.rotation.x = -0.2;
+  grip.add(at(box(0.042, 0.012, 0.052, PALETTE.crate), 0, -0.048, 0)); // grip cap
+  g.add(at(grip, 0, -0.02, 0.08)); // wrist grip: tucks up under the receiver
+  // ---- optics: tube, bell, eyepiece, turret, rings
   const scope = cyl(0.018, 0.018, 0.16, 10, PALETTE.metalDark);
   scope.rotation.x = Math.PI / 2;
-  g.add(at(scope, 0, 0.125, -0.02)); // scope tube
-  // scope rings: thin bands wrapping the tube, tied to the receiver by a rail
-  const ringF = cyl(0.024, 0.024, 0.014, 8, PALETTE.metalDark);
+  g.add(at(scope, 0, 0.14, -0.02)); // scope tube
+  const bell = cyl(0.024, 0.02, 0.05, 10, PALETTE.metalDark);
+  bell.rotation.x = Math.PI / 2;
+  g.add(at(bell, 0, 0.14, -0.115)); // objective bell
+  const lens = cyl(0.021, 0.021, 0.008, 10, PALETTE.metalDeep);
+  lens.rotation.x = Math.PI / 2;
+  g.add(at(lens, 0, 0.14, -0.142)); // objective lens
+  const eyepiece = cyl(0.022, 0.02, 0.045, 10, PALETTE.metalDark);
+  eyepiece.rotation.x = Math.PI / 2;
+  g.add(at(eyepiece, 0, 0.14, 0.078)); // eyepiece
+  g.add(at(cyl(0.012, 0.012, 0.022, 8, PALETTE.steel), 0, 0.164, -0.02)); // elevation turret
+  const ringF = cyl(0.024, 0.024, 0.014, 8, PALETTE.steel);
   ringF.rotation.x = Math.PI / 2;
-  g.add(at(ringF, 0, 0.125, 0.03));
-  const ringR = cyl(0.024, 0.024, 0.014, 8, PALETTE.metalDark);
+  g.add(at(ringF, 0, 0.14, 0.03));
+  const ringR = cyl(0.024, 0.024, 0.014, 8, PALETTE.steel);
   ringR.rotation.x = Math.PI / 2;
-  g.add(at(ringR, 0, 0.125, -0.07));
-  g.add(at(box(0.03, 0.012, 0.14, PALETTE.metalDark), 0, 0.099, -0.02)); // mount rail under the rings
+  g.add(at(ringR, 0, 0.14, -0.07));
+  // ---- bipod
   const bipodL = cyl(0.006, 0.006, 0.09, 6, PALETTE.metalDark);
   bipodL.rotation.z = 0.3;
   g.add(at(bipodL, 0.025, 0.02, -0.55));
   const bipodR = cyl(0.006, 0.006, 0.09, 6, PALETTE.metalDark);
   bipodR.rotation.z = -0.3;
   g.add(at(bipodR, -0.025, 0.02, -0.55));
-  // bolt handle: pin out the right side, bent arm down to a steel knob
+  // bolt handle (this rifle's charging handle): pin out the camera-side flank,
+  // bent arm down to a bright knob so the throw reads at a glance
   const bolt = cyl(0.008, 0.008, 0.04, 6, PALETTE.metalDark);
   bolt.rotation.z = Math.PI / 2;
-  g.add(at(bolt, 0.045, BARREL_Y, 0.05));
-  g.add(at(box(0.012, 0.04, 0.014, PALETTE.metalDark), 0.062, 0.045, 0.05)); // bent arm
-  g.add(at(sphere(0.015, 6, PALETTE.steel), 0.062, 0.022, 0.05)); // knob
-  // mag: loose box ahead of the trigger guard
-  g.add(markMag(at(box(0.04, 0.06, 0.08, PALETTE.ink), 0, -0.01, -0.05)));
+  g.add(at(bolt, -0.045, BARREL_Y, 0.05));
+  g.add(at(box(0.012, 0.04, 0.014, PALETTE.metalDark), -0.062, 0.045, 0.05)); // bent arm
+  g.add(at(sphere(0.015, 6, PALETTE.steelLit), -0.062, 0.022, 0.05)); // knob
+  const bail = slingBail();
+  bail.rotation.x = Math.PI; // hangs under the forend, loop opening down
+  g.add(at(bail, 0, 0.02, -0.365)); // sling loop (3 prims), clear of the support hand
+  // mag: loose box ahead of the trigger guard, with a steel floorplate
+  const mag = new THREE.Group();
+  mag.add(box(0.04, 0.06, 0.08, PALETTE.metalDark));
+  mag.add(at(box(0.046, 0.012, 0.086, PALETTE.steel), 0, -0.035, 0)); // floorplate
+  g.add(looseMag(mag, 0, -0.01, -0.05));
 }
 
 /**

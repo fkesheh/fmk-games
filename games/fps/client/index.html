@@ -5,12 +5,21 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>STRICKEN</title>
     <!-- Pre-boot paint guard only; the real stylesheet is src/style.css.
-         Color traces to PALETTE.ink (shared/src/palette.ts). No external assets/fonts. -->
+         The ONE colour literal in this client: it MUST stay equal to PALETTE.ink
+         (shared/src/palette.ts) and to the :root page background style.css paints
+         from --c11-ink, or the pre-boot flash diverges from the app
+         (VISUAL_UPGRADE.md seam rule 6). `color-scheme: dark` gives the boot
+         splash a light UA default text colour before the stylesheet lands, with
+         no second colour literal. No external assets/fonts. -->
     <style>
+      html {
+        color-scheme: dark;
+      }
       html,
       body {
         margin: 0;
-        background: #14171c;
+        height: 100%;
+        background: #14171c; /* PALETTE.ink */
       }
     </style>
   </head>
@@ -19,6 +28,13 @@
       <canvas id="game"></canvas>
       <div id="hud"></div>
       <div id="menu"></div>
+      <!-- Loading state; removed by main.ts once boot() completes (or at once
+           on a fatal error, so failures are never hidden behind a spinner). -->
+      <div id="boot" class="boot-splash" role="status" aria-live="polite">
+        <div class="boot-mark">STRICKEN</div>
+        <div class="boot-bar"><span class="boot-bar-fill"></span></div>
+        <div class="boot-note">Loading</div>
+      </div>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
