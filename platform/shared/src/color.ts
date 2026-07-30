@@ -78,6 +78,39 @@ export function hueDistance(a: string, b: string): number {
   return d > 180 ? 360 - d : d;
 }
 
+/** Clamp to 0..255 and format one channel. */
+function ch(v: number): string {
+  return Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0');
+}
+
+/**
+ * Linear blend between two hex colours, `t` in 0..1 (0 = a, 1 = b).
+ *
+ * Exists because ATMOSPHERIC PERSPECTIVE (VISUAL_UPGRADE.md §3c/§4 — the far
+ * skyline tier desaturating toward the fog) needs intermediate colours that no
+ * named palette entry can provide. This is the ONLY sanctioned way to produce a
+ * colour that is not a literal palette entry: both endpoints must still be
+ * palette entries, so the result remains traceable to the palette.
+ */
+export function mix(a: string, b: string, t: number): string {
+  const ca = hexToRgb(a);
+  const cb = hexToRgb(b);
+  const k = Math.max(0, Math.min(1, t));
+  return `#${ch(ca.r + (cb.r - ca.r) * k)}${ch(ca.g + (cb.g - ca.g) * k)}${ch(
+    ca.b + (cb.b - ca.b) * k,
+  )}`;
+}
+
+/**
+ * Composite `over` at `alpha` on top of `under` — what an alpha-blended contact
+ * shadow ACTUALLY renders as. Use it to verify a contact shadow really clears
+ * the >= 8 L* drop that §1 L2b requires: the rule applies to this composite,
+ * not to the raw shadow hex.
+ */
+export function composite(under: string, over: string, alpha: number): string {
+  return mix(under, over, alpha);
+}
+
 /**
  * VISUAL_UPGRADE.md §1 L4 — hue split. Satisfied when the two families are
  * >= 25 degrees apart in hue, OR the ground is >= 15 saturation points less

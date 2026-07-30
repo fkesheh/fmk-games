@@ -18,6 +18,7 @@ export const dustbowl: MapDef = {
   sizeZ: D,
   floorMat: 'sand',
   theme: {
+    skyHigh: PALETTE.skyDuskHigh, // S1: zenith — retune with the rest of the theme
     sky: PALETTE.skyDusk,
     horizon: PALETTE.sand,
     ground: PALETTE.dust,

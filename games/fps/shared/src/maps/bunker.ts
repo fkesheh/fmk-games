@@ -28,6 +28,7 @@ export const bunker: MapDef = {
   sizeZ: D,
   floorMat: 'metalDark',
   theme: {
+    skyHigh: PALETTE.skyIndoorHigh, // S1: zenith — retune with the rest of the theme
     sky: PALETTE.steel,
     horizon: PALETTE.ink,
     ground: PALETTE.concreteDark,

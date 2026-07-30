@@ -26,6 +26,7 @@ export const crossfire: MapDef = {
   sizeZ: D,
   floorMat: 'concrete',
   theme: {
+    skyHigh: PALETTE.skyDayHigh, // S1: zenith — retune with the rest of the theme
     sky: PALETTE.skyDay,
     horizon: PALETTE.fogDay,
     ground: PALETTE.concrete,

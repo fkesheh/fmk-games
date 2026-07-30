@@ -36,6 +36,7 @@ export const office: MapDef = {
     // the sun lights ~nothing — the hemisphere IS the light. Steel sky reads
     // as cool fluorescent fill; concrete-tinted ground bounce; fog stays
     // charcoal so the gloom survives once lit.
+    skyHigh: PALETTE.skyIndoorHigh, // S1: zenith — retune with the rest of the theme
     sky: PALETTE.steel,
     horizon: PALETTE.charcoal,
     ground: PALETTE.concrete,

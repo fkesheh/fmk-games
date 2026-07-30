@@ -9,7 +9,9 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
-export { PALETTE } from '@fps/shared';
+import { PALETTE } from '@fps/shared';
+
+export { PALETTE };
 export type { PaletteKey } from '@fps/shared';
 
 // ---- cached material factory ------------------------------------------------
@@ -64,6 +66,27 @@ export function at<T extends THREE.Object3D>(obj: T, x: number, y: number, z: nu
 // the span. Flat shading turns every added edge into a free value break, and
 // `bake()` merges it all away, so articulation costs draw calls NOTHING.
 
+/**
+ * The four colours a wall's trim needs. Resolve them from the frozen tables in
+ * `@fps/shared`: `MAT_COLORS[b.mat]` for `body`, `TRIM_MAT[b.mat]` for `trim`,
+ * `DARK_MAT[b.mat]` for `dark`, `CONTACT_MAT[b.mat]` for `contact`.
+ *
+ * `trim` and `contact` may legitimately come back NULL from those tables when
+ * the material is already at the top or bottom of its ladder (a `…Lit` surface
+ * has nothing above it; a `…Deep` surface has nothing below it). Pass null and
+ * `articulate()` SKIPS that element rather than emitting zero-contrast trim.
+ */
+export interface ArticulateColors {
+  /** The wall's own colour. */
+  body: string;
+  /** Cornice / mid rail — >= 8 L* above `body`, or null to skip them. */
+  trim: string | null;
+  /** Alternating pilaster tier — below `body`. Falls back to `body`. */
+  dark?: string | null;
+  /** Plinth — >= 8 L* below `body`, or null to skip it. */
+  contact: string | null;
+}
+
 export interface ArticulateOpts {
   /** Plinth height in metres. 0 disables. Default 0.32. */
   plinthH?: number;
@@ -71,86 +94,128 @@ export interface ArticulateOpts {
   corniceH?: number;
   /** Pilaster spacing in metres along the wall's long axis. 0 disables. Default 5. */
   pilasterEvery?: number;
-  /** How far trim stands proud of the wall face, in metres. Default 0.05. */
-  proud?: number;
+  /** Plinth proud-of-face, metres per face. Default 0.04 (VISUAL_UPGRADE §3b). */
+  plinthProud?: number;
+  /** Cornice proud-of-face, metres per face. Default 0.06. */
+  corniceProud?: number;
+  /** Pilaster proud-of-face, metres per face. Default 0.05. */
+  pilasterProud?: number;
   /** Add a mid rail. Auto-enabled for walls taller than 4m. */
   midRail?: boolean;
 }
+
+/** Below this height a wall cannot carry trim without self-intersecting. */
+const MIN_ARTICULATE_H = 0.9;
 
 /**
  * Build the trim set for a wall of full extents `w x h x d`, centred on the
  * origin — add it as a SIBLING of the wall box at the same position.
  *
- * `bodyHex` is the wall's own colour; `trimHex` must be >= 8 L* above it
- * (use `TRIM_MAT`); `contactHex` must be >= 8 L* below the GROUND
- * (use `CONTACT_MAT`). Those two rules are the value ladder law's L2 and L3.
+ * Implements VISUAL_UPGRADE.md §3b. Long axis is inferred: pilasters and the
+ * mid rail run along whichever of w/d is larger. Trim stands proud only on the
+ * two LONG faces so end caps never intersect an abutting wall.
  *
- * Long axis is inferred: pilasters and rails run along whichever of w/d is
- * larger, and stand proud on the two long faces.
+ * Returns an EMPTY group for walls too short to carry trim — callers can add
+ * the result unconditionally.
+ *
+ * ONLY `mapRenderer.ts` (F8) may call this. Map data files must NOT express
+ * trim as extra `BoxDef`s: `MapDef.boxes` drives SERVER COLLISION
+ * (games/fps/server/src/game.ts), so trim authored as data would become solid
+ * world geometry and change gameplay.
  */
 export function articulate(
   w: number,
   h: number,
   d: number,
-  trimHex: string,
-  contactHex: string,
+  colors: ArticulateColors,
   opts: ArticulateOpts = {},
 ): THREE.Group {
-  const plinthH = opts.plinthH ?? 0.32;
-  const corniceH = opts.corniceH ?? 0.18;
-  const every = opts.pilasterEvery ?? 5;
-  const proud = opts.proud ?? 0.05;
-  const midRail = opts.midRail ?? h > 4;
   const g = new THREE.Group();
+  if (h < MIN_ARTICULATE_H) return g;
+
+  const every = opts.pilasterEvery ?? 5;
+  const pp = opts.plinthProud ?? 0.04;
+  const cp = opts.corniceProud ?? 0.06;
+  const lp = opts.pilasterProud ?? 0.05;
+  const midRail = opts.midRail ?? h > 4;
   const alongX = w >= d;
   const span = alongX ? w : d;
   const thick = alongX ? d : w;
-  const p2 = proud * 2;
+  const darkHex = colors.dark ?? colors.body;
+
+  // Scale the bands down if they would meet in the middle of a short wall.
+  let plinthH = colors.contact ? (opts.plinthH ?? 0.32) : 0;
+  let corniceH = colors.trim ? (opts.corniceH ?? 0.18) : 0;
+  const avail = h * 0.7;
+  if (plinthH + corniceH > avail) {
+    const k = avail / (plinthH + corniceH);
+    plinthH *= k;
+    corniceH *= k;
+  }
 
   // plinth — the contact band. This is what stops the wall from floating.
-  if (plinthH > 0) {
-    const pl = alongX ? box(w + p2, plinthH, d + p2, contactHex) : box(w + p2, plinthH, d + p2, contactHex);
+  if (plinthH > 0 && colors.contact) {
+    const pl = alongX
+      ? box(w, plinthH, d + pp * 2, colors.contact)
+      : box(w + pp * 2, plinthH, d, colors.contact);
     g.add(at(pl, 0, -h / 2 + plinthH / 2, 0));
   }
   // cornice — catches the sun, reads the wall's top edge at distance.
-  if (corniceH > 0) {
-    const cr = box(w + p2 * 1.4, corniceH, d + p2 * 1.4, trimHex);
+  if (corniceH > 0 && colors.trim) {
+    const cr = alongX
+      ? box(w, corniceH, d + cp * 2, colors.trim)
+      : box(w + cp * 2, corniceH, d, colors.trim);
     g.add(at(cr, 0, h / 2 - corniceH / 2, 0));
   }
-  // mid rail — breaks tall spans horizontally.
-  if (midRail) {
-    const rl = box(w + proud, 0.12, d + proud, trimHex);
-    g.add(at(rl, 0, -h / 2 + plinthH + (h - plinthH - corniceH) * 0.55, 0));
-  }
-  // pilasters — vertical ribs that break the span and self-shadow.
-  if (every > 0 && span > every) {
-    const bodyH = h - plinthH - corniceH;
-    if (bodyH > 0.2) {
-      const yC = -h / 2 + plinthH + bodyH / 2;
-      const n = Math.max(1, Math.floor(span / every) - 1);
-      for (let i = 1; i <= n; i++) {
-        const t = (i / (n + 1) - 0.5) * span;
-        const pil = alongX
-          ? box(0.3, bodyH, thick + p2, trimHex)
-          : box(thick + p2, bodyH, 0.3, trimHex);
-        g.add(at(pil, alongX ? t : 0, yC, alongX ? 0 : t));
-      }
+  // pilasters — vertical ribs that break the span and self-shadow. Alternating
+  // tiers so a long wall reads as rhythm rather than stripes.
+  const bodyH = h - plinthH - corniceH;
+  if (every > 0 && span > every && bodyH > 0.2) {
+    const yC = -h / 2 + plinthH + bodyH / 2;
+    const n = Math.max(1, Math.floor(span / every) - 1);
+    for (let i = 1; i <= n; i++) {
+      const t = (i / (n + 1) - 0.5) * span;
+      const hex = i % 2 === 0 ? darkHex : (colors.trim ?? darkHex);
+      const pil = alongX
+        ? box(0.3, bodyH, thick + lp * 2, hex)
+        : box(thick + lp * 2, bodyH, 0.3, hex);
+      g.add(at(pil, alongX ? t : 0, yC, alongX ? 0 : t));
     }
+  }
+  // mid rail — breaks tall spans horizontally. MUST stand proud of the
+  // pilasters it crosses, or bake() merges it into them and it disappears.
+  if (midRail && colors.trim && bodyH > 0.4) {
+    const rp = lp * 1.4;
+    const rl = alongX
+      ? box(w, 0.12, d + rp * 2, colors.trim)
+      : box(w + rp * 2, 0.12, d, colors.trim);
+    g.add(at(rl, 0, -h / 2 + plinthH + bodyH * 0.55, 0));
   }
   return g;
 }
 
+/** Height above the ground plane for contact shadows — avoids z-fighting. */
+export const CONTACT_Y = 0.02;
+
 /**
- * A flat contact-shadow quad to sit under a prop, at `y` just above the ground
- * plane. The cheap, texture-free replacement for ambient occlusion: without one
- * of these, props visibly float. Every scattered prop gets one.
+ * A flat contact-shadow quad to sit under a prop. The cheap, texture-free
+ * replacement for ambient occlusion: without one of these, props visibly float.
+ * Every scattered prop and every character gets one.
+ *
+ * The shadow is always `PALETTE.ink` — a shadow is an absence of light, not a
+ * material tier, so it must not vary by surface. VISUAL_UPGRADE.md §1 L2b
+ * requires the >= 8 L* drop of the COMPOSITE (use `composite()` from
+ * `@platform/shared` to verify); the default alpha clears it on every ground
+ * above L* 25. On near-black floors (Bunker) no alpha can, and grounding is
+ * carried by the plinth geometry instead — that is expected, not a bug.
  */
-export function contactShadow(radius: number, hex: string, opacity = 0.38): THREE.Mesh {
+export function contactShadow(radius: number, opacity = 0.5): THREE.Mesh {
   const m = new THREE.Mesh(
     new THREE.CircleGeometry(radius, 12),
-    mat(hex, { transparent: true, opacity }),
+    mat(PALETTE.ink, { transparent: true, opacity }),
   );
   m.rotation.x = -Math.PI / 2;
+  m.position.y = CONTACT_Y;
   m.receiveShadow = false;
   m.castShadow = false;
   return m;

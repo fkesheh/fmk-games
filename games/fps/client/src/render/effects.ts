@@ -10,7 +10,7 @@
 // is world.
 // ============================================================================
 import * as THREE from 'three';
-import { PALETTE, rng, rngRange, type MatId, type Team, type Vec3 } from '@fps/shared';
+import { IMPACT_MAT, PALETTE, rng, rngRange, type MatId, type Team, type Vec3 } from '@fps/shared';
 import { box } from '../contract/visual.js';
 import { MAT_COLORS } from './mapRenderer.js';
 
@@ -47,15 +47,10 @@ const SMOKE_RISE = 0.5; // m/s² upward drift — hot smoke climbs
 
 /** Material impact families: dust clouds, metal sparks, snow puffs, wood
  *  chips, foliage hits. Frozen visual mapping (STYLE_BIBLE per-map reads). */
-type ImpactKind = 'dust' | 'spark' | 'snow' | 'chip' | 'leaf';
-const MAT_KIND: Record<MatId, ImpactKind> = {
-  sand: 'dust', sandDark: 'dust', concrete: 'dust', concreteDark: 'dust',
-  metal: 'spark', metalDark: 'spark', wood: 'chip', crate: 'chip',
-  brick: 'dust', plaster: 'dust', roofRed: 'dust',
-  carpet: 'dust', desk: 'chip', paper: 'dust',
-  snow: 'snow', ice: 'snow', rock: 'snow',
-  leaf: 'leaf', cactus: 'leaf',
-};
+// The mapping moved to the shared contract (@fps/shared) as IMPACT_MAT so that
+// adding a MatId cannot silently break this file — the tiered palette added 26
+// materials at once. Aliased to the old local name to keep call sites stable.
+const MAT_KIND = IMPACT_MAT;
 
 // per-material tint as linear-work-space rgb (same conversion as mat()),
 // derived from C3's frozen MatId -> PALETTE table so impacts match the walls

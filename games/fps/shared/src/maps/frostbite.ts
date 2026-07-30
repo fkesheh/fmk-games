@@ -21,6 +21,7 @@ export const frostbite: MapDef = {
   sizeZ: D,
   floorMat: 'snow',
   theme: {
+    skyHigh: PALETTE.skyColdHigh, // S1: zenith — retune with the rest of the theme
     sky: PALETTE.skyCold,
     horizon: PALETTE.snowShadow,
     ground: PALETTE.snowShadow,

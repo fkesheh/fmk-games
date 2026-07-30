@@ -19,7 +19,7 @@ prove how far art direction alone goes.
 | `MeshStandardMaterial`, `MeshPhysicalMaterial`, `MeshPhongMaterial`, PBR, env maps, IBL | Material model stays flat Lambert. |
 | `TextureLoader`, image files, `.png`/`.jpg`/`.hdr` assets, normal/roughness/AO maps | Stays 100% procedural, zero assets. |
 | **New** surface texturing of world geometry (canvas textures mapped onto walls/ground/track) | "No textures" means the world stays untextured. |
-| `vertexColors` on world materials, baked vertex AO | Out of envelope this round. Deliberate — see §6. |
+| **NEW** `vertexColors` materials, or baked vertex AO | Out of envelope this round. Deliberate — see §6. **Not a ban on the existing ones:** KART's world already runs on a shared vertex-coloured Lambert (`trackMesh.ts:93`) and a vertex-coloured sky dome (`render.ts:378`), and FPS's map sky dome uses one (`mapRenderer.ts`). Retuning those existing colour attributes is not only permitted, it is how K1/K2 must do their work. Do not introduce a vertex-coloured material where one does not already exist. |
 | Ad-hoc hex literals anywhere outside the three palette files | Kills cross-agent cohesion. |
 | Raw `new THREE.Mesh*Material` / raw geometry in FPS renderer code | Use the frozen factories. |
 | Lowering shadow quality, disabling shadows, or dropping pixelRatio "for perf/tests" | Known regression that flattens the look. |
@@ -35,9 +35,18 @@ prove how far art direction alone goes.
 4. **Light and shadow settings** — intensities, hemisphere sky/ground tints, sun direction and
    colour, shadow map resolution, frustum fit, bias, fog density.
 5. **Animation, easing, timing, layout, typography, CSS** (2D surfaces).
-6. **Tuning the pre-existing** hand-rolled vignette/grade shader in `scene.ts` and the pre-existing
-   procedural canvas sprites (nameplates, light-pool blob, KART number roundels). These already
-   exist; tuning them is not "adding post-processing". **Do not add new ones.**
+6. **Tuning the pre-existing**, exhaustively: the hand-rolled vignette/grade shader and sky/sun-disc
+   shaders in `scene.ts`; the procedural canvas sprites (FPS nameplates and light-pool blob, KART
+   number roundels, and KART's `cloudTexture()` / `radialTexture()` in `render.ts`); the vertex
+   colour attributes of the materials named above. These already exist; tuning them is not "adding
+   post-processing" or "adding textures". **Do not add new ones.**
+7. **`mix()` and `composite()` from `@platform/shared`** — the ONLY sanctioned way to produce a
+   colour that is not a literal palette entry, and only for **atmospheric perspective** (fading a
+   far tier toward the fog) and for verifying contact-shadow composites. Both endpoints must be
+   palette entries, so the result stays traceable. Anything else is an ad-hoc hex.
+8. **2D surfaces (CSS) may use gradients, box-shadows, borders and filters.** The "no textures / no
+   post-processing" rules describe the 3D render path; they are not a ban on CSS depth. BANK's rail
+   and dice bevels are expected to be CSS gradients and shadows.
 
 ---
 
@@ -59,32 +68,60 @@ geometry you add. **Fix the ladder first; everything else is secondary.**
 
 ### The law — every 3D scene MUST satisfy all four
 
-Let **L** = perceptual lightness (CIE L*, 0–100). Use the `L()` helper in each palette file.
+Let **L** = perceptual lightness (CIE L*, 0–100), from `L()` in `@platform/shared`
+(`platform/shared/src/color.ts`), alongside `hue()`, `saturation()`, `hueSplitOk()`, `mix()` and
+`composite()`.
 
-- **L1 — GROUND SEPARATION.** `L(mainWall) − L(ground) ≥ 20`. Floors are the darkest large
-  surface. A floor may never be lighter than the walls it meets.
-- **L2 — CONTACT BAND.** Every wall base and every prop base carries a contact band whose colour is
-  `≥ 8 L` **below the ground**. This is how objects get grounded without AO. Non-negotiable — it is
-  the entire replacement for ambient occlusion this round.
-- **L3 — TRIM LIFT.** Trim, cornices and sun-facing detail sit `≥ 8 L` **above** the main wall, so
-  articulation reads at distance.
-- **L4 — HUE SPLIT.** `|hue(groundFamily) − hue(wallFamily)| ≥ 25°`, **or** the ground is
-  ≥ 15 points less saturated. Warm architecture ⇄ cooler ground, or the reverse. A frame where
-  every element sits in one 15° hue wedge fails, whatever its value spread.
+- **L1 — GROUND SEPARATION.** `L(mainWall) − L(ground) ≥ 20`, where **`mainWall` is the single
+  material named as the L1 reference in §3a** — not every material present. Floors are the darkest
+  large surface. A floor may never be lighter than the walls it meets.
+- **L2a — WALL PLINTH.** A wall's plinth is `≥ 8 L` below **that wall's own material**. Keyed by
+  the wall, so `CONTACT_MAT` can express it. Where a material is already at the bottom of its
+  ladder the table returns `null` and `articulate()` emits no plinth — a zero-contrast plinth is
+  worse than none.
+- **L2b — PROP CONTACT SHADOW.** Under every prop and character, the **alpha composite** of the
+  shadow over the ground is `≥ 8 L` below the ground — verify with `composite()`, not the raw hex.
+  Exempt where the ground is already below `L 25` (Bunker): no alpha can darken a near-black floor,
+  and grounding is carried by plinth geometry instead.
+  *(These two were a single incoherent rule in the first draft — it defined the band relative to
+  the ground but keyed the table by the wall, and failed on 4 of 6 maps. Do not merge them again.)*
+- **L3 — TRIM LIFT.** Trim, cornices and sun-facing detail sit `≥ 8 L` **above** the material they
+  trim, so articulation reads at distance. `null` at the top of a ladder, same rule as L2a.
+- **L4 — HUE SPLIT.** `|hue(ground) − hue(mainWall)| ≥ 25°`, **or** the ground is ≥ 15 saturation
+  points less saturated. Warm architecture ⇄ cooler ground, or the reverse.
+  **Monochrome exemption:** a map declared monochrome-by-design in §3a (Frostbite, Bunker) is
+  exempt from L4 provided it clears `L1 ≥ 28`. Snow and concrete bunkers genuinely are one hue;
+  there, value does the work that hue does elsewhere. No other map may claim this.
 
 ### Sky law
 
 - **S1 — ZENITH SEPARATION.** The sky dome's zenith stop must be **cooler and ≥ 12 L darker** than
   its horizon stop. A flat sky wash is a fail. `MapTheme` gains a `skyHigh` field for this.
 - **S2 — FOG MATCH.** Fog colour matches the *horizon* stop, never the zenith.
-- **S3 — NO FLOATING CONFETTI.** The current drifting diamond quads in the FPS sky read as render
-  glitches, not clouds. They are **deleted** and replaced with proper layered cloud geometry
-  (flattened, clustered, slow-drifting, horizon-hugging).
+- **S3 — NO FLOATING DIAMONDS.** The pale diamonds in the FPS sky are **not** clouds or confetti:
+  they are the **skyline ring's tips** poking over their own front ranks (`mapRenderer.ts`
+  `buildSkyline()`, fed by `SkylineDef` in each map). A runtime workaround, `stripSkylineCaps()` in
+  `scene.ts`, currently deletes offending triangles.
 
-### Enforcement
+  **That workaround is a landmine and must be removed.** It deletes any triangle whose centroid is
+  above `y 5.5` beyond `r 36` from **every mesh with `castShadow && receiveShadow`** — and `bake()`
+  sets both flags on everything. Any new cloud band or layered skyline built this round would be
+  **silently eaten**, producing an empty sky with no error to diagnose. Assignments:
+  - **F7** deletes `stripSkylineCaps()`, its `SKYCAP_*` constants and its call site. Nothing else
+    may depend on it.
+  - **F1–F6** retune each map's `SkylineDef` height band so tips no longer breach the skyline.
+  - **F8** — and only F8 — builds the replacement: two layered cloud bands, flattened, clustered,
+    horizon-hugging, with the far tier faded toward the fog colour via `mix()`.
 
-Reviewers check L1–L4 and S1–S3 **numerically**, per map and per scene. A violation is a `major`
-finding. Do not argue aesthetics with the ladder — hit the numbers, then art-direct inside them.
+### Enforcement — a test, not an opinion
+
+`games/fps/shared/src/valueLadder.test.ts` (plus KART and BANK equivalents) asserts L1, L2a, L3, L4,
+S1 and S2 over every palette tier and every `MapDef.theme`, and runs in `npm test`. **It is part of
+every task's gate.** Reviewers additionally check L2b composites and S3 by reading the code.
+
+A violation is a `major` finding. Do not argue aesthetics with the ladder — hit the numbers, then
+art-direct inside them. If a number is unreachable, that is a contract gap: report it, do not
+weaken the test. **No implementer may edit the ladder tests.**
 
 ---
 
@@ -101,10 +138,14 @@ finding. Do not argue aesthetics with the ladder — hit the numbers, then art-d
 
 | Suffix | Role | Relative L |
 | --- | --- | --- |
-| `…Lit` | trim, cornices, sun-hit detail | base **+8…+14** |
+| `…Lit` | trim, cornices, sun-hit detail | base **+8 or more** (hard floor) |
 | *(base)* | main wall / body surface | — |
-| `…Dark` | secondary surface, shaded planes | base **−12…−18** |
-| `…Deep` | **contact band**, plinths, crevices | base **−28…−40** |
+| `…Dark` | secondary surface, shaded planes | descriptive: a visible step down |
+| `…Deep` | **contact band**, plinths, crevices | base **−8 or more** (hard floor) |
+
+Only the two **hard floors** are enforced, because they are what L2a and L3 actually depend on. The
+`…Dark` band is guidance. (The first draft specified narrow ranges for all four and then violated
+them 15 times — a header that states a law the file breaks is worse than no header.)
 
 Colours are consumed by name. If you need a value you cannot name, you have found a contract gap —
 **report it, do not invent a hex.**
@@ -124,9 +165,9 @@ every tie: enemies must pop harder after this pass, never less.
 | Dustbowl | `dust` (dropped + cooled) | `sand` (lifted) | `sandDeep` | warm sand walls ⇄ cooler packed-earth ground; **violet-cool zenith** over warm dusk horizon — this pairing is the map's signature |
 | Crossfire | `tarmac` (**new** — must stop being `concrete`) | `concrete` | `concreteDeep` | cool tarmac ⇄ warm-neutral concrete + rust accents |
 | Office | `carpet` (darkened) | `plaster` | `carpetDeep` | cool blue-grey carpet ⇄ warm plaster; screens are the only saturated light |
-| Frostbite | `snowShadow` (dropped) | `snow` / `concrete` rock | `snowDeep` | cold blue ground shadow ⇄ near-white lit snow; rock is the dark anchor |
-| Urbana | `tarmac` / `concreteDark` (**stop using `plaster`** — the inversion) | `plaster` + `brick` | `plasterDeep` / `brickDeep` | cool street ⇄ warm plaster/brick facades |
-| Bunker | `metalDeep` | `concreteDark` | `metalDeep` | near-monochrome by design — carry the split with **saturated skylight shafts** and warm emergency accents against cold concrete |
+| Frostbite | `snowShadow` (dropped) | **`snow`** is the L1 reference — `concrete` is NOT a main wall here (it is 13 L *below* the ground and would recreate the Urbana inversion); use `rock`/`rockDeep` as the dark anchor for masses only | `snowDeep` | **monochrome by design** — exempt from L4, must clear `L1 ≥ 28` |
+| Urbana | `tarmac` (**stop using `plaster`** — the inversion) | **`plaster`** is the L1 reference; `brick` is a secondary facade mass and must still clear `tarmac` by 20 | `plasterDeep` / `brickDeep` | cool street ⇄ warm plaster/brick facades |
+| Bunker | `metalDeep` | `concreteDark` | `metalDeep` | **monochrome by design** — exempt from L4, must clear `L1 ≥ 28`. Carry interest with **saturated skylight shafts** and warm emergency accents against cold concrete. Also L2b-exempt: the floor is below L 25, so props are grounded by geometry, not by shadow quads |
 
 ### 3b. Wall articulation — the second-biggest lever
 
@@ -208,7 +249,33 @@ world density, lighting/mood, silhouette readability, and absence of programmer-
 
 Explicitly **out of scope this round** and not a valid finding: missing SSAO/bloom/post-processing,
 missing textures, missing PBR, missing vertex AO. The judge is told the envelope so it grades what
-the build can actually change.
+the build can actually change. **Camera framing and FOV are fixed** (they live in
+`clientGame.ts`, unowned this round) — the judge may not fault composition for framing it cannot
+change; it grades what is *inside* the frame.
+
+### S1 — `scripts/capture-visuals.mjs` spec (this is the task brief)
+
+Reuse the proven pattern in `scripts/e2e.mjs`: `npm run build`, spawn
+`platform/server/dist/server.js` on `E2E_PORT`, drive with Puppeteer, screenshot, kill the server.
+Viewport **1600×900**, `deviceScaleFactor: 1`. Write to `screenshots/vN/<name>.png`. Print a JSON
+manifest of `{name, game, file}` on stdout so the judge loop can pair shots to owners.
+
+Required shot list — **31 shots**:
+
+| Prefix | Shots |
+| --- | --- |
+| `launcher` | the `/` page (P1) |
+| `fps-<map>-{a,b,c}` | all **6 maps** × 3 poses: a long sightline down the main lane, a close-up on an articulated wall + prop cluster, and a low angle toward the sun. **18 shots** — this is the core of the FPS judgement |
+| `fps-char` | two soldiers at ~8 m, one CT one T, viewmodel in frame |
+| `fps-hud` | live round HUD |
+| `fps-buy` | buy menu |
+| `fps-scoreboard` | scoreboard overlay |
+| `kart-{grid,chase,corner}` | grid at countdown, chase cam at speed on a straight, mid-drift through a corner with FX |
+| `kart-{hud,results}` | HUD at speed, results table |
+| `bank-{table,roll,results}` | table mid-round, dice mid-roll, match-end banner |
+
+If a shot cannot be produced, **fail loudly** — a missing shot is a hole in the judgement, and a
+harness that silently skips is the "gate that scores nothing" this contract exists to prevent.
 
 ---
 
@@ -217,7 +284,9 @@ the build can actually change.
 Architect-owned, **frozen before fan-out**, editable by nobody else:
 `games/fps/shared/src/palette.ts`, `games/fps/shared/src/matColors.ts`,
 `games/fps/shared/src/maps/types.ts`, `games/fps/client/src/contract/visual.ts`,
-`games/kart/shared/src/palette.ts`, `games/bank/shared/src/palette.ts`, this document.
+`games/kart/shared/src/palette.ts`, `games/bank/shared/src/palette.ts`,
+`platform/shared/src/color.ts`, `platform/shared/src/index.ts`,
+the `valueLadder.test.ts` files, `vitest.config.ts`, and this document.
 
 | ID | Owns (exclusive) |
 | --- | --- |
@@ -234,15 +303,38 @@ Architect-owned, **frozen before fan-out**, editable by nobody else:
 | K3 | `games/kart/client/src/kartMesh.ts` |
 | K4 | `games/kart/client/src/fx.ts` |
 | K5 | `games/kart/client/src/style.css` |
+| K6 | `games/kart/client/src/app.ts` — **DOM structure and inline-style removal only.** Owns ~60 HUD/lobby/results class names and 24 JS-set inline styles that currently override any CSS K5 writes. Class names frozen in §9 |
+| K7 | `games/kart/client/src/main.ts` — mirror `KPAL` into CSS custom properties at boot |
 | B1 | `games/bank/client/src/style.css` |
 | B2 | `games/bank/client/src/game.ts` (DOM structure only — class names frozen in §8) |
 | B3 | `games/bank/client/src/dice.ts` |
-| S1 | `scripts/capture-visuals.mjs` (new) |
+| B4 | `games/bank/client/src/main.ts` — mirror `BPAL` into CSS custom properties at boot, per `BPAL_CSS_VARS` |
+| F14 | `games/fps/client/src/main.ts` + `games/fps/client/src/style.css` — complete the PALETTE→CSS-var mirror (`--c11-accent` is consumed but never set, so `style.css` silently falls back to a hardcoded hex) and remove the fallback literals |
+| P1 | `platform/server/src/index.ts` — the launcher page at `/`, the product's front door. Its HTML/CSS is inlined here with 7 raw hex literals and is currently owned by nobody |
+| S1 | `scripts/capture-visuals.mjs` (new) — spec in §6 |
 
-**Seam rules.** F8 owns the sky *dome geometry*; F7 owns the sky *shader and lighting* — F8 must not
-add a competing dome. `makeWeaponModel` lives in F10's file and is imported by F9: F10 owns the
-geometry, F9 owns only how it is attached. B1 owns all CSS and colour; B2 owns DOM structure and may
-**add** classes from the §8 frozen list but never rename or remove an existing one.
+### Seam rules (read the one that names you)
+
+1. **Sky.** F8 owns the sky *dome geometry* and the new cloud bands; F7 owns the sky *shader,
+   lighting and fog*. F8 must not add a competing dome. F7 must delete `stripSkylineCaps()` (§1 S3)
+   — until it is gone, F8's clouds are deleted at runtime with no error.
+2. **Articulation is F8's alone.** §3b trim is implemented **exclusively** in `mapRenderer.ts` by
+   calling `articulate()`. **F1–F6 must NOT express trim as extra `BoxDef`s.** `MapDef.boxes` is
+   the SERVER's collision source (`games/fps/server/src/game.ts`), so trim authored as map data
+   becomes solid world geometry and silently changes gameplay. F1–F6's role in §3b is limited to
+   `floorMat`, `theme` and `MatId` choices.
+3. **Weapons.** `makeWeaponModel` lives in F10's file and is imported by F9. F10 owns the geometry;
+   F9 owns only how it is attached.
+4. **BANK.** B1 owns all CSS and colour; B2 owns DOM structure and may **add** classes from the §8
+   list but never rename or remove one. B3's `bd3d-*` classes are B3's alone — B1 must not style
+   them. B4 owns the palette→CSS mirror; B1 writes `:root` fallbacks that must match `BPAL`.
+5. **KART.** K5 owns all CSS; K6 owns DOM structure and **must strip the inline styles in
+   `app.ts`** or K5's rules lose the cascade. K7 owns the palette→CSS mirror. K1 owns
+   `render.ts` including its `mat()` factory and the material handed to K2 as `MatFn` — K2 consumes
+   it and must not build its own materials.
+6. **Palette `:root` fallbacks.** §0 bans ad-hoc hex outside the palette files. The one exception:
+   `:root` declarations in `style.css` that mirror a palette entry exactly, in B1/K5 only, kept in
+   sync with B4/K7's runtime mirror. Any other literal is a violation.
 
 ---
 

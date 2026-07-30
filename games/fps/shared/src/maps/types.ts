@@ -32,7 +32,7 @@ export type MatId =
   // snow / rock
   | 'snowLit' | 'snow' | 'snowShadow' | 'snowDeep' | 'ice' | 'rock' | 'rockDeep'
   // foliage
-  | 'leafLit' | 'leaf' | 'leafDark' | 'cactus';
+  | 'leafLit' | 'leaf' | 'leafDark' | 'leafDeep' | 'cactus';
 
 export interface BoxDef {
   x: number; y: number; z: number; // center

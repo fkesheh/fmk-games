@@ -48,9 +48,11 @@ import { at, bake, box, cone, cyl, sphere } from '../contract/visual.js';
 
 // ---- MatId -> PALETTE ---------------------------------------------------------
 // The mapping now lives in the shared contract (@fps/shared/matColors.ts) so
-// map authors and the renderer never contend for this file. Re-exported here
-// for compatibility with existing importers. DO NOT redefine it locally.
-export { MAT_COLORS, CONTACT_MAT, TRIM_MAT } from '@fps/shared';
+// map authors and the renderer never contend for this file. Imported for local
+// use AND re-exported for existing importers (effects.ts). DO NOT redefine it.
+import { CONTACT_MAT, MAT_COLORS, TRIM_MAT } from '@fps/shared';
+
+export { MAT_COLORS, CONTACT_MAT, TRIM_MAT };
 
 // ---- scatter tuning (frozen by CONTRACT/C3 spec) ------------------------------
 const SOLID_PAD = 0.5; // solids inflated by this when rejecting prop points
