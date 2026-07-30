@@ -8,13 +8,16 @@ ownership list.** You implement bodies and private helpers inside your own files
 
 - `games/fps/shared/src/types.ts` — all wire types, ids, enums, events
 - `games/fps/shared/src/config.ts` — tick rate, player physics constants, economy, rounds, WEAPONS table
-- `games/fps/shared/src/palette.ts` — the named palette (ALL colors trace here)
+- `games/fps/shared/src/palette.ts` — the named palette (ALL colors trace here), organised in
+  `…Lit / base / …Dark / …Deep` value tiers per VISUAL_UPGRADE.md §2
+- `games/fps/shared/src/matColors.ts` — `MatId` → PALETTE plus the ladder-partner tables
 - `games/fps/shared/src/rng.ts` — seeded RNG (mulberry32)
 - `games/fps/shared/src/physics.ts` — stepBody collide-and-slide, AABB/raycast, hitscan, spread, falloff
 - `games/fps/shared/src/protocol.ts` — parseC2S / encode / decode
 - `games/fps/shared/src/maps/types.ts`, `games/fps/shared/src/maps/index.ts`, `games/fps/shared/src/maps/dustbowl.ts` (reference map)
 - `games/fps/shared/src/maps/{crossfire,office,frostbite,urbana,bunker}.ts` — placeholder data; owned by tasks M1–M5 (they replace file CONTENTS, never the format)
-- `games/fps/client/src/contract/visual.ts` — mat/box/cyl/cone/sphere/at/bake visual vocabulary
+- `games/fps/client/src/contract/visual.ts` — mat/box/cyl/cone/sphere/at/bake visual vocabulary,
+  plus the articulation helpers `articulate()` / `contactShadow()` / `CONTACT_Y`
 
 ## RULES (every implementer, no exceptions)
 
@@ -25,8 +28,9 @@ ownership list.** You implement bodies and private helpers inside your own files
 4. **Imports:** you may import from `@fps/shared`, `three` (client), `ws`/`node:*` (server), and the
    exact exports listed in the module table below. No other cross-module imports.
 5. **All colors from PALETTE.** Meshes only via `games/fps/client/src/contract/visual.ts` factories
-   (`box/cyl/cone/sphere/at/mat/bake`). Exceptions allowed: sky-dome `MeshBasicMaterial` with vertex
-   colors, particle `THREE.Points` materials, nameplate `CanvasTexture` sprites — colors still from PALETTE.
+   (`box/cyl/cone/sphere/at/mat/bake`, plus `articulate/contactShadow`). Exceptions allowed:
+   sky-dome `MeshBasicMaterial` with vertex colors, particle `THREE.Points` materials, nameplate
+   `CanvasTexture` sprites — colors still from PALETTE.
 6. **Bake all static geometry** via `bake()`. Dynamic pivots (limbs, weapon, rotor) stay unbaked.
 7. **Determinism:** gameplay + procedural visual layout use `rng(seed)` from shared only.
    `Math.random` is a violation everywhere; server-side non-gameplay generation (room ids, private
@@ -279,6 +283,55 @@ players reported by `room.stalePlayers()` (poll every 1s via each room's tick �
 `lobby` every 1s; expose nothing extra, S1 iterates its own session↔room map and calls
 `stalePlayers()` on the rooms it created).
 
+## Frozen visual contract surfaces (architect-owned; implementers consume, never edit)
+
+### `games/fps/shared/src/matColors.ts`
+```ts
+export const MAT_COLORS: Record<MatId, string>;        // every MatId -> a PALETTE entry
+// Ladder partners, keyed by MatId (VISUAL_UPGRADE.md §1). CONTACT_MAT and TRIM_MAT are NULLABLE:
+// null means the material already sits at the bottom / top of its own value ladder, and
+// articulate() then SKIPS that element instead of emitting zero-contrast trim.
+export const CONTACT_MAT: Record<MatId, MatId | null>; // plinth / contact band, >= 8 L* BELOW (L2a)
+export const TRIM_MAT: Record<MatId, MatId | null>;    // cornice / mid rail, >= 8 L* ABOVE (L3)
+export const DARK_MAT: Record<MatId, MatId>;           // alternating pilaster tier; never null
+export type ImpactKind = 'dust' | 'spark' | 'snow' | 'chip' | 'leaf';
+export const IMPACT_MAT: Record<MatId, ImpactKind>;    // impact particle family per material
+```
+Every table covers the FULL `MatId` union in `games/fps/shared/src/maps/types.ts` (value-tiered:
+`…Lit / base / …Dark / …Deep` per family). Adding a `MatId` means adding a row to every table here
+as well as to the union.
+
+### `games/fps/client/src/contract/visual.ts` — articulation helpers
+The `mat/box/cyl/cone/sphere/at/bake` factories are unchanged (rule 5). Added for wall articulation:
+```ts
+export interface ArticulateColors {
+  body: string;           // the wall's own colour — MAT_COLORS[b.mat]
+  trim: string | null;    // cornice / mid rail, >= 8 L* above body — TRIM_MAT; null to skip
+  dark?: string | null;   // alternating pilaster tier — DARK_MAT; falls back to body
+  contact: string | null; // plinth, >= 8 L* below body — CONTACT_MAT; null to skip
+}
+export interface ArticulateOpts {
+  plinthH?: number;       // default 0.32 m (0 disables)
+  corniceH?: number;      // default 0.18 m (0 disables)
+  pilasterEvery?: number; // default 5 m along the long axis (0 disables)
+  plinthProud?: number;   // default 0.04 m per face
+  corniceProud?: number;  // default 0.06 m per face
+  pilasterProud?: number; // default 0.05 m per face
+  midRail?: boolean;      // auto-enabled for walls taller than 4 m
+}
+export function articulate(
+  w: number, h: number, d: number, colors: ArticulateColors, opts?: ArticulateOpts,
+): THREE.Group;
+// Trim set (VISUAL_UPGRADE.md §3b) for a w x h x d box centred on the origin — add it as a SIBLING
+// of the wall at the same position. Returns an EMPTY group below h 0.9, so callers may add it
+// unconditionally. mapRenderer.ts ONLY: trim must never be authored as extra BoxDefs, because
+// MapDef.boxes is the server's collision source.
+export const CONTACT_Y: number; // 0.02 — contact-shadow height above the ground plane
+export function contactShadow(radius: number, opacity?: number): THREE.Mesh;
+// Flat PALETTE.ink disc under a prop or character (opacity default 0.5) — the texture-free stand-in
+// for ambient occlusion. Every scattered prop and every character gets one.
+```
+
 ## Module table — client (tasks C1..C11)
 
 ### `games/fps/client/src/net/connection.ts` (C1)
@@ -385,8 +438,10 @@ export function buildMap(map: MapDef): { root: THREE.Group; solids: AABB[] };
 // boxes -> box() meshes at exact BoxDef coords, color = MAT_COLORS[mat], then bake()
 // deco: per DecoZone scatter via rng(decoSeed(map.id, zoneIndex)); reject < minSpacing, inside a
 //   solid, or < 2.5m from any spawn; all props baked into the same static group
-export const MAT_COLORS: Record<MatId, string>; // maps each MatId to a PALETTE entry
 ```
+`MAT_COLORS`, `CONTACT_MAT` and `TRIM_MAT` are owned by `games/fps/shared/src/matColors.ts` (above)
+and merely **re-exported** here for existing importers — never redefined.
+`MapTheme` also carries `skyHigh` (the zenith stop) per VISUAL_UPGRADE.md §1 S1.
 
 ### `games/fps/client/src/render/playerModels.ts` (C4)
 ```ts
@@ -417,7 +472,7 @@ export class ViewModel {
 export class Effects {
   constructor(scene: THREE.Scene);
   tracer(from: Vec3, to: Vec3): void;   // 60ms fading line (tracer color)
-  impact(p: Vec3): void;                // 6-10 dust/spark particles (concrete color + muzzle spark)
+  impact(p: Vec3, mat?: MatId): void;   // 6-10 particles; family from IMPACT_MAT[mat] (@fps/shared)
   decal(p: Vec3): void;                 // bullet mark: small dark splat quad at the hit point,
   // camera-facing, offset slightly along (camera - p) so it doesn't z-fight; pooled 64, fade out
   // after 45s, oldest recycled. Spawned for wall hits only (NOT on player hits).

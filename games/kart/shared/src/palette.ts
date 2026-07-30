@@ -42,7 +42,7 @@ export const KPAL = {
   skyHigh: '#4d78ae', //         L 48
   sky: '#7fa4c9', //             L 64
   horizon: '#c8d8e8', //         L 85
-  fog: '#a8bccc', //             L 75
+  fog: '#c8d8e8', //             L 86  MUST equal horizon (S2) //             L 75
   cloud: '#eef4f9', //           L 95
   cloudShade: '#b8c6d4', //      L 78
 

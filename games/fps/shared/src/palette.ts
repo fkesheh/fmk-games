@@ -5,14 +5,14 @@
 //
 // TIER SYSTEM (VISUAL_UPGRADE.md §2). Every surface family carries up to four
 // value tiers so the VALUE LADDER LAW (§1) is expressible by name:
-//   …Lit   trim / cornice / sun-hit detail   base +8…+14 L*
+//   …Lit   trim / cornice / sun-hit detail   base +8 L* or more (enforced)
 //   base   main wall / body surface
-//   …Dark  secondary surface, shaded planes  base -12…-18 L*
-//   …Deep  CONTACT BAND, plinth, crevice     base -28…-40 L*
+//   …Dark  secondary surface, shaded planes  a visible step down (guidance)
+//   …Deep  CONTACT BAND, plinth, crevice     base -8 L* or more (enforced)
 // The `…Deep` tiers are this round's replacement for ambient occlusion: every
 // wall base and prop base wears one. Never skip them.
 //
-// Approximate L* is noted per entry. `palette.test.ts` verifies the ladder
+// Approximate L* is noted per entry. `valueLadder.test.ts` verifies the ladder
 // numerically via `L()` from @platform/shared — if you change a value here and
 // the test fails, the ART DIRECTION is broken, not the test.
 // ============================================================================
@@ -51,8 +51,8 @@ export const PALETTE = {
   crateLit: '#c48d5c', //        L 64
 
   // ---- urban / office ----
-  brickLit: '#b8756a', //        L 57
-  brick: '#9b5a4a', //           L 45  main wall
+  brickLit: '#d29486', //        L 67
+  brick: '#b8776a', //           L 57  facade (lifted to clear tarmac by 20)
   brickDeep: '#5a3128', //       L 25  contact band
   plasterLit: '#f0eade', //      L 93
   plaster: '#d8cfc0', //         L 83  main wall
@@ -67,9 +67,9 @@ export const PALETTE = {
 
   // ---- snow ----
   snowLit: '#f6fafd', //         L 98
-  snow: '#e2eaf1', //            L 91  main wall
-  snowShadow: '#9fb0c4', //      L 70  GROUND (dropped from #c3ccd8)
-  snowDeep: '#7a8ca3', //        L 57  contact band
+  snow: '#d8e2ec', //            L 89  main wall (dropped so snowLit clears L3)
+  snowShadow: '#7c91a9', //      L 58  GROUND (dropped for Frostbite L1 >= 28)
+  snowDeep: '#64758c', //        L 47  contact band
   ice: '#a8c8d8', //             L 78
   rockDark: '#4a4f55', //        L 32
   rockDeep: '#2c3035', //        L 19  contact band
