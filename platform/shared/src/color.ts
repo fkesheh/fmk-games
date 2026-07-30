@@ -101,14 +101,47 @@ export function mix(a: string, b: string, t: number): string {
   )}`;
 }
 
+/** Linear light -> sRGB channel (0..1). Inverse of `toLinear`. */
+function toSrgb(c: number): number {
+  return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+}
+
 /**
  * Composite `over` at `alpha` on top of `under` — what an alpha-blended contact
  * shadow ACTUALLY renders as. Use it to verify a contact shadow really clears
  * the >= 8 L* drop that §1 L2b requires: the rule applies to this composite,
  * not to the raw shadow hex.
+ *
+ * BLENDS IN LINEAR LIGHT, not sRGB. three.js has `ColorManagement` enabled by
+ * default (r152+) and the renderer runs `outputColorSpace = SRGBColorSpace`, so
+ * material colours are linearised and alpha blending happens in linear-sRGB.
+ * A naive 8-bit lerp overstates the darkening by ~13 L* on mid-value grounds
+ * and would have passed a contact shadow that genuinely fails on Office.
  */
 export function composite(under: string, over: string, alpha: number): string {
-  return mix(under, over, alpha);
+  const a = hexToRgb(under);
+  const b = hexToRgb(over);
+  const k = Math.max(0, Math.min(1, alpha));
+  const blend = (x: number, y: number): number => {
+    const lin = toLinear(x / 255) * (1 - k) + toLinear(y / 255) * k;
+    return Math.round(toSrgb(lin) * 255);
+  };
+  return `#${ch(blend(a.r, b.r))}${ch(blend(a.g, b.g))}${ch(blend(a.b, b.b))}`;
+}
+
+/**
+ * Blue-minus-red channel bias — the working definition of "cooler" used by
+ * §1 S1's zenith rule. Exported so implementers can reach the same number the
+ * ladder gate uses instead of reverse-engineering it from `hue()`.
+ */
+export function blueBias(hex: string): number {
+  const { r, b } = hexToRgb(hex);
+  return b - r;
+}
+
+/** True when `a` is cooler than `b` in the S1 sense. */
+export function isCooler(a: string, b: string): boolean {
+  return blueBias(a) > blueBias(b);
 }
 
 /**

@@ -81,7 +81,9 @@ Let **L** = perceptual lightness (CIE L*, 0–100), from `L()` in `@platform/sha
   worse than none.
 - **L2b — PROP CONTACT SHADOW.** Under every prop and character, the **alpha composite** of the
   shadow over the ground is `≥ 8 L` below the ground — verify with `composite()`, not the raw hex.
-  Exempt where the ground is already below `L 25` (Bunker): no alpha can darken a near-black floor,
+  `composite()` blends in **linear light**, as three.js does; an 8-bit sRGB lerp overstates the
+  darkening by ~13 L* and will tell you a failing shadow passes.
+  Exempt where the ground is below `L 20` (Bunker only): no alpha can darken a near-black floor,
   and grounding is carried by plinth geometry instead.
   *(These two were a single incoherent rule in the first draft — it defined the band relative to
   the ground but keyed the table by the wall, and failed on 4 of 6 maps. Do not merge them again.)*
@@ -93,10 +95,14 @@ Let **L** = perceptual lightness (CIE L*, 0–100), from `L()` in `@platform/sha
   exempt from L4 provided it clears `L1 ≥ 28`. Snow and concrete bunkers genuinely are one hue;
   there, value does the work that hue does elsewhere. No other map may claim this.
 
+- **S4 — GROUND ≠ HORIZON.** A map’s `theme.ground` must not be the same hex as `theme.horizon`.
+  Identical values collapse the ground plane into the backdrop and erase the horizon line.
+
 ### Sky law
 
 - **S1 — ZENITH SEPARATION.** The sky dome's zenith stop must be **cooler and ≥ 12 L darker** than
-  its horizon stop. A flat sky wash is a fail. `MapTheme` gains a `skyHigh` field for this.
+  its horizon stop. "Cooler" means a higher blue-minus-red bias — use `blueBias()` / `isCooler()`
+  from `@platform/shared`, which is exactly what the gate checks. A flat sky wash is a fail. `MapTheme` gains a `skyHigh` field for this.
 - **S2 — FOG MATCH.** Fog colour matches the *horizon* stop, never the zenith.
 - **S3 — NO FLOATING DIAMONDS.** The pale diamonds in the FPS sky are **not** clouds or confetti:
   they are the **skyline ring's tips** poking over their own front ranks (`mapRenderer.ts`
@@ -122,6 +128,30 @@ every task's gate.** Reviewers additionally check L2b composites and S3 by readi
 A violation is a `major` finding. Do not argue aesthetics with the ladder — hit the numbers, then
 art-direct inside them. If a number is unreachable, that is a contract gap: report it, do not
 weaken the test. **No implementer may edit the ladder tests.**
+
+#### The freeze baseline: 17 assertions are RED on purpose
+
+At freeze the suite is **221 passed / 17 failed**. Every failure is a per-map theme or `floorMat`
+value in `games/fps/shared/src/valueLadder.test.ts`, and every one is **F1–F6's assigned work**:
+
+| Map | Failing |
+| --- | --- |
+| dustbowl | L1, L4, S2 — `floorMat` is `sand`, the same MatId as its main wall (ladder = 0.0); §3a says `dust` |
+| crossfire | L1, L4 — `floorMat` is `concrete`, the same MatId as its main wall (ladder = 0.0); §3a says `tarmac` |
+| office | S1 |
+| frostbite | L1, L4-exempt, S1, S2, S4 — `floorMat` is `snow`, the same MatId as its main wall; §3a says `snowShadow` |
+| urbana | S2, S4 |
+| bunker | L1, L4-exempt, S1, S2 — `floorMat` should be `metalDeep`, not `metalDark` |
+
+All 17 are reachable inside the frozen palette — this is tuning, not a contract gap.
+
+**Gate rule.** F1–F6 gate on *their own map's assertions going green*. **Every other task gates on
+"no NEW failures versus this 17-failure baseline"**, plus green typecheck and build. Do not "fix" a
+failure belonging to another map.
+
+**Known flaky test, not yours:** `games/fps/server/src/game.test.ts` "GameRoom armor absorb" fails
+roughly 1 run in 3 with "no hit landed within the tick budget". It fails identically at the parent
+commit and predates this work. **Ignore it; do not fix it.**
 
 ---
 
@@ -286,7 +316,8 @@ Architect-owned, **frozen before fan-out**, editable by nobody else:
 `games/fps/shared/src/maps/types.ts`, `games/fps/client/src/contract/visual.ts`,
 `games/kart/shared/src/palette.ts`, `games/bank/shared/src/palette.ts`,
 `platform/shared/src/color.ts`, `platform/shared/src/index.ts`,
-the `valueLadder.test.ts` files, `vitest.config.ts`, and this document.
+the `valueLadder.test.ts` files, `vitest.config.ts`, `CONTRACT.md`, `STYLE_BIBLE.md`,
+and this document.
 
 | ID | Owns (exclusive) |
 | --- | --- |
@@ -302,16 +333,16 @@ the `valueLadder.test.ts` files, `vitest.config.ts`, and this document.
 | K2 | `games/kart/client/src/trackMesh.ts` |
 | K3 | `games/kart/client/src/kartMesh.ts` |
 | K4 | `games/kart/client/src/fx.ts` |
-| K5 | `games/kart/client/src/style.css` |
+| K5 | `games/kart/client/src/style.css` + `games/kart/client/index.html` |
 | K6 | `games/kart/client/src/app.ts` — **DOM structure and inline-style removal only.** Owns ~60 HUD/lobby/results class names and 24 JS-set inline styles that currently override any CSS K5 writes. Class names frozen in §9 |
 | K7 | `games/kart/client/src/main.ts` — mirror `KPAL` into CSS custom properties at boot |
-| B1 | `games/bank/client/src/style.css` |
+| B1 | `games/bank/client/src/style.css` + `games/bank/client/index.html` |
 | B2 | `games/bank/client/src/game.ts` (DOM structure only — class names frozen in §8) |
 | B3 | `games/bank/client/src/dice.ts` |
 | B4 | `games/bank/client/src/main.ts` — mirror `BPAL` into CSS custom properties at boot, per `BPAL_CSS_VARS` |
-| F14 | `games/fps/client/src/main.ts` + `games/fps/client/src/style.css` — complete the PALETTE→CSS-var mirror (`--c11-accent` is consumed but never set, so `style.css` silently falls back to a hardcoded hex) and remove the fallback literals |
+| F14 | `games/fps/client/src/main.ts` + `games/fps/client/src/style.css` + `games/fps/client/index.html` — complete the PALETTE→CSS-var mirror (`--c11-accent` is consumed but never set, so `style.css` silently falls back to a hardcoded hex) and remove the fallback literals |
 | P1 | `platform/server/src/index.ts` — the launcher page at `/`, the product's front door. Its HTML/CSS is inlined here with 7 raw hex literals and is currently owned by nobody |
-| S1 | `scripts/capture-visuals.mjs` (new) — spec in §6 |
+| S1 | `scripts/capture-visuals.mjs` (new) — spec in §6. Also owns `scripts/screenshot.mjs` (an existing 1600×900 Puppeteer helper): reuse or supersede it, do not silently duplicate it |
 
 ### Seam rules (read the one that names you)
 
@@ -343,7 +374,10 @@ the `valueLadder.test.ts` files, `vitest.config.ts`, and this document.
    `app.ts`** or K5's rules lose the cascade. K7 owns the palette→CSS mirror. K1 owns
    `render.ts` including its `mat()` factory and the material handed to K2 as `MatFn` — K2 consumes
    it and must not build its own materials.
-6. **Palette `:root` fallbacks.** §0 bans ad-hoc hex outside the palette files. The one exception:
+6. **Boot-guard background.** Each client `index.html` carries an inline `<style>` with the pre-boot
+   page colour (a raw hex). Its owner (F14 / K5 / B1) must keep it equal to that game's `:root`
+   page background, or the pre-boot flash will diverge from the app.
+7. **Palette `:root` fallbacks.** §0 bans ad-hoc hex outside the palette files. The one exception:
    `:root` declarations in `style.css` that mirror a palette entry exactly, in B1/K5 only, kept in
    sync with B4/K7's runtime mirror. Any other literal is a violation.
 

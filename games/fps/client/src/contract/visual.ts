@@ -172,7 +172,9 @@ export function articulate(
   const bodyH = h - plinthH - corniceH;
   if (every > 0 && span > every && bodyH > 0.2) {
     const yC = -h / 2 + plinthH + bodyH / 2;
-    const n = Math.max(1, Math.floor(span / every) - 1);
+    // round, not floor: flooring drove a 6m wall to a single rib at 3m spacing,
+    // well under the 4-6m band §3b specifies. n === 0 means "no rib fits".
+    const n = Math.max(0, Math.round(span / every) - 1);
     for (let i = 1; i <= n; i++) {
       const t = (i / (n + 1) - 0.5) * span;
       const hex = i % 2 === 0 ? darkHex : (colors.trim ?? darkHex);
@@ -204,12 +206,17 @@ export const CONTACT_Y = 0.02;
  *
  * The shadow is always `PALETTE.ink` — a shadow is an absence of light, not a
  * material tier, so it must not vary by surface. VISUAL_UPGRADE.md §1 L2b
- * requires the >= 8 L* drop of the COMPOSITE (use `composite()` from
- * `@platform/shared` to verify); the default alpha clears it on every ground
- * above L* 25. On near-black floors (Bunker) no alpha can, and grounding is
- * carried by the plinth geometry instead — that is expected, not a bug.
+ * requires the >= 8 L* drop of the COMPOSITE (verify with `composite()` from
+ * `@platform/shared`, which blends in LINEAR light exactly as three.js does).
+ *
+ * Measured drop at the 0.6 default over each map's ground:
+ *   dustbowl 16.3 · crossfire 11.4 · office 9.8 · frostbite 18.9 · urbana 11.4
+ *   · bunker 3.8 (ground L* 14.5 — exempt, see below)
+ *
+ * On grounds below L* 20 no alpha can produce the drop; there, grounding is
+ * carried by plinth geometry instead. That is expected, not a bug.
  */
-export function contactShadow(radius: number, opacity = 0.5): THREE.Mesh {
+export function contactShadow(radius: number, opacity = 0.6): THREE.Mesh {
   const m = new THREE.Mesh(
     new THREE.CircleGeometry(radius, 12),
     mat(PALETTE.ink, { transparent: true, opacity }),

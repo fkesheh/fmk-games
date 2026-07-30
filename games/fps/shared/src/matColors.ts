@@ -129,8 +129,15 @@ export const TRIM_MAT: Record<MatId, MatId | null> = {
 
 /**
  * The alternating pilaster tier (VISUAL_UPGRADE.md §3b): a step DOWN from the
- * material, shallower than the contact band, so a long wall reads as rhythm
- * rather than stripes. Never null — falls back to the material itself.
+ * material, so a long wall reads as rhythm rather than a flat span. Never null
+ * — falls back to the material itself.
+ *
+ * NOTE: for 14 of the 46 entries this resolves to the SAME MatId as
+ * `CONTACT_MAT` (e.g. `plaster` -> `plasterDeep`), because those families have
+ * no intermediate tier. Such walls carry three values — body, trim, dark —
+ * rather than four. That is accepted, not an oversight: adding a mid tier to
+ * every family would double the palette for marginal gain. Do NOT assume
+ * `DARK_MAT[m] !== CONTACT_MAT[m]`.
  */
 export const DARK_MAT: Record<MatId, MatId> = {
   sandLit: 'sand', sand: 'sandDark', sandDark: 'sandDeep', sandDeep: 'sandDeep',
