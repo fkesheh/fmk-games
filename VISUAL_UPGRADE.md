@@ -315,9 +315,20 @@ the `valueLadder.test.ts` files, `vitest.config.ts`, and this document.
 
 ### Seam rules (read the one that names you)
 
-1. **Sky.** F8 owns the sky *dome geometry* and the new cloud bands; F7 owns the sky *shader,
-   lighting and fog*. F8 must not add a competing dome. F7 must delete `stripSkylineCaps()` (§1 S3)
-   — until it is gone, F8's clouds are deleted at runtime with no error.
+1. **Sky — there are TWO domes, and only one of them is visible.** `mapRenderer.makeSkyDome()`
+   builds a 2-stop vertex-gradient dome; `scene.ts`'s rig then builds its own opaque 3-stop shader
+   dome that **covers it** (see the comment at `scene.ts:373`). Any sky work F8 does on the
+   mapRenderer dome is invisible.
+   - **F7 owns the visible sky**: the rig dome shader, the sun disc, lighting and fog.
+   - **F7 must make `theme.skyHigh` actually do something.** It is currently **dead data** — all six
+     maps set it, `valueLadder.test.ts` asserts S1 on it, and *no renderer reads it*: the rig dome
+     hardcodes `PALETTE.fogDay / skyDay / paper` in its uniforms. Until F7 wires the zenith stop to
+     `theme.skyHigh` (and the horizon stop to `theme.horizon`), **S1 is a gate that scores nothing.**
+     This is the single highest-priority item in F7's brief.
+   - **F8 owns the cloud bands and the layered skyline ring**, and must either delete the now-covered
+     `makeSkyDome()` or leave it strictly alone — not "improve" it, since nobody will ever see it.
+   - F7 must delete `stripSkylineCaps()` (§1 S3) — until it is gone, F8's clouds are deleted at
+     runtime with no error.
 2. **Articulation is F8's alone.** §3b trim is implemented **exclusively** in `mapRenderer.ts` by
    calling `articulate()`. **F1–F6 must NOT express trim as extra `BoxDef`s.** `MapDef.boxes` is
    the SERVER's collision source (`games/fps/server/src/game.ts`), so trim authored as map data
@@ -494,3 +505,37 @@ parked/floating classes · `gearEl.opacity` upshift flash 1647 → animation cla
 
 Also outside `app.ts`: `fx.ts:237-240` writes `left`/`top`/`transform`/`opacity` on every
 `.fx-speedline` — **K5 must not set those four properties on that class.**
+
+---
+
+## §10 — PRECEDENCE (which frozen doc wins)
+
+Three frozen documents now describe this codebase. Where they conflict, precedence is:
+
+**VISUAL_UPGRADE.md  >  STYLE_BIBLE.md  >  CONTRACT.md**
+
+This document is the newest and is scoped to this round. `CONTRACT.md` and `STYLE_BIBLE.md` remain
+authoritative for everything this document does not mention — protocol, physics, gameplay, module
+boundaries. Do not "fix" this document to agree with them.
+
+### Known live conflicts — resolved here, so nobody has to guess
+
+| Subject | CONTRACT.md says | THIS DOCUMENT SAYS (wins) |
+| --- | --- | --- |
+| Soldier primitive budget | 22–32, "≤ 28" in the budget table | **45–60** (§3c). F9 builds to the new number. |
+| Weapon primitive budget | 6–12 | **25–40 each** (§3c). A weapon that is one flat colour fails review. |
+| Deco prop budget | 3–10 | **8–16** (§3c). |
+| Directional shadow map | 2048 | **4096 with the frustum tightened to map bounds** (§3d). F7 owns the change; CONTRACT.md's 2048 describes the code *before* this round. |
+| `MAT_COLORS` location | `mapRenderer.ts` (C3) | `games/fps/shared/src/matColors.ts`, re-exported by mapRenderer. |
+| Sky dome | one 2-stop vertex gradient | **two domes; the rig's 3-stop shader dome is the visible one** (seam rule 1). |
+
+The primitive-budget rows are deliberate: this round exists to raise density, and the old budgets
+were written for the build these screenshots came from. **Raising them is the assignment.**
+
+### Performance guard
+
+Higher budgets are not a licence to regress frame time. Everything static still goes through
+`bake()`, so added trim and props cost draw calls nothing. The non-functional budgets in
+`CONTRACT.md` (target FPS at peak entity count, frame-time ceiling, no per-frame allocation in hot
+paths, pooling) are **unchanged and still binding**. If a density increase costs frame time, that is
+a finding against the implementer, not a reason to relax §3c.
