@@ -28,7 +28,9 @@ import { BankRoom } from './room.js';
 
 /** Wire shape: fresh per-recipient state, or one shared event envelope. */
 type EventEnvelope = { t: 'event'; ev: BankEvent };
-type BankMsg = BankState | EventEnvelope;
+/** Room-level error envelope; the only one the room emits is `room_full`. */
+type ErrorEnvelope = { t: 'error'; code: string; message: string };
+type BankMsg = BankState | EventEnvelope | ErrorEnvelope;
 type RollMsg = Extract<BankEvent, { t: 'roll' }>;
 
 const TURN_MS = TURN_SECONDS * 1000;
@@ -45,6 +47,7 @@ function isBankMsg(msg: unknown): msg is BankMsg {
   if (typeof msg !== 'object' || msg === null) return false;
   const t = (msg as { t?: unknown }).t;
   if (t === 'bank_state') return true;
+  if (t === 'error') return typeof (msg as { code?: unknown }).code === 'string';
   if (t !== 'event') return false;
   const ev = (msg as { ev?: unknown }).ev;
   return typeof ev === 'object' && ev !== null && typeof (ev as { t?: unknown }).t === 'string';
@@ -76,6 +79,10 @@ class FakeIO implements RoomIO {
       if (m !== undefined && m.t === 'bank_state') return m;
     }
     throw new Error(`no bank_state captured for ${id}`);
+  }
+
+  errors(id: PlayerId): ErrorEnvelope[] {
+    return this.all(id).filter((m): m is ErrorEnvelope => m.t === 'error');
   }
 
   events<T extends BankEvent['t']>(id: PlayerId, t: T): Array<Extract<BankEvent, { t: T }>> {
@@ -391,19 +398,158 @@ describe('BankRoom', () => {
     const matchEnds = io.events('p2', 'match_end');
     expect(matchEnds).toHaveLength(1);
     expect(matchEnds[0]).toMatchObject({ winnerId: 'p1' });
-    // MATCH_RESET_SECONDS later: full reset; with 2 players still present the
-    // lobby rules start round 1 immediately.
+    // MATCH_RESET_SECONDS later: full reset back to a lobby that WAITS. The
+    // room no longer restarts itself — `awaitingStart` marks the post-match
+    // lobby and an explicit {t:'start'} is the only way out of it.
     vi.advanceTimersByTime(MATCH_RESET_MS);
     const st2 = io.state('p1');
-    expect(st2.phase).toBe('playing');
-    expect(st2.round).toBe(1);
+    expect(st2.phase).toBe('lobby');
+    expect(st2.awaitingStart).toBe(true);
+    expect(st2.round).toBe(0);
     expect(st2.pot).toBe(0);
     expect(st2.rollCount).toBe(0);
-    expect(st2.currentId).toBe('p1');
+    expect(st2.currentId).toBeNull();
+    expect(st2.turnEndsAt).toBe(0);
     expect(st2.winnerId).toBeNull();
     expect(player(st2, 'p1').score).toBe(0);
     expect(player(st2, 'p2').score).toBe(0);
     expect(player(st2, 'p1').banked).toBe(false);
+    // ...and it STAYS there: no timer, no joiner, nothing restarts it
+    vi.advanceTimersByTime(MATCH_RESET_MS * 4);
+    expect(io.state('p1').phase).toBe('lobby');
+    // any seated player may open the next match
+    room.handleMessage('p2', { t: 'start' });
+    const st3 = io.state('p1');
+    expect(st3.phase).toBe('playing');
+    expect(st3.round).toBe(1);
+    expect(st3.awaitingStart).toBe(false);
+    expect(st3.currentId).toBe('p1');
+    expect(player(st3, 'p1').score).toBe(0);
+  });
+
+  it('post-match lobby: a JOINER does not restart it; only {t:start} does', () => {
+    const io = new FakeIO();
+    // Race mode is the cheapest route to matchEnd: no round cap, the match ends
+    // the moment a bank crosses raceTarget. One roll per round keeps every roll
+    // inside the safe window, so a 7 can never bust and the loop always ends.
+    const race = bootVariant(io, [['p1', 'Alice'], ['p2', 'Bob']], { raceTarget: 500 });
+    let t = EPOCH + 1_000;
+    for (let i = 0; i < 400; i++) {
+      const phase = io.state('p1').phase;
+      if (phase === 'matchEnd') break;
+      if (phase === 'roundEnd') {
+        vi.advanceTimersByTime(ROUND_END_MS);
+        t += ROUND_END_MS;
+        continue;
+      }
+      rollAt(race, io, t);
+      t += 1_000;
+      if (io.state('p1').phase !== 'playing') continue;
+      race.handleMessage('p1', { t: 'bank' });
+      if (io.state('p1').phase !== 'playing') continue;
+      race.handleMessage('p2', { t: 'bank' }); // both banked => round ends
+    }
+    expect(io.state('p1').phase).toBe('matchEnd');
+    vi.advanceTimersByTime(MATCH_RESET_MS);
+    expect(io.state('p1').phase).toBe('lobby');
+    expect(io.state('p1').awaitingStart).toBe(true);
+    // a NEW seat arriving must not silently kick the next match off
+    race.addPlayer('p3', 'Carol');
+    expect(io.state('p1').phase).toBe('lobby');
+    expect(io.state('p1').players).toHaveLength(3);
+    // ...the explicit start does, and the joiner is allowed to send it
+    race.handleMessage('p3', { t: 'start' });
+    expect(io.state('p1').phase).toBe('playing');
+    expect(io.state('p1').awaitingStart).toBe(false);
+  });
+
+  it('start is ignored below MIN_PLAYERS and outside the lobby', () => {
+    const io = new FakeIO();
+    const room = boot(io, [['p1', 'Alice']]); // 1 seat: cold lobby, no auto-start
+    expect(io.state('p1').phase).toBe('lobby');
+    expect(io.state('p1').awaitingStart).toBe(false); // COLD lobby, not post-match
+    room.handleMessage('p1', { t: 'start' }); // too few players => ignored
+    expect(io.state('p1').phase).toBe('lobby');
+    // the cold lobby still auto-starts on reaching MIN_PLAYERS (unchanged)
+    room.addPlayer('p2', 'Bob');
+    expect(io.state('p1').phase).toBe('playing');
+    // mid-match start is ignored and does NOT reset the round or the scores
+    const before = io.state('p1');
+    room.handleMessage('p2', { t: 'start' });
+    const after = io.state('p1');
+    expect(after.phase).toBe('playing');
+    expect(after.round).toBe(before.round);
+    expect(after.currentId).toBe(before.currentId);
+    // and it is ignored during the round-end pause too
+    room.handleMessage('p1', { t: 'bank' });
+    room.handleMessage('p2', { t: 'bank' });
+    expect(io.state('p1').phase).toBe('roundEnd');
+    room.handleMessage('p1', { t: 'start' });
+    expect(io.state('p1').phase).toBe('roundEnd');
+  });
+
+  it('seats MAX_PLAYERS, rotates in join order, and rejects the seat past the cap', () => {
+    const io = new FakeIO();
+    // MAX_PLAYERS is 32; the ids are zero-padded so the join order and the
+    // string order agree and an off-by-one in the rotation is visible.
+    const seats: Array<readonly [PlayerId, string]> = [];
+    for (let i = 0; i < MAX_PLAYERS; i++) {
+      const n = String(i + 1).padStart(2, '0');
+      seats.push([`p${n}`, `Player ${n}`] as const);
+    }
+    const room = boot(io, seats);
+    expect(room.playerCount()).toBe(MAX_PLAYERS);
+    expect(room.info().maxPlayers).toBe(MAX_PLAYERS);
+    const st = io.state('p01');
+    expect(st.phase).toBe('playing'); // filled well past MIN_PLAYERS
+    expect(st.players).toHaveLength(MAX_PLAYERS);
+    expect(st.players.map((p) => p.id)).toEqual(seats.map(([id]) => id)); // join order
+    expect(st.currentId).toBe('p01'); // the first seat opens the round
+
+    // one seat past the cap is refused with room_full, and the table is unchanged
+    room.addPlayer('p33', 'Overflow');
+    expect(room.playerCount()).toBe(MAX_PLAYERS);
+    expect(io.state('p01').players).toHaveLength(MAX_PLAYERS);
+    expect(io.errors('p33')).toEqual([
+      { t: 'error', code: 'room_full', message: 'room is full' },
+    ]);
+    expect(() => io.state('p33')).toThrow(); // a refused seat gets no bank_state
+
+    //  TURN ROTATION over a FULL cycle: all 32 seats in join order, then back to
+    //  the first. A bust would cut the round short, so every roll time is
+    //  pre-selected (the file's probe technique) to be non-bust — the walk then
+    //  survives all 32 turns and the assertion is about ORDER, not luck.
+    const history: number[] = [];
+    let t = EPOCH + 1_000;
+    const visited: Array<string | null> = [st.currentId];
+    for (let i = 0; i < MAX_PLAYERS; i++) {
+      const when = findRollTime(history, (ev) => ev.effect !== 'bust7', t);
+      history.push(when);
+      t = when + 1;
+      expect(rollAt(room, io, when, 'p01').effect).not.toBe('bust7');
+      expect(io.state('p01').phase).toBe('playing'); // the round survived the roll
+      visited.push(io.state('p01').currentId);
+    }
+    expect(visited.slice(0, MAX_PLAYERS)).toEqual(seats.map(([id]) => id));
+    expect(visited[MAX_PLAYERS]).toBe('p01'); // one full cycle wraps to seat 1
+    expect(io.state('p01').rollCount).toBe(MAX_PLAYERS);
+  });
+
+  it('auto-rolls at the NEW TURN_SECONDS, and not a tick before it', () => {
+    const io = new FakeIO();
+    boot(io, [['p1', 'Alice'], ['p2', 'Bob']]);
+    expect(TURN_SECONDS).toBe(12); // pacing contract: config.ts
+    expect(io.state('p1').turnEndsAt).toBe(Date.now() + TURN_MS);
+    // one millisecond short of the deadline nothing has happened yet
+    vi.advanceTimersByTime(TURN_MS - 1);
+    expect(io.events('p1', 'auto_roll')).toHaveLength(0);
+    expect(io.state('p1').currentId).toBe('p1');
+    // ...and on the deadline the server rolls for the seat that stalled
+    vi.advanceTimersByTime(1);
+    expect(io.events('p1', 'auto_roll')).toHaveLength(1);
+    expect(io.state('p1').rollCount).toBe(1);
+    expect(io.state('p1').currentId).toBe('p2');
+    expect(io.state('p1').turnEndsAt).toBe(Date.now() + TURN_MS); // fresh 12 s for p2
   });
 
   it('auto-rolls for the current player when the turn timer expires', () => {
@@ -649,13 +795,20 @@ describe('BankRoom variants', () => {
     expect(io.events('p1', 'round_end')).toHaveLength(0); // race win skips round_end
     vi.advanceTimersByTime(ROUND_END_MS); // no roundEnd pause runs a new round
     expect(io.state('p1').phase).toBe('matchEnd');
-    // the usual matchEnd reset still applies afterwards
+    // the usual matchEnd reset still applies afterwards — into a WAITING lobby
     vi.advanceTimersByTime(MATCH_RESET_MS);
     const st2 = io.state('p1');
-    expect(st2.phase).toBe('playing');
-    expect(st2.round).toBe(1);
+    expect(st2.phase).toBe('lobby');
+    expect(st2.awaitingStart).toBe(true);
+    expect(st2.round).toBe(0);
     expect(player(st2, 'p1').score).toBe(0);
     expect(player(st2, 'p2').score).toBe(0);
+    // ...and the manual start opens the next race with the same frozen variant
+    room.handleMessage('p1', { t: 'start' });
+    const st3 = io.state('p1');
+    expect(st3.phase).toBe('playing');
+    expect(st3.round).toBe(1);
+    expect(st3.settings.raceTarget).toBe(500);
   });
 
   it('createRoom throws on bad settings (the lobby surfaces bad_settings)', () => {

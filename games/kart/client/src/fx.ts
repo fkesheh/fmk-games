@@ -43,7 +43,7 @@
 // emitter is a safe no-op (juice must never crash a race).
 // ============================================================================
 import * as THREE from 'three';
-import { KPAL } from '@kart/shared';
+import { KPAL, MAX_PLAYERS } from '@kart/shared';
 import { decoSeed, rng, rngRange } from '@platform/shared';
 import type { KartScene } from './render.js';
 
@@ -108,7 +108,10 @@ const DRIFT_SPARK_HOT = 0.75; // heat at which they go white-gold
 // sharing an envelope there reads correctly; anywhere else on the circuit a
 // rival's slide can no longer touch yours. Single-kart rate math is unchanged:
 // 22.2 puffs/s x 0.11 = 2.44/s gain vs 1.7/s decay => ~1.0 s ramp to white-gold.
-const HEAT_STREAMS = 8; // MAX_PLAYERS — every kart in a full room can slide at once
+// Derived, never a literal: one envelope per kart, so every kart in a full room
+// can slide at once. Hard-coding this is what let it drift out of step with the
+// player cap before — the import IS the coupling.
+const HEAT_STREAMS = MAX_PLAYERS;
 const HEAT_STREAM_R2 = 3 * 3; // squared match radius (m²)
 const FX_SEED_SALT = 0xf3;
 

@@ -43,20 +43,41 @@ export const WPAL = {
   paperDeep: '#585349', //        L 36  disabled
 
   // ---- semantic states (never colour ALONE — pair with icon/weight) --------
-  accept: '#5fc98a', //           L 73  a valid lock
-  reject: '#c0564a', //           L 48  a refused submission
-  unique: '#7fb8f0', //           L 72  nobody else found it — the prize state
-  split: '#b08fd0', //            L 62  shared with others
+  // Placed on the SAME 12-hue x 2-lightness grid as the chips, so a state can
+  // never collide with a player's identity colour. An earlier hand-picked set
+  // had accept/unique/split BYTE-IDENTICAL to p3/p2/p5 — on the reveal screen,
+  // where a chip and a state sit side by side, that is unreadable.
+  accept: '#59c58f', //           H 150  L 72  a valid lock
+  reject: '#c23838', //           H   0  L 45  a refused submission
+  unique: '#8cb5dd', //           H 210  L 72  nobody else found it — the prize
+  split: '#c1a6dd', //            H 269  L 72  shared with others
 
-  // ---- player chips ----
-  p1: '#f0a63c',
-  p2: '#7fb8f0',
-  p3: '#5fc98a',
-  p4: '#d97fb0',
-  p5: '#b08fd0',
-  p6: '#e8d060',
-  p7: '#6fd0c8',
-  p8: '#e8845c',
+  // ---- player chips (MAX_PLAYERS = 20) ------------------------------------
+  // COMPUTED, not hand-picked, on a 12-hue x 2-lightness grid: neighbours in
+  // hue are 30 deg apart (bar is 25) and same-hue pairs are ~27 L* apart (bar
+  // is 20), so all 24 chip+state colours are mutually distinguishable with a
+  // measured minimum margin of +4.45. Hand-picking produced 5 confusable pairs
+  // and 3 exact duplicates; `valueLadder.test.ts` caught them.
+  p1: '#e1a0a0', //          H   0  L 72
+  p2: '#935f2b', //          H  30  L 45
+  p3: '#d5a97c', //          H  30  L 72
+  p4: '#6e6e20', //          H  60  L 45
+  p5: '#b6b639', //          H  60  L 72
+  p6: '#4c7622', //          H  90  L 45
+  p7: '#81c23f', //          H  90  L 72
+  p8: '#247b24', //          H 120  L 45
+  p9: '#52c852', //          H 120  L 72
+  p10: '#23794e', //         H 150  L 45
+  p11: '#227676', //         H 180  L 45
+  p12: '#3fc2c2', //         H 180  L 72
+  p13: '#316daa', //         H 210  L 45
+  p14: '#5c5cd0', //         H 240  L 45
+  p15: '#acace5', //         H 240  L 72
+  p16: '#8a49ca', //         H 270  L 45
+  p17: '#af33af', //         H 300  L 45
+  p18: '#df98df', //         H 300  L 72
+  p19: '#bb3678', //         H 330  L 45
+  p20: '#e09cbe', //         H 330  L 72
 } as const;
 
 export type WordbombPaletteKey = keyof typeof WPAL;
@@ -96,9 +117,24 @@ export const WPAL_CSS_VARS: Record<WordbombPaletteKey, string> = {
   p6: '--p6',
   p7: '--p7',
   p8: '--p8',
+  p9: '--p9',
+  p10: '--p10',
+  p11: '--p11',
+  p12: '--p12',
+  p13: '--p13',
+  p14: '--p14',
+  p15: '--p15',
+  p16: '--p16',
+  p17: '--p17',
+  p18: '--p18',
+  p19: '--p19',
+  p20: '--p20',
 };
 
 /** Chip colour by seat index. */
 export const WORDBOMB_COLORS: string[] = [
-  WPAL.p1, WPAL.p2, WPAL.p3, WPAL.p4, WPAL.p5, WPAL.p6, WPAL.p7, WPAL.p8,
+  WPAL.p1, WPAL.p2, WPAL.p3, WPAL.p4, WPAL.p5,
+  WPAL.p6, WPAL.p7, WPAL.p8, WPAL.p9, WPAL.p10,
+  WPAL.p11, WPAL.p12, WPAL.p13, WPAL.p14, WPAL.p15,
+  WPAL.p16, WPAL.p17, WPAL.p18, WPAL.p19, WPAL.p20,
 ];

@@ -12,6 +12,7 @@ import {
   COUNTDOWN_SECONDS,
   GATES,
   LAPS_TO_WIN,
+  MAX_PLAYERS,
   NITRO_CHARGES,
   NITRO_TIME,
   RACE_TIMEOUT_S,
@@ -170,7 +171,7 @@ describe('KartRoom phase flow', () => {
     expect(room.info().phase).toBe('lobby');
     expect(room.info().game).toBe('kart');
     expect(room.info().label).toBe('3 laps · circuit');
-    expect(room.info().maxPlayers).toBe(8);
+    expect(room.info().maxPlayers).toBe(MAX_PLAYERS); // never a literal: the cap moves
 
     room.addPlayer('p2', 'Bravo');
     advanceToPhase(io, 'p1', 'ready');

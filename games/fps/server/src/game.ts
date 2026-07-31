@@ -33,7 +33,6 @@ import {
   rewindTicks,
   rng,
   rngInt,
-  rngPick,
   shotSeed,
   stepBody,
 } from '@fps/shared';
@@ -140,6 +139,10 @@ interface BotState {
 const ROOM_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 let roomSeq = 0; // mixes into the rng seed so same-ms rooms still differ
 
+/** Min gap between two freshly placed teammates (2.5x the PLAYER.radius AABB
+    diagonal): closer than this and the two bodies interpenetrate at spawn. */
+const SPAWN_MIN_SEP = 1.5;
+
 function randomToken(next: () => number, len: number): string {
   let s = '';
   for (let i = 0; i < len; i++) s += ROOM_ALPHABET.charAt(rngInt(next, 0, ROOM_ALPHABET.length - 1));
@@ -177,6 +180,10 @@ export class GameRoom {
   // queued team-switch requests (made during freeze/live/roundEnd/matchEnd),
   // applied at the next beginFreeze; warmup switches apply immediately instead
   private readonly teamSwitchQueue = new Map<PlayerId, Team>();
+
+  // spawn indices already handed out in the current spawn wave, per team.
+  // Cleared by beginSpawnWave() at the start of every full placement pass.
+  private readonly spawnTaken: Record<Team, Set<number>> = { T: new Set(), CT: new Set() };
 
   // tick scratch, reused across ticks (hot-path allocation ban)
   private readonly snapPlayers: PlayerSnap[] = [];
@@ -785,6 +792,7 @@ export class GameRoom {
     // advanceAfterRound, so guards below see post-swap teams); placeAtSpawn in
     // the loop then teleports switchers to their NEW team's spawns
     this.applyQueuedTeamSwitches();
+    this.beginSpawnWave(); // one claim set per round: no two teammates share a point
     for (const p of this.players.values()) {
       this.placeAtSpawn(p, now); // teleported, healed, protected
       this.refillWeapons(p); // every owned weapon refills mag+reserve for free
@@ -858,6 +866,7 @@ export class GameRoom {
     this.round = 0;
     this.scoreT = 0;
     this.scoreCT = 0;
+    this.beginSpawnWave();
     for (const p of this.players.values()) {
       p.money = ECONOMY.start;
       p.weapons = ['knife', 'pistol'];
@@ -1158,7 +1167,7 @@ export class GameRoom {
   // -------------------------------------------------------------------------
 
   private placeAtSpawn(p: PlayerState, now: number): void {
-    const spawn = this.pickSpawn(p.team);
+    const spawn = this.pickSpawn(p.team, p.id);
     p.body = makeBody(spawn.x, 0, spawn.z);
     p.yaw = spawn.yaw;
     p.pitch = 0;
@@ -1174,14 +1183,66 @@ export class GameRoom {
     p.spawnProtectedUntil = now + ROUNDS.spawnProtection * 1000;
   }
 
-  private pickSpawn(team: Team): SpawnPoint {
+  /** A placement pass (round freeze, full reset) starts with a clean claim set. */
+  private beginSpawnWave(): void {
+    this.spawnTaken.T.clear();
+    this.spawnTaken.CT.clear();
+  }
+
+  /**
+   * Pick a spawn point for `self` on `team`.
+   *
+   * At 7 a side over 7 spawn points, picking randomly WITH REPLACEMENT puts two
+   * teammates on the same point — two AABBs inside each other. So each pick
+   * CLAIMS a spawn index for the current wave and never reuses a claimed one
+   * while a free one exists; on top of that, any spawn with a living teammate
+   * already within SPAWN_MIN_SEP is treated as occupied (this also covers
+   * drop-ins, warmup respawns and team switches, which are waves of one).
+   * The pre-existing "avoid spawning near a live enemy" rule is kept as the
+   * weakest preference. Single bounded pass over the list: never loops, never
+   * throws, and always returns a real spawn.
+   */
+  private pickSpawn(team: Team, self: PlayerId): SpawnPoint {
     const list = this.map.spawns[team];
-    let pick = rngPick(this.next, list);
-    // retry up to 4x while an alive enemy is within 10m, then accept
-    for (let attempt = 0; attempt < 4 && this.enemyWithin(team, pick.x, pick.z, 10); attempt++) {
-      pick = rngPick(this.next, list);
+    const taken = this.spawnTaken[team];
+    if (list.length === 0) return { x: 0, z: 0, yaw: 0 }; // unreachable: maps ship >= 7
+    if (taken.size >= list.length) taken.clear(); // more bodies than points: reuse from scratch
+    // Penalties, ordered by severity, so the minimum is the least-crowded spawn.
+    // A body on the point (100/teammate) always outweighs a stale claim (50),
+    // which always outweighs a nearby enemy (10).
+    let best = -1;
+    let bestScore = Infinity;
+    const offset = list.length > 0 ? Math.floor(this.next() * list.length) % list.length : 0;
+    for (let i = 0; i < list.length; i++) {
+      const idx = (offset + i) % list.length;
+      const s = list[idx];
+      if (s === undefined) continue;
+      let score = this.teammatesWithin(team, self, s.x, s.z, SPAWN_MIN_SEP) * 100;
+      if (taken.has(idx)) score += 50;
+      if (this.enemyWithin(team, s.x, s.z, 10)) score += 10;
+      if (score === 0) {
+        best = idx;
+        break;
+      }
+      if (score < bestScore) {
+        bestScore = score;
+        best = idx;
+      }
     }
+    const pick = best >= 0 ? list[best] : undefined;
+    if (pick === undefined) return list[0] ?? { x: 0, z: 0, yaw: 0 };
+    taken.add(best);
     return pick;
+  }
+
+  /** Living same-team players (excluding `self`) whose body is within `dist`. */
+  private teammatesWithin(team: Team, self: PlayerId, x: number, z: number, dist: number): number {
+    let n = 0;
+    for (const p of this.players.values()) {
+      if (p.id === self || p.team !== team || !p.alive) continue;
+      if (Math.hypot(p.body.x - x, p.body.z - z) < dist) n++;
+    }
+    return n;
   }
 
   private enemyWithin(team: Team, x: number, z: number, dist: number): boolean {

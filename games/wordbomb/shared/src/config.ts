@@ -10,7 +10,7 @@ export const ROUNDS_MIN = 5;
 export const ROUNDS_MAX = 20;
 
 export const MIN_PLAYERS = 2;
-export const MAX_PLAYERS = 8;
+export const MAX_PLAYERS = 20;
 
 // ---- timing (ms) -------------------------------------------------------------
 /**

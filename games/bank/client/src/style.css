@@ -92,6 +92,14 @@
      (the smallest supported viewport) `felt min-content + rail + actions +
      strip` still fits inside the stage. The list scrolls inside it. */
   --log-strip-h: clamp(76px, 15vh, 180px);
+  /* The rail now seats up to MAX_PLAYERS = 20. It wraps (3 rows on a desktop,
+     ~10 on a phone), and an UNCAPPED wrapping block in an `auto` grid row buys
+     its height straight out of the felt's `1fr` row — the exact failure mode
+     the stage grid was built to prevent, just arriving from a new direction.
+     So the rail is capped here and scrolls internally, the same contract the
+     log strip already runs under: bounded from above, shrinkable from below,
+     height independent of how many people are seated. */
+  --rail-max-h: clamp(104px, 28vh, 265px);
   --serif: Georgia, 'Times New Roman', serif;
 
   color-scheme: dark;
@@ -520,9 +528,13 @@ body {
   min-width: 0;
   min-height: 0;
   display: grid;
-  /* same priority rule one level down: the felt row's floor is the felt's own
-     min-content, so the rail and the buttons can never crush it either */
-  grid-template-rows: minmax(min-content, 1fr) auto auto;
+  /*  same priority rule one level down: the felt row's floor is the felt's own
+      min-content, so the queue, the rail and the buttons can never crush it.
+      Four tracks: felt · turn-queue · player-rail · actions. The queue is one
+      line and the rail is capped (`--rail-max-h`), so rows 2–4 are bounded no
+      matter how many of the 20 seats are filled. A build without the queue
+      simply leaves track 2 at zero height. */
+  grid-template-rows: minmax(min-content, 1fr) auto auto auto;
   align-items: stretch;
   justify-items: center;
   gap: clamp(6px, 1.1vh, 14px);
@@ -956,6 +968,152 @@ body {
   }
 }
 
+/* ---- turn queue ------------------------------------------------------------------
+
+   A 20-seat table is ~9 rolls per round (the bust-7 sets the length, not the
+   seat count), so most players never roll in a given round and can sit ~20
+   turns between their own actions. The rules are not changing, so the queue's
+   whole job is ORIENTATION: name the roller, the next three, and the waiting
+   player's own distance from the front. It reads as a dealer's call line above
+   the rail — a thin brass-hairline plaque, deliberately quieter in value than
+   the felt and the pot so it never competes with them.
+
+   One line tall, so the felt loses ~34 px and keeps its dominance.            */
+
+.turn-queue {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  max-width: 100%;
+  padding: 6px 14px;
+  box-sizing: border-box;
+  border: 1px solid var(--gold-hair);
+  border-radius: 999px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--ink-lit) 82%, var(--felt-deep)),
+    color-mix(in srgb, var(--ink) 88%, var(--felt-deep))
+  );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--gold) 16%, transparent),
+    0 4px 12px -6px var(--shadow-hard);
+  font-size: 13px;
+  line-height: 1.2;
+}
+
+.turn-queue-label {
+  flex: 0 0 auto;
+  color: var(--gold-deep);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.24em;
+  text-indent: 0.24em;
+  text-transform: uppercase;
+}
+
+.turn-queue-list {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+  list-style: none;
+}
+
+.turn-queue-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  max-width: 11ch;
+  padding: 3px 9px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  color: var(--cream-dim);
+}
+
+/*  Rotation arrow BETWEEN entries (not on them), so the strip reads as an order
+    rather than as a row of tags. Decorative, hence a pseudo-element. */
+.turn-queue-item + .turn-queue-item::before {
+  content: '›';
+  margin-left: -4px;
+  color: var(--cream-faint);
+  font-size: 13px;
+}
+
+/*  The roller. Same accessibility rule as the rail (§5): never colour alone —
+    the 'NOW' ordinal (text), the filled plaque (background) and the heavier
+    type each carry the state independently. */
+.turn-queue-item.now {
+  border-color: color-mix(in srgb, var(--gold) 44%, transparent);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--gold) 20%, transparent),
+    color-mix(in srgb, var(--gold-deep) 10%, transparent)
+  );
+  color: var(--cream);
+  font-weight: 700;
+}
+
+.turn-queue-item.you .turn-queue-name {
+  color: var(--gold-bright);
+  text-decoration: underline;
+  text-decoration-color: var(--gold-hair);
+  text-underline-offset: 3px;
+}
+
+/*  Ordinal: 'NOW', then 2 / 3 / 4, then the '+N' tail. Tabular so the plaques
+    do not jitter as the rotation advances. */
+.turn-queue-pos {
+  flex: 0 0 auto;
+  color: var(--gold);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  font-variant-numeric: tabular-nums;
+}
+
+.turn-queue-item.now .turn-queue-pos {
+  color: var(--gold-bright);
+}
+
+.turn-queue-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/*  '+14 more seats behind these four' — the cue that makes a deep table read as
+    deep instead of as a four-player game. */
+.turn-queue-more {
+  color: var(--cream-faint);
+  font-style: italic;
+}
+
+/*  The waiting player's own distance from the front: 'YOU IN 14'. This is the
+    single most useful string on the strip for the 16 people who will not roll
+    this round, so it gets the right-hand anchor and a rule to separate it. */
+.turn-queue-eta {
+  flex: 0 0 auto;
+  padding-left: 12px;
+  border-left: 1px solid var(--gold-hair);
+  color: var(--cream-dim);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  font-variant-numeric: tabular-nums;
+}
+
+/* your turn, or you are next: promote it to gold so it catches the eye */
+.turn-queue-eta.soon {
+  color: var(--gold-bright);
+  text-shadow: 0 0 10px color-mix(in srgb, var(--gold-bright) 40%, transparent);
+}
+
 /* ---- player rail --------------------------------------------------------------- */
 
 .player-rail {
@@ -963,7 +1121,36 @@ body {
   flex-wrap: wrap;
   justify-content: center;
   align-items: stretch;
+  /* rows pack from the top, so a partially-scrolled rail never floats its rows */
+  align-content: flex-start;
   gap: 10px;
+  /*  20 seats. See `--rail-max-h`: bounded height + internal scroll, so the
+      felt's share of the stage is the same with 2 players and with 20.
+      The padding is not cosmetic — `.player-chip.current` lifts 4 px and paints
+      a 5 px ring, and an `overflow` container with no padding would slice both
+      off. `overflow-x: hidden` keeps the page itself free of a horizontal
+      scrollbar at 360 px, which is a layout bug there, never content. */
+  /* offsetParent for the chips, so game.ts's keep-the-roller-visible scroll
+     measures against the rail and not against `.table-stage` */
+  position: relative;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: var(--felt-w);
+  max-height: var(--rail-max-h);
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 10px 6px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--gold-deep) transparent;
+}
+
+/*  `.scrolls` is set by game.ts only when the rail actually overflows (it can
+    still do so on a phone, where 32 chips are ~11 rows). A hard cut at the cap
+    reads as a clipping BUG; a short fade at the bottom edge reads as "there is
+    more below". Deliberately short (18 px) so it never obscures a whole chip —
+    the roller is scrolled into view separately. */
+.player-rail.scrolls {
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 18px), transparent 100%);
 }
 
 .player-chip {
@@ -1163,12 +1350,179 @@ body {
   background: linear-gradient(90deg, var(--gold-bright), var(--gold) 50%, var(--gold-deep));
 }
 
+/* ---- dense rail (13+ seats) -------------------------------------------------------
+
+   MAX_PLAYERS is 32. At full chip size that is ~150 px x 32 = five wrapped rows
+   on a 1120 px felt and eleven on a 430 px phone — a wall of chips, not a rail.
+   Past `DENSE_SEATS` (game.ts) the rail switches to this compact form, which
+   fits 32 seats into ~4 rows at 1600x900 with no scrolling at all.
+
+   What is dropped is only REDUNDANT signal: the per-chip prose ('IN' /
+   'BANKED' / 'AWAY') and the decorative chip stack. Every state still carries a
+   non-colour cue without them (VISUAL_UPGRADE §5) — current keeps its caret,
+   lift, ring and weight; banked keeps the ✓ glyph; offline keeps the dashed
+   border. The prose is KEPT on the current chip, the one seat where it earns
+   its width. Score and name — the two things you actually scan a rail for —
+   are untouched.                                                              */
+
+.player-rail.dense {
+  gap: 7px;
+}
+
+/*  Row PITCH is what decides whether 32 seats fit: at ~6 chips per row a 32-seat
+    rail is six rows, so every pixel of chip height costs six. 4 px of vertical
+    padding on a 20 px avatar gives a 30 px chip and a 36 px pitch, which lands
+    the whole rail inside `--rail-max-h` at 1600x900. Horizontal padding is left
+    generous — it costs nothing in height and keeps the chips from looking
+    starved. */
+.player-rail.dense .player-chip {
+  gap: 7px;
+  padding: 4px 11px;
+  font-size: 13px;
+}
+
+.player-rail.dense .player-chip.current {
+  padding: 3px 10px; /* 2 px border compensation, as in the base rule */
+  transform: translateY(-2px); /* a smaller lift: the rows are tighter here */
+}
+
+.player-rail.dense .player-avatar {
+  width: 20px;
+  height: 20px;
+  font-size: 10px;
+}
+
+/*  16-char names are legal; unbounded they defeat the whole point of the dense
+    row. Truncate with an ellipsis and keep the full name in the queue strip and
+    the log. */
+.player-rail.dense .player-name {
+  max-width: 9ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.player-rail.dense .player-you {
+  padding: 1px 5px;
+  font-size: 9px;
+}
+
+.player-rail.dense .chip-stack,
+.player-rail.dense .player-state {
+  display: none;
+}
+
+/* the one seat where the word is worth its width */
+.player-rail.dense .player-chip.current .player-state {
+  display: inline-block;
+}
+
+/* ---- narrow / short: give height back to the felt ---------------------------------
+
+   Must sit AFTER the queue and rail base rules — same specificity, source order
+   decides the winner. (The portrait block up by `.felt` is above them, so
+   putting these there would silently do nothing; that exact trap is documented
+   at the top of that block.)                                                   */
+
+@media (orientation: portrait), (max-height: 640px) {
+  .turn-queue {
+    gap: 4px 9px;
+    padding: 5px 11px;
+    font-size: 12px;
+  }
+
+  /* the ETA is the line a waiting player needs; 'UP NEXT' is the line they can
+     infer from the plaques themselves. Drop the label, keep the ETA. */
+  .turn-queue-label {
+    display: none;
+  }
+
+  /*  ONE LINE, always. Left to wrap, four name plaques plus the ETA take three
+      lines at 360 px — 74 px of a 554 px stage, taken from the felt and from
+      the log strip (which had collapsed to a 19 px sliver). Nowrap + an
+      internal horizontal scroll pins the height at one line and keeps the ETA
+      anchored on the right, where it is the part that must never scroll away.
+      The scroll is INSIDE the strip; the page itself still never scrolls
+      sideways, which is the actual responsive contract. */
+  .turn-queue {
+    flex-wrap: nowrap;
+    overflow: hidden;
+  }
+
+  .turn-queue-list {
+    flex: 1 1 auto;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .turn-queue-list::-webkit-scrollbar {
+    display: none;
+  }
+
+  .turn-queue-item {
+    flex: 0 0 auto;
+    max-width: 8ch;
+    padding: 2px 7px;
+  }
+
+  .turn-queue-eta {
+    padding-left: 9px;
+    font-size: 9px;
+    letter-spacing: 0.1em;
+  }
+
+  .player-rail {
+    max-height: clamp(92px, 19vh, 175px);
+    padding: 8px 4px;
+  }
+
+  /*  32 seats on a 410 px column. At the desktop dense width only TWO chips fit
+      per row, which turns the rail into a 16-row column that is 90 % scrolled
+      out of view. Trading name length for a third column halves the row count,
+      and the truncated name is not the load-bearing signal here: the initial in
+      the avatar and the position in the queue strip both survive intact, and
+      the full name is one tap away in the log. */
+  .player-rail.dense {
+    gap: 6px;
+  }
+
+  .player-rail.dense .player-chip {
+    gap: 5px;
+    padding: 3px 7px;
+    font-size: 12px;
+  }
+
+  .player-rail.dense .player-chip.current {
+    padding: 2px 6px;
+  }
+
+  .player-rail.dense .player-avatar {
+    width: 18px;
+    height: 18px;
+    font-size: 9px;
+  }
+
+  .player-rail.dense .player-name {
+    max-width: 6ch;
+  }
+}
+
 /* ---- actions ------------------------------------------------------------------ */
 
 .table-actions {
   display: flex;
   justify-content: center;
   gap: 16px;
+}
+
+/*  START — lobby-only. Sized like ROLL because it plays the same role there:
+    the one thing to press. `btn-gold` already carries the treatment; this only
+    matches the scale so the actions row does not change height between the
+    lobby and the table. */
+.btn-start {
+  padding: clamp(13px, 2vh, 18px) clamp(26px, 4vw, 44px);
+  font-size: clamp(16px, 2.2vh, 20px);
 }
 
 .btn-roll {

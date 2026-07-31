@@ -47,7 +47,12 @@ export const GATES = 8; // checkpoints incl. start/finish at gate 0
 export const GATE_RADIUS = 9; // m
 export const LAPS_TO_WIN = 3;
 export const MIN_PLAYERS = 2;
-export const MAX_PLAYERS = 8;
+// 20-kart grid. Three things are TIED to this number and must move with it:
+// KART_COLORS.length (palette.ts — one distinct livery per slot, gated in
+// valueLadder.test.ts), fx.HEAT_STREAMS (client — one drift-heat envelope per
+// simultaneously sliding kart), and gridSlot() (track.ts — procedural, already
+// extends: slot 19 sits 42 m behind the line).
+export const MAX_PLAYERS = 20;
 export const READY_SECONDS = 5; // 'ready' before countdown
 export const COUNTDOWN_SECONDS = 3;
 export const RESULTS_SECONDS = 10;

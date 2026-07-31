@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <meta
+      name="description"
+      content="WORDBOMB — everyone gets the same fragment, a hidden fuse burns, every answer is revealed at once."
+    />
+    <title>WORDBOMB</title>
+    <!-- Pre-boot paint guard only; the real stylesheet is src/style.css.
+         The colour below MUST stay equal to `:root { --ink }` / WPAL.ink
+         (#0d1014) in src/style.css, or the pre-boot flash diverges from the app.
+         No external assets and no external fonts anywhere in this game. -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #0d1014;
+        color-scheme: dark;
+      }
+    </style>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

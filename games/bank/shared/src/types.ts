@@ -13,7 +13,14 @@ export interface BankSettings {
 
 
 /** Room-level messages (the platform lobby handles join/leave/list itself). */
-export type BankC2S = { t: 'roll' } | { t: 'bank' };
+/**
+ * `start` is ADDITIVE (the two existing tags are untouched): a room no longer
+ * auto-restarts after a match ends, so any seated player may open the next one
+ * from the lobby. It is a request, never a command — the room ignores it
+ * outside `lobby` or below MIN_PLAYERS. The FIRST match of a fresh room still
+ * auto-starts on reaching MIN_PLAYERS; only the post-match restart is manual.
+ */
+export type BankC2S = { t: 'roll' } | { t: 'bank' } | { t: 'start' };
 
 export interface BankPlayerState {
   id: string;
@@ -49,6 +56,14 @@ export interface BankState {
   lastRoll: LastRoll | null;
   winnerId: string | null; // set at matchEnd
   code: string | null; // the room's private join code (null for public rooms)
+  /**
+   * ADDITIVE. True only in a POST-MATCH lobby: the previous match finished, the
+   * room reset, and it is now waiting for a seated player to send `{t:'start'}`
+   * instead of restarting itself. False in a fresh lobby (which still
+   * auto-starts on reaching MIN_PLAYERS) and false during play, so a client
+   * that ignores the field sees exactly the behaviour it saw before.
+   */
+  awaitingStart: boolean;
   you: string; // the receiving player's id (per-recipient)
 }
 

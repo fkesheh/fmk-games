@@ -5,8 +5,8 @@
 // same dustbowl solids the server sim uses — fully deterministic.
 // ============================================================================
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ECONOMY, GEAR, INPUT_FIRE, MAPS, MULTIKILL_WINDOW, PLAYER, WEAPONS, boxToAABB, hitscan } from '@fps/shared';
-import type { C2S, GameEvent, HitscanTarget, PlayerId, RoomPhase, S2C, Team, Vec3 } from '@fps/shared';
+import { ECONOMY, GEAR, INPUT_FIRE, MAPS, MAX_PLAYERS, MULTIKILL_WINDOW, PLAYER, WEAPONS, boxToAABB, hitscan } from '@fps/shared';
+import type { C2S, GameEvent, HitscanTarget, MapId, PlayerId, RoomPhase, S2C, Team, Vec3 } from '@fps/shared';
 import { GameRoom } from './game.js';
 import type { RoomIO } from './game.js';
 
@@ -98,6 +98,29 @@ function setupDuel(io: FakeIO): GameRoom {
   room.addPlayer('p2', 'Bravo');
   room.start();
   return room;
+}
+
+/**
+ * Aim point at `aimHeight` on the target's NEAR FACE rather than at its centre.
+ * A ray to the centre crosses the near face LOWER than the aim point, and the
+ * error grows with the vertical angle: point-blank against a target standing on
+ * a 0.9m block, a head-height aim enters the box at chest height and a
+ * `headshot: true` fight driver never fires. Pulling the aim point back by
+ * PLAYER.radius puts the intended band on the face the ray actually meets.
+ */
+function nearFaceAim(
+  me: { x: number; z: number },
+  tgt: { x: number; y: number; z: number },
+  aimHeight: number,
+): Vec3 {
+  const toX = tgt.x - me.x;
+  const toZ = tgt.z - me.z;
+  const flat = Math.hypot(toX, toZ) || 1e-9;
+  return {
+    x: tgt.x - (toX / flat) * PLAYER.radius,
+    y: tgt.y + aimHeight,
+    z: tgt.z - (toZ / flat) * PLAYER.radius,
+  };
 }
 
 function advanceToPhase(io: FakeIO, id: PlayerId, phase: RoomPhase, maxSteps = 500): void {
@@ -274,6 +297,7 @@ function fightUntilKill(
     const dy = aim.y - eye.y;
     const dz = aim.z - eye.z;
     const dist = Math.hypot(dx, dz) || 1e-9;
+    const aimFlat = dist;
     const len = Math.hypot(dx, dy, dz) || 1e-9;
     const dir: Vec3 = { x: dx / len, y: dy / len, z: dz / len };
     let clear: boolean;
@@ -294,7 +318,7 @@ function fightUntilKill(
     }
     // input yaw/pitch so the server's aimDir(yaw,pitch) equals `dir`
     let yaw = Math.atan2(-dx, -dz);
-    const pitch = Math.atan2(dy, dist);
+    const pitch = Math.atan2(dy, aimFlat);
 
     const moved = Math.hypot(me.x - lastX, me.z - lastZ);
     lastX = me.x;
@@ -424,11 +448,12 @@ function fightUntilHit(
     }
 
     const eye: Vec3 = { x: me.x, y: me.y + PLAYER.heightStand - PLAYER.eyeOffset, z: me.z };
-    const aim: Vec3 = { x: tgt.x, y: tgt.y + aimHeight, z: tgt.z };
+    const aim = nearFaceAim(me, tgt, aimHeight);
     const dx = aim.x - eye.x;
     const dy = aim.y - eye.y;
     const dz = aim.z - eye.z;
-    const dist = Math.hypot(dx, dz) || 1e-9;
+    const dist = Math.hypot(tgt.x - me.x, tgt.z - me.z) || 1e-9; // to the target CENTRE
+    const aimFlat = Math.hypot(dx, dz) || 1e-9;
     const len = Math.hypot(dx, dy, dz) || 1e-9;
     const dir: Vec3 = { x: dx / len, y: dy / len, z: dz / len };
     dbgDist = dist;
@@ -456,7 +481,7 @@ function fightUntilHit(
     dbgClear = clear;
     // input yaw/pitch so the server's aimDir(yaw,pitch) equals `dir`
     let yaw = Math.atan2(-dx, -dz);
-    const pitch = Math.atan2(dy, dist);
+    const pitch = Math.atan2(dy, aimFlat);
 
     const moved = Math.hypot(me.x - lastX, me.z - lastZ);
     lastX = me.x;
@@ -489,8 +514,13 @@ function fightUntilHit(
         }
       } else {
         // close (or path exhausted) but the line is blocked: orbit the target —
-        // forward pressure closes in, alternating strafe circles around cover
-        moveZ = dist > 0.6 ? 1 : 0;
+        // forward pressure closes in, alternating strafe circles around cover.
+        // Below 2 * PLAYER.radius the two AABBs interpenetrate and the shooter's
+        // eye sits inside the target's box, which hitscan cannot report a hit on
+        // (the entry t is behind the origin) — so back off instead of grinding
+        // into it. Reachable whenever the target is pinned against cover it
+        // cannot be pushed off, e.g. a spawn flush with a low block.
+        moveZ = dist > 0.95 ? 1 : dist < 0.8 ? -1 : 0;
         moveX = Math.floor(i / 40) % 2 === 0 ? 1 : -1;
       }
     }
@@ -850,8 +880,10 @@ describe('GameRoom stats', () => {
     expect(entry?.kills).toBe(1);
     expect(entry?.headshots).toBe(1);
 
-    // kill 2: v2 was lured to the fight, so it dies well inside MULTIKILL_WINDOW
-    fightUntilKill(room, io, feed, killer, v2, { cadence: 6, strict: true });
+    // kill 2: v2 keeps converging on the killer (it was already being lured
+    // during kill 1), so the follow-up lands well inside MULTIKILL_WINDOW no
+    // matter which of the seven spawns the three players drew.
+    fightUntilKill(room, io, feed, killer, v2, { cadence: 6, strict: true, lure: v2 });
     const kill2At = io.lastSnap(killer).serverTime;
     expect(kill2At - kill1At).toBeLessThanOrEqual(MULTIKILL_WINDOW * 1000);
 
@@ -1080,4 +1112,153 @@ describe('GameRoom suicide (console kill command)', () => {
     expect(eventsOfType(io, 'p1', 'kill').length).toBe(1);
     room.stop();
   });
+});
+
+// ---- 7v7 roster + spawn separation -------------------------------------------
+// MAX_PLAYERS is 14, so a full room is 7 a side over 7 spawn points per side.
+// That leaves zero slack: picking a spawn WITH REPLACEMENT (the old behaviour)
+// collides teammates onto one point, i.e. two bodies inside one AABB.
+
+const MAP_IDS: MapId[] = ['dustbowl', 'crossfire', 'office', 'frostbite', 'urbana', 'bunker'];
+
+/** Closest two spawn points on one side — the hard floor any placement can hit. */
+function minSpawnSeparation(mapId: MapId, team: Team): number {
+  const list = MAPS[mapId].spawns[team];
+  let m = Infinity;
+  for (let i = 0; i < list.length; i++) {
+    for (let j = i + 1; j < list.length; j++) {
+      const a = list[i];
+      const b = list[j];
+      if (a === undefined || b === undefined) continue;
+      m = Math.min(m, Math.hypot(a.x - b.x, a.z - b.z));
+    }
+  }
+  return m;
+}
+
+/** Seat `n` players in a fresh room and run it to the round-1 freeze wave. */
+function seatRoom(mapId: MapId, n: number): { io: FakeIO; room: GameRoom; ids: PlayerId[] } {
+  const io = new FakeIO();
+  const room = new GameRoom(mapId, 'public', io);
+  const ids: PlayerId[] = [];
+  for (let i = 0; i < n; i++) {
+    const id: PlayerId = `s${i}`;
+    room.addPlayer(id, `Seat ${i}`);
+    ids.push(id);
+  }
+  room.start();
+  return { io, room, ids };
+}
+
+/** Spawn positions of every seated player at the room's current tick, by team. */
+function positionsByTeam(io: FakeIO, ids: PlayerId[]): Record<Team, Array<{ x: number; z: number }>> {
+  const first = ids[0];
+  if (first === undefined) throw new Error('no seats');
+  const snap = io.lastSnap(first);
+  const out: Record<Team, Array<{ x: number; z: number }>> = { T: [], CT: [] };
+  for (const id of ids) {
+    const s = snap.players.find((p) => p.id === id);
+    if (s === undefined) throw new Error(`${id} missing from snapshot`);
+    out[teamOf(io, id)].push({ x: s.x, z: s.z });
+  }
+  return out;
+}
+
+/** Assert a placement wave: real spawn points, all distinct, never overlapping. */
+function assertWave(mapId: MapId, spots: Record<Team, Array<{ x: number; z: number }>>, wave: number): void {
+  for (const team of ['T', 'CT'] as Team[]) {
+    const mine = spots[team];
+    const points = MAPS[mapId].spawns[team];
+    expect(mine.length, `${mapId} wave ${wave}: ${team} seat count`).toBe(MAX_PLAYERS / 2);
+    // every body sits exactly on one of the side's spawn points
+    for (const p of mine) {
+      expect(
+        points.some((s) => s.x === p.x && s.z === p.z),
+        `${mapId} wave ${wave}: ${team} body at (${p.x}, ${p.z}) is a real spawn point`,
+      ).toBe(true);
+    }
+    // 7 players over 7 points => every point used exactly once (the regression)
+    const distinct = new Set(mine.map((p) => `${p.x},${p.z}`));
+    expect(distinct.size, `${mapId} wave ${wave}: ${team} distinct spawn points`).toBe(mine.length);
+    // and no pair closer than the separation target. 1.5m is the goal; where the
+    // map's own two closest spawn points sit nearer than that (bunker: 0.80m),
+    // that data-imposed floor is the best any placement can do.
+    const floor = Math.min(1.5, minSpawnSeparation(mapId, team));
+    let closest = Infinity;
+    for (let i = 0; i < mine.length; i++) {
+      for (let j = i + 1; j < mine.length; j++) {
+        const a = mine[i];
+        const b = mine[j];
+        if (a === undefined || b === undefined) continue;
+        closest = Math.min(closest, Math.hypot(a.x - b.x, a.z - b.z));
+      }
+    }
+    expect(
+      closest + 1e-9,
+      `${mapId} wave ${wave}: closest ${team} teammates ${closest.toFixed(2)}m (floor ${floor.toFixed(2)}m)`,
+    ).toBeGreaterThanOrEqual(floor);
+  }
+}
+
+describe('GameRoom 7v7 roster', () => {
+  it('14 players seat as 7v7; a 15th human is refused and bots find no slot', () => {
+    const { io, room, ids } = seatRoom('dustbowl', MAX_PLAYERS);
+    vi.advanceTimersByTime(200);
+
+    expect(MAX_PLAYERS).toBe(14);
+    expect(room.playerCount()).toBe(14);
+    expect(room.info().maxPlayers).toBe(14);
+
+    const teams = ids.map((id) => teamOf(io, id));
+    expect(teams.filter((t) => t === 'T').length).toBe(7);
+    expect(teams.filter((t) => t === 'CT').length).toBe(7);
+
+    // full of humans: no bot to displace, so the join is refused outright
+    room.addPlayer('overflow', 'Fifteen');
+    expect(room.playerCount()).toBe(14);
+    expect(() => io.joined('overflow')).toThrow();
+    expect(room.addBot()).toBeNull();
+
+    // a full room still runs the match, and everyone is placed
+    expect(io.lastSnap('s0').phase).toBe('freeze');
+    expect(io.lastSnap('s0').players.length).toBe(14);
+    room.stop();
+  });
+});
+
+describe('GameRoom spawn separation at 7v7', () => {
+  // Every wave is a fresh room, so every wave draws a different rng seed
+  // (roomSeq mixes into the seed). 50 waves x 6 maps = 300 independent 7v7
+  // placements per run. Note the round-1 freeze is the adversarial case: all 14
+  // bodies are already standing on spawn points from their drop-in placement,
+  // so the wave has to re-seat everyone with every point already occupied.
+  for (const mapId of MAP_IDS) {
+    it(`${mapId}: 50 seeded 7v7 waves never double up a spawn point`, () => {
+      for (let wave = 0; wave < 50; wave++) {
+        const { io, room, ids } = seatRoom(mapId, MAX_PLAYERS);
+        vi.advanceTimersByTime(120); // >= 3 ticks: warmup flips to the round-1 freeze
+        expect(io.lastSnap('s0').phase).toBe('freeze');
+        assertWave(mapId, positionsByTeam(io, ids), wave);
+        room.stop();
+      }
+      // 50 rooms x 14 players is ~60ms unloaded, but the default 5s budget is
+      // tight when the whole suite runs in parallel on a busy machine.
+    }, 30_000);
+  }
+
+  it('a mid-match respawn wave (round 2, everyone dead) still hands out 14 distinct points', () => {
+    const { io, room, ids } = seatRoom('bunker', MAX_PLAYERS);
+    advanceToPhase(io, 's0', 'freeze');
+    advanceToPhase(io, 's0', 'live');
+
+    // mutual elimination: every body dies in place, so the round-2 wave starts
+    // with no living teammate anywhere near a spawn point
+    for (const id of ids) room.handleMessage(id, { t: 'suicide' });
+    advanceToPhase(io, 's0', 'roundEnd');
+    advanceToPhase(io, 's0', 'freeze', 300); // roundEnd is 4s => ~120 ticks
+
+    expect(io.lastSnap('s0').you.alive).toBe(true);
+    assertWave('bunker', positionsByTeam(io, ids), 2);
+    room.stop();
+  }, 30_000);
 });

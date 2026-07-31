@@ -70,16 +70,54 @@ export const KPAL = {
   danger: '#c0392b',
 
   // ---- player karts (index = KartPlayerInfo.color) ----
-  kartRed: '#c0392b',
-  kartBlue: '#3d5a9b',
-  kartGreen: '#4a7a3d',
-  kartYellow: '#c8912f',
-  kartPurple: '#7a4a9b',
-  kartOrange: '#c86a2f',
-  kartTeal: '#2f8f8f',
-  kartPink: '#c86a9b',
+  // IDENTITY LAW (valueLadder.test.ts "KART kart identity"): every PAIR of kart
+  // colours must differ by >= 20 deg of hue OR >= 18 L*. At MAX_PLAYERS 20 a
+  // duplicate or near-duplicate livery destroys the only way to tell rivals
+  // apart on track and on the minimap, so this is a gate, not a preference.
+  // Comments carry the measured H (hue deg) / L (CIE L*) of each entry.
+  //
+  // The ORIGINAL EIGHT (indices 0-7) are unchanged: they are consumed outside
+  // the kart roster (cones, nitro flame, signal lenses, flowers, crowd blocks)
+  // and an 8-player race must look exactly as it did.
+  kartRed: '#c0392b', //         H   6  L 45
+  kartBlue: '#3d5a9b', //        H 222  L 39
+  kartGreen: '#4a7a3d', //       H 107  L 47
+  kartYellow: '#c8912f', //      H  38  L 64
+  kartPurple: '#7a4a9b', //      H 276  L 40
+  kartOrange: '#c86a2f', //      H  23  L 55
+  kartTeal: '#2f8f8f', //        H 180  L 54
+  kartPink: '#c86a9b', //        H 329  L 57
+  // ---- the twelve added for the 20-kart grid ----
+  // Placed to fill the hue gaps the original eight left, and where a gap was
+  // too narrow for a 20 deg step, split by LIGHTNESS instead (mint/forest at
+  // H 142, lime/olive at H 75-78, salmon over maroon, sky over blue). Every
+  // one clears the law against all 19 others; the tightest is teal/cyan at
+  // dH 22.4 AND dL 18.7 (passes on both axes).
+  kartMaroon: '#87324e', //      H 340  L 34
+  kartSalmon: '#ea989a', //      H 359  L 71
+  kartRust: '#68431e', //        H  30  L 32
+  kartLime: '#93b138', //        H  75  L 68
+  kartOlive: '#536529', //       H  78  L 40
+  kartMint: '#5ac581', //        H 142  L 72
+  kartForest: '#16512c', //      H 142  L 30
+  kartCyan: '#86bad9', //        H 202  L 73
+  kartSky: '#8094d5', //         H 226  L 62
+  kartIndigo: '#5343a3', //      H 250  L 35
+  kartLilac: '#c39ddb', //       H 277  L 70
+  kartMagenta: '#ad3aa1', //     H 306  L 45
 } as const;
 
+/**
+ * Kart liveries, one per grid slot: `KART_COLORS.length` MUST equal
+ * config.MAX_PLAYERS (asserted in valueLadder.test.ts) — the server assigns
+ * `color: slot % KART_COLORS.length`, so a short list silently hands two karts
+ * the same livery.
+ *
+ * ORDER IS LOAD-BEARING TWICE OVER: indices 0-7 are frozen so an 8-player race
+ * is pixel-identical to before, and 8-19 alternate light/dark and jump hue
+ * family each step, because gridSlot() seats slots 2k and 2k+1 side by side on
+ * the same row — neighbours on the grid must never be near neighbours in hue.
+ */
 export const KART_COLORS: string[] = [
   KPAL.kartRed,
   KPAL.kartBlue,
@@ -89,6 +127,18 @@ export const KART_COLORS: string[] = [
   KPAL.kartOrange,
   KPAL.kartTeal,
   KPAL.kartPink,
+  KPAL.kartMint,
+  KPAL.kartMaroon,
+  KPAL.kartCyan,
+  KPAL.kartRust,
+  KPAL.kartLilac,
+  KPAL.kartForest,
+  KPAL.kartSalmon,
+  KPAL.kartIndigo,
+  KPAL.kartLime,
+  KPAL.kartMagenta,
+  KPAL.kartSky,
+  KPAL.kartOlive,
 ];
 
 /**

@@ -4,7 +4,8 @@
 //   - 3 attack lanes from T spawn (south) to CT spawn (north)
 //   - no spawn has a direct unobstructed sightline to an enemy spawn
 //   - every lane has cover at least every 8m; longest open sightline <= 42m
-//   - >= 6 spawns per team, all on y=0 ground, none inside boxes
+//   - >= 7 spawns per team (MAX_PLAYERS 14 => 7 a side), all on y=0 ground,
+//     none inside boxes
 //
 // VISUAL_UPGRADE.md §1/§3a value ladder (this round — geometry untouched):
 //   ground  `dust`      L 50  (floorMat; was `sand`, i.e. the SAME MatId as the
@@ -134,6 +135,12 @@ export const dustbowl: MapDef = {
       { x: 4, z: 21.5, yaw: 0 },
       { x: 8, z: 20.5, yaw: 0 },
       { x: 0, z: 18.5, yaw: 0 },
+      // 7th spawn (7v7): at the mouth of the left lane, in line with the left
+      // divider (x=-14.5, arms over z[4,12] and z[-14,-6]) — those arms are
+      // what blocks the x=-14.5 column, so this point has no sightline to any
+      // CT spawn. 3.0m clear of any solid, 6.5m from the nearest T spawn.
+      // Verified numerically against `boxes`.
+      { x: -14.5, z: 20.5, yaw: 0 },
     ],
     CT: [
       { x: -8, z: -20.5, yaw: Math.PI },
@@ -142,6 +149,9 @@ export const dustbowl: MapDef = {
       { x: 4, z: -21.5, yaw: Math.PI },
       { x: 8, z: -20.5, yaw: Math.PI },
       { x: 0, z: -18.5, yaw: Math.PI },
+      // 7th spawn (7v7): z-mirror of the T one, so both sides get the identical
+      // extra position (the map's spawns mirror in z, never in x).
+      { x: -14.5, z: -20.5, yaw: Math.PI },
     ],
   },
   // §3c deco density: 112 -> 222 requested placements (+98%). Zones 0-8 keep

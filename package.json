@@ -8,11 +8,12 @@
     "games/*/*"
   ],
   "scripts": {
-    "dev": "concurrently -n server,fps,bank,kart \"npm run dev -w @platform/server\" \"npm run dev -w @fps/client\" \"npm run dev -w @bank/client\" \"npm run dev -w @kart/client\"",
-    "build": "npm run build -w @fps/client && npm run build -w @bank/client && npm run build -w @kart/client && npm run build -w @platform/server",
+    "dev": "concurrently -n server,fps,bank,kart,wordbomb \"npm run dev -w @platform/server\" \"npm run dev -w @fps/client\" \"npm run dev -w @bank/client\" \"npm run dev -w @kart/client\" \"npm run dev -w @wordbomb/client\"",
+    "build": "npm run build -w @fps/client && npm run build -w @bank/client && npm run build -w @kart/client && npm run build -w @wordbomb/client && npm run build -w @platform/server",
     "start": "npm run start -w @platform/server",
     "typecheck": "npm run typecheck --workspaces",
-    "test": "vitest run"
+    "test": "vitest run",
+    "e2e:wordbomb": "node scripts/e2e-wordbomb.mjs"
   },
   "devDependencies": {
     "concurrently": "10.0.3",

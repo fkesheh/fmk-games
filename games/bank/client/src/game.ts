@@ -130,6 +130,9 @@ function parseState(v: Record<string, unknown>): BankState | null {
     lastRoll,
     winnerId: v.winnerId,
     code: v.code === null ? null : str(v.code) ? v.code : null,
+    // additive + tolerant: a server that predates the manual-restart change
+    // sends no `awaitingStart`, and `false` is exactly the old behaviour
+    awaitingStart: v.awaitingStart === true,
     you: v.you,
   };
 }
@@ -205,6 +208,7 @@ interface BankDebugState {
   score: number; // banked total of `you`
   code: string | null; // private-room code when known (state piggyback or the join code)
   resume: string | null; // the stored rejoin token (localStorage 'bank.resume'), if any
+  awaitingStart: boolean; // post-match lobby: waiting for someone to press START
 }
 
 interface BankApi {
@@ -215,6 +219,7 @@ interface BankApi {
   joinPrivate(name: string, code: string): void;
   roll(): void;
   bank(): void;
+  start(): void; // post-match lobby only; the room ignores it anywhere else
 }
 
 declare global {
@@ -230,6 +235,17 @@ const ROOMS_EVERY_MS = 3000; // menu room-list poll
 const TICK_MS = 100; // pot counter + turn timer refresh (setInterval: blur-safe)
 const POT_STEP = 0.25; // animated counter eases up by this fraction per tick
 const LOG_MAX = 6; // event log keeps the last ~6 entries (docs/BANK.md)
+// "UP NEXT" shows the roller + the next three; deeper than that is a rail, not a
+// queue, and the rail already lists all 20 seats. The remainder becomes "+N".
+const QUEUE_PEEK = 4;
+// Above this many seats the rail switches to its compact form (see renderPlayers).
+// 12 is where full-size chips stop fitting in two rows on a 1120 px felt.
+const DENSE_SEATS = 12;
+// Fraction of the turn that counts as "running out". Was a flat 5 000 ms, which
+// at TURN_SECONDS = 12 would have left the bar in its urgent state for 42 % of
+// every turn — the cue would stop meaning anything. Proportional keeps the
+// warning the same *share* of the turn at any TURN_SECONDS.
+const TIMER_LOW_FRAC = 0.28;
 const NAME_MAX = 16; // lobby cleanName cap (platform protocol)
 const CODE_MAX = 8;
 const DICE_TUMBLE_MS = 600; // tumble frames before the dice settle on d1/d2
@@ -314,11 +330,15 @@ export class BankGame {
   private readonly potEl: HTMLDivElement;
   private readonly potFlashEl: HTMLDivElement;
   private readonly timerFillEl: HTMLDivElement;
+  private readonly queueEl: HTMLDivElement;
+  private readonly queueListEl: HTMLOListElement;
+  private readonly queueEtaEl: HTMLSpanElement;
   private readonly playersEl: HTMLDivElement;
   private readonly logEl: HTMLDivElement;
   private readonly bannerEl: HTMLDivElement;
   private readonly bannerMainEl: HTMLDivElement;
   private readonly bannerSubEl: HTMLDivElement;
+  private readonly startBtn: HTMLButtonElement;
   private readonly rollBtn: HTMLButtonElement;
   private readonly bankBtn: HTMLButtonElement;
 
@@ -459,9 +479,28 @@ export class BankGame {
     feltRail.appendChild(felt);
     stageMain.appendChild(feltRail);
 
+    // ---- turn queue ------------------------------------------------------------
+    // Structural mitigation for a 20-seat table. A round ends on the bust-7, so
+    // it is ~9 rolls long no matter how many seats there are: at 20 players most
+    // people never roll in a given round and can wait ~20 turns for their own
+    // action. Nothing in the RULES can fix that (and we are not changing rules),
+    // but a player who will not act for 15 turns must at least be able to SEE
+    // where they are. This strip names who is rolling now, the next three in
+    // rotation, and how many turns until you are up.
+    //
+    // It sits between the felt and the rail — one line tall, `auto` row — so it
+    // reads at the point the eye already goes and costs the felt almost nothing.
+    this.queueEl = el('div', 'turn-queue hidden');
+    this.queueEl.appendChild(el('span', 'turn-queue-label', 'UP NEXT'));
+    this.queueListEl = el('ol', 'turn-queue-list');
+    this.queueEl.appendChild(this.queueListEl);
+    this.queueEtaEl = el('span', 'turn-queue-eta');
+    this.queueEl.appendChild(this.queueEtaEl);
+    stageMain.appendChild(this.queueEl);
+
     // Rail and actions are siblings of the felt inside `.stage-main`, in document
-    // order felt → rail → actions, so they flow directly under the felt with no
-    // dead band between them.
+    // order felt → queue → rail → actions, so they flow directly under the felt
+    // with no dead band between them.
     this.playersEl = el('div', 'player-rail');
     stageMain.appendChild(this.playersEl);
 
@@ -478,6 +517,20 @@ export class BankGame {
       this.bankBtn.disabled = true; // you bank once per round; next bank_state re-enables
       this.bank();
     });
+    //  START — the room no longer restarts itself after a match, so the lobby
+    //  needs a way out. BANK has no host, so this is live for every seated
+    //  player; the server ignores it outside 'lobby' or below MIN_PLAYERS, and
+    //  the button states the reason rather than sitting inertly greyed out.
+    //  It lives in `.table-actions` and NOT in `.table-banner`, because the
+    //  banner is `pointer-events: none` by contract and nothing inside it can
+    //  ever be clicked.
+    this.startBtn = el('button', 'btn btn-gold btn-start hidden', 'START MATCH');
+    this.startBtn.addEventListener('click', () => {
+      this.audio.resume();
+      this.startBtn.disabled = true; // the next bank_state re-enables or hides it
+      this.startMatch();
+    });
+    actions.appendChild(this.startBtn);
     actions.appendChild(this.rollBtn);
     actions.appendChild(this.bankBtn);
     stageMain.appendChild(actions);
@@ -533,6 +586,7 @@ export class BankGame {
       joinPrivate: (name, code) => this.joinPrivate(name, code),
       roll: () => this.roll(),
       bank: () => this.bank(),
+      start: () => this.startMatch(),
     };
 
     // ---- rejoin record (token captured BEFORE welcome overwrites storage) ------
@@ -736,6 +790,10 @@ export class BankGame {
   private bank(): void {
     this.send({ t: 'bank' });
   }
+  /** Opens the next match from a post-match lobby; any seated player may send it. */
+  private startMatch(): void {
+    this.send({ t: 'start' });
+  }
 
   // ---- message routing -------------------------------------------------------------
   private onMessage(msg: S2C): void {
@@ -807,10 +865,20 @@ export class BankGame {
         this.persistResume();
       }
     }
-    // matchEnd -> lobby is the server's full reset: banner has been shown, auto-return
+    //  matchEnd -> lobby is the server's full reset. This used to eject the
+    //  player back to the MENU ("Match over."), which is incompatible with the
+    //  room now WAITING in that lobby: the seat you were kicked out of is the
+    //  seat that has to press START, and being thrown to the room list is the
+    //  dead screen this change exists to remove. Stay at the table; the banner
+    //  and the START button explain the state, and the top-bar LEAVE button is
+    //  still the way out for anyone who wants it.
     if (prevPhase === 'matchEnd' && s.phase === 'lobby') {
-      this.leaveToMenu('Match over.');
-      return;
+      // drop the finished match's win/lose treatment so the lobby banner is not
+      // rendered in the previous result's colours
+      this.bannerText = '';
+      this.bannerSub = '';
+      this.bannerTone = 'none';
+      this.pushLog('Match over — press START for the next one', 'join');
     }
     this.state = s;
     this.stateCode = code; // refreshed every snapshot; drives the invite chip
@@ -984,6 +1052,7 @@ export class BankGame {
       this.roundEl.textContent = `ROUND ${s.round}/${s.totalRounds}`;
     }
     this.renderPlayers(s);
+    this.renderQueue(s);
     this.renderLog();
 
     // ROLL only on your turn (pulsing); BANK always while unbanked in 'playing'
@@ -995,6 +1064,18 @@ export class BankGame {
     const canBank = s.phase === 'playing' && me !== undefined && !me.banked;
     this.bankBtn.disabled = !canBank;
 
+    //  START is a lobby-only control. It is shown (not hidden) while the table
+    //  is short-handed so the reason is visible — a control that vanishes reads
+    //  as a bug, a control that says NEED 1 MORE PLAYER reads as an instruction.
+    const seated = s.players.filter((p) => p.connected).length;
+    const canStart = seated >= MIN_PLAYERS;
+    this.startBtn.classList.toggle('hidden', s.phase !== 'lobby');
+    this.startBtn.disabled = !canStart;
+    const short = MIN_PLAYERS - seated;
+    this.startBtn.textContent = canStart
+      ? 'START MATCH'
+      : `NEED ${short} MORE PLAYER${short === 1 ? '' : 'S'}`;
+
     if (s.phase === 'roundEnd' || s.phase === 'matchEnd') {
       // matchEnd tone comes from the state when the event was missed (a client
       // that joined mid-banner still gets the right win/lose treatment).
@@ -1004,8 +1085,23 @@ export class BankGame {
       }
       this.setBanner(this.bannerText, this.bannerSub, s.phase === 'matchEnd' ? tone : 'none');
     } else if (s.phase === 'lobby') {
+      //  Two very different lobbies wear the same phase. A COLD one is filling
+      //  up and will start itself; a POST-MATCH one (`awaitingStart`) has reset
+      //  and is deliberately idle until somebody presses START. Saying so is
+      //  the whole point — an idle table with no explanation reads as broken.
       const connected = s.players.filter((p) => p.connected).length;
-      this.setBanner('WAITING FOR PLAYERS', `${connected} of ${MIN_PLAYERS} seated`, 'none');
+      const ready = connected >= MIN_PLAYERS;
+      if (s.awaitingStart) {
+        this.setBanner(
+          ready ? 'READY WHEN YOU ARE' : 'MATCH COMPLETE',
+          ready
+            ? `${connected} seated · anyone can press START`
+            : `${connected} of ${MIN_PLAYERS} seated — waiting for players to start`,
+          'none',
+        );
+      } else {
+        this.setBanner('WAITING FOR PLAYERS', `${connected} of ${MIN_PLAYERS} seated`, 'none');
+      }
     } else {
       this.bannerEl.classList.add('hidden');
       this.bannerEl.classList.remove('banner-win');
@@ -1025,9 +1121,21 @@ export class BankGame {
 
   private renderPlayers(s: BankState): void {
     this.playersEl.replaceChildren();
+    //  DENSE RAIL — the deliberate answer to MAX_PLAYERS = 32. Full-size chips
+    //  are ~150 px wide, so 32 of them wrap to five rows on a 1120 px felt and
+    //  eleven on a phone: a wall, not a rail. Past DENSE_SEATS the stylesheet
+    //  drops the per-chip prose ('IN' / 'BANKED'), the decorative chip stack
+    //  and a chunk of padding, which fits 32 seats into ~4 rows at 1600x900
+    //  with no scrolling at all. It is safe to drop the prose because every
+    //  state keeps a non-colour cue without it (§5): current = caret + lift +
+    //  ring + weight, banked = the ✓ glyph, offline = dashed border. The word
+    //  is kept on the current chip, where it is worth the most.
+    this.playersEl.classList.toggle('dense', s.players.length > DENSE_SEATS);
+    let currentChip: HTMLElement | null = null;
     for (const p of s.players) {
       const isTurn = p.id === s.currentId && s.phase === 'playing';
       const chip = el('div', 'player-chip');
+      if (isTurn) currentChip = chip;
       chip.classList.toggle('current', isTurn);
       chip.classList.toggle('you', p.id === this.playerId);
       chip.classList.toggle('offline', !p.connected);
@@ -1052,6 +1160,98 @@ export class BankGame {
 
       this.playersEl.appendChild(chip);
     }
+    this.keepCurrentChipVisible(currentChip);
+  }
+
+  /**
+   * At 32 seats the rail can still overflow its cap on a phone, and a rail you
+   * have to hunt through is worse than no rail. Nudge the scroll so the roller
+   * is always on screen. Scrolls the RAIL only (never `scrollIntoView`, which
+   * would drag the page with it), and does nothing when nothing overflows.
+   */
+  private keepCurrentChipVisible(chip: HTMLElement | null): void {
+    const rail = this.playersEl;
+    const overflows = rail.scrollHeight > rail.clientHeight;
+    // `.scrolls` drives the bottom fade; without it a capped rail cuts its last
+    // row in half and reads as a clipping bug rather than as "more below"
+    rail.classList.toggle('scrolls', overflows);
+    if (chip === null || !overflows) return;
+    const top = chip.offsetTop - rail.clientTop;
+    const centred = top - (rail.clientHeight - chip.offsetHeight) / 2;
+    rail.scrollTop = Math.max(0, Math.min(centred, rail.scrollHeight - rail.clientHeight));
+  }
+
+  /**
+   * Turn rotation from the current player onward, mirroring the server's
+   * `nextTurn()` exactly (`room.ts`): players are walked in JOIN ORDER from the
+   * seat after the current one, and a seat is eligible only while it is
+   * connected and has not banked. The current player leads the list.
+   *
+   * Returns at most `PEEK` entries — the queue is an orientation aid, not a
+   * second player rail — and an empty array when there is no live rotation.
+   */
+  private turnOrder(s: BankState): BankPlayerState[] {
+    if (s.phase !== 'playing' || s.currentId === null) return [];
+    const seats = s.players;
+    const from = seats.findIndex((p) => p.id === s.currentId);
+    if (from < 0) return [];
+    const out: BankPlayerState[] = [];
+    const cur = seats[from];
+    if (cur !== undefined) out.push(cur);
+    for (let step = 1; step < seats.length; step++) {
+      const cand = seats[(from + step) % seats.length];
+      if (cand !== undefined && cand.connected && !cand.banked) out.push(cand);
+    }
+    return out;
+  }
+
+  /**
+   * "UP NEXT" strip: who is rolling now, the next few in rotation, and your own
+   * distance from the front. `turnOrder()` is unbounded so the ETA can count
+   * past the visible window — at 20 seats "YOU IN 14" is the whole point.
+   */
+  private renderQueue(s: BankState): void {
+    const order = this.turnOrder(s);
+    // one live seat (everyone else banked/offline) makes the queue noise
+    if (order.length < 2) {
+      this.queueEl.classList.add('hidden');
+      this.queueListEl.replaceChildren();
+      this.queueEtaEl.textContent = '';
+      return;
+    }
+    this.queueEl.classList.remove('hidden');
+
+    this.queueListEl.replaceChildren();
+    for (const [i, p] of order.slice(0, QUEUE_PEEK).entries()) {
+      const item = el('li', 'turn-queue-item');
+      if (i === 0) item.classList.add('now');
+      if (p.id === this.playerId) item.classList.add('you');
+      // ordinal is the non-colour cue: "NOW" for the roller, then 2 / 3 / 4
+      item.appendChild(el('span', 'turn-queue-pos', i === 0 ? 'NOW' : String(i + 1)));
+      item.appendChild(el('span', 'turn-queue-name', p.name));
+      this.queueListEl.appendChild(item);
+    }
+    // "+N" tail so a 20-seat table reads as deep rather than as four players
+    const rest = order.length - QUEUE_PEEK;
+    if (rest > 0) {
+      const more = el('li', 'turn-queue-item turn-queue-more');
+      more.appendChild(el('span', 'turn-queue-pos', `+${rest}`));
+      this.queueListEl.appendChild(more);
+    }
+
+    // `mine` is the player's true depth in the rotation, not their depth in the
+    // visible window — at 32 seats that number is the single most useful string
+    // on the screen for the ~30 people who will not roll this round.
+    const mine = order.findIndex((p) => p.id === this.playerId);
+    const me = s.players.find((p) => p.id === this.playerId);
+    let eta: string;
+    if (mine === 0) eta = 'YOUR TURN';
+    else if (me !== undefined && me.banked) eta = 'BANKED — SITTING OUT';
+    else if (mine < 0) eta = 'WATCHING';
+    else if (mine === 1) eta = 'YOU ROLL NEXT';
+    else eta = `YOU ROLL IN ~${mine} TURNS`;
+    this.queueEtaEl.textContent = eta;
+    this.queueEtaEl.classList.toggle('soon', mine >= 0 && mine <= 1);
   }
 
   private renderLog(): void {
@@ -1138,7 +1338,7 @@ export class BankGame {
       const remain = Math.max(0, s.turnEndsAt - this.serverNow());
       const frac = Math.min(1, remain / (TURN_SECONDS * 1000));
       this.timerFillEl.style.width = `${frac * 100}%`;
-      this.timerFillEl.classList.toggle('low', remain < 5000);
+      this.timerFillEl.classList.toggle('low', frac < TIMER_LOW_FRAC);
     } else {
       this.timerFillEl.style.width = '0%';
       this.timerFillEl.classList.remove('low');
@@ -1160,6 +1360,7 @@ export class BankGame {
         score: 0,
         code: this.stateCode ?? this.roomCode,
         resume: this.resumeToken,
+        awaitingStart: false,
       };
     }
     const me = s.players.find((p) => p.id === this.playerId);
@@ -1175,6 +1376,7 @@ export class BankGame {
       score: me?.score ?? 0,
       code: this.stateCode ?? this.roomCode,
       resume: this.resumeToken,
+      awaitingStart: s.awaitingStart,
     };
   }
 }

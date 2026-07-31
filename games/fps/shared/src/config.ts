@@ -5,7 +5,7 @@ import type { WeaponId } from './types.js';
 
 export const TICK_RATE = 30;
 export const TICK_DT = 1 / TICK_RATE;
-export const MAX_PLAYERS = 10; // 5v5
+export const MAX_PLAYERS = 14; // 7v7
 export const MIN_PLAYERS_FOR_MATCH = 2;
 export const PRIVATE_CODE_LEN = 5; // A-Z0-9 join code
 export const MAX_ROOMS = 64;

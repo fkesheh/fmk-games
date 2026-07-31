@@ -14,7 +14,10 @@
       "@bank/shared/*": ["../../games/bank/shared/src/*"],
       "@kart/server": ["../../games/kart/server/src/module.ts"],
       "@kart/shared": ["../../games/kart/shared/src/index.ts"],
-      "@kart/shared/*": ["../../games/kart/shared/src/*"]
+      "@kart/shared/*": ["../../games/kart/shared/src/*"],
+      "@wordbomb/server": ["../../games/wordbomb/server/src/module.ts"],
+      "@wordbomb/shared": ["../../games/wordbomb/shared/src/index.ts"],
+      "@wordbomb/shared/*": ["../../games/wordbomb/shared/src/*"]
     }
   },
   "include": ["src"]

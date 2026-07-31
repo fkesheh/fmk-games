@@ -83,6 +83,14 @@ export class BankRoom implements GameRoomHandle {
   private turnEndsAt = 0; // serverTime ms; 0 when no turn timer runs
   private lastRoll: LastRoll | null = null;
   private winnerId: PlayerId | null = null;
+  /**
+   * POST-MATCH lobby marker. `false` in a fresh lobby and during play; set only
+   * by `fullReset()` and cleared only by `startMatch()`. It is the single bit
+   * that separates "a cold room filling up" (auto-starts, unchanged) from "a
+   * room that just finished a match" (waits for `{t:'start'}`). A low-pop
+   * `abortToLobby()` deliberately leaves it alone, so a rejoin resumes as before.
+   */
+  private awaitingStart = false;
   private timer: ReturnType<typeof setTimeout> | null = null; // one phase timer at a time
   private stopped = false;
 
@@ -162,8 +170,13 @@ export class BankRoom implements GameRoomHandle {
           lastMsgAt: now,
         });
       }
-      // lobby fills up -> round 1 starts immediately (a NEW match resets scores)
-      if (this.phase === 'lobby' && this.playerCount() >= MIN_PLAYERS) {
+      // A COLD lobby fills up -> round 1 starts immediately (a NEW match resets
+      // scores). `awaitingStart` excludes the post-match lobby, which waits for
+      // an explicit `{t:'start'}` so people can leave/join between matches —
+      // otherwise the first joiner after a match would silently restart it.
+      // A low-pop abort does NOT set the flag, so a rejoin still resumes play
+      // exactly as it did before.
+      if (this.phase === 'lobby' && !this.awaitingStart && this.playerCount() >= MIN_PLAYERS) {
         this.startMatch(); // broadcasts fresh state to everyone, joiner included
         return;
       }
@@ -209,6 +222,7 @@ export class BankRoom implements GameRoomHandle {
       if (p === undefined || !p.connected) return;
       p.lastMsgAt = Date.now();
       if (parsed.t === 'roll') this.tryRoll(p);
+      else if (parsed.t === 'start') this.tryStart();
       else this.tryBank(p);
     } catch (err) {
       console.error('[bank] handleMessage failed', err);
@@ -240,7 +254,9 @@ export class BankRoom implements GameRoomHandle {
     this.lastRoll = null;
     this.winnerId = null;
     this.phase = 'playing';
-    this.currentId = this.firstConnectedId();
+    this.awaitingStart = false; // a match is running; nothing to start
+    this.roundStartIndex = 0; // a NEW match always opens on the first seat
+    this.currentId = this.roundStarterId();
     this.startTurnTimer();
     this.broadcastState();
   }
@@ -262,7 +278,9 @@ export class BankRoom implements GameRoomHandle {
     this.rollCount = 0;
     this.lastRoll = null;
     this.phase = 'playing';
-    this.currentId = this.firstConnectedId();
+    // SEAM: advancing `roundStartIndex` here is what would rotate the opening
+    // seat between rounds. Left untouched on purpose — see `roundStarterId()`.
+    this.currentId = this.roundStarterId();
     this.startTurnTimer();
     this.broadcastState();
   }
@@ -292,7 +310,14 @@ export class BankRoom implements GameRoomHandle {
     this.broadcastState(); // timer-driven transition: no caller broadcasts after us
   }
 
-  /** matchEnd -> FULL reset, then lobby rules (>= MIN_PLAYERS restarts at once). */
+  /**
+   * matchEnd -> FULL reset -> lobby, and there it WAITS. It used to restart the
+   * moment `playerCount() >= MIN_PLAYERS`, which at 32 seats means nobody ever
+   * gets a window to leave, join or re-read the scoreboard: the next match was
+   * already running. `awaitingStart` marks this lobby as post-match, which is
+   * the one thing that distinguishes it from a cold lobby — a cold lobby still
+   * auto-starts (see `addPlayer`), only the RESTART is manual (`tryStart`).
+   */
   private fullReset(): void {
     this.purgeGhosts(); // match reset drops every disconnected entry
     for (const p of this.players.values()) {
@@ -307,11 +332,20 @@ export class BankRoom implements GameRoomHandle {
     this.currentId = null;
     this.turnEndsAt = 0;
     this.phase = 'lobby';
-    if (this.playerCount() >= MIN_PLAYERS) {
-      this.startMatch();
-      return;
-    }
+    this.awaitingStart = true;
     this.broadcastState();
+  }
+
+  /**
+   * `{t:'start'}` from any seated player. There is no host in BANK, so anyone
+   * at the table may open the next match. A request, never a command: wrong
+   * phase or too few players is silently ignored (the room never throws on
+   * wire input), and the button is disabled client-side with the reason.
+   */
+  private tryStart(): void {
+    if (this.phase !== 'lobby') return;
+    if (this.playerCount() < MIN_PLAYERS) return;
+    this.startMatch(); // clears awaitingStart and zeroes scores
   }
 
   /** Low pop mid-match: abort to the lobby with scores KEPT for a rejoiner. */
@@ -461,9 +495,33 @@ export class BankRoom implements GameRoomHandle {
     }
   }
 
-  private firstConnectedId(): PlayerId | null {
-    for (const p of this.players.values()) {
-      if (p.connected) return p.id;
+  /**
+   * ---- ROUND-START SEAM ----------------------------------------------------
+   * The seat a round starts from. `roundStartIndex` is the ONE value that
+   * decides it; everything else (nextTurn, the client's queue preview) derives
+   * from wherever the turn currently is, so nothing else hardcodes "index 0".
+   *
+   * It is deliberately fixed at 0 today: behaviour is unchanged, round 1 and
+   * every round after it still open with the first connected seat in join
+   * order. The seam exists because at MAX_PLAYERS = 32 with ~9 rolls per round
+   * a fixed start means the early joiners roll every round and the tail never
+   * rolls at all — the fix is to advance this index at each round boundary
+   * (`startNextRound`), which is a one-line change here plus a test. It is NOT
+   * made yet, pending the owner's decision on the exact rotation rule.
+   *
+   * Walks from `roundStartIndex` and returns the first CONNECTED seat, so an
+   * index pointing at a disconnected (or since-purged) seat degrades to the
+   * next live one instead of stalling the round.
+   */
+  private roundStartIndex = 0;
+
+  private roundStarterId(): PlayerId | null {
+    const order = [...this.players.values()];
+    if (order.length === 0) return null;
+    const from = this.roundStartIndex % order.length;
+    for (let step = 0; step < order.length; step++) {
+      const cand = order[(from + step) % order.length];
+      if (cand !== undefined && cand.connected) return cand.id;
     }
     return null;
   }
@@ -511,6 +569,7 @@ export class BankRoom implements GameRoomHandle {
       players,
       lastRoll: this.lastRoll,
       winnerId: this.winnerId,
+      awaitingStart: this.awaitingStart,
       you,
     };
   }

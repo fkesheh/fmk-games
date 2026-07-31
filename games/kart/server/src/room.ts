@@ -37,6 +37,7 @@ import type {
   KartPlayerInfo,
   KartPlayerSnap,
   KartS2C,
+  KartYou,
   RaceEvent,
   TrackDef,
 } from '@kart/shared';
@@ -49,6 +50,8 @@ import type {
   RoomIO,
   Visibility,
 } from '@platform/shared';
+
+type SnapshotMsg = Extract<KartS2C, { t: 'kart_snapshot' }>;
 
 const ROOM_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 const PRIVATE_CODE_LEN = 5; // A-Z0-9 join code, same convention as the other rooms
@@ -95,6 +98,16 @@ interface Player {
   // nitro (per race, refilled at GO)
   nitroLeft: number; // charges remaining (0 outside racing until the GO refill)
   nitroUntil: number; // serverTime ms; nitroActive in snaps while now < nitroUntil
+  // ---- persistent wire objects (allocated ONCE at join, mutated per tick) ----
+  // The snapshot is 15Hz x every recipient; rebuilding it allocated O(n^2)
+  // objects per tick (400/tick at MAX_PLAYERS 20). These three are the whole
+  // fix: `snap` is this player's entry in the ONE shared per-tick roster,
+  // `you` is their private block, `msg` the envelope that carries both.
+  // Safe because Session.send JSON-encodes synchronously (platform/server
+  // net.ts -> encodeS2C), so no recipient can observe a later tick's values.
+  snap: KartPlayerSnap;
+  you: KartYou;
+  msg: SnapshotMsg;
 }
 
 export class KartRoom implements GameRoomHandle {
@@ -105,6 +118,9 @@ export class KartRoom implements GameRoomHandle {
   private readonly io: RoomIO;
   private readonly track: TrackDef; // shared TrackDef: gate positions for credit checks
   private readonly players = new Map<PlayerId, Player>(); // insertion order = join order
+  // The ONE per-tick roster array, shared by every recipient's snapshot (see
+  // buildSnapPlayers). Rebuilt in place each tick; never reallocated.
+  private readonly snapPlayers: KartPlayerSnap[] = [];
 
   private phase: KartPhase = 'lobby';
   private tickCount = 0; // snapshot sequence
@@ -445,11 +461,41 @@ export class KartRoom implements GameRoomHandle {
   private freshPlayer(id: PlayerId, name: string, now: number): Player {
     const slot = this.lowestFreeSlot();
     const spawn = gridSlot(this.track, slot);
+    const color = slot % KART_COLORS.length;
+    const snap: KartPlayerSnap = {
+      id,
+      name,
+      slot,
+      color,
+      p: [spawn.x, 0, spawn.z],
+      yaw: spawn.yaw,
+      v: [0, 0],
+      steer: 0,
+      drift: false,
+      lap: 1,
+      nextGate: 1,
+      progress: 0,
+      place: slot + 1,
+      finished: false,
+      finishMs: -1,
+      nitroActive: false,
+    };
+    const you: KartYou = {
+      lap: 1,
+      nextGate: 1,
+      progress: 0,
+      place: slot + 1,
+      finished: false,
+      finishMs: -1,
+      bestLapMs: -1,
+      nitroLeft: 0,
+      gapAheadMs: 0,
+    };
     const p: Player = {
       id,
       name,
       slot,
-      color: slot % KART_COLORS.length,
+      color,
       lastStateAt: now,
       lastSeq: -1,
       x: spawn.x,
@@ -471,6 +517,18 @@ export class KartRoom implements GameRoomHandle {
       finishMs: -1,
       nitroLeft: 0, // no charges until the GO refill (mid-race joiners included)
       nitroUntil: 0,
+      snap,
+      you,
+      msg: {
+        t: 'kart_snapshot',
+        tick: 0,
+        serverTime: now,
+        phase: this.phase,
+        countdown: 0,
+        phaseEndsAt: 0,
+        you, // same object: broadcastSnapshot mutates it, never replaces it
+        players: this.snapPlayers,
+      },
     };
     if (this.phase === 'racing') p.lapStartAt = now; // mid-race joiner races immediately
     return p;
@@ -555,53 +613,69 @@ export class KartRoom implements GameRoomHandle {
     return Math.round((Math.hypot(you.x - ahead.x, you.z - ahead.z) / 20) * 1000);
   }
 
-  /** Fresh per-recipient snapshot (the `you` block differs). */
-  private snapshotFor(you: Player, now: number): KartS2C {
-    const players: KartPlayerSnap[] = [];
+  /**
+   * The per-player roster — IDENTICAL for every recipient, so it is built ONCE
+   * per tick into the shared `snapPlayers` array and each player's persistent
+   * `snap` object is mutated in place. Nothing here is allocated per tick.
+   *
+   * This used to live inside the per-recipient loop: n snapshots x n entries =
+   * O(n^2) fresh objects every tick (8 players -> 64/tick; 20 -> 400/tick, i.e.
+   * 6,000/s at SNAPSHOT_HZ 15, each with two fresh sub-arrays). Same pattern as
+   * the FPS server (games/fps/server/src/game.ts sendSnapshots).
+   */
+  private buildSnapPlayers(now: number): KartPlayerSnap[] {
+    const list = this.snapPlayers;
+    list.length = 0;
     for (const p of this.players.values()) {
-      players.push({
-        id: p.id,
-        name: p.name,
-        slot: p.slot,
-        color: p.color,
-        p: [p.x, p.y, p.z],
-        yaw: p.yaw,
-        v: [p.vx, p.vz],
-        steer: p.steer,
-        drift: p.drift,
-        lap: p.lap,
-        nextGate: p.nextGate,
-        progress: p.progress,
-        place: p.place,
-        finished: p.finished,
-        finishMs: p.finishMs,
-        nitroActive: now < p.nitroUntil,
-      });
+      const s = p.snap;
+      s.name = p.name; // a same-session re-add can rename; id/slot/color cannot change
+      s.p[0] = p.x;
+      s.p[1] = p.y;
+      s.p[2] = p.z;
+      s.yaw = p.yaw;
+      s.v[0] = p.vx;
+      s.v[1] = p.vz;
+      s.steer = p.steer;
+      s.drift = p.drift;
+      s.lap = p.lap;
+      s.nextGate = p.nextGate;
+      s.progress = p.progress;
+      s.place = p.place;
+      s.finished = p.finished;
+      s.finishMs = p.finishMs;
+      s.nitroActive = now < p.nitroUntil;
+      list.push(s);
     }
-    return {
-      t: 'kart_snapshot',
-      tick: this.tickCount,
-      serverTime: now,
-      phase: this.phase,
-      countdown: this.countdown,
-      phaseEndsAt: this.phaseEndsAt,
-      you: {
-        lap: you.lap,
-        nextGate: you.nextGate,
-        progress: you.progress,
-        place: you.place,
-        finished: you.finished,
-        finishMs: you.finishMs,
-        bestLapMs: you.bestLapMs,
-        nitroLeft: you.nitroLeft,
-        gapAheadMs: this.gapAheadMs(you),
-      },
-      players,
-    };
+    return list;
   }
 
+  /**
+   * One shared roster + a per-recipient `you` block. The wire bytes are exactly
+   * what snapshotFor() used to produce — Session.send JSON-encodes each message
+   * synchronously, so reusing the objects is invisible to clients.
+   */
   private broadcastSnapshot(now: number): void {
-    for (const p of this.players.values()) this.io.send(p.id, this.snapshotFor(p, now));
+    const list = this.buildSnapPlayers(now);
+    for (const p of this.players.values()) {
+      const you = p.you;
+      you.lap = p.lap;
+      you.nextGate = p.nextGate;
+      you.progress = p.progress;
+      you.place = p.place;
+      you.finished = p.finished;
+      you.finishMs = p.finishMs;
+      you.bestLapMs = p.bestLapMs;
+      you.nitroLeft = p.nitroLeft;
+      you.gapAheadMs = this.gapAheadMs(p);
+      const m = p.msg;
+      m.tick = this.tickCount;
+      m.serverTime = now;
+      m.phase = this.phase;
+      m.countdown = this.countdown;
+      m.phaseEndsAt = this.phaseEndsAt;
+      m.players = list;
+      this.io.send(p.id, m);
+    }
   }
 
   // one shared message object per event: Session.send JSON-encodes synchronously

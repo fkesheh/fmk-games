@@ -1,13 +1,33 @@
-# STRICKEN (+ BANK + KART GP) — multiplayer game platform
+# STRICKEN (+ BANK + KART GP + WORDBOMB) — multiplayer game platform
 
-A browser multiplayer game platform with three games sharing one server:
+A browser multiplayer game platform with four games sharing one server:
 - **STRICKEN** (`/fps/`) — tactical FPS in the spirit of Counter-Strike
 - **BANK** (`/bank/`) — the classic push-your-luck dice party game (canonical Bank rules)
 - **KART GP** (`/kart/`) — multiplayer kart racing: drift physics, 3-lap races, one circuit
+- **WORDBOMB** (`/wordbomb/`) — simultaneous word game: one fragment, a hidden fuse, every
+  answer revealed at once
 
 `/` is a launcher page; all games ride one WebSocket (`/ws`). Everything is
 procedural: no assets — flat-shaded low-poly 3D (FPS, KART), DOM/CSS 3D dice
-(BANK), synthesized WebAudio throughout, colors from frozen palettes.
+(BANK), DOM/CSS typography (WORDBOMB), synthesized WebAudio throughout, colors
+from frozen palettes.
+
+## WORDBOMB — rules
+
+Ten rounds, no elimination. Every player sees the same 3-letter fragment (`TIO`,
+`BLE`, `STR`) at the same instant and types a word containing it; a **hidden**
+fuse burns while they type. Enter locks a word in — the server validates it
+instantly and **privately**, and you may re-lock as often as you like: your last
+valid word stands. When the bomb blows, **every answer is revealed
+simultaneously**.
+
+Scoring rewards being both long *and* unique: `points = max(L, floor(12·L /
+dupes^1.5))` with `L = min(length, 12)` — a unique 12-letter word is the 144-point
+cap, but three players sharing one is worth 27 each, less than a unique 6-letter
+word. No self-reuse: a word only scores once per player per match. Server is the
+only judge — the ~270k-word dictionary never ships to the browser. Up to 8
+players, public quick-join and private share-code rooms, 3 difficulty bands
+(default `normal`).
 
 ## KART GP — driving model & rules
 
@@ -54,7 +74,7 @@ with share codes, quick-join public rooms.
 
 ```bash
 npm install
-npm run dev        # server on :8080, client on :5173 (open http://localhost:5173)
+npm run dev        # server :8080 · fps :5173 · bank :5174 · kart :5175 · wordbomb :5176
 ```
 
 Production (single process serves both HTTP and WS):
@@ -94,15 +114,20 @@ matchmaking, and rooms; games plug in via one registry entry. Adding a new game 
 - `games/fps/client/` — three.js game client: prediction/interp (`net/`), renderer (`render/`),
   HUD/menus (`ui/`), orchestration (`game/`), synthesized audio (`audio/`)
 - `games/bank/{shared,server,client}` — BANK dice: rules contract, turn-based room, felt-table UI
+- `games/kart/{shared,server,client}` — KART GP: kart physics contract, race room, three.js circuit
+- `games/wordbomb/{shared,server,client}` — WORDBOMB: scoring/protocol contract, round room +
+  binary-searched dictionary blob (`server/data/words.blob`), DOM/CSS client
 - `CONTRACT.md` — the frozen FPS contract; `docs/STRUCTURE.md` — the platform contract;
-  `docs/BANK.md` — the BANK game contract
-- `scripts/e2e.mjs` — two-browser FPS suite · `scripts/e2e-bank.mjs` — two-browser BANK suite
+  `docs/BANK.md`, `docs/KART.md`, `docs/WORDBOMB.md` — the per-game contracts
+- `scripts/e2e.mjs` — two-browser FPS suite · `scripts/e2e-bank.mjs` — BANK suite ·
+  `scripts/e2e-kart.mjs` — KART suite · `scripts/e2e-wordbomb.mjs` — WORDBOMB suite
 
 ## Gates
 
 ```bash
-npm run typecheck    # strict TS, all workspaces
-npm test             # 37 unit tests (physics, protocol, game logic)
-npm run build        # client bundle + server bundle
-node scripts/e2e.mjs # 10/10 browser assertions, zero console errors
+npm run typecheck        # strict TS, all workspaces
+npm test                 # 402 unit tests (physics, protocol, game logic, scoring, dictionary)
+npm run build            # four client bundles + server bundle
+node scripts/e2e.mjs     # FPS: 10/10 browser assertions, zero console errors
+npm run e2e:wordbomb     # WORDBOMB: 13 numbered two-browser assertions
 ```

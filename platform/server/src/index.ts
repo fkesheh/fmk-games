@@ -56,7 +56,7 @@ function escapeHtml(s: string): string {
 //
 // COLOUR SOURCING. This file is the platform composition root's sibling and
 // must NOT import a game's shared package (package.json here depends on the
-// three game SERVER packages only, and platform code does not reach into game
+// game SERVER packages only, and platform code does not reach into game
 // internals). §0 still bans ad-hoc hex, so the launcher's small colour set is
 // declared ONCE below as named constants, each MIRRORING an exact entry of a
 // frozen game palette — the source entry is named in the comment. This is the
@@ -86,6 +86,8 @@ const LPAL = {
   bankTint: '#1d5c3f', //   BPAL.felt        — BANK: felt
   kartAccent: '#7fa4c9', // KPAL.sky         — KART GP: arcade sky
   kartTint: '#4a7a3d', //   KPAL.grass       — KART GP: verge green
+  wordbombAccent: '#f0a63c', // WPAL.fuse    — WORDBOMB: the lit fuse
+  wordbombTint: '#28303a', //  WPAL.slate    — WORDBOMB: dark-room slate
 
   // ---- fallback identity for a game with no launcher copy yet ----
   neutralAccent: '#9aa3ad', // PALETTE.steel
@@ -119,6 +121,12 @@ const COPY: Record<string, GameCopy | undefined> = {
     genre: 'Arcade racer',
     blurb: 'Eight karts, drift boost and nitro. Three laps, and the brake is a suggestion.',
     tags: ['2–8 players', 'Drift + nitro'],
+  },
+  wordbomb: {
+    genre: 'Simultaneous word game',
+    blurb:
+      "Same three letters for everyone, a fuse nobody can see. Match someone else's word and you split the points.",
+    tags: ['2–8 players', '10 rounds'],
   },
 };
 
@@ -159,8 +167,8 @@ function launcherHtml(modules: readonly GameModule[]): string {
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
-    <meta name="description" content="Three browser multiplayer games on one server: STRICKEN, BANK and KART GP." />
-    <title>ARCADE — STRICKEN · BANK · KART GP</title>
+    <meta name="description" content="Four browser multiplayer games on one server: STRICKEN, BANK, KART GP and WORDBOMB." />
+    <title>ARCADE — STRICKEN · BANK · KART GP · WORDBOMB</title>
     <style>
       * { box-sizing: border-box; }
       html { -webkit-text-size-adjust: 100%; }
@@ -168,9 +176,14 @@ function launcherHtml(modules: readonly GameModule[]): string {
         margin: 0; min-height: 100vh; display: flex; flex-direction: column;
         color: ${LPAL.paper};
         background-color: ${LPAL.ink};
+        /* Four washes, one per game, on four non-overlapping anchors — upper
+           left, upper right, mid-left flank, bottom centre — so no two tints
+           stack into mud. WORDBOMB's slate is the coolest and takes the
+           otherwise-empty mid-left band between the fps and bank pools. */
         background-image:
           radial-gradient(90ch 52ch at 18% -12%, ${LPAL.fpsTint}2e, transparent 62%),
           radial-gradient(80ch 46ch at 84% 6%, ${LPAL.kartTint}26, transparent 60%),
+          radial-gradient(64ch 42ch at 0% 54%, ${LPAL.wordbombTint}44, transparent 60%),
           radial-gradient(120ch 70ch at 50% 118%, ${LPAL.bankTint}26, transparent 64%),
           linear-gradient(180deg, ${LPAL.charcoal} 0%, ${LPAL.ink} 46%, ${LPAL.inkDeep} 100%);
         background-attachment: fixed;
@@ -195,7 +208,12 @@ function launcherHtml(modules: readonly GameModule[]): string {
         margin: 0; font-size: clamp(40px, 11vw, 82px); font-weight: 900; line-height: 0.98;
         letter-spacing: 0.18em; text-indent: 0.18em;
         color: ${LPAL.paper};
-        background-image: linear-gradient(96deg, ${LPAL.fpsAccent} 6%, ${LPAL.bankAccent} 46%, ${LPAL.kartAccent} 94%);
+        /* Four accents, hue-ordered hot -> cool so the sweep never doubles
+           back: WORDBOMB's saturated fuse orange leads, the two near-identical
+           ambers (fps dusk, bank gold) are packed close in the middle so they
+           read as one warm body rather than two wasted thirds, and KART's sky
+           takes the long cool tail. */
+        background-image: linear-gradient(96deg, ${LPAL.wordbombAccent} 5%, ${LPAL.fpsAccent} 30%, ${LPAL.bankAccent} 48%, ${LPAL.kartAccent} 95%);
         -webkit-background-clip: text; background-clip: text;
         -webkit-text-fill-color: transparent;
       }
@@ -208,9 +226,19 @@ function launcherHtml(modules: readonly GameModule[]): string {
       }
 
       /* ---- cards ---- */
+      /* One column when narrow. Above that, an even 2x2: with four games,
+         auto-fit settles on three columns at this max-width and orphans the
+         fourth card alone on its own row. The 760px cap keeps each card at
+         roughly the width three columns used to give it. */
       .grid {
         display: grid; gap: clamp(14px, 2vw, 20px);
         grid-template-columns: repeat(auto-fit, minmax(248px, 1fr));
+      }
+      @media (min-width: 640px) {
+        .grid {
+          grid-template-columns: repeat(2, 1fr);
+          max-width: 760px; margin-inline: auto; width: 100%;
+        }
       }
       .card {
         --accent: ${LPAL.neutralAccent};
@@ -236,6 +264,9 @@ function launcherHtml(modules: readonly GameModule[]): string {
       .card--fps { --accent: ${LPAL.fpsAccent}; --tint: ${LPAL.fpsTint}; --wash: ${LPAL.fpsTint}3d; --halo: ${LPAL.fpsAccent}2b; }
       .card--bank { --accent: ${LPAL.bankAccent}; --tint: ${LPAL.bankTint}; --wash: ${LPAL.bankTint}4d; --halo: ${LPAL.bankAccent}2b; }
       .card--kart { --accent: ${LPAL.kartAccent}; --tint: ${LPAL.kartTint}; --wash: ${LPAL.kartTint}3d; --halo: ${LPAL.kartAccent}2b; }
+      /* WORDBOMB's tint is the darkest of the four (WPAL.slate, L 19), so its
+         wash carries more alpha to land at the same visual weight. */
+      .card--wordbomb { --accent: ${LPAL.wordbombAccent}; --tint: ${LPAL.wordbombTint}; --wash: ${LPAL.wordbombTint}70; --halo: ${LPAL.wordbombAccent}2b; }
 
       .mark {
         width: 50px; height: 50px; border-radius: 13px; flex: none;
@@ -265,6 +296,20 @@ function launcherHtml(modules: readonly GameModule[]): string {
         background-image: repeating-linear-gradient(72deg, var(--accent) 0 3px, transparent 3px 11px);
         background-size: 74% 62%;
         background-position: 50% 50%;
+      }
+      /* WORDBOMB: a bomb. Four layers, top to bottom — the spark (detached
+         from the fuse tip so it reads as a spark and not a pinhead), a short
+         steep fuse (the "/" iso-lines of a 155deg gradient), the collar on the
+         casing's upper-right shoulder, and the filled casing. The casing is
+         solid rather than a ring: outlined, it reads as a magnifying glass. */
+      .mark--wordbomb {
+        background-image:
+          radial-gradient(circle closest-side, var(--accent) 0 42%, transparent 46%),
+          linear-gradient(155deg, transparent calc(50% - 1.2px), var(--accent) calc(50% - 1.2px) calc(50% + 1.2px), transparent calc(50% + 1.2px)),
+          linear-gradient(var(--accent), var(--accent)),
+          radial-gradient(circle closest-side, var(--accent) 0 96%, transparent 100%);
+        background-size: 22% 22%, 20% 24%, 16% 10%, 46% 46%;
+        background-position: 94% 4%, 80% 30%, 58% 50%, 28% 82%;
       }
 
       .head { display: flex; flex-direction: column; gap: 3px; }
@@ -324,7 +369,7 @@ function launcherHtml(modules: readonly GameModule[]): string {
   <body>
     <div class="page">
       <header class="hero">
-        <p class="eyebrow">Three games &middot; one tab &middot; no install</p>
+        <p class="eyebrow">Four games &middot; one tab &middot; no install</p>
         <h1>ARCADE</h1>
         <hr class="rule" />
         <p class="lede">Real-time multiplayer, straight from the browser. Pick a game, grab a room, send the invite link.</p>

@@ -9,5 +9,6 @@ export function parseBankC2S(raw: unknown): BankC2S | null {
   const t = (raw as Record<string, unknown>).t;
   if (t === 'roll') return { t: 'roll' };
   if (t === 'bank') return { t: 'bank' };
+  if (t === 'start') return { t: 'start' }; // additive; the room validates phase/count
   return null;
 }
