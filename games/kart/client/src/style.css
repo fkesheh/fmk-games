@@ -1031,6 +1031,9 @@ body {
 
 .lobby-panel {
   min-width: min(420px, 92vw);
+  /* MAX_PLAYERS is 20: the panel grows sideways so the chips wrap into columns
+     instead of turning the grid into one 20-row scroll strip */
+  max-width: min(900px, 94vw);
   padding: 22px 26px;
   border: 1px solid var(--gold);
   border-radius: 14px;
@@ -1055,11 +1058,17 @@ body {
   color: var(--gold);
 }
 
+/* Wrapping rows, not a single column: 2 drivers read as a centred pair, a full
+   20-kart grid packs into 3-4 columns and still fits above the START button.
+   The cap + scroll is the last-resort guard on a short viewport. */
 .lobby-players {
   display: flex;
-  flex-direction: column;
+  flex-wrap: wrap;
+  justify-content: center;
   gap: 6px;
   width: 100%;
+  max-height: min(44vh, 340px);
+  overflow-y: auto;
 }
 
 .lobby-status {
@@ -1068,6 +1077,15 @@ body {
   font-weight: 700;
   letter-spacing: 0.14em;
   color: var(--hud-text);
+}
+
+/* The explicit start control — nothing in KART auto-starts. Disabled styling
+   comes from `.btn:disabled`; the reason sits on `.lobby-status` above it. */
+.lobby-start {
+  min-width: 220px;
+  padding: 13px 28px;
+  font-size: 16px;
+  letter-spacing: 0.2em;
 }
 
 .lobby-hint {
@@ -1082,6 +1100,10 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
+  /* fixed-ish track width so wrapped rows line up as columns at 20 karts */
+  flex: 0 0 auto;
+  width: 220px;
+  max-width: 100%;
   padding: 8px 12px;
   border: 1px solid color-mix(in srgb, var(--asphalt-light) 60%, transparent);
   border-radius: 999px;
@@ -1103,6 +1125,7 @@ body {
 }
 
 .player-color {
+  flex: 0 0 auto; /* the livery swatch never shrinks inside a packed chip */
   width: 14px;
   height: 14px;
   border-radius: 4px;
@@ -1116,6 +1139,9 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  min-width: 0; /* a 16-char name must not push GRID N out of a fixed-width chip */
+  overflow: hidden;
+  white-space: nowrap;
 }
 
 .player-you {
@@ -1129,7 +1155,9 @@ body {
 }
 
 .player-slot {
+  flex: 0 0 auto;
   margin-left: auto;
+  white-space: nowrap;
   font-size: 11px;
   letter-spacing: 0.18em;
   color: var(--steel);

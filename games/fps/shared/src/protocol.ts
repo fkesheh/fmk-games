@@ -74,6 +74,8 @@ export function parseC2S(raw: unknown): C2S | null {
       return { t: 'buy_gear', item: raw.item };
     case 'kill_bots':
       return { t: 'kill_bots' };
+    case 'start':
+      return { t: 'start' }; // additive; GameRoom validates phase + player count
     case 'ping':
       if (!num(raw.ts)) return null;
       return { t: 'ping', ts: raw.ts };

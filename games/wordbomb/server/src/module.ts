@@ -13,7 +13,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { rng } from '@platform/shared';
 import type { GameModule, GameRoomHandle } from '@platform/shared';
-import { parseWordbombSettings } from '@wordbomb/shared';
+import { MAX_PLAYERS, MIN_PLAYERS, parseWordbombSettings } from '@wordbomb/shared';
 import { loadDict } from './dict.js';
 import type { DictBundle, FragmentPicker, WordbombRoomCtor } from './ports.js';
 import { createPicker } from './prompts.js';
@@ -115,6 +115,8 @@ export const wordbombModule: GameModule = {
   // /wordbomb/ here when it answers, so one port (8080) serves launcher + HMR
   // client. Must match `server.port` in the client's vite.config.ts.
   devPort: 5176,
+  minPlayers: MIN_PLAYERS,
+  maxPlayers: MAX_PLAYERS,
   createRoom(opts): GameRoomHandle {
     // parseWordbombSettings THROWS Error(message) on bad input; the lobby turns
     // that into { t: 'error', code: 'bad_settings', message }. It also accepts

@@ -237,6 +237,8 @@ function parseS2C(raw: unknown): S2C | null {
         const snap = parsePlayerSnap(p);
         if (snap !== null) players.push(snap);
       }
+      // lobby contract fields are additive: an older server that omits them
+      // still yields a valid snapshot (count from the roster, min from config)
       return {
         t: 'kart_snapshot',
         tick: raw.tick,
@@ -244,6 +246,9 @@ function parseS2C(raw: unknown): S2C | null {
         phase: ph,
         countdown: raw.countdown,
         phaseEndsAt: raw.phaseEndsAt,
+        playerCount: num(raw.playerCount) ? raw.playerCount : players.length,
+        minPlayers: num(raw.minPlayers) ? raw.minPlayers : MIN_PLAYERS,
+        canStart: raw.canStart === true,
         you,
         players,
       };
@@ -280,6 +285,7 @@ interface KartDebugState {
   frozen: boolean; // drive sim frozen (pre-GO freeze: every phase but 'racing')
   assist: boolean; // KIDS MODE auto-steer active (drive.setAssist)
   code: string | null; // private-room invite code (null for public rooms / before join)
+  canStart: boolean; // the lobby START button is live (server says a {t:'start'} lands)
 }
 
 interface KartRemoteDebug {
@@ -326,6 +332,8 @@ interface KartApi {
   createPublic(name: string): void;
   createPrivate(name: string): void;
   joinPrivate(name: string, code: string): void;
+  /** Ask the room to start the race (same message the lobby START button sends). */
+  startRace(): void;
   setInput(throttle: number, brake: number, steer: number, drift: boolean): void;
   telemetry(): KartTelemetry;
 }
@@ -535,6 +543,10 @@ export class KartApp {
   private phase: KartPhase = 'lobby';
   private you: KartYou | null = null;
   private phaseEndsAt = 0; // serverTime ms; 0 when no phase timer
+  // ---- lobby contract (server truth; the START button reads these) --------------
+  private seatedCount = 0; // players seated in the room (snapshot playerCount)
+  private minPlayers = MIN_PLAYERS; // the room's minimum (snapshot minPlayers)
+  private canStart = false; // a {t:'start'} would be accepted right now
   private readonly players = new Map<string, KartPlayerSnap>(); // latest snapshot per id
   private readonly roster = new Map<string, KartPlayerInfo>(); // names/colors/slots per id
   private readonly bestLaps = new Map<string, number>(); // from 'lap' race events (results table)
@@ -624,6 +636,7 @@ export class KartApp {
   private readonly lobbyEl: HTMLDivElement;
   private readonly lobbyPlayersEl: HTMLDivElement;
   private readonly lobbyStatusEl: HTMLDivElement;
+  private readonly startBtn: HTMLButtonElement; // explicit race start (no auto-start)
   private readonly countdownEl: HTMLDivElement;
   private readonly msgEl: HTMLDivElement;
   private readonly hintEl: HTMLDivElement;
@@ -813,6 +826,15 @@ export class KartApp {
     lobbyPanel.appendChild(this.lobbyPlayersEl);
     this.lobbyStatusEl = el('div', 'lobby-status', '');
     lobbyPanel.appendChild(this.lobbyStatusEl);
+    // START: the room never auto-starts. Any seated player may press it; it is
+    // disabled (with the reason on .lobby-status right above) below MIN_PLAYERS.
+    this.startBtn = el('button', 'btn btn-gold lobby-start', 'START RACE');
+    this.startBtn.addEventListener('click', () => {
+      this.audio.resume();
+      this.startBtn.blur(); // keep SPACE/arrows off the focused button once racing
+      if (this.canStart) this.send({ t: 'start' });
+    });
+    lobbyPanel.appendChild(this.startBtn);
     lobbyPanel.appendChild(el('div', 'lobby-hint', 'WASD / ARROWS to drive — SPACE to drift'));
     this.lobbyEl.appendChild(lobbyPanel);
     this.raceEl.appendChild(this.lobbyEl);
@@ -950,6 +972,8 @@ export class KartApp {
       createPublic: (name) => this.createPublic(name),
       createPrivate: (name) => this.createPrivate(name),
       joinPrivate: (name, code) => this.joinPrivate(name, code),
+      // the room validates phase + count, so an early call is a harmless no-op
+      startRace: () => this.send({ t: 'start' }),
       setInput: (throttle, brake, steer, drift) => this.setDebugInput(throttle, brake, steer, drift),
       telemetry: () => this.telemetrySnapshot(),
     };
@@ -1113,6 +1137,8 @@ export class KartApp {
     this.drive.setAssist(this.assist); // kids-mode assist follows the stored toggle into the room
     this.you = null;
     this.phaseEndsAt = 0;
+    this.seatedCount = msg.players.length; // until the first snapshot lands
+    this.canStart = false; // the server decides; a stale true would lie for a frame
     this.countdownShown = 0;
     this.goActive = false;
     this.players.clear();
@@ -1141,6 +1167,9 @@ export class KartApp {
     this.roomCode = null;
     this.updateInviteChip();
     this.phaseEndsAt = 0;
+    this.seatedCount = 0;
+    this.minPlayers = MIN_PLAYERS;
+    this.canStart = false;
     this.players.clear();
     this.roster.clear();
     this.buffers.clear();
@@ -1189,6 +1218,9 @@ export class KartApp {
     this.applyFreeze(); // pre-GO freeze: the sim integrates only while 'racing'
     this.you = snap.you;
     this.phaseEndsAt = snap.phaseEndsAt;
+    this.seatedCount = snap.playerCount; // lobby contract: server truth, not a DOM count
+    this.minPlayers = snap.minPlayers;
+    this.canStart = snap.canStart;
     if (snap.phase !== prevPhase) this.onPhaseChange(prevPhase, snap.phase);
 
     const seen = new Set<string>();
@@ -1610,17 +1642,28 @@ export class KartApp {
       this.hintEl.style.opacity = String(fade);
     }
 
-    // lobby status line
+    // lobby status line + the explicit START control. Nothing auto-starts: in
+    // 'lobby' the panel always states the count against the minimum, and the
+    // button carries the reason it is disabled. During 'ready' the race is
+    // already on its way, so the button goes away and the line counts down.
     if (phase === 'ready') {
       this.lobbyStatusEl.textContent =
         this.phaseEndsAt > 0
           ? `GET READY — ${Math.max(0, Math.ceil((this.phaseEndsAt - this.serverNow()) / 1000))}`
           : 'GET READY';
     } else if (phase === 'lobby') {
-      const n = Math.max(this.players.size, this.roster.size);
+      const n = Math.max(this.seatedCount, this.roster.size);
+      const need = Math.max(0, this.minPlayers - n);
       this.lobbyStatusEl.textContent =
-        n >= MIN_PLAYERS ? 'STARTING…' : `WAITING FOR PLAYERS ${n}/${MIN_PLAYERS}`;
+        need > 0
+          ? `DRIVERS ${n}/${this.minPlayers} — NEED ${need} MORE`
+          : `DRIVERS ${n} · MIN ${this.minPlayers} — READY WHEN YOU ARE`;
+      this.startBtn.disabled = !this.canStart;
+      this.startBtn.title = this.canStart
+        ? 'Start the race'
+        : `Waiting for ${need > 0 ? need : this.minPlayers} more driver${need === 1 ? '' : 's'}`;
     }
+    this.startBtn.classList.toggle('hidden', phase !== 'lobby');
 
     // results auto-return note (the server sends the room back to 'lobby')
     if (phase === 'results') {
@@ -2021,6 +2064,7 @@ export class KartApp {
       frozen: this.phase !== 'racing',
       assist: this.assist,
       code: this.roomCode,
+      canStart: this.canStart,
     };
   }
 

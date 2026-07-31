@@ -14,11 +14,11 @@ export interface BankSettings {
 
 /** Room-level messages (the platform lobby handles join/leave/list itself). */
 /**
- * `start` is ADDITIVE (the two existing tags are untouched): a room no longer
- * auto-restarts after a match ends, so any seated player may open the next one
- * from the lobby. It is a request, never a command — the room ignores it
- * outside `lobby` or below MIN_PLAYERS. The FIRST match of a fresh room still
- * auto-starts on reaching MIN_PLAYERS; only the post-match restart is manual.
+ * `start` is the ONLY way out of `lobby`. NO match ever begins by itself — not
+ * the first one of a cold room, not the one after a finished match. There is no
+ * host: any seated player may send it. It is a request, never a command — the
+ * room ignores it silently outside `lobby` or below MIN_PLAYERS, and never
+ * throws. `canStart` on the wire tells the client whether it would be accepted.
  */
 export type BankC2S = { t: 'roll' } | { t: 'bank' } | { t: 'start' };
 
@@ -57,13 +57,23 @@ export interface BankState {
   winnerId: string | null; // set at matchEnd
   code: string | null; // the room's private join code (null for public rooms)
   /**
-   * ADDITIVE. True only in a POST-MATCH lobby: the previous match finished, the
-   * room reset, and it is now waiting for a seated player to send `{t:'start'}`
-   * instead of restarting itself. False in a fresh lobby (which still
-   * auto-starts on reaching MIN_PLAYERS) and false during play, so a client
-   * that ignores the field sees exactly the behaviour it saw before.
+   * COSMETIC ONLY. True in a POST-MATCH lobby (the previous match finished and
+   * the room reset), false in a cold lobby and during play. BOTH lobbies wait
+   * for `{t:'start'}` — this bit only lets the client say "match complete"
+   * instead of "waiting for players". Never gate the START control on it.
    */
   awaitingStart: boolean;
+  /**
+   * The three fields the lobby UI needs, straight from the server so no client
+   * ever hardcodes the rule. `playerCount` counts CONNECTED seats (the same
+   * number `{t:'start'}` is validated against — disconnected entries in
+   * `players` hold no seat), `minPlayers` mirrors MIN_PLAYERS, and `canStart`
+   * is exactly `phase === 'lobby' && playerCount >= minPlayers`: true iff a
+   * `{t:'start'}` sent right now would be accepted.
+   */
+  playerCount: number;
+  minPlayers: number;
+  canStart: boolean;
   you: string; // the receiving player's id (per-recipient)
 }
 

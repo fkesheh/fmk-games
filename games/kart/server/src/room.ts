@@ -2,8 +2,12 @@
 // KART room (docs/KART.md) — authoritative race rules over client-trusted
 // positions. Clients stream kart_state at 15Hz; the SERVER owns gates, laps,
 // places, and results. One 15Hz interval drives the whole phase machine
-// (lobby → ready 5s → countdown 3-2-1-GO → racing → results 10s → lobby),
-// place computation, the race timeout, and the snapshot broadcast.
+// (lobby -[{t:'start'}]-> ready 5s → countdown 3-2-1-GO → racing → results 10s
+// → lobby), place computation, the race timeout, and the snapshot broadcast.
+//
+// NOTHING auto-starts (frozen lobby contract): 'lobby' is left only when a
+// seated player sends `{t:'start'}` with at least MIN_PLAYERS seated, and the
+// results timer returns the room to the lobby to WAIT for the next one.
 //
 // Gate credit model: the 8 gates are credited IN ORDER only — a credit needs
 // the player's streamed position within GATE_RADIUS of the EXPECTED gate
@@ -187,9 +191,9 @@ export class KartRoom implements GameRoomHandle {
         }
         this.players.set(id, this.freshPlayer(id, name, now));
       }
-      // lobby fills up -> 5s "get ready" (players stay seated across races);
-      // transition BEFORE the joined payload so its phase field is current
-      if (this.phase === 'lobby' && this.playerCount() >= MIN_PLAYERS) this.enterReady(now);
+      // NO AUTO-START (frozen lobby contract): a full lobby still WAITS. The
+      // room leaves 'lobby' only on an explicit `{t:'start'}` from a seated
+      // player (tryStart) — joining never begins a race.
       const p = this.players.get(id)!;
       this.io.send(id, this.joinedFor(p));
     } catch (err) {
@@ -234,6 +238,10 @@ export class KartRoom implements GameRoomHandle {
       p.lastStateAt = now; // any valid message is liveness
       if (parsed.t === 'nitro') {
         this.tryNitro(p, now);
+        return;
+      }
+      if (parsed.t === 'start') {
+        this.tryStart(now);
         return;
       }
       if (parsed.seq <= p.lastSeq) return; // per-client monotonic: drop late dupes
@@ -305,7 +313,24 @@ export class KartRoom implements GameRoomHandle {
     }
   }
 
-  /** 5s "get ready" once the lobby reaches MIN_PLAYERS. */
+  /**
+   * The ONE way out of 'lobby' (frozen lobby contract). Any seated player may
+   * send `{t:'start'}` — there is no host in KART. Accepted only in 'lobby'
+   * with at least MIN_PLAYERS seated; every other case is silently ignored, so
+   * a spammed or mistimed start is a no-op rather than an error.
+   */
+  private tryStart(now: number): void {
+    if (this.phase !== 'lobby') return;
+    if (this.playerCount() < MIN_PLAYERS) return;
+    this.enterReady(now);
+  }
+
+  /** True while a `{t:'start'}` would be accepted (mirrored onto every snapshot). */
+  private canStart(): boolean {
+    return this.phase === 'lobby' && this.playerCount() >= MIN_PLAYERS;
+  }
+
+  /** 5s "get ready" — entered ONLY from tryStart, never automatically. */
   private enterReady(now: number): void {
     this.phase = 'ready';
     this.phaseEndsAt = now + READY_SECONDS * 1000;
@@ -362,15 +387,20 @@ export class KartRoom implements GameRoomHandle {
     this.phaseEndsAt = now + RESULTS_SECONDS * 1000;
   }
 
-  /** Results -> lobby: race state resets, players stay seated, re-arm at MIN_PLAYERS. */
-  private resetToLobby(now: number): void {
+  /**
+   * Results -> lobby: race state resets and players stay seated, and the room
+   * then WAITS. It used to re-arm itself the moment MIN_PLAYERS were seated,
+   * which meant a finished race rolled straight into the next one and nobody
+   * could leave, join, or catch their breath between races. The next race now
+   * needs another explicit `{t:'start'}` (frozen lobby contract).
+   */
+  private resetToLobby(_now: number): void {
     for (const p of this.players.values()) this.resetRaceState(p);
     this.finishOrder = [];
     this.phase = 'lobby';
     this.phaseEndsAt = 0;
     this.countdown = 0;
     this.broadcastEvent({ kind: 'restart' });
-    if (this.playerCount() >= MIN_PLAYERS) this.enterReady(now);
   }
 
   // -------------------------------------------------------------------------
@@ -526,6 +556,9 @@ export class KartRoom implements GameRoomHandle {
         phase: this.phase,
         countdown: 0,
         phaseEndsAt: 0,
+        playerCount: this.playerCount(),
+        minPlayers: MIN_PLAYERS,
+        canStart: this.canStart(),
         you, // same object: broadcastSnapshot mutates it, never replaces it
         players: this.snapPlayers,
       },
@@ -656,6 +689,8 @@ export class KartRoom implements GameRoomHandle {
    */
   private broadcastSnapshot(now: number): void {
     const list = this.buildSnapPlayers(now);
+    const count = this.playerCount();
+    const canStart = this.canStart();
     for (const p of this.players.values()) {
       const you = p.you;
       you.lap = p.lap;
@@ -673,6 +708,9 @@ export class KartRoom implements GameRoomHandle {
       m.phase = this.phase;
       m.countdown = this.countdown;
       m.phaseEndsAt = this.phaseEndsAt;
+      m.playerCount = count;
+      m.minPlayers = MIN_PLAYERS;
+      m.canStart = canStart;
       m.players = list;
       this.io.send(p.id, m);
     }

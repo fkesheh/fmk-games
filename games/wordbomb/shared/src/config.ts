@@ -42,9 +42,21 @@ export function revealMsFor(playerCount: number): number {
   const n = Number.isFinite(playerCount) ? Math.max(0, Math.floor(playerCount)) : 0;
   return Math.min(REVEAL_MAX_MS, REVEAL_BASE_MS + REVEAL_PER_PLAYER_MS * n);
 }
-/** Grace after MIN_PLAYERS is reached, so round 1 is not a cold start. */
+/**
+ * THE POST-PRESS BEAT. This is NOT an auto-start timer and never was one after
+ * the manual-start contract landed: nothing schedules it except a seated player
+ * sending `{t:'wb_start'}`. It exists so round 1 is not a cold start — the
+ * fragment does not appear under the fingers of whoever happened to click.
+ *
+ * `WbPublicState.countdownEndsAt` is non-zero for exactly this window and zero
+ * everywhere else, including a lobby that is merely full and waiting.
+ */
 export const LOBBY_COUNTDOWN_MS = 3_000;
-/** How long final standings hold before the room resets to lobby. */
+/**
+ * How long final standings hold before the room resets to lobby. The reset
+ * returns to `lobby` and WAITS — a finished match does not roll into another
+ * one on its own (see the note on LOBBY_COUNTDOWN_MS).
+ */
 export const MATCH_END_MS = 12_000;
 /** Matches BANK. Platform closes sockets of players idle this long. */
 export const STALE_MS = 300_000;

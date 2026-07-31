@@ -36,6 +36,7 @@ import {
   INPUT_JUMP,
   INPUT_WALK,
   MAPS,
+  MIN_PLAYERS_FOR_MATCH,
   NET,
   PLAYER,
   TICK_RATE,
@@ -182,6 +183,12 @@ export class ClientGame {
   private botPromptVisible = false;
   private botPromptTimer: ReturnType<typeof setTimeout> | null = null;
   private lastGuardErrMs = Number.NEGATIVE_INFINITY; // guard() error-log rate limit
+  // Warmup START control, mirrored verbatim from the latest snapshot. canStart
+  // is the SERVER's verdict on `{t:'start'}` — never recomputed here; seated /
+  // minPlayers are displayed so the player can read WHY it is not ready yet.
+  private snapSeated = 0;
+  private snapMinPlayers = MIN_PLAYERS_FOR_MATCH;
+  private snapCanStart = false;
   // e2e debug overrides (window.__fps.debug via C11); win over held keys when set
   private dbgMove: { x: number; z: number } | null = null;
   private dbgButtons = 0;
@@ -201,6 +208,7 @@ export class ClientGame {
     phase: 'warmup', phaseEndsInSec: 0, round: 0, scoreT: 0, scoreCT: 0,
     spreadPx: 0, scoped: false, spectating: null,
     team: null, you: '', players: [],
+    seated: 0, minPlayers: MIN_PLAYERS_FOR_MATCH, canStart: false,
   };
   private readonly syncOut: SyncEntry[] = []; // roster-merged remotes, reused array
   private readonly syncPool = new Map<PlayerId, SyncEntry>(); // per-id reused entries
@@ -214,6 +222,9 @@ export class ClientGame {
     this.input = new InputController(opts.canvas);
     this.audio = new AudioEngine();
     this.input.onLockChange = (locked) => this.onLockChange(locked);
+    // the warmup lobby's START button is the only interactive HUD node; it hands
+    // the intent back here and C10 owns the socket (and the canStart gate)
+    this.hud.onStart = () => this.startMatch();
     // C10/C11 seam: main.ts dispatches ONE 'fps:gesture' on the first real
     // pointerdown/keydown; resume() is idempotent (C7)
     window.addEventListener('fps:gesture', this.onFirstGesture);
@@ -621,6 +632,9 @@ export class ClientGame {
     this.pendingGear = null;
     this.warmupBannerShown = false;
     this.botPromptShown = false;
+    this.snapSeated = 0;
+    this.snapMinPlayers = MIN_PLAYERS_FOR_MATCH;
+    this.snapCanStart = false;
     this.dbgMove = null;
     this.dbgButtons = 0;
   }
@@ -758,6 +772,13 @@ export class ClientGame {
     s.phaseEndsAt = msg.phaseEndsAt;
     s.latestYou = you;
 
+    // START control inputs. Additive optional fields: a server that predates
+    // them leaves the button disabled with an honest seat count rather than
+    // offering a start that would be silently dropped.
+    this.snapSeated = msg.seated ?? msg.players.length;
+    this.snapMinPlayers = msg.minPlayers ?? MIN_PLAYERS_FOR_MATCH;
+    this.snapCanStart = msg.canStart ?? false;
+
     // a (re-)entry into warmup is a new match — stale scores must not survive it
     if (msg.phase === 'warmup' && (prevPhase !== 'warmup' || s.round !== 0)) {
       s.round = 0;
@@ -768,7 +789,8 @@ export class ClientGame {
     if (msg.phase === 'warmup') {
       if (!this.warmupBannerShown && s.round === 0) {
         this.warmupBannerShown = true;
-        this.hud.banner('WARMUP', 'match starts when 2+ players');
+        // nothing auto-starts: name the phase AND the action that ends it
+        this.hud.banner('WARMUP', 'PRESS START (ENTER) WHEN THE ROOM IS READY');
       }
     } else {
       this.warmupBannerShown = false;
@@ -1207,6 +1229,10 @@ export class ClientGame {
     h.team = s.team;
     h.you = s.youId ?? '';
     h.players = this.syncOut;
+    // warmup START control: the server's own numbers and its own verdict
+    h.seated = this.snapSeated;
+    h.minPlayers = this.snapMinPlayers;
+    h.canStart = this.snapCanStart;
     this.hud.update(h);
 
     w.rig.render();
@@ -1398,6 +1424,46 @@ export class ClientGame {
     }
   }
 
+  // ---- warmup START (lobby button + ENTER) -------------------------------------------
+  //
+  // No game on this platform auto-starts: warmup ends only when a seated player
+  // asks for it. Two ways in, because pointer lock makes one of them impossible
+  // at any given moment:
+  //   * the lobby button — the ONLY pointer-events:auto node in the HUD layer.
+  //     Reachable whenever the pointer is FREE (right after joining, after Esc,
+  //     after the buy menu closes), which is most of a real warmup.
+  //   * ENTER — reachable while the pointer is LOCKED, where no DOM node can be
+  //     clicked at all. The key is printed on the button's cap so it is never a
+  //     hidden binding. InputController ignores Enter (it falls through its
+  //     switch untouched), so this window listener is its only consumer.
+  //
+  // Both funnel here, and here alone decides to send: `snapCanStart` is the
+  // server's verdict, mirrored from the last snapshot and never recomputed.
+
+  /** Send `{t:'start'}` if the server said right now would be accepted. */
+  private startMatch(): void {
+    if (this.world === null || !this.snapCanStart) return;
+    this.conn?.send({ t: 'start' });
+    // the click that got here IS a user gesture — take the pointer back so the
+    // freeze phase starts with the player aiming, not staring at a cursor
+    if (document.pointerLockElement === null && !this.buyOpen && !this.consoleOpen) this.relock();
+  }
+
+  /** ENTER may start the match only from live play — never from under a menu. */
+  private startKeyArmed(): boolean {
+    if (this.world === null || this.buyOpen || this.consoleOpen) return false;
+    if (this.menus.modalOpen()) return false;
+    // A focused TEXT FIELD owns Enter — never steal it. A focused BUTTON does
+    // not disqualify the shortcut (clicking 'NO THANKS' on the bot prompt must
+    // not silently disarm it), with one exception: when the START button itself
+    // has focus the browser already turns Enter into a click on it, and firing
+    // here as well would send the message twice.
+    const tag = document.activeElement?.tagName ?? '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return false;
+    if (this.hud.startFocused()) return false;
+    return this.snapCanStart;
+  }
+
   /** Send reload + play the dip animation (shared by the R edge and e2e debug). */
   private doReload(): void {
     const you = this.state.latestYou;
@@ -1540,6 +1606,13 @@ export class ClientGame {
       if (e.code === 'Escape') {
         e.preventDefault();
         this.closeConsole();
+      }
+      return;
+    }
+    if (e.code === 'Enter' || e.code === 'NumpadEnter') {
+      if (!e.repeat && this.startKeyArmed()) {
+        e.preventDefault();
+        this.startMatch();
       }
       return;
     }

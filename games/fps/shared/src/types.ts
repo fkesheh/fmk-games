@@ -51,6 +51,14 @@ export type C2S =
   | { t: 'buy_gear'; item: GearId } // armor items: kevlar vest / helmet (CS gear)
   | { t: 'kill_bots' } // console 'killbots': kill every bot in place (they stay in the room)
   | { t: 'suicide' } // console 'kill' command: the server kills the sender (killerId null)
+  // ADDITIVE (manual start). Warmup IS this game's lobby and it never ends by
+  // itself: a match begins only when a seated player asks for it. Accepted ONLY
+  // while phase === 'warmup' AND playerCount >= MIN_PLAYERS_FOR_MATCH (bots
+  // count — they hold real roster slots). ANY seated player may send it; there
+  // is no host. Ignored silently in every other case, never an error, never a
+  // throw. The same applies after a match ends: the room resets to warmup and
+  // WAITS for another explicit 'start'.
+  | { t: 'start' }
   | { t: 'ping'; ts: number };
 
 export type GearId = 'kevlar' | 'helmet';
@@ -151,7 +159,33 @@ export type S2C =
   | { t: 'welcome'; playerId: PlayerId }
   | { t: 'room_list'; rooms: RoomInfo[] }
   | { t: 'joined'; roomId: RoomId; code: string | null; mapId: MapId; you: PlayerId; team: Team; tick: number; serverTime: number; round: number; scoreT: number; scoreCT: number; roster: RosterEntry[] }
-  | { t: 'snapshot'; tick: number; serverTime: number; ack: number; phase: RoomPhase; phaseEndsAt: number; players: PlayerSnap[]; you: YouSnap } // phaseEndsAt = 0 during warmup/matchEnd (HUD hides the timer when 0)
+  | {
+      t: 'snapshot';
+      tick: number;
+      serverTime: number;
+      ack: number;
+      phase: RoomPhase;
+      phaseEndsAt: number; // 0 during warmup/matchEnd (HUD hides the timer when 0)
+      players: PlayerSnap[];
+      you: YouSnap;
+      // ---- THE MANUAL-START LOBBY (identical contract across all four games) --
+      // ADDITIVE. No game on this platform auto-starts; fps's lobby is `warmup`
+      // (which stays fully playable) and it leaves warmup only because a seated
+      // player asked. These three fields are what the lobby UI renders, so the
+      // client never hardcodes the threshold or re-derives the acceptance rule
+      // and drifts from the server's answer. Sent on EVERY snapshot; absent
+      // only from an older server (treat as unknown and hide the button).
+      /** Seated players right now — bots included; the count `canStart` judges. */
+      seated?: number;
+      /** MIN_PLAYERS_FOR_MATCH, mirrored on the wire. */
+      minPlayers?: number;
+      /**
+       * True iff a `{t:'start'}` arriving right now would be ACCEPTED: phase is
+       * `warmup` and `seated >= minPlayers`. The server is the only judge; the
+       * button is enabled/disabled straight from this field.
+       */
+      canStart?: boolean;
+    }
   | { t: 'event'; ev: GameEvent }
   | { t: 'pong'; ts: number; serverTime: number }
   | { t: 'error'; code: string; message: string };

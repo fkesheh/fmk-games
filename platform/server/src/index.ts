@@ -109,24 +109,24 @@ const COPY: Record<string, GameCopy | undefined> = {
   fps: {
     genre: 'Tactical FPS',
     blurb:
-      'Round-based 5v5. Buy your loadout, hold the angle, one life per round — across six hand-built maps.',
-    tags: ['2–10 players', '6 maps'],
+      'Round-based 7v7. Buy your loadout, hold the angle, one life per round — across six hand-built maps.',
+    tags: ['6 maps'],
   },
   bank: {
     genre: 'Push-your-luck dice',
     blurb: 'Roll to grow the pot, bank before it busts. One bad die wipes the table clean.',
-    tags: ['2–8 players', 'Party'],
+    tags: ['Party'],
   },
   kart: {
     genre: 'Arcade racer',
-    blurb: 'Eight karts, drift boost and nitro. Three laps, and the brake is a suggestion.',
-    tags: ['2–8 players', 'Drift + nitro'],
+    blurb: 'Twenty karts, drift boost and nitro. Three laps, and the brake is a suggestion.',
+    tags: ['Drift + nitro'],
   },
   wordbomb: {
     genre: 'Simultaneous word game',
     blurb:
       "Same three letters for everyone, a fuse nobody can see. Match someone else's word and you split the points.",
-    tags: ['2–8 players', '10 rounds'],
+    tags: ['10 rounds'],
   },
 };
 
@@ -144,7 +144,10 @@ function launcherHtml(modules: readonly GameModule[]): string {
       const id = escapeHtml(m.id);
       const kind = known ? ` card--${id}` : '';
       const mark = known ? ` mark--${id}` : '';
-      const tags = (copy?.tags ?? [])
+      // Seat range comes from the module, never from hand-written copy —
+      // every hardcoded count on this page had gone stale.
+      const seats = `${m.minPlayers}\u2013${m.maxPlayers} players`;
+      const tags = [seats, ...(copy?.tags ?? [])]
         .map((t) => `<span class="tag">${escapeHtml(t)}</span>`)
         .join('');
       return (

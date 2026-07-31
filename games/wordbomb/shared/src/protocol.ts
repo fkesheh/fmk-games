@@ -16,6 +16,9 @@ import type { WbC2S, WbDifficulty, WordbombSettings } from './types.js';
 export function parseWordbombC2S(raw: unknown): WbC2S | null {
   if (typeof raw !== 'object' || raw === null) return null;
   const t = (raw as { t?: unknown }).t;
+  // The manual start. Payload-free by design: WHO pressed it is the socket the
+  // message arrived on, and there is no host, so there is nothing else to carry.
+  if (t === 'wb_start') return { t: 'wb_start' };
   if (t !== 'wb_submit') return null;
   const word = (raw as { word?: unknown }).word;
   if (typeof word !== 'string') return null;

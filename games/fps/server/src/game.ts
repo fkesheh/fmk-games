@@ -230,6 +230,20 @@ export class GameRoom {
     return this.players.size;
   }
 
+  /**
+   * Manual start (frozen lobby contract, identical across the platform's games):
+   * warmup IS this game's lobby and it NEVER ends by itself. A match begins only
+   * when a seated player asks for it, and only while the room is actually in
+   * warmup with enough players. Bots count — they hold real roster slots — so a
+   * solo player who adds a bot can start.
+   *
+   * Recomputed from live state every snapshot, so dropping back below the
+   * minimum (a leaver, a removed bot) makes it false again immediately.
+   */
+  canStartMatch(): boolean {
+    return this.phase === 'warmup' && this.players.size >= MIN_PLAYERS_FOR_MATCH;
+  }
+
   addPlayer(id: PlayerId, name: string): void {
     try {
       if (this.players.has(id)) return;
@@ -340,6 +354,7 @@ export class GameRoom {
     const snapshotMsg: SnapshotMsg = {
       t: 'snapshot', tick: 0, serverTime: 0, ack: 0,
       phase: this.phase, phaseEndsAt: 0, players: [], you,
+      seated: 0, minPlayers: MIN_PLAYERS_FOR_MATCH, canStart: false,
     };
     const p: PlayerState = {
       id, name, team, bot,
@@ -521,6 +536,9 @@ export class GameRoom {
       case 'kill_bots':
         this.handleKillBots();
         return;
+      case 'start':
+        this.handleStart(id);
+        return;
       case 'switch_team':
         this.handleSwitchTeam(id, parsed.team);
         return;
@@ -640,6 +658,20 @@ export class GameRoom {
       this.sendEvent(id, { t: 'buy_result', ok: true, weapon: null, reason: null });
     } catch (err) {
       console.error('[game] handleBuyGear failed', err);
+    }
+  }
+
+  // Manual start (C2S start): the ONLY warmup -> freeze transition there is.
+  // Accepted from ANY seated player (no host concept on this platform) while
+  // canStartMatch() holds; ignored silently otherwise — an unknown sender, the
+  // wrong phase, or too few players are all no-ops, never errors, never throws.
+  handleStart(id: PlayerId): void {
+    try {
+      if (!this.players.has(id)) return; // only a seated player may start it
+      if (!this.canStartMatch()) return; // wrong phase or below the minimum
+      this.beginFreeze(1, Date.now()); // round 1 of a fresh match (scores are 0 in warmup)
+    } catch (err) {
+      console.error('[game] handleStart failed', err);
     }
   }
 
@@ -834,13 +866,19 @@ export class GameRoom {
   // -------------------------------------------------------------------------
   // Phase machine: warmup -> freeze -> live -> roundEnd -> (halftime) ->
   // matchEnd -> warmup. All timings from ROUNDS.
+  //
+  // warmup is the LOBBY and it is a terminal phase for the tick loop: the only
+  // way out is an explicit C2S 'start' (handleStart). Warmup stays fully
+  // playable — bodies step, guns fire, the dead respawn on the warmup timer —
+  // it simply never ends by itself. Every path back to warmup (fullReset after
+  // a match, abortToWarmup on low population) therefore parks the room there
+  // until a player starts the next match.
   // -------------------------------------------------------------------------
 
   private advancePhase(now: number): void {
     switch (this.phase) {
       case 'warmup':
-        if (this.players.size >= MIN_PLAYERS_FOR_MATCH) this.beginFreeze(1, now);
-        return;
+        return; // lobby: only handleStart leaves warmup — never a timer, never a headcount
       case 'freeze':
       case 'live': {
         // low-population abort: match collapses straight back to warmup
@@ -955,8 +993,10 @@ export class GameRoom {
   }
 
   private fullReset(now: number): void {
-    // 6s after match_end: fresh match — warmup, scores/round 0, money reset,
-    // everyone back on knife+pistol (new pistol round economy), revived at spawn
+    // 6s after match_end: back to the LOBBY — warmup, scores/round 0, money
+    // reset, everyone back on knife+pistol (new pistol round economy), revived
+    // at spawn. The room then WAITS: the next match needs another explicit
+    // 'start', however many players are sitting in warmup.
     this.phase = 'warmup';
     this.phaseEndsAt = 0;
     this.round = 0;
@@ -976,7 +1016,9 @@ export class GameRoom {
   }
 
   private abortToWarmup(now: number): void {
-    // low-population abort (frozen): scores/money/round reset, owned list kept
+    // low-population abort (frozen): scores/money/round reset, owned list kept.
+    // Back in the lobby: refilling the room does NOT resume — someone must
+    // send 'start' again.
     this.phase = 'warmup';
     this.phaseEndsAt = 0;
     this.round = 0;
@@ -1239,6 +1281,10 @@ export class GameRoom {
       list.push(s);
     }
     const canBuy = this.canBuyAt(now);
+    // lobby gate, recomputed every tick so the button never lies: a leaver or a
+    // removed bot flips canStart back to false on the very next snapshot
+    const seated = this.players.size;
+    const canStart = this.canStartMatch();
     for (const p of this.players.values()) {
       const def = WEAPONS[p.weapon];
       const ammo = p.ammo.get(p.weapon);
@@ -1263,6 +1309,9 @@ export class GameRoom {
       m.ack = p.lastProcessedSeq;
       m.phase = this.phase;
       m.phaseEndsAt = this.phaseEndsAt;
+      m.seated = seated;
+      m.minPlayers = MIN_PLAYERS_FOR_MATCH;
+      m.canStart = canStart;
       m.players = list; // shared + per-player you/ack: Session.send stringifies now
       this.io.send(p.id, m);
     }

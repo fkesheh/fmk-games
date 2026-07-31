@@ -2,8 +2,11 @@
 // BANK room (docs/BANK.md) — authoritative, turn-based, event-driven (no tick
 // loop). Two dice per turn into a shared pot; banking locks the pot in for one
 // player and it KEEPS GROWING for the rest; a post-safe-window 7 busts the
-// round. Match length + variant come from the frozen BankSettings (default:
-// 10 rounds, 7=70, no race), then a full reset through the lobby rules. Race
+// round. A match NEVER starts by itself: the room sits in `lobby` until a
+// seated player sends `{t:'start'}` (no host — anyone at the table may), and
+// that holds for the first match of a cold room as much as for the one after a
+// finished match. Match length + variant come from the frozen BankSettings
+// (default: 10 rounds, 7=70, no race), then a full reset to lobby. Race
 // mode (raceTarget set): the match ends the MOMENT a bank takes a player to
 // >= raceTarget. Timers (one at a time): 30s turn auto-roll, 5s roundEnd
 // pause, 8s matchEnd reset. Behavioral invariants: docs/BANK.md "Server:
@@ -84,11 +87,12 @@ export class BankRoom implements GameRoomHandle {
   private lastRoll: LastRoll | null = null;
   private winnerId: PlayerId | null = null;
   /**
-   * POST-MATCH lobby marker. `false` in a fresh lobby and during play; set only
-   * by `fullReset()` and cleared only by `startMatch()`. It is the single bit
-   * that separates "a cold room filling up" (auto-starts, unchanged) from "a
-   * room that just finished a match" (waits for `{t:'start'}`). A low-pop
-   * `abortToLobby()` deliberately leaves it alone, so a rejoin resumes as before.
+   * POST-MATCH lobby marker — COSMETIC. `false` in a fresh lobby and during
+   * play; set only by `fullReset()` and cleared only by `startMatch()`. Both
+   * kinds of lobby wait for `{t:'start'}`; this only lets the client word the
+   * banner as "match complete" rather than "waiting for players". A low-pop
+   * `abortToLobby()` deliberately leaves it alone (the interrupted match is not
+   * a finished one). Nothing in the room branches on it.
    */
   private awaitingStart = false;
   private timer: ReturnType<typeof setTimeout> | null = null; // one phase timer at a time
@@ -170,16 +174,13 @@ export class BankRoom implements GameRoomHandle {
           lastMsgAt: now,
         });
       }
-      // A COLD lobby fills up -> round 1 starts immediately (a NEW match resets
-      // scores). `awaitingStart` excludes the post-match lobby, which waits for
-      // an explicit `{t:'start'}` so people can leave/join between matches —
-      // otherwise the first joiner after a match would silently restart it.
-      // A low-pop abort does NOT set the flag, so a rejoin still resumes play
-      // exactly as it did before.
-      if (this.phase === 'lobby' && !this.awaitingStart && this.playerCount() >= MIN_PLAYERS) {
-        this.startMatch(); // broadcasts fresh state to everyone, joiner included
-        return;
-      }
+      // NO AUTO-START. Reaching MIN_PLAYERS makes the room *startable*, not
+      // started: the broadcast below carries canStart=true and the table waits
+      // for a human to press START. This is the whole point — a room that
+      // starts itself the instant a second seat fills gives nobody a window to
+      // read the variant, invite a friend, or agree they are ready, and at 32
+      // seats every later joiner lands mid-match. Applies to the FIRST match of
+      // a cold room exactly as it does to the one after a finished match.
       this.broadcastState();
     } catch (err) {
       console.error('[bank] addPlayer failed', err);
@@ -311,12 +312,11 @@ export class BankRoom implements GameRoomHandle {
   }
 
   /**
-   * matchEnd -> FULL reset -> lobby, and there it WAITS. It used to restart the
-   * moment `playerCount() >= MIN_PLAYERS`, which at 32 seats means nobody ever
-   * gets a window to leave, join or re-read the scoreboard: the next match was
-   * already running. `awaitingStart` marks this lobby as post-match, which is
-   * the one thing that distinguishes it from a cold lobby — a cold lobby still
-   * auto-starts (see `addPlayer`), only the RESTART is manual (`tryStart`).
+   * matchEnd -> FULL reset -> lobby, and there it WAITS for `{t:'start'}` like
+   * every other lobby. It used to restart the moment `playerCount() >=
+   * MIN_PLAYERS`, which at 32 seats means nobody ever gets a window to leave,
+   * join or re-read the scoreboard: the next match was already running.
+   * `awaitingStart` only changes the client's wording (see the field doc).
    */
   private fullReset(): void {
     this.purgeGhosts(); // match reset drops every disconnected entry
@@ -545,6 +545,7 @@ export class BankRoom implements GameRoomHandle {
 
   private stateFor(you: PlayerId): BankState {
     const players: BankPlayerState[] = [];
+    const connected = this.playerCount();
     for (const p of this.players.values()) {
       players.push({
         id: p.id,
@@ -570,6 +571,11 @@ export class BankRoom implements GameRoomHandle {
       lastRoll: this.lastRoll,
       winnerId: this.winnerId,
       awaitingStart: this.awaitingStart,
+      // the lobby's three numbers, authoritative: the client renders the START
+      // control straight off `canStart` and never re-derives the rule
+      playerCount: connected,
+      minPlayers: MIN_PLAYERS,
+      canStart: this.phase === 'lobby' && connected >= MIN_PLAYERS,
       you,
     };
   }

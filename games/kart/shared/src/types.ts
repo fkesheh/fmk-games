@@ -15,7 +15,14 @@ export type KartC2S =
       steer: number; // -1..1
       drift: boolean;
     }
-  | { t: 'nitro' }; // consume one nitro charge (NITRO_CHARGES per race)
+  | { t: 'nitro' } // consume one nitro charge (NITRO_CHARGES per race)
+  /**
+   * Explicit lobby start (frozen lobby contract, identical in every game): the
+   * room NEVER auto-starts. Accepted only while the phase is 'lobby' AND at
+   * least MIN_PLAYERS are seated; ignored silently otherwise. ANY seated player
+   * may send it — KART has no host.
+   */
+  | { t: 'start' };
 
 export interface KartPlayerInfo {
   id: string;
@@ -70,6 +77,13 @@ export type KartS2C =
       phase: KartPhase;
       countdown: number; // current countdown number during 'countdown', else 0
       phaseEndsAt: number; // serverTime ms; 0 when no phase timer
+      // ---- lobby contract (additive) ----
+      // The three values a lobby needs to render the start control without
+      // guessing: how many are seated, how many it takes, and whether a
+      // `{t:'start'}` sent right now would be accepted.
+      playerCount: number; // seated players (== players.length)
+      minPlayers: number; // MIN_PLAYERS, mirrored so the UI needs no config import
+      canStart: boolean; // phase === 'lobby' && playerCount >= minPlayers
       you: KartYou;
       players: KartPlayerSnap[];
     }

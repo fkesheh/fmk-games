@@ -5,7 +5,7 @@
 // same dustbowl solids the server sim uses — fully deterministic.
 // ============================================================================
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ECONOMY, GEAR, INPUT_FIRE, MAPS, MAX_PLAYERS, MULTIKILL_WINDOW, PLAYER, WEAPONS, boxToAABB, hitscan } from '@fps/shared';
+import { ECONOMY, GEAR, INPUT_FIRE, MAPS, MAX_PLAYERS, MIN_PLAYERS_FOR_MATCH, MULTIKILL_WINDOW, PLAYER, ROUNDS, WEAPONS, boxToAABB, hitscan } from '@fps/shared';
 import type { C2S, GameEvent, HitscanTarget, MapId, PlayerId, RoomPhase, S2C, Team, Vec3 } from '@fps/shared';
 import { GameRoom } from './game.js';
 import type { RoomIO } from './game.js';
@@ -92,11 +92,23 @@ class InputFeed {
   }
 }
 
+/**
+ * The explicit manual start. Warmup is this game's lobby and it never ends by
+ * itself, so any test that wants a match has to ask for one — from a SEATED
+ * player (there is no host). beginFreeze runs synchronously inside the call, so
+ * the room is already in freeze when this returns.
+ */
+function startMatch(room: GameRoom, id: PlayerId): void {
+  room.handleMessage(id, { t: 'start' });
+}
+
+/** Two players, the tick loop running, and the match explicitly started. */
 function setupDuel(io: FakeIO): GameRoom {
   const room = new GameRoom('dustbowl', 'public', io);
   room.addPlayer('p1', 'Alpha');
   room.addPlayer('p2', 'Bravo');
   room.start();
+  startMatch(room, 'p1'); // no auto-start: the room would sit in warmup forever
   return room;
 }
 
@@ -552,8 +564,14 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-describe('GameRoom phase flow', () => {
-  it('stays in warmup solo; a second player flips it to freeze (round 1) within a few ticks', () => {
+// ---------------------------------------------------------------------------
+// THE MANUAL-START LOBBY. No game on this platform auto-starts. fps's lobby is
+// `warmup` — still fully playable — and the ONLY way out of it is an explicit
+// {t:'start'} from a seated player.
+// ---------------------------------------------------------------------------
+
+describe('GameRoom manual start', () => {
+  it('warmup never ends by itself, not even once the minimum is met', () => {
     const io = new FakeIO();
     const room = new GameRoom('dustbowl', 'public', io);
     room.addPlayer('p1', 'Alpha');
@@ -562,11 +580,39 @@ describe('GameRoom phase flow', () => {
     vi.advanceTimersByTime(200);
     expect(io.lastSnap('p1').phase).toBe('warmup'); // < MIN_PLAYERS_FOR_MATCH
     expect(room.info().phase).toBe('warmup');
+    expect(io.lastSnap('p1').seated).toBe(1);
+    expect(io.lastSnap('p1').minPlayers).toBe(MIN_PLAYERS_FOR_MATCH);
+    expect(io.lastSnap('p1').canStart).toBe(false);
 
+    // reaching the minimum makes a start POSSIBLE; it does not perform one.
+    // The old auto-start fired on the very first tick after this join.
     room.addPlayer('p2', 'Bravo');
+    vi.advanceTimersByTime(5000); // ~150 ticks of doing nothing about it
+    expect(io.lastSnap('p1').phase).toBe('warmup');
+    expect(room.info().phase).toBe('warmup');
+    expect(io.lastSnap('p1').seated).toBe(2);
+    expect(io.lastSnap('p1').canStart).toBe(true);
+    expect(eventsOfType(io, 'p1', 'round_start').length).toBe(0);
+    expect(io.lastSnap('p1').you.alive).toBe(true); // and warmup is still playable
+    room.stop();
+  });
+
+  it('an explicit start from any seated player begins the round-1 freeze', () => {
+    const io = new FakeIO();
+    const room = new GameRoom('dustbowl', 'public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.addPlayer('p2', 'Bravo');
+    room.start();
     vi.advanceTimersByTime(200);
+    expect(io.lastSnap('p1').phase).toBe('warmup');
+
+    // p2, not p1: there is no host — any seated player may start the match
+    startMatch(room, 'p2');
+    expect(room.info().phase).toBe('freeze'); // applied synchronously, not on a timer
+
+    tick();
     expect(io.lastSnap('p1').phase).toBe('freeze');
-    expect(room.info().phase).toBe('freeze');
+    expect(io.lastSnap('p1').canStart).toBe(false); // out of the lobby: no longer startable
     expect(room.playerCount()).toBe(2);
 
     const starts = eventsOfType(io, 'p1', 'round_start');
@@ -577,6 +623,128 @@ describe('GameRoom phase flow', () => {
     expect(starts[0]?.freezeUntil).toBeGreaterThan(io.lastSnap('p1').serverTime - 3000);
     room.stop();
   });
+
+  it('start below the minimum is ignored in silence, from a seat or from nobody', () => {
+    const io = new FakeIO();
+    const room = new GameRoom('dustbowl', 'public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.start();
+    vi.advanceTimersByTime(200);
+    expect(io.lastSnap('p1').canStart).toBe(false);
+
+    startMatch(room, 'p1'); // solo: below MIN_PLAYERS_FOR_MATCH
+    startMatch(room, 'ghost'); // not even in the room
+    vi.advanceTimersByTime(200);
+
+    expect(io.lastSnap('p1').phase).toBe('warmup');
+    expect(room.info().phase).toBe('warmup');
+    expect(eventsOfType(io, 'p1', 'round_start').length).toBe(0);
+    expect(io.errors('p1').length).toBe(0); // ignored, never an error, never a throw
+    room.stop();
+  });
+
+  it('a bot counts toward the minimum: solo + one bot may start', () => {
+    const io = new FakeIO();
+    const room = new GameRoom('dustbowl', 'public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.start();
+    vi.advanceTimersByTime(200);
+    expect(io.lastSnap('p1').canStart).toBe(false);
+
+    expect(room.addBot()).not.toBeNull(); // bots hold real roster slots
+    vi.advanceTimersByTime(200);
+    expect(io.lastSnap('p1').phase).toBe('warmup'); // still no auto-start
+    expect(io.lastSnap('p1').seated).toBe(2);
+    expect(io.lastSnap('p1').canStart).toBe(true);
+
+    startMatch(room, 'p1');
+    tick();
+    expect(io.lastSnap('p1').phase).toBe('freeze');
+    room.stop();
+  });
+
+  it('dropping below the minimum re-disables start, and the wire state says so', () => {
+    const io = new FakeIO();
+    const room = new GameRoom('dustbowl', 'public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.start();
+    expect(room.addBot()).not.toBeNull();
+    vi.advanceTimersByTime(200);
+    expect(io.lastSnap('p1').canStart).toBe(true);
+
+    expect(room.removeBot()).toBe(true); // back down to a lone player
+    tick();
+    expect(io.lastSnap('p1').seated).toBe(1);
+    expect(io.lastSnap('p1').canStart).toBe(false);
+
+    startMatch(room, 'p1'); // and the start really is refused now
+    vi.advanceTimersByTime(200);
+    expect(io.lastSnap('p1').phase).toBe('warmup');
+    expect(eventsOfType(io, 'p1', 'round_start').length).toBe(0);
+    room.stop();
+  });
+
+  it('start outside warmup is ignored — freeze and live never restart the match', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io); // seated and explicitly started
+
+    advanceToPhase(io, 'p1', 'freeze');
+    expect(io.lastSnap('p1').canStart).toBe(false);
+    startMatch(room, 'p1');
+    tick();
+    expect(io.lastSnap('p1').phase).toBe('freeze');
+    expect(eventsOfType(io, 'p1', 'round_start').length).toBe(1); // no second round 1
+
+    advanceToPhase(io, 'p1', 'live');
+    expect(io.lastSnap('p1').canStart).toBe(false);
+    startMatch(room, 'p1');
+    tick();
+    expect(io.lastSnap('p1').phase).toBe('live');
+    expect(eventsOfType(io, 'p1', 'round_start').length).toBe(1);
+    expect(io.errors('p1').length).toBe(0);
+    room.stop();
+  });
+
+  it('a finished match returns to warmup and STAYS there until someone starts again', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io);
+
+    // p1 throws every round: the other side takes winRounds and the match ends.
+    // (halftime swaps sides and side-scores together, so the winner keeps its
+    // tally across the swap and still gets there on round `winRounds`.)
+    for (let r = 0; r < ROUNDS.winRounds; r++) {
+      advanceToPhase(io, 'p2', 'live', 300);
+      room.handleSuicide('p1');
+      advanceToPhase(io, 'p2', 'roundEnd', 60);
+      if (r < ROUNDS.winRounds - 1) advanceToPhase(io, 'p2', 'freeze', 300);
+    }
+    advanceToPhase(io, 'p2', 'matchEnd', 300);
+    expect(eventsOfType(io, 'p2', 'match_end').length).toBe(1);
+    expect(io.lastSnap('p2').canStart).toBe(false); // matchEnd is not the lobby
+
+    // the post-match reset drops the room back into the lobby...
+    advanceToPhase(io, 'p2', 'warmup', 300);
+    expect(io.lastSnap('p2').seated).toBe(2);
+    expect(io.lastSnap('p2').canStart).toBe(true);
+    const startsAfterMatch = eventsOfType(io, 'p2', 'round_start').length;
+
+    // ...and it sits there: no second match starts itself, however long we wait
+    vi.advanceTimersByTime(10_000); // ~300 ticks
+    expect(io.lastSnap('p2').phase).toBe('warmup');
+    expect(room.info().phase).toBe('warmup');
+    expect(eventsOfType(io, 'p2', 'round_start').length).toBe(startsAfterMatch);
+
+    // only an explicit start opens match two, from round 1 with the scores clear
+    startMatch(room, 'p2');
+    tick();
+    expect(io.lastSnap('p2').phase).toBe('freeze');
+    const starts = eventsOfType(io, 'p2', 'round_start');
+    expect(starts.length).toBe(startsAfterMatch + 1);
+    expect(starts[starts.length - 1]?.round).toBe(1);
+    expect(starts[starts.length - 1]?.scoreT).toBe(0);
+    expect(starts[starts.length - 1]?.scoreCT).toBe(0);
+    room.stop();
+  }, 30_000);
 });
 
 describe('GameRoom combat + rounds', () => {
@@ -840,6 +1008,7 @@ describe('GameRoom stats', () => {
     room.addPlayer('p2', 'Bravo');
     room.addPlayer('p3', 'Carol');
     room.start();
+    startMatch(room, 'p1');
     const feed = new InputFeed();
     advanceToPhase(io, 'p1', 'live');
 
@@ -914,8 +1083,9 @@ describe('GameRoom bots', () => {
     expect(entry?.team === 'T' || entry?.team === 'CT').toBe(true);
 
     room.start();
+    startMatch(room, 'p1'); // 1 human + 1 bot = MIN_PLAYERS_FOR_MATCH, started by hand
     const feed = new InputFeed();
-    advanceToPhase(io, 'p1', 'live'); // 1 human + 1 bot = MIN_PLAYERS_FOR_MATCH
+    advanceToPhase(io, 'p1', 'live');
 
     // spawn = where the round-1 freeze teleported the bot
     const spawn = io.lastSnap('p1').players.find((p) => p.id === botId);
@@ -957,7 +1127,7 @@ describe('GameRoom bots', () => {
     const b2 = room.addBot();
     if (b1 === null || b2 === null) throw new Error('addBot returned null with free slots');
     expect(room.playerCount()).toBe(3);
-    // the phase machine only advances on ticks: the room is still in warmup
+    // seats never start a match: the room stays in warmup until someone asks
     expect(room.info().phase).toBe('warmup');
 
     room.handleMessage('p1', { t: 'kill_bots' });
@@ -980,11 +1150,11 @@ describe('GameRoom bots', () => {
     expect(room.botCount()).toBe(2);
     expect(room.playerCount()).toBe(3);
 
-    // 3 players >= MIN_PLAYERS_FOR_MATCH, so the very next tick ends warmup and
-    // the round-1 freeze reset revives everyone (in a sub-MIN room the same
-    // death would instead rejoin via the warmup respawn timer). Advance past
-    // the 2s warmup delay: both bots are back alive and nothing else died.
-    vi.advanceTimersByTime(2200); // still inside the 3s freeze: no combat
+    // nobody started a match, so the room is still in warmup and the bots come
+    // back on the normal warmup respawn timer. Advance past that delay: both
+    // bots are alive again and nothing else died.
+    vi.advanceTimersByTime(ROUNDS.warmupRespawnDelay * 1000 + 200);
+    expect(io.lastSnap('p1').phase).toBe('warmup');
     const snap = io.lastSnap('p1');
     expect(snap.players.find((p) => p.id === b1)?.alive).toBe(true);
     expect(snap.players.find((p) => p.id === b2)?.alive).toBe(true);
@@ -1033,6 +1203,7 @@ describe('GameRoom team switching', () => {
     room.addPlayer('p2', 'Bravo');
     room.addPlayer('p3', 'Carol');
     room.start();
+    startMatch(room, 'p1');
     advanceToPhase(io, 'p1', 'freeze'); // 3 players => always 2v1
 
     const ids: PlayerId[] = ['p1', 'p2', 'p3'];
@@ -1153,6 +1324,7 @@ function seatRoom(mapId: MapId, n: number): { io: FakeIO; room: GameRoom; ids: P
     ids.push(id);
   }
   room.start();
+  startMatch(room, 's0'); // seating a full room does not start it; a player must
   return { io, room, ids };
 }
 
@@ -1242,7 +1414,7 @@ describe('GameRoom spawn separation at 7v7', () => {
     it(`${mapId}: 50 seeded 7v7 waves never double up a spawn point`, () => {
       for (let wave = 0; wave < 50; wave++) {
         const { io, room, ids } = seatRoom(mapId, MAX_PLAYERS);
-        vi.advanceTimersByTime(120); // >= 3 ticks: warmup flips to the round-1 freeze
+        vi.advanceTimersByTime(120); // >= 3 ticks of the round-1 freeze seatRoom started
         expect(io.lastSnap('s0').phase).toBe('freeze');
         assertWave(mapId, positionsByTeam(io, ids), wave);
         room.stop();
@@ -1444,7 +1616,9 @@ describe('GameRoom auto-balance', () => {
     expect(idsOn(io, remaining, big).length).toBe(3);
 
     room.start();
-    advanceToPhase(io, idsOn(io, all, small)[2] ?? 'h0', 'freeze');
+    const survivor = idsOn(io, all, small)[2] ?? 'h0';
+    startMatch(room, survivor);
+    advanceToPhase(io, survivor, 'freeze');
 
     const watcher = idsOn(io, all, big)[0] as PlayerId;
     const changes = eventsOfType(io, watcher, 'team_changed');
@@ -1481,6 +1655,7 @@ describe('GameRoom auto-balance', () => {
 
     room.start();
     const watcher = idsOn(io, all, big)[0] as PlayerId;
+    startMatch(room, watcher);
     advanceToPhase(io, watcher, 'freeze');
 
     const changes = eventsOfType(io, watcher, 'team_changed');
@@ -1492,6 +1667,7 @@ describe('GameRoom auto-balance', () => {
   it('leaves a roster that is already within one player alone', () => {
     const { io, room } = seatMixed(3, 0);
     room.start();
+    startMatch(room, 'h0');
     advanceToPhase(io, 'h0', 'freeze'); // 2v1: nothing to repair
     expect(eventsOfType(io, 'h0', 'team_changed').length).toBe(0);
     expect(eventsOfType(io, 'h0', 'notice').length).toBe(0);
@@ -1510,6 +1686,7 @@ describe('GameRoom auto-balance', () => {
 
     room.start();
     const watcher = survivors[0] as PlayerId;
+    startMatch(room, watcher);
     advanceToPhase(io, watcher, 'freeze');
     const firstMove = eventsOfType(io, watcher, 'team_changed')[0]?.id;
     expect(firstMove).toBeDefined(); // round 1: 4v2 -> 3v3

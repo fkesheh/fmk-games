@@ -18,7 +18,7 @@
 export type WbDifficulty = 'easy' | 'normal' | 'hard';
 
 export type WbPhase =
-  | 'lobby' // waiting for MIN_PLAYERS
+  | 'lobby' // seated, waiting for an EXPLICIT wb_start — nothing auto-starts
   | 'live' // fragment shown, fuse burning, players typing
   | 'reveal' // bomb went off, all answers visible
   | 'matchEnd'; // final standings
@@ -88,6 +88,22 @@ export interface WbPublicState {
   players: WbPlayerState[];
   /** Set only at matchEnd. Ties broken by join order — see docs §1.3. */
   winnerId: string | null;
+
+  // ---- THE MANUAL-START LOBBY (identical contract across all four games) -----
+  // No game on this platform auto-starts. The room sits in `lobby` until some
+  // seated player sends `{t:'wb_start'}`. These three fields are what the lobby
+  // UI renders, so the client never hardcodes the threshold or re-derives the
+  // acceptance rule and drifts from the server's answer.
+  /** Connected seats right now — the count `canStart` is judged against. */
+  seated: number;
+  /** MIN_PLAYERS, mirrored on the wire. */
+  minPlayers: number;
+  /**
+   * True iff a `wb_start` arriving right now would be ACCEPTED: phase is
+   * `lobby`, no start beat is already running, and `seated >= minPlayers`.
+   * The server is the only judge; the button is disabled from this field.
+   */
+  canStart: boolean;
 }
 
 // ---- private snapshot (unicast, one per recipient) ---------------------------
@@ -143,5 +159,11 @@ export type WbEvent =
 /**
  * The entire client surface. There is deliberately no "typing" or "progress"
  * message: broadcasting either would leak word length and violate I1.
+ *
+ * `wb_start` is the MANUAL START. No game on this platform auto-starts, so the
+ * room leaves `lobby` only because a seated human asked it to. There is no host
+ * concept — ANY seated player may press it — and it is accepted ONLY when
+ * `phase === 'lobby'` and `seated >= MIN_PLAYERS`. Otherwise it is ignored in
+ * silence (never an error, never a throw — I6).
  */
-export type WbC2S = { t: 'wb_submit'; word: string };
+export type WbC2S = { t: 'wb_submit'; word: string } | { t: 'wb_start' };

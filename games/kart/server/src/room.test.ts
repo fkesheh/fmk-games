@@ -13,6 +13,7 @@ import {
   GATES,
   LAPS_TO_WIN,
   MAX_PLAYERS,
+  MIN_PLAYERS,
   NITRO_CHARGES,
   NITRO_TIME,
   RACE_TIMEOUT_S,
@@ -125,12 +126,13 @@ function driveRace(room: KartRoom, feed: StateFeed, id: PlayerId): void {
   for (let lap = 0; lap < LAPS_TO_WIN; lap++) driveLap(room, feed, id);
 }
 
-/** Two players seated, room started, driven all the way to 'racing'. */
+/** Two players seated, room started, START pressed, driven all the way to 'racing'. */
 function setupRace(io: FakeIO): { room: KartRoom; feed: StateFeed } {
   const room = new KartRoom('public', io);
   room.addPlayer('p1', 'Alpha');
   room.addPlayer('p2', 'Bravo');
   room.start();
+  room.handleMessage('p1', { t: 'start' }); // nothing auto-starts: a seated player presses START
   const feed = new StateFeed();
   advanceToPhase(io, 'p1', 'racing');
   return { room, feed };
@@ -160,7 +162,7 @@ afterEach(() => {
 });
 
 describe('KartRoom phase flow', () => {
-  it('stays in lobby solo; a second player runs ready -> countdown 3-2-1-go -> racing', () => {
+  it('stays in lobby solo; with 2 seated an explicit START runs ready -> countdown 3-2-1-go -> racing', () => {
     const io = new FakeIO();
     const room = new KartRoom('public', io);
     room.addPlayer('p1', 'Alpha');
@@ -174,6 +176,10 @@ describe('KartRoom phase flow', () => {
     expect(room.info().maxPlayers).toBe(MAX_PLAYERS); // never a literal: the cap moves
 
     room.addPlayer('p2', 'Bravo');
+    vi.advanceTimersByTime(READY_SECONDS * 1000 + 2000); // a full lobby still WAITS
+    expect(io.lastSnap('p1').phase).toBe('lobby');
+
+    room.handleMessage('p2', { t: 'start' }); // any seated player may start it
     advanceToPhase(io, 'p1', 'ready');
     expect(room.info().phase).toBe('ready');
     const readySnap = io.lastSnap('p1');
@@ -189,6 +195,135 @@ describe('KartRoom phase flow', () => {
     expect(kinds).toEqual([...Array.from({ length: COUNTDOWN_SECONDS }, () => 'countdown'), 'go']);
     const countdowns = eventsOfKind(io, 'p1', 'countdown').map((e) => e.n);
     expect(countdowns).toEqual(Array.from({ length: COUNTDOWN_SECONDS }, (_, i) => COUNTDOWN_SECONDS - i));
+    room.stop();
+  });
+});
+
+describe('KartRoom explicit start (frozen lobby contract)', () => {
+  /** A seated lobby that is startable but has NOT been started. */
+  function seatedLobby(io: FakeIO, n = MIN_PLAYERS): KartRoom {
+    const room = new KartRoom('public', io);
+    for (let i = 0; i < n; i++) room.addPlayer(`p${i + 1}`, `Driver${i + 1}`);
+    room.start();
+    tick();
+    return room;
+  }
+
+  it('never auto-starts: a lobby at MIN_PLAYERS sits in lobby however long it waits', () => {
+    const io = new FakeIO();
+    const room = seatedLobby(io);
+
+    vi.advanceTimersByTime((READY_SECONDS + COUNTDOWN_SECONDS) * 1000 + 10_000);
+    expect(io.lastSnap('p1').phase).toBe('lobby');
+    expect(room.info().phase).toBe('lobby');
+    expect(io.raceEvents('p1').length).toBe(0); // no countdown, no go
+    room.stop();
+  });
+
+  it('does not auto-start at a FULL grid either (MAX_PLAYERS seated)', () => {
+    const io = new FakeIO();
+    const room = seatedLobby(io, MAX_PLAYERS);
+
+    vi.advanceTimersByTime((READY_SECONDS + COUNTDOWN_SECONDS) * 1000 + 5000);
+    expect(room.playerCount()).toBe(MAX_PLAYERS);
+    expect(io.lastSnap('p1').phase).toBe('lobby');
+    room.stop();
+  });
+
+  it('the snapshot carries playerCount / minPlayers / canStart', () => {
+    const io = new FakeIO();
+    const room = new KartRoom('public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.start();
+    tick();
+
+    let snap = io.lastSnap('p1');
+    expect(snap.playerCount).toBe(1);
+    expect(snap.minPlayers).toBe(MIN_PLAYERS);
+    expect(snap.canStart).toBe(false); // one short
+
+    room.addPlayer('p2', 'Bravo');
+    tick();
+    snap = io.lastSnap('p1');
+    expect(snap.playerCount).toBe(2);
+    expect(snap.canStart).toBe(true);
+
+    room.handleMessage('p1', { t: 'start' });
+    advanceToPhase(io, 'p1', 'ready');
+    expect(io.lastSnap('p1').canStart).toBe(false); // no longer in the lobby phase
+    room.stop();
+  });
+
+  it('start below MIN_PLAYERS is ignored (and never throws)', () => {
+    const io = new FakeIO();
+    const room = new KartRoom('public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.start();
+
+    expect(() => room.handleMessage('p1', { t: 'start' })).not.toThrow();
+    vi.advanceTimersByTime((READY_SECONDS + COUNTDOWN_SECONDS) * 1000 + 2000);
+    expect(io.lastSnap('p1').phase).toBe('lobby');
+    expect(io.raceEvents('p1').length).toBe(0);
+    room.stop();
+  });
+
+  it('start from a player who is not in the room is ignored', () => {
+    const io = new FakeIO();
+    const room = seatedLobby(io);
+
+    expect(() => room.handleMessage('ghost', { t: 'start' })).not.toThrow();
+    vi.advanceTimersByTime(READY_SECONDS * 1000 + 2000);
+    expect(io.lastSnap('p1').phase).toBe('lobby');
+    room.stop();
+  });
+
+  it('a valid start runs ready -> countdown -> racing, and any seated player may send it', () => {
+    const io = new FakeIO();
+    const room = seatedLobby(io);
+
+    room.handleMessage('p2', { t: 'start' }); // the SECOND joiner, not a "host"
+    advanceToPhase(io, 'p1', 'ready');
+    advanceToPhase(io, 'p1', 'countdown');
+    advanceToPhase(io, 'p1', 'racing');
+
+    const kinds = io.raceEvents('p1').map((e) => e.kind);
+    expect(kinds).toEqual([...Array.from({ length: COUNTDOWN_SECONDS }, () => 'countdown'), 'go']);
+    room.stop();
+  });
+
+  it('extra starts during ready/countdown/racing/results change nothing', () => {
+    const io = new FakeIO();
+    const room = seatedLobby(io);
+
+    room.handleMessage('p1', { t: 'start' });
+    advanceToPhase(io, 'p1', 'ready');
+    const readyEndsAt = io.lastSnap('p1').phaseEndsAt;
+    room.handleMessage('p2', { t: 'start' }); // ignored: not in 'lobby'
+    tick();
+    expect(io.lastSnap('p1').phase).toBe('ready');
+    expect(io.lastSnap('p1').phaseEndsAt).toBe(readyEndsAt); // the timer was NOT restarted
+
+    advanceToPhase(io, 'p1', 'countdown');
+    room.handleMessage('p1', { t: 'start' });
+    tick();
+    expect(io.lastSnap('p1').phase).toBe('countdown');
+
+    advanceToPhase(io, 'p1', 'racing');
+    room.handleMessage('p1', { t: 'start' });
+    tick();
+    expect(io.lastSnap('p1').phase).toBe('racing');
+
+    const feed = new StateFeed();
+    driveRace(room, feed, 'p1');
+    driveRace(room, feed, 'p2');
+    advanceToPhase(io, 'p1', 'results');
+    room.handleMessage('p1', { t: 'start' });
+    tick();
+    expect(io.lastSnap('p1').phase).toBe('results'); // no early exit out of results
+
+    // exactly one countdown run for the whole race, despite five start messages
+    expect(eventsOfKind(io, 'p1', 'countdown').length).toBe(COUNTDOWN_SECONDS);
+    expect(eventsOfKind(io, 'p1', 'go').length).toBe(1);
     room.stop();
   });
 });
@@ -266,7 +401,7 @@ describe('KartRoom gates + laps', () => {
 });
 
 describe('KartRoom race end', () => {
-  it('results last 10s, then the room resets to lobby keeping players and clearing progress', () => {
+  it('results last 10s, then the room resets to lobby keeping players, clearing progress, and WAITS', () => {
     const io = new FakeIO();
     const { room, feed } = setupRace(io);
 
@@ -279,18 +414,25 @@ describe('KartRoom race end', () => {
     expect(finishes.map((e) => e.place)).toEqual([1, 2]);
     expect(room.playerCount()).toBe(2); // both still seated through results
 
-    room.removePlayer('p2'); // below MIN_PLAYERS: the lobby reset can't re-arm a race
     vi.advanceTimersByTime(RESULTS_SECONDS * 1000 - 1500); // ~8.5s in: still results
     expect(io.lastSnap('p1').phase).toBe('results');
     vi.advanceTimersByTime(2000); // past the 10s mark
     expect(io.lastSnap('p1').phase).toBe('lobby');
     expect(room.info().phase).toBe('lobby');
-    expect(room.playerCount()).toBe(1); // p1 kept (p2 left on its own above)
+    expect(room.playerCount()).toBe(2); // both kept across the reset
 
     const you = io.lastSnap('p1').you; // race state cleared for the next race
     expect(you.progress).toBe(0);
     expect(you.finished).toBe(false);
     expect(you.finishMs).toBe(-1);
+
+    // ...and it STAYS there: a full lobby after a race never re-arms itself
+    vi.advanceTimersByTime((READY_SECONDS + COUNTDOWN_SECONDS) * 1000 + 5000);
+    expect(io.lastSnap('p1').phase).toBe('lobby');
+    expect(io.lastSnap('p1').canStart).toBe(true); // startable, just not started
+
+    room.handleMessage('p2', { t: 'start' }); // the NEXT race is another explicit press
+    advanceToPhase(io, 'p1', 'ready');
     room.stop();
   });
 
@@ -347,6 +489,7 @@ describe('KartRoom pre-GO freeze', () => {
     room.addPlayer('p1', 'Alpha');
     room.addPlayer('p2', 'Bravo');
     room.start();
+    room.handleMessage('p1', { t: 'start' }); // explicit start: nothing auto-starts
     const feed = new StateFeed();
     const spawn = gridSlot(TRACK, 0);
 
@@ -373,6 +516,7 @@ describe('KartRoom pre-GO freeze', () => {
     room.addPlayer('p1', 'Alpha');
     room.addPlayer('p2', 'Bravo');
     room.start();
+    room.handleMessage('p1', { t: 'start' }); // explicit start: nothing auto-starts
     const feed = new StateFeed();
     const spawn = gridSlot(TRACK, 0);
 
@@ -454,6 +598,7 @@ describe('KartRoom gap timing', () => {
     expect(io.lastSnap('p1').you.gapAheadMs).toBe(0);
 
     room.addPlayer('p2', 'Bravo');
+    room.handleMessage('p2', { t: 'start' });
     advanceToPhase(io, 'p1', 'ready');
     expect(io.lastSnap('p1').you.gapAheadMs).toBe(0);
 

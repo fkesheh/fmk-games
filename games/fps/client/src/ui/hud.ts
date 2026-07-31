@@ -1,5 +1,6 @@
 // ============================================================================
-// C8 — HUD. DOM-based overlay, pointer-events none, layered. All colors trace
+// C8 — HUD. DOM-based overlay, pointer-events none (the warmup lobby's START
+// button is the one deliberate exception), layered. All colors trace
 // to PALETTE (set as CSS custom props on the root); styling lives in the
 // injected <style> block below. update() is on the render hot path: DOM is
 // only touched when a cached value actually changes; zero allocation per
@@ -43,6 +44,19 @@ export interface HudState {
   you: string;
   /** Everyone in the latest snapshot, merged with the roster's name/team. */
   players: readonly HudPlayer[];
+  /**
+   * Seated players right now, bots included — the snapshot's `seated`, mirrored
+   * verbatim. Shown as a number, never used to decide anything.
+   */
+  seated: number;
+  /** The snapshot's `minPlayers` (the server's threshold). <=0 = not yet known. */
+  minPlayers: number;
+  /**
+   * The SERVER's verdict: would a `{t:'start'}` sent right now be accepted?
+   * The START button is driven straight from this — the rule is NEVER
+   * re-derived here, because a second judge is a judge that drifts.
+   */
+  canStart: boolean;
 }
 
 const PHASE_LABEL: Record<RoomPhase, string> = {
@@ -216,6 +230,12 @@ const ICON_ARMOR = 'M12 2l8.2 3.1v6.2c0 4.9-3.3 8.9-8.2 10.7C7.1 20.2 3.8 16.2 3
 const ICON_T = 'M2 3.4h20L12 22z';
 const ICON_CT = 'M12 2L22 21L2 21Z M12 7.6L6.4 18.2L17.6 18.2Z';
 const TEAM_ICON: Record<Team, string> = { T: ICON_T, CT: ICON_CT };
+// START control. Two states, two SHAPES: a play wedge that points forward when
+// the match can begin, three waiting blocks when it cannot. The state is also
+// spelled out in words underneath and carried by the button's own `disabled`
+// flag — hue is the last of four signals here, never the only one.
+const ICON_PLAY = 'M5.4 2.6L20.6 12L5.4 21.4Z';
+const ICON_WAIT = 'M2.4 9.4h5.2v5.2H2.4z M9.4 9.4h5.2v5.2H9.4z M16.4 9.4h5.2v5.2h-5.2z';
 
 function icon(path: string, cls: string): SVGSVGElement {
   const s = document.createElementNS(SVG_NS, 'svg');
@@ -476,11 +496,22 @@ const CSS = `
 .fh-foe-ct { color: var(--fh-ct-lit); }
 .fh-foe-n { margin-left: auto; color: var(--fh-text); }
 
-/* ---- warmup lobby: both rosters side by side + the start condition --------
-   Pointer-events stay off (it is part of .fh-layer): warmup is playable, so
-   this is a readout, never a gate. It sits above the crosshair and clears it. */
+/* ---- warmup lobby: both rosters side by side + the START control ----------
+   Pointer-events stay off for the PANEL (it is part of .fh-layer): warmup is
+   playable, so this is a readout, never a gate. The single exception is the
+   START button below, which re-enables events for itself alone. It sits above
+   the crosshair and clears it.
+
+   z-index is LOAD-BEARING here, not decoration. C11's shell stacks canvas ->
+   #hud -> #menu, and #menu is a full-screen pointer-events:AUTO root painted
+   after #hud: at z-index auto it swallows every click aimed at the START button
+   (measured — elementFromPoint at the button's centre returned #menu's bare
+   div). This panel's own translateX makes it a stacking context, so the lift
+   has to live HERE, on the transformed element, or it is trapped inside and
+   changes nothing. At 1 it clears #menu (auto = 0) and stays far below
+   .fps-menus (40), so an open pause/buy/main modal still covers it. */
 .fh-lobby { position: absolute; left: 50%; top: 104px; transform: translateX(-50%);
-  width: min(640px, 80vw); }
+  width: min(640px, 80vw); z-index: 1; }
 .fh-lobby-head { display: flex; align-items: center; justify-content: space-between;
   gap: 14px; padding: 9px 14px 8px; border-bottom: 1px solid var(--fh-edge); }
 .fh-lobby-eyebrow { font-size: 10px; font-weight: 800; letter-spacing: 3.4px;
@@ -512,7 +543,41 @@ const CSS = `
 .fh-lobby-foot { padding: 7px 14px 9px; text-align: center; font-size: 10px;
   font-weight: 800; letter-spacing: 2.2px; color: var(--fh-text-mute);
   background: var(--fh-track); border-top: 1px solid var(--fh-edge); }
-.fh-lobby-foot.fh-ready { color: var(--fh-text); }
+
+/* ---- the START control — the ONE interactive node in the HUD layer ---------
+   .fh-layer and every descendant are pointer-events:none, so the button turns
+   events back on for ITSELF only: the lobby stays a readout and warmup stays
+   playable underneath. While the pointer is LOCKED no DOM node can be clicked
+   at all, so C10 binds the same action to ENTER and the key is printed on the
+   cap — the control is reachable in both pointer states, never a dead end. */
+.fh-lobby-startbar { display: flex; flex-direction: column; align-items: center;
+  gap: 7px; padding: 12px 14px 11px; border-top: 1px solid var(--fh-edge); }
+.fh-layer .fh-start-btn { pointer-events: auto; cursor: pointer;
+  display: flex; align-items: center; gap: 10px;
+  font-family: inherit; font-size: 13px; font-weight: 900; letter-spacing: 2.8px;
+  padding: 10px 24px; border-radius: 3px; text-shadow: none;
+  color: var(--fh-ink); border: 1px solid var(--fh-accent);
+  background: linear-gradient(180deg, var(--fh-accent) 0%, var(--fh-accent-dim) 100%);
+  box-shadow: inset 0 1px 0 var(--fh-buy-lit), 0 2px 0 var(--fh-deep),
+              0 4px 14px var(--fh-shade); }
+.fh-layer .fh-start-btn:hover { filter: brightness(1.08); }
+.fh-layer .fh-start-btn:active { transform: translateY(1px);
+  box-shadow: inset 0 1px 0 var(--fh-buy-lit), 0 1px 0 var(--fh-deep); }
+.fh-layer .fh-start-btn:focus-visible { outline: 2px solid var(--fh-text);
+  outline-offset: 3px; }
+/* waiting = a SUNKEN face (the meter track, not the lit chip), the waiting
+   glyph, and the reason spelled out in .fh-start-why below it */
+.fh-layer .fh-start-btn[disabled] { cursor: default; transform: none;
+  color: var(--fh-text-mute); background: var(--fh-track);
+  border-color: var(--fh-edge); text-shadow: 0 1px 3px var(--fh-ink);
+  box-shadow: inset 0 1px 3px var(--fh-deep), inset 0 0 0 1px var(--fh-edge); }
+.fh-start-ico { display: block; width: 13px; height: 13px; flex: none; }
+.fh-start-key { font-size: 9px; font-weight: 800; letter-spacing: 1.5px;
+  padding: 1px 6px; border-radius: 2px; border: 1px solid currentColor;
+  opacity: 0.78; white-space: nowrap; }
+.fh-start-why { font-size: 10px; font-weight: 800; letter-spacing: 2px;
+  color: var(--fh-text); text-align: center; }
+.fh-start-why.fh-waiting { color: var(--fh-text-dim); }
 .fh-clock { text-align: center; padding: 5px 16px 7px; min-width: 112px; }
 .fh-phase { font-size: 11px; font-weight: 700; letter-spacing: 3px;
   color: var(--fh-text-mute); }
@@ -688,6 +753,32 @@ export class Hud {
   private readonly teamEl: HTMLDivElement;
   private readonly lobbyEl: HTMLDivElement;
 
+  // warmup START control. Built ONCE and re-parented by every lobby rebuild, so
+  // its listener is attached exactly once for the life of the HUD and a second
+  // match reuses the same node. Its state is cached separately from the roster
+  // signature (seat counts move without the roster rendering differently).
+  private readonly startBar: HTMLDivElement;
+  private readonly startBtn: HTMLButtonElement;
+  private readonly startGo: SVGSVGElement;
+  private readonly startWait: SVGSVGElement;
+  private readonly startLabel: HTMLSpanElement;
+  private readonly startKey: HTMLSpanElement;
+  private readonly startWhy: HTMLDivElement;
+  /**
+   * Fired by the START control (click or the ENTER key C10 binds to it). C10
+   * sends `{t:'start'}`; the HUD never talks to the socket itself.
+   */
+  onStart: (() => void) | null = null;
+
+  /**
+   * True while the START button itself holds keyboard focus — the browser then
+   * turns ENTER into a click on it, so C10's ENTER shortcut must stand down or
+   * the start would be sent twice.
+   */
+  startFocused(): boolean {
+    return document.activeElement === this.startBtn;
+  }
+
   // hp / armor / ammo / money
   private readonly hpWrap: HTMLDivElement;
   private readonly hpNum: HTMLDivElement;
@@ -738,6 +829,9 @@ export class Hud {
   private cMine: Team | null | '' = '';   // which score chip carries the YOU pill
   private cTeamSig = Number.NaN;          // roster+alive hash behind the rail/lobby
   private cWarmup = false;                // lobby visible instead of the rail
+  private cCanStart: boolean | null = null; // server's start verdict, as rendered
+  private cSeated = -1;                   // seat counts as rendered on the START bar
+  private cMinPlayers = -1;
 
   constructor(root: HTMLElement) {
     // PALETTE -> CSS custom properties on the root (single source of truth).
@@ -952,6 +1046,27 @@ export class Hud {
     this.teamEl = div('fh-team fh-panel fh-hidden');
     this.lobbyEl = div('fh-lobby fh-panel fh-hidden');
     this.layer.append(this.teamEl, this.lobbyEl);
+
+    // START control — one node, built once, re-parented by every lobby rebuild
+    this.startBar = div('fh-lobby-startbar');
+    this.startBtn = document.createElement('button');
+    this.startBtn.type = 'button';
+    this.startBtn.className = 'fh-start-btn';
+    this.startBtn.setAttribute('aria-keyshortcuts', 'Enter');
+    this.startGo = icon(ICON_PLAY, 'fh-start-ico');
+    this.startWait = icon(ICON_WAIT, 'fh-start-ico fh-hidden');
+    this.startLabel = span('fh-start-label', 'START MATCH');
+    this.startKey = span('fh-start-key', 'ENTER');
+    this.startBtn.append(this.startGo, this.startWait, this.startLabel, this.startKey);
+    this.startBtn.addEventListener('click', () => {
+      // `disabled` already blocks this, but the callback is the only thing that
+      // can reach the socket — keep the guard where the send is decided.
+      if (this.startBtn.disabled) return;
+      this.onStart?.();
+    });
+    this.startWhy = div('fh-start-why');
+    this.startWhy.setAttribute('role', 'status'); // the reason must be announced, not just seen
+    this.startBar.append(this.startBtn, this.startWhy);
   }
 
   update(s: HudState): void {
@@ -1072,6 +1187,7 @@ export class Hud {
       pill(this.scoreCTPill, s.team === null ? null : mineCT);
     }
     this.syncTeams(s);
+    this.syncStart(s);
 
     // crosshair gap = spreadPx; hidden while scoped (scope overlay instead)
     const gap = Math.max(2, Math.round(s.spreadPx));
@@ -1180,15 +1296,45 @@ export class Hud {
     const cols = div('fh-lobby-cols');
     cols.append(lobbyCol(s, 'T', team), lobbyCol(s, 'CT', team));
 
-    const total = s.players.length;
-    const ready = total >= MATCH_MIN_PLAYERS;
-    const foot = div(`fh-lobby-foot${ready ? ' fh-ready' : ''}`);
-    foot.textContent = ready
-      ? `${total} PLAYERS IN — THE MATCH STARTS ANY MOMENT`
-      : `WAITING FOR PLAYERS · ${total}/${MATCH_MIN_PLAYERS} — WARMUP IS LIVE, MOVE AND SHOOT`;
+    // Static copy: nothing on this platform auto-starts, so the footer states
+    // the rule once and the live numbers live on the START bar instead (they
+    // move with the seat count, which is not part of the roster signature).
+    const foot = div('fh-lobby-foot');
+    foot.textContent = 'WARMUP IS LIVE — MOVE AND SHOOT WHILE YOU WAIT · '
+      + 'THE MATCH BEGINS ONLY WHEN SOMEONE PRESSES START';
 
     this.lobbyEl.textContent = '';
-    this.lobbyEl.append(head, cols, foot);
+    this.lobbyEl.append(head, cols, this.startBar, foot);
+  }
+
+  /**
+   * The START control. Driven STRAIGHT from the server's `canStart` — the
+   * warmup/seat rule is never recomputed here, so the button cannot disagree
+   * with the server that judges the message. The seat numbers are shown, not
+   * consulted. Cached on (canStart, seated, minPlayers): an idle warmup frame
+   * compares three primitives and allocates nothing.
+   */
+  private syncStart(s: HudState): void {
+    const min = s.minPlayers > 0 ? s.minPlayers : MATCH_MIN_PLAYERS;
+    if (s.canStart === this.cCanStart && s.seated === this.cSeated && min === this.cMinPlayers) return;
+    this.cCanStart = s.canStart;
+    this.cSeated = s.seated;
+    this.cMinPlayers = min;
+    this.startBtn.disabled = !s.canStart;
+    this.startGo.classList.toggle('fh-hidden', !s.canStart);
+    this.startWait.classList.toggle('fh-hidden', s.canStart);
+    this.startLabel.textContent = s.canStart ? 'START MATCH' : 'WAITING FOR PLAYERS';
+    this.startKey.classList.toggle('fh-hidden', !s.canStart);
+    this.startWhy.classList.toggle('fh-waiting', !s.canStart);
+    this.startWhy.textContent = s.canStart
+      ? `${s.seated}/${min} SEATED — CLICK START OR PRESS ENTER`
+      : s.seated < min
+        ? `NEED ${min} PLAYERS — ${s.seated}/${min} SEATED. ADD A BOT OR WAIT FOR SOMEONE`
+        : `${s.seated}/${min} SEATED — THE SERVER IS NOT READY YET`;
+    this.startBtn.setAttribute(
+      'aria-label',
+      `${this.startLabel.textContent} — ${this.startWhy.textContent}`,
+    );
   }
 
   /**

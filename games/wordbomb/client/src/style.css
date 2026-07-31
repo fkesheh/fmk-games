@@ -689,6 +689,277 @@ body {
   }
 }
 
+/* ---- THE LOBBY: the room before the room ------------------------------------
+
+   Manual start replaces the old 3s auto-start: the match no longer begins on
+   its own once two players are seated, so this panel is the temporary
+   centrepiece of `.stage-main` while everyone waits — it is `.lobby`'s turn to
+   sit where `.bomb` sits once play begins (it is inserted as `.stage-main`'s
+   first child, before `.bomb`). Same panel language as `.bomb`: the same
+   ground-lit slate surface, rim-light and contact shadow, because it is the
+   same room, just not lit yet.
+
+   `.hidden` (declared above, `display: none !important`) always wins over the
+   `display: flex` set here regardless of source order or specificity, exactly
+   like every other `.hidden`-gated panel in this file. */
+.lobby {
+  position: relative;
+  width: 100%;
+  max-width: 720px;
+  padding: clamp(16px, 2.6vh, 28px) clamp(16px, 3vw, 30px) clamp(18px, 2.8vh, 30px);
+  border: 1px solid var(--hair-soft);
+  border-radius: 22px;
+  background:
+    radial-gradient(
+      ellipse 76% 62% at 50% 6%,
+      color-mix(in srgb, var(--fuse) 8%, transparent) 0%,
+      transparent 66%
+    ),
+    var(--panel);
+  box-shadow:
+    inset 0 1px 0 var(--rim),
+    inset 0 -18px 34px -26px var(--ink-deep),
+    0 26px 52px -30px var(--shadow-hard);
+  display: flex;
+  flex-direction: column;
+  gap: clamp(12px, 2vh, 18px);
+}
+
+.lobby-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px 16px;
+}
+
+.lobby-title {
+  color: var(--fuse);
+  font-size: 12px;
+  font-weight: 900;
+  letter-spacing: 0.34em;
+  text-indent: 0.34em;
+  text-shadow: 0 1px 0 var(--ink-deep);
+}
+
+/* "2 of 2 needed" — the value carries the number, the qualifier stays muted so
+   the two read as one sentence rather than two competing numbers. */
+.lobby-count {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.lobby-count-value {
+  color: var(--fuse-lit);
+  font-family: var(--mono);
+  font-size: clamp(20px, 3.2vh, 28px);
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 0 20px color-mix(in srgb, var(--fuse) 34%, transparent);
+}
+
+.lobby-count-min {
+  color: var(--paper-dim);
+  font-size: 11.5px;
+  font-style: italic;
+  letter-spacing: 0.04em;
+}
+
+/* ---- room settings, read-only in this panel --------------------------------- */
+
+.lobby-settings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.lobby-setting {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  border: 1px solid var(--hair-soft);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--slate) 46%, transparent);
+}
+
+.lobby-setting-label {
+  color: var(--paper-deep);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.2em;
+}
+
+.lobby-setting-value {
+  color: var(--paper-lit);
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+
+/* ---- the seats --------------------------------------------------------------
+
+   Each seat card carries its player's colour on the top rail and the avatar,
+   exactly the way `.player-chip`/`.player-avatar` use `--seat` in the rail
+   below the bomb — `--seat` is set inline per seat as `var(--p1)`…`var(--p8)`
+   and falls back to `--fuse` for the one card (`.lobby-seat--empty`) that
+   deliberately does not receive it. */
+.lobby-seats {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+}
+
+.lobby-seat {
+  flex: 1 1 128px;
+  max-width: 168px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 12px 10px 10px;
+  border: 1px solid var(--hair-soft);
+  border-top: 3px solid var(--seat, var(--fuse));
+  border-radius: 12px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--slate) 70%, transparent),
+    color-mix(in srgb, var(--slate-deep) 82%, transparent)
+  );
+  box-shadow:
+    inset 0 1px 0 var(--rim),
+    0 6px 16px -10px var(--shadow-hard);
+  text-align: center;
+  transition:
+    border-color 160ms ease,
+    box-shadow 160ms ease,
+    transform 160ms ease;
+}
+
+.lobby-seat-avatar {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: linear-gradient(
+    160deg,
+    color-mix(in srgb, var(--seat, var(--fuse)) 92%, var(--paper-lit)),
+    color-mix(in srgb, var(--seat, var(--fuse)) 58%, var(--ink-deep))
+  );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--paper-lit) 40%, transparent),
+    0 2px 5px -2px var(--shadow-hard);
+  color: var(--ink-deep);
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.lobby-seat-name {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  max-width: 14ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--paper);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.lobby-seat-you {
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: linear-gradient(180deg, var(--fuse-lit), var(--fuse));
+  color: var(--ink-deep);
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+}
+
+.lobby-seat-state {
+  color: var(--paper-dim);
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+}
+
+/* YOU — the seat you're sitting in, unmistakably: a stronger rail, a filled
+   tint and a ring, on top of the `lobby-seat-you` pill already in the DOM. */
+.lobby-seat--you {
+  border-color: var(--fuse-hair);
+  border-top-color: var(--fuse);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--fuse) 16%, var(--slate)),
+    color-mix(in srgb, var(--slate-deep) 86%, transparent)
+  );
+  box-shadow:
+    inset 0 1px 0 var(--rim),
+    0 0 0 2px color-mix(in srgb, var(--fuse) 26%, transparent),
+    0 8px 18px -10px var(--shadow-hard);
+}
+
+.lobby-seat--you .lobby-seat-state {
+  color: var(--fuse-lit);
+}
+
+/* EMPTY — a hole, not a player: dashed on every edge, muted paper tones only,
+   reduced opacity, and the avatar deliberately does NOT read `--seat`. */
+.lobby-seat--empty {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--paper-deep) 55%, transparent);
+  background: color-mix(in srgb, var(--ink-deep) 30%, transparent);
+  opacity: 0.55;
+  box-shadow: none;
+}
+
+.lobby-seat--empty .lobby-seat-avatar {
+  background: var(--slate-deep);
+  box-shadow: none;
+  color: var(--paper-deep);
+}
+
+.lobby-seat--empty .lobby-seat-name,
+.lobby-seat--empty .lobby-seat-state {
+  color: var(--paper-deep);
+  font-style: italic;
+}
+
+/* ---- the call to action ------------------------------------------------------
+
+   The primary CTA — built on `.btn.btn-primary` already declared above, so it
+   inherits that pair's colour, hover lift, active press and focus ring; this
+   block only sizes it up to centrepiece scale and hardens the disabled read. */
+.lobby-start {
+  width: 100%;
+  max-width: 360px;
+  margin: 4px auto 0;
+  padding: 15px 20px;
+  font-size: 16px;
+  letter-spacing: 0.16em;
+  text-align: center;
+}
+
+/* disabled must not rely on colour alone: `.btn:disabled` already dims it, this
+   adds a desaturated look and a cursor that says "not clickable" outright, and
+   `.lobby-reason` below always carries the words for why. */
+.lobby-start:disabled {
+  cursor: not-allowed;
+  filter: saturate(0.4);
+}
+
+.lobby-reason {
+  margin-top: -6px;
+  color: var(--paper-dim);
+  font-size: 12px;
+  text-align: center;
+}
+
 /* ---- the bomb: the prompt and the fuse -------------------------------------- */
 
 /*  The one lit object in the room. A slate panel with a warm rim-light along the
@@ -2043,6 +2314,20 @@ body {
 }
 
 @media (max-width: 480px) {
+  .lobby {
+    padding: 14px 12px 13px;
+    border-radius: 18px;
+  }
+
+  .lobby-seat {
+    flex: 1 1 104px;
+    max-width: 130px;
+  }
+
+  .lobby-start {
+    max-width: none;
+  }
+
   .bomb {
     padding: 14px 12px 13px;
     border-radius: 18px;
@@ -2122,6 +2407,7 @@ body {
 
   .btn,
   .player-chip,
+  .lobby-seat,
   .room-row,
   .answer-input,
   .menu-name,

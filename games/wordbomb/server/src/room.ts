@@ -3,8 +3,15 @@
 // (no tick loop). Every player gets the SAME fragment at the SAME moment, a
 // HIDDEN fuse burns, and every answer is revealed at once when it blows.
 //
-// Phase ladder:  lobby -(LOBBY_COUNTDOWN_MS)-> live -(hidden fuse)-> reveal
-//                -(revealMsFor)-> live ... -> matchEnd -(MATCH_END_MS)-> lobby
+// Phase ladder:  lobby -(wb_start, then LOBBY_COUNTDOWN_MS)-> live
+//                -(hidden fuse)-> reveal -(revealMsFor)-> live ...
+//                -> matchEnd -(MATCH_END_MS)-> lobby (and WAITS)
+//
+// NOTHING AUTO-STARTS. The room leaves `lobby` only because a seated player
+// sent `{t:'wb_start'}`. Filling the room does not start it, and finishing a
+// match does not roll into another one — `fullReset` returns to `lobby` and
+// stops there. `LOBBY_COUNTDOWN_MS` survives as the beat AFTER the press, so
+// round 1 is not a cold start; it is never scheduled by anything else.
 //
 // ONE `setTimeout` slot at a time (countdown | fuse | grace | reveal | matchEnd)
 // and every deadline the client is allowed to know is an ABSOLUTE server
@@ -173,8 +180,23 @@ export class WordbombRoom implements GameRoomHandle {
     return n;
   }
 
-  /** Connected players with no room-level message for STALE_MS. */
+  /**
+   * Connected players with no room-level message for STALE_MS. The platform
+   * closes their sockets (lobby.ts `pollStaleSessions`).
+   *
+   * NOBODY IS SWEPT WHILE THE ROOM IS IN `lobby`. The sweep exists to evict a
+   * player who has stopped playing a match in progress; a player waiting for a
+   * friend is not idle, they are waiting, and `wb_submit` is the only room-level
+   * message this game has — `ping` is a LOBBY tag and never reaches us, so a
+   * seated player in a lobby CANNOT refresh `lastMsgAt` even in principle.
+   *
+   * This was latent before the manual-start contract only because the room
+   * auto-started within LOBBY_COUNTDOWN_MS and nobody could sit in a lobby for
+   * five minutes. Now that lobbies wait indefinitely, sweeping them would kick
+   * exactly the people the START button is waiting on.
+   */
   stalePlayers(): PlayerId[] {
+    if (this.phase === 'lobby') return [];
     const now = Date.now();
     const out: PlayerId[] = [];
     for (const p of this.players.values()) {
@@ -217,11 +239,8 @@ export class WordbombRoom implements GameRoomHandle {
           used: new Set<string>(),
         });
       }
-      // lobby fills up -> LOBBY_COUNTDOWN_MS grace, then round 1 (a NEW match)
-      if (this.phase === 'lobby' && this.countdownEndsAt === 0 && this.playerCount() >= MIN_PLAYERS) {
-        this.startCountdown();
-        return;
-      }
+      // A full lobby is STILL just a lobby. Reaching MIN_PLAYERS only flips
+      // `canStart` in the next snapshot; somebody has to press START.
       this.broadcastState();
     } catch (err) {
       console.error('[wordbomb] addPlayer failed', err);
@@ -271,6 +290,10 @@ export class WordbombRoom implements GameRoomHandle {
       const p = this.players.get(id);
       if (p === undefined || !p.connected) return;
       p.lastMsgAt = Date.now();
+      if (parsed.t === 'wb_start') {
+        this.tryStart();
+        return;
+      }
       this.trySubmit(p, parsed.word);
     } catch (err) {
       console.error('[wordbomb] handleMessage failed', err);
@@ -290,7 +313,37 @@ export class WordbombRoom implements GameRoomHandle {
   // Match flow
   // -------------------------------------------------------------------------
 
-  /** Lobby grace so round 1 is not a cold start. `countdownEndsAt` is public. */
+  /**
+   * THE MANUAL START — the only door out of `lobby`.
+   *
+   * ANY seated player may press it: there is no host, so the room cannot be
+   * held hostage by whoever happened to create it (or by whoever left). The
+   * acceptance rule is exactly `canStart` on the wire, so a client that renders
+   * an enabled button and a server that accepts the press can never disagree.
+   *
+   * Every other case is ignored IN SILENCE — no error, no throw (I6). A second
+   * press during the beat, a press mid-match, a press at matchEnd and a press
+   * with one player seated are all indistinguishable no-ops, which is what makes
+   * a double-click harmless.
+   */
+  private tryStart(): void {
+    if (!this.startAllowed()) return;
+    this.startCountdown();
+  }
+
+  /** The single source of truth for `wb_start` acceptance AND `canStart`. */
+  private startAllowed(): boolean {
+    return (
+      this.phase === 'lobby' && this.countdownEndsAt === 0 && this.playerCount() >= MIN_PLAYERS
+    );
+  }
+
+  /**
+   * The beat AFTER the press, so round 1 is not a cold start — the fragment
+   * does not appear under the fingers of whoever clicked. Scheduled from
+   * `tryStart()` and nowhere else. `countdownEndsAt` is public and is zero in
+   * every lobby that is merely waiting.
+   */
   private startCountdown(): void {
     this.countdownEndsAt = Date.now() + LOBBY_COUNTDOWN_MS;
     this.setTimer(() => {
@@ -438,8 +491,14 @@ export class WordbombRoom implements GameRoomHandle {
   }
 
   /**
-   * §1.3 — purge disconnected entries, zero scores AND every used-word set,
-   * return to `lobby`, and auto-start again if >= MIN_PLAYERS remain.
+   * §1.3 — purge disconnected entries, zero scores AND every used-word set, and
+   * return to `lobby`, where the room WAITS.
+   *
+   * This used to auto-start the next match if >= MIN_PLAYERS remained. It no
+   * longer does: a table that just finished ten rounds is exactly the moment
+   * people want to leave, change the difficulty, or wait for a friend, and
+   * silently dealing them into another match takes that choice away. The
+   * standings stay readable until somebody presses START again.
    */
   private fullReset(): void {
     this.purgeGhosts();
@@ -454,11 +513,7 @@ export class WordbombRoom implements GameRoomHandle {
     }
     this.usedFragments.clear();
     this.resetPhaseFields();
-    if (this.playerCount() >= MIN_PLAYERS) {
-      this.startCountdown();
-      return;
-    }
-    this.broadcastState();
+    this.broadcastState(); // back in the lobby, waiting for an explicit START
   }
 
   /** Low pop mid-match: abort to the lobby with scores KEPT, timers cleared. */
@@ -652,6 +707,12 @@ export class WordbombRoom implements GameRoomHandle {
       difficulty: this.settings.difficulty,
       players,
       winnerId: this.winnerId,
+      // The manual-start lobby. `canStart` is computed from the SAME predicate
+      // `wb_start` is judged by, so an enabled button and an accepted press can
+      // never disagree.
+      seated: this.playerCount(),
+      minPlayers: MIN_PLAYERS,
+      canStart: this.startAllowed(),
     };
   }
 

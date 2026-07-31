@@ -38,6 +38,9 @@ import {
   MAX_WORD_LEN,
   MIN_PLAYERS,
   revealMsFor,
+  ROUNDS_MAX,
+  ROUNDS_MIN,
+  STALE_MS,
   SUBMIT_COOLDOWN_MS,
   SUBMIT_GRACE_MS,
   scoreWord,
@@ -266,6 +269,17 @@ interface BootOpts {
   dict?: StubDict;
   picker?: ScriptedPicker;
   rand?: () => number;
+  /**
+   * Default true: after seating every `players` entry, `boot()` sends
+   * `{t:'wb_start'}` from the FIRST-joined player, so the ~40 `boot(...);
+   * advance();` flows written before the manual-start lobby landed keep
+   * working unchanged — the press is now an explicit part of setup, not
+   * something the room does for you. A single-seated `boot()` call still
+   * "presses" by default; `tryStart()` ignores it in silence (below
+   * MIN_PLAYERS), which is harmless. Pass `false` to leave the room in a
+   * genuinely un-pressed lobby, as the manual-start tests do.
+   */
+  start?: boolean;
 }
 
 interface Harness {
@@ -290,6 +304,12 @@ function boot(players: ReadonlyArray<readonly [PlayerId, string]>, opts: BootOpt
   room.start(); // idempotent per the platform contract
   for (const [id, name] of players) room.addPlayer(id, name);
   room.start(); // covers either start/add ordering
+  // Default true — see BootOpts.start: the manual-start press is now part of
+  // setup, not something `addPlayer` does for you.
+  if (opts.start !== false && players.length > 0) {
+    const presser = players[0]?.[0];
+    if (presser !== undefined) room.handleMessage(presser, { t: 'wb_start' });
+  }
   tracked.push(room);
   return { room, io, dict, picker };
 }
@@ -693,6 +713,11 @@ describe('§5 validation — every reason, in the mandated order', () => {
     expect(h.io.rejects('a')).toEqual(['not_live']);
 
     h.room.addPlayer('b', 'Bob');
+    // Manual start: reaching MIN_PLAYERS only flips `canStart` — a seated
+    // player still has to press.
+    expect(h.io.pub('a').canStart).toBe(true);
+    expect(h.io.pub('a').countdownEndsAt).toBe(0);
+    h.room.handleMessage('a', { t: 'wb_start' });
     advance(); // round 1 live
     cooldown();
     submit(h.room, 'a', 'nation');
@@ -1172,8 +1197,19 @@ describe('phases', () => {
 
     h.room.addPlayer('b', 'Bob');
     st = h.io.pub('a');
+    // Manual start: reaching MIN_PLAYERS does NOT arm a countdown by itself —
+    // it only flips `canStart`. The room stays exactly where it was.
     expect(st.phase).toBe('lobby');
+    expect(st.countdownEndsAt).toBe(0);
+    expect(st.canStart).toBe(true);
+    expect(st.seated).toBe(2);
+    expect(st.minPlayers).toBe(MIN_PLAYERS);
+
+    h.room.handleMessage('a', { t: 'wb_start' }); // the press — explicit, not automatic
+    st = h.io.pub('a');
+    expect(st.phase).toBe('lobby'); // still lobby: this is the post-press BEAT
     expect(st.countdownEndsAt).toBe(Date.now() + LOBBY_COUNTDOWN_MS);
+    expect(st.canStart).toBe(false); // a beat is already running
 
     advance();
     st = h.io.pub('a');
@@ -1366,7 +1402,7 @@ describe('§1.3 match end', () => {
     expect(end?.standings.map((s) => s.playerId)).toEqual(['a', 'b']);
 
     // MATCH_END_MS later: purge, zero scores AND every used-word set, back to
-    // lobby — and with >= MIN_PLAYERS present, straight into a new countdown.
+    // `lobby` — and the room WAITS. Nothing auto-starts a new match anymore.
     const endedAt = Date.now();
     advance();
     expect(Date.now() - endedAt).toBe(MATCH_END_MS);
@@ -1376,11 +1412,21 @@ describe('§1.3 match end', () => {
     expect(st.winnerId).toBeNull();
     expect(st.matchEndsAt).toBe(0);
     expect(st.fragment).toBeNull();
+    expect(st.countdownEndsAt).toBe(0);
+    expect(st.canStart).toBe(true);
+    expect(st.seated).toBe(2);
     expect(playerOf(st, 'a').score).toBe(0);
     expect(playerOf(st, 'b').score).toBe(0);
-    expect(st.countdownEndsAt).toBe(Date.now() + LOBBY_COUNTDOWN_MS);
     expect(h.io.priv('a').yourWord).toBeNull();
 
+    // ...and it STAYS there: heavy time pressure proves nothing auto-starts.
+    const before = h.io.totalSent();
+    vi.advanceTimersByTime(LOBBY_COUNTDOWN_MS * 10);
+    expect(h.io.pub('a').phase).toBe('lobby');
+    expect(h.io.pub('a').round).toBe(0);
+    expect(h.io.totalSent()).toBe(before); // not one more message was sent
+
+    h.room.handleMessage('a', { t: 'wb_start' }); // an explicit press begins the new match
     advance(); // countdown -> a brand new match
     st = h.io.pub('a');
     expect(st.phase).toBe('live');
@@ -1390,6 +1436,409 @@ describe('§1.3 match end', () => {
     submit(h.room, 'a', 'nation');
     expect(h.io.rejects('a')).toEqual([]);
     expect(h.io.priv('a').yourWord).toBe('nation');
+  });
+});
+
+// =============================================================================
+// Manual start — nothing on this platform auto-starts a WORDBOMB room
+// =============================================================================
+
+/** The 5-fragment script every short (`ROUNDS_MIN`-round) match below uses. */
+const FRAGMENTS_5 = ['ion', 'tio', 'nat', 'uni', 'vis'] as const;
+
+/** A short, deterministic 5-round script that lets both players score cleanly. */
+const SHORT_MATCH_SCRIPT: ReadonlyArray<readonly [string, string]> = [
+  ['nation', 'nations'],
+  ['rations', 'actions'],
+  ['nature', 'donate'],
+  ['union', 'unite'],
+  ['vision', 'visual'],
+];
+
+describe('manual start — no game auto-starts', () => {
+  it('a fresh room seated to MIN_PLAYERS does not auto-start, even under heavy time pressure', () => {
+    const h = boot(
+      [
+        ['a', 'Alice'],
+        ['b', 'Bob'],
+      ],
+      { start: false },
+    );
+    vi.advanceTimersByTime(LOBBY_COUNTDOWN_MS * 10);
+
+    // Stream-level proof, not just a final-snapshot check: a room that started
+    // AND finished a round could still pass a snapshot-only assertion.
+    for (const id of ['a', 'b'] as const) {
+      const pubs = h.io.all(id).filter((m): m is WbPublicState => m.t === 'wb_public');
+      expect(pubs.every((p) => p.phase === 'lobby')).toBe(true);
+      expect(h.io.events(id, 'wb_boom')).toHaveLength(0);
+    }
+    expect(vi.getTimerCount()).toBe(0);
+
+    const st = h.io.pub('a');
+    expect(st.phase).toBe('lobby');
+    expect(st.round).toBe(0);
+    expect(st.fragment).toBeNull();
+    expect(st.countdownEndsAt).toBe(0);
+    expect(st.canStart).toBe(true);
+    expect(st.seated).toBe(2);
+    expect(st.minPlayers).toBe(MIN_PLAYERS);
+  });
+
+  it('wb_start with too few players seated is ignored — no state change, no error', () => {
+    const h = boot([['a', 'Alice']], { start: false });
+    h.room.handleMessage('a', { t: 'wb_start' });
+
+    let st = h.io.pub('a');
+    expect(st.phase).toBe('lobby');
+    expect(st.countdownEndsAt).toBe(0);
+    expect(st.canStart).toBe(false);
+    expect(st.seated).toBe(1);
+    expect(h.io.all('a').some((m) => m.t === 'error')).toBe(false);
+
+    vi.advanceTimersByTime(LOBBY_COUNTDOWN_MS * 10);
+    st = h.io.pub('a');
+    expect(st.phase).toBe('lobby');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('wb_start outside lobby is ignored — live, reveal, and matchEnd', () => {
+    const h = boot(
+      [
+        ['a', 'Alice'],
+        ['b', 'Bob'],
+      ],
+      {
+        settings: { rounds: ROUNDS_MIN, difficulty: 'normal' },
+        picker: new ScriptedPicker(FRAGMENTS_5),
+        start: false,
+      },
+    );
+    h.room.handleMessage('a', { t: 'wb_start' });
+    advance(); // round 1 live
+
+    // --- live: a press changes nothing ---
+    let st = h.io.pub('a');
+    expect(st.phase).toBe('live');
+    const round = st.round;
+    const roundStartedAt = st.roundStartedAt;
+    const fragment = st.fragment;
+    h.room.handleMessage('a', { t: 'wb_start' });
+    h.room.handleMessage('b', { t: 'wb_start' });
+    st = h.io.pub('a');
+    expect(st.phase).toBe('live');
+    expect(st.round).toBe(round);
+    expect(st.roundStartedAt).toBe(roundStartedAt);
+    expect(st.fragment).toBe(fragment);
+
+    // --- reveal: a press changes nothing, no new round begins ---
+    toBoom();
+    st = h.io.pub('a');
+    expect(st.phase).toBe('reveal');
+    const revealRound = st.round;
+    const boomsBefore = h.io.events('a', 'wb_boom').length;
+    h.room.handleMessage('a', { t: 'wb_start' });
+    h.room.handleMessage('b', { t: 'wb_start' });
+    st = h.io.pub('a');
+    expect(st.phase).toBe('reveal');
+    expect(st.round).toBe(revealRound);
+    expect(h.io.events('a', 'wb_boom')).toHaveLength(boomsBefore);
+
+    // drive to matchEnd (round 1 already boomed above)
+    afterReveal(); // round 2 live
+    for (let r = 2; r <= ROUNDS_MIN; r++) {
+      toBoom();
+      afterReveal();
+    }
+    st = h.io.pub('a');
+    expect(st.phase).toBe('matchEnd');
+    const matchEndsAt = st.matchEndsAt;
+    const winnerId = st.winnerId;
+
+    // --- matchEnd: a press changes nothing ---
+    h.room.handleMessage('a', { t: 'wb_start' });
+    h.room.handleMessage('b', { t: 'wb_start' });
+    st = h.io.pub('a');
+    expect(st.phase).toBe('matchEnd');
+    expect(st.matchEndsAt).toBe(matchEndsAt);
+    expect(st.winnerId).toBe(winnerId);
+  });
+
+  it('a double press while the beat is running does not re-arm or extend it, and exactly one round 1 begins', () => {
+    const h = boot(
+      [
+        ['a', 'Alice'],
+        ['b', 'Bob'],
+      ],
+      { start: false },
+    );
+    h.room.handleMessage('a', { t: 'wb_start' });
+    const armedAt = h.io.pub('a').countdownEndsAt;
+    expect(armedAt).toBe(Date.now() + LOBBY_COUNTDOWN_MS);
+
+    vi.advanceTimersByTime(LOBBY_COUNTDOWN_MS / 2);
+    h.room.handleMessage('a', { t: 'wb_start' }); // second press, same player
+    h.room.handleMessage('b', { t: 'wb_start' }); // and from the other player too
+    expect(h.io.pub('a').countdownEndsAt).toBe(armedAt); // not re-armed, not extended
+
+    advance(); // the ORIGINAL beat fires — the only one that was ever scheduled
+    const st = h.io.pub('a');
+    expect(st.phase).toBe('live');
+    expect(st.round).toBe(1);
+
+    // round 1 began exactly ONCE despite three presses
+    const liveRound1 = h.io
+      .all('a')
+      .filter((m): m is WbPublicState => m.t === 'wb_public' && m.phase === 'live' && m.round === 1);
+    expect(liveRound1).toHaveLength(1);
+  });
+
+  it('a valid start begins round 1 — pressed by the first-joined OR the second-joined player, proving there is no host', () => {
+    for (const presser of ['a', 'b'] as const) {
+      const h = boot(
+        [
+          ['a', 'Alice'],
+          ['b', 'Bob'],
+        ],
+        { start: false },
+      );
+      h.room.handleMessage(presser, { t: 'wb_start' });
+
+      let st = h.io.pub('a');
+      expect(st.phase).toBe('lobby'); // the post-press BEAT, not live yet
+      expect(st.countdownEndsAt).toBe(Date.now() + LOBBY_COUNTDOWN_MS);
+      expect(st.canStart).toBe(false); // a beat is already running
+
+      advance();
+      st = h.io.pub('a');
+      expect(st.phase).toBe('live');
+      expect(st.round).toBe(1);
+      expect(st.fragment).not.toBeNull();
+      expect(st.canStart).toBe(false);
+    }
+  });
+
+  it('a match ending returns to lobby and STAYS there — then a press begins a brand new match', () => {
+    const h = boot(
+      [
+        ['a', 'Alice'],
+        ['b', 'Bob'],
+      ],
+      {
+        settings: { rounds: ROUNDS_MIN, difficulty: 'normal' },
+        picker: new ScriptedPicker(FRAGMENTS_5),
+      }, // default start:true — this FIRST match is allowed to begin normally
+    );
+    advance(); // round 1 live
+    playFiveRounds(h, SHORT_MATCH_SCRIPT);
+    expect(h.io.pub('a').phase).toBe('matchEnd');
+
+    advance(); // MATCH_END_MS later: fullReset() -> lobby, and the room WAITS
+    let st = h.io.pub('a');
+    expect(st.phase).toBe('lobby');
+    expect(st.round).toBe(0);
+    expect(st.countdownEndsAt).toBe(0);
+    expect(st.canStart).toBe(true);
+    expect(playerOf(st, 'a').score).toBe(0);
+    expect(playerOf(st, 'b').score).toBe(0);
+
+    // it STAYS there — no wb_boom arrives under sustained time pressure
+    const boomsBefore = h.io.events('a', 'wb_boom').length;
+    vi.advanceTimersByTime(LOBBY_COUNTDOWN_MS * 10);
+    expect(h.io.pub('a').phase).toBe('lobby');
+    expect(h.io.pub('a').round).toBe(0);
+    expect(h.io.events('a', 'wb_boom')).toHaveLength(boomsBefore);
+
+    // a press begins a brand new match, scores back at 0
+    h.room.handleMessage('a', { t: 'wb_start' });
+    advance();
+    st = h.io.pub('a');
+    expect(st.phase).toBe('live');
+    expect(st.round).toBe(1);
+    expect(playerOf(st, 'a').score).toBe(0);
+    expect(playerOf(st, 'b').score).toBe(0);
+  });
+
+  it('a player leaving during the beat cancels the countdown; the room stays in lobby', () => {
+    const h = boot(
+      [
+        ['a', 'Alice'],
+        ['b', 'Bob'],
+      ],
+      { start: false },
+    );
+    h.room.handleMessage('a', { t: 'wb_start' });
+    expect(h.io.pub('a').countdownEndsAt).toBe(Date.now() + LOBBY_COUNTDOWN_MS);
+
+    h.room.removePlayer('b'); // drops below MIN_PLAYERS before the beat expires
+    const st = h.io.pub('a');
+    expect(st.phase).toBe('lobby');
+    expect(st.countdownEndsAt).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+
+    vi.advanceTimersByTime(LOBBY_COUNTDOWN_MS * 10);
+    expect(h.io.pub('a').phase).toBe('lobby');
+    expect(h.io.pub('a').round).toBe(0);
+  });
+
+  it('canStart is TRUE exactly when a wb_start sent at that moment actually starts something (anti-drift)', () => {
+    // Presses START and reports whether the room's own wire state moved as a
+    // DIRECT result — the room only ever broadcasts from `startCountdown()`,
+    // so a change here can only mean the press was accepted.
+    const pressAndDidItStartSomething = (h: Harness, presser: PlayerId): boolean => {
+      const before = h.io.pub(presser);
+      h.room.handleMessage(presser, { t: 'wb_start' });
+      const after = h.io.pub(presser);
+      return before.countdownEndsAt !== after.countdownEndsAt || before.phase !== after.phase;
+    };
+
+    const rows: Array<{ label: string; expected: boolean; build: () => Harness }> = [
+      {
+        label: '1 seated',
+        expected: false,
+        build: () => boot([['a', 'Alice']], { start: false }),
+      },
+      {
+        label: '2 seated, no beat running',
+        expected: true,
+        build: () =>
+          boot(
+            [
+              ['a', 'Alice'],
+              ['b', 'Bob'],
+            ],
+            { start: false },
+          ),
+      },
+      {
+        label: 'beat already running',
+        expected: false,
+        build: () =>
+          boot([
+            ['a', 'Alice'],
+            ['b', 'Bob'],
+          ]), // default start:true arms the beat
+      },
+      {
+        label: 'live',
+        expected: false,
+        build: () => {
+          const h = boot([
+            ['a', 'Alice'],
+            ['b', 'Bob'],
+          ]);
+          advance();
+          return h;
+        },
+      },
+      {
+        label: 'reveal',
+        expected: false,
+        build: () => {
+          const h = boot([
+            ['a', 'Alice'],
+            ['b', 'Bob'],
+          ]);
+          advance();
+          toBoom();
+          return h;
+        },
+      },
+      {
+        label: 'matchEnd',
+        expected: false,
+        build: () => {
+          const h = boot(
+            [
+              ['a', 'Alice'],
+              ['b', 'Bob'],
+            ],
+            {
+              settings: { rounds: ROUNDS_MIN, difficulty: 'normal' },
+              picker: new ScriptedPicker(FRAGMENTS_5),
+            },
+          );
+          advance();
+          playFiveRounds(h, SHORT_MATCH_SCRIPT);
+          return h;
+        },
+      },
+      // NOTE: "0 seated" is not representable here — with zero real players
+      // nobody exists to receive the `wb_public` snapshot `canStart` lives on,
+      // so the claim is unobservable via the wire by construction. Its
+      // operational meaning (no seated player can press) is covered instead
+      // by the I6 test above: a `wb_start` from an unknown/disconnected id
+      // never throws and never starts anything.
+    ];
+
+    for (const row of rows) {
+      const h = row.build();
+      const canStart = h.io.pub('a').canStart;
+      const changed = pressAndDidItStartSomething(h, 'a');
+      // Each row builds its own room; stop it BEFORE the next row builds one,
+      // same reason as `leakScenario()` above: `advance()` inside the NEXT
+      // row's `build()` fires the globally-earliest fake timer, and a second
+      // live room's leftover timer would interleave with it.
+      h.room.stop();
+      expect(canStart).toBe(row.expected);
+      expect(changed).toBe(row.expected);
+      // THE anti-drift assertion: canStart and actual acceptance must always
+      // agree, independent of what either individual value happens to be.
+      expect(canStart).toBe(changed);
+    }
+  });
+
+  describe('stalePlayers() lobby exemption (the manual-start lobby cannot be swept)', () => {
+    it('two players idling in lobby forever are never reported stale, and can still start normally', () => {
+      const h = boot(
+        [
+          ['a', 'Alice'],
+          ['b', 'Bob'],
+        ],
+        { start: false },
+      );
+      vi.advanceTimersByTime(STALE_MS * 2);
+
+      expect(h.room.stalePlayers()).toEqual([]);
+      expect(h.room.playerCount()).toBe(2);
+      const st = h.io.pub('a');
+      expect(st.phase).toBe('lobby');
+      expect(st.canStart).toBe(true);
+
+      h.room.handleMessage('a', { t: 'wb_start' });
+      advance();
+      expect(h.io.pub('a').phase).toBe('live');
+      expect(h.io.pub('a').round).toBe(1);
+    });
+
+    it('the sweep still works mid-match — this is a lobby exemption, not a removal', () => {
+      // ROUNDS_MAX rounds with the fuse pinned to FUSE_MAX_MS: a full match
+      // takes ~469s (20 * (15s fuse + grace + ~8.2s reveal)), comfortably
+      // longer than STALE_MS + 1000 (301s). Without this margin the match
+      // (and even the post-matchEnd fullReset) could complete WITHIN the
+      // window and land back in `lobby` on its own, making the "not lobby"
+      // check below vacuous — the exact trap the manual-start lobby exemption
+      // must not accidentally hide behind.
+      const h = boot(
+        [
+          ['a', 'Alice'],
+          ['b', 'Bob'],
+        ],
+        { settings: { rounds: ROUNDS_MAX, difficulty: 'normal' }, rand: () => 0.9999 },
+      ); // default start:true; boot() presses START
+      advance(); // round 1 live
+      expect(h.io.pub('a').phase).toBe('live');
+
+      // Neither player sends anything for well over STALE_MS. The fuse will
+      // boom and the round will move on regardless — assert against whatever
+      // non-lobby phase the room actually lands in, and prove it truly left
+      // (and stayed out of) `lobby` so the stale check below is not vacuous.
+      vi.advanceTimersByTime(STALE_MS + 1000);
+      const phase = h.io.pub('a').phase;
+      expect(phase).not.toBe('lobby');
+
+      expect(h.room.stalePlayers().slice().sort()).toEqual(['a', 'b']);
+    });
   });
 });
 
@@ -1431,6 +1880,13 @@ describe('I6 — no GameRoomHandle member throws', () => {
       { t: 'wb_boom', answers: [] }, // a server->client tag, sent inbound
       circular,
       Object.create(null) as object,
+      // wb_start with junk siblings — payload-free by design (protocol.ts),
+      // so these must never throw in any phase, whether or not they are
+      // legal presses at that moment.
+      { t: 'wb_start' },
+      { t: 'wb_start', word: 123 },
+      { t: 'wb_start', extra: {} },
+      { t: 'wb_start', word: 123, extra: {} },
     ];
 
     const hammer = (): void => {
@@ -1463,6 +1919,39 @@ describe('I6 — no GameRoomHandle member throws', () => {
     expect(room.info().game).toBe('wordbomb');
   });
 
+  it('wb_start never throws from an unknown or disconnected player, and still starts when legal despite junk siblings', () => {
+    const h = boot(
+      [
+        ['a', 'Alice'],
+        ['b', 'Bob'],
+      ],
+      { start: false },
+    );
+
+    // an id that was never seated: silently ignored, never throws
+    expect(() => h.room.handleMessage('nobody', { t: 'wb_start' })).not.toThrow();
+    expect(h.io.pub('a').phase).toBe('lobby');
+    expect(h.io.pub('a').countdownEndsAt).toBe(0);
+
+    // a disconnected (ghost) player: silently ignored, never throws
+    h.room.removePlayer('b'); // socket dropped, not a permanent leave
+    expect(() => h.room.handleMessage('b', { t: 'wb_start' })).not.toThrow();
+    expect(h.io.pub('a').phase).toBe('lobby');
+    expect(h.io.pub('a').countdownEndsAt).toBe(0);
+    h.room.addPlayer('b', 'Bob'); // reconnect — the room is legal again (2 seated)
+    expect(h.io.pub('a').canStart).toBe(true);
+
+    // junk siblings on an otherwise-legal press: the parser is payload-free,
+    // so this MUST still be accepted as a start (not silently dropped as junk).
+    expect(() =>
+      h.room.handleMessage('a', { t: 'wb_start', word: 123, extra: {} }),
+    ).not.toThrow();
+    expect(h.io.pub('a').countdownEndsAt).toBe(Date.now() + LOBBY_COUNTDOWN_MS);
+    advance();
+    expect(h.io.pub('a').phase).toBe('live');
+    expect(h.io.pub('a').round).toBe(1);
+  });
+
   it('an over-full room refuses politely instead of throwing', () => {
     const seats = Array.from({ length: MAX_PLAYERS }, (_, i) => [`p${i}`, `P${i}`] as const);
     const h = boot(seats);
@@ -1493,6 +1982,7 @@ describe('I6 — no GameRoomHandle member throws', () => {
     room.start();
     room.addPlayer('a', 'Alice');
     room.addPlayer('b', 'Bob');
+    room.handleMessage('a', { t: 'wb_start' }); // manual start: the press is explicit
     expect(() => vi.advanceTimersToNextTimer()).not.toThrow();
     expect(io.pub('a').phase).toBe('matchEnd');
   });

@@ -7,7 +7,7 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DEFAULT_SETTINGS } from '@bank/shared';
+import { DEFAULT_SETTINGS, MAX_PLAYERS, MIN_PLAYERS } from '@bank/shared';
 import type { BankSettings } from '@bank/shared';
 import type { GameModule, GameRoomHandle } from '@platform/shared';
 import { BankRoom } from './room.js';
@@ -69,6 +69,8 @@ export const bankModule: GameModule = {
   // vite dev server (npm run dev -w @bank/client): the platform proxies /bank/
   // here when it answers, so one port (8080) serves launcher + HMR client.
   devPort: 5174,
+  minPlayers: MIN_PLAYERS,
+  maxPlayers: MAX_PLAYERS,
   createRoom(opts): GameRoomHandle {
     return new BankRoom(opts.visibility, opts.io, resolveSettings(opts.settings));
   },

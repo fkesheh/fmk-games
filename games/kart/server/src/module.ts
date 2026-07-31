@@ -1,3 +1,4 @@
+import { MIN_PLAYERS, MAX_PLAYERS } from '@kart/shared';
 // ============================================================================
 // KART GameModule — the KART GP plug into the platform registry (the ONLY
 // kart-server file that imports @platform/shared). Owns the clientDist probe;
@@ -44,6 +45,8 @@ export const kartModule: GameModule = {
   // vite dev server (npm run dev -w @kart/client): the platform proxies /kart/
   // here when it answers, so one port (8080) serves launcher + HMR client.
   devPort: 5175,
+  minPlayers: MIN_PLAYERS,
+  maxPlayers: MAX_PLAYERS,
   createRoom(opts): GameRoomHandle {
     return new KartRoom(opts.visibility, opts.io); // settings ignored: no variants v1
   },

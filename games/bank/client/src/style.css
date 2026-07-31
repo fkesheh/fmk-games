@@ -1525,6 +1525,22 @@ body {
   font-size: clamp(16px, 2.2vh, 20px);
 }
 
+/*  A disabled START still carries an instruction ("NEED 2 PLAYERS"), not a
+    dead control — the generic `.btn:disabled` rule (opacity: 0.35) would sink
+    that label into unreadable mush on top of the already-low-contrast
+    ink-on-gold `.btn-gold` fill. This keeps full opacity and swaps the fill
+    for the `--warn` semantic tone (waiting-on-a-condition, not an error, and
+    not the gold "press me" invitation) with a `--cream` label for contrast.
+    No hover/pulse: it must read as informative, not interactive. */
+.btn-start:disabled {
+  opacity: 1;
+  cursor: default;
+  background: color-mix(in srgb, var(--warn) 16%, var(--ink-lit));
+  border-color: color-mix(in srgb, var(--warn) 55%, transparent);
+  color: color-mix(in srgb, var(--warn) 35%, var(--cream));
+  box-shadow: none;
+}
+
 .btn-roll {
   padding: clamp(13px, 2vh, 18px) clamp(32px, 5vw, 52px);
   font-size: clamp(17px, 2.4vh, 21px);
@@ -1742,6 +1758,34 @@ body {
   text-shadow:
     0 2px 0 var(--ink-deep),
     0 0 40px color-mix(in srgb, var(--danger) 42%, transparent);
+}
+
+/*  The lobby is a state players SIT IN and interact with — read the roster,
+    press START — not a transient result they glance past. Full-stage
+    scrim+blur is right for `roundEnd`/`matchEnd` (brief, non-interactive) but
+    wrong here: it dims the START button and blurs the seated chips to
+    illegibility. `.banner-lobby` swaps the full-bleed treatment for a
+    compact plate that floats over the felt, leaving the rest of the table —
+    button, rail, log — crisp and at full contrast. */
+/*  40%, not 50%: the plate is centred on `.table-stage`, which spans the felt
+    PLUS the rail and the actions row. At 1600x900 the felt is tall enough that
+    either value lands inside it, but at 360x640 the felt is short and 50% put
+    the plate straight over the first player chip — hiding who is seated, which
+    is the one thing the lobby has to show. 40% keeps it inside the felt at
+    every viewport tested (1600x900, 430x880, 360x640). */
+.table-banner.banner-lobby {
+  inset: auto;
+  top: 40%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: min(88%, 720px);
+  padding: clamp(14px, 2.4vw, 28px) clamp(18px, 3.6vw, 40px);
+  background: color-mix(in srgb, var(--ink-deep) 78%, transparent);
+  backdrop-filter: none;
+  border-radius: 14px;
+  border: 1px solid color-mix(in srgb, var(--gold) 38%, transparent);
+  box-shadow: 0 12px 40px var(--shadow-hard);
+  font-size: clamp(20px, 3.2vw, 38px);
 }
 
 .banner-sub {

@@ -15,6 +15,7 @@ import {
   DEFAULT_SETTINGS,
   MATCH_RESET_SECONDS,
   MAX_PLAYERS,
+  MIN_PLAYERS,
   ROUND_END_SECONDS,
   SAFE_ROLLS,
   SEVEN_BONUS,
@@ -104,11 +105,32 @@ function player(st: BankState, id: PlayerId): BankPlayerState {
 /** Rooms stopped in afterEach (the turn timer must be cleared per contract). */
 const tracked: GameRoomHandle[] = [];
 
+/**
+ * The room no longer auto-starts on reaching MIN_PLAYERS (docs/BANK.md "no
+ * game may auto-start"): a seated player must send an explicit {t:'start'}.
+ * boot/bootVariant/probeOutcome all seat a full table and then send it from
+ * the FIRST seated player here, in one place, so the rest of the suite (which
+ * overwhelmingly exercises the PLAYED game, not the lobby) doesn't have to.
+ * A table under MIN_PLAYERS is left in `lobby`, matching production: sending
+ * {t:'start'} early would be silently ignored anyway, but skipping it here
+ * also lets single-seat tests observe the true cold-lobby state.
+ */
+function startIfReady(
+  room: Pick<GameRoomHandle, 'handleMessage'>,
+  players: ReadonlyArray<readonly [PlayerId, string]>,
+): void {
+  if (players.length < MIN_PLAYERS) return;
+  const starter = players[0];
+  if (starter === undefined) return;
+  room.handleMessage(starter[0], { t: 'start' });
+}
+
 function boot(io: FakeIO, players: ReadonlyArray<readonly [PlayerId, string]>): BankRoom {
   const room = new BankRoom('public', io);
   room.start(); // idempotent per the platform contract
   for (const [id, name] of players) room.addPlayer(id, name);
   room.start(); // covers either start/add ordering
+  startIfReady(room, players);
   tracked.push(room);
   return room;
 }
@@ -126,6 +148,7 @@ function bootVariant(
   room.start();
   for (const [id, name] of players) room.addPlayer(id, name);
   room.start();
+  startIfReady(room, players);
   tracked.push(room);
   return room;
 }
@@ -156,10 +179,15 @@ function rollAt(room: GameRoomHandle, io: FakeIO, t: number, via: PlayerId = 'p1
 function probeOutcome(history: ReadonlyArray<number>, t: number): RollMsg {
   const io = new FakeIO();
   const room = new BankRoom('public', io);
+  // built through the EXACT same sequence as boot(io, [['p1', ...], ['p2', ...]])
+  // (start/addPlayer/addPlayer/start/startIfReady) — the roll seed depends only
+  // on Date.now() and rollCounter, but keeping the construction path identical
+  // is what makes the probe-then-replay determinism safe to rely on at all.
+  const players = [['p1', 'Probe A'], ['p2', 'Probe B']] as const;
   room.start();
-  room.addPlayer('p1', 'Probe A');
-  room.addPlayer('p2', 'Probe B');
+  for (const [id, name] of players) room.addPlayer(id, name);
   room.start();
+  startIfReady(room, players);
   try {
     for (const h of history) rollAt(room, io, h);
     return rollAt(room, io, t);
@@ -194,9 +222,9 @@ afterEach(() => {
 // ---- tests -------------------------------------------------------------------
 
 describe('BankRoom', () => {
-  it('waits in lobby, drops invalid messages, starts the match at MIN_PLAYERS', () => {
+  it('waits in lobby, drops invalid messages, and only an explicit start begins the match', () => {
     const io = new FakeIO();
-    const room = boot(io, [['p1', 'Alice']]);
+    const room = boot(io, [['p1', 'Alice']]); // 1 seat: below MIN_PLAYERS, boot sends no start
     const st = io.state('p1'); // addPlayer sends a fresh bank_state join payload
     expect(st.phase).toBe('lobby');
     expect(st.you).toBe('p1');
@@ -215,13 +243,65 @@ describe('BankRoom', () => {
     room.handleMessage('p1', 'garbage');
     room.handleMessage('p1', { t: 'roll' }); // no effect outside 'playing'
     expect(io.events('p1', 'roll')).toHaveLength(0);
-    // second player => round 1 begins, first joiner holds the turn
+    // second player => the table is now STARTABLE, but does NOT start itself
     room.addPlayer('p2', 'Bob');
     const st2 = io.state('p1');
-    expect(st2.phase).toBe('playing');
-    expect(st2.round).toBe(1);
-    expect(st2.currentId).toBe('p1');
-    expect(st2.turnEndsAt).toBe(Date.now() + TURN_MS);
+    expect(st2.phase).toBe('lobby');
+    expect(st2.canStart).toBe(true);
+    expect(st2.playerCount).toBe(2);
+    expect(st2.minPlayers).toBe(MIN_PLAYERS);
+    expect(st2.currentId).toBeNull();
+    // an explicit start from a seated player => round 1 begins, first joiner
+    // holds the turn
+    room.handleMessage('p1', { t: 'start' });
+    const st3 = io.state('p1');
+    expect(st3.phase).toBe('playing');
+    expect(st3.round).toBe(1);
+    expect(st3.currentId).toBe('p1');
+    expect(st3.turnEndsAt).toBe(Date.now() + TURN_MS);
+  });
+
+  it('a cold room seated to MIN_PLAYERS is startable but never starts on its own', () => {
+    const io = new FakeIO();
+    // built directly (not via boot()), which would send the start itself
+    const room = new BankRoom('public', io);
+    room.start();
+    room.addPlayer('p1', 'Alice');
+    room.addPlayer('p2', 'Bob');
+    tracked.push(room);
+    const st = io.state('p1');
+    expect(st.phase).toBe('lobby');
+    expect(st.awaitingStart).toBe(false); // cold, not post-match
+    expect(st.canStart).toBe(true);
+    expect(st.playerCount).toBe(2);
+    expect(st.minPlayers).toBe(MIN_PLAYERS);
+    expect(st.round).toBe(0);
+    expect(st.currentId).toBeNull();
+    expect(st.turnEndsAt).toBe(0);
+    // advance far past every timer the room would be running if it HAD
+    // started (turn/roundEnd/matchEnd are all well under 60s) — nothing
+    // restarts it, because no timer is running underneath a lobby at all
+    vi.advanceTimersByTime(60_000);
+    const st2 = io.state('p1');
+    expect(st2.phase).toBe('lobby');
+    expect(st2.round).toBe(0);
+    expect(st2.currentId).toBeNull();
+    expect(st2.turnEndsAt).toBe(0);
+  });
+
+  it('any seated player may start the match, not only the first to join', () => {
+    const io = new FakeIO();
+    const room = new BankRoom('public', io);
+    room.start();
+    room.addPlayer('p1', 'Alice');
+    room.addPlayer('p2', 'Bob');
+    tracked.push(room);
+    expect(io.state('p1').phase).toBe('lobby');
+    room.handleMessage('p2', { t: 'start' }); // p2 joined second — there is no host
+    const st = io.state('p1');
+    expect(st.phase).toBe('playing');
+    expect(st.round).toBe(1);
+    expect(st.currentId).toBe('p1'); // the opening seat is unaffected by WHO started it
   });
 
   it('safe-window 7 is worth +70, and only the current player may roll', () => {
@@ -288,6 +368,7 @@ describe('BankRoom', () => {
     expect(st.phase).toBe('roundEnd');
     expect(st.pot).toBe(0); // pot lost — shown as 0 for the next round
     expect(st.turnEndsAt).toBe(0); // no timer runs during roundEnd
+    expect(st.canStart).toBe(false); // start only ever fires from 'lobby'
     expect(player(st, 'p1').score).toBe(0); // nobody banked: the pot is gone
     expect(player(st, 'p2').score).toBe(0);
     vi.advanceTimersByTime(ROUND_END_MS);
@@ -393,6 +474,7 @@ describe('BankRoom', () => {
     }
     expect(st.phase).toBe('matchEnd');
     expect(st.winnerId).toBe('p1');
+    expect(st.canStart).toBe(false); // never true outside 'lobby'
     expect(player(st, 'p1').score).toBe(s1);
     expect(player(st, 'p2').score).toBe(s2);
     const matchEnds = io.events('p2', 'match_end');
@@ -405,6 +487,9 @@ describe('BankRoom', () => {
     const st2 = io.state('p1');
     expect(st2.phase).toBe('lobby');
     expect(st2.awaitingStart).toBe(true);
+    expect(st2.canStart).toBe(true); // both seats are still connected
+    expect(st2.playerCount).toBe(2);
+    expect(st2.minPlayers).toBe(MIN_PLAYERS);
     expect(st2.round).toBe(0);
     expect(st2.pot).toBe(0);
     expect(st2.rollCount).toBe(0);
@@ -417,14 +502,21 @@ describe('BankRoom', () => {
     // ...and it STAYS there: no timer, no joiner, nothing restarts it
     vi.advanceTimersByTime(MATCH_RESET_MS * 4);
     expect(io.state('p1').phase).toBe('lobby');
-    // any seated player may open the next match
+    // any seated player may open the next match — p2 here, not the "first"
+    // seat that opened the match originally
     room.handleMessage('p2', { t: 'start' });
     const st3 = io.state('p1');
     expect(st3.phase).toBe('playing');
     expect(st3.round).toBe(1);
     expect(st3.awaitingStart).toBe(false);
+    expect(st3.canStart).toBe(false); // no longer in 'lobby'
     expect(st3.currentId).toBe('p1');
+    // the new match's scores are ZEROED even though p1 scored s1 > 0 in the
+    // match that just ended, and neither player is marked banked
     expect(player(st3, 'p1').score).toBe(0);
+    expect(player(st3, 'p2').score).toBe(0);
+    expect(player(st3, 'p1').banked).toBe(false);
+    expect(player(st3, 'p2').banked).toBe(false);
   });
 
   it('post-match lobby: a JOINER does not restart it; only {t:start} does', () => {
@@ -453,37 +545,55 @@ describe('BankRoom', () => {
     vi.advanceTimersByTime(MATCH_RESET_MS);
     expect(io.state('p1').phase).toBe('lobby');
     expect(io.state('p1').awaitingStart).toBe(true);
+    expect(io.state('p1').canStart).toBe(true); // already >= MIN_PLAYERS
+    expect(io.state('p1').playerCount).toBe(2);
     // a NEW seat arriving must not silently kick the next match off
     race.addPlayer('p3', 'Carol');
     expect(io.state('p1').phase).toBe('lobby');
     expect(io.state('p1').players).toHaveLength(3);
-    // ...the explicit start does, and the joiner is allowed to send it
+    expect(io.state('p1').playerCount).toBe(3);
+    expect(io.state('p1').canStart).toBe(true);
+    // ...the explicit start does, and the JOINER — who arrived after the
+    // table was already startable, and is nobody's "host" — is allowed to
+    // send it just as freely as an original seat
     race.handleMessage('p3', { t: 'start' });
     expect(io.state('p1').phase).toBe('playing');
     expect(io.state('p1').awaitingStart).toBe(false);
+    expect(io.state('p1').canStart).toBe(false);
   });
 
-  it('start is ignored below MIN_PLAYERS and outside the lobby', () => {
+  it('start is ignored below MIN_PLAYERS and outside the lobby, and never throws', () => {
     const io = new FakeIO();
-    const room = boot(io, [['p1', 'Alice']]); // 1 seat: cold lobby, no auto-start
+    const room = boot(io, [['p1', 'Alice']]); // 1 seat: cold lobby, boot sends no start
     expect(io.state('p1').phase).toBe('lobby');
     expect(io.state('p1').awaitingStart).toBe(false); // COLD lobby, not post-match
-    room.handleMessage('p1', { t: 'start' }); // too few players => ignored
+    expect(io.state('p1').canStart).toBe(false); // below MIN_PLAYERS
+    expect(() => room.handleMessage('p1', { t: 'start' })).not.toThrow(); // too few players => ignored
     expect(io.state('p1').phase).toBe('lobby');
-    // the cold lobby still auto-starts on reaching MIN_PLAYERS (unchanged)
+    // the cold lobby does NOT auto-start on reaching MIN_PLAYERS anymore — it
+    // only becomes STARTABLE; an explicit {t:'start'} is required to proceed
     room.addPlayer('p2', 'Bob');
+    expect(io.state('p1').phase).toBe('lobby');
+    expect(io.state('p1').canStart).toBe(true);
+    room.handleMessage('p1', { t: 'start' });
     expect(io.state('p1').phase).toBe('playing');
-    // mid-match start is ignored and does NOT reset the round or the scores
+    // mid-match start is ignored and does NOT reset the round, the pot or the
+    // scores — compare a full before/after snapshot
     const before = io.state('p1');
+    expect(before.canStart).toBe(false); // not in lobby => never startable
     room.handleMessage('p2', { t: 'start' });
     const after = io.state('p1');
     expect(after.phase).toBe('playing');
     expect(after.round).toBe(before.round);
     expect(after.currentId).toBe(before.currentId);
+    expect(after.pot).toBe(before.pot);
+    expect(player(after, 'p1').score).toBe(player(before, 'p1').score);
+    expect(player(after, 'p2').score).toBe(player(before, 'p2').score);
     // and it is ignored during the round-end pause too
     room.handleMessage('p1', { t: 'bank' });
     room.handleMessage('p2', { t: 'bank' });
     expect(io.state('p1').phase).toBe('roundEnd');
+    expect(io.state('p1').canStart).toBe(false);
     room.handleMessage('p1', { t: 'start' });
     expect(io.state('p1').phase).toBe('roundEnd');
   });
@@ -620,7 +730,7 @@ describe('BankRoom', () => {
     expect(player(io.state('p3'), 'p3').score).toBeGreaterThan(0); // scored in round 1
   });
 
-  it('aborts to lobby on low population, keeps scores, resets them on the new match', () => {
+  it('aborts to lobby on low population, keeps scores, and only an explicit start resets them', () => {
     const io = new FakeIO();
     const room = boot(io, [['p1', 'Alice'], ['p2', 'Bob']]);
     const pot = rollAt(room, io, EPOCH + 1_000).potAfter;
@@ -632,8 +742,15 @@ describe('BankRoom', () => {
     expect(st.currentId).toBeNull();
     expect(player(st, 'p1').score).toBe(pot); // scores KEPT across the abort
     expect(player(st, 'p2').connected).toBe(false); // row kept for a rejoiner
-    // rejoin => a NEW match starts from round 1 with fresh scores
+    // rejoin brings the table back to startable, but the room does NOT
+    // restart itself — it waits for an explicit {t:'start'} like any lobby
     room.addPlayer('p2', 'Bob');
+    const stRejoined = io.state('p1');
+    expect(stRejoined.phase).toBe('lobby');
+    expect(stRejoined.canStart).toBe(true);
+    expect(player(stRejoined, 'p1').score).toBe(pot); // still kept, pre-start
+    // explicit start => a NEW match starts from round 1 with fresh scores
+    room.handleMessage('p1', { t: 'start' });
     const st2 = io.state('p1');
     expect(st2.players).toHaveLength(2); // rejoin, not a duplicate row
     expect(st2.phase).toBe('playing');

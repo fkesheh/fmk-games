@@ -115,6 +115,8 @@ function parseState(v: Record<string, unknown>): BankState | null {
       potAfter: v.lastRoll.potAfter,
     };
   }
+  const playerCount = num(v.playerCount) ? v.playerCount : players.filter((p) => p.connected).length;
+  const minPlayers = num(v.minPlayers) ? v.minPlayers : MIN_PLAYERS;
   return {
     t: 'bank_state',
     phase: ph,
@@ -133,6 +135,15 @@ function parseState(v: Record<string, unknown>): BankState | null {
     // additive + tolerant: a server that predates the manual-restart change
     // sends no `awaitingStart`, and `false` is exactly the old behaviour
     awaitingStart: v.awaitingStart === true,
+    // additive + tolerant, same style, for the three authoritative-lobby
+    // fields: a server that predates them sends none, so each falls back to
+    // the best value derivable from data already parsed above.
+    playerCount,
+    minPlayers,
+    // `v.canStart === true` alone is not a safe fallback — an omitted field
+    // would then silently read as "cannot start" even when the room already
+    // qualifies — so a missing value is recomputed from the server's own rule.
+    canStart: typeof v.canStart === 'boolean' ? v.canStart : ph === 'lobby' && playerCount >= minPlayers,
     you: v.you,
   };
 }
@@ -208,7 +219,9 @@ interface BankDebugState {
   score: number; // banked total of `you`
   code: string | null; // private-room code when known (state piggyback or the join code)
   resume: string | null; // the stored rejoin token (localStorage 'bank.resume'), if any
-  awaitingStart: boolean; // post-match lobby: waiting for someone to press START
+  awaitingStart: boolean; // COSMETIC ONLY: true = post-match lobby, false = cold lobby — both wait for START
+  canStart: boolean; // phase === 'lobby' && playerCount >= minPlayers (server-authoritative)
+  playerCount: number; // connected seats right now
 }
 
 interface BankApi {
@@ -219,7 +232,7 @@ interface BankApi {
   joinPrivate(name: string, code: string): void;
   roll(): void;
   bank(): void;
-  start(): void; // post-match lobby only; the room ignores it anywhere else
+  start(): void; // any lobby (cold or post-match); the room ignores it anywhere else
 }
 
 declare global {
@@ -790,7 +803,7 @@ export class BankGame {
   private bank(): void {
     this.send({ t: 'bank' });
   }
-  /** Opens the next match from a post-match lobby; any seated player may send it. */
+  /** Opens the match from any lobby (cold or post-match); any seated player may send it. */
   private startMatch(): void {
     this.send({ t: 'start' });
   }
@@ -1067,14 +1080,16 @@ export class BankGame {
     //  START is a lobby-only control. It is shown (not hidden) while the table
     //  is short-handed so the reason is visible — a control that vanishes reads
     //  as a bug, a control that says NEED 1 MORE PLAYER reads as an instruction.
-    const seated = s.players.filter((p) => p.connected).length;
-    const canStart = seated >= MIN_PLAYERS;
+    //  `canStart` is server-authoritative (frozen contract) — never re-derived
+    //  client-side, so the button always agrees with what the server will act on.
     this.startBtn.classList.toggle('hidden', s.phase !== 'lobby');
-    this.startBtn.disabled = !canStart;
-    const short = MIN_PLAYERS - seated;
-    this.startBtn.textContent = canStart
-      ? 'START MATCH'
-      : `NEED ${short} MORE PLAYER${short === 1 ? '' : 'S'}`;
+    if (s.phase === 'lobby') {
+      this.startBtn.disabled = !s.canStart;
+      const short = s.minPlayers - s.playerCount;
+      this.startBtn.textContent = s.canStart
+        ? 'START MATCH'
+        : `NEED ${short} MORE PLAYER${short === 1 ? '' : 'S'}`;
+    }
 
     if (s.phase === 'roundEnd' || s.phase === 'matchEnd') {
       // matchEnd tone comes from the state when the event was missed (a client
@@ -1083,39 +1098,54 @@ export class BankGame {
       if (s.phase === 'matchEnd' && tone === 'none') {
         tone = s.winnerId !== null && s.winnerId === this.playerId ? 'win' : 'lose';
       }
-      this.setBanner(this.bannerText, this.bannerSub, s.phase === 'matchEnd' ? tone : 'none');
+      this.setBanner(this.bannerText, this.bannerSub, s.phase === 'matchEnd' ? tone : 'none', false);
     } else if (s.phase === 'lobby') {
-      //  Two very different lobbies wear the same phase. A COLD one is filling
-      //  up and will start itself; a POST-MATCH one (`awaitingStart`) has reset
-      //  and is deliberately idle until somebody presses START. Saying so is
-      //  the whole point — an idle table with no explanation reads as broken.
-      const connected = s.players.filter((p) => p.connected).length;
-      const ready = connected >= MIN_PLAYERS;
+      //  Two very different lobbies wear the same phase, and NEITHER one ever
+      //  starts itself — the server never auto-starts a match, cold or
+      //  post-match, so both sit idle until somebody presses START.
+      //  `awaitingStart` is now COSMETIC ONLY (true = post-match, false =
+      //  cold): it only changes the WORDING here, never whether the table is
+      //  waiting. `canStart` / `playerCount` / `minPlayers` are all
+      //  server-authoritative — never re-derived client-side.
       if (s.awaitingStart) {
         this.setBanner(
-          ready ? 'READY WHEN YOU ARE' : 'MATCH COMPLETE',
-          ready
-            ? `${connected} seated · anyone can press START`
-            : `${connected} of ${MIN_PLAYERS} seated — waiting for players to start`,
+          s.canStart ? 'READY WHEN YOU ARE' : 'MATCH COMPLETE',
+          s.canStart
+            ? `${s.playerCount} seated · anyone can press START`
+            : `${s.playerCount} of ${s.minPlayers} seated — waiting for players`,
           'none',
+          true,
         );
       } else {
-        this.setBanner('WAITING FOR PLAYERS', `${connected} of ${MIN_PLAYERS} seated`, 'none');
+        this.setBanner(
+          s.canStart ? 'READY WHEN YOU ARE' : 'WAITING FOR PLAYERS',
+          s.canStart
+            ? `${s.playerCount} seated · anyone can press START`
+            : `${s.playerCount} of ${s.minPlayers} seated`,
+          'none',
+          true,
+        );
       }
     } else {
       this.bannerEl.classList.add('hidden');
       this.bannerEl.classList.remove('banner-win');
       this.bannerEl.classList.remove('banner-lose');
+      this.bannerEl.classList.remove('banner-lobby');
     }
   }
 
   /** Headline + sub-line + win/lose tone on the result banner. */
-  private setBanner(main: string, sub: string, tone: BannerTone): void {
+  private setBanner(main: string, sub: string, tone: BannerTone, isLobby: boolean): void {
     this.bannerMainEl.textContent = main;
     this.bannerSubEl.textContent = sub;
     this.bannerSubEl.classList.toggle('hidden', sub.length === 0);
     this.bannerEl.classList.toggle('banner-win', tone === 'win');
     this.bannerEl.classList.toggle('banner-lose', tone === 'lose');
+    //  `banner-lobby` swaps the full-stage scrim+blur (correct for the
+    //  TRANSIENT round/match banners) for a compact plate: the lobby is a
+    //  state players sit in and interact with (read the rail, press START),
+    //  so the table underneath must stay crisp and legible, never blurred.
+    this.bannerEl.classList.toggle('banner-lobby', isLobby);
     this.bannerEl.classList.remove('hidden');
   }
 
@@ -1155,7 +1185,18 @@ export class BankGame {
       chip.appendChild(el('span', p.banked ? 'player-banked on' : 'player-banked', p.banked ? '✓' : ''));
 
       // second, non-colour cue for turn/banked/offline (accessibility, §5)
-      const stateText = !p.connected ? 'AWAY' : isTurn ? 'TURN' : p.banked ? 'BANKED' : 'IN';
+      // in the lobby a connected seat hasn't "banked" anything yet — 'SEATED'
+      // reads as waiting-to-play, where 'IN' (leftover from mid-match wording)
+      // would read as mid-round. Same `.player-state` class either way.
+      const stateText = !p.connected
+        ? 'AWAY'
+        : isTurn
+          ? 'TURN'
+          : p.banked
+            ? 'BANKED'
+            : s.phase === 'lobby'
+              ? 'SEATED'
+              : 'IN';
       chip.appendChild(el('span', 'player-state', stateText));
 
       this.playersEl.appendChild(chip);
@@ -1361,6 +1402,8 @@ export class BankGame {
         code: this.stateCode ?? this.roomCode,
         resume: this.resumeToken,
         awaitingStart: false,
+        canStart: false,
+        playerCount: 0,
       };
     }
     const me = s.players.find((p) => p.id === this.playerId);
@@ -1377,6 +1420,8 @@ export class BankGame {
       code: this.stateCode ?? this.roomCode,
       resume: this.resumeToken,
       awaitingStart: s.awaitingStart,
+      canStart: s.canStart,
+      playerCount: s.playerCount,
     };
   }
 }

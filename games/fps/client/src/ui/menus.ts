@@ -1295,6 +1295,16 @@ export class Menus {
     this.showExclusive('pause');
   }
 
+  /**
+   * True while ANY modal layer (main / buy / end / joining / pause) is up — i.e.
+   * while a menu owns the screen and the keyboard. C10 uses it to gate the
+   * warmup ENTER shortcut, so a key pressed at a menu can never reach the game.
+   */
+  modalOpen(): boolean {
+    for (const id of MODALS) if (this.isShown(id)) return true;
+    return false;
+  }
+
   hideAll(): void {
     for (const id of Object.keys(this.layers) as LayerId[]) this.hide(id);
     this.hideScoreboard(); // also stops the open board's refresh loop

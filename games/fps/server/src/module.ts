@@ -6,7 +6,7 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { MAPS, MAP_LIST, rng, rngPick } from '@fps/shared';
+import { MAP_LIST, MAPS, MAX_PLAYERS, MIN_PLAYERS_FOR_MATCH, rng, rngPick } from '@fps/shared';
 import type { MapId } from '@fps/shared';
 import type { GameModule, GameRoomHandle } from '@platform/shared';
 import { GameRoom } from './game.js';
@@ -57,6 +57,8 @@ export const fpsModule: GameModule = {
   // vite dev server (npm run dev -w @fps/client): the platform proxies /fps/
   // here when it answers, so one port (8080) serves launcher + HMR client.
   devPort: 5173,
+  minPlayers: MIN_PLAYERS_FOR_MATCH,
+  maxPlayers: MAX_PLAYERS,
   createRoom(opts): GameRoomHandle {
     const mapId = mapIdFrom(opts.settings);
     // The platform RoomIO is structurally identical to the fps contract's own

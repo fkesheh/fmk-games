@@ -51,6 +51,17 @@
 //   .table-invite  .table-invite-code
 //   .table-stage  .stage-main  .stage-side
 //
+// THE LOBBY — no game auto-starts, so this is a real screen, not a spinner.
+// It is the FIRST child of `.stage-main` and is the only visible thing there
+// while `phase === 'lobby'` (`.bomb`, `.answer-form` and `.answer-meta` are
+// hidden). `--seat` is set on `.lobby-seat` exactly as on `.player-chip`.
+//   .lobby  .lobby-head  .lobby-title
+//   .lobby-count  .lobby-count-value  .lobby-count-min
+//   .lobby-settings  .lobby-setting  .lobby-setting-label  .lobby-setting-value
+//   .lobby-seats  .lobby-seat  .lobby-seat--you  .lobby-seat--empty
+//   .lobby-seat-avatar  .lobby-seat-name  .lobby-seat-you  .lobby-seat-state
+//   .lobby-start  .lobby-reason
+//
 // the bomb + the prompt
 //   .bomb  .bomb--idle  .bomb--live  .bomb--armed  .bomb--boom
 //   .bomb-label  .fragment  .fragment-letter  .fragment-hint
@@ -95,7 +106,8 @@ import {
   DIFFICULTIES,
   MAX_SUBMITS_PER_ROUND,
   MAX_WORD_LEN,
-  MIN_PLAYERS,
+  // MIN_PLAYERS is deliberately NOT imported: the threshold arrives on the wire
+  // as `minPlayers`, so the lobby cannot disagree with the server that enforces it.
   MIN_WORD_LEN,
   ROUNDS_MAX,
   ROUNDS_MIN,
@@ -205,6 +217,9 @@ function parsePublic(v: Record<string, unknown>): WbPublicState | null {
   if (!num(v.fuseMinMs) || !num(v.fuseMaxMs)) return null;
   if (!num(v.roundStartedAt) || !num(v.revealEndsAt)) return null;
   if (!num(v.countdownEndsAt) || !num(v.matchEndsAt)) return null;
+  // the manual-start lobby fields — required, so an old server is rejected
+  // outright rather than rendering a START button whose state is a guess
+  if (!num(v.seated) || !num(v.minPlayers) || !bool(v.canStart)) return null;
   if (!Array.isArray(v.players)) return null;
   const players: WbPlayerState[] = [];
   for (const raw of v.players) {
@@ -228,6 +243,9 @@ function parsePublic(v: Record<string, unknown>): WbPublicState | null {
     difficulty,
     players,
     winnerId: v.winnerId,
+    seated: v.seated,
+    minPlayers: v.minPlayers,
+    canStart: v.canStart,
   };
 }
 
@@ -308,6 +326,14 @@ interface WordbombApi {
   state(): WbMergedState | null;
   createPrivate(name: string, settings?: Partial<WordbombSettings>): void;
   joinPrivate(name: string, code: string): void;
+  /**
+   * Press START. Additive to the §4.3 surface, because no game auto-starts any
+   * more and without it the e2e suite can never reach `phase === 'live'`.
+   * Sends `{t:'wb_start'}` unconditionally — the SERVER is the only judge of
+   * whether that is legal (I2), so this deliberately does not pre-check
+   * `canStart`: the suite must be able to prove an illegal press is ignored.
+   */
+  start(): void;
   submit(word: string): void;
   /** Most recent rejection delivered to THIS client, or null. */
   lastReject(): WbRejectReason | null;
@@ -411,6 +437,7 @@ class WordbombGame {
   private standings: WbStanding[] = [];
   private deltas = new Map<string, number>(); // playerId -> points from the last boom
   private lastRoundKey = ''; // `${round}:${roundStartedAt}` — round-change detector
+  private lastPhase: WbPhase | null = null; // lobby-entry detector (see onLobbyEntry)
   private readonly msgLog: unknown[] = [];
   private readonly logLines: LogEntry[] = [];
   private bannerTone: BannerTone = 'none';
@@ -432,6 +459,15 @@ class WordbombGame {
   private readonly inviteCodeEl: HTMLSpanElement;
   private readonly copyBtn: HTMLButtonElement;
 
+  private readonly lobbyEl: HTMLDivElement;
+  private readonly lobbyCountValueEl: HTMLSpanElement;
+  private readonly lobbyCountMinEl: HTMLSpanElement;
+  private readonly lobbyDifficultyEl: HTMLSpanElement;
+  private readonly lobbyRoundsEl: HTMLSpanElement;
+  private readonly lobbySeatsEl: HTMLDivElement;
+  private readonly lobbyStartBtn: HTMLButtonElement;
+  private readonly lobbyReasonEl: HTMLDivElement;
+
   private readonly bombEl: HTMLDivElement;
   private readonly fragmentEl: HTMLDivElement;
   private readonly fragmentHintEl: HTMLDivElement;
@@ -439,6 +475,8 @@ class WordbombGame {
   private readonly fuseMarkEl: HTMLDivElement;
   private readonly fuseLabelEl: HTMLDivElement;
 
+  private readonly answerFormEl: HTMLFormElement;
+  private readonly answerMetaEl: HTMLDivElement;
   private readonly answerInput: HTMLInputElement;
   private readonly answerMaxEl: HTMLDivElement;
   private readonly answerMaxValueEl: HTMLSpanElement;
@@ -561,6 +599,49 @@ class WordbombGame {
     const stageMain = el('div', 'stage-main');
     const stageSide = el('aside', 'stage-side');
 
+    // ---- THE LOBBY ----------------------------------------------------------
+    // Nothing auto-starts, so the wait is a screen with a decision on it, not a
+    // spinner: who is here, how many are still needed, what you are about to
+    // play, and one button. The button's enabled state is `s.canStart` and
+    // NOTHING ELSE — the server computes it from the same predicate it judges
+    // `wb_start` by, so the UI cannot promise a start the server would refuse.
+    this.lobbyEl = el('div', 'lobby hidden');
+    const lobbyHead = el('div', 'lobby-head');
+    lobbyHead.appendChild(el('div', 'lobby-title', 'LOBBY'));
+    const lobbyCount = el('div', 'lobby-count');
+    this.lobbyCountValueEl = el('span', 'lobby-count-value', '0');
+    this.lobbyCountMinEl = el('span', 'lobby-count-min', '');
+    lobbyCount.appendChild(this.lobbyCountValueEl);
+    lobbyCount.appendChild(this.lobbyCountMinEl);
+    lobbyHead.appendChild(lobbyCount);
+    this.lobbyEl.appendChild(lobbyHead);
+
+    const lobbySettings = el('div', 'lobby-settings');
+    const diffSetting = el('div', 'lobby-setting');
+    diffSetting.appendChild(el('span', 'lobby-setting-label', 'DIFFICULTY'));
+    this.lobbyDifficultyEl = el('span', 'lobby-setting-value', '');
+    diffSetting.appendChild(this.lobbyDifficultyEl);
+    lobbySettings.appendChild(diffSetting);
+    const roundsSetting = el('div', 'lobby-setting');
+    roundsSetting.appendChild(el('span', 'lobby-setting-label', 'ROUNDS'));
+    this.lobbyRoundsEl = el('span', 'lobby-setting-value', '');
+    roundsSetting.appendChild(this.lobbyRoundsEl);
+    lobbySettings.appendChild(roundsSetting);
+    this.lobbyEl.appendChild(lobbySettings);
+
+    this.lobbySeatsEl = el('div', 'lobby-seats');
+    this.lobbyEl.appendChild(this.lobbySeatsEl);
+
+    this.lobbyStartBtn = el('button', 'btn btn-primary lobby-start', 'START MATCH');
+    this.lobbyStartBtn.type = 'button';
+    this.lobbyStartBtn.addEventListener('click', () => this.pressStart());
+    this.lobbyEl.appendChild(this.lobbyStartBtn);
+    // The reason is never colour-only: a disabled button ALWAYS has words under
+    // it saying what is missing.
+    this.lobbyReasonEl = el('div', 'lobby-reason', '');
+    this.lobbyEl.appendChild(this.lobbyReasonEl);
+    stageMain.appendChild(this.lobbyEl);
+
     // ---- the bomb: fragment + fuse ------------------------------------------
     this.bombEl = el('div', 'bomb bomb--idle');
     this.bombEl.appendChild(el('div', 'bomb-label', 'YOUR WORD MUST CONTAIN'));
@@ -587,6 +668,7 @@ class WordbombGame {
 
     // ---- the answer input ----------------------------------------------------
     const form = el('form', 'answer-form');
+    this.answerFormEl = form;
     this.answerInput = el('input', 'answer-input');
     this.answerInput.maxLength = MAX_WORD_LEN;
     this.answerInput.placeholder = 'type a word · Enter to lock';
@@ -605,6 +687,7 @@ class WordbombGame {
     stageMain.appendChild(form);
 
     const meta = el('div', 'answer-meta');
+    this.answerMetaEl = meta;
     this.answerMaxEl = el('div', 'answer-max');
     this.answerMaxValueEl = el('span', 'answer-max-value', '');
     this.answerMaxLabelEl = el('span', 'answer-max-label', '');
@@ -678,6 +761,7 @@ class WordbombGame {
       state: () => this.mergedState(),
       createPrivate: (name, settings) => this.createPrivate(name, settings),
       joinPrivate: (name, code) => this.joinPrivate(name, code),
+      start: () => this.pressStart(),
       submit: (word) => this.submit(word),
       lastReject: () => this.reject,
       lastBoom: () => (this.boom === null ? null : { fragment: this.boom.fragment, answers: this.boom.answers.map((a) => ({ ...a })) }),
@@ -893,6 +977,16 @@ class WordbombGame {
     this.send({ t: 'wb_submit', word });
   }
 
+  /**
+   * THE MANUAL START. Sent unconditionally — the server is the only judge (I2)
+   * and ignores an illegal press in silence, so there is no local gate here to
+   * drift out of step with `canStart`. The button's `disabled` state is a
+   * courtesy to the player, never the enforcement.
+   */
+  private pressStart(): void {
+    this.send({ t: 'wb_start' });
+  }
+
   /** Enter / LOCK IN: send exactly what is typed; the SERVER is the only judge (I2). */
   private submitTyped(): void {
     const word = this.answerInput.value.trim().toLowerCase();
@@ -973,8 +1067,31 @@ class WordbombGame {
         this.persistResume();
       }
     }
+    this.onLobbyEntry(s);
     this.onRoundBoundary(s);
     this.renderTable();
+  }
+
+  /**
+   * Entering `lobby` from anywhere else. Now that a finished match returns here
+   * and WAITS instead of rolling straight into the next one, this transition is
+   * something a player actually sits in — so the previous match's reveal,
+   * standings, deltas and round log are cleared rather than left hanging behind
+   * the START button. `onRoundBoundary` cannot do this: it only fires for
+   * `live`, which is exactly the phase the room is no longer going to.
+   */
+  private onLobbyEntry(s: WbPublicState): void {
+    const wasLobby = this.lastPhase === 'lobby';
+    this.lastPhase = s.phase;
+    if (s.phase !== 'lobby' || wasLobby) return;
+    this.boom = null;
+    this.reject = null;
+    this.standings = [];
+    this.deltas.clear();
+    this.answerInput.value = '';
+    this.bannerTone = 'none';
+    this.logLines.length = 0;
+    this.renderLog();
   }
 
   private onPrivate(p: WbPrivate): void {
@@ -1138,13 +1255,89 @@ class WordbombGame {
     this.inviteEl.classList.toggle('hidden', inviteCode === null);
     if (inviteCode !== null) this.inviteCodeEl.textContent = `CODE ${inviteCode}`;
 
+    // In the lobby the bomb and the input are dead weight — an idle "?" and a
+    // disabled box. The lobby panel replaces them outright, so the wait has one
+    // clear subject and one clear action.
+    const inLobby = s.phase === 'lobby';
+    this.lobbyEl.classList.toggle('hidden', !inLobby);
+    this.bombEl.classList.toggle('hidden', inLobby);
+    this.answerFormEl.classList.toggle('hidden', inLobby);
+    this.answerMetaEl.classList.toggle('hidden', inLobby);
+    this.railEl.classList.toggle('hidden', inLobby); // `.lobby-seats` IS the rail here
+
+    this.renderLobby(s);
     this.renderFragment(s);
     this.renderRail(s);
     this.renderAnswerMeta();
     this.renderBanner(s);
-    this.revealEl.classList.toggle('hidden', this.boom === null || s.phase === 'live');
+    this.revealEl.classList.toggle('hidden', this.boom === null || s.phase === 'live' || inLobby);
     this.standingsEl.classList.toggle('hidden', s.phase !== 'matchEnd' || this.standings.length === 0);
     this.tick(); // fuse bar + countdowns immediately, not up to TICK_MS late
+  }
+
+  /**
+   * THE LOBBY. Four questions, answered without scrolling: who is here, how many
+   * more are needed, what am I about to play, and can I start it.
+   *
+   * `seated`, `minPlayers` and `canStart` all come off the wire. The client
+   * never recomputes the threshold — the server judges `wb_start` by the same
+   * predicate it fills `canStart` with, so a button that says it will work
+   * cannot be refused, and one that is disabled is disabled for the server's own
+   * reason rather than a guess this file made.
+   */
+  private renderLobby(s: WbPublicState): void {
+    if (s.phase !== 'lobby') return;
+
+    this.lobbyCountValueEl.textContent = String(s.seated);
+    this.lobbyCountMinEl.textContent = `of ${String(s.minPlayers)} needed`;
+    this.lobbyDifficultyEl.textContent = s.difficulty.toUpperCase();
+    this.lobbyRoundsEl.textContent = String(s.rounds);
+
+    const seats: HTMLElement[] = [];
+    for (const [i, p] of s.players.entries()) {
+      const seat = el('div', 'lobby-seat');
+      seat.style.setProperty('--seat', seatVar(i));
+      seat.classList.toggle('lobby-seat--you', p.id === this.playerId);
+      seat.appendChild(
+        el('span', 'lobby-seat-avatar', p.name.trim().charAt(0).toUpperCase() || '?'),
+      );
+      const name = el('span', 'lobby-seat-name', p.name);
+      if (p.id === this.playerId) name.appendChild(el('span', 'lobby-seat-you', 'YOU'));
+      seat.appendChild(name);
+      seat.appendChild(el('span', 'lobby-seat-state', p.connected ? 'READY' : 'AWAY'));
+      seats.push(seat);
+    }
+    // Pad to `minPlayers` with visible HOLES, so "one more player" is a shape on
+    // the screen and not only a sentence under the button.
+    for (let i = s.players.length; i < s.minPlayers; i++) {
+      const seat = el('div', 'lobby-seat lobby-seat--empty');
+      seat.appendChild(el('span', 'lobby-seat-avatar', '?'));
+      seat.appendChild(el('span', 'lobby-seat-name', 'empty seat'));
+      seat.appendChild(el('span', 'lobby-seat-state', 'WAITING'));
+      seats.push(seat);
+    }
+    this.lobbySeatsEl.replaceChildren(...seats);
+
+    const counting = s.countdownEndsAt > 0;
+    this.lobbyStartBtn.disabled = !s.canStart;
+    this.lobbyStartBtn.textContent = counting ? 'STARTING…' : 'START MATCH';
+    this.lobbyReasonEl.textContent = this.startReason(s);
+  }
+
+  /**
+   * Why the button is off, in words. A disabled control with no explanation is
+   * the same bug as colour-only state: the player is told "no" and not "why".
+   */
+  private startReason(s: WbPublicState): string {
+    if (s.countdownEndsAt > 0) {
+      const secs = secondsLeft(s.countdownEndsAt, this.serverNow());
+      return `starting in ${String(secs)}s`;
+    }
+    if (s.seated < s.minPlayers) {
+      const missing = s.minPlayers - s.seated;
+      return `waiting for ${String(missing)} more player${missing === 1 ? '' : 's'} — share the room code`;
+    }
+    return 'anyone here can start it';
   }
 
   private renderFragment(s: WbPublicState): void {
@@ -1368,12 +1561,11 @@ class WordbombGame {
 
   private renderBanner(s: WbPublicState): void {
     if (s.phase === 'lobby') {
-      const connected = s.players.filter((p) => p.connected).length;
-      this.setBanner(
-        'WAITING FOR PLAYERS',
-        `${String(connected)} of ${String(MIN_PLAYERS)} seated`,
-        'none',
-      );
+      // No banner in the lobby: `.lobby` already occupies the stage and says all
+      // of this, and an overlay across the START button would be actively worse.
+      this.bannerEl.classList.add('hidden');
+      this.bannerEl.classList.remove('banner--win');
+      this.bannerEl.classList.remove('banner--lose');
       return;
     }
     if (s.phase === 'matchEnd') {
@@ -1505,9 +1697,9 @@ class WordbombGame {
       }
     }
 
-    if (s.phase === 'lobby' && s.countdownEndsAt > 0) {
-      this.setBanner('GET READY', `starting in ${String(secondsLeft(s.countdownEndsAt, now))}s`, 'none');
-    }
+    // The lobby's own live text: the post-press beat counts down in the reason
+    // line, under the button that is now disabled because the beat is running.
+    if (s.phase === 'lobby') this.lobbyReasonEl.textContent = this.startReason(s);
   }
 
   /**

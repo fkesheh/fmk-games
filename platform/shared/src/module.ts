@@ -60,6 +60,16 @@ export interface GameModule {
   readonly clientDist: string; // absolute path to the built client (served at /<id>/)
   readonly devPort?: number; // vite dev-server port; when reachable, /<id>/ is proxied
   // there instead of serving clientDist (single dev entry point through the platform server)
+  /**
+   * Seat range, reported by the game rather than restated by the platform.
+   *
+   * The launcher advertises these on its cards. They used to be hardcoded
+   * strings there ("2–8 players") and silently went stale the moment a cap
+   * changed — every one of the four was wrong. Deriving them means the front
+   * page cannot lie about the game behind it.
+   */
+  readonly minPlayers: number;
+  readonly maxPlayers: number;
   createRoom(opts: {
     visibility: Visibility;
     io: RoomIO;
