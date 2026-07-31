@@ -1078,10 +1078,16 @@ describe('GameRoom team switching', () => {
     fightUntilKill(room, io, feed, 'p2', 'p1');
     advanceToPhase(io, 'p1', 'freeze');
 
+    // The switch is applied first and IS honoured. It leaves a 2v0, which the
+    // freeze-time auto-balance immediately repairs by moving the OTHER player
+    // (p2: same rank, joined later) to the empty side — 2v0 -> 1v1, and p1
+    // still gets the team it asked for.
     const changes = eventsOfType(io, 'p1', 'team_changed');
-    expect(changes.length).toBe(1);
+    expect(changes.length).toBe(2);
     expect(changes[0]?.id).toBe('p1');
     expect(changes[0]?.team).toBe(to);
+    expect(changes[1]?.id).toBe('p2');
+    expect(changes[1]?.team).toBe(to === 'T' ? 'CT' : 'T');
 
     // round-2 freeze teleported p1 to a spawn of its NEW team
     const self = io.lastSnap('p1').players.find((p) => p.id === 'p1');
@@ -1261,4 +1267,265 @@ describe('GameRoom spawn separation at 7v7', () => {
     assertWave('bunker', positionsByTeam(io, ids), 2);
     room.stop();
   }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// Mid-round joins + freeze-time auto-balance.
+// ---------------------------------------------------------------------------
+
+/** Roster flag as it stood at the instant `id` joined (before any tick ran). */
+function joinedPending(io: FakeIO, id: PlayerId): boolean {
+  return io.joined(id).roster.find((e) => e.id === id)?.joiningNextRound === true;
+}
+
+/** Current team, following every team_changed anyone has seen for `id`. */
+function liveTeam(io: FakeIO, watcher: PlayerId, id: PlayerId): Team {
+  let team = teamOf(io, id);
+  for (const ev of eventsOfType(io, watcher, 'team_changed')) {
+    if (ev.id === id) team = ev.team;
+  }
+  return team;
+}
+
+describe('GameRoom mid-round join', () => {
+  it('joining a live round seats you as a spectator, then spawns you at the next freeze', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io);
+    advanceToPhase(io, 'p1', 'live');
+
+    room.addPlayer('p3', 'Charlie');
+    // decided at the join instant, before any tick could have re-placed them
+    expect(joinedPending(io, 'p3')).toBe(true);
+    tick();
+
+    // --- one coherent state: seated, spectating, NOT in the world -----------
+    const you = io.lastSnap('p3').you;
+    expect(you.alive).toBe(false);
+    expect(you.joiningNextRound).toBe(true);
+    expect(you.respawnAt).toBeNull(); // not "respawning": waiting for the round
+
+    // told why, in words
+    const notices = eventsOfType(io, 'p3', 'notice');
+    expect(notices.length).toBe(1);
+    expect(notices[0]?.code).toBe('joining_next_round');
+    expect(notices[0]?.text.length).toBeGreaterThan(0);
+
+    // seated on a team and on everyone's scoreboard, flagged as joining
+    const joinEv = eventsOfType(io, 'p1', 'player_joined').find((e) => e.entry.id === 'p3');
+    expect(joinEv?.entry.team === 'T' || joinEv?.entry.team === 'CT').toBe(true);
+    expect(joinEv?.entry.joiningNextRound).toBe(true);
+    expect(io.joined('p3').roster.length).toBe(3);
+
+    // --- next freeze: a normal player, spawned on their team's spawns ------
+    advanceToPhase(io, 'p1', 'roundEnd', 3500);
+    advanceToPhase(io, 'p1', 'freeze', 300);
+
+    const spawned = io.lastSnap('p3');
+    expect(spawned.you.alive).toBe(true);
+    expect(spawned.you.joiningNextRound).toBe(false);
+    expect(spawned.you.canBuy).toBe(true); // full buy access, per the usual rules
+    const self = spawned.players.find((p) => p.id === 'p3');
+    if (self === undefined) throw new Error('p3 missing from the freeze snapshot');
+    const team = liveTeam(io, 'p1', 'p3');
+    expect(MAPS.dustbowl.spawns[team].some((s) => s.x === self.x && s.z === self.z)).toBe(true);
+    // and everyone else can see them again
+    expect(io.lastSnap('p1').players.some((p) => p.id === 'p3')).toBe(true);
+    room.stop();
+  });
+
+  it('a mid-round joiner is absent from every snapshot, inert, and cannot be damaged', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io);
+    const feed = new InputFeed();
+    advanceToPhase(io, 'p1', 'live');
+    room.addPlayer('p3', 'Charlie');
+
+    // hammer the joiner's inputs: full-forward + trigger held, for ~2s
+    for (let i = 0; i < 60; i++) {
+      tick();
+      feed.send(room, 'p3', { moveZ: 1, buttons: INPUT_FIRE });
+      // nobody, at any tick, sees the joiner in the world
+      for (const watcher of ['p1', 'p2', 'p3'] as const) {
+        expect(io.lastSnap(watcher).players.some((p) => p.id === 'p3')).toBe(false);
+      }
+    }
+    // inert: no shot ever left their gun, and they still hold a full magazine
+    expect(eventsOfType(io, 'p1', 'shot').some((e) => e.shooterId === 'p3')).toBe(false);
+    expect(io.lastSnap('p3').you.mag).toBe(WEAPONS.pistol.mag);
+
+    // a real fight runs to a kill while they spectate: never a target
+    const victim = teamOf(io, 'p1') === teamOf(io, 'p2') ? null : 'p1';
+    if (victim !== null) fightUntilKill(room, io, feed, 'p2', victim);
+    expect(eventsOfType(io, 'p3', 'dmg_taken').length).toBe(0);
+    expect(eventsOfType(io, 'p1', 'kill').some((e) => e.victimId === 'p3')).toBe(false);
+    expect(io.lastSnap('p3').you.hp).toBe(0); // spectating, never "hurt" down to it
+    room.stop();
+  });
+
+  it('joining during warmup still spawns you immediately', () => {
+    const io = new FakeIO();
+    const room = new GameRoom('dustbowl', 'public', io);
+    room.addPlayer('p1', 'Alpha'); // one player: the room stays in warmup
+    room.start();
+    vi.advanceTimersByTime(200);
+    expect(io.lastSnap('p1').phase).toBe('warmup');
+
+    room.addPlayer('p2', 'Bravo');
+    expect(joinedPending(io, 'p2')).toBe(false); // placed at the join instant
+    tick();
+
+    expect(io.lastSnap('p2').you.alive).toBe(true);
+    expect(io.lastSnap('p2').you.joiningNextRound).toBe(false);
+    expect(eventsOfType(io, 'p2', 'notice').length).toBe(0);
+    expect(io.lastSnap('p1').players.some((p) => p.id === 'p2')).toBe(true);
+    room.stop();
+  });
+
+  it('joining during a freeze also spawns immediately — freeze IS the next round', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io);
+    advanceToPhase(io, 'p1', 'freeze');
+
+    room.addPlayer('p3', 'Charlie');
+    expect(joinedPending(io, 'p3')).toBe(false);
+    tick();
+    expect(io.lastSnap('p3').phase).toBe('freeze');
+    expect(io.lastSnap('p3').you.alive).toBe(true);
+    expect(io.lastSnap('p3').you.canBuy).toBe(true);
+    expect(io.lastSnap('p1').players.some((p) => p.id === 'p3')).toBe(true);
+    room.stop();
+  });
+
+  it('a spectating joiner never blocks elimination or the round clock', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io);
+    const feed = new InputFeed();
+    advanceToPhase(io, 'p1', 'live');
+    room.addPlayer('p3', 'Charlie');
+    tick();
+
+    // p1 dies; its team is now empty of LIVING players, so the round must end
+    // even though the pending joiner may be seated on that same team.
+    room.handleSuicide('p1');
+    const ended = advanceUntil(() => io.lastSnap('p1').phase === 'roundEnd', 60);
+    expect(ended).toBe(true);
+    feed.send(room, 'p2');
+    room.stop();
+  });
+});
+
+describe('GameRoom auto-balance', () => {
+  /** n humans, then `bots` bots, all seated during warmup (no ticks yet). */
+  function seatMixed(nHumans: number, nBots: number): { io: FakeIO; room: GameRoom; bots: PlayerId[] } {
+    const io = new FakeIO();
+    const room = new GameRoom('dustbowl', 'public', io);
+    for (let i = 0; i < nHumans; i++) room.addPlayer(`h${i}`, `Human ${i}`);
+    const bots: PlayerId[] = [];
+    for (let i = 0; i < nBots; i++) {
+      const id = room.addBot();
+      if (id === null) throw new Error('bot slot refused');
+      bots.push(id);
+    }
+    return { io, room, bots };
+  }
+
+  function idsOn(io: FakeIO, all: PlayerId[], team: Team): PlayerId[] {
+    return all.filter((id) => teamOf(io, id) === team);
+  }
+
+  it('repairs a roster gone lopsided through leavers, at the next freeze, and says why', () => {
+    const { io, room } = seatMixed(6, 0);
+    const all = ['h0', 'h1', 'h2', 'h3', 'h4', 'h5'];
+    const big: Team = idsOn(io, all, 'T').length >= 3 ? 'T' : 'CT';
+    const small: Team = big === 'T' ? 'CT' : 'T';
+    // 3v3 -> 3v1 by two leavers on one side: pickTeam never sees this happen
+    for (const id of idsOn(io, all, small).slice(0, 2)) room.removePlayer(id);
+    const remaining = all.filter((id) => io.errors(id).length === 0);
+    expect(idsOn(io, remaining, big).length).toBe(3);
+
+    room.start();
+    advanceToPhase(io, idsOn(io, all, small)[2] ?? 'h0', 'freeze');
+
+    const watcher = idsOn(io, all, big)[0] as PlayerId;
+    const changes = eventsOfType(io, watcher, 'team_changed');
+    expect(changes.length).toBe(1); // one move: 3v1 -> 2v2, never an overshoot
+    expect(changes[0]?.team).toBe(small);
+
+    // the mover is the most recently joined player of the oversized team
+    const bigIds = idsOn(io, all, big);
+    expect(changes[0]?.id).toBe(bigIds[bigIds.length - 1]);
+
+    // and they are told, personally, that it happened and why
+    const moved = changes[0]?.id as PlayerId;
+    const notices = eventsOfType(io, moved, 'notice').filter((n) => n.code === 'team_rebalanced');
+    expect(notices.length).toBe(1);
+    expect(notices[0]?.text).toContain(small);
+    room.stop();
+  });
+
+  it('prefers moving a bot over a human, even a more recently joined human', () => {
+    // pickTeam fills the smaller side and coin-flips ties, so an even seat count
+    // is always balanced: the two bots split one per side, and the two late
+    // humans (joined AFTER the bots) also split one per side.
+    const { io, room, bots } = seatMixed(4, 2); // 3v3
+    room.addPlayer('late0', 'Late Zero');
+    room.addPlayer('late1', 'Late One'); // 4v4
+    const b0 = bots[0] as PlayerId;
+    const all = ['h0', 'h1', 'h2', 'h3', ...bots, 'late0', 'late1'];
+    const big = teamOf(io, b0);
+    const small: Team = big === 'T' ? 'CT' : 'T';
+    // the oversized side really does hold a human who joined after the bot,
+    // so "most recently joined" alone would NOT pick the bot
+    expect(idsOn(io, ['late0', 'late1'], big).length).toBe(1);
+    for (const id of idsOn(io, all, small).slice(0, 3)) room.removePlayer(id); // 4v1
+
+    room.start();
+    const watcher = idsOn(io, all, big)[0] as PlayerId;
+    advanceToPhase(io, watcher, 'freeze');
+
+    const changes = eventsOfType(io, watcher, 'team_changed');
+    expect(changes.length).toBe(1); // 4v1 -> 3v2
+    expect(changes[0]?.id).toBe(b0); // the bot went, not the newer human
+    room.stop();
+  });
+
+  it('leaves a roster that is already within one player alone', () => {
+    const { io, room } = seatMixed(3, 0);
+    room.start();
+    advanceToPhase(io, 'h0', 'freeze'); // 2v1: nothing to repair
+    expect(eventsOfType(io, 'h0', 'team_changed').length).toBe(0);
+    expect(eventsOfType(io, 'h0', 'notice').length).toBe(0);
+    room.stop();
+  });
+
+  it('does not move the same player two freezes in a row when another candidate exists', () => {
+    const { io, room } = seatMixed(8, 0);
+    const all = ['h0', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'h7'];
+    const big: Team = idsOn(io, all, 'T').length >= 4 ? 'T' : 'CT';
+    const small: Team = big === 'T' ? 'CT' : 'T';
+    const smallIds = idsOn(io, all, small);
+    room.removePlayer(smallIds[0] as PlayerId);
+    room.removePlayer(smallIds[1] as PlayerId); // 4v2
+    const survivors = [smallIds[2] as PlayerId, smallIds[3] as PlayerId];
+
+    room.start();
+    const watcher = survivors[0] as PlayerId;
+    advanceToPhase(io, watcher, 'freeze');
+    const firstMove = eventsOfType(io, watcher, 'team_changed')[0]?.id;
+    expect(firstMove).toBeDefined(); // round 1: 4v2 -> 3v3
+
+    // now shrink the OTHER side, so the team holding the round-1 mover is the
+    // oversized one at round 2's freeze — with untouched candidates on it too
+    const bigLeft = idsOn(io, all, big).filter((id) => id !== firstMove);
+    room.removePlayer(bigLeft[0] as PlayerId);
+    room.removePlayer(bigLeft[1] as PlayerId); // 1v3
+    advanceToPhase(io, watcher, 'roundEnd', 3500);
+    advanceToPhase(io, watcher, 'freeze', 300);
+
+    const moves = eventsOfType(io, watcher, 'team_changed');
+    expect(moves.length).toBe(2); // exactly one more move: 1v3 -> 2v2
+    expect(moves[1]?.id).not.toBe(firstMove); // ping-pong avoided
+    expect(survivors).toContain(moves[1]?.id); // an untouched candidate went
+    room.stop();
+  });
 });

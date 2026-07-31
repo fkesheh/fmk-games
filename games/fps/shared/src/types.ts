@@ -76,6 +76,11 @@ export interface RosterEntry {
   bot: boolean; // server-driven player (scoreboard shows a BOT tag)
   money: number | null; // populated only for the receiving player, null otherwise
   connected: boolean; // always true for bots
+  // ADDITIVE (mid-round join): true while this player is seated on a team but
+  // sits out the round in progress — absent from the world and from snapshots,
+  // spawning at the next freeze. Scoreboard shows "joining next round".
+  // Absent/undefined means false (older servers never send it).
+  joiningNextRound?: boolean;
 }
 
 // One player inside a snapshot. x/y/z = FEET position (y is the floor under them).
@@ -108,9 +113,23 @@ export interface YouSnap {
   vy: number; // authoritative vertical velocity (client prediction replays gravity from it)
   armor: number; // 0..100 kevlar points (0 = no vest)
   helmet: boolean; // owned helmet (protects head with armor absorb)
+  // ADDITIVE (mid-round join): the recipient joined after this round went live
+  // and is spectating until the next freeze. alive is false and there is no
+  // respawnAt — the HUD should say "joining next round", not "respawning".
+  // Absent/undefined means false.
+  joiningNextRound?: boolean;
 }
 
 export type RoundEndReason = 'elimination' | 'time' | 'forfeit';
+
+// ADDITIVE. Personal, human-readable server notice delivered to ONE player when
+// the server changed something about their participation without them asking.
+// `text` is display-ready; `code` lets a client style/localize it. Clients that
+// do not know a code should still show `text` (or ignore the event entirely —
+// nothing else depends on it).
+export type NoticeCode =
+  | 'joining_next_round' // you joined mid-round: spectating until the next freeze
+  | 'team_rebalanced'; // the server moved you to the other team to even the sides
 
 export type GameEvent =
   | { t: 'shot'; shooterId: PlayerId; weapon: WeaponId; from: Vec3; to: Vec3 } // broadcast to ALL players in the room; from = shooter eye, to = hit point or wall end (drives tracers, muzzle flash, shot sounds)
@@ -125,7 +144,8 @@ export type GameEvent =
   | { t: 'player_joined'; entry: RosterEntry }
   | { t: 'player_left'; id: PlayerId }
   | { t: 'team_changed'; id: PlayerId; team: Team } // broadcast; roster update for id (also fired when applied at freeze)
-  | { t: 'buy_result'; ok: boolean; weapon: WeaponId | null; reason: string | null };
+  | { t: 'buy_result'; ok: boolean; weapon: WeaponId | null; reason: string | null }
+  | { t: 'notice'; code: NoticeCode; text: string }; // ADDITIVE; to one player only
 
 export type S2C =
   | { t: 'welcome'; playerId: PlayerId }

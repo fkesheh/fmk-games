@@ -37,7 +37,7 @@ import {
   MAX_SUBMIT_LEN,
   MAX_WORD_LEN,
   MIN_PLAYERS,
-  REVEAL_MS,
+  revealMsFor,
   SUBMIT_COOLDOWN_MS,
   SUBMIT_GRACE_MS,
   scoreWord,
@@ -956,7 +956,7 @@ describe('SUBMIT_GRACE_MS', () => {
     expect(playerOf(h.io.pub('b'), 'b').score).toBe(0);
   });
 
-  it('the reveal window runs REVEAL_MS beyond the grace', () => {
+  it('the reveal window runs revealMsFor(players) beyond the grace', () => {
     const h = boot([
       ['a', 'Alice'],
       ['b', 'Bob'],
@@ -964,10 +964,10 @@ describe('SUBMIT_GRACE_MS', () => {
     advance();
     advance(); // explosion
     const boomAt = Date.now();
-    expect(h.io.pub('a').revealEndsAt).toBe(boomAt + SUBMIT_GRACE_MS + REVEAL_MS);
+    expect(h.io.pub('a').revealEndsAt).toBe(boomAt + SUBMIT_GRACE_MS + revealMsFor(2));
     advance(); // wb_boom
     advance(); // afterReveal
-    expect(Date.now()).toBe(boomAt + SUBMIT_GRACE_MS + REVEAL_MS);
+    expect(Date.now()).toBe(boomAt + SUBMIT_GRACE_MS + revealMsFor(2));
     expect(h.io.pub('a').round).toBe(2);
   });
 });

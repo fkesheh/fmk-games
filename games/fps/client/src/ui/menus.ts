@@ -18,6 +18,15 @@ import type {
 } from '@fps/shared';
 import { weaponIcon } from './hud.js';
 
+/**
+ * The alive/dead half of a scoreboard row. Structurally a subset of C10's
+ * roster-merged snapshot entry, so the caller passes its existing reused array.
+ */
+export interface LivePlayer {
+  readonly id: PlayerId;
+  readonly alive: boolean;
+}
+
 export interface MenuCallbacks {
   onQuickJoin(name: string): void;
   onCreatePublic(name: string, mapId: MapId): void; // listed in the room browser
@@ -38,6 +47,7 @@ export interface MenuCallbacks {
 const NAME_KEY = 'stricken.name';
 const STYLE_ID = 'fps-menus-style';
 const CONSOLE_MAX_LINES = 50; // dev console keeps only the tail of the output log
+const SCORE_REFRESH_MS = 120; // open-scoreboard re-read cadence (alive/K/D move)
 
 type LayerId = 'main' | 'buy' | 'score' | 'end' | 'joining' | 'pause' | 'chip' | 'botprompt';
 // modal layers are mutually exclusive; scoreboard + chip stack on top freely
@@ -281,6 +291,14 @@ export class Menus {
   private roomListEl: HTMLElement | null = null;
   private roomReq = 0; // stale-guard for async room-list refreshes
   private scoreSig = ''; // scoreboard content signature — skips no-op rebuilds
+  private scoreRaf = 0; // rAF handle for the open scoreboard's refresh loop
+  private scoreArgs: {
+    roster: RosterEntry[];
+    you: PlayerId;
+    scoreT: number;
+    scoreCT: number;
+    live: readonly LivePlayer[] | undefined;
+  } | null = null;
   private selectedMap: MapId = MAP_LIST[0]?.id ?? 'dustbowl';
   private consoleEl: HTMLElement | null = null; // built lazily on first use
   private consoleOutEl: HTMLElement | null = null;
@@ -338,7 +356,7 @@ export class Menus {
   // ---- main menu ------------------------------------------------------------
   showMain(errorText?: string): void {
     this.showExclusive('main');
-    this.hide('score');
+    this.hideScoreboard(); // a live refresh loop would re-show it over the menu
     this.hide('chip');
     const layer = this.layers.main;
     layer.textContent = '';
@@ -890,12 +908,64 @@ export class Menus {
   }
 
   // ---- scoreboard -------------------------------------------------------------
-  showScoreboard(roster: RosterEntry[], you: PlayerId, scoreT: number, scoreCT: number): void {
-    // C10 may call this every snapshot while Tab is held — skip no-op rebuilds
+  /**
+   * `live` (optional, additive) is C10's roster-merged snapshot array; when it
+   * is supplied every row also carries alive/dead for the current round. The
+   * frozen 4-arg call still works and simply omits that state.
+   *
+   * The caller drives this from the Tab EDGE, but the arrays it hands over keep
+   * mutating underneath (roster entries track kills/deaths locally, and `live`
+   * is C10's reused snapshot array). A board frozen at the keydown would keep
+   * claiming a respawned teammate is dead, so while it is open it re-reads them
+   * on a throttled rAF; the signature check below makes every idle pass a no-op.
+   */
+  showScoreboard(
+    roster: RosterEntry[],
+    you: PlayerId,
+    scoreT: number,
+    scoreCT: number,
+    live?: readonly LivePlayer[],
+  ): void {
+    this.scoreArgs = { roster, you, scoreT, scoreCT, live };
+    this.renderScoreboard();
+    if (this.scoreRaf === 0) {
+      let last = 0;
+      const tick = (t: number): void => {
+        if (this.scoreArgs === null) {
+          this.scoreRaf = 0;
+          return;
+        }
+        if (t - last >= SCORE_REFRESH_MS) {
+          last = t;
+          this.renderScoreboard();
+        }
+        this.scoreRaf = requestAnimationFrame(tick);
+      };
+      this.scoreRaf = requestAnimationFrame(tick);
+    }
+  }
+
+  private renderScoreboard(): void {
+    const args = this.scoreArgs;
+    if (args === null) return;
+    const { roster, you, scoreT, scoreCT, live } = args;
+    const known = live !== undefined && live.length > 0;
+    // `live` holds exactly the players the server has in THIS round, so absence
+    // from it is a third state, not death: a mid-round joiner sits out until the
+    // next round and must not be libelled as a corpse.
+    const inRound = new Set<PlayerId>();
+    const aliveIds = new Set<PlayerId>();
+    if (live !== undefined) {
+      for (const p of live) {
+        inRound.add(p.id);
+        if (p.alive) aliveIds.add(p.id);
+      }
+    }
+    // runs on every refresh pass — skip no-op rebuilds
     const sig =
-      `${scoreT}|${scoreCT}|${you}|` +
+      `${scoreT}|${scoreCT}|${you}|${known ? 1 : 0}|` +
       roster
-        .map((r) => `${r.id}:${r.name}:${r.team}:${r.kills}:${r.deaths}:${r.headshots}:${r.money ?? ''}:${r.bot ? 1 : 0}:${r.connected ? 1 : 0}`)
+        .map((r) => `${r.id}:${r.name}:${r.team}:${r.kills}:${r.deaths}:${r.headshots}:${r.money ?? ''}:${r.bot ? 1 : 0}:${r.connected ? 1 : 0}:${aliveIds.has(r.id) ? 1 : 0}:${inRound.has(r.id) ? 1 : 0}`)
         .join('|');
     if (sig === this.scoreSig && this.isShown('score')) return;
     this.scoreSig = sig;
@@ -911,43 +981,72 @@ export class Menus {
     const yourTeam = roster.find((r) => r.id === you)?.team ?? null;
 
     const head = el('div', 'm9-score-head');
-    head.appendChild(this.buildScorePlate('T', scoreT, scoreT > scoreCT, yourTeam === 'T'));
+    head.appendChild(this.buildScorePlate('T', scoreT, scoreT > scoreCT, yourTeam));
     head.appendChild(el('span', 'm9-score-vs', 'VS'));
-    head.appendChild(this.buildScorePlate('CT', scoreCT, scoreCT > scoreT, yourTeam === 'CT'));
+    head.appendChild(this.buildScorePlate('CT', scoreCT, scoreCT > scoreT, yourTeam));
     panel.appendChild(head);
 
+    // YOUR side's table comes FIRST, whichever side it is: the reading order
+    // itself answers "which one am I" before any tag or colour is decoded.
+    const order: readonly Team[] = yourTeam === 'CT' ? ['CT', 'T'] : ['T', 'CT'];
     const tables = el('div', 'm9-tables');
-    tables.appendChild(this.buildTeamTable('T', roster, you));
-    tables.appendChild(this.buildTeamTable('CT', roster, you));
+    for (const t of order) {
+      tables.appendChild(
+        this.buildTeamTable(t, roster, you, t === yourTeam, known, aliveIds, inRound),
+      );
+    }
     panel.appendChild(tables);
 
     const legend = el('div', 'm9-score-legend');
     legend.appendChild(el('span', '', 'K kills · D deaths · HS headshots · K/D ratio'));
     legend.appendChild(el('span', 'm9-legend-you', 'YOU'));
-    legend.appendChild(el('span', '', 'marks your row'));
+    legend.appendChild(
+      el('span', '', known ? 'marks your row · struck-through = out of this round' : 'marks your row'),
+    );
     panel.appendChild(legend);
     layer.appendChild(panel);
   }
 
   /** One side of the scoreline: tag, full team name, big round count. */
-  private buildScorePlate(team: Team, score: number, leading: boolean, mine: boolean): HTMLElement {
+  private buildScorePlate(
+    team: Team,
+    score: number,
+    leading: boolean,
+    yourTeam: Team | null,
+  ): HTMLElement {
     const plate = el('div', `m9-score-plate ${team === 'T' ? 'm9-plate-t' : 'm9-plate-ct'}`);
     if (leading) plate.classList.add('m9-plate-lead');
+    const mine = yourTeam === team;
+    if (mine) plate.classList.add('m9-plate-mine');
     const tagRow = el('div', 'm9-plate-tags');
     tagRow.appendChild(el('span', team === 'T' ? 'm9-t' : 'm9-ct', team));
-    if (mine) tagRow.appendChild(el('span', 'm9-plate-you', 'YOU'));
+    // BOTH plates are tagged — one YOU, one ENEMY — so the pair is never
+    // symmetrical and the answer never depends on spotting a single chip.
+    if (yourTeam !== null) {
+      tagRow.appendChild(el('span', mine ? 'm9-plate-you' : 'm9-plate-foe', mine ? 'YOU' : 'ENEMY'));
+    }
     plate.appendChild(tagRow);
     plate.appendChild(el('div', 'm9-plate-name', TEAM_NAME[team]));
     plate.appendChild(el('div', 'm9-plate-score', `${score}`));
     return plate;
   }
 
-  private buildTeamTable(team: Team, roster: RosterEntry[], you: PlayerId): HTMLElement {
+  private buildTeamTable(
+    team: Team,
+    roster: RosterEntry[],
+    you: PlayerId,
+    mine: boolean,
+    known: boolean,
+    aliveIds: ReadonlySet<PlayerId>,
+    inRound: ReadonlySet<PlayerId>,
+  ): HTMLElement {
     const rows = roster.filter((r) => r.team === team).sort(byScore);
     const wrap = el('div', `m9-table ${team === 'T' ? 'm9-table-t' : 'm9-table-ct'}`);
+    if (mine) wrap.classList.add('m9-table-mine');
     const head = el('div', `m9-table-head ${team === 'T' ? 'm9-th-t' : 'm9-th-ct'}`);
     head.appendChild(el('span', 'm9-th-tag', team));
     head.appendChild(el('span', 'm9-th-name', TEAM_NAME[team]));
+    head.appendChild(el('span', mine ? 'm9-th-mine' : 'm9-th-foe', mine ? 'YOUR TEAM' : 'ENEMY'));
     head.appendChild(el('span', 'm9-th-count', `${rows.length}`));
     wrap.appendChild(head);
 
@@ -965,14 +1064,28 @@ export class Menus {
     for (const r of rows) {
       const row = el('div', 'm9-row');
       if (r.id === you) row.classList.add('m9-you');
-      // RosterEntry carries no alive flag — the status dot tracks `connected`
+      // RosterEntry carries no alive flag — it comes from the caller's snapshot
+      // mirror (`live`). Without it the dot falls back to `connected` only.
+      const out = known && !inRound.has(r.id); // joined mid-round: in next round
+      const dead = known && !out && !aliveIds.has(r.id);
+      if (dead || out) row.classList.add('m9-dead');
       const dot = el('span', 'm9-dot');
-      if (!r.connected) dot.classList.add('m9-off');
-      dot.title = r.connected ? 'connected' : 'disconnected';
+      if (!r.connected || out) dot.classList.add('m9-off');
+      else if (dead) dot.classList.add('m9-down');
+      dot.title = !r.connected
+        ? 'disconnected'
+        : out
+          ? 'joined mid-round — in from the next round'
+          : dead
+            ? 'dead this round'
+            : 'alive';
       row.appendChild(dot);
       const nameCell = el('span', 'm9-c-name');
       nameCell.appendChild(document.createTextNode(r.name));
       if (r.bot) nameCell.appendChild(el('span', 'm9-bot-tag', 'BOT'));
+      // dead is shape (hollow rotated dot) + strike-through + this word
+      if (dead) nameCell.appendChild(el('span', 'm9-dead-tag', 'DEAD'));
+      if (out) nameCell.appendChild(el('span', 'm9-out-tag', 'NEXT ROUND'));
       // the local row is marked by a rail, a weight change AND this word
       if (r.id === you) nameCell.appendChild(el('span', 'm9-you-tag', 'YOU'));
       row.appendChild(nameCell);
@@ -991,6 +1104,13 @@ export class Menus {
   hideScoreboard(): void {
     this.hide('score');
     this.scoreSig = '';
+    // drop the refresh loop AND the arrays it holds (the rAF sees the null and
+    // stops itself; cancelling here too means a re-show never stacks two loops)
+    this.scoreArgs = null;
+    if (this.scoreRaf !== 0) {
+      cancelAnimationFrame(this.scoreRaf);
+      this.scoreRaf = 0;
+    }
   }
 
   // ---- match end ----------------------------------------------------------------
@@ -1002,7 +1122,7 @@ export class Menus {
     roster: RosterEntry[],
   ): void {
     this.showExclusive('end');
-    this.hide('score');
+    this.hideScoreboard();
     const layer = this.layers.end;
     layer.textContent = '';
 
@@ -1081,7 +1201,7 @@ export class Menus {
 
   showJoining(): void {
     this.showExclusive('joining');
-    this.hide('score');
+    this.hideScoreboard();
     this.hide('chip');
   }
 
@@ -1177,7 +1297,7 @@ export class Menus {
 
   hideAll(): void {
     for (const id of Object.keys(this.layers) as LayerId[]) this.hide(id);
-    this.scoreSig = '';
+    this.hideScoreboard(); // also stops the open board's refresh loop
     this.hideConsole();
   }
 
@@ -1577,16 +1697,29 @@ const CSS = `
 .m9-score-plate.m9-plate-lead{box-shadow:inset 0 0 30px rgba(var(--m9-hudAccent-rgb),.1);}
 .m9-plate-tags .m9-t,.m9-plate-tags .m9-ct{font-size:16px;font-weight:900;letter-spacing:.18em;}
 .m9-plate-you{font-size:9px;font-weight:800;letter-spacing:.16em;color:var(--m9-ink);
-  background:var(--m9-hudAccent);border-radius:3px;padding:2px 6px;}
+  background:var(--m9-paper);border-radius:3px;padding:2px 6px;}
+.m9-plate-foe{font-size:9px;font-weight:800;letter-spacing:.16em;color:var(--m9-steel);
+  border:1px solid var(--m9-metalDark);border-radius:3px;padding:1px 6px;}
+/* your plate is claimed by a lit rim + a full-height side rail, not by hue */
+.m9-score-plate.m9-plate-mine{border-color:rgba(var(--m9-paper-rgb),.45);
+  box-shadow:inset 0 1px 0 rgba(var(--m9-paper-rgb),.16);}
+.m9-plate-mine.m9-plate-t::before,.m9-plate-mine.m9-plate-ct::before{width:7px;}
 .m9-t{color:var(--m9-tAmber);}
 .m9-ct{color:var(--m9-ctLit);}
 
 .m9-tables{display:flex;gap:14px;flex-wrap:wrap;}
 .m9-table{flex:1 1 340px;border:1px solid var(--m9-metalDark);border-radius:10px;overflow:hidden;
   background:rgba(var(--m9-ink-rgb),.6);}
-.m9-table-head{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:10px;
+.m9-table-head{display:grid;grid-template-columns:auto 1fr auto auto;align-items:center;gap:10px;
   padding:10px 12px;font-weight:800;font-size:11px;letter-spacing:.2em;}
 .m9-th-tag{font-size:15px;font-weight:900;letter-spacing:.14em;}
+/* which table is yours: a word in the header band, not a shade of the band */
+.m9-th-mine{font-size:9px;font-weight:900;letter-spacing:.18em;padding:2px 8px;border-radius:3px;
+  white-space:nowrap;background:rgba(var(--m9-ink-rgb),.8);color:var(--m9-paper);}
+.m9-th-foe{font-size:9px;font-weight:800;letter-spacing:.18em;padding:1px 7px;border-radius:3px;
+  white-space:nowrap;border:1px solid currentColor;opacity:.72;}
+.m9-table.m9-table-mine{border-color:rgba(var(--m9-paper-rgb),.42);
+  box-shadow:0 0 0 1px rgba(var(--m9-paper-rgb),.12);}
 .m9-th-count{font-size:11px;font-weight:800;letter-spacing:.06em;opacity:.75;
   border:1px solid currentColor;border-radius:999px;padding:1px 8px;}
 .m9-th-t{color:var(--m9-ink);background:linear-gradient(180deg,var(--m9-tLit),var(--m9-tAmber));}
@@ -1604,6 +1737,17 @@ const CSS = `
 .m9-dot{width:8px;height:8px;border-radius:50%;background:var(--m9-hpGreen);display:inline-block;
   box-shadow:0 0 7px rgba(var(--m9-hpGreen-rgb),.6);}
 .m9-dot.m9-off{background:transparent;border:1px solid var(--m9-concreteDark);box-shadow:none;}
+/* dead: the mark changes SHAPE (filled circle -> hollow rotated square) */
+.m9-dot.m9-down{width:7px;height:7px;background:transparent;border-radius:0;
+  border:1px solid var(--m9-danger);box-shadow:none;transform:rotate(45deg);}
+.m9-table .m9-row.m9-dead .m9-c-name{color:var(--m9-steel);text-decoration:line-through;}
+.m9-table .m9-row.m9-dead .m9-c-num{opacity:.62;}
+.m9-dead-tag{margin-left:6px;padding:0 5px;border-radius:3px;font-size:9px;font-weight:800;
+  letter-spacing:.12em;background:rgba(var(--m9-danger-rgb),.2);color:var(--m9-paper);
+  border:1px solid rgba(var(--m9-danger-rgb),.75);vertical-align:1px;text-decoration:none;}
+.m9-out-tag{margin-left:6px;padding:0 5px;border-radius:3px;font-size:9px;font-weight:800;
+  letter-spacing:.12em;background:var(--m9-metalDark);color:var(--m9-steel);
+  vertical-align:1px;text-decoration:none;}
 .m9-c-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;letter-spacing:.02em;}
 .m9-bot-tag{margin-left:6px;padding:0 5px;border-radius:3px;font-size:9px;font-weight:800;
   letter-spacing:.12em;background:var(--m9-metalDark);color:var(--m9-steel);vertical-align:1px;}

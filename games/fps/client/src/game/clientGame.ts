@@ -200,6 +200,7 @@ export class ClientGame {
     weapon: 'pistol', weaponName: '', mag: -1, reserve: -1,
     phase: 'warmup', phaseEndsInSec: 0, round: 0, scoreT: 0, scoreCT: 0,
     spreadPx: 0, scoped: false, spectating: null,
+    team: null, you: '', players: [],
   };
   private readonly syncOut: SyncEntry[] = []; // roster-merged remotes, reused array
   private readonly syncPool = new Map<PlayerId, SyncEntry>(); // per-id reused entries
@@ -401,7 +402,8 @@ export class ClientGame {
       // roster money only refreshes on joins/halftime — patch ours live
       const me = s.youId !== null ? s.roster.get(s.youId) : undefined;
       if (me !== undefined && s.latestYou !== null) me.money = s.latestYou.money;
-      this.menus.showScoreboard(roster, s.youId ?? '', s.scoreT, s.scoreCT);
+      // syncOut carries this round's alive/dead (RosterEntry does not)
+      this.menus.showScoreboard(roster, s.youId ?? '', s.scoreT, s.scoreCT, this.syncOut);
     } else {
       this.menus.hideScoreboard();
     }
@@ -1199,6 +1201,12 @@ export class ClientGame {
       (this.canvas.clientHeight / 2);
     h.scoped = scopedNow;
     h.spectating = spectName;
+    // team identity + roster rail: syncOut is already the roster-merged snapshot
+    // (name/team/alive per player), so the HUD reads it directly — no copy, no
+    // allocation. The HUD hashes it and rebuilds only when it actually changes.
+    h.team = s.team;
+    h.you = s.youId ?? '';
+    h.players = this.syncOut;
     this.hud.update(h);
 
     w.rig.render();

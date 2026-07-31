@@ -4,7 +4,7 @@
 // HIDDEN fuse burns, and every answer is revealed at once when it blows.
 //
 // Phase ladder:  lobby -(LOBBY_COUNTDOWN_MS)-> live -(hidden fuse)-> reveal
-//                -(REVEAL_MS)-> live ... -> matchEnd -(MATCH_END_MS)-> lobby
+//                -(revealMsFor)-> live ... -> matchEnd -(MATCH_END_MS)-> lobby
 //
 // ONE `setTimeout` slot at a time (countdown | fuse | grace | reveal | matchEnd)
 // and every deadline the client is allowed to know is an ABSOLUTE server
@@ -34,7 +34,7 @@ import {
   MAX_WORD_LEN,
   MIN_PLAYERS,
   MIN_WORD_LEN,
-  REVEAL_MS,
+  revealMsFor,
   STALE_MS,
   SUBMIT_COOLDOWN_MS,
   SUBMIT_GRACE_MS,
@@ -371,7 +371,8 @@ export class WordbombRoom implements GameRoomHandle {
     this.boomAt = Date.now();
     this.phase = 'reveal';
     this.roundStartedAt = 0; // 0 when not live (WbPublicState)
-    this.revealEndsAt = this.boomAt + SUBMIT_GRACE_MS + REVEAL_MS;
+    // scales with the table — see revealMsFor()
+    this.revealEndsAt = this.boomAt + SUBMIT_GRACE_MS + revealMsFor(this.playerCount());
     this.setTimer(() => this.resolve(), SUBMIT_GRACE_MS);
     this.broadcastPublic(); // no answers yet — this is the flash, not the reveal
   }

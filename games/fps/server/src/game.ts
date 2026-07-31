@@ -123,6 +123,14 @@ interface PlayerState {
   spawnProtectedUntil: number; // serverTime ms
   respawnAt: number | null; // warmup respawn timer, else null
   spectateTarget: PlayerId | null; // set while dead in a live round
+  // Mid-round joiner: seated on a team and on the scoreboard, but NOT in the
+  // world for the round already in progress — no body, no snapshot entry, no
+  // hitbox, no vote in elimination. Cleared (and the player spawned) by the
+  // next beginFreeze / fullReset / abortToWarmup. Never true in warmup/freeze.
+  pending: boolean;
+  joinSeq: number; // monotonic per room; higher = joined more recently
+  balancedRound: number; // round this player was last auto-balanced, -1 = never
+
   // preallocated wire objects, mutated in place per snapshot (no hot allocs)
   snap: PlayerSnap;
   you: YouSnap;
@@ -165,6 +173,7 @@ export class GameRoom {
   private readonly players = new Map<PlayerId, PlayerState>();
   private readonly bots = new Map<PlayerId, BotState>(); // insertion order = add order
   private botCounter = 0; // 'Bot N' counter — never reused, also seeds the brain
+  private joinCounter = 0; // monotonic join stamp; orders "most recently joined"
   private readonly lag = new LagBuffer(NET.lagBufferTicks);
   private readonly next: () => number;
 
@@ -299,22 +308,34 @@ export class GameRoom {
     return this.bots.size;
   }
 
-  /** Shared join flow for humans and bots: identical spawn/roster/broadcast. */
+  /**
+   * Shared join flow for humans and bots: identical spawn/roster/broadcast.
+   *
+   * Mid-round joins (CS rule): warmup and freeze drop you straight into the
+   * world — freeze IS the pre-round buy window, so joining then costs nobody
+   * anything. Joining once the round is under way (live/roundEnd/matchEnd)
+   * seats you on a team and puts you on the scoreboard, but leaves you OUT of
+   * the world until the next freeze: `pending`, alive false, no body, no
+   * snapshot entry, no hitbox. Before this, every join called placeAtSpawn
+   * unconditionally, which left drop-ins standing in the map as shootable
+   * targets who could not act until the round rolled over.
+   */
   private joinPlayer(id: PlayerId, name: string, bot: boolean): void {
     if (this.players.has(id) || this.players.size >= MAX_PLAYERS) return;
     const now = Date.now();
     const team = this.pickTeam();
+    const pending = this.roundInProgress();
 
     const snap: PlayerSnap = {
       id, x: 0, y: 0, z: 0, yaw: 0, pitch: 0,
-      hp: PLAYER.maxHp, alive: true, crouch: false, moving: false, weapon: 'pistol',
+      hp: pending ? 0 : PLAYER.maxHp, alive: !pending, crouch: false, moving: false, weapon: 'pistol',
     };
     const you: YouSnap = {
-      hp: PLAYER.maxHp, alive: true, money: ECONOMY.start,
+      hp: pending ? 0 : PLAYER.maxHp, alive: !pending, money: ECONOMY.start,
       weapons: ['pistol', 'knife'], weapon: 'pistol',
       mag: WEAPONS.pistol.mag, reserve: WEAPONS.pistol.reserve,
       canBuy: false, spectateTarget: null, respawnAt: null, vy: 0,
-      armor: 0, helmet: false,
+      armor: 0, helmet: false, joiningNextRound: pending,
     };
     const snapshotMsg: SnapshotMsg = {
       t: 'snapshot', tick: 0, serverTime: 0, ack: 0,
@@ -329,15 +350,17 @@ export class GameRoom {
       weapons: ['knife', 'pistol'], ownedOrdered: ['pistol', 'knife'], weapon: 'pistol',
       ammo: new Map<WeaponId, Ammo>([['pistol', defaultAmmo('pistol')]]),
       reloadUntil: 0, nextShotAt: 0, bloom: 0, shotSeq: 0,
-      hp: PLAYER.maxHp, alive: true,
+      hp: pending ? 0 : PLAYER.maxHp, alive: !pending,
       money: ECONOMY.start, kills: 0, deaths: 0, headshots: 0,
       armor: 0, hasKevlar: false, helmet: false,
       lastKillAt: 0, streak: 0,
       spawnProtectedUntil: 0, respawnAt: null, spectateTarget: null,
+      pending, joinSeq: ++this.joinCounter, balancedRound: -1,
       snap, you, snapshotMsg,
     };
     this.players.set(id, p);
-    this.placeAtSpawn(p, now); // drop-in: always spawn alive, with protection
+    // warmup/freeze: straight into the world. Round in progress: stay out of it.
+    if (!pending) this.placeAtSpawn(p, now);
     this.io.send(id, {
       t: 'joined', roomId: this.id, code: this.code, mapId: this.mapId,
       you: id, team, tick: this.tickN, serverTime: now,
@@ -345,6 +368,19 @@ export class GameRoom {
       roster: this.buildRoster(id),
     });
     this.broadcastExcept(id, { t: 'player_joined', entry: this.rosterEntry(p, null) });
+    // never leave a spectating joiner guessing why they cannot move
+    if (pending && !bot) {
+      this.sendEvent(id, {
+        t: 'notice',
+        code: 'joining_next_round',
+        text: 'Round in progress — you spawn at the start of the next round',
+      });
+    }
+  }
+
+  /** True while a round is under way: a fresh joiner must sit this one out. */
+  private roundInProgress(): boolean {
+    return this.phase !== 'warmup' && this.phase !== 'freeze';
   }
 
   private pickTeam(): Team {
@@ -383,6 +419,62 @@ export class GameRoom {
       p.team = team;
       this.broadcast({ t: 'team_changed', id, team });
     }
+  }
+
+  /**
+   * Freeze-time auto-balance. pickTeam()/teamSwitchAllowed() keep JOINS even,
+   * but a roster that goes lopsided through leavers is never repaired — a 5v2
+   * stays 5v2 forever. So at every freeze (and only at a freeze: yanking
+   * someone out of a live round is worse than the imbalance) move players off
+   * the bigger side until the sides differ by at most 1.
+   *
+   * Candidate order, best first:
+   *   1. bots before humans   — a bot does not care which side it plays
+   *   2. players NOT moved at the previous freeze — nobody gets ping-ponged
+   *   3. most recently joined — the newest player has the least invested
+   * Each move shrinks the gap by exactly 2, so from |diff| >= 2 it never
+   * overshoots into a worse imbalance; the loop is bounded by the roster size.
+   */
+  private autoBalanceTeams(): void {
+    for (let guard = this.players.size; guard > 0; guard--) {
+      const t = this.countConnected('T');
+      const ct = this.countConnected('CT');
+      if (Math.abs(t - ct) <= 1) return; // already balanced (or 1 apart: fine)
+      const from: Team = t > ct ? 'T' : 'CT';
+      const to: Team = from === 'T' ? 'CT' : 'T';
+      const mover = this.pickBalanceCandidate(from);
+      if (mover === null) return; // nothing movable: leave it rather than churn
+      mover.team = to;
+      mover.balancedRound = this.round;
+      this.teamSwitchQueue.delete(mover.id); // a pending request is now moot
+      this.broadcast({ t: 'team_changed', id: mover.id, team: to });
+      if (!mover.bot) {
+        this.sendEvent(mover.id, {
+          t: 'notice',
+          code: 'team_rebalanced',
+          text: `Teams were uneven — you were moved to ${to}`,
+        });
+      }
+    }
+  }
+
+  /** Least-disruptive player to move off `from` (see autoBalanceTeams). */
+  private pickBalanceCandidate(from: Team): PlayerState | null {
+    let best: PlayerState | null = null;
+    let bestRank = Infinity;
+    let bestSeq = -1;
+    for (const p of this.players.values()) {
+      if (p.team !== from) continue;
+      // moved at the previous freeze: only picked when nothing else is left
+      const movedLastRound = p.balancedRound === this.round - 1 ? 1 : 0;
+      const rank = (p.bot ? 0 : 2) + movedLastRound;
+      if (rank < bestRank || (rank === bestRank && p.joinSeq > bestSeq)) {
+        best = p;
+        bestRank = rank;
+        bestSeq = p.joinSeq;
+      }
+    }
+    return best;
   }
 
   private freshPlayerId(): PlayerId {
@@ -792,8 +884,12 @@ export class GameRoom {
     // advanceAfterRound, so guards below see post-swap teams); placeAtSpawn in
     // the loop then teleports switchers to their NEW team's spawns
     this.applyQueuedTeamSwitches();
+    // auto-balance AFTER queued switches (it must see the final rosters) and
+    // BEFORE placement (movers spawn on their new side, not their old one)
+    this.autoBalanceTeams();
     this.beginSpawnWave(); // one claim set per round: no two teammates share a point
     for (const p of this.players.values()) {
+      p.pending = false; // mid-round joiners join THIS round, from the freeze
       this.placeAtSpawn(p, now); // teleported, healed, protected
       this.refillWeapons(p); // every owned weapon refills mag+reserve for free
       p.streak = 0; // multikill streaks reset for everyone at every freeze
@@ -868,6 +964,8 @@ export class GameRoom {
     this.scoreCT = 0;
     this.beginSpawnWave();
     for (const p of this.players.values()) {
+      p.pending = false; // fresh match: nobody is sitting a round out any more
+      p.balancedRound = -1;
       p.money = ECONOMY.start;
       p.weapons = ['knife', 'pistol'];
       p.ammo.clear();
@@ -887,8 +985,11 @@ export class GameRoom {
     for (const p of this.players.values()) {
       p.money = ECONOMY.start;
       p.spectateTarget = null;
+      p.balancedRound = -1;
+      // the match is over: a mid-round joiner is a normal warmup player again
+      p.pending = false;
       if (!p.alive && p.respawnAt === null) {
-        // round-dead players rejoin via the warmup respawn timer
+        // round-dead players (and ex-pending joiners) rejoin via the warmup timer
         p.respawnAt = now + ROUNDS.warmupRespawnDelay * 1000;
       }
     }
@@ -1120,6 +1221,10 @@ export class GameRoom {
     const list = this.snapPlayers;
     list.length = 0;
     for (const p of this.players.values()) {
+      // mid-round joiners have no body this round: they are not in the world,
+      // so they are not in ANYONE's snapshot (their own included). The client's
+      // first-self-snapshot reset then rebases prediction when they do spawn.
+      if (p.pending) continue;
       const s = p.snap;
       s.x = p.body.x;
       s.y = p.body.y;
@@ -1151,6 +1256,7 @@ export class GameRoom {
       you.vy = p.body.vy;
       you.armor = p.armor;
       you.helmet = p.helmet;
+      you.joiningNextRound = p.pending;
       const m = p.snapshotMsg;
       m.tick = this.tickN;
       m.serverTime = now;
@@ -1306,6 +1412,7 @@ export class GameRoom {
       bot: p.bot,
       money: p.id === forId ? p.money : null,
       connected: true,
+      joiningNextRound: p.pending, // scoreboard tag: seated, spawns next round
     };
   }
 

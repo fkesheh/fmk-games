@@ -323,7 +323,7 @@ document and the TypeScript disagree, the TypeScript wins — report the drift.*
 | `ROUNDS_DEFAULT` / `_MIN` / `_MAX` | 10 / 5 / 20 | room setting |
 | `MIN_PLAYERS` / `MAX_PLAYERS` | 2 / 8 | |
 | `FUSE_MIN_MS` / `FUSE_MAX_MS` | 8000 / 15000 | actual fuse uniform in range, **never sent** |
-| `REVEAL_MS` | 6000 | |
+| `revealMsFor(n)` | 7000 + 600n, max 16000 | scales with the table: 8.2s at 2 players, 16s at 20 |
 | `LOBBY_COUNTDOWN_MS` | 3000 | |
 | `MATCH_END_MS` | 12000 | §1.3 |
 | `SUBMIT_GRACE_MS` | 250 | latency fairness |

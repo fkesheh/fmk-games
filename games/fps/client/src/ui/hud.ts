@@ -14,8 +14,20 @@
 // the vitals legible over snow and desert sand. No state is signalled by hue
 // alone: each pairs colour with an icon, a tag, motion or position.
 // ============================================================================
-import { PALETTE, WEAPONS } from '@fps/shared';
+import { MIN_PLAYERS_FOR_MATCH, PALETTE, WEAPONS } from '@fps/shared';
 import type { RoomPhase, Team, WeaponId } from '@fps/shared';
+
+/**
+ * One player as the team rail / warmup lobby needs them. Structurally a subset
+ * of C10's roster-merged sync entry, so the caller passes its existing reused
+ * array — no per-frame allocation on either side.
+ */
+export interface HudPlayer {
+  readonly id: string;
+  readonly name: string;
+  readonly team: Team;
+  readonly alive: boolean;
+}
 
 export interface HudState {
   hp: number; armor: number; alive: boolean; money: number; canBuy: boolean;
@@ -25,11 +37,24 @@ export interface HudState {
   /** Convention: a string starting with 'respawn' is a self respawn countdown
    *  (rendered as-is); anything else is a spectate target name ('SPECTATING X'). */
   spectating: string | null;
+  /** YOUR side. null before 'joined' lands — the team rail stays hidden then. */
+  team: Team | null;
+  /** YOUR player id, '' before 'joined' — marks your row in the rail/lobby. */
+  you: string;
+  /** Everyone in the latest snapshot, merged with the roster's name/team. */
+  players: readonly HudPlayer[];
 }
 
 const PHASE_LABEL: Record<RoomPhase, string> = {
   warmup: 'WARMUP', freeze: 'FREEZE', live: 'LIVE', roundEnd: 'ROUND END', matchEnd: 'MATCH END',
 };
+
+const TEAM_FULL: Record<Team, string> = { T: 'TERRORISTS', CT: 'COUNTER-TERRORISTS' };
+const OTHER: Record<Team, Team> = { T: 'CT', CT: 'T' };
+
+// The warmup->live threshold the server actually enforces (advancePhase reads
+// the same constant) — the lobby quotes it rather than restating a magic 2.
+const MATCH_MIN_PLAYERS = MIN_PLAYERS_FOR_MATCH;
 
 const LOW_HP = 30;          // below this: danger + pulse
 const KILLFEED_MAX = 5;     // rows, newest on top
@@ -184,6 +209,13 @@ function alpha(hex: string, a: number): string {
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const ICON_HP = 'M8.6 2h6.8v6.6H22v6.8h-6.6V22H8.6v-6.6H2V8.6h6.6z';
 const ICON_ARMOR = 'M12 2l8.2 3.1v6.2c0 4.9-3.3 8.9-8.2 10.7C7.1 20.2 3.8 16.2 3.8 11.3V5.1z';
+// Team marks. Two differences at once — orientation (down vs up) AND weight
+// (solid vs hollow) — because these get used at 11-15px, where a shield and a
+// wedge blur into the same blob. The hollow one is a single path whose inner
+// triangle is wound the other way, so plain nonzero fill knocks it out.
+const ICON_T = 'M2 3.4h20L12 22z';
+const ICON_CT = 'M12 2L22 21L2 21Z M12 7.6L6.4 18.2L17.6 18.2Z';
+const TEAM_ICON: Record<Team, string> = { T: ICON_T, CT: ICON_CT };
 
 function icon(path: string, cls: string): SVGSVGElement {
   const s = document.createElementNS(SVG_NS, 'svg');
@@ -363,14 +395,124 @@ const CSS = `
    scores stay identifiable without relying on their team colour. */
 .fh-top { position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
   display: flex; align-items: stretch; gap: 10px; }
-.fh-score { display: flex; align-items: center; justify-content: center;
-  min-width: 88px; font-size: 26px; font-weight: 800; letter-spacing: 1px;
-  padding: 5px 14px 8px;
+.fh-score { display: flex; align-items: center; justify-content: center; gap: 8px;
+  min-width: 128px; font-size: 26px; font-weight: 800; letter-spacing: 1px;
+  padding: 5px 13px 9px;
   text-shadow: 0 0 3px var(--fh-ink), 0 1px 2px var(--fh-ink); }
 .fh-score::after { content: ''; position: absolute; left: 0; right: 0; bottom: 0;
   height: 3px; background: var(--fh-teambar, transparent); }
 .fh-score-t { color: var(--fh-t-lit); --fh-teambar: var(--fh-t); }
-.fh-score-ct { color: var(--fh-ct-lit); --fh-teambar: var(--fh-ct); }
+.fh-score-ct { color: var(--fh-ct-lit); --fh-teambar: var(--fh-ct);
+  flex-direction: row-reverse; }
+/* YOUR side, spelled out four ways at once: the word YOU on a bright pill, the
+   word ENEMY on the other chip, a fatter fully-lit team bar, and a lit rim —
+   so the two chips are never symmetrical and none of it rides on hue. */
+.fh-side { display: flex; align-items: center; gap: 5px; font-size: 15px;
+  font-weight: 900; letter-spacing: 1.6px; }
+.fh-side-ico { display: block; width: 13px; height: 13px; flex: none;
+  filter: drop-shadow(0 1px 2px var(--fh-ink)); }
+.fh-score-num { font-size: 26px; font-weight: 800; letter-spacing: 1px; }
+.fh-pill { font-size: 9px; font-weight: 800; letter-spacing: 1.6px;
+  padding: 1px 5px; border-radius: 2px; line-height: 1.5; }
+.fh-pill-you { color: var(--fh-ink); background: var(--fh-text); text-shadow: none; }
+.fh-pill-foe { color: var(--fh-text-mute); border: 1px solid var(--fh-edge); }
+.fh-score.fh-mine { border-color: var(--fh-rim-hi);
+  box-shadow: 0 2px 10px var(--fh-shade), inset 0 1px 0 var(--fh-rim-hi),
+              inset 0 -2px 0 var(--fh-deep), 0 0 0 1px var(--fh-teambar); }
+.fh-score.fh-mine::after { height: 6px; }
+.fh-score:not(.fh-mine) .fh-score-num { opacity: 0.8; }
+
+/* ---- team rail (left): who is with you, and who is still standing ---------
+   Alive/dead is carried by the mark's SHAPE (filled square vs hollow rotated
+   outline), a strike-through name and the word DEAD — never by hue. */
+/* Wide enough to fit COUNTER-TERRORISTS un-truncated beside the mark, the tag
+   and the YOU pill — the header must never abbreviate the one thing the panel
+   exists to say. (Measured on the built client at 1600x900.) */
+.fh-team { position: absolute; left: 32px; top: 98px; width: 252px; }
+.fh-team-head { display: flex; align-items: center; gap: 6px; padding: 6px 9px; }
+.fh-team-head-t { color: var(--fh-ink);
+  background: linear-gradient(180deg, var(--fh-t-lit), var(--fh-t)); }
+.fh-team-head-ct { color: var(--fh-text);
+  background: linear-gradient(180deg, var(--fh-ct-lit), var(--fh-ct)); }
+.fh-team-ico { display: block; width: 15px; height: 15px; flex: none; }
+.fh-team-tag { font-size: 14px; font-weight: 900; letter-spacing: 2px;
+  text-shadow: none; }
+.fh-team-name { font-size: 9px; font-weight: 800; letter-spacing: 1.1px;
+  opacity: 0.86; text-shadow: none; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
+.fh-team-mine { margin-left: auto; font-size: 9px; font-weight: 800;
+  letter-spacing: 1.4px; padding: 1px 5px; border-radius: 2px;
+  background: var(--fh-ink); color: var(--fh-text); text-shadow: none; }
+.fh-team-sub { display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; padding: 4px 9px; font-size: 9px; font-weight: 800;
+  letter-spacing: 1.8px; color: var(--fh-text-mute); background: var(--fh-track); }
+.fh-team-alive { color: var(--fh-text); }
+.fh-team-list { padding: 3px 0 4px; }
+.fh-tm { display: flex; align-items: center; gap: 7px; padding: 2px 9px;
+  font-size: 12px; font-weight: 700; line-height: 1.55; }
+.fh-tm-mark { width: 9px; height: 9px; flex: none; border-radius: 2px;
+  background: var(--fh-hp); box-shadow: inset 0 -2px 0 var(--fh-deep); }
+.fh-tm-dead .fh-tm-mark { background: transparent; border-radius: 0;
+  border: 1px solid var(--fh-text-mute); box-shadow: none;
+  width: 7px; height: 7px; margin: 1px; transform: rotate(45deg); }
+.fh-tm-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--fh-text); }
+.fh-tm-dead .fh-tm-name { color: var(--fh-text-mute); text-decoration: line-through; }
+.fh-tm-state { margin-left: auto; font-size: 9px; font-weight: 800;
+  letter-spacing: 1.2px; color: var(--fh-text-mute); }
+.fh-tm-self { background: var(--fh-rim); box-shadow: inset 3px 0 0 var(--fh-text); }
+.fh-tm-self .fh-tm-name { font-weight: 800; }
+.fh-tm-tag { margin-left: 6px; font-size: 9px; font-weight: 800;
+  letter-spacing: 1.2px; padding: 0 4px; border-radius: 2px;
+  background: var(--fh-text); color: var(--fh-ink); text-shadow: none; }
+.fh-none { padding: 4px 10px; font-size: 10px; font-weight: 800;
+  letter-spacing: 1.8px; color: var(--fh-text-mute); }
+.fh-team-foe { display: flex; align-items: center; gap: 6px; padding: 4px 9px;
+  font-size: 9px; font-weight: 800; letter-spacing: 1.6px;
+  color: var(--fh-text-mute); background: var(--fh-track);
+  border-top: 1px solid var(--fh-edge); }
+.fh-foe-ico { display: block; width: 11px; height: 11px; flex: none; }
+.fh-foe-t { color: var(--fh-t-lit); }
+.fh-foe-ct { color: var(--fh-ct-lit); }
+.fh-foe-n { margin-left: auto; color: var(--fh-text); }
+
+/* ---- warmup lobby: both rosters side by side + the start condition --------
+   Pointer-events stay off (it is part of .fh-layer): warmup is playable, so
+   this is a readout, never a gate. It sits above the crosshair and clears it. */
+.fh-lobby { position: absolute; left: 50%; top: 104px; transform: translateX(-50%);
+  width: min(640px, 80vw); }
+.fh-lobby-head { display: flex; align-items: center; justify-content: space-between;
+  gap: 14px; padding: 9px 14px 8px; border-bottom: 1px solid var(--fh-edge); }
+.fh-lobby-eyebrow { font-size: 10px; font-weight: 800; letter-spacing: 3.4px;
+  color: var(--fh-text-mute); }
+.fh-lobby-you { display: flex; align-items: center; gap: 7px; font-size: 11px;
+  font-weight: 800; letter-spacing: 1.6px; color: var(--fh-text); }
+.fh-lobby-you-ico { display: block; width: 14px; height: 14px; flex: none; }
+.fh-lobby-you-t { color: var(--fh-t-lit); }
+.fh-lobby-you-ct { color: var(--fh-ct-lit); }
+.fh-lobby-cols { display: flex; }
+.fh-lobby-col { flex: 1 1 0; min-width: 0; }
+.fh-lobby-col + .fh-lobby-col { border-left: 1px solid var(--fh-edge); }
+.fh-lobby-ch { display: flex; align-items: center; gap: 6px; padding: 5px 12px; }
+.fh-lobby-ch-t { color: var(--fh-ink);
+  background: linear-gradient(180deg, var(--fh-t-lit), var(--fh-t)); }
+.fh-lobby-ch-ct { color: var(--fh-text);
+  background: linear-gradient(180deg, var(--fh-ct-lit), var(--fh-ct)); }
+.fh-lobby-ch-n { margin-left: auto; font-size: 10px; font-weight: 800;
+  letter-spacing: 1px; border: 1px solid currentColor; border-radius: 999px;
+  padding: 0 7px; text-shadow: none; white-space: nowrap; flex: none; }
+.fh-lobby-ch-mine { margin-left: auto; font-size: 9px; font-weight: 900;
+  letter-spacing: 1.4px; padding: 1px 6px; border-radius: 2px; flex: none;
+  white-space: nowrap; background: var(--fh-ink); color: var(--fh-text);
+  text-shadow: none; }
+.fh-lobby-ch-mine + .fh-lobby-ch-n { margin-left: 6px; }
+.fh-lobby-rows { padding: 6px 0 8px; min-height: 78px; }
+.fh-lobby-row { padding-left: 12px; padding-right: 12px; }
+.fh-lobby-rows .fh-none { padding-left: 12px; }
+.fh-lobby-foot { padding: 7px 14px 9px; text-align: center; font-size: 10px;
+  font-weight: 800; letter-spacing: 2.2px; color: var(--fh-text-mute);
+  background: var(--fh-track); border-top: 1px solid var(--fh-edge); }
+.fh-lobby-foot.fh-ready { color: var(--fh-text); }
 .fh-clock { text-align: center; padding: 5px 16px 7px; min-width: 112px; }
 .fh-phase { font-size: 11px; font-weight: 700; letter-spacing: 3px;
   color: var(--fh-text-mute); }
@@ -535,6 +677,16 @@ export class Hud {
   private readonly roundEl: HTMLDivElement;
   private readonly scoreTEl: HTMLDivElement;
   private readonly scoreCTEl: HTMLDivElement;
+  private readonly scoreTNum: HTMLSpanElement;
+  private readonly scoreCTNum: HTMLSpanElement;
+  private readonly scoreTPill: HTMLSpanElement;
+  private readonly scoreCTPill: HTMLSpanElement;
+
+  // team rail (in a round) + warmup lobby. Both are rebuilt wholesale, and only
+  // when the roster signature actually moves (a join, a leave, a death, a side
+  // swap) — never per frame. ~20 nodes, a handful of times per round.
+  private readonly teamEl: HTMLDivElement;
+  private readonly lobbyEl: HTMLDivElement;
 
   // hp / armor / ammo / money
   private readonly hpWrap: HTMLDivElement;
@@ -583,6 +735,9 @@ export class Hud {
   private cSpec: string | null = null;
   private cWeapon: WeaponId | '' = '';
   private cUrgent = false;
+  private cMine: Team | null | '' = '';   // which score chip carries the YOU pill
+  private cTeamSig = Number.NaN;          // roster+alive hash behind the rail/lobby
+  private cWarmup = false;                // lobby visible instead of the rail
 
   constructor(root: HTMLElement) {
     // PALETTE -> CSS custom properties on the root (single source of truth).
@@ -709,8 +864,16 @@ export class Hud {
     // off `fh-top` (not the clock) — the clock clips its own overflow, which
     // used to swallow the ROUND label whole.
     const top = div('fh-top');
+    // Each score chip is [side mark + tag] [number] [YOU|ENEMY pill]; the CT
+    // chip mirrors it with row-reverse so the pair still reads T-left/CT-right.
     this.scoreTEl = div('fh-score fh-panel fh-score-t');
+    this.scoreTNum = span('fh-score-num');
+    this.scoreTPill = span('fh-pill fh-pill-foe', 'ENEMY');
+    this.scoreTEl.append(side('T'), this.scoreTNum, this.scoreTPill);
     this.scoreCTEl = div('fh-score fh-panel fh-score-ct');
+    this.scoreCTNum = span('fh-score-num');
+    this.scoreCTPill = span('fh-pill fh-pill-foe', 'ENEMY');
+    this.scoreCTEl.append(side('CT'), this.scoreCTNum, this.scoreCTPill);
     this.clockEl = div('fh-clock fh-panel');
     this.phaseEl = div('fh-phase');
     this.timerEl = div('fh-timer');
@@ -784,6 +947,11 @@ export class Hud {
     // spectating label
     this.specEl = div('fh-spec fh-panel fh-hidden');
     this.layer.appendChild(this.specEl);
+
+    // team rail + warmup lobby (contents built on the first roster signature)
+    this.teamEl = div('fh-team fh-panel fh-hidden');
+    this.lobbyEl = div('fh-lobby fh-panel fh-hidden');
+    this.layer.append(this.teamEl, this.lobbyEl);
   }
 
   update(s: HudState): void {
@@ -887,12 +1055,23 @@ export class Hud {
     }
     if (s.scoreT !== this.cScoreT) {
       this.cScoreT = s.scoreT;
-      this.scoreTEl.textContent = `T ${s.scoreT}`;
+      this.scoreTNum.textContent = String(s.scoreT);
     }
     if (s.scoreCT !== this.cScoreCT) {
       this.cScoreCT = s.scoreCT;
-      this.scoreCTEl.textContent = `${s.scoreCT} CT`;
+      this.scoreCTNum.textContent = String(s.scoreCT);
     }
+    // which of the two score chips is MINE — the pair must never be symmetrical
+    if (s.team !== this.cMine) {
+      this.cMine = s.team;
+      const mineT = s.team === 'T';
+      const mineCT = s.team === 'CT';
+      this.scoreTEl.classList.toggle('fh-mine', mineT);
+      this.scoreCTEl.classList.toggle('fh-mine', mineCT);
+      pill(this.scoreTPill, s.team === null ? null : mineT);
+      pill(this.scoreCTPill, s.team === null ? null : mineCT);
+    }
+    this.syncTeams(s);
 
     // crosshair gap = spreadPx; hidden while scoped (scope overlay instead)
     const gap = Math.max(2, Math.round(s.spreadPx));
@@ -924,6 +1103,92 @@ export class Hud {
           : `SPECTATING ${s.spectating}`;
       }
     }
+  }
+
+  /**
+   * The team rail and the warmup lobby. Both are pure functions of (your side,
+   * your id, every player's name/side/alive) plus the warmup flag, so a 32-bit
+   * FNV-1a over exactly those inputs decides whether anything is rebuilt: the
+   * frames where nothing changed — the overwhelming majority — touch no DOM and
+   * allocate nothing. A rebuild costs ~20 nodes and happens on a join, a leave,
+   * a death, a respawn or a side swap.
+   */
+  private syncTeams(s: HudState): void {
+    const warmup = s.phase === 'warmup';
+    const sig = rosterSig(s);
+    if (sig === this.cTeamSig && warmup === this.cWarmup) return;
+    this.cTeamSig = sig;
+    this.cWarmup = warmup;
+    const team = s.team;
+    if (team === null) {
+      // not in a room yet: no side to claim, so claim nothing
+      this.teamEl.classList.add('fh-hidden');
+      this.lobbyEl.classList.add('fh-hidden');
+      return;
+    }
+    // exactly one of the two is up: the lobby IS the warmup form of the rail
+    this.teamEl.classList.toggle('fh-hidden', warmup);
+    this.lobbyEl.classList.toggle('fh-hidden', !warmup);
+    if (warmup) this.buildLobby(s, team);
+    else this.buildRail(s, team);
+  }
+
+  /** Left rail: your side named and marked, your squad, the enemy head-count. */
+  private buildRail(s: HudState, team: Team): void {
+    const foeTeam = OTHER[team];
+    const mine = pickTeam(s.players, team, s.you);
+    const foe = pickTeam(s.players, foeTeam, s.you);
+    const head = div(`fh-team-head fh-team-head-${lc(team)}`);
+    head.append(
+      icon(TEAM_ICON[team], 'fh-team-ico'),
+      span('fh-team-tag', team),
+      span('fh-team-name', TEAM_FULL[team]),
+      span('fh-team-mine', 'YOU'),
+    );
+    const sub = div('fh-team-sub');
+    sub.append(
+      span('', 'YOUR TEAM'),
+      span('fh-team-alive', `${aliveOf(mine)}/${mine.length} ALIVE`),
+    );
+    const list = div('fh-team-list');
+    if (mine.length === 0) list.appendChild(div('fh-none', 'WAITING FOR SPAWN'));
+    for (const p of mine) list.appendChild(memberRow(p, p.id === s.you, ''));
+    const foeRow = div('fh-team-foe');
+    foeRow.append(
+      icon(TEAM_ICON[foeTeam], `fh-foe-ico fh-foe-${lc(foeTeam)}`),
+      span(`fh-foe-${lc(foeTeam)}`, foeTeam),
+      span('', 'ENEMY'),
+      span('fh-foe-n', `${aliveOf(foe)}/${foe.length} ALIVE`),
+    );
+    this.teamEl.textContent = '';
+    this.teamEl.append(head, sub, list, foeRow);
+  }
+
+  /** Warmup pre-match view: both rosters side by side + the start condition. */
+  private buildLobby(s: HudState, team: Team): void {
+    const head = div('fh-lobby-head');
+    head.appendChild(span('fh-lobby-eyebrow', 'WARMUP LOBBY'));
+    const you = div('fh-lobby-you');
+    you.append(
+      span('', 'YOU ARE'),
+      icon(TEAM_ICON[team], `fh-lobby-you-ico fh-lobby-you-${lc(team)}`),
+      span(`fh-lobby-you-${lc(team)}`, team),
+      span('', TEAM_FULL[team]),
+    );
+    head.appendChild(you);
+
+    const cols = div('fh-lobby-cols');
+    cols.append(lobbyCol(s, 'T', team), lobbyCol(s, 'CT', team));
+
+    const total = s.players.length;
+    const ready = total >= MATCH_MIN_PLAYERS;
+    const foot = div(`fh-lobby-foot${ready ? ' fh-ready' : ''}`);
+    foot.textContent = ready
+      ? `${total} PLAYERS IN — THE MATCH STARTS ANY MOMENT`
+      : `WAITING FOR PLAYERS · ${total}/${MATCH_MIN_PLAYERS} — WARMUP IS LIVE, MOVE AND SHOOT`;
+
+    this.lobbyEl.textContent = '';
+    this.lobbyEl.append(head, cols, foot);
   }
 
   /**
@@ -1048,8 +1313,100 @@ export class Hud {
   }
 }
 
-function div(cls: string): HTMLDivElement {
+function div(cls: string, text?: string): HTMLDivElement {
   const d = document.createElement('div');
   d.className = cls;
+  if (text !== undefined) d.textContent = text;
   return d;
+}
+
+function span(cls: string, text?: string): HTMLSpanElement {
+  const s = document.createElement('span');
+  if (cls !== '') s.className = cls;
+  if (text !== undefined) s.textContent = text;
+  return s;
+}
+
+const lc = (team: Team): string => (team === 'T' ? 't' : 'ct');
+
+/** The [team mark + tag] cluster that leads a score chip. */
+function side(team: Team): HTMLDivElement {
+  const d = div('fh-side');
+  d.append(icon(TEAM_ICON[team], 'fh-side-ico'), span('', team));
+  return d;
+}
+
+/** Retag a score chip's pill: YOU (bright) / ENEMY (outline) / hidden (no room). */
+function pill(el: HTMLSpanElement, mine: boolean | null): void {
+  const you = mine === true;
+  el.textContent = you ? 'YOU' : 'ENEMY';
+  el.classList.toggle('fh-pill-you', you);
+  el.classList.toggle('fh-pill-foe', !you);
+  el.classList.toggle('fh-hidden', mine === null);
+}
+
+/** One roster line. Alive/dead is shape + strike-through + the word DEAD. */
+function memberRow(p: HudPlayer, isYou: boolean, extra: string): HTMLDivElement {
+  const row = div(`fh-tm${extra === '' ? '' : ` ${extra}`}${p.alive ? '' : ' fh-tm-dead'}${isYou ? ' fh-tm-self' : ''}`);
+  row.append(
+    div('fh-tm-mark'),
+    span('fh-tm-name', p.name),
+    span('fh-tm-state', p.alive ? '' : 'DEAD'),
+  );
+  if (isYou) row.appendChild(span('fh-tm-tag', 'YOU'));
+  return row;
+}
+
+/** One warmup-lobby column: side header, head-count, the players on it. */
+function lobbyCol(s: HudState, team: Team, yours: Team): HTMLDivElement {
+  const rows = pickTeam(s.players, team, s.you);
+  const col = div('fh-lobby-col');
+  const ch = div(`fh-lobby-ch fh-lobby-ch-${lc(team)}`);
+  ch.append(
+    icon(TEAM_ICON[team], 'fh-team-ico'),
+    span('fh-team-tag', team),
+    span('fh-team-name', TEAM_FULL[team]),
+  );
+  if (team === yours) ch.appendChild(span('fh-lobby-ch-mine', 'YOURS'));
+  ch.appendChild(span('fh-lobby-ch-n', `${rows.length}`));
+  const body = div('fh-lobby-rows');
+  if (rows.length === 0) body.appendChild(div('fh-none', 'NOBODY YET'));
+  for (const p of rows) body.appendChild(memberRow(p, p.id === s.you, 'fh-lobby-row'));
+  col.append(ch, body);
+  return col;
+}
+
+/** One side's players, YOU pinned to the top, everyone else by name. */
+function pickTeam(players: readonly HudPlayer[], team: Team, you: string): HudPlayer[] {
+  const out = players.filter((p) => p.team === team);
+  out.sort((a, b) => {
+    if (a.id === you) return -1;
+    if (b.id === you) return 1;
+    return a.name.localeCompare(b.name);
+  });
+  return out;
+}
+
+function aliveOf(list: readonly HudPlayer[]): number {
+  let n = 0;
+  for (const p of list) if (p.alive) n++;
+  return n;
+}
+
+/**
+ * FNV-1a over EXACTLY what the rail and lobby render (your side + your id, then
+ * every player's id, name, side and alive flag, in order). Runs every frame, so
+ * it reads chars instead of building a signature string: no allocation.
+ */
+function rosterSig(s: HudState): number {
+  let h = 0x811c9dc5;
+  h = Math.imul(h ^ (s.team === null ? 0 : s.team === 'T' ? 1 : 2), 16777619);
+  for (let i = 0; i < s.you.length; i++) h = Math.imul(h ^ s.you.charCodeAt(i), 16777619);
+  for (const p of s.players) {
+    for (let i = 0; i < p.id.length; i++) h = Math.imul(h ^ p.id.charCodeAt(i), 16777619);
+    for (let i = 0; i < p.name.length; i++) h = Math.imul(h ^ p.name.charCodeAt(i), 16777619);
+    h = Math.imul(h ^ (p.alive ? 1 : 2), 16777619);
+    h = Math.imul(h ^ (p.team === 'T' ? 3 : 4), 16777619);
+  }
+  return h | 0;
 }

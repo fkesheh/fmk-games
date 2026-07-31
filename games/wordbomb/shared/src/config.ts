@@ -20,8 +20,28 @@ export const MAX_PLAYERS = 20;
  */
 export const FUSE_MIN_MS = 8_000;
 export const FUSE_MAX_MS = 15_000;
-/** Reading the reveal — who collided with whom — is part of the game. */
-export const REVEAL_MS = 6_000;
+/**
+ * Reading the reveal — who collided with whom, and what it cost — IS part of
+ * the game, not a pause between rounds. It has to be read, not glimpsed.
+ *
+ * It therefore SCALES WITH THE TABLE. A flat 6s was too short at 2 players (the
+ * reveal is the payoff and it was gone before you had enjoyed it) and far too
+ * short at 20, where it worked out at 300ms per answer — less time than it takes
+ * to find your own row, let alone see who collided with you.
+ *
+ *    2 players ->  8.2s      8 players -> 11.8s
+ *    4 players ->  9.4s     20 players -> 16.0s (clamped)
+ *
+ * The clamp exists so a full table does not stall between rounds.
+ */
+export const REVEAL_BASE_MS = 7_000;
+export const REVEAL_PER_PLAYER_MS = 600;
+export const REVEAL_MAX_MS = 16_000;
+
+export function revealMsFor(playerCount: number): number {
+  const n = Number.isFinite(playerCount) ? Math.max(0, Math.floor(playerCount)) : 0;
+  return Math.min(REVEAL_MAX_MS, REVEAL_BASE_MS + REVEAL_PER_PLAYER_MS * n);
+}
 /** Grace after MIN_PLAYERS is reached, so round 1 is not a cold start. */
 export const LOBBY_COUNTDOWN_MS = 3_000;
 /** How long final standings hold before the room resets to lobby. */
