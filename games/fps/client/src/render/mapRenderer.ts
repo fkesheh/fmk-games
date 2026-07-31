@@ -91,6 +91,7 @@ import {
 import { mix } from '@platform/shared';
 import {
   CONTACT_Y,
+  COPLANAR_EPS,
   articulate,
   at,
   bake,
@@ -392,14 +393,34 @@ function buildRichBox(g: THREE.Group, b: BoxDef): void {
   // contact band at the floor line: L2a for posts too narrow to articulate.
   // `contact === null` means the material IS the bottom of its ladder, and
   // `DARK_MAT` self-maps there — a fallback band would be zero contrast.
+  // The skirt is outset on both lateral axes already, but its UNDERSIDE used to
+  // sit exactly on the body's underside — two down-facing quads at one depth,
+  // which the sun's shadow pass (shadowSide = BackSide) renders and fights over.
+  // Grow it COPLANAR_EPS down into the ground; the top edge does not move.
   if (contact !== null && b.h >= 1.8 && Math.abs(bottom) <= 0.06 && (b.w >= 0.8 || b.d >= 0.8)) {
-    g.add(at(box(b.w + SKIRT_OUT * 2, SKIRT_H, b.d + SKIRT_OUT * 2, contact), b.x, bottom + SKIRT_H / 2, b.z));
+    const skirtH = SKIRT_H + COPLANAR_EPS;
+    g.add(
+      at(
+        box(b.w + SKIRT_OUT * 2, skirtH, b.d + SKIRT_OUT * 2, contact),
+        b.x,
+        bottom + SKIRT_H - skirtH / 2,
+        b.z,
+      ),
+    );
   }
   // cornice band just under the cap — the L3 lift, read at distance. Same null
   // rule: no trim tier, no band (a `…Dark` band here would read as a stain).
+  // Grown COPLANAR_EPS UP into the cap so its top face is not flush with the
+  // body's; the visible line under it is unmoved.
   if (trim !== null && b.h >= 2.2) {
+    const bandH = TRIM_H + COPLANAR_EPS;
     g.add(
-      at(box(b.w + TRIM_OUT * 2, TRIM_H, b.d + TRIM_OUT * 2, trim), b.x, top - capH - TRIM_H / 2, b.z),
+      at(
+        box(b.w + TRIM_OUT * 2, bandH, b.d + TRIM_OUT * 2, trim),
+        b.x,
+        top - capH - TRIM_H + bandH / 2,
+        b.z,
+      ),
     );
   }
 }
@@ -440,16 +461,22 @@ function addWallDetail(
   const beadH = plinthH > 0 && trim !== null ? BEAD_H : 0;
   const soffitH = corniceH > 0 && contact !== null ? SOFFIT_H : 0;
 
+  // Same rule as `articulate()`'s own bands: carry them COPLANAR_EPS PAST the
+  // wall's two end faces along the long axis. Flush end caps put a second quad
+  // on the wall's end plane at the same depth, which is what made wall bases
+  // and rooflines flicker as the camera moved.
+  const bandSpan = span + COPLANAR_EPS * 2;
+
   if (beadH > 0 && trim !== null) {
     const bead = alongX
-      ? box(b.w, beadH, b.d + BEAD_OUT * 2, trim)
-      : box(b.w + BEAD_OUT * 2, beadH, b.d, trim);
+      ? box(bandSpan, beadH, b.d + BEAD_OUT * 2, trim)
+      : box(b.w + BEAD_OUT * 2, beadH, bandSpan, trim);
     g.add(at(bead, b.x, bottom + plinthH + beadH / 2, b.z));
   }
   if (soffitH > 0 && contact !== null) {
     const soffit = alongX
-      ? box(b.w, soffitH, b.d + SOFFIT_OUT * 2, contact)
-      : box(b.w + SOFFIT_OUT * 2, soffitH, b.d, contact);
+      ? box(bandSpan, soffitH, b.d + SOFFIT_OUT * 2, contact)
+      : box(b.w + SOFFIT_OUT * 2, soffitH, bandSpan, contact);
     g.add(at(soffit, b.x, b.y + b.h / 2 - corniceH - soffitH / 2, b.z));
   }
 
@@ -550,10 +577,28 @@ function addReveal(
   const depth = thick + OPEN_PROUD * 2;
   const mid = (g0 + g1) / 2;
 
-  for (const edge of [g0 - OPEN_JAMB_W / 2, g1 + OPEN_JAMB_W / 2]) {
+  // A jamb used to finish EXACTLY on the flanking wall's end plane, and to run
+  // from exactly the wall's underside to exactly its top — three coplanar,
+  // same-facing quad pairs per jamb, trim tier against body tier, on the
+  // most-looked-at surface in the map (see COPLANAR_EPS). So:
+  //  - pull each jamb COPLANAR_EPS back off the reveal, i.e. BACK INTO ITS OWN
+  //    WALL, so it still never intrudes into the gap and nothing about movement
+  //    or collision changes;
+  //  - run it COPLANAR_EPS below the wall's underside, into the ground;
+  //  - and stop it COPLANAR_EPS BELOW an unlintelled wall's top rather than on
+  //    it, so a jamb never lands on the wall top (or on the cornice that now
+  //    finishes just above it) and never breaks a roofline.
+  const jambLo = -COPLANAR_EPS;
+  const jambTop = Math.min(jambH, wallH - COPLANAR_EPS);
+  const jambBoxH = jambTop - jambLo;
+  for (const edge of [g0 - OPEN_JAMB_W / 2 - COPLANAR_EPS, g1 + OPEN_JAMB_W / 2 + COPLANAR_EPS]) {
     const jamb =
-      axis === 'x' ? box(OPEN_JAMB_W, jambH, depth, hex) : box(depth, jambH, OPEN_JAMB_W, hex);
-    g.add(at(jamb, axis === 'x' ? edge : cross, jambH / 2, axis === 'x' ? cross : edge));
+      axis === 'x'
+        ? box(OPEN_JAMB_W, jambBoxH, depth, hex)
+        : box(depth, jambBoxH, OPEN_JAMB_W, hex);
+    g.add(
+      at(jamb, axis === 'x' ? edge : cross, (jambLo + jambTop) / 2, axis === 'x' ? cross : edge),
+    );
   }
   // A gap that runs the full height of tall walls with nothing spanning it is a
   // LANE, not a doorway: capping it with a beam would invent architecture that
@@ -563,7 +608,7 @@ function addReveal(
     axis === 'x'
       ? box(gap + OPEN_JAMB_W * 2, OPEN_HEAD_H, depth, hex)
       : box(depth, OPEN_HEAD_H, gap + OPEN_JAMB_W * 2, hex);
-  g.add(at(head, axis === 'x' ? mid : cross, jambH - OPEN_HEAD_H / 2, axis === 'x' ? cross : mid));
+  g.add(at(head, axis === 'x' ? mid : cross, jambTop - OPEN_HEAD_H / 2, axis === 'x' ? cross : mid));
 }
 
 // ---- floor life (patchwork tint zones + wear lanes; visual overlays only) -----

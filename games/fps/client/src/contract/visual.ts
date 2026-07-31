@@ -108,6 +108,40 @@ export interface ArticulateOpts {
 const MIN_ARTICULATE_H = 0.9;
 
 /**
+ * Coplanar-face guard, in metres. Trim is a SIBLING of the full wall box, so any
+ * trim face that lands on exactly the same plane as a wall face, facing the same
+ * way, produces two fragments with the same depth. `bake()` merges by material,
+ * so the two ended up in DIFFERENT meshes with different triangulations, and
+ * which one survives the depth test is then decided by the last bits of the
+ * interpolated depth — it changes with the camera. That is the flicker on wall
+ * bases: the plinth's end caps and underside used to be exactly flush with the
+ * wall's.
+ *
+ * The rule this file and its one caller (`mapRenderer.ts`) now hold to: NO TRIM
+ * FACE MAY SHARE A PLANE WITH A WALL FACE. Wherever a band used to finish
+ * exactly flush it is carried `COPLANAR_EPS` PAST instead — past the two end
+ * faces along the long axis, past the underside, past the top face. Past rather
+ * than short of, because a band cut short vanishes behind the wall's own face,
+ * and on a box whose two horizontal extents are close (a 9 x 12 m building) the
+ * "end" faces are full facades: cutting there strips the whole stack off half
+ * the building. Every visible edge LINE — plinth top, cornice underside — is
+ * left exactly where it was; only the buried edge moves.
+ *
+ * Why 6 mm:
+ *  - Depth resolution of a 24-bit buffer at this camera's near/far (0.1 / 500,
+ *    see scene.ts) is z^2 * (1/near - 1/far) / 2^24 ~= z^2 * 6e-7 m: 0.06 mm at
+ *    10 m, 0.5 mm at 30 m, 2 mm at 60 m, 6 mm at 100 m. 6 mm therefore resolves
+ *    to at least one depth step everywhere inside ~100 m, and past that a 0.32 m
+ *    plinth is under 2 px tall and inside the fog.
+ *  - It is a third of the SMALLEST proud-of-face offset in the stack (0.018) and
+ *    an eighth of the shortest band (0.05), so it can never reorder the stack.
+ *  - It is under the 10 mm gap between a wall's underside (y=0) and the ground
+ *    slab's top face (y=-0.01), so a downward-grown plinth cannot land on the
+ *    ground plane and trade one coplanar pair for another.
+ */
+export const COPLANAR_EPS = 0.006;
+
+/**
  * Build the trim set for a wall of full extents `w x h x d`, centred on the
  * origin — add it as a SIBLING of the wall box at the same position.
  *
@@ -153,25 +187,56 @@ export function articulate(
     corniceH *= k;
   }
 
+  // Long-axis extent of every horizontal band: a hair PAST the wall's two end
+  // faces, so no band end cap is ever coplanar with them (see COPLANAR_EPS).
+  //
+  // Past, not short of. Shortening also kills the coplanarity, but it hides the
+  // whole band behind the wall's own end face — and for a box whose two
+  // horizontal extents are close (a 9 x 12 m building), the "end" faces are
+  // full facades. Cutting the band there strips plinth, cornice and bead off
+  // half the building and hands back exactly the flat blockout quad §3b exists
+  // to kill. Standing 6 mm proud instead keeps the band reading all the way
+  // round, and it cannot break the "never intersect an abutting wall" rule the
+  // 0.04-0.06 m proud offsets are held to: 6 mm past a wall's end face is 6 mm
+  // INSIDE whatever that end abuts, i.e. behind that neighbour's own surface.
+  const bandSpan = span + COPLANAR_EPS * 2;
+
   // plinth — the contact band. This is what stops the wall from floating.
+  // Grown COPLANAR_EPS DOWNWARD (into the ground / whatever it stands on) so its
+  // underside is not flush with the wall's; its top edge — the line that reads —
+  // is unmoved.
   if (plinthH > 0 && colors.contact) {
+    const ph = plinthH + COPLANAR_EPS;
     const pl = alongX
-      ? box(w, plinthH, d + pp * 2, colors.contact)
-      : box(w + pp * 2, plinthH, d, colors.contact);
-    g.add(at(pl, 0, -h / 2 + plinthH / 2, 0));
+      ? box(bandSpan, ph, d + pp * 2, colors.contact)
+      : box(w + pp * 2, ph, bandSpan, colors.contact);
+    g.add(at(pl, 0, -h / 2 + plinthH - ph / 2, 0));
   }
-  // cornice — catches the sun, reads the wall's top edge at distance.
+  // cornice — catches the sun, reads the wall's top edge at distance. Grown
+  // COPLANAR_EPS UPWARD so its top face is not flush with the wall's top face
+  // (which is what fought when you looked down on a roofline); its underside —
+  // the line the soffit shadows — is unmoved.
   if (corniceH > 0 && colors.trim) {
+    const ch = corniceH + COPLANAR_EPS;
     const cr = alongX
-      ? box(w, corniceH, d + cp * 2, colors.trim)
-      : box(w + cp * 2, corniceH, d, colors.trim);
-    g.add(at(cr, 0, h / 2 - corniceH / 2, 0));
+      ? box(bandSpan, ch, d + cp * 2, colors.trim)
+      : box(w + cp * 2, ch, bandSpan, colors.trim);
+    g.add(at(cr, 0, h / 2 - corniceH + ch / 2, 0));
   }
   // pilasters — vertical ribs that break the span and self-shadow. Alternating
   // tiers so a long wall reads as rhythm rather than stripes.
   const bodyH = h - plinthH - corniceH;
   if (every > 0 && span > every && bodyH > 0.2) {
-    const yC = -h / 2 + plinthH + bodyH / 2;
+    // A rib runs the full body height, but its ends must not land on the plinth
+    // top / cornice underside — the caller's bead and soffit sit on exactly
+    // those two lines. Bury it COPLANAR_EPS into the plinth below (or into the
+    // ground, when the ladder gave this wall no plinth) and COPLANAR_EPS into
+    // the cornice above; with no cornice, cut it that much SHORT instead, so a
+    // rib never breaks a roofline.
+    const ribLo = -h / 2 + plinthH - COPLANAR_EPS;
+    const ribHi = h / 2 - corniceH + (corniceH > 0 ? COPLANAR_EPS : -COPLANAR_EPS);
+    const ribH = ribHi - ribLo;
+    const yC = (ribLo + ribHi) / 2;
     // round, not floor: flooring drove a 6m wall to a single rib at 3m spacing,
     // well under the 4-6m band §3b specifies. n === 0 means "no rib fits".
     const n = Math.max(0, Math.round(span / every) - 1);
@@ -179,8 +244,8 @@ export function articulate(
       const t = (i / (n + 1) - 0.5) * span;
       const hex = i % 2 === 0 ? darkHex : (colors.trim ?? darkHex);
       const pil = alongX
-        ? box(0.3, bodyH, thick + lp * 2, hex)
-        : box(thick + lp * 2, bodyH, 0.3, hex);
+        ? box(0.3, ribH, thick + lp * 2, hex)
+        : box(thick + lp * 2, ribH, 0.3, hex);
       g.add(at(pil, alongX ? t : 0, yC, alongX ? 0 : t));
     }
   }
@@ -189,8 +254,8 @@ export function articulate(
   if (midRail && colors.trim && bodyH > 0.4) {
     const rp = lp * 1.4;
     const rl = alongX
-      ? box(w, 0.12, d + rp * 2, colors.trim)
-      : box(w + rp * 2, 0.12, d, colors.trim);
+      ? box(bandSpan, 0.12, d + rp * 2, colors.trim)
+      : box(w + rp * 2, 0.12, bandSpan, colors.trim);
     g.add(at(rl, 0, -h / 2 + plinthH + bodyH * 0.55, 0));
   }
   return g;
