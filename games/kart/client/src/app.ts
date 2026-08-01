@@ -8,13 +8,18 @@
 // (skid marks / smoke / dust / sparks / nitro trail / speed lines) lives in
 // ./fx.js — pooled and zero-alloc; this file only feeds it sim facts.
 //
-// Net model: the kart is simulated LOCALLY — drive.ts wraps shared stepKart,
-// owns the keyboard (WASD/arrows/Space, R = respawn) and paces the 15Hz
-// kart_state packets; app.ts wires packet() -> ws. Snapshots carry the
-// server's race truth (phase/places/laps). Own position is corrected GENTLY —
-// only past 5m divergence, and then only a fraction of the gap per snapshot.
-// Remote karts render ~120ms behind serverTime from per-player interpolation
-// buffers. Debug surface window.__kart per docs/KART.md.
+// Net model: SERVER-AUTHORITATIVE. The wire carries INPUTS, never coordinates
+// — drive.ts owns the keyboard (WASD/arrows/Space, R = respawn) and emits one
+// kart_input per SIM_DT (SIM_HZ = 30); app.ts flushes them to the socket. The
+// server integrates the shared sim over those inputs and owns every position,
+// including kart-vs-kart contact (which arrives back as a 'bump' race event
+// both drivers see identically). The client PREDICTS locally — each input is
+// applied the instant it is produced, so steering never waits for the server —
+// and each snapshot at SNAPSHOT_HZ carries you.sim + you.lastProcessedSeq, on
+// top of which drive.reconcile() replays every unacknowledged input; a
+// converged client corrects by 0m. Remote karts render ~120ms behind
+// serverTime from per-player interpolation buffers. Debug surface window.__kart
+// per docs/KART.md.
 // ============================================================================
 import {
   GATES,
@@ -23,6 +28,8 @@ import {
   LAPS_TO_WIN,
   MIN_PLAYERS,
   NITRO_CHARGES,
+  SIM_HZ,
+  SNAPSHOT_HZ,
   TOP_SPEED,
   buildTrack,
   engineRevs,
@@ -37,6 +44,7 @@ import type {
   KartPlayerInfo,
   KartPlayerSnap,
   KartS2C,
+  KartSim,
   KartState,
   KartYou,
   RaceEvent,
@@ -109,11 +117,41 @@ function parsePlayerInfo(v: unknown): KartPlayerInfo | null {
   return { id: v.id, name: v.name, slot: v.slot, color: v.color };
 }
 
+/** The server's authoritative own-kart state — every field or nothing (a
+ *  half-parsed KartSim would re-base the predictor onto garbage). Rebuilt as a
+ *  plain object so nothing downstream retains the decoded wire reference. */
+function parseSim(v: unknown): KartSim | null {
+  if (!isObj(v)) return null;
+  if (!num(v.x) || !num(v.y) || !num(v.z) || !num(v.yaw)) return null;
+  if (!num(v.vx) || !num(v.vz) || !num(v.gear) || !num(v.shiftLeft)) return null;
+  if (!bool(v.drifting) || !num(v.nitroLeft) || !num(v.expectedGate)) return null;
+  if (!num(v.anchorX) || !num(v.anchorZ) || !num(v.anchorYaw)) return null;
+  return {
+    x: v.x,
+    y: v.y,
+    z: v.z,
+    yaw: v.yaw,
+    vx: v.vx,
+    vz: v.vz,
+    gear: v.gear,
+    shiftLeft: v.shiftLeft,
+    drifting: v.drifting,
+    nitroLeft: v.nitroLeft,
+    expectedGate: v.expectedGate,
+    anchorX: v.anchorX,
+    anchorZ: v.anchorZ,
+    anchorYaw: v.anchorYaw,
+  };
+}
+
 function parseYou(v: unknown): KartYou | null {
   if (!isObj(v)) return null;
   if (!num(v.lap) || !num(v.nextGate) || !num(v.progress) || !num(v.place)) return null;
   if (!bool(v.finished) || !num(v.finishMs) || !num(v.bestLapMs)) return null;
   if (!num(v.nitroLeft) || !num(v.gapAheadMs)) return null;
+  if (!num(v.lastProcessedSeq)) return null; // the ack the replay drops from
+  const sim = parseSim(v.sim);
+  if (sim === null) return null;
   return {
     lap: v.lap,
     nextGate: v.nextGate,
@@ -124,6 +162,8 @@ function parseYou(v: unknown): KartYou | null {
     bestLapMs: v.bestLapMs,
     nitroLeft: v.nitroLeft,
     gapAheadMs: v.gapAheadMs,
+    lastProcessedSeq: v.lastProcessedSeq,
+    sim,
   };
 }
 
@@ -167,6 +207,11 @@ function parseRaceEvent(v: unknown): RaceEvent | null {
     case 'nitro':
       return str(v.playerId) && num(v.left)
         ? { kind: 'nitro', playerId: v.playerId, left: v.left }
+        : null;
+    case 'bump':
+      // server-resolved contact: BOTH drivers get this same event for the tick
+      return str(v.a) && str(v.b) && num(v.impulse)
+        ? { kind: 'bump', a: v.a, b: v.b, impulse: v.impulse }
         : null;
     case 'finish':
       return str(v.playerId) && num(v.place)
@@ -233,7 +278,7 @@ function parseS2C(raw: unknown): S2C | null {
       if (you === null || !Array.isArray(raw.players)) return null;
       const players: KartPlayerSnap[] = [];
       for (const p of raw.players) {
-        // a malformed entry drops alone at 15Hz — never the whole frame
+        // a malformed entry drops alone at SNAPSHOT_HZ — never the whole frame
         const snap = parsePlayerSnap(p);
         if (snap !== null) players.push(snap);
       }
@@ -303,7 +348,18 @@ interface KartTelemetry {
   phase: KartPhase | 'menu';
   playerId: string | null;
   slot: number;
-  seq: number; // kart_state frames sent (drive.ts owns the wire seq)
+  seq: number; // kart_input frames sent (drive.ts owns the wire seq) — now SIM_HZ paced
+  seqHz: number; // SIM_HZ: the input/sim rate, so a harness can calibrate its clock
+  /** Reconciliation health — the netcode's own report card. */
+  net: {
+    ack: number; // you.lastProcessedSeq: the last input the server consumed
+    pending: number; // unacknowledged inputs still queued for replay
+    lastCorrectionM: number; // metres the last reconcile moved the predicted kart
+    maxCorrectionM: number; // biggest this race (reset on each race reset)
+    corrections: number; // reconciles that moved us > 0.05m this race
+  };
+  /** Most recent server-resolved contact seen (atMs = serverNow when received). */
+  lastBump: { a: string; b: string; impulse: number; atMs: number } | null;
   offsetMs: number; // serverNow = Date.now() + offsetMs
   rttMs: number;
   input: KartInput; // the latched ext input (keyboard is drive-internal)
@@ -351,12 +407,21 @@ const ROOMS_EVERY_MS = 3000; // menu room-list poll
 const WATCHDOG_MS = 200; // background-tab keepalive cadence (rAF pauses there)
 const WATCHDOG_DT = 0.2; // s of sim per watchdog step (slow-mo, still < INPUT_STALE_MS)
 const FRAME_STALE_MS = 250; // rAF silence that wakes the watchdog
-const INTERP_DELAY_MS = 120; // remote karts render this far behind serverTime
+// Remote karts render this far behind serverTime. Expressed as ~1.8 SNAPSHOT_HZ
+// intervals rather than a constant, because that ratio — not the millisecond
+// value — is what buys jitter tolerance: a snapshot may arrive most of an
+// interval late and still be interpolated rather than extrapolated. It was a
+// hardcoded 120ms, which was exactly 1.8 intervals at the old SNAPSHOT_HZ 15;
+// keeping the RATIO at the new 20Hz makes it 90ms, so the faster snapshot rate
+// is spent on latency (~0.6m less positional lag at racing speed) instead of on
+// buffer nobody asked for. Two clients disagree about a kart's position by
+// roughly (this delay x its speed), so it is the single biggest term in that
+// number once the two peers agree on the physics.
+const INTERP_DELAY_MS = Math.round(1800 / SNAPSHOT_HZ);
 const BUFFER_KEEP_MS = 1000; // per-remote snapshot history
 const EXTRAPOLATE_MAX_MS = 250; // past-newest velocity extrapolation cap
 const TELEPORT_SQ = 10 * 10; // m² — bigger jumps snap, never lerp (matches fps interp)
-const CORRECT_DIST_SQ = 5 * 5; // m² — server/own divergence that triggers a correction
-const CORRECT_BLEND = 0.35; // fraction of the gap closed per correcting snapshot (GENTLE)
+const CORRECTION_EPS_M = 0.05; // reconciles that move us less than this are "converged"
 const OFFSET_EMA = 0.2; // server-clock offset smoothing per pong (spike must not lurch remotes)
 const MAX_FRAME_DT = 0.05; // s — tab-switch clamp for the local sim
 const GO_FLASH_MS = 900; // how long the big GO! stays up
@@ -555,7 +620,12 @@ export class KartApp {
   private offset = 0; // serverNow = Date.now() + offset (rtt/2 estimate, like bank)
   private offsetSet = false; // first pong sets the offset directly; later pongs EMA it
   private rttMs = 0;
-  private packetsSent = 0; // kart_state frames actually sent (drive.ts owns the seq)
+  private packetsSent = 0; // kart_input frames actually sent (drive.ts owns the seq)
+  // ---- reconciliation health (telemetry; the two-client verification reads these) ----
+  private ackSeq = 0; // you.lastProcessedSeq — the last input the server consumed
+  private maxCorrectionM = 0; // biggest reconcile this race (reset per race)
+  private corrections = 0; // reconciles that moved us > CORRECTION_EPS_M (per race)
+  private lastBump: { a: string; b: string; impulse: number; atMs: number } | null = null;
 
   // ---- local kart + remotes -------------------------------------------------------
   private readonly track: TrackDef = buildTrack();
@@ -1180,7 +1250,6 @@ export class KartApp {
     this.fx.clear();
     this.debugInput = null;
     this.drive.setInput({ ...ZERO_INPUT }); // clear a latched debug driver
-    this.drive.setOthers([]);
     this.applyFreeze(); // back at the menu the sim is frozen ('lobby' !== 'racing')
     this.countdownShown = 0;
     this.goActive = false;
@@ -1193,7 +1262,9 @@ export class KartApp {
   /** Fresh race: own kart back on its grid slot, per-race locals cleared. */
   private resetRaceLocal(): void {
     const g = gridSlot(this.track, this.slot);
-    this.drive.reset(g.x, g.z, g.yaw);
+    this.drive.reset(g.x, g.z, g.yaw); // also drops the predictor's replay queue
+    this.maxCorrectionM = 0; // netcode health is measured per race
+    this.corrections = 0;
     this.buffers.clear(); // remotes re-appear at their slots via fresh snapshots
     this.visuals.clear();
     this.bestLaps.clear();
@@ -1223,8 +1294,17 @@ export class KartApp {
     this.canStart = snap.canStart;
     if (snap.phase !== prevPhase) this.onPhaseChange(prevPhase, snap.phase);
 
+    // AUTHORITATIVE OWN STATE — exactly once per snapshot, from the `you` block
+    // (the roster entry carries only p/yaw/v, which cannot restart a replay).
+    // After onPhaseChange so a grid reset is followed by the server's truth.
+    this.ackSeq = snap.you.lastProcessedSeq;
+    const corr = this.drive.reconcile(snap.you.sim, snap.you.lastProcessedSeq);
+    if (corr > CORRECTION_EPS_M) {
+      this.corrections += 1;
+      if (corr > this.maxCorrectionM) this.maxCorrectionM = corr;
+    }
+
     const seen = new Set<string>();
-    const others: Array<readonly [number, number, number]> = []; // for drive.ts soft repulsion
     let rosterDirty = false;
     for (const p of snap.players) {
       seen.add(p.id);
@@ -1235,13 +1315,8 @@ export class KartApp {
         rosterDirty = true;
       }
       this.ensureKart(p.id, p.color);
-      if (p.id === this.playerId) this.correctOwn(p);
-      else {
-        this.pushRemote(p, snap.serverTime);
-        others.push(p.p);
-      }
+      if (p.id !== this.playerId) this.pushRemote(p, snap.serverTime);
     }
-    this.drive.setOthers(others);
     for (const id of [...this.players.keys()]) {
       if (!seen.has(id) && id !== this.playerId) {
         this.players.delete(id);
@@ -1286,19 +1361,6 @@ export class KartApp {
     if (prev === 'countdown' && next === 'racing' && !this.goActive) this.showGo(); // lost 'go' event
   }
 
-  /** GENTLE server correction: the server echoes our own last state; only a
-   *  >5m divergence (clamp/packet loss) pulls the local kart, and only partway.
-   *  drive.correctTo nudges position ONLY (velocity/gates/anchor untouched) and
-   *  ignores the known-stale echoes right after an R-respawn teleport. */
-  private correctOwn(p: KartPlayerSnap): void {
-    const s = this.drive.state();
-    const dx = p.p[0] - s.x;
-    const dz = p.p[2] - s.z;
-    if (dx * dx + dz * dz > CORRECT_DIST_SQ) {
-      this.drive.correctTo(s.x + dx * CORRECT_BLEND, s.z + dz * CORRECT_BLEND);
-    }
-  }
-
   // ---- race events ---------------------------------------------------------------------
   private onRaceEvent(ev: RaceEvent): void {
     switch (ev.kind) {
@@ -1335,6 +1397,21 @@ export class KartApp {
           this.audio.sfx('turbo', { distance: Math.round(dist) });
         }
         break;
+      case 'bump': {
+        // server-resolved contact — the SAME fact reaches both drivers
+        this.lastBump = { a: ev.a, b: ev.b, impulse: ev.impulse, atMs: this.serverNow() };
+        if (ev.a === this.playerId || ev.b === this.playerId) {
+          this.audio.sfx('thud'); // we were in it: full-volume hit
+        } else {
+          const otherId = ev.a; // a remote-on-remote hit: locate it and scale by distance
+          const remote = this.players.get(otherId);
+          const s = this.drive.state();
+          const dist =
+            remote !== undefined ? Math.hypot(remote.p[0] - s.x, remote.p[2] - s.z) : 0;
+          this.audio.sfx('thud', { distance: Math.round(dist) });
+        }
+        break;
+      }
       case 'finish':
         if (ev.playerId === this.playerId) {
           this.audio.sfx('finish');
@@ -1363,7 +1440,7 @@ export class KartApp {
     this.countdownShown = 0;
     this.lapStartAt = this.serverNow(); // the race clock starts at GO
     // no grid reset here: the server wipes positions at GO and the first racing
-    // snapshot's gentle >5m correction (correctOwn) settles us onto our slot
+    // snapshot's reconcile adopts that authoritative state onto our slot
     this.audio.sfx('go');
   }
 
@@ -1372,17 +1449,17 @@ export class KartApp {
     this.msgUntil = performance.now() + MSG_MS;
   }
 
-  // ---- kart_state stream ------------------------------------------------------------------
-  /** Sends one paced packet (drive.ts produces ≤ 15Hz of stepped sim time). */
+  // ---- kart_input stream ------------------------------------------------------------------
+  /** Bound once: flush() calls it per queued input, so it must never re-allocate. */
+  private readonly sendInput = (m: KartC2S): void => this.send(m);
+
+  /** Drains every input drive.ts produced since the last flush (SIM_HZ paced). */
   private sendPacket(): void {
     if (!this.joined) return;
-    const pkt = this.drive.packet();
-    if (pkt === null) return; // not a packet tick yet
-    this.packetsSent += 1;
-    this.send(pkt);
+    this.packetsSent += this.drive.flush(this.sendInput);
   }
 
-  /** rAF pauses in background tabs: keep the sim + the 15Hz stream alive at a
+  /** rAF pauses in background tabs: keep the sim + the input stream alive at a
    *  slow clip (INPUT_STALE_MS keepalive). Never double-steps while rAF is healthy. */
   private watchdog(): void {
     if (this.screen !== 'race') return;
@@ -1877,7 +1954,7 @@ export class KartApp {
       nitroActive: p.nitroActive,
     };
     const last = buf[buf.length - 1];
-    if (last !== undefined && time < last.t) return; // out-of-order: drop (15Hz self-heals)
+    if (last !== undefined && time < last.t) return; // out-of-order: drop (the next snapshot self-heals)
     if (last !== undefined && time === last.t) buf[buf.length - 1] = sample; // duplicate tick: newest wins
     else buf.push(sample);
     // evict beyond ~1s of history, keeping one older entry for bracketing
@@ -2090,7 +2167,24 @@ export class KartApp {
       phase: this.screen === 'menu' ? 'menu' : this.phase,
       playerId: this.playerId,
       slot: this.slot,
-      seq: this.packetsSent, // kart_state frames sent (drive.ts owns the wire seq)
+      seq: this.packetsSent, // kart_input frames sent (drive.ts owns the wire seq)
+      seqHz: SIM_HZ,
+      net: {
+        ack: this.ackSeq,
+        pending: this.drive.pending(),
+        lastCorrectionM: this.drive.lastCorrection(),
+        maxCorrectionM: this.maxCorrectionM,
+        corrections: this.corrections,
+      },
+      lastBump:
+        this.lastBump === null
+          ? null
+          : {
+              a: this.lastBump.a,
+              b: this.lastBump.b,
+              impulse: this.lastBump.impulse,
+              atMs: this.lastBump.atMs,
+            },
       offsetMs: this.offset,
       rttMs: this.rttMs,
       // the latched ext input only — the keyboard is drive-internal and not observable here

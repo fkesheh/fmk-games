@@ -8,8 +8,15 @@
 // processes: no cross-tab rAF throttling) through the window.__kart debug
 // surface (docs/KART.md) against the multi-game static route /kart/:
 //   A createPrivate('Alice') -> private-room code; B joinPrivate('Bob', code);
-//   both pages see 2 players. With MIN_PLAYERS met the room runs its frozen
-//   phase machine — lobby -> ready (5s) -> countdown (3-2-1) -> racing — and
+//   both pages see 2 players. NOTHING AUTO-STARTS (frozen lobby contract,
+//   games/kart/server/src/room.ts): a room sits in 'lobby' until a SEATED
+//   player sends {t:'start'} with >= MIN_PLAYERS seated. The harness presses
+//   it the way a player does — the real button.btn.btn-gold.lobby-start
+//   ("START RACE"), disabled until the server's canStart — with
+//   window.__kart.startRace() (the same frame) as the fallback for any spot
+//   where the button is not live. The press rides the phase poll itself, so
+//   no 'ready' sample can be missed; the room then runs its frozen phase
+//   machine — lobby -[START]-> ready (5s) -> countdown (3-2-1) -> racing — and
 //   every transition is observed on A (the grid shot lands inside the
 //   countdown window). Then A drives: setInput(1,0,0,false) until A's
 //   streamed position (state().pos — what the client ships to the server at
@@ -51,7 +58,13 @@
 // (the frozen debug surface exposes no roomId) and B joins through the menu
 // room-row click, the client's only join_public sender (row -> joinPublic(
 // menuName(), room.id) with the wire RoomInfo.id) — both pages then assert 2
-// players. With MIN_PLAYERS met that room races too, so KIDS MODE rides it:
+// players. That public room also carries the NO-AUTO-START proof: with both
+// pages seated (state().players >= MIN_PLAYERS) and the server's canStart
+// true, and BEFORE any press, the harness holds for 6+ seconds and asserts the
+// phase is STILL 'lobby' on BOTH pages — never 'ready'/'countdown'/'racing' —
+// with canStart still true at the end, proving the room could have started and
+// chose not to ('lobby does not auto-start'). Only then is START RACE clicked,
+// so that room races too and KIDS MODE rides it:
 // assist toggled on via KeyT (verified on state().assist), then throttle ONLY
 // — setInput(1,0,0) with the steer argument locked at 0 and never touched —
 // while the client's pure-pursuit auto-steer must steer itself around gate 1
@@ -85,6 +98,12 @@
 // telemetry().remotes, and the join code falls back to the lobby server log.
 // Screenshots: kart-grid.png (countdown on the grid) + kart-race.png
 // (mid-drive chase cam).
+// A finished race ALSO returns the room to 'lobby' and WAITS there (the server
+// no longer re-arms itself), so every long tail section that needs 'racing'
+// calls ensureRacing() first — a single state() read while the race is still
+// running, an explicit re-press of START if the room fell back to the lobby.
+// Env: E2E_PORT overrides the default port 8183; E2E_SKIP_BUILD=1 (exactly
+// '1') reuses the existing dist output instead of running npm run build.
 //
 // Exit 0 only if every assertion passes AND zero page/console/network errors
 // were seen on either page (benign favicon noise excluded).
@@ -97,13 +116,28 @@ import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const PORT = Number(process.env.E2E_PORT ?? 8080);
+const PORT = Number(process.env.E2E_PORT ?? 8183);
 const BASE = `http://localhost:${PORT}`;
 const GAME_URL = `${BASE}/kart/`; // the launcher lives at /; the kart client is mounted at /kart/
 const SHOTS_DIR = path.join(ROOT, 'screenshots');
 
 // the KART.md debug surface freezes these window.__kart methods
-const KART_SURFACE = ['state', 'joinQuick', 'createPublic', 'createPrivate', 'joinPrivate', 'setInput', 'telemetry'];
+// ('startRace' sends the manual-start {t:'start'} frame — the fallback for the
+// spots where the lobby's START RACE button is not rendered)
+const KART_SURFACE = [
+  'state',
+  'joinQuick',
+  'createPublic',
+  'createPrivate',
+  'joinPrivate',
+  'setInput',
+  'telemetry',
+  'startRace',
+];
+
+// MIN_PLAYERS in @kart/shared config — the seat floor the server's canStart
+// mirrors (the client debug surface reports the seat COUNT as state().players)
+const MIN_PLAYERS = 2;
 
 // ---- tiny framework -----------------------------------------------------------
 const results = [];
@@ -429,7 +463,125 @@ function telePose(t) {
  * null when seq is unreadable.
  */
 function teleSimS(t) {
-  return t !== null && typeof t === 'object' && typeof t.seq === 'number' && Number.isFinite(t.seq) ? t.seq / 15 : null;
+  if (t === null || typeof t !== 'object') return null;
+  if (typeof t.seq !== 'number' || !Number.isFinite(t.seq)) return null;
+  // CALIBRATE, never hardcode. `seq` used to count 15Hz kart_state packets; under
+  // the server-authoritative model it counts kart_input frames at SIM_HZ (30), so
+  // a hardcoded /15 made EVERY sim-second budget in this file run 2x fast — the
+  // `kids stuck auto-respawn` failure was this, not a game defect. The client now
+  // publishes its own rate as telemetry().seqHz for exactly this reason.
+  const hz = typeof t.seqHz === 'number' && Number.isFinite(t.seqHz) && t.seqHz > 0 ? t.seqHz : 15;
+  return t.seq / hz;
+}
+
+// ---- manual start (the frozen lobby contract) --------------------------------
+// A kart room NEVER starts by itself: 'lobby' is left only when a SEATED player
+// sends {t:'start'} with >= MIN_PLAYERS seated (games/kart/server/src/room.ts
+// startRace/canStart), and a finished race drops the room back to 'lobby' to
+// WAIT for the next press. The real player path is the lobby's START RACE
+// button (button.btn.btn-gold.lobby-start — `disabled` until the server's
+// canStart, `hidden` outside 'lobby'); window.__kart.startRace() sends the
+// identical frame and is the sanctioned fallback where the button is not live.
+
+/**
+ * Seat readiness off the client debug surface. NOTE (source drift): the kart
+ * client's KartDebugState exposes the seat COUNT as `players` and the server's
+ * verdict as `canStart`; it does NOT carry playerCount/minPlayers (those are
+ * wire-snapshot fields). Both spellings are read here, so the harness keeps
+ * working if the surface ever grows them.
+ */
+function seating(s) {
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  if (s === null || typeof s !== 'object') return { seated: null, minPlayers: MIN_PLAYERS, canStart: null };
+  return {
+    seated: num(s.playerCount) ?? num(s.players),
+    minPlayers: num(s.minPlayers) ?? MIN_PLAYERS,
+    canStart: typeof s.canStart === 'boolean' ? s.canStart : null,
+  };
+}
+
+/**
+ * One REAL click on the lobby's START RACE button. Returns true only when the
+ * button existed and was enabled (i.e. the click actually went through the
+ * client's own handler, which re-checks canStart before sending).
+ */
+const clickStartButton = (page) =>
+  page.evaluate(() => {
+    const b = document.querySelector('.lobby-start');
+    if (b && !b.disabled) {
+      b.click();
+      return true;
+    }
+    return false;
+  });
+
+/**
+ * Press START through the real UI and prove the room left 'lobby'. Waits for
+ * the server's canStart (the button is disabled until then), polls the click
+ * with the shared wait helper, then confirms the phase moved. If the click
+ * never lands or the phase does not move, falls back to __kart.startRace()
+ * (the same {t:'start'} frame) — re-sending is harmless: the server silently
+ * ignores a start outside 'lobby'.
+ */
+async function pressStart(page, label, timeoutMs = 20000) {
+  await waitFor(async () => {
+    const st = seating(await kartState(page));
+    return st.canStart === true ? st : null;
+  }, timeoutMs, `${label}: state().canStart === true (server accepts a start)`);
+  const clicked = await waitFor(() => clickStartButton(page), 10000, `${label}: .lobby-start enabled and clicked`).catch(
+    () => false,
+  );
+  const left = async (ms) =>
+    waitFor(async () => {
+      const s = await kartState(page);
+      return s !== null && s.phase !== 'lobby' && s.phase !== 'menu' ? s.phase : null;
+    }, ms, `${label}: phase leaves 'lobby' after START`).catch(() => null);
+  let phase = clicked ? await left(8000) : null;
+  if (phase === null) {
+    console.log(`${label}: START button press did not move the phase (clicked=${clicked}) — using __kart.startRace()`);
+    await page.evaluate(() => window.__kart?.startRace?.());
+    phase = await left(10000);
+  }
+  console.log(`${label}: race started (button=${clicked}, phase now ${phase ?? 'still lobby'})`);
+  return phase;
+}
+
+/**
+ * Re-establish 'racing' for a section that requires it. A finished race returns
+ * the room to 'lobby' and waits there, so any long tail can find itself parked
+ * in the lobby; this presses START again and rides out ready+countdown. A cheap
+ * no-op (one state() read) while the race is still running. Never throws — a
+ * failure is logged and the section's own assertion reports the consequence.
+ */
+async function ensureRacing(page, label) {
+  const s = await kartState(page);
+  if (s !== null && s.phase === 'racing') return true;
+  console.log(`${label}: phase is '${s !== null ? s.phase : '?'}' — waiting the room back to 'racing' (re-pressing START if it waits in the lobby)`);
+  try {
+    if (s !== null && (s.phase === 'ready' || s.phase === 'countdown')) {
+      // already on its way (a restart the previous section triggered): no press
+      await waitFor(async () => {
+        const r = await kartState(page);
+        return r !== null && r.phase === 'racing' ? r : null;
+      }, 30000, `${label}: phase 'racing' (start already under way)`);
+      return true;
+    }
+    if (s !== null && s.phase === 'results') {
+      await waitFor(async () => {
+        const r = await kartState(page);
+        return r !== null && r.phase === 'lobby' ? r : null;
+      }, 20000, `${label}: results -> lobby`);
+    }
+    await pressStart(page, label, 15000);
+    await waitFor(async () => {
+      const r = await kartState(page);
+      return r !== null && r.phase === 'racing' ? r : null;
+    }, 30000, `${label}: phase 'racing' after the restart`);
+    return true;
+  } catch (err) {
+    console.log(`${label}: could not restart the race (${err instanceof Error ? err.message : String(err)}) — continuing`);
+    return false;
+  }
 }
 
 /** Shortest signed angle from a to b, in (-PI, PI]. */
@@ -569,7 +721,20 @@ function gearOscillationReps(seq) {
 // ---- main ---------------------------------------------------------------------------
 async function main() {
   await mkdir(SHOTS_DIR, { recursive: true });
-  buildAll();
+  // E2E_SKIP_BUILD=1 (exactly '1') reuses the dist output from a previous
+  // build — for fast local iteration and for a runner that already built once.
+  // Anything else (unset, '0', 'true') keeps the default full build.
+  if (process.env.E2E_SKIP_BUILD !== '1') {
+    buildAll();
+  } else {
+    console.log('build: skipped (E2E_SKIP_BUILD=1) — reusing the existing dist output');
+    if (
+      !existsSync(path.join(ROOT, 'games/kart/client/dist/index.html')) ||
+      !existsSync(path.join(ROOT, 'platform/server/dist/server.js'))
+    ) {
+      throw new Error('E2E_SKIP_BUILD=1 but the dist output is missing — run npm run build once first');
+    }
+  }
   startServer();
   await waitForServer();
   console.log(`server up on ${BASE} (kart client at /kart/)`);
@@ -638,6 +803,60 @@ async function main() {
     publicRoomId !== null,
     `roomId=${publicRoomId ?? '?'} (lobby log); B clicked row "${bRowText}"; counts A=${pubSeated.sa.players} B=${pubSeated.sb.players}`,
   );
+
+  // -- lobby does not auto-start (frozen lobby contract) -------------------------------
+  // The whole point of the manual-start lobby: with the seats full the room is
+  // ALLOWED to start and still must not. Both pages are seated (players >=
+  // MIN_PLAYERS) and the server says canStart — and BEFORE any press the
+  // harness holds for 6+ seconds, sampling both pages, and demands every single
+  // sample read 'lobby'. A single 'ready'/'countdown'/'racing' sighting means
+  // something started the race on its own. canStart is re-read at the end of
+  // the hold: it proves the room could have started the entire time and chose
+  // not to (a room that merely became unstartable would also stay in 'lobby').
+  const AUTOSTART_HOLD_MS = 6000;
+  const preStart = await waitFor(
+    async () => {
+      const [sa, sb] = await Promise.all([kartState(A), kartState(B)]);
+      const ka = seating(sa);
+      const kb = seating(sb);
+      return ka.canStart === true &&
+        kb.canStart === true &&
+        ka.seated !== null &&
+        ka.seated >= ka.minPlayers &&
+        kb.seated !== null &&
+        kb.seated >= kb.minPlayers
+        ? { sa, sb, ka, kb }
+        : null;
+    },
+    15000,
+    'both pages seated with canStart === true (before any START press)',
+  ).catch(() => null);
+  const holdPhases = new Set(); // every phase either page reported during the hold
+  const holdT0 = Date.now();
+  while (Date.now() - holdT0 < AUTOSTART_HOLD_MS + 400) {
+    const [sa, sb] = await Promise.all([kartState(A), kartState(B)]);
+    if (sa !== null && typeof sa.phase === 'string') holdPhases.add(sa.phase);
+    if (sb !== null && typeof sb.phase === 'string') holdPhases.add(sb.phase);
+    await sleep(250);
+  }
+  const holdMs = Date.now() - holdT0;
+  const [holdEndA, holdEndB] = await Promise.all([kartState(A), kartState(B)]);
+  const endA = seating(holdEndA);
+  const endB = seating(holdEndB);
+  const stayedLobby = holdPhases.size === 1 && holdPhases.has('lobby');
+  check(
+    'lobby does not auto-start: seats full and canStart true, the room is STILL in lobby after a 6s hold',
+    preStart !== null && holdMs >= AUTOSTART_HOLD_MS && stayedLobby && endA.canStart === true && endB.canStart === true,
+    `seated A=${preStart !== null ? preStart.ka.seated : endA.seated ?? '?'}/${endA.minPlayers} ` +
+      `B=${preStart !== null ? preStart.kb.seated : endB.seated ?? '?'}/${endB.minPlayers}; ` +
+      `phases seen over ${(holdMs / 1000).toFixed(1)}s: [${[...holdPhases].join(', ')}]; ` +
+      `canStart at the end A=${endA.canStart} B=${endB.canStart}`,
+  );
+
+  // -- manual START (public room): the real button, pressed by a seated player -----
+  // The room stays in the lobby until this press — nothing below (kids assist,
+  // stuck respawn, wrong-way) can run without it.
+  await pressStart(A, 'public room START');
 
   // -- kids assist (KIDS MODE): throttle only, steer locked at 0 ----------------------
   // docs/KART.md 'Kids mode': with the assist on, the CLIENT pure-pursues the
@@ -715,6 +934,7 @@ async function main() {
   // coordinate (<= GATE_RADIUS + 1m), and show a reset speed (< 10 m/s at the
   // jump sample — gear-1 from rest needs ~1 sim-s for that). Both proofs ride
   // telemetry().own; the sim clock rides telemetry().seq (see teleSimS).
+  await ensureRacing(A, 'kids stuck auto-respawn'); // a finished race waits in the lobby
   const kidsTrack = computeTrackData(); // same frozen math — a cheap recompute
   const kidsGates = kidsTrack.gates;
 
@@ -909,6 +1129,7 @@ async function main() {
   // rotation direction) if it wedges anyway. Either recovery shape passes:
   // a three-point-turn drive-out restores the facing on the spot, a wrong-
   // way auto-respawn restores it at the anchor.
+  await ensureRacing(A, 'kids wrong-way recovery'); // a finished race waits in the lobby
   await kidsAssistTo(false); // the spin is manual
   await kidsRespawn(); // standstill at the anchor gate, facing along travel
   const wwPose0 = telePose(await kartTelemetry(A));
@@ -1071,7 +1292,7 @@ async function main() {
       `remotes A sees [${(teleA0?.remotes ?? []).map((r) => r.name)}] B sees [${(teleB0?.remotes ?? []).map((r) => r.name)}]`,
   );
 
-  // -- phase machine: lobby -> ready (5s) -> countdown (3-2-1) -> racing --------------
+  // -- phase machine: lobby -[START]-> ready (5s) -> countdown (3-2-1) -> racing -----
   // Poll at 150ms from the moment both are seated (the phases are 5s/3s: no
   // transition is missed) and record every distinct phase. Countdown numbers
   // are not on state(); they are derived from telemetry()'s phase timer for
@@ -1086,7 +1307,18 @@ async function main() {
   // the whole ready+countdown span observable even when slow evaluates
   // compress wall-clock margins — a serial window can land inside the
   // countdown under load and the loop then never sees 'ready'.
+  //
+  // The MANUAL START rides this same loop: the private room sits in 'lobby'
+  // until a seated player presses START RACE, and pressing from inside the poll
+  // (instead of a serial step before it) means the very next sample is already
+  // the post-press one — no 'ready' sighting can be lost in the gap. The click
+  // is re-attempted on every lobby sample (the server silently ignores a
+  // {t:'start'} outside 'lobby', so an extra press is harmless); after 5
+  // samples where the button never went live the debug frame is sent instead.
   const phasesSeen = []; // [{phase, countdown}] — distinct consecutive samples
+  let startClicks = 0; // real button clicks that landed
+  let startMisses = 0; // lobby samples where .lobby-start was absent/disabled
+  let startFellBack = false; // __kart.startRace() used as the fallback
   let gridShot = false;
   let freezeLatched = false; // throttle latched on the first pre-GO sample
   let freezePos0 = null; // position at latch
@@ -1097,6 +1329,16 @@ async function main() {
   await waitFor(async () => {
     const [s, tele] = await Promise.all([kartState(A), kartTelemetry(A)]);
     if (!joined(s)) return null;
+    if (s.phase === 'lobby' && s.canStart === true) {
+      // the real player path: click the lobby's START RACE button
+      if (await clickStartButton(A)) {
+        startClicks++;
+      } else if (++startMisses >= 5 && !startFellBack) {
+        startFellBack = true;
+        console.log('private room START: .lobby-start never went live — falling back to __kart.startRace()');
+        await A.evaluate(() => window.__kart?.startRace?.());
+      }
+    }
     if (s.phase !== 'racing') {
       freezePhases.add(s.phase);
       if (!freezeLatched) {
@@ -1123,7 +1365,11 @@ async function main() {
       await shot(A, 'kart-grid.png');
     }
     return s.phase === 'racing' ? s : null;
-  }, 30000, "phase 'racing' after ready + countdown");
+  }, 30000, "phase 'racing' after START + ready + countdown");
+  console.log(
+    `private room START: ${startClicks} button click(s) landed, ${startMisses} lobby sample(s) with the button not live` +
+      `${startFellBack ? ', __kart.startRace() fallback used' : ''}`,
+  );
   await A.evaluate(() => window.__kart.setInput(0, 0, 0, false)); // unlatch the freeze throttle at GO
   if (!gridShot) {
     console.log('countdown window missed — kart-grid.png taken after the fact (phase checks below will fail)');
@@ -1378,6 +1624,7 @@ async function main() {
   // it REVERSE through the second pulse — where the yaw response flips and
   // the sign reads backwards. Deltas are wrapPi'd so a heading crossing ±PI
   // still reads right.
+  await ensureRacing(A, 'A/D direction'); // a finished race waits in the lobby
   await A.keyboard.press('KeyR'); // client respawn (drive.ts onKeyDown)
   await sleep(400);
   await A.evaluate(() => window.__kart.setInput(1, 0, 0, false));
@@ -1438,6 +1685,7 @@ async function main() {
   // Verify the respawn landed (standstill + near the road). The dist bound is
   // lenient: this script's recomputed centerline can deviate a few meters from
   // the server's track. One R retry covers a swallowed keypress.
+  await ensureRacing(A, 'gears'); // a finished race waits in the lobby (frozen sim)
   let respawned = false;
   for (let attempt = 0; attempt < 2 && !respawned; attempt++) {
     await A.keyboard.press('KeyR');
@@ -1607,6 +1855,7 @@ async function main() {
     }
   };
 
+  await ensureRacing(A, 'nitro'); // a finished race waits in the lobby (charges refill at GO)
   const nitroStart = await awaitNitroLeft(3, 8000); // charges refilled at GO
   await respawnParked();
   await A.evaluate(() => window.__kart.setInput(1, 0, 0, false));
@@ -1653,6 +1902,7 @@ async function main() {
   const STAB_WINDOW_SIM_S = 20; // gear-sampling window in SIM seconds
   const TOP_SPEED_FLOOR = 28; // m/s — spec floor: > 30 ideal, >= 28 headless
   const STAB_BUDGET_SIM_S = 45; // sim-s cap for the window + the top-speed hunt
+  await ensureRacing(A, 'gear stability'); // a finished race waits in the lobby
   await respawnParked(); // verified standstill at the last credited gate
   await A.evaluate(() => window.__kart.setInput(1, 0, 0, false));
   const gearSeq = []; // 2Hz gear samples; null = unreadable that tick

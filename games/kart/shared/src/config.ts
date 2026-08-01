@@ -41,6 +41,13 @@ export const GRASS_ENGINE_MUL = 0.55;
 export const GRASS_DRAG = 2.5; // extra drag off-road
 export const BARRIER_DAMP = 0.4; // velocity kept along the normal after a barrier hit
 export const KART_RADIUS = 0.9; // collision circle (kart-kart repulsion + barriers)
+export const BARRIER_OUT = 1.2; // barrier wall offset past the road edge (m)
+// Kart-vs-kart contact (SERVER-RESOLVED, shared/sim.ts resolveKartPair). Equal
+// masses: the normal impulse is split evenly, so both karts see the SAME impact
+// at the same tick — a bump is momentum exchange, not a one-sided position shove.
+export const KART_RESTITUTION = 0.35; // bounciness of a kart-kart hit (0 = dead stop, 1 = elastic)
+export const BUMP_MIN_SPEED = 2; // m/s of approach speed before a 'bump' race event fires
+export const BUMP_COOLDOWN_MS = 250; // per-player minimum spacing between bump events
 
 // ---- race rules ----
 export const GATES = 8; // checkpoints incl. start/finish at gate 0
@@ -60,5 +67,40 @@ export const RACE_TIMEOUT_S = 300; // hard cap per race
 export const NITRO_CHARGES = 3; // per player per race
 export const NITRO_TIME = 1.5; // s of boost per charge
 export const NITRO_BOOST = 10; // extra engine m/s^2 during nitro
-export const SNAPSHOT_HZ = 15;
-export const INPUT_STALE_MS = 10_000; // no kart_state for this long => stale
+
+// ---- netcode (SERVER-AUTHORITATIVE simulation) ----
+// The wire carries INPUTS, never coordinates: the server integrates the shared
+// sim (shared/sim.ts stepDrive) from the input stream and owns every position.
+// The client runs the SAME step on the same input for prediction and replays
+// unacknowledged inputs on top of the server's state (fps/net/prediction.ts).
+//
+// SIM_HZ is the authority AND input rate: one input message covers exactly one
+// SIM_DT of simulation, so "how many inputs the server consumed" IS "how much
+// time that kart simulated" — there is no clock to spoof. 30Hz matches the FPS
+// tick and keeps steering response at 33ms (20Hz would add a felt 50ms).
+export const SIM_HZ = 30;
+export const SIM_DT = 1 / SIM_HZ;
+// Physics still integrates at 120Hz: one sim tick runs SIM_SUBSTEPS substeps,
+// so the handling model (kartPhysics.ts) is bit-identical to the pre-netcode
+// client sim. SIM_SUBSTEP_HZ must stay an integer multiple of SIM_HZ.
+export const SIM_SUBSTEP_HZ = 120;
+export const SIM_SUBSTEPS = SIM_SUBSTEP_HZ / SIM_HZ; // 4
+// A malformed/hostile dt is clamped into this band before it reaches the sim,
+// and the per-second SIM_BUDGET_MUL cap below bounds total simulated time.
+export const SIM_DT_MIN = 1 / 240;
+export const SIM_DT_MAX = 1 / 15;
+// Speedhack budget: a player may not have more than this multiple of REAL time
+// integrated on their behalf in any 1s window (honest clients sit at 1.0;
+// jitter/catch-up needs the headroom). Inputs past the budget are dropped
+// UNACKNOWLEDGED, so an honest client would simply replay them.
+export const SIM_BUDGET_MUL = 1.3;
+export const MAX_INPUTS_PER_TICK = 4; // catch-up cap: 1 nominal + 3 of recovered jitter
+export const INPUT_QUEUE_CAP = 60; // ~2s of queued inputs; oldest dropped beyond this
+export const PENDING_INPUT_CAP = 120; // client-side replay queue (~4s at SIM_HZ)
+
+// Snapshot rate: raised 15 -> 20. At TOP_SPEED that cuts the per-frame
+// quantisation a remote kart is rendered with from 2.4m to 1.8m; the cost is
+// linear in bandwidth (~1.5 -> ~2.0 MiB/s aggregate at MAX_PLAYERS 20), which
+// is why it is not 30Hz (that would be ~3.0 MiB/s for another 0.6m).
+export const SNAPSHOT_HZ = 20;
+export const INPUT_STALE_MS = 10_000; // no kart_input for this long => stale

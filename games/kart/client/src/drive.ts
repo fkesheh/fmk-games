@@ -1,44 +1,67 @@
 // ============================================================================
-// kart-drive — DriveController: keyboard → deterministic local kart sim.
-// Wraps the shared stepKart at fixed 120Hz substeps (render dt accumulates),
-// with a surfaceAt() grip lookup per substep, barrier push-out at the road
-// shoulder, soft kart-kart repulsion, and an in-order gate tracker whose last
-// credited gate doubles as the R-respawn anchor. Keyboard: Arrows/WASD drive,
-// Space/Shift drift (handbrake), R respawn; window blur clears every held key
-// (this game has no pointer lock). KIDS MODE (setAssist): pure-pursuit auto-steer
-// ~10m ahead on the centerline replaces the keyboard steer channel, hardened by
-// three assist-only safeties — wrong-way recovery (>100° off the travel tangent
-// for 1.2s of sim time → full-lock steer back to within 30°), stuck auto-respawn
-// (throttle held 2.5s while barely moving → respawn(); kids can't press R) and
-// the reverse steer mirror (the bicycle model's yaw rate flips sign with speedF).
-// Throttle, brake, drift, R and nitro stay manual. state()/packet() return module scratch
-// objects — copy out what you keep; nothing here allocates per frame, and
-// logic never calls Math.random (deterministic per input sequence).
+// kart-drive — DriveController: keyboard → INPUTS → predicted kart.
+//
+// The kart is no longer simulated here alone: this module produces one
+// `kart_input` per SIM_DT of real time, applies it IMMEDIATELY through a
+// shared KartPredictor (so steering is instant — nothing in the local response
+// path waits for the server) and hands the same objects to the wire. The
+// server integrates the identical shared stepDrive over the identical inputs
+// and is authoritative; reconcile() re-bases on its state and replays whatever
+// it has not acknowledged yet. Kart-vs-kart contact is SERVER-resolved and is
+// deliberately absent from this file.
+//
+// What still lives here is everything DOM- and feel-shaped: the keyboard
+// (Arrows/WASD drive, Space/Shift drift, R respawn, N nitro; tracked by e.code,
+// cleared on window blur, ignored while typing in a lobby field), the external
+// setInput latch (e2e/debug driver), the pre-GO freeze, KIDS MODE (setAssist →
+// the shared pursuitSteer controller owns the steer channel, plus the stuck
+// auto-respawn kids can't press R for), the smoothed drift visual, and the
+// VISUAL error offset that hides a reconciliation correction over ~120ms.
+//
+// R / the stuck detector do NOT teleport directly: they raise a one-shot flag
+// consumed by the next input as `respawn: true`, so the teleport is part of the
+// replayable input sequence instead of something reconciliation fights.
+//
+// state() returns module scratch — copy out what you keep; nothing here
+// allocates per frame except exactly one input object per sim tick, which is
+// REQUIRED: the predictor retains it for replay, so it can never be scratch.
 // ============================================================================
 import {
-  BARRIER_DAMP, GATES, GATE_RADIUS, KART_RADIUS, NITRO_TIME, SNAPSHOT_HZ,
-  closestOnTrack, forwardSpeed, makeKart, stepKart, surfaceAt,
+  NITRO_TIME,
+  PENDING_INPUT_CAP,
+  SIM_DT,
+  KartPredictor,
+  forwardSpeed,
+  makeAssistState,
+  pursuitSteer,
+  stuckStep,
 } from '@kart/shared';
-import type { KartC2S, KartInput, KartState, TrackDef } from '@kart/shared';
+import type {
+  AssistState,
+  KartC2S,
+  KartInput,
+  KartInputMsg,
+  KartSim,
+  TrackDef,
+} from '@kart/shared';
 
 // ---- tuning -----------------------------------------------------------------
-const SUBSTEP_DT = 1 / 120; // fixed physics rate, independent of rAF rate
 const MAX_FRAME_DT = 0.25; // tab-back hitch clamp; sim time beyond this is dropped
-const PACKET_DT = 1 / SNAPSHOT_HZ; // kart_state stream rate (15Hz)
-const BARRIER_OUT = 1.2; // barrier wall offset past the road edge (m)
 const DRIFT_VIS_RATE = 10; // driftVisual approach rate /s
-const PURSUIT_AHEAD = 10; // KIDS MODE lookahead along the centerline (m)
-const PURSUIT_GAIN = 2.2; // KIDS MODE steer = clamp(-yawErr * gain)
-const WRONG_WAY_RAD = (100 * Math.PI) / 180; // facing vs travel past this = wrong way
-const WRONG_WAY_HOLD_S = 1.2; // continuous wrong-way sim time before recovery
-const RECOVER_DONE_RAD = (30 * Math.PI) / 180; // recovery exits inside this alignment
-const STUCK_THROTTLE = 0.5; // auto-respawn needs the throttle held above this
-const STUCK_SPEED = 0.5; // ...while |speed| stays under this (m/s)
-const STUCK_HOLD_S = 2.5; // continuous stuck sim time before the auto-respawn
-const REVERSE_FLIP_SPEED = -0.5; // speedF below this mirrors the assist steer
-const CORRECT_SUPPRESS_S = 0.6; // post-respawn window where server echoes are known-stale
+const ERR_TAU_S = 0.12; // visual error offset decay time constant (~120ms)
+const ERR_SNAP_M = 8; // a correction bigger than this is a teleport: snap, don't smooth
+// Backstop only: flush() runs every frame while in a room, so the outbox holds
+// at most a frame's worth (1-2). The cap exists so that a caller which stops
+// flushing (screen change, torn-down socket) cannot grow it without bound —
+// dropped frames are what the ack + replay already recover from.
+const OUTBOX_CAP = PENDING_INPUT_CAP;
+// A correction that stays pinned at the clamp means prediction is not
+// converging at all (the offset would otherwise park the rendered kart a full
+// ERR_SNAP_M from where gates and collisions actually resolve). After this many
+// consecutive clamped corrections, stop hiding it and snap.
+const ERR_CLAMP_GIVE_UP = 3;
 
-export interface DriveState extends KartState {
+export interface DriveState extends KartSim {
   steer: number; // current effective steering input -1..1 (wheel visual)
   driftVisual: number; // smoothed 0..1 drift intensity (skid visual)
   speed: number; // signed forward speed, m/s
@@ -49,21 +72,12 @@ export interface DriveState extends KartState {
 const STATE_OUT: DriveState = {
   x: 0, y: 0, z: 0, yaw: 0, vx: 0, vz: 0,
   gear: 1, shiftLeft: 0, drifting: false, nitroLeft: 0,
+  expectedGate: 0, anchorX: 0, anchorZ: 0, anchorYaw: 0,
   steer: 0, driftVisual: 0, speed: 0, assist: false,
 };
-const PACKET_OUT: Extract<KartC2S, { t: 'kart_state' }> = {
-  t: 'kart_state', seq: 0, p: [0, 0, 0], yaw: 0, v: [0, 0], steer: 0, drift: false,
-};
-const NO_OTHERS: ReadonlyArray<readonly [number, number, number]> = [];
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
-}
-
-/** Wrap an angle to (-π, π]. */
-function wrapPi(a: number): number {
-  const TWO_PI = Math.PI * 2;
-  return ((((a + Math.PI) % TWO_PI) + TWO_PI) % TWO_PI) - Math.PI;
 }
 
 /** True when a key event targets an editable element (lobby inputs keep typing). */
@@ -76,7 +90,7 @@ function typingTarget(t: EventTarget | null): boolean {
 }
 
 export class DriveController {
-  private readonly k: KartState = makeKart(0, 0, 0);
+  private readonly pred: KartPredictor;
 
   // held keyboard state (tracked by e.code, layout-independent)
   private keyUp = false;
@@ -85,34 +99,32 @@ export class DriveController {
   private keyRight = false;
   private keyDrift = false;
 
-  // external input latch (setInput) + the per-step merged effective input
+  // external input latch (setInput) + the per-tick merged effective input
   private readonly ext: KartInput = { throttle: 0, brake: 0, steer: 0, drift: false };
   private readonly eff: KartInput = { throttle: 0, brake: 0, steer: 0, drift: false };
 
-  private acc = 0; // stepped-but-unconsumed frame time
-  private pktClock = PACKET_DT; // first packet() fires immediately
+  private acc = 0; // real time accumulated toward the next SIM_DT tick
   private seq = 0; // per-client monotonic, never reset within a connection
   private driftVis = 0;
-  private frozen = false; // pre-GO freeze: step() integrates nothing
+  private frozen = false; // pre-GO freeze: ticks are sent but never simulated
   private assistOn = false; // KIDS MODE — app-owned; reset()/blur never clear it
-  private correctSuppress = 0; // sim-seconds left where correctTo() is ignored
-  private wrongWayT = 0; // continuous sim-seconds facing >100° off the travel tangent
-  private recovering = false; // wrong-way recovery: full-lock steer, pursuit off
-  private stuckT = 0; // continuous sim-seconds throttle held while nearly stopped
+  private readonly assist: AssistState = makeAssistState();
+  private respawnPending = false; // one-shot, consumed by the next input's `respawn`
+
+  // inputs produced since the last flush() — the SAME objects the predictor holds
+  private readonly outbox: KartInputMsg[] = [];
+
+  // visual-only position offset that absorbs the last reconciliation correction
+  private errX = 0;
+  private errZ = 0;
+  private errClamped = 0; // consecutive corrections that hit the offset clamp
+  private lastCorr = 0; // metres the last reconcile() moved the predicted kart
 
   /** App-wired nitro request hook — fired on a fresh KeyN press. */
   onNitro: (() => void) | null = null;
 
-  // other karts' [x,y,z] for soft repulsion — reference retained, caller-owned
-  private others: ReadonlyArray<readonly [number, number, number]> = NO_OTHERS;
-
-  // in-order gate tracker; the last credited gate is the respawn anchor
-  private expectedGate = 0;
-  private anchorX = 0;
-  private anchorZ = 0;
-  private anchorYaw = 0;
-
   constructor(private readonly track: TrackDef) {
+    this.pred = new KartPredictor(track);
     if (typeof window !== 'undefined') {
       window.addEventListener('keydown', this.onKeyDown);
       window.addEventListener('keyup', this.onKeyUp);
@@ -128,24 +140,31 @@ export class DriveController {
     window.removeEventListener('blur', this.onBlur);
   }
 
-  /** Teleport to a spawn/grid slot. The next gate to cross is gate 0 (the line). */
+  /**
+   * Teleport to a spawn/grid slot (the GO grid wipe). Clears the predictor's
+   * replay queue — the inputs that led anywhere else are moot now — and the
+   * visual error offset, so the kart appears exactly on its slot.
+   */
   reset(x: number, z: number, yaw: number): void {
-    const k = this.k;
-    k.x = x; k.y = 0; k.z = z; k.yaw = yaw;
-    k.vx = 0; k.vz = 0;
-    k.gear = 1; k.shiftLeft = 0;
-    k.drifting = false;
+    this.pred.reset(x, z, yaw);
     this.acc = 0;
     this.driftVis = 0;
-    this.pktClock = PACKET_DT;
-    this.expectedGate = 0;
-    this.anchorX = x; this.anchorZ = z; this.anchorYaw = yaw;
-    this.wrongWayT = 0;
-    this.recovering = false;
-    this.stuckT = 0;
+    this.errX = 0;
+    this.errZ = 0;
+    this.errClamped = 0;
+    this.lastCorr = 0;
+    // inputs already emitted for the PRE-reset kart are dropped from the replay
+    // queue by pred.reset(), so sending them would be asserting intent for a
+    // kart that no longer exists. The server ignores them today (it force-acks
+    // at GO) — do not lean on that.
+    this.outbox.length = 0;
+    this.assist.wrongWayT = 0;
+    this.assist.recovering = false;
+    this.assist.stuckT = 0;
+    this.respawnPending = false;
   }
 
-  /** Latch an external input (debug surface / e2e). Merged over the keyboard per step. */
+  /** Latch an external input (debug surface / e2e). Merged over the keyboard per tick. */
   setInput(inp: KartInput): void {
     this.ext.throttle = inp.throttle;
     this.ext.brake = inp.brake;
@@ -153,27 +172,22 @@ export class DriveController {
     this.ext.drift = inp.drift;
   }
 
-  /** Other karts as [x,y,z] tuples (e.g. snapshot player p arrays). Reference retained. */
-  setOthers(positions: ReadonlyArray<readonly [number, number, number]>): void {
-    this.others = positions;
-  }
-
   /**
-   * Pre-GO freeze: while frozen, step() integrates nothing — input is ignored,
-   * velocity is zeroed, and the kart holds its grid slot no matter what the
-   * keyboard or a debug setInput latch says. The packet clock keeps running so
-   * the (stationary) state stream never gaps.
+   * Pre-GO freeze: while frozen, the tick still produces and SENDS an input
+   * (liveness + the ack keeps flowing) but with every channel zeroed, and it is
+   * NOT pushed into the predictor — the server does not integrate outside
+   * 'racing' either, so both peers stay in exact agreement while the grid waits.
    */
   setFrozen(frozen: boolean): void {
     this.frozen = frozen;
   }
 
   /**
-   * KIDS MODE toggle: while on, step() ignores the keyboard/latched steer and
-   * drives the steer channel with the assist controller (pure pursuit toward
-   * the centerline ~10m ahead + wrong-way recovery + reverse mirror), and a
-   * stuck kart auto-respawns. Throttle/brake/drift/R/nitro stay manual.
-   * App-owned — reset() and window blur do NOT clear it.
+   * KIDS MODE toggle: while on, the steer channel is driven by the shared
+   * assist controller (pure pursuit toward the centerline ~10m ahead +
+   * wrong-way recovery + reverse mirror) instead of the keyboard, and a stuck
+   * kart auto-respawns. Throttle/brake/drift/R/nitro stay manual. App-owned —
+   * reset() and window blur do NOT clear it.
    */
   setAssist(on: boolean): void {
     this.assistOn = on;
@@ -181,81 +195,114 @@ export class DriveController {
 
   /** Server-approved nitro (the nitro event for the local player): start the boost. */
   activateNitro(): void {
-    this.k.nitroLeft = NITRO_TIME;
+    this.pred.state().nitroLeft = NITRO_TIME;
   }
 
   /**
-   * GENTLE own-state server correction (app.ts correctOwn): nudge POSITION
-   * only. Velocity, gear, the gate tracker and the respawn anchor are all
-   * untouched — this is a nudge, not the grid reset (drive.reset() zeroes
-   * velocity, restarts the gate tracker at 0 and re-anchors mid-track).
-   * Suppressed for CORRECT_SUPPRESS_S of sim time after a respawn: the server
-   * then still echoes our PRE-teleport position for ~rtt/2 + a snapshot
-   * interval, and pulling toward that known-stale echo rubber-bands the kart
-   * (the echo adopts the respawned position from our next kart_state — the
-   * net model is client-trusted, so the divergence heals by itself).
+   * Advance real time; emits one input per SIM_DT of it. Each input is applied
+   * to the predictor the instant it is produced (instant steering) and queued
+   * for both the wire and the replay.
    */
-  correctTo(x: number, z: number): void {
-    if (this.correctSuppress > 0) return;
-    this.k.x = x;
-    this.k.z = z;
-  }
-
-  /** Advance the sim by render dt (seconds); runs fixed 120Hz substeps inside. */
   step(dt: number): void {
     if (!(dt > 0)) return; // NaN/negative guard
     const dtc = Math.min(dt, MAX_FRAME_DT);
-    this.pktClock += dtc;
-    if (this.correctSuppress > 0) {
-      this.correctSuppress = Math.max(0, this.correctSuppress - dtc);
+    // visual error offset decays toward 0 with a ~ERR_TAU_S time constant
+    if (this.errX !== 0 || this.errZ !== 0) {
+      const k = Math.exp(-dtc / ERR_TAU_S);
+      this.errX *= k;
+      this.errZ *= k;
     }
-    const e = this.eff;
-    if (this.frozen) {
-      e.throttle = 0; e.brake = 0; e.steer = 0; e.drift = false;
-      this.k.vx = 0; this.k.vz = 0;
-      return;
-    }
-    e.throttle = clamp((this.keyUp ? 1 : 0) + this.ext.throttle, 0, 1);
-    e.brake = clamp((this.keyDown ? 1 : 0) + this.ext.brake, 0, 1);
-    // KIDS MODE: the steer channel is fully owned by the assist controller.
-    if (this.assistOn) {
-      // STUCK AUTO-RESPAWN (kids can't press R): throttle held while barely
-      // moving for STUCK_HOLD_S of continuous sim time teleports to the anchor.
-      if (e.throttle > STUCK_THROTTLE && Math.abs(forwardSpeed(this.k)) < STUCK_SPEED) {
-        this.stuckT += dtc;
-        if (this.stuckT >= STUCK_HOLD_S) {
-          this.stuckT = 0;
-          this.respawn();
-        }
-      } else {
-        this.stuckT = 0;
-      }
-      e.steer = this.assistSteer(dtc);
-    } else {
-      e.steer = clamp((this.keyRight ? 1 : 0) - (this.keyLeft ? 1 : 0) + this.ext.steer, -1, 1);
-    }
-    e.drift = this.keyDrift || this.ext.drift;
     this.acc += dtc;
-    while (this.acc >= SUBSTEP_DT) {
-      this.substep();
-      this.acc -= SUBSTEP_DT;
+    while (this.acc >= SIM_DT) {
+      this.acc -= SIM_DT;
+      this.tick();
     }
-    this.creditGate();
-    this.repelOthers();
   }
 
-  /** Live sim state + visual extras. Module scratch — do not retain. */
+  /**
+   * Adopt the server's authoritative own-state and replay everything it has not
+   * acknowledged. The position jump the correction introduces is moved into the
+   * VISUAL offset instead of onto the screen, so a converged client (correction
+   * 0m) renders with an offset of exactly 0 and a small correction is absorbed
+   * over ~120ms; a jump past ERR_SNAP_M is a teleport and snaps.
+   * @returns the correction in metres.
+   */
+  reconcile(auth: Readonly<KartSim>, ackSeq: number): number {
+    const s = this.pred.state();
+    const preX = s.x;
+    const preZ = s.z;
+    const corr = this.pred.reconcile(auth, ackSeq);
+    this.lastCorr = corr;
+    if (corr <= 0) return corr;
+    if (corr > ERR_SNAP_M) {
+      this.errX = 0; // teleport (respawn / grid wipe / desync): show it honestly
+      this.errZ = 0;
+      this.errClamped = 0;
+      return corr;
+    }
+    this.errX += preX - s.x;
+    this.errZ += preZ - s.z;
+    const mag = Math.hypot(this.errX, this.errZ);
+    if (mag > ERR_SNAP_M) {
+      this.errClamped++;
+      if (this.errClamped >= ERR_CLAMP_GIVE_UP) {
+        // sustained divergence: smoothing has become a lie about where the kart
+        // is — drop the whole offset rather than render permanently offset
+        this.errX = 0;
+        this.errZ = 0;
+        this.errClamped = 0;
+        return corr;
+      }
+      const k = ERR_SNAP_M / mag; // stacked corrections must never park us far off
+      this.errX *= k;
+      this.errZ *= k;
+    } else {
+      this.errClamped = 0;
+    }
+    return corr;
+  }
+
+  /**
+   * Hand every input produced since the last flush to `send` (which must
+   * serialize synchronously — these objects are still owned by the predictor).
+   * @returns how many inputs were sent.
+   */
+  flush(send: (m: KartC2S) => void): number {
+    const box = this.outbox;
+    const n = box.length;
+    for (let i = 0; i < n; i++) {
+      const m = box[i];
+      if (m !== undefined) send(m);
+    }
+    box.length = 0;
+    return n;
+  }
+
+  /**
+   * Live predicted state + the visual offset + visual extras. Module scratch —
+   * do not retain. This is the RENDERED view of the kart, not the sim's own
+   * state: the visual error offset is folded into x/z, and while frozen the
+   * velocity reads 0 (a parked grid must show a parked speedo and an idling
+   * engine). The predictor's true state is never touched by either — physics,
+   * gates and the replay all run on the real numbers.
+   */
   state(): DriveState {
-    const k = this.k;
+    const k = this.pred.state();
     const o = STATE_OUT;
-    o.x = k.x; o.y = k.y; o.z = k.z; o.yaw = k.yaw;
-    o.vx = k.vx; o.vz = k.vz;
+    o.x = k.x + this.errX; // RENDERED position: physics/gates use the true one
+    o.y = k.y;
+    o.z = k.z + this.errZ;
+    o.yaw = k.yaw;
+    o.vx = this.frozen ? 0 : k.vx;
+    o.vz = this.frozen ? 0 : k.vz;
     o.gear = k.gear; o.shiftLeft = k.shiftLeft;
     o.drifting = k.drifting;
     o.nitroLeft = k.nitroLeft;
+    o.expectedGate = k.expectedGate;
+    o.anchorX = k.anchorX; o.anchorZ = k.anchorZ; o.anchorYaw = k.anchorYaw;
     o.steer = this.eff.steer;
     o.driftVisual = this.driftVis;
-    o.speed = forwardSpeed(k);
+    o.speed = this.frozen ? 0 : forwardSpeed(k);
     o.assist = this.assistOn;
     return o;
   }
@@ -265,176 +312,85 @@ export class DriveController {
     return this.eff.throttle;
   }
 
-  /**
-   * 15Hz kart_state packet for the wire: non-null once per PACKET_DT of stepped
-   * sim time. Module scratch — serialize/send immediately, do not retain.
-   */
-  packet(): KartC2S | null {
-    if (this.pktClock < PACKET_DT) return null;
-    this.pktClock -= PACKET_DT;
-    const k = this.k;
-    const p = PACKET_OUT;
-    p.seq = ++this.seq;
-    p.p[0] = k.x; p.p[1] = k.y; p.p[2] = k.z;
-    p.yaw = k.yaw;
-    p.v[0] = k.vx; p.v[1] = k.vz;
-    p.steer = this.eff.steer;
-    p.drift = k.drifting; // actual drift state — what remote skid visuals need
-    return p;
+  /** Inputs still awaiting a server ack (netcode health / telemetry). */
+  pending(): number {
+    return this.pred.pendingCount();
+  }
+
+  /** Metres the last reconcile() moved the predicted kart (0 = converged). */
+  lastCorrection(): number {
+    return this.lastCorr;
+  }
+
+  /** The last input seq produced (what the server's ack is compared against). */
+  seqNo(): number {
+    return this.seq;
   }
 
   // ---- internals --------------------------------------------------------------
 
-  /**
-   * KIDS MODE assist channel — owns e.steer while assist is on, layering three
-   * safeties over pure pursuit (all deterministic on sim time, no allocation).
-   * WRONG-WAY RECOVERY: facing more than WRONG_WAY_RAD off the nearest
-   * centerline tangent for WRONG_WAY_HOLD_S continuous drops pursuit in favor
-   * of a full-lock steer toward the tangent (the sign that shrinks the yaw
-   * error fastest) until aligned within RECOVER_DONE_RAD. REVERSE FLIP: the
-   * bicycle model's yaw rate is proportional to speedF, so while reversing the
-   * whole assist output is mirrored (backing up steers opposite, like a real
-   * car). Pure pursuit: walk the centerline forward from the kart's nearest
-   * sample to the point ~PURSUIT_AHEAD m ahead, then steer toward it. Positive
-   * steer = RIGHT (yaw decreases): with the platform yaw convention
-   * forward = (-sin(yaw), -cos(yaw)), the desired yaw to a target is
-   * atan2(-dx, -dz), so steer = clamp(-yawErr * gain) turns toward the target.
-   */
-  private assistSteer(dtc: number): number {
-    const k = this.k;
-    const cl = this.track.centerline;
-    const n = cl.length;
-    const i0 = closestOnTrack(this.track, k.x, k.z).index;
-    const a0 = cl[i0]!;
-    const b0 = cl[(i0 + 1) % n]!;
-    // travel direction at the nearest sample — same yaw convention as creditGate
-    const travelYaw = Math.atan2(-(b0[0] - a0[0]), -(b0[1] - a0[1]));
-    const yawErr = wrapPi(travelYaw - k.yaw); // facing vs travel, |·| in 0..π
-    if (this.recovering) {
-      if (Math.abs(yawErr) < RECOVER_DONE_RAD) {
-        this.recovering = false;
-        this.wrongWayT = 0;
-      }
-    } else if (Math.abs(yawErr) > WRONG_WAY_RAD) {
-      this.wrongWayT += dtc;
-      if (this.wrongWayT > WRONG_WAY_HOLD_S) this.recovering = true;
-    } else {
-      this.wrongWayT = 0;
+  /** One SIM_DT of driver intent: build it, apply it, queue it. */
+  private tick(): void {
+    const e = this.eff;
+    if (this.frozen) {
+      e.throttle = 0; e.brake = 0; e.steer = 0; e.drift = false;
+      this.respawnPending = false; // a respawn means nothing on a frozen grid
+      this.emit(false); // liveness only: sent, never simulated on either side
+      return;
     }
-
-    let steer: number;
-    if (this.recovering) {
-      // full lock toward the tangent: positive steer = RIGHT = yaw decreases
-      steer = yawErr > 0 ? -1 : 1;
+    const k = this.pred.state();
+    e.throttle = clamp((this.keyUp ? 1 : 0) + this.ext.throttle, 0, 1);
+    e.brake = clamp((this.keyDown ? 1 : 0) + this.ext.brake, 0, 1);
+    // KIDS MODE: the steer channel is fully owned by the assist controller.
+    if (this.assistOn) {
+      // STUCK AUTO-RESPAWN (kids can't press R): the rule is shared + unit
+      // tested (sim.ts stuckStep) because losing it strands a wedged player.
+      if (stuckStep(this.assist, e.throttle, forwardSpeed(k), SIM_DT)) this.respawn();
+      e.steer = pursuitSteer(this.track, k, this.assist, SIM_DT);
     } else {
-      let i = i0;
-      let ahead = 0;
-      for (let steps = 0; steps < n && ahead < PURSUIT_AHEAD; steps++) {
-        const a = cl[i]!;
-        i = (i + 1) % n;
-        const b = cl[i]!;
-        ahead += Math.hypot(b[0] - a[0], b[1] - a[1]);
-      }
-      const target = cl[i]!;
-      const desiredYaw = Math.atan2(-(target[0] - k.x), -(target[1] - k.z));
-      steer = clamp(-wrapPi(desiredYaw - k.yaw) * PURSUIT_GAIN, -1, 1);
+      e.steer = clamp((this.keyRight ? 1 : 0) - (this.keyLeft ? 1 : 0) + this.ext.steer, -1, 1);
     }
-    // mirror the command while backing up (yaw response flips with speedF)
-    return forwardSpeed(k) < REVERSE_FLIP_SPEED ? -steer : steer;
-  }
-
-  private substep(): void {
-    const k = this.k;
-    stepKart(k, this.eff, SUBSTEP_DT, surfaceAt(this.track, k.x, k.z));
-    this.collideBarrier();
-    // smoothed skid intensity for the renderer (deterministic per substep count)
+    e.drift = this.keyDrift || this.ext.drift;
+    const respawn = this.respawnPending;
+    this.respawnPending = false;
+    const msg = this.emit(respawn);
+    this.pred.push(msg); // applied NOW — this is what keeps the local kart instant
+    // smoothed skid intensity for the renderer (deterministic per sim tick)
     const target = k.drifting ? 1 : 0;
-    this.driftVis += (target - this.driftVis) * Math.min(1, DRIFT_VIS_RATE * SUBSTEP_DT);
+    this.driftVis += (target - this.driftVis) * Math.min(1, DRIFT_VIS_RATE * SIM_DT);
   }
 
   /**
-   * Barrier band: the kart center may not exceed |lateral| > roadHalfW +
-   * BARRIER_OUT - KART_RADIUS. Push out along the centerline normal by the
-   * OVERSHOOT ONLY (teleporting to the sample's band point would discard the
-   * tangential motion and freeze a wall-grinding kart in place), and keep
-   * BARRIER_DAMP of the normal speed, bounced inward.
+   * Allocate this tick's wire input and queue it for sending. ONE allocation
+   * per sim tick is required, not a leak: the predictor retains the object for
+   * replay, so it can never be a reused scratch object.
    */
-  private collideBarrier(): void {
-    const k = this.k;
-    const t = this.track;
-    const lim = t.roadHalfW + BARRIER_OUT - KART_RADIUS;
-    const c = closestOnTrack(t, k.x, k.z);
-    const over = Math.abs(c.lateral) - lim;
-    if (over <= 0) return;
-    const side = c.lateral > 0 ? 1 : -1;
-    const cl = t.centerline;
-    const a = cl[c.index]!;
-    const b = cl[(c.index + 1) % cl.length]!;
-    const dx = b[0] - a[0];
-    const dz = b[1] - a[1];
-    const len = Math.hypot(dx, dz) || 1;
-    // left-of-travel unit normal — matches closestOnTrack's lateral sign
-    const nx = -dz / len;
-    const nz = dx / len;
-    k.x -= nx * side * over;
-    k.z -= nz * side * over;
-    const vn = k.vx * nx + k.vz * nz;
-    if (vn * side > 0) {
-      // still moving outward: damped reflection off the wall
-      const cut = vn * (1 + BARRIER_DAMP);
-      k.vx -= nx * cut;
-      k.vz -= nz * cut;
-    }
+  private emit(respawn: boolean): KartInputMsg {
+    const e = this.eff;
+    const msg: KartInputMsg = {
+      t: 'kart_input',
+      seq: ++this.seq,
+      throttle: e.throttle,
+      brake: e.brake,
+      steer: e.steer,
+      drift: e.drift,
+      respawn,
+      dt: SIM_DT,
+    };
+    if (this.outbox.length >= OUTBOX_CAP) this.outbox.shift(); // socket away: drop oldest
+    this.outbox.push(msg);
+    return msg;
   }
 
-  /** Server rule mirrored locally: credit within GATE_RADIUS of the expected gate, in order. */
-  private creditGate(): void {
-    const g = this.track.gates[this.expectedGate]!; // GATES entries; index kept in range below
-    const dx = this.k.x - g.x;
-    const dz = this.k.z - g.z;
-    if (dx * dx + dz * dz > GATE_RADIUS * GATE_RADIUS) return;
-    this.anchorX = g.x;
-    this.anchorZ = g.z;
-    this.anchorYaw = Math.atan2(-g.tx, -g.tz); // face along travel (platform yaw convention)
-    this.expectedGate = (this.expectedGate + 1) % GATES;
-  }
-
-  /** Soft circle push: separate half the overlap from any kart closer than 2*KART_RADIUS. */
-  private repelOthers(): void {
-    const k = this.k;
-    const minD = 2 * KART_RADIUS;
-    let pushed = false;
-    for (const o of this.others) {
-      let dx = k.x - o[0];
-      let dz = k.z - o[2];
-      const d2 = dx * dx + dz * dz;
-      if (d2 >= minD * minD) continue;
-      let d = Math.sqrt(d2);
-      if (d < 1e-6) {
-        dx = 1; dz = 0; d = 1; // stacked exactly: deterministic split direction
-      }
-      const push = ((minD - d) * 0.5) / d; // half each — the remote client resolves its own
-      k.x += dx * push;
-      k.z += dz * push;
-      pushed = true;
-    }
-    if (pushed) this.collideBarrier(); // a shove can land us past the wall
-  }
-
-  /** R — back to the last credited gate (or the spawn point) with a fresh kart. */
+  /** R / kids-mode stuck recovery — the teleport rides the NEXT input. */
   private respawn(): void {
-    const k = this.k;
-    k.x = this.anchorX; k.y = 0; k.z = this.anchorZ; k.yaw = this.anchorYaw;
-    k.vx = 0; k.vz = 0;
-    k.gear = 1; k.shiftLeft = 0;
-    k.drifting = false;
-    this.acc = 0;
+    this.respawnPending = true;
     this.driftVis = 0;
-    this.pktClock = PACKET_DT; // tell the server at once
-    this.correctSuppress = CORRECT_SUPPRESS_S; // echoes of the old spot are stale now
-    this.wrongWayT = 0; // re-anchored facing travel — recovery state is moot
-    this.recovering = false;
-    this.stuckT = 0;
+    this.errX = 0; // the pre-teleport visual error is meaningless at the anchor
+    this.errZ = 0;
+    this.assist.wrongWayT = 0; // re-anchored facing travel — recovery state is moot
+    this.assist.recovering = false;
+    this.assist.stuckT = 0;
   }
 
   private clearHeld(): void {

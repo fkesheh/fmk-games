@@ -3,17 +3,33 @@
 // e2e-bank — prove BANK runs end-to-end in a real (headless) browser.
 //
 // Builds the whole monorepo first (npm run build must produce
-// games/bank/client/dist), spawns the production platform server
-// (platform/server/dist), then drives THREE browser instances (separate
-// processes: no cross-tab timer throttling) through the window.__bank debug
-// surface against the multi-game static route /bank/:
+// games/bank/client/dist; set E2E_SKIP_BUILD=1 to reuse an existing dist),
+// spawns the production platform server (platform/server/dist) on E2E_PORT
+// (default 8182), then drives THREE browser instances (separate processes: no
+// cross-tab timer throttling) through the window.__bank debug surface against
+// the multi-game static route /bank/:
 //   A createPrivate('Alice') -> private-room code; B joinPrivate('Bob', code);
-//   both see 2 players; the current player (found by polling state()) rolls
+//   both see 2 players; the room then SITS THERE — BANK has no auto-start, so
+//   the suite holds 6s and asserts the lobby is STILL a lobby with the round
+//   un-advanced while the server reports canStart ('lobby does not auto-start'
+//   — the room COULD have started and chose not to); only then does a seated
+//   player press the REAL top control, button.btn.btn-gold.btn-start ("START
+//   MATCH", `hidden` outside the lobby and `disabled` until canStart), which is
+//   what moves the room to 'playing'; the current player (found by polling
+//   state()) rolls
 //   until pot > 0; B banks mid-round REGARDLESS of turn -> B score == pot at
 //   bank time, the pot itself is UNCHANGED (banking never drains it), B is
 //   marked banked; the non-banked pages keep rolling until the round ends
-//   (bust7 / all_banked; the 30s auto-roll backstops termination) -> the
+//   (bust7 / all_banked; the 12s auto-roll backstops termination) -> the
 //   round increments (or match_end after round 10 — loop is capped).
+// MANUAL START, everywhere: a finished match returns to the lobby and WAITS,
+//   and every freshly created room opens in the lobby too. Each point where the
+//   suite needs play running therefore presses start — the primary press is a
+//   real button click, and window.__bank.start() is the fallback used only for
+//   the defensive re-press guard where the button may not be on screen. The
+//   press is ALWAYS gated on the server-authoritative `canStart`, never on the
+//   purely cosmetic `awaitingStart` (which merely distinguishes a post-match
+//   lobby from a cold one for wording purposes).
 // (20) mid-round join (docs/BANK.md "Join/leave"): page C joins the SAME code
 //   during round 1 -> all three pages see players.length === 3, C's entry is
 //   NOT pre-banked (banked=false: mid-round joiners participate immediately),
@@ -29,7 +45,10 @@
 //   SECOND private room on the variant; B rejoins by the fresh code; both
 //   pages must deep-match state().settings ({sevenBonus:false,totalRounds:20,
 //   raceTarget:null}) and show the variant label in the table header chip
-//   ("20 rounds · plain 7").
+//   ("20 rounds · plain 7"). That second room is a NEW room, so it too opens in
+//   the lobby and waits: the suite asserts it did not auto-start with 2 seats
+//   and then presses its START MATCH button to open match 2, so the invite and
+//   leave scenarios below run against a live table exactly as before.
 // (26) invite: in A's private room the table UI must show the room's code in a
 //   visible chip next to a COPY-INVITE-ish button, and a fresh page D opened
 //   directly on /bank/?code=<code> must prefill the menu code input (or
@@ -55,12 +74,21 @@ import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const PORT = Number(process.env.E2E_PORT ?? 8080);
+const PORT = Number(process.env.E2E_PORT ?? 8182);
 const BASE = `http://localhost:${PORT}`;
 const SHOTS_DIR = path.join(ROOT, 'screenshots');
 
 // fields the BANK.md debug surface freezes for window.__bank.state()
 const BANK_STATE_FIELDS = ['phase', 'round', 'pot', 'rollCount', 'currentId', 'you', 'players'];
+
+// games/bank/shared/src/config.ts MIN_PLAYERS. state() carries playerCount /
+// canStart but NOT minPlayers, so the seat threshold is mirrored here; every
+// gate still prefers the server's own `canStart` and uses this only to report
+// seat counts (and as the ?? fallback should minPlayers ever appear).
+const BANK_MIN_PLAYERS = 2;
+
+// How long the full lobby is held to prove nothing starts it but a player.
+const LOBBY_HOLD_MS = 6000;
 
 // ---- tiny framework -----------------------------------------------------------
 const results = [];
@@ -199,6 +227,78 @@ async function shot(page, name) {
   console.log(`shot  ${name} (retry, ${((Date.now() - t0) / 1000).toFixed(1)}s)`);
 }
 
+// ---- manual start helpers -------------------------------------------------------------
+// BANK never starts itself. `{t:'start'}` from any SEATED player is the only
+// way out of the lobby, and the room silently ignores a press that is not legal
+// (wrong phase / too few seats), so the harness must press at a moment the
+// server would honour: phase 'lobby' AND canStart true.
+
+/**
+ * Press START through the REAL control a player uses:
+ * `button.btn.btn-gold.btn-start` ("START MATCH"). It carries the `hidden`
+ * class outside the lobby and is `disabled` until the server-authoritative
+ * `canStart` flips, so polling the click until it lands IS the readiness wait —
+ * no separate state gate is needed and no press can go out illegally.
+ * Both guards matter: `disabled` is only refreshed inside the client's lobby
+ * branch, so a stale `disabled === false` survives into 'playing'; `hidden` is
+ * what actually tracks the phase.
+ */
+async function pressStartButton(page, label, timeoutMs = 20000) {
+  await waitFor(
+    () =>
+      page.evaluate(() => {
+        const b = document.querySelector('.btn-start');
+        if (b && !b.disabled && !b.classList.contains('hidden')) {
+          b.click();
+          return true;
+        }
+        return false;
+      }),
+    timeoutMs,
+    label,
+  );
+}
+
+/** Legit fallback press for spots where the button is not on screen. */
+const debugStart = (page) => page.evaluate(() => window.__bank?.start());
+
+/** Poll until this page reports 'playing' (i.e. the press landed). */
+const waitForPlaying = (page, label, timeoutMs = 15000) =>
+  waitFor(
+    async () => {
+      const s = await bankState(page);
+      return s !== null && s.phase === 'playing' ? s : null;
+    },
+    timeoutMs,
+    label,
+  );
+
+/**
+ * Best-effort repair, NOT an assertion: make sure a match is running before a
+ * scenario that needs one. A match that ends drops the room back to 'lobby'
+ * (after the matchEnd -> fullReset beat) and WAITS there forever, so any step
+ * the suite reaches after a match end would otherwise stall on a dead table.
+ * Uses the debug press because the caller may be mid-banner/overlay; returns
+ * the phase it settled on and never throws.
+ */
+async function ensureMatchRunning(page, timeoutMs = 30000) {
+  const t0 = Date.now();
+  for (;;) {
+    const s = await bankState(page);
+    if (s !== null && s.phase === 'playing') return 'playing';
+    // 'matchEnd' is a timed beat on its way to the lobby — just wait it out.
+    if (s !== null && s.phase === 'lobby' && s.canStart === true) {
+      try {
+        await debugStart(page);
+      } catch {
+        // page mid-navigation — retried on the next lap
+      }
+    }
+    if (Date.now() - t0 > timeoutMs) return s === null ? 'unknown' : s.phase;
+    await sleep(400);
+  }
+}
+
 // ---- gameplay helpers ---------------------------------------------------------------
 /** Roll from this page only when the server says it is this player's turn. */
 async function rollIfCurrent(page, s) {
@@ -256,7 +356,9 @@ const variantLabelIn = (text) => /20\s*rounds/i.test(text) && /plain\s*7/i.test(
 // ---- main ---------------------------------------------------------------------------
 async function main() {
   await mkdir(SHOTS_DIR, { recursive: true });
-  buildAll();
+  // E2E_SKIP_BUILD=1 (and only exactly '1') reuses whatever dist is on disk —
+  // the orchestrator builds once and then runs several suites back to back.
+  if (process.env.E2E_SKIP_BUILD !== '1') buildAll();
   startServer();
   await waitForServer();
   console.log(`server up on ${BASE} (bank client at /bank/)`);
@@ -304,12 +406,53 @@ async function main() {
     `A sees [${bothSee2.sa.players.map((p) => p.name)}] B sees [${bothSee2.sb.players.map((p) => p.name)}]`,
   );
 
-  // -- round 1 starts once MIN_PLAYERS are connected -------------------------------------
-  await waitFor(async () => {
-    const s = await bankState(A);
-    return s !== null && s.phase === 'playing' ? s : null;
-  }, 15000, "phase 'playing'");
-  check("phase reaches 'playing' with 2 players", true);
+  // -- the seated lobby must NOT start itself ---------------------------------------------
+  // Both seats are filled and the server says canStart — under the old rules the
+  // room would already be dealing. The whole point of the manual-start change is
+  // that reaching MIN_PLAYERS makes a room STARTABLE, not started, so hold well
+  // past any plausible auto-start delay and prove the room stayed put: still
+  // 'lobby' on both pages, round un-advanced, and canStart still true (the
+  // server is telling us a press would land right now — the room COULD have
+  // started and chose not to). `awaitingStart` is COSMETIC (it only separates a
+  // post-match lobby from a cold one for the banner wording) and is deliberately
+  // NOT part of this gate.
+  let seatedLobby = null;
+  try {
+    seatedLobby = await waitFor(async () => {
+      const s = await bankState(A);
+      return s !== null && s.phase === 'lobby' && s.canStart === true && s.playerCount >= BANK_MIN_PLAYERS
+        ? s
+        : null;
+    }, 15000, 'A sees a startable lobby (2 seated, canStart)');
+  } catch {
+    seatedLobby = await bankState(A); // recorded as a failure by the assertion below
+  }
+  const roundAtSeat = seatedLobby === null ? -1 : seatedLobby.round;
+  await sleep(LOBBY_HOLD_MS);
+  const [heldA, heldB] = await Promise.all([bankState(A), bankState(B)]);
+  check(
+    'lobby does not auto-start',
+    seatedLobby !== null &&
+      seatedLobby.canStart === true &&
+      heldA !== null &&
+      heldA.phase === 'lobby' &&
+      heldA.round === roundAtSeat &&
+      heldA.canStart === true &&
+      heldB !== null &&
+      heldB.phase === 'lobby' &&
+      heldB.round === roundAtSeat,
+    `after ${LOBBY_HOLD_MS}ms seated: A phase=${heldA?.phase} round=${heldA?.round} (was ${roundAtSeat}) ` +
+      `canStart=${heldA?.canStart} playerCount=${heldA?.playerCount}/${BANK_MIN_PLAYERS} ` +
+      `awaitingStart=${heldA?.awaitingStart} · B phase=${heldB?.phase} round=${heldB?.round}`,
+  );
+
+  // -- round 1 starts when a SEATED PLAYER presses START MATCH ----------------------------
+  // The primary press of the suite goes through the real button, so the harness
+  // exercises exactly what a player does (and proves the control is enabled,
+  // visible and wired) rather than shortcutting to window.__bank.start().
+  await pressStartButton(A, 'A clicks .btn-start (START MATCH)');
+  await waitForPlaying(A, "phase 'playing' after A presses START MATCH");
+  check("phase reaches 'playing' with 2 players", true, 'opened by A clicking button.btn-start');
 
   // -- (20) mid-round join: C sits down in round 1 and plays IMMEDIATELY -----------
   // docs/BANK.md "Join/leave": a mid-round joiner is appended to the END of the
@@ -449,6 +592,15 @@ async function main() {
     `round ${roundBefore} -> ${advanced.round} phase=${advanced.phase}`,
   );
 
+  // The loop above is allowed to exit on match_end, and a finished BANK match
+  // does NOT roll into another one: it resets to the lobby and waits. Re-press
+  // (best effort, no assertion of its own) so the reconnect scenario below runs
+  // against a live table instead of a parked lobby.
+  {
+    const phase = await ensureMatchRunning(A);
+    console.log(`note  pre-reconnect table phase: ${phase}`);
+  }
+
   // -- (21) reconnect: B reloads and RESUMES its entry via the stored resume token -----
   // docs/BANK.md "Rejoin (resume token)": the client persists its playerId and
   // joinPrivate re-sends it as `resume`; the room re-binds the disconnected
@@ -571,6 +723,30 @@ async function main() {
     'variant: table header chip shows the variant label (both pages)',
     variantLabelIn(headerA) && variantLabelIn(headerB),
     `A="${headerA.split('\n')[0]?.trim()}" B="${headerB.split('\n')[0]?.trim()}"`,
+  );
+
+  // -- variant room: a FRESH room is a fresh lobby, so it waits for START too -------
+  // createPrivate opened a brand-new room; filling its second seat did not start
+  // it (asserted below on the state read here, which is still the pre-press
+  // lobby), and pressing its own START MATCH button opens match 2. Soft-gated:
+  // a failure here must not abort the invite/leave scenarios that follow.
+  const variantLobby = await bankState(A);
+  let variantPlaying = null;
+  try {
+    await pressStartButton(A, 'A clicks .btn-start in the variant room');
+    variantPlaying = await waitForPlaying(A, "variant room reaches 'playing' after START");
+  } catch {
+    // recorded as a failing assertion below
+  }
+  check(
+    'variant: the fresh room waits for START too, then its button opens match 2',
+    variantLobby !== null &&
+      variantLobby.phase === 'lobby' &&
+      variantLobby.canStart === true &&
+      variantPlaying !== null,
+    `pre-press phase=${variantLobby?.phase} canStart=${variantLobby?.canStart} ` +
+      `playerCount=${variantLobby?.playerCount} -> post-press phase=${variantPlaying?.phase ?? 'never playing'} ` +
+      `round=${variantPlaying?.round}`,
   );
 
   // -- (26) invite: the private-room code is shareable from the table UI ----------

@@ -2,7 +2,7 @@
 // ============================================================================
 // capture-visuals — the VISUAL_UPGRADE.md §6 screenshot harness.
 //
-// Produces the frozen 31-shot list at 1600x900 / deviceScaleFactor 1 into
+// Produces the frozen 35-shot list at 1600x900 / deviceScaleFactor 1 into
 // screenshots/<version>/ and prints a JSON manifest of {name, game, file} as
 // the LAST stdout line so the art-director judge can pair every shot with the
 // task that owns it.
@@ -10,12 +10,34 @@
 // Same proven pattern as scripts/e2e.mjs: the production build must already
 // exist (npm run build), the platform server is spawned on E2E_PORT, every
 // page is driven through the frozen window.__fps / window.__kart / window.__bank
-// debug surfaces, and everything is torn down in a finally block.
+// / window.__wordbomb debug surfaces, and everything is torn down in a finally
+// block.
+//
+// MANUAL START — the rule that shapes every gameplay shot below. NO game on
+// this platform auto-starts any more: every room sits in its LOBBY phase
+// (fps 'warmup', kart/bank/wordbomb 'lobby') until a SEATED player sends an
+// explicit start, and the SERVER is the only judge — an early press is ignored
+// in silence, never an error. So every step that needs a running match polls
+// for the room's own canStart signal and then presses, re-pressing until the
+// phase actually moves:
+//   fps       — no __fps.start() exists. The HUD's `button.fh-start-btn`
+//               (ui/hud.ts) is clicked once the server un-disables it. Bots
+//               COUNT as seats, so the bot fallback fills to MIN 2 and presses.
+//   kart      — `button.lobby-start` / `__kart.startRace()`, gated on
+//               `__kart.state().canStart`.
+//   bank      — `button.btn-start` / `__bank.start()`, gated on
+//               `__bank.state().canStart`.
+//   wordbomb  — `__wordbomb.start()`, gated on `state().canStart`, followed by
+//               a LOBBY_COUNTDOWN_MS (3000ms) beat before phase 'live'.
+// Nothing here ever sleeps a fixed round length: every phase change is polled.
 //
 // How each shot is DRIVEN (there is no free camera anywhere — the camera is
 // always a real player's camera, so every pose is reached by real gameplay):
 //
-//   launcher      — GET / (the platform launcher page).
+//   launcher      — GET / (the platform launcher page). With FOUR game cards
+//                   the 2x2 grid can run past 900px, so this one shot grows its
+//                   viewport to the document height before capturing — all four
+//                   cards must be fully in frame.
 //   fps-<map>-a   — private room on <map>, alone (phase warmup). Map GEOMETRY is
 //   fps-<map>-b     loaded into this process (esbuild-bundled from
 //   fps-<map>-c     games/fps/shared/src/maps) and 2D-raycast from the player's
@@ -56,6 +78,21 @@
 //                   still animating when the capture returns; up to 3 attempts).
 //   bank-results  — every player banks each round until round 10 ends -> the
 //                   'matchEnd' winner banner.
+//   wordbomb-lobby— 2 pages seated in a private room, canStart true, captured
+//                   BEFORE the start press: the START control is live.
+//   wordbomb-live — phase 'live': the fragment is up, the fuse bar is burning
+//                   and one player is locked (a real word containing the
+//                   round's fragment, picked out of the committed dictionary
+//                   blob games/wordbomb/server/data/words.blob and submitted
+//                   through __wordbomb.submit).
+//   wordbomb-boom — the reveal: phase 'reveal' with lastBoom() populated, every
+//                   answer visible. The window is revealMsFor(2) = 8200ms, so
+//                   the watcher polls at 200ms and captures immediately.
+//   wordbomb-results— phase 'matchEnd'. A default match is 10 rounds (~4min),
+//                   so the room is created with rounds: 5 (ROUNDS_MIN) and both
+//                   pages submit a word every round so the standings carry real
+//                   numbers. matchEnd holds for MATCH_END_MS (12000ms) before
+//                   the room drops back to lobby — the capture lands inside it.
 //
 // Flags: --out <dir> (default screenshots/v2) · --only <prefix> (capture just
 // the shots whose name starts with <prefix>; the other games are never even
@@ -78,7 +115,7 @@
 // and being partial-safe never turns a missing shot into a pass.
 // ============================================================================
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -111,6 +148,10 @@ const SHOT_LIST = [
   { name: 'bank-table', game: 'bank' },
   { name: 'bank-roll', game: 'bank' },
   { name: 'bank-results', game: 'bank' },
+  { name: 'wordbomb-lobby', game: 'wordbomb' },
+  { name: 'wordbomb-live', game: 'wordbomb' },
+  { name: 'wordbomb-boom', game: 'wordbomb' },
+  { name: 'wordbomb-results', game: 'wordbomb' },
 ];
 
 // ---- args --------------------------------------------------------------------
@@ -327,7 +368,7 @@ async function waitForServer(timeoutMs = 20000) {
  * a half-finished edit rather than the reviewed build. Detect and refuse.
  */
 async function assertProductionMounts(gameIds) {
-  const devPorts = { fps: 5173, bank: 5174, kart: 5175 };
+  const devPorts = { fps: 5173, bank: 5174, kart: 5175, wordbomb: 5176 };
   for (const id of gameIds) {
     const res = await fetch(`${BASE}/${id}/`, { signal: AbortSignal.timeout(5000) });
     if (!res.ok) throw new Error(`GET /${id}/ returned ${res.status} — is the client built? (npm run build)`);
@@ -890,7 +931,64 @@ async function walkFor(page, ms, x = 0, z = 1) {
   await sleep(250); // let the server sim settle the stop before sampling pos
 }
 
+/**
+ * MANUAL START (fps): the room stays in 'warmup' forever until a seated player
+ * presses START. There is NO window.__fps.start() — the debug surface does not
+ * expose one and this harness does not edit game source — so the only door is
+ * the HUD button (`.fh-start-btn`, games/fps/client/src/ui/hud.ts), which the
+ * server keeps `disabled` until canStart (phase 'warmup' and >= 2 seats; BOTS
+ * COUNT as seats). page.click() is unreliable here — the HUD layer sits under a
+ * pointer-locked canvas — so the click is dispatched in-page through the real
+ * handler.
+ *
+ * The press is retried every 500ms until the phase actually leaves 'warmup':
+ * the server is the only judge and it ignores an early press in SILENCE, so a
+ * single fire-and-forget press would hang the whole section on nothing.
+ */
+async function startFpsMatch(page, timeoutMs = 90000) {
+  const t0 = Date.now();
+  let presses = 0;
+  for (;;) {
+    const s = await fpsState(page).catch(() => null);
+    // 'matchEnd' is NOT started: the room drops back to 'warmup' and waits for
+    // another press, so the loop keeps polling (the button is disabled until
+    // then, so nothing is sent in the meantime).
+    if (s !== null && (s.phase === 'freeze' || s.phase === 'live' || s.phase === 'roundEnd')) {
+      log(`fps: match started (phase ${s.phase}) after ${presses} START press(es)`);
+      return s;
+    }
+    const pressed = await page
+      .evaluate(() => {
+        const b = document.querySelector('.fh-start-btn');
+        if (b !== null && !b.disabled) {
+          b.click();
+          return true;
+        }
+        return false;
+      })
+      .catch(() => false);
+    if (pressed) presses++;
+    if (Date.now() - t0 > timeoutMs) {
+      assertServerAlive();
+      throw new Error(
+        `the fps room never left 'warmup' within ${(timeoutMs / 1000).toFixed(0)}s (${presses} START press(es) landed; ` +
+          `the button is disabled until the server says canStart) — ${await describeFpsPage(page, 'start')}`,
+      );
+    }
+    await sleep(500);
+  }
+}
+
 // ---- section: launcher ---------------------------------------------------------
+/**
+ * The launcher is server-rendered (platform/server/src/index.ts) and now shows
+ * FOUR game cards in a 2x2 grid. At 1600x900 the hero + two card rows can run
+ * past the fold, and a clipped card is exactly the defect this shot exists to
+ * catch — so the viewport is grown to the document's own height (capped) before
+ * the capture, and every `.card` is then verified to be fully inside it.
+ */
+const LAUNCHER_MAX_HEIGHT = 2200;
+
 async function captureLauncher() {
   const page = await launchOne('launcher');
   try {
@@ -900,7 +998,37 @@ async function captureLauncher() {
       10000,
       'launcher body content',
     );
+    const cards = await waitFor(
+      () => page.evaluate(() => document.querySelectorAll('.card').length),
+      10000,
+      'the launcher game cards',
+    );
+    // grow the frame to whatever the page actually needs (never shrink it)
+    const needed = await page.evaluate(() =>
+      Math.ceil(
+        Math.max(
+          document.documentElement.scrollHeight,
+          document.body.scrollHeight,
+          ...[...document.querySelectorAll('.card')].map((c) => c.getBoundingClientRect().bottom + window.scrollY),
+        ),
+      ),
+    );
+    const height = Math.min(LAUNCHER_MAX_HEIGHT, Math.max(VIEWPORT.height, needed + 8));
+    if (height !== VIEWPORT.height) {
+      await page.setViewport({ ...VIEWPORT, height });
+      await sleep(300); // the responsive grid reflows at the new height
+    }
     await settle(page, { frames: 2, ms: 500 });
+    const clipped = await page.evaluate(() =>
+      [...document.querySelectorAll('.card')]
+        .map((c, i) => ({ i, bottom: Math.round(c.getBoundingClientRect().bottom) }))
+        .filter((c) => c.bottom > window.innerHeight)
+        .map((c) => `card#${c.i} bottom=${c.bottom}`),
+    );
+    if (clipped.length > 0) {
+      log(`[warn] launcher: ${clipped.length} card(s) still below the fold at ${height}px — ${clipped.join(', ')}`);
+    }
+    log(`launcher: ${cards} card(s) framed at ${VIEWPORT.width}x${height}`);
     await shot(page, 'launcher');
   } finally {
     await closePage(page);
@@ -1282,14 +1410,25 @@ async function seatFpsPages(pages, names, room, budgetMs = 150000) {
   }
 }
 
-/** Deterministic fallback to a running match on ONE page: fill with bots. */
+/**
+ * Deterministic fallback to a running match on ONE page: fill with bots, THEN
+ * press START. Bots count as seats for MIN_PLAYERS_FOR_MATCH (2), but they do
+ * not press the button — nothing does except a seated player, so the bot fill
+ * only makes the press legal.
+ */
 async function startMatchWithBots(page) {
-  for (let i = 0; i < 2; i++) {
+  for (let i = 0; i < 3; i++) {
     const s = await fpsState(page);
-    if (s !== null && (s.phase === 'freeze' || s.phase === 'live')) return true;
+    if (s !== null && (s.phase === 'freeze' || s.phase === 'live' || s.phase === 'roundEnd')) return true;
+    if (s !== null && s.players >= 2) break;
     await page.evaluate(() => window.__fps.addBot()).catch(() => {});
     await sleep(1200);
   }
+  const started = await startFpsMatch(page, 60000).catch((err) => {
+    log(`[warn] fps bot fallback: ${errText(err)}`);
+    return null;
+  });
+  if (started === null) return false;
   return (
     (await waitFor(
       async () => {
@@ -1297,7 +1436,7 @@ async function startMatchWithBots(page) {
         return s !== null && (s.phase === 'freeze' || s.phase === 'live') ? s : null;
       },
       45000,
-      'a bot-filled match to start (freeze/live)',
+      'a bot-filled match to reach freeze/live',
       () => describeFpsPage(page, 'cam'),
     ).catch(() => null)) !== null
   );
@@ -1347,6 +1486,9 @@ async function captureFps() {
     // bot-filled room and are still captured.
     const seated = await attempt(['fps-char'], 'fps 3-page seating + fps-char', async () => {
       await seatFpsPages(pages, names, room);
+      // MANUAL START: three seated players is no longer enough — the room holds
+      // in 'warmup' until one of them presses START. Alice presses.
+      await startFpsMatch(A);
       await waitFor(
         async () => {
           const s = await fpsState(A);
@@ -1385,6 +1527,50 @@ async function setAssist(page, on) {
   }
   const s = await kartState(page);
   return s !== null && s.assist === on;
+}
+
+/**
+ * MANUAL START (kart): the room holds in 'lobby' until a seated player presses
+ * START RACE. `canStart` comes straight off the server snapshot, and the server
+ * ignores an early press in silence — so poll canStart, press, and keep pressing
+ * until the phase actually moves. The real `button.lobby-start` is clicked when
+ * it is enabled (that is what a player does); `__kart.startRace()` is the
+ * fallback for the tick where the button has not been rebuilt yet.
+ */
+async function startKartRace(page, timeoutMs = 60000) {
+  const t0 = Date.now();
+  let presses = 0;
+  let last = null;
+  for (;;) {
+    const s = await kartState(page).catch(() => null);
+    if (s !== null) last = s;
+    if (s !== null && s.phase !== 'lobby' && s.phase !== 'menu' && s.phase !== 'none') {
+      log(`kart: race started (phase ${s.phase}) after ${presses} START press(es)`);
+      return s;
+    }
+    if (s !== null && s.canStart === true) {
+      await page
+        .evaluate(() => {
+          const b = document.querySelector('button.lobby-start');
+          if (b !== null && !b.disabled) {
+            b.click();
+            return true;
+          }
+          window.__kart.startRace();
+          return true;
+        })
+        .catch(() => {});
+      presses++;
+    }
+    if (Date.now() - t0 > timeoutMs) {
+      assertServerAlive();
+      throw new Error(
+        `the kart room never left 'lobby' within ${(timeoutMs / 1000).toFixed(0)}s (${presses} START press(es); ` +
+          `last state: phase=${last?.phase ?? 'null'} players=${last?.players ?? '?'} canStart=${last?.canStart ?? '?'})`,
+      );
+    }
+    await sleep(400);
+  }
 }
 
 /** yaw rate (rad/s) over `ms`, plus the sample that produced it */
@@ -1495,6 +1681,9 @@ async function captureKart() {
     const [sa, sb] = await Promise.all([kartState(A), kartState(B)]);
     return sa !== null && sb !== null && sa.players === 2 && sb.players === 2 ? sa : null;
   }, 20000, 'both karts seated');
+
+  // MANUAL START: two karts on the grid no longer start anything on their own.
+  await startKartRace(A);
 
   // grid: the countdown beats (3-2-1) over the painted grid slots
   await attempt(['kart-grid'], 'kart-grid', async () => {
@@ -1624,6 +1813,49 @@ async function captureKart() {
 const bankState = (page) => page.evaluate(() => window.__bank?.state() ?? null);
 const meOf = (s) => (s === null ? null : s.players.find((p) => p.id === s.you) ?? null);
 
+/**
+ * MANUAL START (bank): the table sits in 'lobby' until a seated player presses
+ * START MATCH. `.btn-start` carries a `hidden` class outside 'lobby' and is
+ * `disabled` while !canStart, so the press is gated on the snapshot's own
+ * canStart and repeated until the phase moves — the server drops an illegal
+ * press without a word.
+ */
+async function startBankMatch(page, timeoutMs = 60000) {
+  const t0 = Date.now();
+  let presses = 0;
+  let last = null;
+  for (;;) {
+    const s = await bankState(page).catch(() => null);
+    if (s !== null) last = s;
+    if (s !== null && s.phase !== 'lobby' && s.phase !== 'none') {
+      log(`bank: match started (phase ${s.phase}) after ${presses} START press(es)`);
+      return s;
+    }
+    if (s !== null && s.canStart === true) {
+      await page
+        .evaluate(() => {
+          const b = document.querySelector('button.btn-start');
+          if (b !== null && !b.disabled) {
+            b.click();
+            return true;
+          }
+          window.__bank.start();
+          return true;
+        })
+        .catch(() => {});
+      presses++;
+    }
+    if (Date.now() - t0 > timeoutMs) {
+      assertServerAlive();
+      throw new Error(
+        `the bank table never left 'lobby' within ${(timeoutMs / 1000).toFixed(0)}s (${presses} START press(es); ` +
+          `last state: phase=${last?.phase ?? 'null'} playerCount=${last?.playerCount ?? '?'} canStart=${last?.canStart ?? '?'})`,
+      );
+    }
+    await sleep(400);
+  }
+}
+
 /** True while a die is still tumbling (its transform changes across 80ms). */
 async function diceAnimating(page) {
   const read = () => page.evaluate(() => document.querySelector('.bd3d-die')?.style.transform ?? '');
@@ -1653,6 +1885,8 @@ async function captureBank() {
       const [sa, sb] = await Promise.all([bankState(A), bankState(B)]);
       return sa !== null && sb !== null && sa.players.length === 2 && sb.players.length === 2 ? sa : null;
     }, 20000, 'both bank pages seated');
+    // MANUAL START: two seated players wait in the lobby until someone presses.
+    await startBankMatch(A);
     await waitFor(async () => {
       const s = await bankState(A);
       return s !== null && s.phase === 'playing' ? s : null;
@@ -1745,6 +1979,259 @@ async function captureBank() {
   }
 }
 
+// ---- section: wordbomb ---------------------------------------------------------
+const WB_SHOTS = ['wordbomb-lobby', 'wordbomb-live', 'wordbomb-boom', 'wordbomb-results'];
+// ROUNDS_MIN (games/wordbomb/shared/src/config.ts). The default is 10 rounds,
+// which at a hidden 8-15s fuse plus an 8.2s reveal is ~4 minutes of waiting for
+// ONE screenshot; 5 rounds reaches matchEnd in roughly half that.
+const WB_ROUNDS = 5;
+const WB_MAX_WORD = 12; // MAX_SCORING_LEN — longer words score no better
+
+const wbState = (page) => page.evaluate(() => window.__wordbomb?.state() ?? null);
+
+const wbDescribe = (s) =>
+  s === null
+    ? 'state() is null (client not in a room / not booted)'
+    : `phase=${s.phase} round=${s.round}/${s.rounds} fragment=${s.fragment ?? 'none'} seated=${s.seated} ` +
+      `canStart=${s.canStart} locked=[${s.players.map((p) => `${p.name}:${p.locked ? 'Y' : 'n'}`).join(',')}]`;
+
+/**
+ * The committed dictionary, read straight off disk. NOT imported from
+ * @wordbomb/* — that package is TypeScript source and this is a screenshot
+ * script; the blob's format is the contract (latin1, newline-delimited, sorted,
+ * /^[a-z]{3,15}$/). Loaded once, lazily, and only when a wordbomb shot is
+ * wanted.
+ */
+let wbWords = null;
+function wbDictionary() {
+  if (wbWords !== null) return wbWords;
+  const file = path.join(ROOT, 'games/wordbomb/server/data/words.blob');
+  if (!existsSync(file)) {
+    log(`[warn] wordbomb: ${path.relative(ROOT, file)} is missing — no word can be submitted`);
+    wbWords = [];
+    return wbWords;
+  }
+  wbWords = readFileSync(file, 'latin1').split('\n');
+  log(`wordbomb: dictionary loaded (${wbWords.length} words)`);
+  return wbWords;
+}
+
+/** First unused real word containing `fragment`. Deliberately simple. */
+function wbPickWord(fragment, used) {
+  if (typeof fragment !== 'string' || fragment.length === 0) return null;
+  for (const w of wbDictionary()) {
+    if (w.length < 3 || w.length > WB_MAX_WORD) continue;
+    if (!w.includes(fragment)) continue;
+    if (used.has(w)) continue;
+    return w;
+  }
+  return null;
+}
+
+async function captureWordbomb() {
+  if (!wantAny(...WB_SHOTS)) return;
+  const A = await launchOne('wbA');
+  const B = await launchOne('wbB');
+  const pages = [A, B];
+  const used = new Map(pages.map((p) => [p, new Set()])); // I4: a word scores once per player per match
+  const playedRound = new Map(pages.map((p) => [p, -1]));
+  // Both players would otherwise pick the SAME first match and the reveal would
+  // show one answer twice. Words already taken this round are off the table, so
+  // wordbomb-boom shows two distinct answers.
+  const takenThisRound = new Map(); // round -> Set<string>
+
+  /**
+   * Submit ONE valid word for the current live round on `page`. Once per round
+   * per page: MAX_SUBMITS_PER_ROUND is 20 and SUBMIT_COOLDOWN_MS is 400, and a
+   * single lock is all any shot here needs.
+   */
+  async function play(page, s) {
+    if (s === null || s.phase !== 'live' || s.fragment === null) return false;
+    if (playedRound.get(page) === s.round) return false;
+    playedRound.set(page, s.round);
+    const bag = used.get(page);
+    let taken = takenThisRound.get(s.round);
+    if (taken === undefined) {
+      taken = new Set();
+      takenThisRound.set(s.round, taken);
+    }
+    const word = wbPickWord(s.fragment, new Set([...bag, ...taken]));
+    if (word === null) {
+      log(`[warn] wordbomb: no dictionary word left for fragment '${s.fragment}'`);
+      return false;
+    }
+    bag.add(word);
+    taken.add(word);
+    await page.evaluate((w) => window.__wordbomb.submit(w), word).catch(() => {});
+    return true;
+  }
+  /** Keep both players honest every tick of every waiting loop. */
+  const playBoth = async (s) => {
+    await play(A, s);
+    await play(B, s);
+  };
+
+  try {
+    for (const p of pages) {
+      await p.goto(`${BASE}/wordbomb/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await waitFor(() => p.evaluate(() => !!window.__wordbomb), 20000, '__wordbomb ready');
+    }
+    wbDictionary();
+    await A.evaluate((r) => window.__wordbomb.createPrivate('Alice', { rounds: r }), WB_ROUNDS);
+    const room = await waitFor(
+      async () => {
+        const s = await wbState(A);
+        return s !== null && typeof s.code === 'string' && s.code.length > 0 ? s : null;
+      },
+      20000,
+      'A createPrivate (code)',
+      async () => wbDescribe(await wbState(A)),
+    );
+    await B.evaluate((c) => window.__wordbomb.joinPrivate('Bob', c), room.code);
+    // MIN_PLAYERS is 2, and canStart is the SERVER's answer — never re-derived.
+    await waitFor(
+      async () => {
+        const [sa, sb] = await Promise.all([wbState(A), wbState(B)]);
+        return sa !== null && sb !== null && sa.seated === 2 && sb.seated === 2 && sa.canStart ? sa : null;
+      },
+      25000,
+      'both wordbomb pages seated with canStart',
+      async () => wbDescribe(await wbState(A)),
+    );
+
+    // lobby: the START control live, BEFORE anyone presses it
+    await attempt(['wordbomb-lobby'], 'wordbomb-lobby', async () => {
+      await settle(A, { frames: 3, ms: 400 });
+      await shot(A, 'wordbomb-lobby');
+    });
+
+    // MANUAL START: nothing here auto-starts. Press until the room moves — the
+    // press is followed by a LOBBY_COUNTDOWN_MS (3000ms) beat, so 'lobby' with
+    // countdownEndsAt != 0 already means the press LANDED.
+    const started = await attempt(WB_SHOTS.slice(1), 'wordbomb start press', async () => {
+      const t0 = Date.now();
+      let presses = 0;
+      let last = null;
+      for (;;) {
+        const s = await wbState(A);
+        if (s !== null) last = s;
+        if (s !== null && (s.phase !== 'lobby' || s.countdownEndsAt !== 0)) break;
+        if (s !== null && s.canStart === true) {
+          await A.evaluate(() => window.__wordbomb.start()).catch(() => {});
+          presses++;
+        }
+        if (Date.now() - t0 > 45000) {
+          assertServerAlive();
+          throw new Error(`the wordbomb room never left 'lobby' (${presses} press(es)) — ${wbDescribe(last)}`);
+        }
+        await sleep(400);
+      }
+      log(`wordbomb: started after ${presses} press(es) (3s countdown beat, then 'live')`);
+      // the countdown beat, then the first fragment
+      await waitFor(
+        async () => {
+          const s = await wbState(A);
+          return s !== null && s.phase === 'live' && s.fragment !== null ? s : null;
+        },
+        30000,
+        "wordbomb phase 'live'",
+        async () => wbDescribe(await wbState(A)),
+      );
+    });
+    // Every remaining wordbomb shot lives inside a running match. If the press
+    // never landed they are already blamed for that one reason — burning three
+    // more multi-minute timeouts on a room that is still in its lobby only
+    // delays the report (and, with --only wordbomb-lobby, there is nothing left
+    // to do here at all).
+    if (!started) return;
+
+    // live: fragment up, fuse burning, at least one player locked. The fuse is
+    // HIDDEN and uniform in [8000,15000]ms, so this never sleeps a round: it
+    // submits, waits briefly for the lock, and retries on the NEXT round if the
+    // bomb beat it.
+    await attempt(['wordbomb-live'], 'wordbomb-live', async () => {
+      const deadline = Date.now() + 120000;
+      let last = null;
+      while (Date.now() < deadline) {
+        const s = await wbState(A);
+        if (s !== null) last = s;
+        if (s === null || s.phase !== 'live' || s.fragment === null) {
+          await sleep(200);
+          continue;
+        }
+        await playBoth(s);
+        const locked = await waitFor(
+          async () => {
+            const t = await wbState(A);
+            return t !== null && t.phase === 'live' && t.players.some((p) => p.locked) ? t : null;
+          },
+          4000,
+          'a locked player while the fuse still burns',
+        ).catch(() => null);
+        if (locked === null) continue; // the bomb went off first — take the next round
+        await settle(A, { frames: 2, ms: 120 });
+        await shot(A, 'wordbomb-live');
+        return;
+      }
+      throw new Error(`no live round with a locked player within 120s — ${wbDescribe(last)}`);
+    });
+
+    // boom: the reveal, every answer visible. revealMsFor(2) is 8200ms, so the
+    // poll is tight and the capture is taken the moment the phase flips.
+    await attempt(['wordbomb-boom'], 'wordbomb-boom', async () => {
+      const deadline = Date.now() + 120000;
+      let last = null;
+      while (Date.now() < deadline) {
+        const s = await wbState(A);
+        if (s !== null) {
+          last = s;
+          await playBoth(s);
+          if (s.phase === 'reveal') {
+            const boom = await A.evaluate(() => window.__wordbomb.lastBoom() ?? null).catch(() => null);
+            if (boom !== null) {
+              await settle(A, { frames: 1, ms: 100 });
+              await shot(A, 'wordbomb-boom');
+              log(`wordbomb-boom: fragment '${boom.fragment}', ${boom.answers.length} answer(s)`);
+              return;
+            }
+          }
+        }
+        await sleep(200);
+      }
+      throw new Error(`no reveal with a populated lastBoom() within 120s — ${wbDescribe(last)}`);
+    });
+
+    // results: the final standings. Both pages keep answering so the board is
+    // not a row of zeroes; matchEnd holds for MATCH_END_MS (12000ms) before the
+    // room drops back to lobby, so the poll stays at 250ms to the very end.
+    await attempt(['wordbomb-results'], 'wordbomb-results', async () => {
+      const deadline = Date.now() + 240000;
+      let last = null;
+      let lastLog = 0;
+      while (Date.now() < deadline) {
+        const s = await wbState(A);
+        if (s !== null) {
+          last = s;
+          await playBoth(s);
+          if (s.phase === 'matchEnd') {
+            await settle(A, { frames: 2, ms: 200 });
+            await shot(A, 'wordbomb-results');
+            return;
+          }
+          if (Date.now() - lastLog > 20000) {
+            lastLog = Date.now();
+            log(`wordbomb match: ${wbDescribe(s)}`);
+          }
+        }
+        await sleep(250);
+      }
+      throw new Error(`the ${WB_ROUNDS}-round match never reached 'matchEnd' within 240s — ${wbDescribe(last)}`);
+    });
+  } finally {
+    for (const p of pages) await closePage(p);
+  }
+}
+
 // ---- main ----------------------------------------------------------------------
 async function main() {
   const t0 = Date.now();
@@ -1777,6 +2264,10 @@ async function main() {
       captureKart,
     ); // returns a live page + a background results watcher
     await section(['bank-table', 'bank-roll', 'bank-results'], 'bank', captureBank);
+    // wordbomb runs between bank and fps deliberately: it needs two browsers,
+    // and fps needs three — running it here keeps the concurrent peak at three
+    // (kart's results page + these two) instead of five.
+    await section(WB_SHOTS, 'wordbomb', captureWordbomb);
     await section(
       SHOT_LIST.filter((s) => s.game === 'fps').map((s) => s.name),
       'fps',

@@ -2,9 +2,14 @@
 // ============================================================================
 // e2e — prove STRICKEN runs end-to-end in a real (headless) browser.
 //
-// Spawns the production server (server/dist, build must exist), drives TWO
-// browser instances (separate processes: no cross-tab rAF throttling) through
-// the frozen window.__fps surface: private-room create/join, phase machine
+// Builds the monorepo first (SKIPPED when E2E_SKIP_BUILD=1, so an orchestrator
+// that just built can reuse the warm dist), spawns the production server
+// (server/dist), drives TWO browser instances (separate processes: no
+// cross-tab rAF throttling) through the frozen window.__fps surface:
+// private-room create/join, the MANUAL-START lobby (warmup NEVER auto-starts —
+// the room sits in warmup until a SEATED player presses START; the harness
+// clicks the HUD's own button.fh-start-btn, the real player path, and asserts
+// the room does not start on its own), phase machine
 // warmup->freeze->live, movement, combat (aim math + semi-auto fire edges),
 // buy flow, state-surface shape, a 6-map screenshot tour, public-room create
 // (code === null), debug scoreboard toggle, jump-apex height, crouch travel
@@ -23,17 +28,31 @@
 // killbots (console 'killbots' kills every bot in place — roster deaths
 // increment, player count unchanged, bots revive at full hp).
 //
+// MANUAL START (frozen lobby contract): warmup has no timer and no headcount
+// trigger — `{t:'start'}` from a seated player is the ONLY way out of it
+// (server game.ts advancePhase case 'warmup'). So every step that needs a
+// phase past warmup — the first live wait, the (18) team_full guard, the (22)
+// spectate soak, the (24) buy/quick-switch round, the (26) kevlar freeze —
+// presses START first via startMatchOn(), and re-presses whenever the room
+// falls back to warmup (matchEnd -> fullReset, or a low-population abort).
+// The dedicated assertion 'warmup does not auto-start' seats 2 players and
+// holds for 7s BEFORE any press, proving the phase never leaves warmup and
+// that the START control is on screen while it waits.
+//
 // Exit 0 only if every assertion passes AND zero page/console/network errors
 // were seen on either page (benign favicon noise excluded).
 // ============================================================================
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const PORT = Number(process.env.E2E_PORT ?? 8080);
+// 8181, not 8080: a dev server on the conventional port must never be able to
+// answer this harness's probes (the env override stays for CI).
+const PORT = Number(process.env.E2E_PORT ?? 8181);
 const BASE = `http://localhost:${PORT}`;
 const GAME_URL = `${BASE}/fps/`; // the launcher lives at /; the fps client is mounted at /fps/
 const SHOTS_DIR = path.join(ROOT, 'screenshots');
@@ -104,7 +123,124 @@ function clickBotPrompt(page) {
   });
 }
 
-// ---- server -------------------------------------------------------------------
+// ---- start control (the manual-start lobby) ------------------------------------
+// The frozen observable is the HUD's own button.fh-start-btn (hud.ts): it is
+// the single pointer-events:auto node in the HUD layer, it lives in the warmup
+// lobby panel only, and its `disabled` flag mirrors the SERVER's canStart
+// verbatim — so a press is only legal when the button says it is. Reading it
+// (not __fps, which exposes no start()/canStart) keeps the harness on exactly
+// the path a player walks.
+const START_SEL = '.fh-start-btn';
+
+/** { present, visible, disabled, label } for the warmup START control. */
+function startBtnState(page) {
+  return page.evaluate((sel) => {
+    const b = document.querySelector(sel);
+    if (b === null) return { present: false, visible: false, disabled: true, label: '' };
+    const r = b.getBoundingClientRect();
+    let visible = r.width > 0 && r.height > 0;
+    for (let el = b; visible && el !== null; el = el.parentElement) {
+      const cs = getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden') visible = false;
+    }
+    return { present: true, visible, disabled: b.disabled === true, label: b.textContent ?? '' };
+  }, START_SEL);
+}
+
+/**
+ * One real DOM click on an ENABLED START button — the same handler a player
+ * fires (hud.ts click listener -> clientGame.startMatch -> {t:'start'}).
+ * page.click() is unreliable here (the HUD layer is pointer-events:none except
+ * for this node, and pointer lock can own the cursor), so the sanctioned form
+ * is the in-page click. Returns true only when a click was actually issued.
+ */
+function clickStart(page) {
+  return page.evaluate((sel) => {
+    const b = document.querySelector(sel);
+    if (b && !b.disabled) {
+      b.click();
+      return true;
+    }
+    return false;
+  }, START_SEL);
+}
+
+/**
+ * Take `page`'s room out of the lobby: wait for the server to enable START
+ * (canStart = warmup && seated >= MIN_PLAYERS_FOR_MATCH — bots count as seats),
+ * click it, and confirm the phase actually left warmup. The press is re-issued
+ * every ~1.5s while the phase is still warmup: a click landing in the same
+ * instant the snapshot flips canStart is otherwise simply dropped by the
+ * server (illegal presses are ignored in silence, never an error).
+ */
+async function startMatchOn(page, label, timeoutMs = 30000) {
+  const t0 = Date.now();
+  await waitFor(
+    async () => ((await startBtnState(page)).disabled ? null : true),
+    timeoutMs,
+    `START button enabled (${label})`,
+  );
+  let presses = 0;
+  let keys = 0;
+  if (await clickStart(page)) presses++;
+  let lastPress = Date.now();
+  const phase = await waitFor(async () => {
+    const s = await fpsState(page);
+    if (s !== null && s.roomId !== null && s.phase !== 'warmup') return s.phase;
+    if (Date.now() - lastPress > 1500) {
+      lastPress = Date.now();
+      if (await clickStart(page)) presses++;
+      // after a few unanswered clicks, also take the OTHER real player path:
+      // Enter on window (clientGame.onKeyDown, armed only with no menu/buy/
+      // console open and no text field focused — a no-op otherwise, and
+      // HTMLElement.click() never moves focus, so the shortcut stays armed)
+      if (presses >= 3 && keys < 3) {
+        keys++;
+        await page.keyboard.press('Enter').catch(() => {});
+      }
+    }
+    return null;
+  }, timeoutMs, `phase leaves warmup after START (${label})`);
+  console.log(
+    `start ${label}: warmup -> ${phase} after ${presses} press(es)` +
+      `${keys > 0 ? ` + ${keys} Enter fallback(s)` : ''} in ${((Date.now() - t0) / 1000).toFixed(1)}s`,
+  );
+  return phase;
+}
+
+/**
+ * Best-effort press for the long soak loops: the room can fall BACK to warmup
+ * mid-test (matchEnd -> fullReset after 6s, or a low-population abort), and
+ * nothing restarts it on its own any more. Never throws, never waits; throttled
+ * to one press per second per page so a 150ms poll cannot spam the socket.
+ */
+const lastNudge = new Map(); // page -> ms of the last press attempt
+async function nudgeStart(page) {
+  const now = Date.now();
+  if (now - (lastNudge.get(page) ?? 0) < 1000) return false;
+  lastNudge.set(page, now);
+  try {
+    const s = await fpsState(page);
+    if (s === null || s.roomId === null || s.phase !== 'warmup') return false;
+    return await clickStart(page);
+  } catch {
+    return false; // page mid-navigation / closed — the caller's own loop reports
+  }
+}
+
+// ---- build + server -------------------------------------------------------------
+function buildAll() {
+  console.log('build: npm run build');
+  const r = spawnSync('npm', ['run', 'build'], { cwd: ROOT, stdio: 'inherit' });
+  if (r.status !== 0) throw new Error(`npm run build exited with code ${r.status}`);
+  if (!existsSync(path.join(ROOT, 'games/fps/client/dist/index.html'))) {
+    throw new Error('games/fps/client/dist/index.html missing after build (fps client not wired into npm run build?)');
+  }
+  if (!existsSync(path.join(ROOT, 'platform/server/dist/server.js'))) {
+    throw new Error('platform/server/dist/server.js missing after build');
+  }
+}
+
 function startServer() {
   const child = spawn(process.execPath, ['platform/server/dist/server.js'], {
     cwd: ROOT,
@@ -336,6 +472,8 @@ async function fireOneShot(page) {
 // ---- main -----------------------------------------------------------------------
 async function main() {
   await mkdir(SHOTS_DIR, { recursive: true });
+  // E2E_SKIP_BUILD=1 (exactly '1') reuses a warm dist — anything else builds
+  if (process.env.E2E_SKIP_BUILD !== '1') buildAll();
   startServer();
   await waitForServer();
   console.log(`server up on ${BASE}`);
@@ -397,7 +535,51 @@ async function main() {
     `A=${bothRoster.sa.team} B=${bothRoster.sb.team}`,
   );
 
-  // -- phase machine: warmup -> freeze -> live ---------------------------------------
+  // -- MANUAL START (frozen lobby contract) -------------------------------------------
+  //    The room now holds 2 seats — MIN_PLAYERS_FOR_MATCH — and warmup has NO
+  //    timer and NO headcount trigger (server advancePhase case 'warmup':
+  //    "only handleStart leaves warmup"). So before touching anything, prove
+  //    the room stays put: poll BOTH pages for 7s (> the 6s bar; warmup has no
+  //    clock at all, so any leak would show as a phase change here) and record
+  //    the first non-warmup phase seen, if any. The START control must be on
+  //    screen the whole time — it IS the lobby's affordance.
+  const HOLD_MS = 7000;
+  let strayPhase = null; // first phase seen that is not warmup (either page)
+  let startBtnSeen = null; // START control state during the hold
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < HOLD_MS) {
+      const [sa, sb] = await Promise.all([fpsState(A), fpsState(B)]);
+      if (sa !== null && sa.phase !== 'warmup') strayPhase = `A:${sa.phase}`;
+      else if (sb !== null && sb.phase !== 'warmup') strayPhase = `B:${sb.phase}`;
+      if (strayPhase !== null) break;
+      const btn = await startBtnState(A);
+      if (startBtnSeen === null || (!startBtnSeen.visible && btn.visible)) startBtnSeen = btn;
+      await sleep(250);
+    }
+  }
+  const heldA = await fpsState(A);
+  const heldB = await fpsState(B);
+  check(
+    'warmup does not auto-start (2 seated, 7s hold, phase never leaves warmup)',
+    strayPhase === null && heldA.phase === 'warmup' && heldB.phase === 'warmup',
+    strayPhase !== null
+      ? `room left warmup on its own (${strayPhase})`
+      : `A=${heldA.phase} B=${heldB.phase} after ${HOLD_MS}ms with ${heldA.players} seated`,
+  );
+  check(
+    'warmup shows the START control (button.fh-start-btn present on screen)',
+    startBtnSeen !== null && startBtnSeen.present && startBtnSeen.visible,
+    startBtnSeen === null
+      ? 'never sampled'
+      : `present=${startBtnSeen.present} visible=${startBtnSeen.visible} disabled=${startBtnSeen.disabled} label=${JSON.stringify(startBtnSeen.label.trim())}`,
+  );
+  await shot(A, 'warmup-lobby.png');
+
+  // -- phase machine: warmup --(a player presses START)--> freeze -> live -------------
+  //    A presses the HUD button; the server (the only judge) answers with
+  //    beginFreeze(round 1), and freeze runs into live on its own timer.
+  await startMatchOn(A, 'A+B private dustbowl room');
   const liveAt = await waitFor(async () => {
     const s = await fpsState(A);
     return s.phase === 'live' ? s : null;
@@ -439,7 +621,8 @@ async function main() {
   //    once in range A plants and fires frame-rate-proof confirmed shots
   //    (fireOneShot — see its note on the AAA-scene rAF collapse), reloading as
   //    needed. Firing only starts in range so 60 pistol rounds are never wasted
-  //    on walls from spawn. Budget is 90s wall-clock: the approach is
+  //    on walls from spawn. Budget is 120s wall-clock (90s + headroom for the
+  //    escalating stall relocations below): the approach is
   //    geometry-bound (dustbowl mid walls cost 20-35s of parallel sliding) and
   //    confirmed shots run ~2/s at degraded fps.
   const combatT0 = Date.now();
@@ -449,7 +632,8 @@ async function main() {
   const walkers = new Map(); // page -> committed-strafe wall-following state
   let engageHp = 100; // B hp when the current engage burst started
   let engageSince = 0; // when the current no-progress engage began
-  let burstDir = 1; // lateral-burst direction; flips per stall (side walls)
+  let relocDir = 1; // committed relocation direction; flips only on a dead end
+  let stalls = 0; // escalating relocation length (see relocate())
 
   /**
    * Walk `page` towards targetPos. Box-map wall following: while wedged, strafe
@@ -487,7 +671,31 @@ async function main() {
     return dist;
   }
 
-  while (Date.now() - combatT0 < 90000) {
+  /**
+   * Stall breaker: a COMMITTED, ESCALATING lateral run (see the engage branch).
+   * Pure strafe (setMove(dir, 0)) for `runMs`, sampling the authoritative
+   * position so the caller can tell a real relocation from a dead end. Nothing
+   * here relies on the approach walker: at engage range the loop stops
+   * path-following entirely, so this is the only thing that can walk the
+   * shooter out from behind a piece of map.
+   */
+  async function relocate(page, dir, runMs) {
+    const from = (await fpsState(page)).pos;
+    await page.evaluate((x) => window.__fps.debug.setMove(x, 0), dir);
+    const t0 = Date.now();
+    let to = from;
+    while (Date.now() - t0 < runMs) {
+      await sleep(200);
+      const s = await fpsState(page);
+      if (s === null) break;
+      to = s.pos;
+      if (!s.alive) break;
+    }
+    await page.evaluate(() => window.__fps.debug.setMove(0, 0));
+    return { moved: Math.hypot(to[0] - from[0], to[2] - from[2]), from, to };
+  }
+
+  while (Date.now() - combatT0 < 120000) {
     const sa = await fpsState(A);
     const sb = await fpsState(B);
     if (!sb.alive) {
@@ -521,23 +729,40 @@ async function main() {
       } else if (engageSince === 0) {
         engageSince = Date.now();
       }
-      if (Date.now() - engageSince > 4000) {
-        // 4s of fire with no damage: geometry blocks the line — a crate row can
-        // sit between them even at 2m (firing through it forever is the other
-        // failure mode, so range alone must not suppress this). Committed
-        // lateral burst to break LOS symmetry (A strafes one way, B the other
-        // so they cannot mirror into the same trap; the direction flips on
-        // each successive stall in case a side wall eats the first burst),
-        // then RE-ARM the fire window: after relocating, the next burst either
-        // lands (engageHp reset) or re-triggers the burst ~4s later.
-        const d = burstDir;
-        await A.evaluate((x) => window.__fps.debug.setMove(x, 0), d);
-        await B.evaluate((x) => window.__fps.debug.setMove(x, 0), -d);
-        await sleep(1200);
-        await A.evaluate(() => window.__fps.debug.setMove(0, 0));
+      if (Date.now() - engageSince > 3000) {
+        // 3s of fire with no damage: geometry blocks the line. On dustbowl the
+        // spawn sightline breaker (maps/dustbowl.ts: x 0, z -15, w 12, h 3) is
+        // the killer case — a shooter spawned at x 0 walks straight into it,
+        // ends up wedged at z -15.8 with the target 7-8m beyond it, and every
+        // round goes into 3m of wall. Under the engage threshold the loop has
+        // stopped path-following, so ONLY this branch can free it.
+        //
+        // The old form (both pages strafing 1.2s in "opposite" directions,
+        // flipping the direction on every stall) could not: A and B face each
+        // other, so their local strafes point the SAME way in world space —
+        // they slid in parallel, keeping the wall between them — and the
+        // per-stall flip turned it into an oscillator around the spawn x
+        // (observed: A ping-ponging x 0.0 <-> -2.3 for 90s at hp 100).
+        //
+        // So: only the SHOOTER relocates (no mirroring), the direction is
+        // COMMITTED across stalls, and each run is longer than the last
+        // (2.5s -> 4.5s -> 6.5s, capped at 7s ~= 15m) until it is longer than
+        // the obstruction is wide. The direction flips only when a run gains
+        // under 1.5m — a genuine dead end, not a wall to walk around. After
+        // the run the range is usually back above the engage threshold, so
+        // approach() resumes and closes with the wall now cleared.
+        stalls++;
+        const runMs = Math.min(2500 + 2000 * (stalls - 1), 7000);
         await B.evaluate(() => window.__fps.debug.setMove(0, 0));
-        burstDir = -burstDir;
+        const r = await relocate(A, relocDir, runMs);
+        console.log(
+          `combat relocate #${stalls} dir=${relocDir} runMs=${runMs} moved=${r.moved.toFixed(1)}m ` +
+            `(${r.from.map((v) => v.toFixed(1))} -> ${r.to.map((v) => v.toFixed(1))})`,
+        );
+        if (r.moved < 1.5) relocDir = -relocDir; // dead end: commit the other way
+        walkers.delete(A); // stale wedge state: the approach walker re-derives it
         engageSince = Date.now();
+        engageHp = (await fpsState(B)).hp; // re-arm the fire window at the new spot
         continue;
       }
       await B.evaluate(() => window.__fps.debug.setMove(0, 0));
@@ -565,10 +790,14 @@ async function main() {
   }
 
   // -- buy: next freeze (auto-opens the buy menu client-side) ---------------------------
+  //    (the 90s fight can outlive the match: matchEnd -> fullReset drops the
+  //    room back to the LOBBY, where no freeze will ever come — so the poll
+  //    re-presses START whenever it finds the phase back in warmup)
   let freezeSeen = null;
   try {
     freezeSeen = await waitFor(async () => {
       const s = await fpsState(A);
+      if (s.phase === 'warmup') await nudgeStart(A);
       return s.phase === 'freeze' ? s : null;
     }, 30000, "phase 'freeze' for buy test");
   } catch {
@@ -817,7 +1046,8 @@ async function main() {
   // -- (14) bots: A is alone in the public crossfire room here (B stayed in
   //    the private dustbowl room from the combat flow) — so assert deltas off
   //    the live count, not absolutes. Kept after (12)/(13) so bots cannot
-  //    start a match mid-scoreboard/jump and perturb those samples.
+  //    perturb those samples (belt and braces now that seats alone can never
+  //    start a match — the room stays in warmup until (17) presses START).
   const botsBefore = (await fpsState(A)).players;
   await A.evaluate(() => {
     window.__fps.addBot();
@@ -855,8 +1085,9 @@ async function main() {
     removed ? `${botsBefore + 2} -> ${removed.players}` : `expected ${botsBefore + 1}, still ${(await fpsState(A)).players}`,
   );
 
-  // -- (16) soak: the remaining bot fights for ~6s (it may start a real match
-  //    and hunt A) — nothing on either page may crash or log.
+  // -- (16) soak: the remaining bot hunts A for ~6s (in the LOBBY: warmup is
+  //    live play, and nothing has pressed START yet) — nothing on either page
+  //    may crash or log.
   const errsBeforeSoak = pageErrors.length;
   await sleep(6000);
   check(
@@ -867,7 +1098,10 @@ async function main() {
 
   // -- (17) team switch: frozen semantics — immediate apply in warmup; queued
   //    and applied at the next beginFreeze (guard re-evaluated) in any other
-  //    phase. Post-soak the room holds A + 1 bot, so the queued path dominates.
+  //    phase. Post-soak the room holds A + 1 bot — two seats, so START is legal
+  //    — and A PRESSES IT here: the running match is what makes the queued path
+  //    (the interesting one) reachable at all, and (18) below needs roundEnds.
+  //    Both paths stay asserted; whichever the phase lands in is reported.
   //    Detection is a TEAM wait, not a phase wait: once the flip lands the old
   //    team is empty, so the room forfeit-cycles with ONE-TICK (~33ms) freezes
   //    that a 150ms phase poll can never catch — the flipped team persists for
@@ -875,6 +1109,15 @@ async function main() {
   //    switch (1 < 1 + 1). The 5s immediate window covers the warmup path; the
   //    long window covers a full round (live 100s + roundEnd 4s + matchEnd
   //    detour) for the queued one.
+  //    START is pressed BEFORE the team is sampled: beginFreeze auto-balances,
+  //    so a team read from the lobby could be stale by the time the request
+  //    lands. A failure to start is not fatal — (17) then simply exercises the
+  //    warmup/immediate path and (18) reports its own inconclusive detail.
+  try {
+    await startMatchOn(A, 'A + soak bot (public crossfire)', 20000);
+  } catch (err) {
+    console.log(`start17: ${err instanceof Error ? err.message : String(err)} — continuing in the lobby`);
+  }
   const team17Before = (await fpsState(A)).team;
   const team17Target = team17Before === 'T' ? 'CT' : 'T';
   let lastLog17 = 0;
@@ -902,6 +1145,10 @@ async function main() {
       flip17 = await waitFor(async () => {
         await log17('queued');
         const s = await fpsState(A);
+        // a queued switch applies at the next beginFreeze — and the forfeit
+        // cycle can run the match all the way to matchEnd -> fullReset, which
+        // parks the room in the lobby where no freeze will ever come again
+        if (s !== null && s.phase === 'warmup') await nudgeStart(A);
         return s !== null && s.team === team17Target ? s : null;
       }, 125000, 'team flip at the next beginFreeze (queued path)');
     } catch {
@@ -916,88 +1163,138 @@ async function main() {
       : `still ${(await fpsState(A)).team}, target ${team17Target}`,
   );
 
-  // -- (18) team_full guard: after (17), A shares a team with the soak bot and
-  //    the other team is EMPTY — so B's quick-join (the only public room)
-  //    deterministically lands B alone on the small team: a 2v1. B requests
-  //    the larger team; the guard (target >= other + 1) must deny it. A bare
-  //    "no flip within 3s" cannot tell DENIED from ALLOWED-but-queued (a grant
-  //    would apply only at the next beginFreeze), so the attempt is made
-  //    during roundEnd (next freeze ~4s out; the post-(17) forfeit cycle keeps
-  //    roundEnds frequent) and B's team is watched from the attempt THROUGH
-  //    that beginFreeze +5s: the guard re-evaluates there, so surviving it
-  //    proves the request was dropped, not merely pending. Round 5's roundEnd
-  //    is skipped: the halftime swap at its end flips EVERYONE, guard or no
-  //    guard. (Dev note: shaping via addBot alone is impossible — pickTeam
-  //    auto-balances with a coin flip on ties and removeBot is LIFO — hence
-  //    the second human as the switcher.)
-  const aRoom18 = (await fpsState(A)).roomId;
-  await B.evaluate(() => window.__fps.joinQuick('Bob'));
-  let bIn18 = null;
-  try {
-    bIn18 = await waitFor(async () => {
-      const [sa, sb] = await Promise.all([fpsState(A), fpsState(B)]);
-      return sb !== null && sb.roomId !== null && sb.roomId === aRoom18 && sb.team !== sa.team
-        ? sb
-        : null;
-    }, 15000, 'B quick-join into A public room on the opposite team');
-  } catch {
-    bIn18 = null; // reported by the failing check below; (18) guard check is skipped
-  }
+  // -- (18) team_full guard (frozen rule: a switch is DENIED when the target
+  //    team already holds >= other + 1). Proving a denial needs a roster the
+  //    guard actually bites on — the switcher ALONE on one side, two players on
+  //    the other — and that can no longer be shaped out of the (17) room:
+  //    the very beginFreeze that applies (17)'s queued flip also runs the
+  //    balancer right after it (game.ts beginFreeze: applyQueuedTeamSwitches
+  //    THEN autoBalanceTeams), so the 2v0 it creates is repaired on the spot by
+  //    pulling the soak bot across (bots are the first balance candidates). The
+  //    room is a 1v1 again, B's quick-join is a pickTeam coin flip, and either
+  //    way B ends up on the 2-side of a 2v1 where the guard cannot apply. (The
+  //    old failure was exactly this: "B failed to land on the opposite team"
+  //    while the room ids matched — B had simply landed on A's side.)
+  //
+  //    So (18) shapes its OWN room, in WARMUP, where a switch applies
+  //    IMMEDIATELY (game.ts handleSwitchTeam) and is therefore readable one
+  //    poll later — no freeze round trip and no guessing:
+  //      A + B in a fresh private room (auto-balanced to 1v1) + 1 bot -> 2v1.
+  //      1. Put A and B on the SAME side. The bot is then provably ALONE on the
+  //         other one — the only thing the harness can know about the bot's
+  //         side without reading the server's roster. B -> A's side is tried
+  //         first; when the guard denies it (that means A's side is the 2-side,
+  //         i.e. the bot is already with A) the read-back shows no change and
+  //         A -> B's side is used instead. Exactly one of the two is legal.
+  //      2. Move A onto the bot's side: 1 < 2 + 1, allowed. Result: A + bot (2)
+  //         vs B alone (1), and |diff| == 1 so autoBalanceTeams leaves it be.
+  //    Then START, and B suicides in live via the frozen console 'kill'
+  //    command: B IS its entire side, so the round ends at once and roundEnd
+  //    arrives in ~1s instead of a full 100s round. B requests A's side from
+  //    that roundEnd; a granted switch would apply at the next beginFreeze, so
+  //    B's team is watched THROUGH that freeze +5s. The guard re-evaluates
+  //    there (target 2 >= other 1 + 1) and must drop the request — surviving
+  //    the freeze unchanged is what separates DENIED from merely pending.
+  //    Round 5 (halftime swaps everyone) is never reached: this is round 1.
   let denied18 = false;
   let detail18 = '';
-  if (bIn18 === null) {
-    detail18 = `B failed to land on the opposite team (in ${(await fpsState(B)).roomId}, want ${aRoom18})`;
-  } else {
-    try {
-      // arm the attempt inside a roundEnd (re-issue if the phase raced past)
-      let bTeam18 = null;
-      let bTarget18 = null;
-      for (let tries = 0; tries < 2 && bTeam18 === null; tries++) {
-        const safe = await waitFor(async () => {
-          const s = await fpsState(B);
-          return s !== null && s.phase === 'roundEnd' && s.round !== 5 ? s : null;
-        }, 120000, "roundEnd with round !== 5 for the guard attempt");
-        const target = safe.team === 'T' ? 'CT' : 'T';
-        await B.evaluate((t) => window.__fps.debug.switchTeam(t), target);
-        const now = await fpsState(B);
-        if (now !== null && now.phase === 'roundEnd') {
-          bTeam18 = safe.team;
-          bTarget18 = target;
-        }
+  try {
+    await A.evaluate(() => window.__fps.createPrivate('Alice', 'crossfire'));
+    const a18 = await waitFor(async () => {
+      const s = await fpsState(A);
+      return s !== null && s.roomId !== null ? s : null;
+    }, 15000, 'A private room for the team_full guard');
+    await B.evaluate((c) => window.__fps.joinPrivate('Bob', c), a18.code);
+    await waitFor(async () => {
+      const s = await fpsState(B);
+      return s !== null && s.roomId === a18.roomId ? s : null;
+    }, 15000, 'B into the guard room');
+    await A.evaluate(() => window.__fps.addBot());
+    await waitFor(async () => {
+      const [sa, sb] = await Promise.all([fpsState(A), fpsState(B)]);
+      return sa !== null && sb !== null && sa.players === 3 && sb.players === 3 ? true : null;
+    }, 10000, '3 seats (A + B + bot) in the guard room');
+
+    // step 1 — A and B onto one side (warmup: immediate, so just read back)
+    let sa18 = await fpsState(A);
+    let sb18 = await fpsState(B);
+    const shapeFrom = `A=${sa18.team} B=${sb18.team}`;
+    if (sa18.team !== sb18.team) {
+      await B.evaluate((t) => window.__fps.debug.switchTeam(t), sa18.team);
+      await sleep(1200);
+      sa18 = await fpsState(A);
+      sb18 = await fpsState(B);
+      if (sa18.team !== sb18.team) {
+        // denied => A's side already holds the bot; move A to B's side instead
+        await A.evaluate((t) => window.__fps.debug.switchTeam(t), sb18.team);
+        await sleep(1200);
+        sa18 = await fpsState(A);
+        sb18 = await fpsState(B);
       }
-      if (bTeam18 === null) throw new Error('could not attempt during roundEnd (phase raced twice)');
-      // watch from the attempt through the NEXT transition into freeze +5s
-      const t0 = Date.now();
-      let prevPhase = 'roundEnd';
-      let freezeAt = 0;
-      let changedTo = null;
-      while (Date.now() - t0 < 125000) {
-        const s = await fpsState(B);
-        if (s !== null) {
-          if (s.team !== bTeam18) {
-            changedTo = s.team;
-            break;
-          }
-          if (s.phase !== prevPhase) {
-            if (s.phase === 'freeze' && freezeAt === 0) freezeAt = Date.now();
-            prevPhase = s.phase;
-          }
-          if (freezeAt !== 0 && Date.now() - freezeAt >= 5000) break; // freeze passed, request dropped
-        }
-        await sleep(200);
-      }
-      denied18 = changedTo === null && freezeAt !== 0;
-      detail18 =
-        `B=${bTeam18} target=${bTarget18}` +
-        (changedTo !== null
-          ? ` FLIPPED to ${changedTo} — guard let it through`
-          : freezeAt === 0
-            ? ' — no freeze within 125s, inconclusive'
-            : ' — unchanged through beginFreeze + 5s (denied, request dropped)');
-    } catch (err) {
-      denied18 = false;
-      detail18 = `aborted: ${err instanceof Error ? err.message : String(err)}`;
     }
+    if (sa18.team !== sb18.team) {
+      throw new Error(`could not put A and B on one side (${shapeFrom} -> A=${sa18.team} B=${sb18.team})`);
+    }
+    // step 2 — A joins the (now provably lone) bot: A + bot vs B alone
+    const botTeam18 = sa18.team === 'T' ? 'CT' : 'T';
+    await A.evaluate((t) => window.__fps.debug.switchTeam(t), botTeam18);
+    await sleep(1200);
+    sa18 = await fpsState(A);
+    sb18 = await fpsState(B);
+    if (sa18.team !== botTeam18 || sb18.team === sa18.team) {
+      throw new Error(`could not seat A with the bot (A=${sa18.team} B=${sb18.team}, wanted A=${botTeam18})`);
+    }
+    console.log(`guard18 shaping: ${shapeFrom} -> A+bot=${sa18.team} vs B=${sb18.team} (2v1)`);
+
+    await startMatchOn(A, 'team_full guard room (A + bot vs B)', 25000);
+    await waitFor(async () => {
+      const s = await fpsState(B);
+      return s !== null && s.phase === 'live' ? s : null;
+    }, 30000, "phase 'live' in the guard room");
+    // B is its whole side: its death ends the round, so roundEnd is ~1s away
+    await B.evaluate(() => window.__fps.debug.console('kill'));
+    const at18 = await waitFor(async () => {
+      const s = await fpsState(B);
+      return s !== null && s.phase === 'roundEnd' ? s : null;
+    }, 30000, 'roundEnd for the guard attempt');
+
+    const bTeam18 = at18.team;
+    const bTarget18 = bTeam18 === 'T' ? 'CT' : 'T'; // the 2-side: A + the bot
+    await B.evaluate((t) => window.__fps.debug.switchTeam(t), bTarget18);
+    // watch from the attempt through the NEXT transition into freeze +5s
+    const t0 = Date.now();
+    let prevPhase = 'roundEnd';
+    let freezeAt = 0;
+    let changedTo = null;
+    while (Date.now() - t0 < 60000) {
+      const s = await fpsState(B);
+      if (s !== null) {
+        if (s.team !== bTeam18) {
+          changedTo = s.team;
+          break;
+        }
+        if (s.phase !== prevPhase) {
+          if (s.phase === 'freeze' && freezeAt === 0) freezeAt = Date.now();
+          prevPhase = s.phase;
+        }
+        // a match can still end under the watch — press START again so a
+        // beginFreeze (where the guard re-evaluates) is still coming
+        if (s.phase === 'warmup' && freezeAt === 0) await nudgeStart(B);
+        if (freezeAt !== 0 && Date.now() - freezeAt >= 5000) break; // freeze passed, request dropped
+      }
+      await sleep(200);
+    }
+    denied18 = changedTo === null && freezeAt !== 0;
+    detail18 =
+      `B=${bTeam18} alone, target=${bTarget18} (A + bot)` +
+      (changedTo !== null
+        ? ` FLIPPED to ${changedTo} — guard let it through`
+        : freezeAt === 0
+          ? ' — no freeze within 60s, inconclusive'
+          : ' — unchanged through beginFreeze + 5s (denied, request dropped)');
+  } catch (err) {
+    denied18 = false;
+    detail18 = `aborted: ${err instanceof Error ? err.message : String(err)}`;
   }
   check(
     'team_full guard: switch to the larger team is denied (no flip through the next freeze)',
@@ -1084,6 +1381,19 @@ async function main() {
   await A.evaluate(() => window.__fps.debug.scoreboard(false)); // closed BEFORE the blackout scan
   console.log(`spectate22 team shaping: A team size=${teamSize22} (want 3)`);
 
+  // -- (22 start) the spectate chip is a MATCH observable: updateSpectators
+  //    only assigns spectateTarget in live/roundEnd/matchEnd — in warmup it is
+  //    pinned to null (a respawn is already coming). So the shaped room must be
+  //    taken out of the lobby before the death watch, and put back in play
+  //    whenever a match ends under it (see the nudge inside the loop).
+  //    Shaping ran in the lobby on purpose: beginFreeze auto-balances only when
+  //    the sides differ by more than one, so a 3v2 survives the press intact.
+  try {
+    await startMatchOn(A, 'spectate room (A + 3 bots)', 20000);
+  } catch (err) {
+    console.log(`start22: ${err instanceof Error ? err.message : String(err)} — the chip watch will keep pressing`);
+  }
+
   // -- (22) spectate visual sanity: the setup above shaped the (20) room to a
   //    3v2 (A + 2 bot teammates; re-rolled coin flips — in a plain 2v2 the lone
   //    teammate dies its 1v2 first and A's death never gets a spectateTarget).
@@ -1091,107 +1401,121 @@ async function main() {
   //    appear for B in the private-room 1v1 — the server assigns spectateTarget
   //    as the first alive TEAMMATE (game.ts updateSpectators), so a lone dead
   //    player gets null and the chip stays hidden (see death-spectate.png:
-  //    corpse cam, no chip). A's death in this 2v2 is the contract-conformant
-  //    way to observe 'SPECTATING X'. A is herded INTO THE ENEMY HALF
-  //    (defenseless, target side latched per life) so it dies at the START of
-  //    the fight while every teammate is alive — mid-standing A survives whole
-  //    rounds, and late deaths can follow a teammate's (null target). Bots
-  //    engage only within 45m awareness. The chip (#hud .fh-spec, hud.ts) is
-  //    polled across every death
-  //    window for 240s; once 'SPECTATING <name>' shows, assert nothing blacks
-  //    out the view — no #hud/#menu element covering >40% of the viewport with
-  //    a near-opaque (alpha >= 0.5) black-ish non-gradient background
-  //    (body/#app are the page's opaque ink backdrop by design; the .fh-vig
-  //    vignette is a radial gradient). One legit overlay is EXCLUDED by
-  //    dismissal: when A dies close to a round boundary, the next freeze
-  //    auto-opens the buy menu over the spectate view (an open .m9-layer-buy
-  //    IS a 78%-ink full-viewport layer) — it is closed with B and that sample
-  //    skipped rather than counted as a blackout.
+  //    corpse cam, no chip). A's death with 2 live bot teammates is the
+  //    contract-conformant way to observe 'SPECTATING X'.
+  //
+  //    HOW A DIES: the frozen console command 'kill' (clientGame.consoleExec ->
+  //    C2S suicide -> game.ts handleSuicide, the normal death path with a null
+  //    killer, legal in warmup/live only). The old form herded a defenceless A
+  //    into the enemy half and waited for a bot to shoot it, which is neither
+  //    prompt nor certain — in a shaped 3v1 the teammates win the round before
+  //    A is ever touched (observed: 3 death samples in 240s, every one of them
+  //    already past the kill, chip text stale from an earlier life and the
+  //    element back to fh-hidden because spectateTarget had gone null again).
+  //    Suiciding mid-live is deterministic and puts the chip up while every
+  //    teammate is certainly alive.
+  //
+  //    HOW IT IS OBSERVED: an IN-PAGE recorder, not a node poll. The client
+  //    renders at ~5fps headless, so a node-side poll (one CDP round trip per
+  //    sample) can step straight over a chip window; a setInterval inside the
+  //    page samples every 50ms off the timer queue and, on the first visible
+  //    'SPECTATING <name>', runs the blackout scan ATOMICALLY in the same tick
+  //    the chip is up. Blackout = any #hud/#menu element covering >40% of the
+  //    viewport with a near-opaque (alpha >= 0.5) black-ish non-gradient
+  //    background (body/#app are the page's opaque ink backdrop by design; the
+  //    .fh-vig vignette is a radial gradient). One legit overlay is EXCLUDED:
+  //    when A dies close to a round boundary the next freeze auto-opens the buy
+  //    menu over the spectate view (an open .m9-layer-buy IS a 78%-ink
+  //    full-viewport layer) — those samples are skipped, not counted.
   let specOk = false;
   let specDetail = '';
   let chipSeen = null;
   let blackouts = [];
-  const specDeadline = Date.now() + 240000;
+  await A.evaluate(() => {
+    window.__specWatch = { seen: null, deadSamples: 0, visibleSamples: 0 };
+    const scanBlackouts = () => {
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const out = [];
+      for (const el of document.querySelectorAll('#hud *, #menu *')) {
+        const r = el.getBoundingClientRect();
+        if (r.width * r.height <= 0.4 * vw * vh) continue;
+        const cs = getComputedStyle(el);
+        if (cs.display === 'none' || cs.visibility === 'hidden' || Number(cs.opacity) === 0) continue;
+        if (cs.backgroundImage.includes('gradient')) continue;
+        const m = /^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,\s/]+([\d.]+%?))?\s*\)$/.exec(
+          cs.backgroundColor,
+        );
+        if (m === null) continue;
+        const alpha =
+          m[4] === undefined ? 1 : m[4].endsWith('%') ? Number(m[4].slice(0, -1)) / 100 : Number(m[4]);
+        const blackish = Number(m[1]) <= 64 && Number(m[2]) <= 64 && Number(m[3]) <= 64;
+        if (blackish && alpha >= 0.5) {
+          out.push(`${el.tagName.toLowerCase()}.${String(el.className)} bg=${cs.backgroundColor}`);
+        }
+      }
+      return out;
+    };
+    window.__specWatchTimer = setInterval(() => {
+      const w = window.__specWatch;
+      if (w.seen !== null) return;
+      const st = window.__fps?.state?.() ?? null;
+      if (st === null || st.alive) return;
+      w.deadSamples++;
+      const el = document.querySelector('#hud .fh-spec');
+      if (el === null) return;
+      const cs = getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      if (cs.display === 'none' || r.width === 0 || r.height === 0) return;
+      w.visibleSamples++;
+      const text = el.textContent ?? '';
+      if (!text.toUpperCase().includes('SPECTATING')) return;
+      const buy = document.querySelector('.fps-menus .m9-layer-buy');
+      if (buy !== null && getComputedStyle(buy).display !== 'none') return; // legit freeze overlay
+      w.seen = { text, visible: true, phase: st.phase, blackouts: scanBlackouts() };
+    }, 50);
+  });
+  const specDeadline = Date.now() + 180000;
   let lastSpecLog = 0;
-  let rushTargetZ = null; // latched per life: the ENEMY side of the map
+  let specKills = 0;
   while (Date.now() < specDeadline && chipSeen === null) {
     const s = await fpsState(A);
-    if (s !== null && s.alive) {
-      // Push A into the ENEMY half, not just mid: rounds where A stands at mid
-      // end with the teammates winning before A is touched (no death window at
-      // all — observed: 1 death in 180s), and mid-fight deaths can come after
-      // a teammate fell (null target). Dying deep in the enemy rush happens at
-      // the START of the fight, while every teammate is still alive. Bots only
-      // engage within 45m awareness, so A must cross the map. The target side
-      // is latched per life (A respawns on its own side each round).
-      if (rushTargetZ === null) rushTargetZ = s.pos[2] >= 0 ? -23 : 23;
-      const yaw = yawTo(s.pos[0], s.pos[2], 0, rushTargetZ);
-      await A.evaluate((y) => {
-        window.__fps.debug.setLook(y, 0);
-        window.__fps.debug.setMove(0, 1);
-      }, yaw);
+    // a finished match drops the room back to the lobby (fullReset), where
+    // spectateTarget is always null — press START again and keep hunting
+    if (s !== null && s.phase === 'warmup') await nudgeStart(A);
+    if (s !== null && s.alive && s.phase === 'live') {
+      await A.evaluate(() => window.__fps.debug.console('kill'));
+      specKills++;
+      await sleep(1200); // let the death land and the chip come up
     }
-    if (s !== null && !s.alive) {
-      rushTargetZ = null; // relatch on the next respawn
-      const buyOpen22 = await A.evaluate(() => {
-        const el = document.querySelector('.fps-menus .m9-layer-buy');
-        return el !== null && getComputedStyle(el).display !== 'none';
-      });
-      if (buyOpen22) {
-        await A.keyboard.press('KeyB'); // legit freeze buy menu, not a blackout
-        await sleep(200);
-        continue;
-      }
-      const chip = await A.evaluate(() => {
-        const el = document.querySelector('#hud .fh-spec');
-        if (el === null) return null;
-        const cs = getComputedStyle(el);
-        const r = el.getBoundingClientRect();
-        return {
-          text: el.textContent ?? '',
-          visible: cs.display !== 'none' && r.width > 0 && r.height > 0,
-        };
-      });
-      if (Date.now() - lastSpecLog > 4000) {
-        lastSpecLog = Date.now(); // evidence for future flakes (death windows seen)
-        console.log(`spectate22: A dead phase=${s.phase} chip=${JSON.stringify(chip)}`);
-      }
-      if (chip !== null && chip.visible && chip.text.toUpperCase().includes('SPECTATING')) {
-        chipSeen = chip; // ~within one poll (<=250ms) of the death snapshot
-        blackouts = await A.evaluate(() => {
-          const vw = window.innerWidth;
-          const vh = window.innerHeight;
-          const out = [];
-          for (const el of document.querySelectorAll('#hud *, #menu *')) {
-            const r = el.getBoundingClientRect();
-            if (r.width * r.height <= 0.4 * vw * vh) continue;
-            const cs = getComputedStyle(el);
-            if (cs.display === 'none' || cs.visibility === 'hidden' || Number(cs.opacity) === 0) continue;
-            if (cs.backgroundImage.includes('gradient')) continue;
-            const m = /^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,\s/]+([\d.]+%?))?\s*\)$/.exec(
-              cs.backgroundColor,
-            );
-            if (m === null) continue;
-            const alpha =
-              m[4] === undefined ? 1 : m[4].endsWith('%') ? Number(m[4].slice(0, -1)) / 100 : Number(m[4]);
-            const blackish = Number(m[1]) <= 64 && Number(m[2]) <= 64 && Number(m[3]) <= 64;
-            if (blackish && alpha >= 0.5) {
-              out.push(`${el.tagName.toLowerCase()}.${String(el.className)} bg=${cs.backgroundColor}`);
-            }
-          }
-          return out;
-        });
-      }
+    const w = await A.evaluate(() => window.__specWatch);
+    if (w.seen !== null) {
+      chipSeen = { text: w.seen.text, visible: w.seen.visible };
+      blackouts = w.seen.blackouts;
+      break;
     }
-    await sleep(150);
+    if (Date.now() - lastSpecLog > 5000) {
+      lastSpecLog = Date.now(); // evidence for future flakes
+      console.log(
+        `spectate22: phase=${s?.phase} alive=${s?.alive} kills=${specKills} ` +
+          `deadSamples=${w.deadSamples} chipVisibleSamples=${w.visibleSamples}`,
+      );
+    }
+    await sleep(250);
   }
-  await A.evaluate(() => window.__fps.debug.setMove(0, 0));
+  await A.evaluate(() => {
+    if (window.__specWatchTimer !== undefined) clearInterval(window.__specWatchTimer);
+    window.__fps.debug.setMove(0, 0);
+  });
   if (chipSeen === null) {
-    specDetail = 'no SPECTATING chip observed across 240s of death windows';
+    const w = await A.evaluate(() => window.__specWatch);
+    specDetail =
+      `no SPECTATING chip observed in 180s ` +
+      `(${specKills} console 'kill's, ${w.deadSamples} dead samples, ${w.visibleSamples} visible-chip samples)`;
   } else {
     specOk = blackouts.length === 0;
     specDetail =
-      `chip=${JSON.stringify(chipSeen)}` +
+      `chip=${JSON.stringify(chipSeen)} after ${specKills} console 'kill'(s)` +
       ` blackout-overlays=${blackouts.length}${blackouts.length > 0 ? `: ${blackouts.join('; ')}` : ''}`;
   }
   check(
@@ -1221,8 +1545,10 @@ async function main() {
   //    __fakeLock set, Document.prototype.pointerLockElement reports the
   //    canvas. Everything downstream is the real path — keydown -> edge queue
   //    -> handleEdges -> C2S switch -> server validation -> snapshot.
-  //    Flow: fresh private crossfire room + 1 bot; round 1 C rushes
-  //    defenseless (meets the bot halfway, dies fast); every round outcome
+  //    Flow: fresh private crossfire room + 1 bot, then C PRESSES START (two
+  //    seats = canStart; the lobby never leaves warmup by itself, and the money
+  //    this test needs only exists once rounds actually resolve); round 1 C
+  //    rushes defenseless (meets the bot halfway, dies fast); every round outcome
   //    pays >= ECONOMY.lossReward (1900), so the round-2 freeze has
   //    money >= 1500 -> debug.buy('smg') (the canBuy path). NOTE: the server
   //    does NOT auto-switch when the held weapon survives the buy (pistol is
@@ -1255,6 +1581,11 @@ async function main() {
       return s !== null && s.roomId !== null ? s : null;
     }, 10000, 'C createPrivate join');
     await C.evaluate(() => window.__fps.addBot());
+    await waitFor(async () => {
+      const s = await fpsState(C);
+      return s !== null && s.players >= 2 ? s : null;
+    }, 10000, 'the bot is seated on C (2 seats = canStart)');
+    await startMatchOn(C, 'C + bot (private crossfire)', 20000);
     await C.evaluate(() => window.__fps.debug.setMove(0, 1)); // rush until round 1 ends
     const rich24 = await waitFor(async () => {
       const s = await fpsState(C);
@@ -1262,6 +1593,9 @@ async function main() {
       if (s.phase === 'live' || s.phase === 'warmup') {
         await C.evaluate(() => window.__fps.debug.setMove(0, 1)); // re-assert the rush
       }
+      // a match that runs out (matchEnd -> fullReset) parks C in the lobby:
+      // press START again or no freeze — and no money — is ever coming
+      if (s.phase === 'warmup') await nudgeStart(C);
       return s.phase === 'freeze' && s.money >= 1500 ? s : null;
     }, 150000, 'freeze with money >= 1500 (one full round + slack)');
     await C.evaluate(() => window.__fps.debug.setMove(0, 0));
@@ -1314,6 +1648,17 @@ async function main() {
   //    independent of quick-switch. 'addbot 2' must grow the room by exactly 2
   //    within 5s; an unknown command must return the non-empty error line the
   //    overlay would print.
+  //
+  //    THE SEAT COUNT IS rosterSize, NOT players. A bot added while a round is
+  //    in progress (game.ts joinPlayer: pending = roundInProgress(), i.e. any
+  //    phase but warmup/freeze) holds a real roster slot but has NO BODY until
+  //    the next beginFreeze, and sendSnapshots skips pending players outright —
+  //    so state().players (the snapshot headcount) does not move for up to a
+  //    full round, while state().rosterSize (fed by the player_joined event)
+  //    moves at once. (24) leaves this room LIVE — under the old auto-start it
+  //    happened to be sampled in a lobby/freeze window where the two agreed —
+  //    so waiting on `players` here was a 5s timeout by construction. Both are
+  //    reported; the assertion is on the seats the command actually created.
   let conOk = false;
   let conDetail = '';
   try {
@@ -1325,15 +1670,17 @@ async function main() {
         return s !== null && s.roomId !== null ? s : null;
       }, 10000, 'C re-join for the console check');
     }
-    const before25 = (await fpsState(C)).players;
+    const before25 = await fpsState(C);
     const nonsense = await C.evaluate(() => window.__fps.debug.console('nonsense'));
     await C.evaluate(() => window.__fps.debug.console('addbot 2'));
     const populated25 = await waitFor(async () => {
       const s = await fpsState(C);
-      return s !== null && s.players === before25 + 2 ? s : null;
-    }, 5000, 'players +2 after console addbot 2');
+      return s !== null && s.rosterSize === before25.rosterSize + 2 ? s : null;
+    }, 5000, 'rosterSize +2 after console addbot 2');
     conOk = typeof nonsense === 'string' && nonsense.trim() !== '';
-    conDetail = `nonsense -> ${JSON.stringify(nonsense)}; players ${before25} -> ${populated25.players}`;
+    conDetail =
+      `nonsense -> ${JSON.stringify(nonsense)}; seats ${before25.rosterSize} -> ${populated25.rosterSize}` +
+      ` (phase=${populated25.phase}, snapshot players ${before25.players} -> ${populated25.players})`;
   } catch (err) {
     conDetail = err instanceof Error ? err.message : String(err);
   }
@@ -1345,9 +1692,9 @@ async function main() {
   //    frames + the kill_bots one go out in ONE evaluate: ws delivery is FIFO
   //    and the room handles C2S on receipt (game.ts handleMessage), so both
   //    bots exist before kill_bots runs, and the room is still in warmup at
-  //    that instant (advancePhase starts the match next tick, when it sees
-  //    players >= MIN_PLAYERS_FOR_MATCH) — the bots' first deaths take the
-  //    warmup death path; the round-1 beginFreeze then revives them.
+  //    that instant (it stays there — nothing but a START press leaves the
+  //    lobby) — the bots' first deaths take the warmup death path. C then
+  //    presses START, and the round-1 beginFreeze revives them.
   let gearOk = false;
   let gearDetail = '';
   let botsOk = false;
@@ -1366,8 +1713,9 @@ async function main() {
       window.__fps.debug.console('killbots'); // (27) first wave — see below
     });
 
-    // -- (26) kevlar: the round-1 freeze (entered the tick after the bots
-    //    join) has ECONOMY.start (800) >= kevlarPrice (650) — no round needs
+    // -- (26) kevlar: the round-1 freeze (which only exists once START is
+    //    pressed — 3 seats make the press legal, dead bots included) has
+    //    ECONOMY.start (800) >= kevlarPrice (650) — no round needs
     //    to complete. Freeze-only window: C is guaranteed alive there (in
     //    live the bots can frag C, and the dead cannot buy). armor rides the
     //    e2e state() surface (main.ts mirrors YouSnap.armor, set server-side
@@ -1376,6 +1724,12 @@ async function main() {
     //    hence the (24)-style wide timeout.
     await waitFor(async () => {
       const s = await fpsState(C);
+      return s !== null && s.players === 3 ? s : null;
+    }, 10000, 'both bots seated on C (3 seats)');
+    await startMatchOn(C, 'C + 2 bots (kevlar/killbots room)', 20000);
+    await waitFor(async () => {
+      const s = await fpsState(C);
+      if (s !== null && s.phase === 'warmup') await nudgeStart(C); // match ended -> lobby again
       return s !== null && s.phase === 'freeze' && s.money >= 650 ? s : null;
     }, 120000, 'freeze with money >= 650 for the kevlar buy');
     const money26 = (await fpsState(C)).money;

@@ -2,19 +2,38 @@
 // FROZEN CONTRACT — KART GP: wire types. See docs/KART.md.
 // ============================================================================
 
+import type { KartSim } from './sim.js';
+
 export type KartPhase = 'lobby' | 'ready' | 'countdown' | 'racing' | 'results';
+
+/**
+ * One tick of driver intent. THE ONLY THING A CLIENT MAY ASSERT about its kart
+ * — this message replaced `kart_state`, which carried absolute world
+ * coordinates the server copied in verbatim. Positions are now derived, never
+ * received: the server integrates shared/sim.ts stepDrive from this stream, so
+ * "teleport to the next gate" is not a message that exists.
+ *
+ * `seq` is per-client monotonic and increments once per SIM_DT of client sim
+ * time; the server echoes the last one it consumed as you.lastProcessedSeq,
+ * which is what the client replays from. `dt` is the sim time this input
+ * accounts for (honest clients always send SIM_DT) — it is clamped to
+ * [SIM_DT_MIN, SIM_DT_MAX] on arrival and bounded in aggregate by
+ * SIM_BUDGET_MUL of real time.
+ */
+export interface KartInputMsg {
+  t: 'kart_input';
+  seq: number; // per-client monotonic, +1 per sim tick
+  throttle: number; // 0..1
+  brake: number; // 0..1 (also reverses from standstill)
+  steer: number; // -1..1 (positive = RIGHT)
+  drift: boolean; // handbrake held
+  respawn: boolean; // R / kids-mode stuck recovery: teleport to the last gate
+  dt: number; // sim seconds this input covers
+}
 
 /** Room-level messages (platform lobby handles join/leave/list itself). */
 export type KartC2S =
-  | {
-      t: 'kart_state';
-      seq: number; // per-client monotonic
-      p: [number, number, number]; // kart origin (y ~0)
-      yaw: number;
-      v: [number, number]; // velocity x/z m/s
-      steer: number; // -1..1
-      drift: boolean;
-    }
+  | KartInputMsg
   | { t: 'nitro' } // consume one nitro charge (NITRO_CHARGES per race)
   /**
    * Explicit lobby start (frozen lobby contract, identical in every game): the
@@ -56,6 +75,26 @@ export interface KartYou {
   bestLapMs: number; // -1 until a lap completes
   nitroLeft: number; // charges remaining this race (NITRO_CHARGES at GO)
   gapAheadMs: number; // est. ms behind the player one place ahead; 0 for the leader
+  /**
+   * Ack: the last kart_input seq the server actually consumed for THIS player.
+   * The client drops everything up to it and replays the rest on top of `sim`.
+   *
+   * It is a WATERMARK, NOT A COUNT of inputs simulated: when a client's backlog
+   * overruns INPUT_QUEUE_CAP the server drops from the FRONT, so the ack can
+   * step over seqs that were never integrated. That is exactly what the client
+   * needs — everything at or below it is settled, one way or another, and
+   * re-basing on `sim` is what makes the dropped ones harmless — but nothing
+   * downstream may treat `lastProcessedSeq` as "how much I have simulated".
+   */
+  lastProcessedSeq: number;
+  /**
+   * The server's authoritative sim state for this player at `lastProcessedSeq`
+   * — the full KartSim, not just a position, because the replay has to restart
+   * from the same gear/shift/drift/anchor the server was in or the two peers
+   * integrate different karts. Per-recipient (never in the shared roster), so
+   * it costs one block per snapshot, not one per player per player.
+   */
+  sim: KartSim;
 }
 
 export type RaceEvent =
@@ -64,6 +103,12 @@ export type RaceEvent =
   | { kind: 'gate'; playerId: string; gate: number }
   | { kind: 'lap'; playerId: string; lap: number; lapMs: number }
   | { kind: 'nitro'; playerId: string; left: number } // a charge was consumed (remote sfx/visual)
+  /**
+   * Server-resolved kart-vs-kart contact. Both drivers receive the SAME event
+   * for the same tick — the impact is one fact about the race, not two clients
+   * each guessing. `impulse` is the approach speed (m/s) the collision removed.
+   */
+  | { kind: 'bump'; a: string; b: string; impulse: number }
   | { kind: 'finish'; playerId: string; place: number }
   | { kind: 'timeout' }
   | { kind: 'restart' };

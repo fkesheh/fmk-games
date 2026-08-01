@@ -1,29 +1,59 @@
 // ============================================================================
-// KART room (docs/KART.md) — authoritative race rules over client-trusted
-// positions. Clients stream kart_state at 15Hz; the SERVER owns gates, laps,
-// places, and results. One 15Hz interval drives the whole phase machine
-// (lobby -[{t:'start'}]-> ready 5s → countdown 3-2-1-GO → racing → results 10s
-// → lobby), place computation, the race timeout, and the snapshot broadcast.
+// KART room (docs/KART.md) — the SERVER-AUTHORITATIVE race. It used to referee
+// race rules over CLIENT-TRUSTED POSITIONS: clients streamed `kart_state`
+// (absolute world x/y/z/yaw/velocity) and the room copied it straight into the
+// player record behind nothing but a stateless range clamp. Kart-vs-kart
+// contact was resolved client-side, position-only and per-client, so the two
+// drivers in a bump saw two different, contradictory collisions.
 //
-// NOTHING auto-starts (frozen lobby contract): 'lobby' is left only when a
-// seated player sends `{t:'start'}` with at least MIN_PLAYERS seated, and the
-// results timer returns the room to the lobby to WAIT for the next one.
+// WHAT CHANGED — the wire now carries INTENT, never coordinates:
+//   * clients send `kart_input` (throttle/brake/steer/drift/respawn + dt + seq);
+//     `kart_state` does not exist any more, so "teleport to the next gate" is
+//     not a message that can be sent;
+//   * the room integrates the SHARED sim (shared/sim.ts stepDrive, the exact
+//     function the client predicts with) at SIM_HZ from that input stream and
+//     owns every position on the track;
+//   * kart-vs-kart contact is resolved ONCE per tick over all karts
+//     (resolveKartPair) — real momentum exchange, so both drivers get the same
+//     impact, at the same instant, with the hit costing the hitter what it
+//     gives the hit;
+//   * each snapshot echoes `you.lastProcessedSeq` + `you.sim` so the client can
+//     re-base and replay its unacknowledged inputs (fps/net/prediction.ts).
+// A client's only remaining levers are the CONTENTS of its inputs and how many
+// it sends; the latter is bounded by MAX_INPUTS_PER_TICK per tick and by
+// SIM_BUDGET_MUL seconds of simulated kart time per real second.
 //
-// Gate credit model: the 8 gates are credited IN ORDER only — a credit needs
-// the player's streamed position within GATE_RADIUS of the EXPECTED gate
-// (skipping gates gives nothing). nextGate starts at 1, so the start/finish
-// line (gate 0) is the LAST credit of every lap: 8 credits per lap, finish at
-// exactly LAPS_TO_WIN * GATES. `progress` is the monotonic credit count
-// (KART.md "progress = lap×GATES + nextGateIndex" with a 0-based lap).
-// Never throws.
+// TWO INTERVALS: the sim tick (SIM_HZ) runs the phase machine, consumes inputs,
+// integrates, resolves contact and recomputes places; the snapshot tick
+// (SNAPSHOT_HZ) only broadcasts. Both are individually guarded — this room
+// never throws, whatever arrives on the wire.
+//
+// Phase machine (unchanged): lobby -[{t:'start'}]-> ready 5s → countdown
+// 3-2-1-GO → racing → results 10s → lobby. NOTHING auto-starts (frozen lobby
+// contract): 'lobby' is left only when a seated player sends `{t:'start'}` with
+// at least MIN_PLAYERS seated, and the results timer returns the room to the
+// lobby to WAIT for the next one.
+//
+// Gate credit model (unchanged, now over SERVER-SIMULATED positions): the 8
+// gates are credited IN ORDER only — a credit needs the kart within
+// GATE_RADIUS of the EXPECTED gate (skipping gates gives nothing) — and the
+// check runs after EVERY integrated input, not once per tick, so a burst of
+// queued inputs can never tunnel through a gate. nextGate starts at 1, so the
+// start/finish line (gate 0) is the LAST credit of every lap: 8 credits per
+// lap, finish at exactly LAPS_TO_WIN * GATES. `progress` is the monotonic
+// credit count (KART.md "progress = lap×GATES + nextGateIndex", 0-based lap).
 // ============================================================================
 import {
+  BUMP_COOLDOWN_MS,
+  BUMP_MIN_SPEED,
   COUNTDOWN_SECONDS,
   GATE_RADIUS,
   GATES,
+  INPUT_QUEUE_CAP,
   INPUT_STALE_MS,
   KART_COLORS,
   LAPS_TO_WIN,
+  MAX_INPUTS_PER_TICK,
   MAX_PLAYERS,
   MIN_PLAYERS,
   NITRO_CHARGES,
@@ -31,16 +61,25 @@ import {
   READY_SECONDS,
   RESULTS_SECONDS,
   RACE_TIMEOUT_S,
+  SIM_BUDGET_MUL,
+  SIM_HZ,
   SNAPSHOT_HZ,
   buildTrack,
+  clampToBarrier,
   gridSlot,
+  makeSim,
   parseKartC2S,
+  resetSim,
+  resolveKartPair,
+  stepDrive,
 } from '@kart/shared';
 import type {
+  KartInputMsg,
   KartPhase,
   KartPlayerInfo,
   KartPlayerSnap,
   KartS2C,
+  KartSim,
   KartYou,
   RaceEvent,
   TrackDef,
@@ -77,17 +116,19 @@ interface Player {
   name: string;
   slot: number; // grid slot (lowest free at join)
   color: number; // index into KART_COLORS
-  lastStateAt: number; // serverTime ms of join / last valid kart_state; stale sweep
-  lastSeq: number; // last accepted kart_state seq (per-client monotonic)
-  // last streamed kart state (spawn = the player's grid slot)
-  x: number;
-  y: number;
-  z: number;
-  yaw: number;
-  vx: number;
-  vz: number;
-  steer: number;
-  drift: boolean;
+  lastStateAt: number; // serverTime ms of join / last valid message; stale sweep
+  // ---- authoritative simulation ----
+  // `sim` IS the kart: position, yaw, velocity, gearbox, drift and respawn
+  // anchor. Nothing on the wire writes to it — only stepDrive (from consumed
+  // inputs) and resolveKartPair (contact) do.
+  sim: KartSim;
+  steer: number; // last consumed input's steer: a VISUAL channel (wheel angle), not physics
+  inputQueue: KartInputMsg[]; // FIFO, capped at INPUT_QUEUE_CAP (oldest dropped)
+  lastQueuedSeq: number; // monotonic gate applied at enqueue time
+  lastProcessedSeq: number; // last seq actually consumed; echoed as you.lastProcessedSeq
+  simWindow: number; // floor(now/1000) bucket the speedhack budget is charged in
+  simUsed: number; // simulated seconds charged inside that bucket
+  bumpAt: number; // serverTime ms of this player's last 'bump' event (cooldown)
   // race state (reset on every return to the lobby)
   lap: number; // 1-based current lap
   nextGate: number; // expected gate index; 1 at race start (the line ends each lap)
@@ -103,12 +144,13 @@ interface Player {
   nitroLeft: number; // charges remaining (0 outside racing until the GO refill)
   nitroUntil: number; // serverTime ms; nitroActive in snaps while now < nitroUntil
   // ---- persistent wire objects (allocated ONCE at join, mutated per tick) ----
-  // The snapshot is 15Hz x every recipient; rebuilding it allocated O(n^2)
-  // objects per tick (400/tick at MAX_PLAYERS 20). These three are the whole
-  // fix: `snap` is this player's entry in the ONE shared per-tick roster,
-  // `you` is their private block, `msg` the envelope that carries both.
-  // Safe because Session.send JSON-encodes synchronously (platform/server
-  // net.ts -> encodeS2C), so no recipient can observe a later tick's values.
+  // The snapshot is SNAPSHOT_HZ x every recipient; rebuilding it allocated
+  // O(n^2) objects per tick (400/tick at MAX_PLAYERS 20). These three are the
+  // whole fix: `snap` is this player's entry in the ONE shared per-tick roster,
+  // `you` is their private block (whose `sim` field is bound to `sim` above
+  // ONCE, at join — never reassigned per tick), `msg` the envelope. Safe
+  // because Session.send JSON-encodes synchronously (platform/server net.ts ->
+  // encodeS2C), so no recipient can observe a later tick's values.
   snap: KartPlayerSnap;
   you: KartYou;
   msg: SnapshotMsg;
@@ -125,6 +167,10 @@ export class KartRoom implements GameRoomHandle {
   // The ONE per-tick roster array, shared by every recipient's snapshot (see
   // buildSnapPlayers). Rebuilt in place each tick; never reallocated.
   private readonly snapPlayers: KartPlayerSnap[] = [];
+  // The ONE scratch Player[] — rebuilt in place for the pair loop and for the
+  // place sort (which used to allocate `[...players.values()]` every tick, a
+  // cost that doubled when places moved from 15Hz to SIM_HZ).
+  private readonly order: Player[] = [];
 
   private phase: KartPhase = 'lobby';
   private tickCount = 0; // snapshot sequence
@@ -134,7 +180,8 @@ export class KartRoom implements GameRoomHandle {
   private raceStartAt = 0; // serverTime ms of GO
   private raceEndsAt = 0; // serverTime ms; hard cap (RACE_TIMEOUT_S after GO)
   private finishOrder: PlayerId[] = []; // finish sequence; kept even for disconnects
-  private interval: ReturnType<typeof setInterval> | null = null;
+  private simTimer: ReturnType<typeof setInterval> | null = null;
+  private snapTimer: ReturnType<typeof setInterval> | null = null;
   private stopped = false;
 
   constructor(visibility: Visibility, io: RoomIO) {
@@ -165,7 +212,7 @@ export class KartRoom implements GameRoomHandle {
     return this.players.size;
   }
 
-  /** Players with no kart_state for INPUT_STALE_MS. */
+  /** Players with no valid message (kart_input/nitro/start) for INPUT_STALE_MS. */
   stalePlayers(): PlayerId[] {
     const now = Date.now();
     const out: PlayerId[] = [];
@@ -228,6 +275,11 @@ export class KartRoom implements GameRoomHandle {
     }
   }
 
+  /**
+   * Wire ingress ONLY — it never simulates. An input is validated, gated on the
+   * per-client monotonic seq and QUEUED; the sim tick is the single place a
+   * kart moves, so message timing/bursting cannot buy a player extra motion.
+   */
   handleMessage(id: PlayerId, msg: unknown): void {
     try {
       const parsed = parseKartC2S(msg);
@@ -244,20 +296,10 @@ export class KartRoom implements GameRoomHandle {
         this.tryStart(now);
         return;
       }
-      if (parsed.seq <= p.lastSeq) return; // per-client monotonic: drop late dupes
-      p.lastSeq = parsed.seq;
-      // Pre-GO freeze (frozen): positions are IGNORED outside 'racing' — the
-      // snapshot stays at the grid slot until GO wipes any pre-GO movement.
-      if (this.phase !== 'racing') return;
-      p.x = parsed.p[0];
-      p.y = parsed.p[1];
-      p.z = parsed.p[2];
-      p.yaw = parsed.yaw;
-      p.vx = parsed.v[0];
-      p.vz = parsed.v[1];
-      p.steer = parsed.steer;
-      p.drift = parsed.drift;
-      if (!p.finished) this.tryGateCredit(p, now);
+      if (parsed.seq <= p.lastQueuedSeq) return; // per-client monotonic: drop late dupes
+      p.lastQueuedSeq = parsed.seq;
+      if (p.inputQueue.length >= INPUT_QUEUE_CAP) p.inputQueue.shift(); // oldest dropped
+      p.inputQueue.push(parsed);
     } catch (err) {
       console.error('[kart] handleMessage failed', err);
     }
@@ -265,24 +307,32 @@ export class KartRoom implements GameRoomHandle {
 
   start(): void {
     this.stopped = false; // idempotent
-    if (this.interval === null) {
-      this.interval = setInterval(() => this.tick(), 1000 / SNAPSHOT_HZ);
+    if (this.simTimer === null) {
+      this.simTimer = setInterval(() => this.simTick(), 1000 / SIM_HZ);
+    }
+    if (this.snapTimer === null) {
+      this.snapTimer = setInterval(() => this.snapshotTick(), 1000 / SNAPSHOT_HZ);
     }
   }
 
   stop(): void {
     this.stopped = true;
-    if (this.interval !== null) {
-      clearInterval(this.interval);
-      this.interval = null;
+    if (this.simTimer !== null) {
+      clearInterval(this.simTimer);
+      this.simTimer = null;
+    }
+    if (this.snapTimer !== null) {
+      clearInterval(this.snapTimer);
+      this.snapTimer = null;
     }
   }
 
   // -------------------------------------------------------------------------
-  // Phase machine (driven by the 15Hz tick)
+  // Sim tick (SIM_HZ): phase machine, input consumption + integration,
+  // kart-vs-kart contact, places. Never throws.
   // -------------------------------------------------------------------------
 
-  private tick(): void {
+  private simTick(): void {
     if (this.stopped) return;
     try {
       const now = Date.now();
@@ -294,7 +344,6 @@ export class KartRoom implements GameRoomHandle {
           if (now >= this.countdownEndsAt) this.advanceCountdown(now);
           break;
         case 'racing':
-          this.updatePlaces();
           if (now >= this.raceEndsAt) {
             this.broadcastEvent({ kind: 'timeout' });
             this.enterResults(now);
@@ -306,12 +355,131 @@ export class KartRoom implements GameRoomHandle {
         case 'lobby':
           break;
       }
-      this.tickCount++;
-      this.broadcastSnapshot(now);
+      // integrate in join order, then resolve every contact ONCE over the
+      // post-step positions (order-independent, unlike per-player resolution)
+      for (const p of this.players.values()) this.tickPlayer(p, now);
+      if (this.phase === 'racing') {
+        this.resolveContacts(now);
+        this.updatePlaces();
+      }
     } catch (err) {
-      console.error('[kart] tick failed', err);
+      console.error('[kart] simTick failed', err);
     }
   }
+
+  /** Snapshot tick (SNAPSHOT_HZ): broadcast only, no simulation. Never throws. */
+  private snapshotTick(): void {
+    if (this.stopped) return;
+    try {
+      this.tickCount++;
+      this.broadcastSnapshot(Date.now());
+    } catch (err) {
+      console.error('[kart] snapshotTick failed', err);
+    }
+  }
+
+  /**
+   * Consume this player's queued inputs (FIFO, at most MAX_INPUTS_PER_TICK) and
+   * integrate them.
+   *
+   * SPEEDHACK BUDGET: simulated time is charged into a 1-second wall-clock
+   * bucket and capped at SIM_BUDGET_MUL seconds of kart time per real second.
+   * An honest client sending SIM_HZ inputs of SIM_DT each sits at exactly 1.0
+   * and never trips it; the headroom absorbs jitter/catch-up. Over budget the
+   * remaining inputs simply stay QUEUED (and unacknowledged), which is a rate
+   * limit rather than a kick — the flood is throttled to real time.
+   *
+   * Outside 'racing' inputs are still consumed and ACKED but NOT integrated:
+   * the pre-GO grid freeze holds (nothing a client sends can move a kart before
+   * GO) while the client's replay queue still drains instead of growing to its
+   * cap during the whole countdown.
+   */
+  private tickPlayer(p: Player, now: number): void {
+    const q = p.inputQueue;
+    if (q.length === 0) return;
+    const win = Math.floor(now / 1000);
+    if (p.simWindow !== win) {
+      p.simWindow = win;
+      p.simUsed = 0;
+    }
+    const racing = this.phase === 'racing';
+    const max = Math.min(q.length, MAX_INPUTS_PER_TICK);
+    let n = 0;
+    for (; n < max; n++) {
+      const inp = q[n];
+      if (inp === undefined) break;
+      // budget is charged only for inputs that actually integrate
+      if (racing && p.simUsed + inp.dt > SIM_BUDGET_MUL) break;
+      p.lastProcessedSeq = inp.seq;
+      if (racing) {
+        // steer is a VISUAL channel (the remote kart's wheel angle), but it is
+        // still client-supplied, so it obeys the pre-GO freeze too: a kart on
+        // the grid shows straight wheels no matter what its driver is holding.
+        p.steer = inp.steer;
+        stepDrive(p.sim, inp, inp.dt, this.track);
+        p.simUsed += inp.dt;
+        // per INPUT, not per tick: a burst can never tunnel through a gate
+        if (!p.finished) this.tryGateCredit(p, now);
+      }
+    }
+    if (n >= q.length) q.length = 0;
+    else if (n > 0) {
+      q.copyWithin(0, n);
+      q.length -= n;
+    }
+  }
+
+  /**
+   * Kart-vs-kart contact for the WHOLE room, resolved once per sim tick after
+   * every kart has stepped. Each unordered pair is resolved exactly once, so
+   * both drivers get the same overlap split and the same normal impulse — the
+   * bump is one fact about the race instead of two clients disagreeing.
+   *
+   * A shove can land a kart past the wall, so every kart is re-clamped to the
+   * barrier AFTER the whole pair loop, not inside it. Two reasons, both real:
+   * resolveKartPair returns 0 for a pair that is TOUCHING BUT SEPARATING — it
+   * has already split their overlap by then, so a zero return is not "nothing
+   * moved" and an inner-loop clamp guarded by the return value misses it (two
+   * karts respawning onto the same gate anchor is the easy case: 1.8m of
+   * push-out with zero relative velocity). And a chained shove (A pushed into
+   * B, B pushed into the wall) is only resolved if the pairs happen to come in
+   * the right order. One unconditional O(n) pass at the end covers both, and
+   * costs 20 clamps a tick instead of up to 380 — cheaper than the guarded
+   * version it replaces, and it cannot miss a case.
+   */
+  private resolveContacts(now: number): void {
+    const list = this.rebuildOrder();
+    for (let i = 0; i < list.length; i++) {
+      const a = list[i]!;
+      for (let j = i + 1; j < list.length; j++) {
+        const b = list[j]!;
+        const impulse = resolveKartPair(a.sim, b.sim);
+        if (impulse <= 0) continue;
+        if (
+          impulse >= BUMP_MIN_SPEED &&
+          now - a.bumpAt >= BUMP_COOLDOWN_MS &&
+          now - b.bumpAt >= BUMP_COOLDOWN_MS
+        ) {
+          a.bumpAt = now;
+          b.bumpAt = now;
+          this.broadcastEvent({ kind: 'bump', a: a.id, b: b.id, impulse });
+        }
+      }
+    }
+    for (const p of list) clampToBarrier(p.sim, this.track);
+  }
+
+  /** The shared scratch roster, refilled in place (never reallocated). */
+  private rebuildOrder(): Player[] {
+    const list = this.order;
+    list.length = 0;
+    for (const p of this.players.values()) list.push(p);
+    return list;
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase machine
+  // -------------------------------------------------------------------------
 
   /**
    * The ONE way out of 'lobby' (frozen lobby contract). Any seated player may
@@ -364,16 +532,18 @@ export class KartRoom implements GameRoomHandle {
     this.raceEndsAt = now + RACE_TIMEOUT_S * 1000;
     this.phaseEndsAt = this.raceEndsAt;
     for (const p of this.players.values()) {
-      // Pre-GO freeze: wipe any streamed pre-GO movement back to the grid slot
+      // Grid wipe: a fresh kart on the slot, and the pre-GO input backlog is
+      // DROPPED but ACKED — dropping alone would leave those seqs pending in
+      // the client's replay queue forever (it would keep re-applying inputs the
+      // server will never process), acking alone would let them apply after GO.
       const spawn = gridSlot(this.track, p.slot);
-      p.x = spawn.x;
-      p.y = 0;
-      p.z = spawn.z;
-      p.yaw = spawn.yaw;
-      p.vx = 0;
-      p.vz = 0;
+      resetSim(p.sim, spawn.x, spawn.z, spawn.yaw);
       p.steer = 0;
-      p.drift = false;
+      p.inputQueue.length = 0;
+      p.lastProcessedSeq = Math.max(p.lastProcessedSeq, p.lastQueuedSeq);
+      p.simWindow = 0;
+      p.simUsed = 0;
+      p.bumpAt = 0;
       p.nitroLeft = NITRO_CHARGES; // per-race charges refill at GO
       p.nitroUntil = 0;
       p.lapStartAt = now;
@@ -415,8 +585,8 @@ export class KartRoom implements GameRoomHandle {
    */
   private tryGateCredit(p: Player, now: number): void {
     const gate = this.track.gates[p.nextGate]!;
-    const dx = p.x - gate.x;
-    const dz = p.z - gate.z;
+    const dx = p.sim.x - gate.x;
+    const dz = p.sim.z - gate.z;
     if (dx * dx + dz * dz > GATE_RADIUS * GATE_RADIUS) return;
     const credited = p.nextGate;
     p.nextGate = (p.nextGate + 1) % GATES;
@@ -442,38 +612,51 @@ export class KartRoom implements GameRoomHandle {
 
   /**
    * Nitro (frozen): one charge per use, only while racing, only if a charge
-   * remains (else silently ignored). The boost itself is client-side; the
-   * server times nitroActive (NITRO_TIME) for snaps and broadcasts the event.
+   * remains (else silently ignored).
+   *
+   * THREE different quantities, deliberately: `p.nitroLeft` is the CHARGE COUNT
+   * (0..NITRO_CHARGES, shown in the HUD), `p.nitroUntil` is the wall-clock
+   * window `nitroActive` is true in (the remote flame/skid visual), and
+   * `p.sim.nitroLeft` is BOOST SECONDS consumed by stepKart. The last one used
+   * to be set only on the client, which was harmless while the client owned
+   * positions — now that the server integrates, a server sim without the boost
+   * would fight a client prediction with it for the whole NITRO_TIME, i.e. a
+   * hard correction on every press.
    */
   private tryNitro(p: Player, now: number): void {
     if (this.phase !== 'racing') return;
     if (p.nitroLeft <= 0) return;
     p.nitroLeft--;
     p.nitroUntil = now + NITRO_TIME * 1000;
+    p.sim.nitroLeft = NITRO_TIME; // boost seconds: what the SIM actually burns
     this.broadcastEvent({ kind: 'nitro', playerId: p.id, left: p.nitroLeft });
   }
 
   /**
    * Race position: finished players first by finish time (their order is
    * final), then racing players by progress desc; ties break by distance to
-   * the player's next gate, ascending.
+   * the player's next gate, ascending. Sorts the shared scratch array in
+   * place — it runs at SIM_HZ now, so it may not allocate.
    */
   private updatePlaces(): void {
-    const order = [...this.players.values()];
-    order.sort((a, b) => {
-      if (a.finished && b.finished) return a.finishMs - b.finishMs;
-      if (a.finished !== b.finished) return a.finished ? -1 : 1;
-      if (a.progress !== b.progress) return b.progress - a.progress;
-      return this.distToNextGate(a) - this.distToNextGate(b);
-    });
-    order.forEach((p, i) => {
-      p.place = i + 1;
-    });
+    const order = this.rebuildOrder();
+    order.sort(this.placeCmp); // hoisted: a fresh comparator closure per call
+    // was the one remaining allocation in a 30Hz tick
+    for (let i = 0; i < order.length; i++) order[i]!.place = i + 1;
   }
+
+  /** Place order: finishers first by finish time, then by progress, then by
+   *  distance to their own next gate. Allocated once, not per sort. */
+  private readonly placeCmp = (a: Player, b: Player): number => {
+    if (a.finished && b.finished) return a.finishMs - b.finishMs;
+    if (a.finished !== b.finished) return a.finished ? -1 : 1;
+    if (a.progress !== b.progress) return b.progress - a.progress;
+    return this.distToNextGate(a) - this.distToNextGate(b);
+  };
 
   private distToNextGate(p: Player): number {
     const gate = this.track.gates[p.nextGate]!;
-    return Math.hypot(p.x - gate.x, p.z - gate.z);
+    return Math.hypot(p.sim.x - gate.x, p.sim.z - gate.z);
   }
 
   /** Every connected player has finished (and someone is connected). */
@@ -492,6 +675,7 @@ export class KartRoom implements GameRoomHandle {
     const slot = this.lowestFreeSlot();
     const spawn = gridSlot(this.track, slot);
     const color = slot % KART_COLORS.length;
+    const sim = makeSim(spawn.x, spawn.z, spawn.yaw);
     const snap: KartPlayerSnap = {
       id,
       name,
@@ -520,6 +704,8 @@ export class KartRoom implements GameRoomHandle {
       bestLapMs: -1,
       nitroLeft: 0,
       gapAheadMs: 0,
+      lastProcessedSeq: -1,
+      sim, // bound ONCE: the sim mutates in place, the reference never changes
     };
     const p: Player = {
       id,
@@ -527,15 +713,14 @@ export class KartRoom implements GameRoomHandle {
       slot,
       color,
       lastStateAt: now,
-      lastSeq: -1,
-      x: spawn.x,
-      y: 0,
-      z: spawn.z,
-      yaw: spawn.yaw,
-      vx: 0,
-      vz: 0,
+      sim,
       steer: 0,
-      drift: false,
+      inputQueue: [],
+      lastQueuedSeq: -1,
+      lastProcessedSeq: -1,
+      simWindow: 0,
+      simUsed: 0,
+      bumpAt: 0,
       lap: 1,
       nextGate: 1,
       progress: 0,
@@ -570,14 +755,13 @@ export class KartRoom implements GameRoomHandle {
   /** Back to the grid for the next race (slot and color stay). */
   private resetRaceState(p: Player): void {
     const spawn = gridSlot(this.track, p.slot);
-    p.x = spawn.x;
-    p.y = 0;
-    p.z = spawn.z;
-    p.yaw = spawn.yaw;
-    p.vx = 0;
-    p.vz = 0;
+    resetSim(p.sim, spawn.x, spawn.z, spawn.yaw);
     p.steer = 0;
-    p.drift = false;
+    p.inputQueue.length = 0;
+    p.lastProcessedSeq = Math.max(p.lastProcessedSeq, p.lastQueuedSeq);
+    p.simWindow = 0;
+    p.simUsed = 0;
+    p.bumpAt = 0;
     p.lap = 1;
     p.nextGate = 1;
     p.progress = 0;
@@ -643,7 +827,7 @@ export class KartRoom implements GameRoomHandle {
       const theirs = ahead.gateTimes.get(seq);
       if (mine !== undefined && theirs !== undefined) return Math.max(0, mine - theirs);
     }
-    return Math.round((Math.hypot(you.x - ahead.x, you.z - ahead.z) / 20) * 1000);
+    return Math.round((Math.hypot(you.sim.x - ahead.sim.x, you.sim.z - ahead.sim.z) / 20) * 1000);
   }
 
   /**
@@ -653,7 +837,7 @@ export class KartRoom implements GameRoomHandle {
    *
    * This used to live inside the per-recipient loop: n snapshots x n entries =
    * O(n^2) fresh objects every tick (8 players -> 64/tick; 20 -> 400/tick, i.e.
-   * 6,000/s at SNAPSHOT_HZ 15, each with two fresh sub-arrays). Same pattern as
+   * 8,000/s at SNAPSHOT_HZ 20, each with two fresh sub-arrays). Same pattern as
    * the FPS server (games/fps/server/src/game.ts sendSnapshots).
    */
   private buildSnapPlayers(now: number): KartPlayerSnap[] {
@@ -661,15 +845,16 @@ export class KartRoom implements GameRoomHandle {
     list.length = 0;
     for (const p of this.players.values()) {
       const s = p.snap;
+      const k = p.sim; // the authoritative kart: nothing else writes these
       s.name = p.name; // a same-session re-add can rename; id/slot/color cannot change
-      s.p[0] = p.x;
-      s.p[1] = p.y;
-      s.p[2] = p.z;
-      s.yaw = p.yaw;
-      s.v[0] = p.vx;
-      s.v[1] = p.vz;
+      s.p[0] = k.x;
+      s.p[1] = k.y;
+      s.p[2] = k.z;
+      s.yaw = k.yaw;
+      s.v[0] = k.vx;
+      s.v[1] = k.vz;
       s.steer = p.steer;
-      s.drift = p.drift;
+      s.drift = k.drifting;
       s.lap = p.lap;
       s.nextGate = p.nextGate;
       s.progress = p.progress;
@@ -685,7 +870,8 @@ export class KartRoom implements GameRoomHandle {
   /**
    * One shared roster + a per-recipient `you` block. The wire bytes are exactly
    * what snapshotFor() used to produce — Session.send JSON-encodes each message
-   * synchronously, so reusing the objects is invisible to clients.
+   * synchronously, so reusing the objects is invisible to clients. `you.sim` is
+   * NOT assigned here: it is bound to the player's live KartSim once at join.
    */
   private broadcastSnapshot(now: number): void {
     const list = this.buildSnapPlayers(now);
@@ -702,6 +888,7 @@ export class KartRoom implements GameRoomHandle {
       you.bestLapMs = p.bestLapMs;
       you.nitroLeft = p.nitroLeft;
       you.gapAheadMs = this.gapAheadMs(p);
+      you.lastProcessedSeq = p.lastProcessedSeq;
       const m = p.msg;
       m.tick = this.tickCount;
       m.serverTime = now;
