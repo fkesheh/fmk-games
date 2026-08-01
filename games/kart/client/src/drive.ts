@@ -123,13 +123,19 @@ export class DriveController {
   /** App-wired nitro request hook — fired on a fresh KeyN press. */
   onNitro: (() => void) | null = null;
 
-  constructor(private readonly track: TrackDef) {
+  constructor(private track: TrackDef) {
     this.pred = new KartPredictor(track);
     if (typeof window !== 'undefined') {
       window.addEventListener('keydown', this.onKeyDown);
       window.addEventListener('keyup', this.onKeyUp);
       window.addEventListener('blur', this.onBlur);
     }
+  }
+
+  /** Swap circuits (the room's trackId arrives with kart_joined). Drops the replay queue. */
+  setTrack(track: TrackDef): void {
+    this.track = track;
+    this.pred.setTrack(track);
   }
 
   /** Remove keyboard listeners (teardown / hot-reload). */

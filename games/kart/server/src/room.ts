@@ -72,6 +72,7 @@ import {
   resetSim,
   resolveKartPair,
   stepDrive,
+  TRACKS,
 } from '@kart/shared';
 import type {
   KartInputMsg,
@@ -83,6 +84,7 @@ import type {
   KartYou,
   RaceEvent,
   TrackDef,
+  TrackId,
 } from '@kart/shared';
 import { rng, rngInt } from '@platform/shared';
 import type {
@@ -160,6 +162,7 @@ export class KartRoom implements GameRoomHandle {
   readonly id: RoomId;
   readonly code: string | null;
   readonly visibility: Visibility;
+  readonly trackId: TrackId; // this room's circuit; never changes after construction
 
   private readonly io: RoomIO;
   private readonly track: TrackDef; // shared TrackDef: gate positions for credit checks
@@ -184,10 +187,11 @@ export class KartRoom implements GameRoomHandle {
   private snapTimer: ReturnType<typeof setInterval> | null = null;
   private stopped = false;
 
-  constructor(visibility: Visibility, io: RoomIO) {
+  constructor(trackId: TrackId, visibility: Visibility, io: RoomIO) {
     this.visibility = visibility;
     this.io = io;
-    this.track = buildTrack(); // deterministic: same gates the client renders
+    this.track = buildTrack(TRACKS[trackId]); // deterministic: same gates the client renders
+    this.trackId = this.track.id;
     // server-side generation (room id, private code) uses rng(Date.now())
     const next = rng((Date.now() ^ (roomSeq++ * 0x9e3779b9)) >>> 0);
     this.id = randomToken(next, 8);
@@ -199,7 +203,7 @@ export class KartRoom implements GameRoomHandle {
       id: this.id,
       code: this.code,
       game: 'kart',
-      label: '3 laps · circuit',
+      label: `3 laps · ${this.track.name}`,
       players: this.playerCount(),
       maxPlayers: MAX_PLAYERS,
       phase: this.phase,
@@ -744,6 +748,7 @@ export class KartRoom implements GameRoomHandle {
         playerCount: this.playerCount(),
         minPlayers: MIN_PLAYERS,
         canStart: this.canStart(),
+        trackId: this.track.id, // this room's circuit never changes; set once, not per tick
         you, // same object: broadcastSnapshot mutates it, never replaces it
         players: this.snapPlayers,
       },
@@ -801,6 +806,7 @@ export class KartRoom implements GameRoomHandle {
       slot: you.slot,
       color: you.color,
       phase: this.phase,
+      trackId: this.track.id,
       players,
     };
   }

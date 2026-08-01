@@ -30,7 +30,7 @@
 // ============================================================================
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
-import { KPAL, KART_COLORS, buildTrack, type TrackDef } from '@kart/shared';
+import { KPAL, KART_COLORS, type TrackDef } from '@kart/shared';
 import { box, cyl, sphere, type MatFn } from './trackMesh.js';
 
 // ---- kart visual tuning (frozen feel) ---------------------------------------------
@@ -47,12 +47,17 @@ const LEAN_MAX = 0.14; // driver lean into turns at full lock + speed (rad)
 const SHAKE_AMP = 0.012; // grass shake amplitude (m) — tiny, high-frequency
 const SHAKE_MIN_SPEED = 1.5; // m/s — no shake when parked on the grass
 
-// ---- grass detection (the one deterministic circuit; built lazily, no I/O) -------
+// ---- grass detection (injected circuit; multi-track, no I/O) ---------------------
 // surfaceAt()/closestOnTrack() allocate per call — this inline distance check
 // against the same centerline keeps update() allocation-free.
 let grassTrack: TrackDef | null = null;
+/** The circuit KartVisual's off-road check runs against. app.ts injects it whenever the
+ *  room's circuit changes; unset means "assume on-road" (nothing to compare against). */
+export function setKartTrack(track: TrackDef): void {
+  grassTrack = track;
+}
 function offRoad(x: number, z: number): boolean {
-  if (!grassTrack) grassTrack = buildTrack();
+  if (!grassTrack) return false;
   const cl = grassTrack.centerline;
   let bestD = Infinity;
   for (let i = 0; i < cl.length; i++) {

@@ -42,6 +42,7 @@ import {
   SNAPSHOT_HZ,
   buildTrack,
   closestOnTrack,
+  DEFAULT_TRACK_ID,
   gridSlot,
   makeAssistState,
   makeSim,
@@ -49,9 +50,11 @@ import {
   pursuitSteer,
   resetSim,
   stepDrive,
+  TRACKS,
 } from '@kart/shared';
 import type { KartInputMsg, KartPhase, KartS2C, KartSim, RaceEvent } from '@kart/shared';
 import type { PlayerId, RoomIO } from '@platform/shared';
+import { kartModule } from './module.js';
 import { KartRoom } from './room.js';
 
 type SnapshotMsg = Extract<KartS2C, { t: 'kart_snapshot' }>;
@@ -114,7 +117,7 @@ class FakeIO implements RoomIO {
 // ---- timing ------------------------------------------------------------------
 
 /** The one circuit under test — the same TrackDef the room builds. */
-const TRACK = buildTrack();
+const TRACK = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
 const SIM_STEP_MS = Math.ceil(1000 / SIM_HZ); // 34ms: one sim tick (+ a little)
 const SNAP_STEP_MS = Math.ceil(1000 / SNAPSHOT_HZ); // 50ms: one snapshot tick
 
@@ -246,7 +249,7 @@ function driveUntil(
 
 /** Seated players, room started, START pressed, driven all the way to 'racing'. */
 function setupRace(io: FakeIO, ids: PlayerId[] = ['p1', 'p2']): { room: KartRoom; drivers: Driver[] } {
-  const room = new KartRoom('public', io);
+  const room = new KartRoom(DEFAULT_TRACK_ID, 'public', io);
   ids.forEach((id, i) => room.addPlayer(id, `Driver${i + 1}`));
   room.start();
   room.handleMessage(ids[0]!, { t: 'start' }); // nothing auto-starts
@@ -322,18 +325,35 @@ function lateralOf(p: [number, number, number]): number {
 }
 
 /**
- * Park every kart on ONE point: drive them until each has credited gate 0 (so
- * they all share the same respawn anchor), then send a `respawn` input. The
- * result is a perfectly stacked pile with zero relative velocity — the contact
- * case resolveKartPair splits positions for while returning impulse 0.
+ * Park every kart on ONE point: drive each kart until IT has credited gate 0
+ * (so they all share the same respawn anchor), then send a `respawn` input.
+ * The result is a perfectly stacked pile with zero relative velocity — the
+ * contact case resolveKartPair splits positions for while returning impulse 0.
+ *
+ * Once a kart's expectedGate reaches 1 it is braked, not just left at the
+ * same throttle — a kart that keeps accelerating runs on toward gate 1, and
+ * crossing THAT gate moves its anchor from gate 0 to gate 1 (598.2 m / 8 =
+ * 74.8 m down the road), which un-stacks the pile that respawn is supposed to
+ * produce. With the corrected (arc-length) starting grid every kart starts on
+ * tarmac, so the front rows can clear gate 1 while the packed back rows are
+ * still working through contact; braking each kart the instant it is anchored
+ * holds it at gate 0 while the stragglers catch up. Do not "simplify" this
+ * back to a single throttle applied to the whole field.
  */
 function stackOnAnchor(room: KartRoom, io: FakeIO, ids: PlayerId[]): number {
   let seq = 0;
   const anchored = (): boolean =>
     ids.every((id) => (io.snapOrNull(id)?.you.sim.expectedGate ?? 0) >= 1);
-  for (let i = 0; i < 250 && !anchored(); i++) {
+  // 1200: with braking-on-anchor, the 3-kart pile settles in ~12 ticks but the
+  // packed 20-kart pile needs ~1090 — braked leaders sit at gate 0 while the
+  // still-accelerating back rows fight through contact to reach it too.
+  for (let i = 0; i < 1200 && !anchored(); i++) {
     seq++;
-    for (const id of ids) sendInput(room, id, seq, { throttle: 1, brake: 0, dt: SIM_DT });
+    for (const id of ids) {
+      const expectedGate = io.snapOrNull(id)?.you.sim.expectedGate ?? 0;
+      const input = expectedGate >= 1 ? { throttle: 0, brake: 1 } : { throttle: 1, brake: 0 };
+      sendInput(room, id, seq, { ...input, dt: SIM_DT });
+    }
     tick();
   }
   expect(anchored(), 'every kart crossed the line and moved its respawn anchor').toBe(true);
@@ -356,7 +376,7 @@ afterEach(() => {
 describe('KartRoom phase flow', () => {
   it('stays in lobby solo; with 2 seated an explicit START runs ready -> countdown 3-2-1-go -> racing', () => {
     const io = new FakeIO();
-    const room = new KartRoom('public', io);
+    const room = new KartRoom(DEFAULT_TRACK_ID, 'public', io);
     room.addPlayer('p1', 'Alpha');
     room.start();
 
@@ -364,7 +384,7 @@ describe('KartRoom phase flow', () => {
     expect(io.lastSnap('p1').phase).toBe('lobby'); // < MIN_PLAYERS
     expect(room.info().phase).toBe('lobby');
     expect(room.info().game).toBe('kart');
-    expect(room.info().label).toBe('3 laps · circuit');
+    expect(room.info().label).toBe(`3 laps · ${TRACKS[DEFAULT_TRACK_ID].name}`); // e.g. "3 laps · Greenvale Ring"
     expect(room.info().maxPlayers).toBe(MAX_PLAYERS); // never a literal: the cap moves
 
     room.addPlayer('p2', 'Bravo');
@@ -394,7 +414,7 @@ describe('KartRoom phase flow', () => {
 
   it('runs a sim tick AND a snapshot tick, at their own rates', () => {
     const io = new FakeIO();
-    const room = new KartRoom('public', io);
+    const room = new KartRoom(DEFAULT_TRACK_ID, 'public', io);
     room.addPlayer('p1', 'Alpha');
     room.start();
 
@@ -412,7 +432,7 @@ describe('KartRoom phase flow', () => {
 describe('KartRoom explicit start (frozen lobby contract)', () => {
   /** A seated lobby that is startable but has NOT been started. */
   function seatedLobby(io: FakeIO, n = MIN_PLAYERS): KartRoom {
-    const room = new KartRoom('public', io);
+    const room = new KartRoom(DEFAULT_TRACK_ID, 'public', io);
     for (let i = 0; i < n; i++) room.addPlayer(`p${i + 1}`, `Driver${i + 1}`);
     room.start();
     settle();
@@ -442,7 +462,7 @@ describe('KartRoom explicit start (frozen lobby contract)', () => {
 
   it('the snapshot carries playerCount / minPlayers / canStart', () => {
     const io = new FakeIO();
-    const room = new KartRoom('public', io);
+    const room = new KartRoom(DEFAULT_TRACK_ID, 'public', io);
     room.addPlayer('p1', 'Alpha');
     room.start();
     settle();
@@ -466,7 +486,7 @@ describe('KartRoom explicit start (frozen lobby contract)', () => {
 
   it('start below MIN_PLAYERS is ignored (and never throws)', () => {
     const io = new FakeIO();
-    const room = new KartRoom('public', io);
+    const room = new KartRoom(DEFAULT_TRACK_ID, 'public', io);
     room.addPlayer('p1', 'Alpha');
     room.start();
 
@@ -1074,7 +1094,7 @@ describe('KartRoom race end', () => {
 describe('KartRoom pre-GO freeze', () => {
   it('inputs during ready/countdown are ACKED but never integrated; the kart moves only after GO', () => {
     const io = new FakeIO();
-    const room = new KartRoom('public', io);
+    const room = new KartRoom(DEFAULT_TRACK_ID, 'public', io);
     room.addPlayer('p1', 'Alpha');
     room.addPlayer('p2', 'Bravo');
     room.start();
@@ -1214,7 +1234,7 @@ describe('KartRoom gap timing', () => {
 
   it('gapAheadMs is 0 in every non-racing phase (lobby/ready/countdown/results)', () => {
     const io = new FakeIO();
-    const room = new KartRoom('public', io);
+    const room = new KartRoom(DEFAULT_TRACK_ID, 'public', io);
     room.addPlayer('p1', 'Alpha');
     room.start();
 
@@ -1330,5 +1350,83 @@ describe('KartRoom robustness', () => {
     vi.advanceTimersByTime(11_000);
     expect(room.stalePlayers().sort()).toEqual(['p1', 'p2']);
     room.stop();
+  });
+});
+
+// ==============================================================================
+// MULTI-TRACK CONTRACT — trackId travels on kart_joined and every kart_snapshot,
+// and the lobby label names the circuit instead of a generic "circuit" placeholder.
+// ==============================================================================
+describe('KartRoom multi-track contract', () => {
+  it('kart_joined and every kart_snapshot carry trackId for a default-track room', () => {
+    const io = new FakeIO();
+    const room = new KartRoom(DEFAULT_TRACK_ID, 'public', io);
+    room.addPlayer('p1', 'Alpha');
+    expect(io.joined('p1').trackId).toBe(DEFAULT_TRACK_ID);
+
+    room.start();
+    settle();
+    expect(io.lastSnap('p1').trackId).toBe(DEFAULT_TRACK_ID);
+
+    room.addPlayer('p2', 'Bravo');
+    expect(io.joined('p2').trackId).toBe(DEFAULT_TRACK_ID);
+    settle();
+    expect(io.lastSnap('p1').trackId).toBe(DEFAULT_TRACK_ID);
+    expect(io.lastSnap('p2').trackId).toBe(DEFAULT_TRACK_ID);
+    room.stop();
+  });
+
+  it('room.info().label names the circuit', () => {
+    const io = new FakeIO();
+    const room = new KartRoom(DEFAULT_TRACK_ID, 'public', io);
+    expect(room.info().label).toBe(`3 laps · ${TRACKS[DEFAULT_TRACK_ID].name}`);
+    room.stop();
+  });
+});
+
+// ==============================================================================
+// kartModule settings validation (games/kart/server/src/module.ts trackIdFrom):
+// absent settings default to DEFAULT_TRACK_ID; an invalid trackId THROWS, which
+// the platform lobby turns into 'bad_settings' — mirrors fps's mapIdFrom.
+// ==============================================================================
+describe('kartModule settings validation', () => {
+  function fakeIo(): RoomIO {
+    return {
+      send() {
+        /* no-op */
+      },
+      rttMs() {
+        return 0;
+      },
+    };
+  }
+
+  it('accepts a known trackId and defaults when settings are absent', () => {
+    const withTrack = kartModule.createRoom({
+      visibility: 'public',
+      io: fakeIo(),
+      settings: { trackId: 'greenvale' },
+    }) as KartRoom;
+    expect(withTrack.trackId).toBe('greenvale');
+    withTrack.stop();
+
+    const withoutSettings = kartModule.createRoom({
+      visibility: 'public',
+      io: fakeIo(),
+    }) as KartRoom;
+    expect(withoutSettings.trackId).toBe(DEFAULT_TRACK_ID);
+    withoutSettings.stop();
+  });
+
+  it('throws on an unknown or malformed trackId (the lobby turns this into bad_settings)', () => {
+    expect(() =>
+      kartModule.createRoom({ visibility: 'public', io: fakeIo(), settings: { trackId: 'nope' } }),
+    ).toThrow();
+    expect(() =>
+      kartModule.createRoom({ visibility: 'public', io: fakeIo(), settings: { trackId: 42 } }),
+    ).toThrow();
+    expect(() =>
+      kartModule.createRoom({ visibility: 'public', io: fakeIo(), settings: { trackId: null } }),
+    ).toThrow();
   });
 });

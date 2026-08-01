@@ -57,9 +57,22 @@ export const MIN_PLAYERS = 2;
 // 20-kart grid. Three things are TIED to this number and must move with it:
 // KART_COLORS.length (palette.ts — one distinct livery per slot, gated in
 // valueLadder.test.ts), fx.HEAT_STREAMS (client — one drift-heat envelope per
-// simultaneously sliding kart), and gridSlot() (track.ts — procedural, already
-// extends: slot 19 sits 42 m behind the line).
+// simultaneously sliding kart), and GRID_ROWS below (which sizes the arc of
+// road gridSlot() walks back from the start line).
 export const MAX_PLAYERS = 20;
+
+// ---- starting grid (track.ts gridSlot; laid out BY ARC LENGTH along the road) ----
+// Slots are placed by walking the centreline backward from the start line, so
+// these are metres of ROAD, not metres along a straight ray. GRID_DEPTH_M
+// (= 42 m at MAX_PLAYERS 20) is derived in track.ts and validated against the
+// circuit length so a grid can never wrap past its own start line.
+export const GRID_ROW_BACK0 = 6; // m of arc from the line to row 0
+export const GRID_ROW_GAP = 4; // m of arc between rows
+export const GRID_LATERAL = 2.2; // m either side of the centreline (two columns)
+export const GRID_ROWS = Math.ceil(MAX_PLAYERS / 2); // 10 rows of 2
+// Keep-off-the-barriers margin: the stagger is clamped to roadHalfW - this, so
+// a narrower circuit narrows the grid instead of starting karts in the wall.
+export const GRID_EDGE_MARGIN = 1.5; // > KART_RADIUS (0.9) plus a shoulder
 export const READY_SECONDS = 5; // 'ready' before countdown
 export const COUNTDOWN_SECONDS = 3;
 export const RESULTS_SECONDS = 10;

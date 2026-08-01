@@ -1,9 +1,10 @@
-import { MIN_PLAYERS, MAX_PLAYERS } from '@kart/shared';
+import { DEFAULT_TRACK_ID, isTrackId, MIN_PLAYERS, MAX_PLAYERS } from '@kart/shared';
+import type { TrackId } from '@kart/shared';
 // ============================================================================
 // KART GameModule — the KART GP plug into the platform registry (the ONLY
-// kart-server file that imports @platform/shared). Owns the clientDist probe;
-// all race logic stays in room.ts. createRoom ignores settings (docs/KART.md:
-// no room variants v1).
+// kart-server file that imports @platform/shared). Owns the clientDist probe
+// and createRoom settings validation (trackId); all race logic stays in
+// room.ts.
 // ============================================================================
 import { existsSync } from 'node:fs';
 import path from 'node:path';
@@ -38,6 +39,18 @@ function resolveClientDist(): string {
   return dev;
 }
 
+/**
+ * settings.trackId (opaque to the platform) must be a valid TrackId; absent
+ * (quick_join) => DEFAULT_TRACK_ID. Invalid => throw; the lobby forwards the
+ * message as 'bad_settings'. Mirrors fps's mapIdFrom (games/fps/server/src/module.ts).
+ */
+function trackIdFrom(settings: Record<string, unknown> | undefined): TrackId {
+  const raw = settings?.['trackId'];
+  if (raw === undefined) return DEFAULT_TRACK_ID;
+  if (!isTrackId(raw)) throw new Error('unknown track');
+  return raw;
+}
+
 export const kartModule: GameModule = {
   id: 'kart',
   name: 'KART GP',
@@ -48,6 +61,7 @@ export const kartModule: GameModule = {
   minPlayers: MIN_PLAYERS,
   maxPlayers: MAX_PLAYERS,
   createRoom(opts): GameRoomHandle {
-    return new KartRoom(opts.visibility, opts.io); // settings ignored: no variants v1
+    const trackId = trackIdFrom(opts.settings);
+    return new KartRoom(trackId, opts.visibility, opts.io);
   },
 };

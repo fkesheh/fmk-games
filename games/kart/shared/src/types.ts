@@ -3,6 +3,7 @@
 // ============================================================================
 
 import type { KartSim } from './sim.js';
+import type { TrackId } from './track.js';
 
 export type KartPhase = 'lobby' | 'ready' | 'countdown' | 'racing' | 'results';
 
@@ -114,12 +115,29 @@ export type RaceEvent =
   | { kind: 'restart' };
 
 export type KartS2C =
-  | { t: 'kart_joined'; you: string; slot: number; color: number; phase: KartPhase; players: KartPlayerInfo[] }
+  /**
+   * `trackId` is the room's circuit, and it is the FIRST thing the client can
+   * act on: the joiner builds that TrackDef and its mesh before the first
+   * snapshot lands. It is repeated on every snapshot (one short string at
+   * SNAPSHOT_HZ) so a client that missed or mis-parsed the join — or that is
+   * resuming into a room mid-race — still converges on the right circuit
+   * instead of driving a road nobody else is on.
+   */
+  | {
+      t: 'kart_joined';
+      you: string;
+      slot: number;
+      color: number;
+      phase: KartPhase;
+      trackId: TrackId;
+      players: KartPlayerInfo[];
+    }
   | {
       t: 'kart_snapshot';
       tick: number;
       serverTime: number;
       phase: KartPhase;
+      trackId: TrackId;
       countdown: number; // current countdown number during 'countdown', else 0
       phaseEndsAt: number; // serverTime ms; 0 when no phase timer
       // ---- lobby contract (additive) ----

@@ -32,7 +32,7 @@ import {
 } from './config.js';
 import { makeKart, stepKart } from './kartPhysics.js';
 import type { KartInput, KartState } from './kartPhysics.js';
-import { closestOnTrack, surfaceAt } from './track.js';
+import { closestOnTrack, pointAtArc, surfaceAt } from './track.js';
 import type { TrackDef } from './track.js';
 
 // ---- assist tuning (KIDS MODE pure pursuit; pure math, shared so the server
@@ -368,16 +368,12 @@ export function pursuitSteer(
   if (a.recovering) {
     steer = yawErr > 0 ? -1 : 1; // full lock toward the tangent
   } else {
-    let i = i0;
-    let ahead = 0;
-    for (let steps = 0; steps < n && ahead < PURSUIT_AHEAD; steps++) {
-      const p = cl[i]!;
-      i = (i + 1) % n;
-      const q = cl[i]!;
-      ahead += Math.hypot(q[0] - p[0], q[1] - p[1]);
-    }
-    const target = cl[i]!;
-    const desiredYaw = Math.atan2(-(target[0] - s.x), -(target[1] - s.z));
+    // ONE arc-length walk in the codebase — the same helper the starting grid
+    // uses (track.ts pointAtArc). It interpolates inside the final segment, so
+    // the aim point is exactly PURSUIT_AHEAD metres of ROAD ahead rather than
+    // snapped to whichever sample first passed it (up to 3.6 m of slop).
+    const target = pointAtArc(track, i0, PURSUIT_AHEAD);
+    const desiredYaw = Math.atan2(-(target.x - s.x), -(target.z - s.z));
     steer = clamp(-wrapPi(desiredYaw - s.yaw) * PURSUIT_GAIN, -1, 1);
   }
   const speedF = s.vx * -Math.sin(s.yaw) + s.vz * -Math.cos(s.yaw);
@@ -404,7 +400,26 @@ export class KartPredictor {
   private readonly pending: SimInput[] = []; // seq-ordered ascending
   private lastCorrection = 0; // metres the last reconcile() moved us
 
-  constructor(private readonly track: TrackDef) {}
+  constructor(private track: TrackDef) {}
+
+  /**
+   * Swap the circuit this predictor integrates on (the room's trackId arrives
+   * with kart_joined, after the client has already built a default track).
+   * INVARIANT: after setTrack the predictor holds a valid state on the NEW
+   * circuit and has nothing queued — never a position expressed in the OLD
+   * circuit's coordinates. It does exactly what reset() does, defaulting the
+   * anchor to the origin: (x, z, yaw) are optional so this stays a drop-in
+   * one-argument call (drive.ts's `pred.setTrack(track)` is frozen), but the
+   * caller SHOULD pass the real grid slot for the new track immediately after
+   * — see KartApp.applyTrack — since the origin is only guaranteed valid, not
+   * correct. Dropping every pending input is required either way: replaying
+   * inputs from one circuit's geometry on another's would reconcile against a
+   * road that was never driven.
+   */
+  setTrack(track: TrackDef, x = 0, z = 0, yaw = 0): void {
+    this.track = track;
+    this.reset(x, z, yaw);
+  }
 
   /** Re-base at a spawn/grid slot; drops every unacknowledged input. */
   reset(x: number, z: number, yaw: number): void {

@@ -22,6 +22,7 @@
 // per docs/KART.md.
 // ============================================================================
 import {
+  DEFAULT_TRACK_ID,
   GATES,
   KART_COLORS,
   KPAL,
@@ -31,10 +32,12 @@ import {
   SIM_HZ,
   SNAPSHOT_HZ,
   TOP_SPEED,
+  TRACKS,
   buildTrack,
   engineRevs,
   forwardSpeed,
   gridSlot,
+  isTrackId,
   surfaceAt,
 } from '@kart/shared';
 import type {
@@ -49,12 +52,14 @@ import type {
   KartYou,
   RaceEvent,
   TrackDef,
+  TrackId,
 } from '@kart/shared';
 import type { LobbyC2S, RoomInfo } from '@platform/shared';
 import { KartScene } from './render.js';
 import { DriveController } from './drive.js';
 import { KartAudio } from './audio.js';
 import { KartFx } from './fx.js';
+import { setKartTrack } from './kartMesh.js';
 
 // ---- wire parsing (mirror of the platform style: invalid => null, never throw) ----
 type LobbyMsg =
@@ -264,6 +269,7 @@ function parseS2C(raw: unknown): S2C | null {
         slot: raw.slot,
         color: raw.color,
         phase: ph,
+        trackId: isTrackId(raw.trackId) ? raw.trackId : DEFAULT_TRACK_ID,
         players,
         code: str(raw.code) ? raw.code : null,
       };
@@ -289,6 +295,7 @@ function parseS2C(raw: unknown): S2C | null {
         tick: raw.tick,
         serverTime: raw.serverTime,
         phase: ph,
+        trackId: isTrackId(raw.trackId) ? raw.trackId : DEFAULT_TRACK_ID,
         countdown: raw.countdown,
         phaseEndsAt: raw.phaseEndsAt,
         playerCount: num(raw.playerCount) ? raw.playerCount : players.length,
@@ -346,6 +353,7 @@ interface KartRemoteDebug {
 
 interface KartTelemetry {
   phase: KartPhase | 'menu';
+  trackId: TrackId; // the currently loaded circuit (room's, or selectedTrackId pre-join)
   playerId: string | null;
   slot: number;
   seq: number; // kart_input frames sent (drive.ts owns the wire seq) — now SIM_HZ paced
@@ -392,6 +400,8 @@ interface KartApi {
   startRace(): void;
   setInput(throttle: number, brake: number, steer: number, drift: boolean): void;
   telemetry(): KartTelemetry;
+  /** Choose the circuit the NEXT create_public/create_private room will use. */
+  setTrack(id: string): boolean;
 }
 
 declare global {
@@ -628,7 +638,10 @@ export class KartApp {
   private lastBump: { a: string; b: string; impulse: number; atMs: number } | null = null;
 
   // ---- local kart + remotes -------------------------------------------------------
-  private readonly track: TrackDef = buildTrack();
+  private trackId: TrackId = DEFAULT_TRACK_ID;
+  private track: TrackDef = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
+  /** Room-create circuit choice (no track-picker UI yet; set via __kart.setTrack). */
+  private selectedTrackId: TrackId = DEFAULT_TRACK_ID;
   private readonly drive: DriveController;
   private readonly scene: KartScene;
   private readonly audio = new KartAudio();
@@ -664,10 +677,11 @@ export class KartApp {
   private dustAcc = 0;
   private readonly remoteFx = new Map<string, RemoteFxState>();
   private minimapNextAt = 0; // performance.now() of the next 4Hz redraw
-  private readonly mapPath: Path2D; // track outline, precomputed once
-  private readonly mapScale: number; // world -> map px: mx = (x + mapOffX) * mapScale
-  private readonly mapOffX: number;
-  private readonly mapOffZ: number;
+  // not readonly: fitMinimap() recomputes these when applyTrack() swaps circuits
+  private mapPath: Path2D = new Path2D(); // track outline, precomputed once
+  private mapScale = 1; // world -> map px: mx = (x + mapOffX) * mapScale
+  private mapOffX = 0;
+  private mapOffZ = 0;
 
   // ---- DOM handles (built once in the constructor, updated in place) ----------------
   private readonly menuEl: HTMLDivElement;
@@ -963,10 +977,11 @@ export class KartApp {
     root.appendChild(this.menuEl);
     root.appendChild(this.raceEl);
 
-    // ---- scene + kart (frozen module signatures; the track never changes) -------
+    // ---- scene + kart (frozen module signatures) ---------------------------------
     this.scene = new KartScene(this.canvas);
     this.scene.setTheme(this.track.theme);
     this.scene.buildTrack(this.track);
+    setKartTrack(this.track); // arms the off-road check for the default circuit
     this.drive = new DriveController(this.track);
     this.drive.setAssist(this.assist); // kids-mode assist restored before the first join
     // nitro key (N) asks the SERVER to spend a charge; only racing may spend one.
@@ -978,38 +993,7 @@ export class KartApp {
 
     // ---- fx pools + minimap precompute -------------------------------------------
     this.fx = new KartFx(KartFx.sceneRoot(this.scene), this.raceEl);
-    // minimap: fit the centerline bounds into MINIMAP_SIZE px with a small pad;
-    // the outline path is static — only the dots move (4Hz redraw)
-    {
-      const cl = this.track.centerline;
-      let minX = Infinity;
-      let maxX = -Infinity;
-      let minZ = Infinity;
-      let maxZ = -Infinity;
-      for (const c of cl) {
-        if (c[0] < minX) minX = c[0];
-        if (c[0] > maxX) maxX = c[0];
-        if (c[1] < minZ) minZ = c[1];
-        if (c[1] > maxZ) maxZ = c[1];
-      }
-      const pad = 9;
-      const spanX = Math.max(1, maxX - minX);
-      const spanZ = Math.max(1, maxZ - minZ);
-      this.mapScale = Math.min((MINIMAP_SIZE - pad * 2) / spanX, (MINIMAP_SIZE - pad * 2) / spanZ);
-      // center the shorter axis; project: mx = (x + mapOffX) * mapScale
-      this.mapOffX = -minX + (MINIMAP_SIZE / this.mapScale - spanX) / 2;
-      this.mapOffZ = -minZ + (MINIMAP_SIZE / this.mapScale - spanZ) / 2;
-      const path = new Path2D();
-      for (let i = 0; i < cl.length; i++) {
-        const c = cl[i]!;
-        const mx = (c[0] + this.mapOffX) * this.mapScale;
-        const my = (c[1] + this.mapOffZ) * this.mapScale;
-        if (i === 0) path.moveTo(mx, my);
-        else path.lineTo(mx, my);
-      }
-      path.closePath();
-      this.mapPath = path;
-    }
+    this.fitMinimap();
 
     // ---- listeners (driving keys are owned by drive.ts; audio unlocks on clicks) ----
     window.addEventListener('resize', () => {
@@ -1046,6 +1030,11 @@ export class KartApp {
       startRace: () => this.send({ t: 'start' }),
       setInput: (throttle, brake, steer, drift) => this.setDebugInput(throttle, brake, steer, drift),
       telemetry: () => this.telemetrySnapshot(),
+      setTrack: (id) => {
+        if (!isTrackId(id)) return false;
+        this.selectedTrackId = id;
+        return true;
+      },
     };
 
     this.connect();
@@ -1115,6 +1104,7 @@ export class KartApp {
       t: 'create_public',
       name: cleanName(name),
       game: 'kart',
+      settings: { trackId: this.selectedTrackId },
     };
     this.send(msg);
   }
@@ -1123,6 +1113,7 @@ export class KartApp {
       t: 'create_private',
       name: cleanName(name),
       game: 'kart',
+      settings: { trackId: this.selectedTrackId },
     };
     this.send(msg);
   }
@@ -1195,8 +1186,68 @@ export class KartApp {
     }
   }
 
+  /**
+   * Fit the minimap's static outline path + world->px projection to whichever
+   * circuit is currently loaded (this.track). Recomputed on construction and
+   * every time applyTrack() swaps circuits — a track-specific bounds fit that
+   * used to assume the one track's centerline.
+   */
+  private fitMinimap(): void {
+    const cl = this.track.centerline;
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minZ = Infinity;
+    let maxZ = -Infinity;
+    for (const c of cl) {
+      if (c[0] < minX) minX = c[0];
+      if (c[0] > maxX) maxX = c[0];
+      if (c[1] < minZ) minZ = c[1];
+      if (c[1] > maxZ) maxZ = c[1];
+    }
+    const pad = 9;
+    const spanX = Math.max(1, maxX - minX);
+    const spanZ = Math.max(1, maxZ - minZ);
+    this.mapScale = Math.min((MINIMAP_SIZE - pad * 2) / spanX, (MINIMAP_SIZE - pad * 2) / spanZ);
+    // center the shorter axis; project: mx = (x + mapOffX) * mapScale
+    this.mapOffX = -minX + (MINIMAP_SIZE / this.mapScale - spanX) / 2;
+    this.mapOffZ = -minZ + (MINIMAP_SIZE / this.mapScale - spanZ) / 2;
+    const path = new Path2D();
+    for (let i = 0; i < cl.length; i++) {
+      const c = cl[i]!;
+      const mx = (c[0] + this.mapOffX) * this.mapScale;
+      const my = (c[1] + this.mapOffZ) * this.mapScale;
+      if (i === 0) path.moveTo(mx, my);
+      else path.lineTo(mx, my);
+    }
+    path.closePath();
+    this.mapPath = path;
+  }
+
+  /**
+   * Adopt the room's circuit. No-op when it is already loaded. Rebuilds the
+   * mesh, the sim/predictor track, the kart off-road check and the minimap
+   * fit. Cheap identity check keeps this off the per-snapshot hot path.
+   */
+  private applyTrack(id: TrackId): void {
+    if (id === this.trackId) return;
+    this.trackId = id;
+    this.track = buildTrack(TRACKS[id]);
+    this.scene.setTheme(this.track.theme);
+    this.scene.buildTrack(this.track); // idempotent: disposes the previous circuit's geometry
+    this.drive.setTrack(this.track);
+    setKartTrack(this.track);
+    this.fitMinimap();
+    // setTrack() only guarantees the predictor holds SOME valid state on the
+    // new circuit (the origin) — re-anchor onto OUR grid slot on the NEW
+    // circuit right away, or a track swap would visibly leave the kart at the
+    // old circuit's coordinates (or the origin) until the next manual reset.
+    const g = gridSlot(this.track, this.slot);
+    this.drive.reset(g.x, g.z, g.yaw);
+  }
+
   // ---- join / leave -------------------------------------------------------------------
   private onJoined(msg: JoinedMsg): void {
+    this.applyTrack(msg.trackId); // circuit FIRST — resetRaceLocal()/gridSlot below reads this.track
     this.joined = true;
     this.slot = msg.slot;
     this.colorIdx = msg.color;
@@ -1284,6 +1335,7 @@ export class KartApp {
   // ---- snapshots -----------------------------------------------------------------------
   private onSnapshot(snap: SnapshotMsg): void {
     if (!this.joined) return; // stale room traffic after a leave
+    this.applyTrack(snap.trackId); // cheap identity check; recovery path for a missed/mis-parsed join
     const prevPhase = this.phase;
     this.phase = snap.phase;
     this.applyFreeze(); // pre-GO freeze: the sim integrates only while 'racing'
@@ -2165,6 +2217,7 @@ export class KartApp {
     }
     return {
       phase: this.screen === 'menu' ? 'menu' : this.phase,
+      trackId: this.trackId,
       playerId: this.playerId,
       slot: this.slot,
       seq: this.packetsSent, // kart_input frames sent (drive.ts owns the wire seq)

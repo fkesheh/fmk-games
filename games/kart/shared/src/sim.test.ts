@@ -8,9 +8,15 @@ import { describe, expect, it } from 'vitest';
 import {
   GATE_RADIUS,
   GATES,
+  GRID_LATERAL,
+  GRID_ROW_BACK0,
+  GRID_ROW_GAP,
+  GRID_ROWS,
   KART_RADIUS,
   KART_RESTITUTION,
+  MAX_PLAYERS,
   PENDING_INPUT_CAP,
+  ROAD_HALF_W,
   SIM_DT,
   SIM_SUBSTEPS,
   TOP_SPEED,
@@ -21,8 +27,24 @@ import {
 import { BARRIER_DAMP, BARRIER_OUT } from './config.js';
 import { makeKart, stepKart } from './kartPhysics.js';
 import type { KartState } from './kartPhysics.js';
-import { buildTrack, closestOnTrack, gridSlot, surfaceAt } from './track.js';
-import type { TrackDef } from './track.js';
+import {
+  assertValidTrack,
+  buildTrack,
+  closestOnTrack,
+  GRID_DEPTH_M,
+  gridSlot,
+  MIN_CONTROL_POINTS,
+  MIN_CORNER_RADIUS,
+  MIN_SELF_CLEARANCE,
+  MIN_TRACK_LENGTH,
+  pointAtArc,
+  SAMPLES,
+  SELF_CLEARANCE_ARC_WINDOW,
+  surfaceAt,
+  validateTrack,
+} from './track.js';
+import type { TrackDef, TrackSource } from './track.js';
+import { DEFAULT_TRACK_ID, TRACK_LIST, TRACKS } from './tracks/index.js';
 import {
   KartPredictor,
   clampToBarrier,
@@ -52,7 +74,7 @@ function drive(over: Partial<DriveInput> = {}): DriveInput {
  * enough from every gate's GATE_RADIUS that a kart parked there does not
  * trip creditAnchor by accident. Used wherever a test needs gate-crediting to
  * be a controlled event rather than an ambient side effect (grid slot 0 sits
- * only ~6-9m behind gate 0, well inside GATE_RADIUS=9m, so tests that care
+ * exactly 6m of arc behind gate 0, well inside GATE_RADIUS=9m, so tests that care
  * about NOT triggering a credit must not start there).
  */
 function midGateSpot(track: TrackDef): { x: number; z: number; yaw: number } {
@@ -93,8 +115,8 @@ function fieldsOf(s: Readonly<KartSim>): unknown[] {
 
 describe('determinism — the prediction contract', () => {
   it('two KartSims fed the identical input sequence end bit-identical on every field', () => {
-    const trackA = buildTrack();
-    const trackB = buildTrack(); // independently built — determinism must not depend on sharing an object
+    const trackA = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
+    const trackB = buildTrack(TRACKS[DEFAULT_TRACK_ID]); // independently built — determinism must not depend on sharing an object
     const spot = midGateSpot(trackA);
     const a = makeSim(spot.x, spot.z, spot.yaw);
     const b = makeSim(spot.x, spot.z, spot.yaw);
@@ -116,7 +138,7 @@ describe('determinism — the prediction contract', () => {
     // private to sim.ts (not exported) so it cannot be replayed here — the spot
     // is chosen far from every gate so it never fires in either branch, keeping
     // the anchor fields trivially equal without reimplementing it.
-    const track = buildTrack();
+    const track = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
     const spot = midGateSpot(track);
     const inp = drive({ throttle: 1, steer: 0.4 });
 
@@ -140,7 +162,7 @@ describe('determinism — the prediction contract', () => {
   });
 
   it('a non-finite or non-positive dt is a no-op', () => {
-    const track = buildTrack();
+    const track = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
     const spot = midGateSpot(track);
     // NOTE: +Infinity is deliberately excluded — the guard is `!(dt > 0)`, and
     // `Infinity > 0` is true, so a +Infinity dt is NOT treated as a no-op (it
@@ -159,7 +181,7 @@ describe('determinism — the prediction contract', () => {
 
 describe('resetSim / copySim', () => {
   it('resetSim wipes velocity/gear/drift state and re-anchors at the new spot (the GO grid wipe)', () => {
-    const track = buildTrack();
+    const track = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
     const spot = midGateSpot(track);
     const s = makeSim(spot.x, spot.z, spot.yaw);
     // scramble it as if mid-race, then wipe
@@ -189,7 +211,7 @@ describe('resetSim / copySim', () => {
   });
 
   it('copySim copies every field without allocating a new object', () => {
-    const track = buildTrack();
+    const track = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
     const spot = midGateSpot(track);
     const src = makeSim(spot.x, spot.z, spot.yaw);
     src.vx = 3;
@@ -221,7 +243,7 @@ describe('resetSim / copySim', () => {
 
 describe('integration from input', () => {
   it('full throttle for 1s from a grid slot moves the kart forward a plausible distance', () => {
-    const track = buildTrack();
+    const track = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
     const grid = gridSlot(track, 0);
     const s = makeSim(grid.x, grid.z, grid.yaw);
     const fx = -Math.sin(grid.yaw);
@@ -233,9 +255,10 @@ describe('integration from input', () => {
   });
 
   it('zero input from rest leaves the kart exactly still', () => {
-    const track = buildTrack();
-    // NOT gridSlot(track, 0): grid slot 0 sits only ~6.4m behind gate 0, inside
-    // GATE_RADIUS=9m, so it credits the gate on the very first tick regardless
+    const track = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
+    // NOT gridSlot(track, 0): grid slot 0 sits exactly 6m of ARC behind gate 0
+    // (row 0 is GRID_ROW_BACK0 metres back), inside GATE_RADIUS=9m, so it
+    // credits the gate on the very first tick regardless
     // of input — a real, correct side effect, but orthogonal to "stillness"
     // and it would mutate anchorX/anchorZ/expectedGate under our feet. Use a
     // spot proven clear of every gate instead.
@@ -253,7 +276,7 @@ describe('integration from input', () => {
 
 describe('barrier clamp', () => {
   it('clamps a kart shoved off the racing line back inside the band and reflects/damps the outward velocity', () => {
-    const track = buildTrack();
+    const track = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
     const grid = gridSlot(track, 0);
     const limit = track.roadHalfW + BARRIER_OUT - KART_RADIUS;
     const off0 = closestOnTrack(track, grid.x, grid.z);
@@ -303,7 +326,7 @@ describe('barrier clamp', () => {
   });
 
   it('does nothing when the kart is already within the band', () => {
-    const track = buildTrack();
+    const track = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
     const grid = gridSlot(track, 0);
     const kart: KartState = {
       x: grid.x, y: 0, z: grid.z, yaw: grid.yaw, vx: 5, vz: -3,
@@ -321,7 +344,7 @@ describe('barrier clamp', () => {
 
 describe('gate anchor tracking', () => {
   it('driving forward past the EXPECTED gate advances expectedGate and snaps the anchor onto it', () => {
-    const track = buildTrack();
+    const track = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
     const g1 = track.gates[1]!;
     const approach = 20; // meters behind gate 1, well outside GATE_RADIUS=9m
     const s = makeSim(g1.x - g1.tx * approach, g1.z - g1.tz * approach, Math.atan2(-g1.tx, -g1.tz));
@@ -347,7 +370,7 @@ describe('gate anchor tracking', () => {
   });
 
   it('does not credit a gate out of order even when physically sitting on it', () => {
-    const track = buildTrack();
+    const track = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
     const g3 = track.gates[3]!;
     const s = makeSim(g3.x, g3.z, 0);
     s.expectedGate = 1; // still waiting on gate 1, not 3
@@ -358,7 +381,7 @@ describe('gate anchor tracking', () => {
 
 describe('respawn', () => {
   it('teleports exactly onto the anchor with zero velocity, gear 1, no drift, and integrates nothing that tick', () => {
-    const track = buildTrack();
+    const track = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
     const spot = midGateSpot(track);
     const s = makeSim(spot.x, spot.z, spot.yaw);
     // scramble the transient state away from the anchor
@@ -384,7 +407,7 @@ describe('respawn', () => {
   });
 
   it('replayed mid-sequence from a divergent transient state lands in exactly the same place', () => {
-    const track = buildTrack();
+    const track = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
     const anchor = { x: 12.5, z: -48.25, yaw: 0.42 };
     const respawnInput = drive({ throttle: 1, steer: -1, brake: 1, drift: true, respawn: true });
 
@@ -530,7 +553,7 @@ describe('resolveKartPair', () => {
 
 describe('KartPredictor reconciliation', () => {
   it('converges to zero correction with no interference, then converges again after a server-side perturbation', () => {
-    const track = buildTrack();
+    const track = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
     const grid = gridSlot(track, 0);
     const server: KartSim = makeSim(grid.x, grid.z, grid.yaw);
     const client = new KartPredictor(track);
@@ -602,7 +625,7 @@ describe('KartPredictor reconciliation', () => {
   });
 
   it('drops acked inputs from the pending queue as reconcile advances the ack', () => {
-    const track = buildTrack();
+    const track = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
     const grid = gridSlot(track, 0);
     const server: KartSim = makeSim(grid.x, grid.z, grid.yaw);
     const client = new KartPredictor(track);
@@ -619,7 +642,7 @@ describe('KartPredictor reconciliation', () => {
   });
 
   it('bounds the pending queue at PENDING_INPUT_CAP even with no reconcile', () => {
-    const track = buildTrack();
+    const track = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
     const client = new KartPredictor(track);
     client.reset(0, 0, 0);
     for (let i = 0; i < PENDING_INPUT_CAP + 20; i++) {
@@ -635,7 +658,7 @@ describe('KartPredictor reconciliation', () => {
 
 describe('pursuitSteer', () => {
   it('drives a full lap, crediting all 8 gates in order within ~35s of sim time, without long off-road excursions', () => {
-    const track = buildTrack();
+    const track = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
     const grid = gridSlot(track, 0);
     const s = makeSim(grid.x, grid.z, grid.yaw);
     const assist = makeAssistState();
@@ -672,7 +695,7 @@ describe('pursuitSteer', () => {
     // by exactly `dt` per call — an isolated, deterministic test of the
     // hold-time/threshold logic without organic-driving noise.
     const HOLD_S = 1.2; // mirrors WRONG_WAY_HOLD_S in sim.ts
-    const track = buildTrack();
+    const track = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
     const g0 = track.gates[0]!;
     const travelYaw = Math.atan2(-g0.tx, -g0.tz);
     const s: KartState = makeKart(g0.x, g0.z, wrapPi(travelYaw + Math.PI)); // facing exactly backwards
@@ -751,7 +774,7 @@ describe('KIDS MODE stuck auto-respawn', () => {
   });
 
   it('relocates a kart wedged off-track to its last credited gate, and kills its speed', () => {
-    const track = buildTrack();
+    const track = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
     const s = makeSim(gridSlot(track, 0).x, gridSlot(track, 0).z, gridSlot(track, 0).yaw);
     // drive far enough to credit real gates, so the anchor is NOT the spawn
     const a = makeAssistState();
@@ -801,7 +824,7 @@ describe('KIDS MODE stuck auto-respawn', () => {
   });
 
   it('the relocation SURVIVES reconciliation: the server lands on the same anchor', () => {
-    const track = buildTrack();
+    const track = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
     const spawn = gridSlot(track, 0);
     // server and client start equal, as they do at GO
     const server = makeSim(spawn.x, spawn.z, spawn.yaw);
@@ -859,5 +882,374 @@ describe('KIDS MODE stuck auto-respawn', () => {
     expect(pred.state().z).toBe(server.z);
     expect(Math.hypot(pred.state().x - predicted.x, pred.state().z - predicted.z),
       'client and server chose the SAME anchor, so the correction is nil').toBeLessThan(1e-9);
+  });
+});
+
+// ==============================================================================
+// 8. THE STARTING GRID — regression coverage for the arc-length grid bug.
+//
+// gridSlot() used to extrapolate along gate 0's FROZEN TANGENT (a straight ray)
+// while the start "straight" is actually a curve. On the 598.18m Greenvale
+// circuit (ROAD_HALF_W 5) that put slot 4 7.05m outside the road edge, slot 8
+// 12.18m out, and slot 12 17.36m out — only slots 0-3 were ever on tarmac, live
+// at ANY player count above 4. It is fixed by walking the centreline BY ARC
+// LENGTH (pointAtArc). Every test below would have failed loudly on the old
+// code; test 1 is the headline assertion.
+// ==============================================================================
+
+/**
+ * Arc-length distance walking BACKWARD along the centreline from `fromIndex`
+ * to `toIndex`, by summing consecutive sample segments. Deliberately NOT
+ * pointAtArc's own accumulation (that function is under test elsewhere in this
+ * file) — an independent oracle for "how far behind the line is this sample".
+ */
+function arcBackDistance(track: TrackDef, fromIndex: number, toIndex: number): number {
+  const cl = track.centerline;
+  const n = cl.length;
+  let i = ((Math.round(fromIndex) % n) + n) % n;
+  const target = ((Math.round(toIndex) % n) + n) % n;
+  let dist = 0;
+  for (let steps = 0; steps < n; steps++) {
+    if (i === target) return dist;
+    const j = (i - 1 + n) % n;
+    const a = cl[i]!;
+    const b = cl[j]!;
+    dist += Math.hypot(a[0] - b[0], a[1] - b[1]);
+    i = j;
+  }
+  return Infinity; // unreachable on a closed loop; would mean toIndex is bogus
+}
+
+describe('starting grid', () => {
+  const track = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
+
+  it('THE HEADLINE ASSERTION: every slot 0..MAX_PLAYERS-1 sits on tarmac', () => {
+    for (let i = 0; i < MAX_PLAYERS; i++) {
+      const g = gridSlot(track, i);
+      const c = closestOnTrack(track, g.x, g.z);
+      expect(Math.abs(c.lateral), `slot ${i} lateral=${c.lateral} off the centreline`).toBeLessThan(
+        ROAD_HALF_W,
+      );
+      expect(surfaceAt(track, g.x, g.z), `slot ${i} surface`).toBe('road');
+    }
+  });
+
+  it('the stagger is real: even/odd slots sit on alternating sides, each ~GRID_LATERAL from the centreline', () => {
+    for (let i = 0; i < MAX_PLAYERS; i++) {
+      const g = gridSlot(track, i);
+      const lateral = closestOnTrack(track, g.x, g.z).lateral;
+      const expectedSign = i % 2 === 0 ? -1 : 1; // gridSlot: col = i%2===0 ? -1 : 1
+      expect(Math.sign(lateral), `slot ${i} side, lateral=${lateral}`).toBe(expectedSign);
+      expect(
+        Math.abs(Math.abs(lateral) - GRID_LATERAL),
+        `slot ${i} |lateral|=${Math.abs(lateral)} vs GRID_LATERAL=${GRID_LATERAL}`,
+      ).toBeLessThan(0.2);
+    }
+  });
+
+  it('rows march backward BY ARC LENGTH (not a straight ray) and the grid never wraps or interpenetrates', () => {
+    // a circuit shorter than 2x the grid depth could wrap the last row past the line
+    expect(GRID_DEPTH_M * 2).toBeLessThan(track.length);
+
+    const gate0 = track.gates[0]!;
+    const rowPoints = Array.from({ length: GRID_ROWS }, (_, row) =>
+      pointAtArc(track, gate0.index, -(GRID_ROW_BACK0 + row * GRID_ROW_GAP)),
+    );
+    for (let row = 1; row < GRID_ROWS; row++) {
+      const prev = rowPoints[row - 1]!;
+      const cur = rowPoints[row]!;
+      // walking FORWARD from the further-back row by exactly GRID_ROW_GAP must
+      // land back on the previous row — proves consecutive rows really are
+      // GRID_ROW_GAP metres of ROAD apart, not GRID_ROW_GAP metres of a
+      // straight-line chord (the old bug's failure mode, which would drift
+      // further from this roundtrip every row).
+      const idx = closestOnTrack(track, cur.x, cur.z).index;
+      const forward = pointAtArc(track, idx, GRID_ROW_GAP);
+      expect(
+        Math.hypot(forward.x - prev.x, forward.z - prev.z),
+        `row ${row} -> ${row - 1} arc spacing`,
+      ).toBeLessThan(3); // ~ one sample spacing on a 598m/256-sample circuit
+    }
+
+    // no two grid slots may start interpenetrating (karts must not overlap at GO)
+    const positions = Array.from({ length: MAX_PLAYERS }, (_, i) => gridSlot(track, i));
+    for (let i = 0; i < positions.length; i++) {
+      for (let j = i + 1; j < positions.length; j++) {
+        const d = Math.hypot(positions[i]!.x - positions[j]!.x, positions[i]!.z - positions[j]!.z);
+        expect(d, `slots ${i} and ${j} are ${d.toFixed(2)}m apart`).toBeGreaterThanOrEqual(
+          2 * KART_RADIUS,
+        );
+      }
+    }
+  });
+
+  it('every slot faces down the road: forward vector aligns with the local centreline tangent', () => {
+    for (let i = 0; i < MAX_PLAYERS; i++) {
+      const g = gridSlot(track, i);
+      const idx = closestOnTrack(track, g.x, g.z).index;
+      const local = pointAtArc(track, idx, 0); // metres=0: the tangent AT that sample
+      const fx = -Math.sin(g.yaw);
+      const fz = -Math.cos(g.yaw); // platform forward convention
+      const dot = fx * local.tx + fz * local.tz;
+      expect(dot, `slot ${i} yaw=${g.yaw} vs local tangent, dot=${dot}`).toBeGreaterThan(0.95);
+    }
+  });
+
+  it('slots 0 and 1 straddle the centreline ~GRID_ROW_BACK0 metres of arc behind the line', () => {
+    const gate0 = track.gates[0]!;
+    for (const i of [0, 1]) {
+      const g = gridSlot(track, i);
+      const idx = closestOnTrack(track, g.x, g.z).index;
+      const back = arcBackDistance(track, gate0.index, idx);
+      expect(Math.abs(back - GRID_ROW_BACK0), `slot ${i} arc distance behind gate0 = ${back}`).toBeLessThan(1);
+    }
+    const lat0 = closestOnTrack(track, gridSlot(track, 0).x, gridSlot(track, 0).z).lateral;
+    const lat1 = closestOnTrack(track, gridSlot(track, 1).x, gridSlot(track, 1).z).lateral;
+    expect(Math.sign(lat0), 'slot 0 and slot 1 on opposite sides').not.toBe(Math.sign(lat1));
+  });
+});
+
+// ==============================================================================
+// 9. pointAtArc — the shared arc-length walk (gridSlot + kids-mode pure pursuit)
+// ==============================================================================
+
+describe('pointAtArc', () => {
+  const track = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
+
+  it('metres = 0 returns the sample itself', () => {
+    for (const idx of [0, 55, 200]) {
+      const pose = pointAtArc(track, idx, 0);
+      const s = track.centerline[idx]!;
+      expect(pose.x).toBeCloseTo(s[0], 9);
+      expect(pose.z).toBeCloseTo(s[1], 9);
+    }
+  });
+
+  it('walking forward d metres then backward d metres from the arrival returns near the start (within a sample spacing)', () => {
+    const fromIndex = 40;
+    const start = track.centerline[fromIndex]!;
+    for (const d of [5, 37.5, 123.4, 300]) {
+      const fwd = pointAtArc(track, fromIndex, d);
+      const arriveIdx = closestOnTrack(track, fwd.x, fwd.z).index;
+      const back = pointAtArc(track, arriveIdx, -d);
+      expect(
+        Math.hypot(back.x - start[0], back.z - start[1]),
+        `round trip d=${d}`,
+      ).toBeLessThan(3); // ~ one sample spacing on a 598m/256-sample circuit
+    }
+  });
+
+  it('the returned point always stays within ROAD_HALF_W of the centreline', () => {
+    for (const fromIndex of [0, 30, 120, 200]) {
+      for (const d of [-400, -50, -1, 1, 50, 400]) {
+        const pose = pointAtArc(track, fromIndex, d);
+        expect(
+          closestOnTrack(track, pose.x, pose.z).dist,
+          `fromIndex=${fromIndex} metres=${d}`,
+        ).toBeLessThan(ROAD_HALF_W);
+      }
+    }
+  });
+
+  it('the tangent points DOWN-TRACK for both a positive and a negative metres — walking backward does not flip it', () => {
+    const fromIndex = 60;
+    for (const d of [30, -30, 120, -120]) {
+      const pose = pointAtArc(track, fromIndex, d);
+      const arrivalIdx = closestOnTrack(track, pose.x, pose.z).index;
+      // independent local forward direction: the raw centreline segment at the
+      // arrival sample, in the direction of INCREASING index (down-track).
+      const a = track.centerline[arrivalIdx]!;
+      const b = track.centerline[(arrivalIdx + 1) % SAMPLES]!;
+      const ltx = b[0] - a[0];
+      const ltz = b[1] - a[1];
+      const l = Math.hypot(ltx, ltz) || 1;
+      const dot = pose.tx * (ltx / l) + pose.tz * (ltz / l);
+      expect(dot, `metres=${d} tangent vs local down-track direction`).toBeGreaterThan(0.95);
+    }
+  });
+
+  it('a walk longer than the circuit terminates (does not hang) and stays on the road', () => {
+    const far = track.length * 5; // several full laps
+    const fwd = pointAtArc(track, 10, far);
+    expect(Number.isFinite(fwd.x)).toBe(true);
+    expect(Number.isFinite(fwd.z)).toBe(true);
+    expect(surfaceAt(track, fwd.x, fwd.z)).toBe('road');
+
+    const bwd = pointAtArc(track, 10, -far);
+    expect(Number.isFinite(bwd.x)).toBe(true);
+    expect(Number.isFinite(bwd.z)).toBe(true);
+    expect(surfaceAt(track, bwd.x, bwd.z)).toBe('road');
+  });
+});
+
+// ==============================================================================
+// 10. validateTrack — the guard for every authored circuit (the gate the
+// 7-more-circuits agent must clear). Every negative fixture is checked against
+// its SPECIFIC error text, not just `ok === false`, so a test cannot pass for
+// the wrong reason.
+// ==============================================================================
+
+describe('validateTrack', () => {
+  const theme = TRACKS[DEFAULT_TRACK_ID].theme;
+
+  it('every registered TrackSource (the compiler-enforced TRACKS registry) is valid, and ids/name/blurb are sane', () => {
+    // Iterate TRACKS (Object.values), not TRACK_LIST directly — TRACKS is the
+    // compiler-enforced Record<TrackId, TrackSource> that can never miss a
+    // registered circuit; TRACK_LIST is merely derived from it (see the next
+    // assertion), so validating the registry itself is the guard that cannot
+    // be defeated by an author forgetting a second list.
+    for (const src of Object.values(TRACKS)) {
+      const v = validateTrack(src);
+      expect(v.errors, `${src.id} errors`).toEqual([]);
+      expect(v.ok, `${src.id} ok`).toBe(true);
+    }
+    for (const [key, src] of Object.entries(TRACKS)) {
+      expect(src.id, `TRACKS['${key}'].id`).toBe(key);
+      expect(src.name.length, `${key} name non-empty`).toBeGreaterThan(0);
+      expect(src.blurb.length, `${key} blurb non-empty`).toBeGreaterThan(0);
+    }
+  });
+
+  it('TRACK_LIST is derived from TRACKS: same circuits, no drift possible', () => {
+    // Pins the Fix-1 derivation (`TRACK_LIST = Object.values(TRACKS)`) so it
+    // can never silently regress back into a hand-maintained second list that
+    // an author forgets to update.
+    const registryValues = Object.values(TRACKS);
+    expect(TRACK_LIST.length).toBe(registryValues.length);
+    expect(new Set(TRACK_LIST.map((s) => s.id))).toEqual(new Set(registryValues.map((s) => s.id)));
+    for (let i = 0; i < TRACK_LIST.length; i++) {
+      expect(TRACK_LIST[i]).toBe(registryValues[i]); // same objects, same order
+    }
+  });
+
+  it('rejects a figure-8 / self-crossing control loop, naming the crossing', () => {
+    const figureEight: TrackSource = {
+      id: DEFAULT_TRACK_ID,
+      name: 'fixture',
+      blurb: 'fixture',
+      theme,
+      points: [
+        [-80, -80], [80, 80], [80, -80], [-80, 80],
+        [-40, 0], [40, 0], [0, 40], [0, -40],
+      ],
+    };
+    const v = validateTrack(figureEight);
+    expect(v.ok).toBe(false);
+    expect(v.errors.some((e) => e.includes('crosses itself')), v.errors.join('; ')).toBe(true);
+  });
+
+  it('rejects a corner tighter than MIN_CORNER_RADIUS', () => {
+    // a large loop with one point pulled sharply inward: a near-reversal spike
+    // whose local circumradius is far below MIN_CORNER_RADIUS (~7.2m)
+    const spikyLoop: TrackSource = {
+      id: DEFAULT_TRACK_ID,
+      name: 'fixture',
+      blurb: 'fixture',
+      theme,
+      points: [
+        [0, -150], [150, -100], [200, 0], [150, 100], [0, 150],
+        [-150, 100], [-160, 20], [-140, 0], [-160, -20], [-150, -100],
+      ],
+    };
+    const v = validateTrack(spikyLoop);
+    expect(v.ok).toBe(false);
+    expect(
+      v.errors.some(
+        (e) => e.includes('corner radius') && e.includes(`${MIN_CORNER_RADIUS.toFixed(1)} m minimum`),
+      ),
+      v.errors.join('; '),
+    ).toBe(true);
+  });
+
+  it('rejects fewer than MIN_CONTROL_POINTS points', () => {
+    const tooFew: TrackSource = {
+      id: DEFAULT_TRACK_ID,
+      name: 'fixture',
+      blurb: 'fixture',
+      theme,
+      points: [[0, 0], [50, 0], [50, 50], [0, 50], [-25, 25]],
+    };
+    expect(tooFew.points.length).toBeLessThan(MIN_CONTROL_POINTS);
+    const v = validateTrack(tooFew);
+    expect(v.ok).toBe(false);
+    expect(v.errors.some((e) => e.includes('control points') && e.includes('at least'))).toBe(true);
+  });
+
+  it('rejects a non-finite coordinate', () => {
+    const nonFinite: TrackSource = {
+      id: DEFAULT_TRACK_ID,
+      name: 'fixture',
+      blurb: 'fixture',
+      theme,
+      points: [
+        [0, 0], [50, 0], [50, 50], [0, 50], [-25, 25], [NaN, 25], [-50, -25],
+      ],
+    };
+    const v = validateTrack(nonFinite);
+    expect(v.ok).toBe(false);
+    expect(v.errors.some((e) => e.includes('not finite'))).toBe(true);
+  });
+
+  it('rejects a tiny circuit shorter than MIN_TRACK_LENGTH, mentioning the grid', () => {
+    const tiny: TrackSource = {
+      id: DEFAULT_TRACK_ID,
+      name: 'fixture',
+      blurb: 'fixture',
+      theme,
+      points: [
+        [0, -10], [7, -7], [10, 0], [7, 7], [0, 10], [-7, 7], [-10, 0], [-7, -7],
+      ],
+    };
+    const built = buildTrack(tiny);
+    expect(built.length, 'fixture really is shorter than the minimum').toBeLessThan(MIN_TRACK_LENGTH);
+    const v = validateTrack(tiny);
+    expect(v.ok).toBe(false);
+    expect(
+      v.errors.some((e) => e.includes('grid') && e.includes(`${MIN_TRACK_LENGTH.toFixed(0)} m`)),
+      v.errors.join('; '),
+    ).toBe(true);
+  });
+
+  it('rejects two stretches of road within MIN_SELF_CLEARANCE of each other even though the centreline never crosses', () => {
+    // a long, thin "hairpin corridor": two ~300m legs 8m apart, joined by two
+    // wide, gentle turnarounds so the CENTRELINE itself never actually crosses.
+    const hairpinCorridor: TrackSource = {
+      id: DEFAULT_TRACK_ID,
+      name: 'fixture',
+      blurb: 'fixture',
+      theme,
+      points: [
+        [0, 0], [150, 0], [300, 0],
+        [330, 4],
+        [300, 8], [150, 8], [0, 8],
+        [-30, 4],
+      ],
+    };
+    const gap = 8;
+    expect(gap).toBeLessThan(MIN_SELF_CLEARANCE);
+    // sanity: the legs really are far enough apart (in arc length) that the
+    // near-miss check does not dismiss them as "just the road bending"
+    expect(SELF_CLEARANCE_ARC_WINDOW).toBeLessThan(300);
+    const v = validateTrack(hairpinCorridor);
+    expect(v.ok).toBe(false);
+    expect(
+      v.errors.some((e) => e.includes('passes within') && e.includes('of itself')),
+      v.errors.join('; '),
+    ).toBe(true);
+    // the crossing check specifically must NOT be why it failed — this is the
+    // near-miss case, not a genuine self-intersection
+    expect(v.errors.some((e) => e.includes('crosses itself')), v.errors.join('; ')).toBe(false);
+  });
+
+  it('assertValidTrack throws on an invalid source and does not throw on a valid one', () => {
+    expect(() => assertValidTrack(TRACKS[DEFAULT_TRACK_ID])).not.toThrow();
+    const invalid: TrackSource = {
+      id: DEFAULT_TRACK_ID,
+      name: 'fixture',
+      blurb: 'fixture',
+      theme,
+      points: [[0, 0], [1, 1], [2, 2]],
+    };
+    expect(() => assertValidTrack(invalid)).toThrow(/invalid track/);
   });
 });

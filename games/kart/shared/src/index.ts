@@ -5,4 +5,5 @@ export * from './palette.js';
 export * from './protocol.js';
 export * from './kartPhysics.js';
 export * from './track.js';
+export * from './tracks/index.js';
 export * from './sim.js';
