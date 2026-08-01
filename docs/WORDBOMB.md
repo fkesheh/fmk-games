@@ -126,7 +126,7 @@ Left undefined, each of these gets invented differently by W3, W8 and W11. Mirro
 | Player joins while `phase !== 'lobby'` | seated with score 0, `locked: false`, and **may not submit until the next round starts**. Their `wb_boom` row for the round in progress is `{ word: null, points: 0 }` — they cannot score a round they did not play |
 | Player disconnects holding a locked word | the word **is** scored and **does** appear in `answers`. Their entry persists with `connected: false` |
 | Player leaves permanently | entry deleted; `wb_boom` still carries `name` on every row (that is why `WbAnswer.name` exists) so the reveal renders standalone |
-| Count drops below `MIN_PLAYERS` | abort to `lobby`, **scores kept**, timers cleared |
+| **SEATS** drop below `MIN_PLAYERS` | abort to `lobby`, **scores kept**, timers cleared. **Counted in SEATS, not connections** — only a permanent leave frees a seat. A disconnect (reload) must NOT abort, or I8 is unreachable at a 2-player table and this rule contradicts it |
 | Room becomes empty | stop all timers; the room is dropped |
 | `yourWord` / `locked` lifecycle | both reset at the **start** of each round, and persist through `reveal` so a client can highlight its own answer |
 

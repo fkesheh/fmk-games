@@ -181,6 +181,26 @@ export class WordbombRoom implements GameRoomHandle {
   }
 
   /**
+   * SEATS held, connected or not — a ghost still occupies one.
+   *
+   * This exists because `playerCount()` (connected only) is the wrong question
+   * for "should the match abort". §2.1 says a disconnected player's entry
+   * PERSISTS and their locked word is still scored; I8 says reconnecting
+   * mid-round restores your score and your word. But the abort test used the
+   * CONNECTED count, so at MIN_PLAYERS = 2 — the smallest legal table — one
+   * player reloading dropped it to 1, aborted the match, and nulled EVERY
+   * player's word. I8 was unreachable at a 2-player table, and the two rules
+   * contradicted each other.
+   *
+   * A DISCONNECT IS NOT A LEAVE. Only a permanent leave frees a seat (it
+   * deletes the entry), so only a permanent leave can take the room below the
+   * minimum and end the match.
+   */
+  private seatedCount(): number {
+    return this.players.size;
+  }
+
+  /**
    * Connected players with no room-level message for STALE_MS. The platform
    * closes their sockets (lobby.ts `pollStaleSessions`).
    *
@@ -261,8 +281,9 @@ export class WordbombRoom implements GameRoomHandle {
       p.connected = false;
       if (permanent === true) this.players.delete(id);
 
-      if (this.playerCount() === 0) {
-        // §2.1: room empty — stop every timer; the platform drops the room.
+      if (this.seatedCount() === 0) {
+        // §2.1: room empty — no SEATS left (not merely nobody online). Stop
+        // every timer; the platform drops the room.
         this.clearTimer();
         this.countdownEndsAt = 0;
         this.scoringOpen = false;
@@ -270,7 +291,8 @@ export class WordbombRoom implements GameRoomHandle {
       }
       if (this.phase === 'live' || this.phase === 'reveal') {
         // §2.1: below MIN_PLAYERS mid-match -> abort to lobby, SCORES KEPT.
-        if (this.playerCount() < MIN_PLAYERS) this.abortToLobby();
+        // SEATS, not connections: a reload must not kill the match (I8).
+        if (this.seatedCount() < MIN_PLAYERS) this.abortToLobby();
       } else if (this.phase === 'lobby' && this.countdownEndsAt !== 0) {
         if (this.playerCount() < MIN_PLAYERS) {
           this.clearTimer();
@@ -461,7 +483,9 @@ export class WordbombRoom implements GameRoomHandle {
   /** Reveal window over: next round, or the end of the match. */
   private afterReveal(): void {
     this.revealEndsAt = 0;
-    if (this.playerCount() < MIN_PLAYERS) {
+    // Seats, not connections — a player reloading between rounds keeps the match
+    // alive and rejoins into it (I8).
+    if (this.seatedCount() < MIN_PLAYERS) {
       this.abortToLobby();
       this.broadcastState();
       return;

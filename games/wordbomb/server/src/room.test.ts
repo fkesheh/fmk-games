@@ -1107,7 +1107,41 @@ describe('§2.1 membership', () => {
     for (const row of boom.answers) expect(row.name).toBeTruthy();
   });
 
-  it('row 4: dropping below MIN_PLAYERS aborts to lobby, KEEPS scores, clears timers', () => {
+  it('row 4: a mid-round RELOAD does NOT abort — seats, not connections (I8)', () => {
+    // The bug this pins: the abort used the CONNECTED count, so at MIN_PLAYERS=2
+    // — the smallest legal table — one player reloading killed the whole match
+    // and nulled EVERY player's word. That made I8 ("reconnect is safe")
+    // unreachable at a 2-player table, and put §2.1 and I8 in direct conflict.
+    // A DISCONNECT IS NOT A LEAVE: only a permanent leave frees a seat.
+    const h = boot([
+      ['a', 'Alice'],
+      ['b', 'Bob'],
+    ]);
+    advance();
+    submit(h.room, 'a', 'nation');
+    toBoom();
+    afterReveal(); // round 2 live
+    expect(h.io.pub('a').round).toBe(2);
+    submit(h.room, 'a', 'motion'); // a's word is live and must survive b's reload
+
+    h.room.removePlayer('b'); // NOT permanent — this is a reload
+    expect(h.room.playerCount()).toBe(1); // b is offline...
+
+    const st = h.io.pub('a');
+    expect(st.phase).toBe('live'); // ...but the match is UNTOUCHED
+    expect(st.round).toBe(2);
+    expect(st.fragment).not.toBeNull();
+    expect(playerOf(st, 'a').score).toBe(72);
+    expect(h.io.priv('a').yourWord).toBe('motion'); // a's word was NOT nulled
+
+    // and b comes back into the SAME round with their score intact
+    h.room.addPlayer('b', 'Bob');
+    expect(h.io.pub('a').phase).toBe('live');
+    expect(h.io.pub('a').round).toBe(2);
+    expect(playerOf(h.io.pub('a'), 'b').connected).toBe(true);
+  });
+
+  it('row 4b: a PERMANENT leave below MIN_PLAYERS aborts to lobby, KEEPS scores, clears timers', () => {
     const h = boot([
       ['a', 'Alice'],
       ['b', 'Bob'],
@@ -1119,7 +1153,7 @@ describe('§2.1 membership', () => {
     afterReveal(); // round 2 live
     expect(h.io.pub('a').round).toBe(2);
 
-    h.room.removePlayer('b');
+    h.room.removePlayer('b', true); // PERMANENT — the seat is freed
     expect(h.room.playerCount()).toBe(1);
     expect(MIN_PLAYERS).toBe(2);
     const st = h.io.pub('a');
