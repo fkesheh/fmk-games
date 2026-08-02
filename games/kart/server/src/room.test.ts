@@ -19,7 +19,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   BARRIER_OUT,
   BUMP_MIN_SPEED,
+  CHAMPIONSHIP_DEFAULT,
   COUNTDOWN_SECONDS,
+  DEFAULT_SEASON_ROUNDS,
   GATES,
   GATE_RADIUS,
   INPUT_QUEUE_CAP,
@@ -31,28 +33,49 @@ import {
   MIN_PLAYERS,
   NITRO_CHARGES,
   NITRO_TIME,
+  POINTS_TABLE,
   RACE_TIMEOUT_S,
   READY_SECONDS,
   RESULTS_SECONDS,
+  SEASON_ROUNDS_MAX,
+  SEASON_ROUNDS_MIN,
   SIM_BUDGET_MUL,
   SIM_DT,
   SIM_DT_MAX,
   SIM_DT_MIN,
   SIM_HZ,
   SNAPSHOT_HZ,
+  buildCalendar,
   buildTrack,
   closestOnTrack,
+  compareSeason,
+  defaultKartRoomSettings,
   DEFAULT_TRACK_ID,
   gridSlot,
   makeAssistState,
   makeSim,
   parseKartC2S,
+  parseKartRoomSettings,
+  pointsForPlace,
   pursuitSteer,
   resetSim,
   stepDrive,
+  TRACK_LIST,
   TRACKS,
 } from '@kart/shared';
-import type { KartInputMsg, KartPhase, KartS2C, KartSim, RaceEvent } from '@kart/shared';
+import type {
+  KartInputMsg,
+  KartPhase,
+  KartS2C,
+  KartSeason,
+  KartSeasonSettings,
+  KartSim,
+  KartStandingRow,
+  RaceEvent,
+  SeasonSortKey,
+  TrackDef,
+  TrackId,
+} from '@kart/shared';
 import type { PlayerId, RoomIO } from '@platform/shared';
 import { kartModule } from './module.js';
 import { KartRoom } from './room.js';
@@ -101,6 +124,16 @@ class FakeIO implements RoomIO {
     return this.lastOf(id, 'kart_snapshot');
   }
 
+  /**
+   * EVERY snapshot this player ever received. `lastSnap` proves a value is
+   * right once; this proves an invariant held on all of them — the difference
+   * between "the championship is null now" and "this room never once shipped a
+   * championship".
+   */
+  snaps(id: PlayerId): SnapshotMsg[] {
+    return (this.log.get(id) ?? []).filter((m): m is SnapshotMsg => m.t === 'kart_snapshot');
+  }
+
   joined(id: PlayerId): JoinedMsg {
     const m = this.lastOf(id, 'kart_joined');
     if (m === null) throw new Error(`no 'kart_joined' captured for ${id}`);
@@ -116,8 +149,17 @@ class FakeIO implements RoomIO {
 
 // ---- timing ------------------------------------------------------------------
 
-/** The one circuit under test — the same TrackDef the room builds. */
-const TRACK = buildTrack(TRACKS[DEFAULT_TRACK_ID]);
+/** The same TrackDef the room builds for a given circuit id. */
+function trackFor(id: TrackId): TrackDef {
+  return buildTrack(TRACKS[id]);
+}
+
+/**
+ * The default circuit — what every non-championship test drives on. A
+ * championship room changes circuit between rounds, so those tests build their
+ * drivers on `trackFor(room.trackId)` (the LIVE one) instead.
+ */
+const TRACK = trackFor(DEFAULT_TRACK_ID);
 const SIM_STEP_MS = Math.ceil(1000 / SIM_HZ); // 34ms: one sim tick (+ a little)
 const SNAP_STEP_MS = Math.ceil(1000 / SNAPSHOT_HZ); // 50ms: one snapshot tick
 
@@ -154,21 +196,39 @@ function advanceToPhase(io: FakeIO, id: PlayerId, phase: KartPhase, maxSteps = 4
  */
 class Driver {
   readonly twin: KartSim;
-  private readonly assist = makeAssistState();
+  private assist = makeAssistState();
   private seq = 0;
 
   constructor(
     readonly id: PlayerId,
     readonly slot: number,
+    /** The circuit this kart is racing — a championship round is not always TRACK. */
+    private track: TrackDef = TRACK,
   ) {
-    const g = gridSlot(TRACK, slot);
+    const g = gridSlot(track, slot);
     this.twin = makeSim(g.x, g.z, g.yaw);
   }
 
   /** Re-base the twin on the grid slot — exactly what the room's GO wipe does. */
   regrid(): void {
-    const g = gridSlot(TRACK, this.slot);
+    const g = gridSlot(this.track, this.slot);
     resetSim(this.twin, g.x, g.z, g.yaw);
+  }
+
+  /**
+   * Adopt the circuit the room has moved to (a championship changes circuit
+   * between rounds) and re-grid the twin on it, steering assist included.
+   *
+   * `seq` deliberately KEEPS COUNTING. It is per-connection monotonic, and the
+   * room carries its ack watermark across a race (GO acks the whole pre-race
+   * backlog), so a driver that restarted its numbering each round would have
+   * every input of round 2 dropped as already-processed — the kart would sit on
+   * the grid while its twin drove off, which reads exactly like a stuck kart.
+   */
+  retrack(track: TrackDef): void {
+    this.track = track;
+    this.assist = makeAssistState();
+    this.regrid();
   }
 
   lastSeq(): number {
@@ -177,7 +237,7 @@ class Driver {
 
   /** Next pure-pursuit input; `over` replaces any field (reverse, coast, ...). */
   input(over: Partial<KartInputMsg> = {}): KartInputMsg {
-    const steer = pursuitSteer(TRACK, this.twin, this.assist, SIM_DT);
+    const steer = pursuitSteer(this.track, this.twin, this.assist, SIM_DT);
     const throttle = Math.abs(steer) > 0.45 ? 0.4 : 1; // ease off in the tight stuff
     return {
       t: 'kart_input',
@@ -200,7 +260,7 @@ class Driver {
   send(room: KartRoom, over: Partial<KartInputMsg> = {}, junk?: Record<string, unknown>): KartInputMsg {
     const inp = this.input(over);
     room.handleMessage(this.id, junk === undefined ? inp : { ...inp, ...junk });
-    stepDrive(this.twin, inp, inp.dt, TRACK);
+    stepDrive(this.twin, inp, inp.dt, this.track);
     return inp;
   }
 }
@@ -384,7 +444,11 @@ describe('KartRoom phase flow', () => {
     expect(io.lastSnap('p1').phase).toBe('lobby'); // < MIN_PLAYERS
     expect(room.info().phase).toBe('lobby');
     expect(room.info().game).toBe('kart');
-    expect(room.info().label).toBe(`3 laps · ${TRACKS[DEFAULT_TRACK_ID].name}`); // e.g. "3 laps · Greenvale Ring"
+    // a default room IS a championship room, so the room list advertises the
+    // ROUND a joiner would be walking into, not the lap count (e.g. "R1/8 ·
+    // Greenvale Ring"); the old "3 laps · ..." form survives only on a room
+    // booked with { championship: false } — pinned in the championship block
+    expect(room.info().label).toBe(`R1/${DEFAULT_SEASON_ROUNDS} · ${TRACKS[DEFAULT_TRACK_ID].name}`);
     expect(room.info().maxPlayers).toBe(MAX_PLAYERS); // never a literal: the cap moves
 
     room.addPlayer('p2', 'Bravo');
@@ -1012,8 +1076,11 @@ describe('KartRoom race end', () => {
     expect(you.progress).toBe(0);
     expect(you.finished).toBe(false);
     expect(you.finishMs).toBe(-1);
-    // ...and the kart is back on its grid slot, at rest
-    const spawn = gridSlot(TRACK, 0);
+    // ...and the kart is back on its grid slot, at rest. On the circuit the
+    // room is ABOUT to race, not the one it just left: this is a championship
+    // room (the default), so the reset that clears the race also advances the
+    // calendar, and "back on the grid" means the NEXT round's grid.
+    const spawn = gridSlot(trackFor(room.trackId), 0);
     expect(posOf(io, 'p1')).toEqual([spawn.x, 0, spawn.z]);
     expect(you.sim.vx).toBe(0);
     expect(you.sim.vz).toBe(0);
@@ -1376,10 +1443,10 @@ describe('KartRoom multi-track contract', () => {
     room.stop();
   });
 
-  it('room.info().label names the circuit', () => {
+  it('room.info().label names the circuit (and, on a championship room, the round)', () => {
     const io = new FakeIO();
     const room = new KartRoom(DEFAULT_TRACK_ID, 'public', io);
-    expect(room.info().label).toBe(`3 laps · ${TRACKS[DEFAULT_TRACK_ID].name}`);
+    expect(room.info().label).toBe(`R1/${DEFAULT_SEASON_ROUNDS} · ${TRACKS[DEFAULT_TRACK_ID].name}`);
     room.stop();
   });
 });
@@ -1430,3 +1497,734 @@ describe('kartModule settings validation', () => {
     ).toThrow();
   });
 });
+
+// ==============================================================================
+// CHAMPIONSHIP — THE PURE RULEBOOK (shared/protocol.ts).
+//
+// Scoring, the tie-break, the calendar and the settings validator are pure
+// functions precisely so they can be pinned here in microseconds, without a
+// kart moving. Everything the room block below asserts is built on top of
+// these, so if one of them is wrong the whole championship is wrong in a way
+// no amount of driving would localise.
+// ==============================================================================
+describe('championship rules (pure)', () => {
+  /** A standings key with everything at its "has never raced" value. */
+  interface NamedKey extends SeasonSortKey {
+    id: string;
+  }
+  function key(id: string, over: Partial<SeasonSortKey> = {}): NamedKey {
+    return { id, points: 0, wins: 0, bestFinish: 0, seq: 0, ...over };
+  }
+  const orderOf = (rows: readonly NamedKey[]): string[] =>
+    [...rows].sort(compareSeason).map((r) => r.id);
+
+  /** Every arrangement of `xs` — used to prove a comparator is a TOTAL order. */
+  function permutations<T>(xs: readonly T[]): T[][] {
+    if (xs.length <= 1) return [[...xs]];
+    const out: T[][] = [];
+    xs.forEach((x, i) => {
+      for (const rest of permutations([...xs.slice(0, i), ...xs.slice(i + 1)])) out.push([x, ...rest]);
+    });
+    return out;
+  }
+
+  it('pointsForPlace pays the F1 table for the top ten and nothing anywhere else', () => {
+    POINTS_TABLE.forEach((pts, i) => expect(pointsForPlace(i + 1)).toBe(pts));
+    // the table must actually REWARD a better place: a flat (or inverted) one
+    // would make every scoring assertion in this file vacuously true
+    for (let i = 1; i < POINTS_TABLE.length; i++) {
+      expect(POINTS_TABLE[i - 1]!).toBeGreaterThan(POINTS_TABLE[i]!);
+    }
+    // a finish, but not a scoring one
+    expect(pointsForPlace(POINTS_TABLE.length + 1)).toBe(0);
+    expect(pointsForPlace(MAX_PLAYERS)).toBe(0); // the last kart of a full grid
+    // ...and anything that is not a 1-based place scores nothing rather than
+    // reading off the end of the table or throwing
+    expect(pointsForPlace(0)).toBe(0);
+    expect(pointsForPlace(-1)).toBe(0);
+    expect(pointsForPlace(Number.NaN)).toBe(0);
+    expect(pointsForPlace(Number.POSITIVE_INFINITY)).toBe(0);
+    expect(pointsForPlace(1.5)).toBe(pointsForPlace(1)); // floored, never interpolated
+  });
+
+  it('the tie-break ladder is points, then wins, then best finish, then join order', () => {
+    // rung 0: POINTS beat everything — one more point outranks a race winner
+    expect(
+      orderOf([
+        key('winner', { points: POINTS_TABLE[0]!, wins: 1, bestFinish: 1, seq: 0 }),
+        key('steady', { points: POINTS_TABLE[0]! + 1, wins: 0, bestFinish: 2, seq: 1 }),
+      ]),
+    ).toEqual(['steady', 'winner']);
+
+    // rung 1: level on points, the countback goes to WINS (F1 art. 7.2)
+    expect(
+      orderOf([
+        key('consistent', { points: 50, wins: 0, bestFinish: 2, seq: 0 }),
+        key('spiky', { points: 50, wins: 2, bestFinish: 1, seq: 1 }),
+      ]),
+    ).toEqual(['spiky', 'consistent']);
+
+    // rung 2: level on points AND wins, the better single finish decides
+    expect(
+      orderOf([
+        key('bestIsFifth', { points: 20, wins: 0, bestFinish: 5, seq: 0 }),
+        key('bestIsSecond', { points: 20, wins: 0, bestFinish: 2, seq: 1 }),
+      ]),
+    ).toEqual(['bestIsSecond', 'bestIsFifth']);
+
+    // bestFinish 0 is "NEVER FINISHED", not "place zero": it must rank below the
+    // worst real finish there is, not sort to the front as a small number would
+    expect(
+      orderOf([
+        key('neverHome', { bestFinish: 0, seq: 0 }),
+        key('lastButHome', { bestFinish: MAX_PLAYERS, seq: 1 }),
+      ]),
+    ).toEqual(['lastButHome', 'neverHome']);
+
+    // rung 3: level all the way down, the earliest driver to appear this season
+    // wins — and `seq` is unique, so this rung can never itself tie
+    expect(orderOf([key('late', { seq: 7 }), key('early', { seq: 2 }), key('mid', { seq: 4 })])).toEqual([
+      'early',
+      'mid',
+      'late',
+    ]);
+    expect(compareSeason(key('early', { seq: 2 }), key('late', { seq: 7 }))).toBeLessThan(0);
+    expect(compareSeason(key('late', { seq: 7 }), key('early', { seq: 2 }))).toBeGreaterThan(0);
+  });
+
+  it('the standings have exactly ONE valid arrangement, whatever order the rows arrive in', () => {
+    // five drivers that tie at every rung except the last one that separates them
+    const rows: NamedKey[] = [
+      key('a', { points: 43, wins: 1, bestFinish: 1, seq: 0 }),
+      key('b', { points: 43, wins: 1, bestFinish: 1, seq: 3 }), // separated from a by seq only
+      key('c', { points: 43, wins: 0, bestFinish: 1, seq: 1 }), // fewer wins
+      key('d', { points: 43, wins: 0, bestFinish: 4, seq: 2 }), // worse best finish
+      key('e', { points: 0, wins: 0, bestFinish: 0, seq: 4 }), // never scored, never finished
+    ];
+    const canonical = orderOf(rows);
+    expect(canonical).toEqual(['a', 'b', 'c', 'd', 'e']);
+
+    // idempotent: re-sorting a sorted table cannot reshuffle equals
+    expect(orderOf([...rows].sort(compareSeason))).toEqual(canonical);
+    // total: EVERY input permutation lands on the same arrangement, so two rooms
+    // holding the same rows can never disagree about the championship order
+    const perms = permutations(rows);
+    expect(perms.length).toBe(120);
+    for (const p of perms) expect(orderOf(p)).toEqual(canonical);
+  });
+
+  it('the calendar is `rounds` circuits of the registry rotation, starting at the room track and wrapping', () => {
+    const ids = TRACK_LIST.map((t) => t.id);
+    const first = ids[0]!;
+    const last = ids[ids.length - 1]!;
+
+    const full = buildCalendar(first, SEASON_ROUNDS_MAX);
+    expect(full.length).toBe(SEASON_ROUNDS_MAX); // a full season however short the registry is
+    expect(full[0]).toBe(first); // round 1 is the circuit the room was booked on
+    // registry order, wrapping: with one circuit registered that is the same
+    // circuit every round; with eight it is eight different ones, no code change
+    full.forEach((id, i) => expect(id).toBe(ids[i % ids.length]));
+
+    // starting elsewhere ROTATES the rotation, it never reorders it
+    const rotated = buildCalendar(last, SEASON_ROUNDS_MAX);
+    expect(rotated[0]).toBe(last);
+    rotated.forEach((id, i) => expect(id).toBe(ids[(ids.length - 1 + i) % ids.length]));
+
+    // a shorter season is a PREFIX of the same calendar — the rest is not
+    // "missing", the season is simply shorter
+    expect(buildCalendar(first, SEASON_ROUNDS_MIN)).toEqual(full.slice(0, SEASON_ROUNDS_MIN));
+    expect(buildCalendar(first, SEASON_ROUNDS_MIN).length).toBe(SEASON_ROUNDS_MIN);
+  });
+
+  it('parseKartRoomSettings defaults an absent bag and accepts every documented value', () => {
+    expect(parseKartRoomSettings(undefined)).toEqual(defaultKartRoomSettings());
+    expect(parseKartRoomSettings({})).toEqual(defaultKartRoomSettings());
+    expect(defaultKartRoomSettings().season).toEqual({
+      championship: CHAMPIONSHIP_DEFAULT,
+      rounds: DEFAULT_SEASON_ROUNDS,
+    });
+
+    // a registered circuit is taken and leaves the season half at its defaults
+    const someTrack = TRACK_LIST[TRACK_LIST.length - 1]!.id;
+    expect(parseKartRoomSettings({ trackId: someTrack })).toEqual(defaultKartRoomSettings(someTrack));
+
+    // the championship can be switched off; `rounds` is ACCEPTED (and ignored)
+    // beside it, so a client may send both fields unconditionally
+    expect(parseKartRoomSettings({ championship: false })).toEqual({
+      trackId: DEFAULT_TRACK_ID,
+      season: { championship: false, rounds: DEFAULT_SEASON_ROUNDS },
+    });
+    expect(parseKartRoomSettings({ championship: false, rounds: SEASON_ROUNDS_MIN }).season).toEqual({
+      championship: false,
+      rounds: SEASON_ROUNDS_MIN,
+    });
+
+    // a short season, and both ends of the legal band
+    expect(parseKartRoomSettings({ rounds: 3 }).season).toEqual({
+      championship: CHAMPIONSHIP_DEFAULT,
+      rounds: 3,
+    });
+    expect(parseKartRoomSettings({ rounds: SEASON_ROUNDS_MIN }).season.rounds).toBe(SEASON_ROUNDS_MIN);
+    expect(parseKartRoomSettings({ rounds: SEASON_ROUNDS_MAX }).season.rounds).toBe(SEASON_ROUNDS_MAX);
+  });
+
+  it('parseKartRoomSettings THROWS on everything the lobby must reject as bad_settings', () => {
+    expect(() => parseKartRoomSettings({ trackId: 'nope' })).toThrow();
+    expect(() => parseKartRoomSettings({ trackId: 42 })).toThrow();
+    expect(() => parseKartRoomSettings({ trackId: null })).toThrow();
+
+    // `championship` is a BOOLEAN, not a truthy value: coercing '1' or 1 into
+    // "on" would silently give a room a season its creator never asked for
+    expect(() => parseKartRoomSettings({ championship: 'true' })).toThrow();
+    expect(() => parseKartRoomSettings({ championship: 1 })).toThrow();
+    expect(() => parseKartRoomSettings({ championship: null })).toThrow();
+
+    // `rounds` is an INTEGER inside the band — never clamped, never floored
+    expect(() => parseKartRoomSettings({ rounds: SEASON_ROUNDS_MIN - 1 })).toThrow();
+    expect(() => parseKartRoomSettings({ rounds: SEASON_ROUNDS_MAX + 1 })).toThrow();
+    expect(() => parseKartRoomSettings({ rounds: 2.5 })).toThrow();
+    expect(() => parseKartRoomSettings({ rounds: '3' })).toThrow();
+    expect(() => parseKartRoomSettings({ rounds: Number.NaN })).toThrow();
+    expect(() => parseKartRoomSettings({ rounds: Number.POSITIVE_INFINITY })).toThrow();
+  });
+});
+
+// ==============================================================================
+// CHAMPIONSHIP — THE ROOM HALF.
+//
+// The season is read ONLY off the wire (`snapshot.championship`), never off the
+// room's fields: the standings ARE a contract with the client, and a test that
+// reached inside could not tell a broken snapshot from a broken table.
+//
+// Full 3-lap races cost ~3000 sim ticks each, so they are spent deliberately:
+// the four-kart grid and the two-round title decider are driven for real, and
+// every other round here ends the cheap way — either on RACE_TIMEOUT_S with an
+// empty track, or the instant the last CONNECTED kart is home.
+// ==============================================================================
+describe('KartRoom championship', () => {
+  const FULL_SEASON: KartSeasonSettings = {
+    championship: true,
+    rounds: DEFAULT_SEASON_ROUNDS,
+  };
+
+  /** The season off the wire. Throws rather than silently passing on `null`. */
+  function seasonOf(io: FakeIO, id: PlayerId): KartSeason {
+    const season = io.lastSnap(id).championship;
+    if (season === null) throw new Error(`snapshot for ${id} carries no championship`);
+    return season;
+  }
+
+  function rowOf(season: KartSeason, id: PlayerId): KartStandingRow {
+    const row = season.standings.find((r) => r.id === id);
+    if (row === undefined) throw new Error(`no standings row for ${id}`);
+    return row;
+  }
+
+  /** The durable half of a standings row — what a reset may never touch. */
+  function durable(row: KartStandingRow): Record<string, unknown> {
+    const { id, name, pos, points, wins, bestFinish, joinedRound } = row;
+    return { id, name, pos, points, wins, bestFinish, joinedRound };
+  }
+
+  /** A seated, started, NOT-yet-racing championship room. */
+  function seasonRoom(io: FakeIO, ids: PlayerId[], season: KartSeasonSettings): KartRoom {
+    const room = new KartRoom(DEFAULT_TRACK_ID, 'public', io, season);
+    ids.forEach((id, i) => room.addPlayer(id, `Driver${i + 1}`));
+    room.start();
+    settle();
+    return room;
+  }
+
+  /**
+   * Press START and run the lights out. Drivers are built on the room's LIVE
+   * circuit (`room.trackId` moves between rounds), so their twins integrate the
+   * same road the room does — with a one-circuit registry that is always the
+   * same track, with eight it is round 2's.
+   */
+  function startRound(io: FakeIO, room: KartRoom, ids: PlayerId[], reuse?: Driver[]): Driver[] {
+    room.handleMessage(ids[0]!, { t: 'start' });
+    advanceToPhase(io, ids[0]!, 'racing');
+    const track = trackFor(room.trackId);
+    // A second round must REUSE its drivers (see Driver.retrack): a fresh
+    // Driver would restart `seq` at 1 and the room would drop every input.
+    if (reuse === undefined) return ids.map((id, i) => new Driver(id, i, track));
+    for (const d of reuse) d.retrack(track);
+    return reuse;
+  }
+
+  /**
+   * Run the clock out on the CURRENT phase and no further — measured from the
+   * live snapshot rather than from RACE_TIMEOUT_S, because a race that has
+   * already been driven for a minute has only the rest of the timeout left, and
+   * a fixed advance would sail through results and out the other side.
+   */
+  function runOutThePhase(io: FakeIO, id: PlayerId): void {
+    const live = io.lastSnap(id);
+    expect(live.phaseEndsAt, 'this phase has a timer to run out').toBeGreaterThan(0);
+    vi.advanceTimersByTime(live.phaseEndsAt - live.serverTime + SNAP_STEP_MS + SIM_STEP_MS);
+  }
+
+  /** Start and end a round with nobody driving: the race dies on RACE_TIMEOUT_S. */
+  function timeoutRound(io: FakeIO, room: KartRoom, ids: PlayerId[]): void {
+    startRound(io, room, ids);
+    runOutThePhase(io, ids[0]!);
+    expect(io.lastSnap(ids[0]!).phase, 'the race timed out').toBe('results');
+    expect(eventsOfKind(io, ids[0]!, 'timeout').length).toBeGreaterThan(0);
+  }
+
+  /**
+   * The cheapest round that actually SCORES. The passengers are disconnected
+   * the instant the lights go out — which is the contract's second DNF case
+   * ("disconnected before finishing") AND clears the starting grid, which sits
+   * on the start straight the leader must drive down again on laps 2 and 3.
+   * With every connected kart home the race ends on the spot: one kart's worth
+   * of sim, and no RACE_TIMEOUT_S wait.
+   */
+  function sprintRound(io: FakeIO, room: KartRoom, winner: Driver, ...dnfIds: PlayerId[]): void {
+    for (const id of dnfIds) room.removePlayer(id);
+    driveUntil(room, io, [winner], () => io.lastSnap(winner.id).you.finished, 3600);
+    settle();
+    expect(io.lastSnap(winner.id).phase, 'the last connected kart home ends the race').toBe('results');
+  }
+
+  /** Sit through results; the room advances the round and the circuit on the way out. */
+  function toLobby(io: FakeIO, id: PlayerId): void {
+    vi.advanceTimersByTime(RESULTS_SECONDS * 1000 + SNAP_STEP_MS + SIM_STEP_MS);
+    expect(io.lastSnap(id).phase, 'results ended').toBe('lobby');
+  }
+
+  it('scores a full grid straight off the F1 table: every finisher takes exactly pointsForPlace(their place)', () => {
+    const io = new FakeIO();
+    const ids: PlayerId[] = ['p1', 'p2', 'p3', 'p4'];
+    const room = seasonRoom(io, ids, FULL_SEASON);
+    const drivers = startRound(io, room, ids);
+
+    // Release the grid one kart at a time. Every kart drives the SAME
+    // pure-pursuit line, so a field that starts together simply drives into
+    // itself — the head start is the trick the two-kart finish test already
+    // uses, scaled to four. It also clears the start straight (which the grid
+    // sits on) well before the leader comes back round to begin lap 2.
+    const STAGGER = 200;
+    for (let i = 1; i <= drivers.length; i++) drive(room, drivers.slice(0, i), STAGGER);
+    driveUntil(room, io, drivers, () => io.lastSnap('p1').phase === 'results', 4200);
+    settle();
+
+    // the true order is READ, never assumed: whoever the sim put where
+    const finishes = eventsOfKind(io, 'p1', 'finish');
+    expect(finishes.length, 'the whole grid got home — nobody is a DNF here').toBe(ids.length);
+    expect(finishes.map((e) => e.place)).toEqual(ids.map((_, i) => i + 1));
+
+    const season = seasonOf(io, 'p1');
+    expect(season.round, 'during results, `round` is the round just SCORED').toBe(1);
+    expect(season.rounds).toBe(DEFAULT_SEASON_ROUNDS);
+    expect(season.over).toBe(false);
+    expect(season.championId).toBeNull();
+
+    for (const ev of finishes) {
+      const row = rowOf(season, ev.playerId);
+      expect(row.points, `${ev.playerId} finished P${ev.place}`).toBe(pointsForPlace(ev.place));
+      expect(row.delta, 'round 1: the delta IS the total').toBe(pointsForPlace(ev.place));
+      expect(row.wins).toBe(ev.place === 1 ? 1 : 0);
+      expect(row.bestFinish).toBe(ev.place);
+      expect(row.here).toBe(true);
+      expect(row.joinedRound).toBe(1);
+      expect(row.pos, 'championship position after one round IS the race result').toBe(ev.place);
+    }
+
+    // places 1..4 pay strictly descending points, so no tie-break is involved
+    // yet and the table must BE the finishing order
+    expect(season.standings.map((r) => r.id)).toEqual(finishes.map((e) => e.playerId));
+    expect(season.standings.map((r) => r.pos)).toEqual(ids.map((_, i) => i + 1));
+    for (let i = 1; i < season.standings.length; i++) {
+      expect(season.standings[i - 1]!.points).toBeGreaterThan(season.standings[i]!.points);
+    }
+    expect(season.standings[0]!.wins).toBe(1);
+    // the season rode on EVERY snapshot, not just the results one
+    expect(io.snaps('p1').length).toBeGreaterThan(SNAPSHOT_HZ);
+    expect(io.snaps('p1').every((s) => s.championship !== null)).toBe(true);
+    room.stop();
+  });
+
+  it('a kart that never reaches the finish order scores nothing, while the winner is paid in full', () => {
+    const io = new FakeIO();
+    const ids: PlayerId[] = ['p1', 'p2'];
+    const room = seasonRoom(io, ids, FULL_SEASON);
+    const drivers = startRound(io, room, ids);
+    sprintRound(io, room, drivers[0]!, 'p2'); // p2 is gone at the lights: a DNF
+
+    const season = seasonOf(io, 'p1');
+    const won = rowOf(season, 'p1');
+    expect(won.points).toBe(pointsForPlace(1));
+    expect(won.delta).toBe(pointsForPlace(1));
+    expect(won.wins).toBe(1);
+    expect(won.bestFinish).toBe(1);
+    expect(won.pos).toBe(1);
+
+    // the DNF still has a ROW — they are in the championship, on nothing
+    const dnf = rowOf(season, 'p2');
+    expect(dnf.points).toBe(0);
+    expect(dnf.delta).toBe(0);
+    expect(dnf.bestFinish, '0 means never finished, not "finished last"').toBe(0);
+    expect(dnf.wins).toBe(0);
+    expect(dnf.here).toBe(false);
+    expect(dnf.pos).toBe(2);
+    // ...and it is an OMISSION, not a place the table happened to pay nothing
+    // for: exactly one kart was ever classified
+    expect(eventsOfKind(io, 'p1', 'finish').map((e) => e.playerId)).toEqual(['p1']);
+    room.stop();
+  });
+
+  it('a race nobody finishes pays nobody, and still burns a round of the season', () => {
+    const io = new FakeIO();
+    const ids: PlayerId[] = ['p1', 'p2'];
+    const room = seasonRoom(io, ids, FULL_SEASON);
+    timeoutRound(io, room, ids); // both seated, both stationary, nobody home
+
+    const scored = seasonOf(io, 'p1');
+    expect(scored.round).toBe(1);
+    expect(scored.standings.length).toBe(ids.length);
+    for (const row of scored.standings) {
+      expect(row.points).toBe(0);
+      expect(row.delta).toBe(0);
+      expect(row.wins).toBe(0);
+      expect(row.bestFinish).toBe(0);
+      expect(row.here, 'a seated DNF is still seated').toBe(true);
+    }
+    expect(eventsOfKind(io, 'p1', 'finish').length).toBe(0);
+    expect(eventsOfKind(io, 'p1', 'timeout').length).toBe(1);
+
+    toLobby(io, 'p1');
+    expect(seasonOf(io, 'p1').round, 'a scoreless round is still a round').toBe(2);
+    room.stop();
+  });
+
+  it('the championship is the one thing resetToLobby does NOT wipe: points survive, race state does not', () => {
+    const io = new FakeIO();
+    const ids: PlayerId[] = ['p1', 'p2'];
+    const room = seasonRoom(io, ids, FULL_SEASON);
+    const drivers = startRound(io, room, ids);
+    sprintRound(io, room, drivers[0]!, 'p2');
+
+    const scored = seasonOf(io, 'p1');
+    expect(rowOf(scored, 'p1').points).toBe(pointsForPlace(1)); // there IS something to lose
+    toLobby(io, 'p1');
+
+    const lobby = seasonOf(io, 'p1');
+    // every row came through the reset untouched — including the departed one
+    expect(lobby.standings.map(durable)).toEqual(scored.standings.map(durable));
+    // `delta` names the most recently SCORED round, which the reset did not change
+    expect(lobby.standings.map((r) => r.delta)).toEqual(scored.standings.map((r) => r.delta));
+    expect(lobby.round, 'the round advanced on the way out of results').toBe(2);
+    expect(lobby.rounds).toBe(DEFAULT_SEASON_ROUNDS);
+    expect(lobby.over).toBe(false);
+    expect(lobby.championId).toBeNull();
+
+    // ...while the per-race state was wiped exactly as it always was
+    const you = io.lastSnap('p1').you;
+    expect(you.progress).toBe(0);
+    expect(you.lap).toBe(1);
+    expect(you.finished).toBe(false);
+    expect(you.finishMs).toBe(-1);
+    expect(you.bestLapMs).toBe(-1);
+    expect(io.lastSnap('p1').phase).toBe('lobby');
+    room.stop();
+  });
+
+  it('mid-season the room still never auto-starts: round 2 waits for an explicit start, exactly like round 1', () => {
+    const io = new FakeIO();
+    const ids: PlayerId[] = ['p1', 'p2'];
+    const room = seasonRoom(io, ids, FULL_SEASON);
+    timeoutRound(io, room, ids);
+    toLobby(io, 'p1');
+    expect(seasonOf(io, 'p1').round).toBe(2);
+
+    // a full lobby, a season in progress, and a circuit already chosen: still
+    // nothing happens until somebody presses the button
+    vi.advanceTimersByTime((READY_SECONDS + COUNTDOWN_SECONDS) * 1000 + 10_000);
+    expect(io.lastSnap('p1').phase).toBe('lobby');
+    expect(io.lastSnap('p1').canStart).toBe(true);
+    expect(eventsOfKind(io, 'p1', 'go').length, 'exactly one GO so far: round 1').toBe(1);
+    expect(seasonOf(io, 'p1').round).toBe(2);
+
+    room.handleMessage('p2', { t: 'start' }); // any seated driver, mid-season too
+    advanceToPhase(io, 'p1', 'ready');
+    // and arming round 2 neither re-scored nor reset the table
+    expect(seasonOf(io, 'p1').round).toBe(2);
+    expect(seasonOf(io, 'p1').standings.length).toBe(ids.length);
+    room.stop();
+  });
+
+  it('the season walks its calendar: each round races the next circuit, and the last round has no next', () => {
+    const io = new FakeIO();
+    const ids: PlayerId[] = ['p1', 'p2'];
+    const ROUNDS = 3;
+    const room = seasonRoom(io, ids, { championship: true, rounds: ROUNDS });
+    // compared against the CALENDAR, never a literal id: this must hold with
+    // one circuit registered (every round the same track) and with eight
+    const calendar = buildCalendar(DEFAULT_TRACK_ID, ROUNDS);
+    expect(calendar.length).toBe(ROUNDS);
+
+    for (let r = 1; r <= ROUNDS; r++) {
+      const circuit = calendar[r - 1]!;
+      const lobby = seasonOf(io, 'p1');
+      expect(lobby.round).toBe(r);
+      expect(lobby.rounds).toBe(ROUNDS);
+      expect(lobby.over).toBe(false);
+      expect(lobby.trackId, `round ${r} is on the calendar's ${r}th circuit`).toBe(circuit);
+      expect(io.lastSnap('p1').trackId).toBe(circuit); // the wire agrees...
+      expect(room.trackId).toBe(circuit); // ...and so does the room itself
+      expect(lobby.nextTrackId, 'the final round has nothing after it').toBe(
+        r < ROUNDS ? calendar[r]! : null,
+      );
+      expect(room.info().label).toBe(`R${r}/${ROUNDS} · ${TRACKS[circuit].name}`);
+
+      timeoutRound(io, room, ids);
+      const scored = seasonOf(io, 'p1');
+      expect(scored.round, 'results still names the round just scored').toBe(r);
+      expect(scored.trackId).toBe(circuit);
+      expect(scored.over).toBe(r === ROUNDS);
+      toLobby(io, 'p1');
+    }
+
+    // the calendar is spent: the room rolls into a brand new season
+    const fresh = seasonOf(io, 'p1');
+    expect(fresh.round).toBe(1);
+    expect(fresh.rounds).toBe(ROUNDS);
+    expect(fresh.over).toBe(false);
+    room.stop();
+  });
+
+  it('the final round crowns the standings leader, then the room opens a fresh season with the same drivers', () => {
+    const io = new FakeIO();
+    const ids: PlayerId[] = ['p1', 'p2'];
+    const ROUNDS = 2;
+    const room = seasonRoom(io, ids, { championship: true, rounds: ROUNDS });
+
+    // ROUND 1 — driven for real, both karts home, so a genuine two-kart
+    // classification (P1 and P2) comes out of the sim rather than out of a fixture.
+    const r1 = startRound(io, room, ids);
+    drive(room, [r1[0]!], 200); // a head start: one pure-pursuit line, two karts
+    driveUntil(room, io, r1, () => io.lastSnap('p1').phase === 'results', 4200);
+    settle();
+    expect(eventsOfKind(io, 'p1', 'finish').length, 'both karts home in round 1').toBe(ids.length);
+    const midSeason = seasonOf(io, 'p1');
+    expect(midSeason.round).toBe(1);
+    expect(midSeason.over, 'a season is not over until its LAST round is scored').toBe(false);
+    expect(midSeason.championId).toBeNull();
+    toLobby(io, 'p1');
+
+    // ROUND 2 — a DIFFERENT circuit (the calendar moved), so only the leader is
+    // driven and the round is closed by RACE_TIMEOUT_S. What this test is about
+    // is the table, the champion and the tie-break; making it depend on a
+    // hand-rolled autopilot lapping all eight circuits two-abreast would couple
+    // a rules test to driving skill. p2 stays SEATED throughout and simply DNFs.
+    const r2 = startRound(io, room, ids, r1);
+    driveUntil(room, io, [r2[0]!], () => io.lastSnap('p1').you.finished, 3600);
+    expect(io.lastSnap('p1').phase, 'a kart is still out there, so the race runs on').toBe('racing');
+    runOutThePhase(io, 'p1'); // ...until the rest of RACE_TIMEOUT_S is spent
+    expect(io.lastSnap('p1').phase).toBe('results');
+    expect(seasonOf(io, 'p1').round).toBe(ROUNDS);
+
+    // Rebuild the whole championship from the finish events alone and demand the
+    // room agrees — table AND champion. Nothing here is hardcoded to a winner:
+    // the sim decides the races, the frozen comparator decides the order.
+    const finishes = eventsOfKind(io, 'p1', 'finish');
+    const expected = ids
+      .map((id, seq) => {
+        const places = finishes.filter((e) => e.playerId === id).map((e) => e.place);
+        return {
+          id,
+          points: places.reduce((sum, place) => sum + pointsForPlace(place), 0),
+          wins: places.filter((place) => place === 1).length,
+          bestFinish: places.length === 0 ? 0 : Math.min(...places),
+          seq,
+        };
+      })
+      .sort(compareSeason);
+
+    const final = seasonOf(io, 'p1');
+    expect(final.over, 'the last round of the calendar closes the season').toBe(true);
+    expect(final.championId).toBe(expected[0]!.id);
+    expect(final.championId).toBe(final.standings[0]!.id);
+    expect(final.standings.map((r) => r.id)).toEqual(expected.map((k) => k.id));
+    for (const k of expected) {
+      const row = rowOf(final, k.id);
+      expect(row.points, `${k.id} season total`).toBe(k.points);
+      expect(row.wins).toBe(k.wins);
+      expect(row.bestFinish).toBe(k.bestFinish);
+    }
+    // the table ACCUMULATED across the two rounds: the leader scored in both, so
+    // their total is more than any single race could possibly pay. A room that
+    // rebuilt the table each round could not produce this number.
+    expect(final.standings[0]!.points).toBeGreaterThan(pointsForPlace(1));
+    // ...while `delta` still names only the round that was just scored: the
+    // solo winner of round 2 took the win, the kart that sat it out took nothing
+    expect(rowOf(final, 'p1').delta).toBe(pointsForPlace(1));
+    expect(rowOf(final, 'p2').delta, 'a DNF in the final round adds nothing').toBe(0);
+
+    // ...and the next reset wipes the slate without emptying the room
+    toLobby(io, 'p1');
+    const fresh = seasonOf(io, 'p1');
+    expect(fresh.round).toBe(1);
+    expect(fresh.over).toBe(false);
+    expect(fresh.championId).toBeNull();
+    expect(fresh.standings.length).toBe(ids.length);
+    for (const row of fresh.standings) {
+      expect(row.points).toBe(0);
+      expect(row.delta).toBe(0);
+      expect(row.wins).toBe(0);
+      expect(row.bestFinish).toBe(0);
+      expect(row.here).toBe(true);
+      expect(row.joinedRound, 'a new season starts everyone on round 1').toBe(1);
+    }
+    expect(room.playerCount()).toBe(ids.length); // nobody was evicted by the reset
+    expect(io.lastSnap('p1').phase).toBe('lobby');
+    room.stop();
+  });
+
+  it('a mid-season joiner starts on zero, behind everyone they are level with, and moves nobody else', () => {
+    const io = new FakeIO();
+    const ids: PlayerId[] = ['p1', 'p2'];
+    const room = seasonRoom(io, ids, FULL_SEASON);
+    timeoutRound(io, room, ids); // a scoreless round, so the joiner ties everybody
+    toLobby(io, 'p1');
+
+    const before = seasonOf(io, 'p1');
+    expect(before.round).toBe(2);
+    room.addPlayer('p3', 'Driver3');
+    settle();
+
+    const after = seasonOf(io, 'p1');
+    const joiner = rowOf(after, 'p3');
+    expect(joiner.points).toBe(0);
+    expect(joiner.delta).toBe(0);
+    expect(joiner.wins).toBe(0);
+    expect(joiner.bestFinish).toBe(0);
+    expect(joiner.here).toBe(true);
+    expect(joiner.joinedRound, 'they walked in during the live round, not round 1').toBe(after.round);
+    // level on points, wins and bestFinish with both incumbents, so the ONLY
+    // rung left is join order — the newest driver must be last, not first
+    expect(joiner.pos).toBe(after.standings.length);
+    expect(after.standings[after.standings.length - 1]!.id).toBe('p3');
+    // ...and joining is not a re-score: the drivers already there are untouched,
+    // championship position included
+    expect(after.standings.slice(0, ids.length)).toEqual(before.standings);
+    room.stop();
+  });
+
+  it('a driver who leaves keeps the points they scored: the row stays, only `here` goes false', () => {
+    const io = new FakeIO();
+    const ids: PlayerId[] = ['p1', 'p2'];
+    const room = seasonRoom(io, ids, FULL_SEASON);
+    const drivers = startRound(io, room, ids);
+    sprintRound(io, room, drivers[0]!, 'p2'); // p1 wins the round outright
+
+    // an observer seats during results: the standings are a WIRE fact, so they
+    // have to outlive the driver who scored them, on somebody else's snapshot
+    room.addPlayer('obs', 'Observer');
+    settle();
+    const before = rowOf(seasonOf(io, 'obs'), 'p1');
+    expect(before.points).toBe(pointsForPlace(1));
+    expect(before.name).toBe('Driver1');
+    expect(before.here).toBe(true);
+
+    room.removePlayer('p1');
+    settle();
+    const after = rowOf(seasonOf(io, 'obs'), 'p1');
+    expect(after.here, 'the only thing leaving changes').toBe(false);
+    expect(after.points).toBe(before.points);
+    expect(after.delta).toBe(before.delta);
+    expect(after.wins).toBe(before.wins);
+    expect(after.bestFinish).toBe(before.bestFinish);
+    expect(after.joinedRound).toBe(before.joinedRound);
+    // the NAME survives too: a results screen reading "DRIVER — 25 pts" for the
+    // driver who just won the race is the placeholder leaking over a real name
+    expect(after.name).toBe(before.name);
+    expect(after.pos, 'still leading the championship they are no longer racing in').toBe(1);
+    expect(room.playerCount()).toBe(1);
+
+    // ...and coming BACK is not a second registration: the same id re-attaches
+    // to the same row rather than starting a duplicate one on zero
+    room.addPlayer('p1', 'Driver1');
+    settle();
+    const rejoined = seasonOf(io, 'obs');
+    expect(rejoined.standings.filter((r) => r.id === 'p1').length).toBe(1);
+    expect(rowOf(rejoined, 'p1').points).toBe(before.points);
+    expect(rowOf(rejoined, 'p1').here).toBe(true);
+    expect(rowOf(rejoined, 'p1').joinedRound).toBe(before.joinedRound);
+    room.stop();
+  });
+
+  it('a round that was abandoned rather than raced does not burn a slot of the calendar', () => {
+    const io = new FakeIO();
+    const ids: PlayerId[] = ['p1', 'p2'];
+    const room = seasonRoom(io, ids, FULL_SEASON);
+    startRound(io, room, ids); // lights out on round 1...
+    const circuit = room.trackId;
+
+    // ...and then the room empties mid-race: there is nobody left to race it,
+    // nobody to show results to, and NOTHING was scored
+    room.removePlayer('p1');
+    room.removePlayer('p2');
+    settle();
+
+    // a fresh pair walks in and finds round 1 still to be raced, on the circuit
+    // it was always going to be raced on — an abandoned race costs the season
+    // nothing, where a race that ran and paid nobody still costs it a round
+    room.addPlayer('p3', 'Driver3');
+    room.addPlayer('p4', 'Driver4');
+    settle();
+    expect(io.lastSnap('p3').phase).toBe('lobby');
+    const season = seasonOf(io, 'p3');
+    expect(season.round).toBe(1);
+    expect(season.trackId).toBe(circuit);
+    expect(room.trackId).toBe(circuit);
+    expect(season.over).toBe(false);
+    expect(rowOf(season, 'p3').joinedRound, 'they joined in round 1, because it never left').toBe(1);
+    room.stop();
+  });
+
+  it('a room booked with { championship: false } behaves exactly as it did before championships existed', () => {
+    const io = new FakeIO();
+    const ids: PlayerId[] = ['p1', 'p2'];
+    const room = new KartRoom(DEFAULT_TRACK_ID, 'public', io, {
+      championship: false,
+      rounds: DEFAULT_SEASON_ROUNDS, // accepted and ignored: there is no season
+    });
+    ids.forEach((id, i) => room.addPlayer(id, `Driver${i + 1}`));
+    room.start();
+    settle();
+    expect(io.lastSnap('p1').championship).toBeNull();
+    expect(room.info().label, 'the old label, not a round counter').toBe(
+      `3 laps · ${TRACKS[DEFAULT_TRACK_ID].name}`,
+    );
+
+    // the unchanged phase machine: manual start, lights, race, 10s of results,
+    // back to the lobby, and then a wait
+    room.handleMessage('p1', { t: 'start' });
+    advanceToPhase(io, 'p1', 'ready');
+    advanceToPhase(io, 'p1', 'countdown');
+    advanceToPhase(io, 'p1', 'racing');
+    vi.advanceTimersByTime(RACE_TIMEOUT_S * 1000 + SNAP_STEP_MS);
+    expect(io.lastSnap('p1').phase).toBe('results');
+    vi.advanceTimersByTime(RESULTS_SECONDS * 1000 - 3000);
+    expect(io.lastSnap('p1').phase, 'results still last the full 10s').toBe('results');
+    vi.advanceTimersByTime(4000);
+    expect(io.lastSnap('p1').phase).toBe('lobby');
+    expect(room.playerCount()).toBe(ids.length);
+    vi.advanceTimersByTime((READY_SECONDS + COUNTDOWN_SECONDS) * 1000 + 5000);
+    expect(io.lastSnap('p1').phase, 'and it still never re-arms itself').toBe('lobby');
+    expect(io.lastSnap('p1').canStart).toBe(true);
+
+    // the circuit never moved, the label never learned to count rounds, and NO
+    // snapshot in the room's whole life carried a season
+    expect(room.trackId).toBe(DEFAULT_TRACK_ID);
+    expect(room.info().label).toBe(`3 laps · ${TRACKS[DEFAULT_TRACK_ID].name}`);
+    expect(io.snaps('p1').length).toBeGreaterThan(SNAPSHOT_HZ);
+    expect(io.snaps('p1').every((s) => s.championship === null)).toBe(true);
+    expect(io.snaps('p1').every((s) => s.trackId === DEFAULT_TRACK_ID)).toBe(true);
+    room.stop();
+  });
+});
+
+

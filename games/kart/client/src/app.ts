@@ -47,7 +47,9 @@ import type {
   KartPlayerInfo,
   KartPlayerSnap,
   KartS2C,
+  KartSeason,
   KartSim,
+  KartStandingRow,
   KartState,
   KartYou,
   RaceEvent,
@@ -196,6 +198,55 @@ function parsePlayerSnap(v: unknown): KartPlayerSnap | null {
   };
 }
 
+/** One championship line. All-or-nothing per ROW (a half-parsed row would put a
+ *  driver on the table with a phantom points total), but a bad row drops alone —
+ *  see parseSeason. */
+function parseStandingRow(v: unknown): KartStandingRow | null {
+  if (!isObj(v) || !str(v.id) || !str(v.name)) return null;
+  if (!num(v.pos) || !num(v.points) || !num(v.delta) || !num(v.wins)) return null;
+  if (!num(v.bestFinish) || !bool(v.here) || !num(v.joinedRound)) return null;
+  return {
+    id: v.id,
+    name: v.name,
+    pos: v.pos,
+    points: v.points,
+    delta: v.delta,
+    wins: v.wins,
+    bestFinish: v.bestFinish,
+    here: v.here,
+    joinedRound: v.joinedRound,
+  };
+}
+
+/**
+ * The room's season block. `null` is a LEGITIMATE wire value (a room booked
+ * `{championship:false}`), so malformed input degrades to exactly that rather
+ * than failing the frame: the race must keep rendering at SNAPSHOT_HZ even if
+ * the championship did not survive the wire. Standings arrive pre-sorted by
+ * `pos` and are kept in wire order — the tie-break is the server's to own.
+ */
+function parseSeason(raw: unknown): KartSeason | null {
+  if (!isObj(raw)) return null;
+  if (!num(raw.round) || !num(raw.rounds) || !bool(raw.over)) return null;
+  if (!isTrackId(raw.trackId)) return null; // an unknown circuit has no display name
+  if (!Array.isArray(raw.standings)) return null;
+  const standings: KartStandingRow[] = [];
+  for (const r of raw.standings) {
+    const row = parseStandingRow(r);
+    if (row !== null) standings.push(row); // one bad row ≠ a lost table
+  }
+  return {
+    round: raw.round,
+    rounds: raw.rounds,
+    trackId: raw.trackId,
+    // null on the final round; anything unrecognised is treated as "no next"
+    nextTrackId: isTrackId(raw.nextTrackId) ? raw.nextTrackId : null,
+    over: raw.over,
+    championId: str(raw.championId) ? raw.championId : null,
+    standings,
+  };
+}
+
 function parseRaceEvent(v: unknown): RaceEvent | null {
   if (!isObj(v) || !str(v.kind)) return null;
   switch (v.kind) {
@@ -301,6 +352,9 @@ function parseS2C(raw: unknown): S2C | null {
         playerCount: num(raw.playerCount) ? raw.playerCount : players.length,
         minPlayers: num(raw.minPlayers) ? raw.minPlayers : MIN_PLAYERS,
         canStart: raw.canStart === true,
+        // additive like the lobby block: an older server (or one still shipping
+        // the championship) simply yields null and the screens stay as they were
+        championship: parseSeason(raw.championship),
         you,
         players,
       };
@@ -331,7 +385,7 @@ interface KartDebugState {
   pos: { x: number; y: number; z: number };
   speed: number; // signed forward speed, m/s
   gear: number; // 1-based automatic gearbox gear (index into the contract GEARS)
-  players: number; // karts in the room (snapshot count)
+  players: number; // karts the client KNOWS are seated (roster/server count, not snapshot-only)
   nitroLeft: number; // charges left this race (you.nitroLeft, server-authoritative)
   gapAheadMs: number; // ms behind the player one place ahead; 0 for the leader
   frozen: boolean; // drive sim frozen (pre-GO freeze: every phase but 'racing')
@@ -388,6 +442,13 @@ interface KartTelemetry {
   gapAheadMs: number; // ms behind the player one place ahead; 0 for the leader
   frozen: boolean; // drive sim frozen (pre-GO freeze: every phase but 'racing')
   assist: boolean; // KIDS MODE auto-steer active (drive.setAssist)
+  /**
+   * Where the room is in its season, plus OUR line in it — so the screenshot
+   * harness can assert WHICH championship screen it is shooting instead of
+   * reading pixels. `null` on a championship-disabled room (and before the
+   * first snapshot); points/pos are 0 while we have no standings row yet.
+   */
+  season: { round: number; rounds: number; points: number; pos: number; over: boolean } | null;
 }
 
 interface KartApi {
@@ -622,6 +683,10 @@ export class KartApp {
   private seatedCount = 0; // players seated in the room (snapshot playerCount)
   private minPlayers = MIN_PLAYERS; // the room's minimum (snapshot minPlayers)
   private canStart = false; // a {t:'start'} would be accepted right now
+  // ---- championship contract (mirrored on every snapshot; null = disabled room) ----
+  // Held raw and rendered from, never mutated: `standings` is the server's
+  // sorted table and re-sorting it here would silently re-litigate the tie-break.
+  private season: KartSeason | null = null;
   private readonly players = new Map<string, KartPlayerSnap>(); // latest snapshot per id
   private readonly roster = new Map<string, KartPlayerInfo>(); // names/colors/slots per id
   private readonly bestLaps = new Map<string, number>(); // from 'lap' race events (results table)
@@ -718,6 +783,9 @@ export class KartApp {
   private readonly gateEl: HTMLDivElement;
   private readonly gateLabelEl: HTMLDivElement;
   private readonly lobbyEl: HTMLDivElement;
+  private readonly lobbySeasonEl: HTMLDivElement; // championship placard (hidden when disabled)
+  private readonly lobbyRoundEl: HTMLDivElement; // 'ROUND 3 OF 8 · RIVERSIDE'
+  private readonly lobbySeasonNoteEl: HTMLDivElement; // our own standing, in words
   private readonly lobbyPlayersEl: HTMLDivElement;
   private readonly lobbyStatusEl: HTMLDivElement;
   private readonly startBtn: HTMLButtonElement; // explicit race start (no auto-start)
@@ -729,7 +797,16 @@ export class KartApp {
   private readonly copyBtn: HTMLButtonElement;
   private copiedTimer = 0; // 'COPIED' feedback reset handle
   private readonly resultsEl: HTMLDivElement;
+  private readonly resultsPanelEl: HTMLDivElement; // carries 'season-final' at season end
   private readonly resultsBodyEl: HTMLTableSectionElement;
+  // ---- championship block inside the results panel (hidden when disabled) ----
+  private readonly standingsEl: HTMLDivElement;
+  private readonly standingsTitleEl: HTMLDivElement;
+  private readonly standingsBodyEl: HTMLTableSectionElement;
+  private readonly standingsNextEl: HTMLDivElement; // 'NEXT ROUND · CLIFFSIDE'
+  private readonly championEl: HTMLDivElement; // trophy banner, only when season.over
+  private readonly championNameEl: HTMLDivElement;
+  private readonly championStatEl: HTMLDivElement;
   private readonly resultsNoteEl: HTMLDivElement;
 
   constructor(root: HTMLElement) {
@@ -906,6 +983,16 @@ export class KartApp {
     this.lobbyEl = el('div', 'lobby-overlay hidden');
     const lobbyPanel = el('div', 'lobby-panel');
     lobbyPanel.appendChild(el('div', 'lobby-title', 'GRID'));
+    // Championship placard, directly under the title: a joiner has to be able to
+    // read what they walked into (which round, which circuit, where THEY stand)
+    // before they read the grid. Whole block hides on a championship-disabled
+    // room, so that lobby is pixel-identical to the pre-championship one.
+    this.lobbySeasonEl = el('div', 'lobby-season hidden');
+    this.lobbyRoundEl = el('div', 'lobby-round', '');
+    this.lobbySeasonEl.appendChild(this.lobbyRoundEl);
+    this.lobbySeasonNoteEl = el('div', 'lobby-season-note', '');
+    this.lobbySeasonEl.appendChild(this.lobbySeasonNoteEl);
+    lobbyPanel.appendChild(this.lobbySeasonEl);
     this.lobbyPlayersEl = el('div', 'lobby-players');
     lobbyPanel.appendChild(this.lobbyPlayersEl);
     this.lobbyStatusEl = el('div', 'lobby-status', '');
@@ -959,6 +1046,7 @@ export class KartApp {
     // results overlay: place / name / time / best lap, auto-return note
     this.resultsEl = el('div', 'results-overlay hidden');
     const resultsPanel = el('div', 'results-panel');
+    this.resultsPanelEl = resultsPanel;
     resultsPanel.appendChild(el('div', 'results-title', 'RESULTS'));
     const table = el('table', 'results-table');
     const thead = el('thead');
@@ -969,6 +1057,40 @@ export class KartApp {
     this.resultsBodyEl = el('tbody');
     table.appendChild(this.resultsBodyEl);
     resultsPanel.appendChild(table);
+
+    // Championship block: the race you just ran, then the season it belongs to.
+    // Built once here and refilled in buildStandings(); `hidden` (and therefore
+    // zero-height) on a championship-disabled room. Order is deliberate — the
+    // trophy banner outranks the table it summarises, so it sits above it.
+    this.standingsEl = el('div', 'results-standings hidden');
+    this.championEl = el('div', 'champion-banner hidden');
+    this.championEl.appendChild(el('div', 'champion-label', 'WORLD CHAMPION'));
+    this.championNameEl = el('div', 'champion-name', '');
+    this.championEl.appendChild(this.championNameEl);
+    this.championStatEl = el('div', 'champion-stat', '');
+    this.championEl.appendChild(this.championStatEl);
+    this.standingsEl.appendChild(this.championEl);
+    this.standingsTitleEl = el('div', 'standings-title', '');
+    this.standingsEl.appendChild(this.standingsTitleEl);
+    // the table lives in its own scroll box: 8 drivers fit at 720p, a 20-kart
+    // season caps here instead of pushing the auto-return note off the panel
+    const standingsScroll = el('div', 'standings-scroll');
+    const standingsTable = el('table', 'standings-table');
+    const standingsHead = el('thead');
+    const standingsHeadRow = el('tr');
+    for (const h of ['POS', 'DRIVER', 'PTS', '+']) {
+      standingsHeadRow.appendChild(el('th', undefined, h));
+    }
+    standingsHead.appendChild(standingsHeadRow);
+    standingsTable.appendChild(standingsHead);
+    this.standingsBodyEl = el('tbody');
+    standingsTable.appendChild(this.standingsBodyEl);
+    standingsScroll.appendChild(standingsTable);
+    this.standingsEl.appendChild(standingsScroll);
+    this.standingsNextEl = el('div', 'standings-next', '');
+    this.standingsEl.appendChild(this.standingsNextEl);
+    resultsPanel.appendChild(this.standingsEl);
+
     this.resultsNoteEl = el('div', 'results-note', '');
     resultsPanel.appendChild(this.resultsNoteEl);
     this.resultsEl.appendChild(resultsPanel);
@@ -1291,6 +1413,7 @@ export class KartApp {
     this.seatedCount = 0;
     this.minPlayers = MIN_PLAYERS;
     this.canStart = false;
+    this.season = null; // the season belongs to the ROOM — carrying it out would lie
     this.players.clear();
     this.roster.clear();
     this.buffers.clear();
@@ -1344,6 +1467,7 @@ export class KartApp {
     this.seatedCount = snap.playerCount; // lobby contract: server truth, not a DOM count
     this.minPlayers = snap.minPlayers;
     this.canStart = snap.canStart;
+    this.season = snap.championship; // null on a disabled room, or on a bad block
     if (snap.phase !== prevPhase) this.onPhaseChange(prevPhase, snap.phase);
 
     // AUTHORITATIVE OWN STATE — exactly once per snapshot, from the `you` block
@@ -1794,6 +1918,36 @@ export class KartApp {
     }
     this.startBtn.classList.toggle('hidden', phase !== 'lobby');
 
+    // Championship placard. Written unconditionally (not per-phase) because the
+    // lobby overlay is up in BOTH 'lobby' and 'ready' and the placard must read
+    // the same in each; the overlay's own hidden flag handles every other phase.
+    // Text only — the layout is style.css's (VISUAL_UPGRADE.md §9).
+    const season = this.season;
+    this.lobbySeasonEl.classList.toggle('hidden', season === null);
+    if (season !== null) {
+      this.lobbyRoundEl.textContent = `ROUND ${season.round} OF ${season.rounds} · ${TRACKS[
+        season.trackId
+      ].name.toUpperCase()}`;
+      const mine = this.standingOf(this.playerId, season);
+      // "New here" is `joinedRound`, NOT zero points — the two look identical on
+      // the table and mean opposite things. An incumbent who DNF'd round 1 is on
+      // 0 pts and must be told exactly that ("YOU: 0 PTS · P3 OF 3"): a zero he
+      // earned is information, and greeting him as a newcomer erases his round.
+      // Only a driver with no row at all, or one whose first round IS this one,
+      // gets the welcome — and only once the season is actually underway.
+      const arrivedNow = season.round > 1 && (mine === null || mine.joinedRound === season.round);
+      let note: string;
+      if (arrivedNow) {
+        note = 'YOU JOIN ON 0 PTS — SEASON ALREADY UNDERWAY';
+      } else if (mine === null || (season.round === 1 && mine.points <= 0)) {
+        // round 1: nobody has scored yet, so a standing line would be noise
+        note = 'EVERY DRIVER STARTS ON 0 PTS';
+      } else {
+        note = `YOU: ${mine.points} PTS · P${mine.pos} OF ${season.standings.length}`;
+      }
+      this.lobbySeasonNoteEl.textContent = note;
+    }
+
     // results auto-return note (the server sends the room back to 'lobby')
     if (phase === 'results') {
       this.resultsNoteEl.textContent =
@@ -2122,6 +2276,75 @@ export class KartApp {
       tr.appendChild(el('td', 'result-best', fmtMs(best)));
       this.resultsBodyEl.appendChild(tr);
     }
+    this.buildStandings();
+  }
+
+  /** A driver's championship line, or null (no season / no id / never seated). */
+  private standingOf(id: string | null, season: KartSeason): KartStandingRow | null {
+    if (id === null) return null;
+    return season.standings.find((r) => r.id === id) ?? null;
+  }
+
+  /**
+   * The season table under the race result. Rebuilt whole per snapshot, matching
+   * the results table's replaceChildren budget above it: 'results' is a paused
+   * screen and the row count is the season's driver list, not a per-frame
+   * stream, so this is a handful of nodes a few times a second.
+   */
+  private buildStandings(): void {
+    const season = this.season;
+    this.standingsEl.classList.toggle('hidden', season === null);
+    // two separate markers: 'has-standings' buys the season table its vertical
+    // room on EVERY championship screen (a disabled room never gets it, so that
+    // panel is unchanged); 'season-final' is the finale's own dressing.
+    this.resultsPanelEl.classList.toggle('has-standings', season !== null);
+    this.resultsPanelEl.classList.toggle('season-final', season !== null && season.over);
+    if (season === null) {
+      this.standingsBodyEl.replaceChildren(); // drop stale rows with the season
+      this.championEl.classList.add('hidden');
+      return;
+    }
+
+    this.standingsTitleEl.textContent = season.over
+      ? 'FINAL CHAMPIONSHIP STANDINGS'
+      : `CHAMPIONSHIP · AFTER ROUND ${season.round} OF ${season.rounds}`;
+
+    // The trophy, only once the final round is scored — and only when the named
+    // champion actually has a row. A championId with no standings line is a wire
+    // mismatch, and an empty banner is worse than no banner.
+    const champ = season.over ? this.standingOf(season.championId, season) : null;
+    this.championEl.classList.toggle('hidden', champ === null);
+    if (champ !== null) {
+      this.championNameEl.textContent = champ.name;
+      this.championStatEl.textContent = `${champ.points} PTS · ${champ.wins} WIN${
+        champ.wins === 1 ? '' : 'S'
+      }`;
+    }
+
+    this.standingsBodyEl.replaceChildren();
+    for (const row of season.standings) {
+      // wire order IS championship order (points, then the server's tie-break) —
+      // sorting here would quietly re-decide who is second
+      const tr = el('tr');
+      if (row.id === this.playerId) tr.classList.add('you', 'standing-row-you');
+      if (champ !== null && row.id === champ.id) tr.classList.add('standing-row-champion');
+      if (!row.here) tr.classList.add('standing-row-gone'); // left the room, kept the points
+      tr.appendChild(el('td', 'standing-pos', `P${row.pos}`));
+      tr.appendChild(el('td', 'standing-name', row.name));
+      tr.appendChild(el('td', 'standing-pts', String(row.points)));
+      // a scoreless round must read as NOTHING; '+0' reads as a bug
+      const scored = row.delta > 0;
+      const delta = el('td', 'standing-delta', scored ? `+${row.delta}` : '—');
+      if (scored) delta.classList.add('standing-delta-up');
+      tr.appendChild(delta);
+      this.standingsBodyEl.appendChild(tr);
+    }
+
+    const next = season.nextTrackId;
+    this.standingsNextEl.classList.toggle('hidden', next === null); // nothing follows the finale
+    if (next !== null) {
+      this.standingsNextEl.textContent = `NEXT ROUND · ${TRACKS[next].name.toUpperCase()}`;
+    }
   }
 
   // ---- invite chip (private rooms) ---------------------------------------------------
@@ -2187,7 +2410,14 @@ export class KartApp {
       pos: { x: s.x, y: s.y, z: s.z },
       speed: forwardSpeed(s),
       gear: s.gear,
-      players: this.players.size,
+      // What the client KNOWS is seated, not what the last snapshot carried:
+      // kart_joined fills the roster immediately, but the first snapshot can be
+      // ~1s behind it (the joiner blocks on the track-mesh build, then every
+      // queued snapshot flushes at once). Reading `players` alone reported 0 for
+      // that whole window while the lobby chips were already on screen. Same
+      // idiom as the lobby status line, and all three sources are cleared by
+      // resetRoom(), so a leave drops this straight back to 0.
+      players: Math.max(this.players.size, this.roster.size, this.seatedCount),
       nitroLeft: you?.nitroLeft ?? NITRO_CHARGES,
       gapAheadMs: you?.gapAheadMs ?? 0,
       frozen: this.phase !== 'racing',
@@ -2259,6 +2489,21 @@ export class KartApp {
       gapAheadMs: this.you?.gapAheadMs ?? 0,
       frozen: this.phase !== 'racing',
       assist: this.assist,
+      season: this.seasonTelemetry(),
+    };
+  }
+
+  /** Debug-only projection of the season + our line in it (null = disabled room). */
+  private seasonTelemetry(): KartTelemetry['season'] {
+    const season = this.season;
+    if (season === null) return null;
+    const mine = this.standingOf(this.playerId, season);
+    return {
+      round: season.round,
+      rounds: season.rounds,
+      points: mine?.points ?? 0, // 0, not -1: no row means no points, which is a real answer
+      pos: mine?.pos ?? 0, // 0 = "not on the table" (positions are 1-based)
+      over: season.over,
     };
   }
 }

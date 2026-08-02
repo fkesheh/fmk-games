@@ -11,12 +11,41 @@
 // add a track that is live on the wire but never validated (the test suite
 // iterates TRACK_LIST/TRACKS). A track that fails validateTrack() fails the
 // shared test suite.
+//
+// CALENDAR ORDER (the order below IS the order a championship runs, because
+// TRACK_LIST is Object.values of this literal): the eight circuits are laid out
+// so no two neighbours drive alike — a short sprint never follows a short
+// sprint, and the two longest are split across the calendar.
+//   greenvale  598 m  all-round parkland, the home circuit
+//   copper     395 m  the sprint: shortest lap, constant traffic
+//   thunder    745 m  a 177 m straight into a 12 m hairpin
+//   lantern    518 m  twenty corners, one straight — the drift circuit
+//   cobalt     703 m  sweepers only, barely a braking point
+//   switchback 803 m  decreasing-radius corners that punish greed
+//   crown      660 m  double apex, increasing-radius sweep, chicane
+//   highland   891 m  the endurance lap
+// tracks.test.ts gates the spread: no two laps within 5 % of each other, and a
+// better than 2x range from the shortest circuit to the longest.
 // ============================================================================
 import type { TrackId, TrackSource } from '../track.js';
+import { cobalt } from './cobalt.js';
+import { copper } from './copper.js';
+import { crown } from './crown.js';
 import { greenvale } from './greenvale.js';
+import { highland } from './highland.js';
+import { lantern } from './lantern.js';
+import { switchback } from './switchback.js';
+import { thunder } from './thunder.js';
 
 export const TRACKS: Record<TrackId, TrackSource> = {
   greenvale,
+  copper,
+  thunder,
+  lantern,
+  cobalt,
+  switchback,
+  crown,
+  highland,
 };
 
 /**
@@ -42,4 +71,12 @@ export function trackSource(id: TrackId): TrackSource {
   return TRACKS[id];
 }
 
+export * from './palette.js';
+export * from './cobalt.js';
+export * from './copper.js';
+export * from './crown.js';
 export * from './greenvale.js';
+export * from './highland.js';
+export * from './lantern.js';
+export * from './switchback.js';
+export * from './thunder.js';

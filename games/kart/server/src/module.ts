@@ -1,5 +1,4 @@
-import { DEFAULT_TRACK_ID, isTrackId, MIN_PLAYERS, MAX_PLAYERS } from '@kart/shared';
-import type { TrackId } from '@kart/shared';
+import { MIN_PLAYERS, MAX_PLAYERS, parseKartRoomSettings } from '@kart/shared';
 // ============================================================================
 // KART GameModule — the KART GP plug into the platform registry (the ONLY
 // kart-server file that imports @platform/shared). Owns the clientDist probe
@@ -39,18 +38,6 @@ function resolveClientDist(): string {
   return dev;
 }
 
-/**
- * settings.trackId (opaque to the platform) must be a valid TrackId; absent
- * (quick_join) => DEFAULT_TRACK_ID. Invalid => throw; the lobby forwards the
- * message as 'bad_settings'. Mirrors fps's mapIdFrom (games/fps/server/src/module.ts).
- */
-function trackIdFrom(settings: Record<string, unknown> | undefined): TrackId {
-  const raw = settings?.['trackId'];
-  if (raw === undefined) return DEFAULT_TRACK_ID;
-  if (!isTrackId(raw)) throw new Error('unknown track');
-  return raw;
-}
-
 export const kartModule: GameModule = {
   id: 'kart',
   name: 'KART GP',
@@ -61,7 +48,12 @@ export const kartModule: GameModule = {
   minPlayers: MIN_PLAYERS,
   maxPlayers: MAX_PLAYERS,
   createRoom(opts): GameRoomHandle {
-    const trackId = trackIdFrom(opts.settings);
-    return new KartRoom(trackId, opts.visibility, opts.io);
+    // Settings are opaque to the platform; the game validates them and THROWS
+    // on bad input, which the lobby forwards as `bad_settings`. Parsing lives in
+    // @kart/shared so the room, the tests and this plug cannot drift apart —
+    // `trackId` alone used to be parsed here, which left `championship`/`rounds`
+    // unreachable in production even though the room supported them.
+    const { trackId, season } = parseKartRoomSettings(opts.settings);
+    return new KartRoom(trackId, opts.visibility, opts.io, season);
   },
 };

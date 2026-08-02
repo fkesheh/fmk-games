@@ -42,11 +42,28 @@
 // start/finish line (gate 0) is the LAST credit of every lap: 8 credits per
 // lap, finish at exactly LAPS_TO_WIN * GATES. `progress` is the monotonic
 // credit count (KART.md "progress = lap×GATES + nextGateIndex", 0-based lap).
+//
+// CHAMPIONSHIP (additive, per-room-session): a room IS an F1 season. It races
+// `season.rounds` circuits off a calendar built by walking the track registry
+// from its own starting circuit WITH WRAPAROUND — which is also the answer to
+// "what if the season is longer than the registry": with one circuit registered
+// an 8-round season is 8 races at that circuit, and a room that books FEWER
+// rounds than the registry holds simply races the first `rounds` of the
+// rotation (the rest is not "missing", the season is just shorter). Each round
+// is scored on the way INTO 'results' (25-18-15-...-1; a DNF is not in
+// finishOrder, so it scores 0 with no special case), the circuit advances on
+// the way BACK to the lobby, and the final round crowns a champion and rolls
+// into a fresh season. Points are per-room and die with it — nothing here
+// persists. A room booked `{ championship: false }` behaves EXACTLY as it did
+// before any of this existed: one fixed circuit, `championship: null` on the
+// wire, the old lobby label.
 // ============================================================================
 import {
   BUMP_COOLDOWN_MS,
   BUMP_MIN_SPEED,
+  CHAMPIONSHIP_DEFAULT,
   COUNTDOWN_SECONDS,
+  DEFAULT_SEASON_ROUNDS,
   GATE_RADIUS,
   GATES,
   INPUT_QUEUE_CAP,
@@ -61,14 +78,18 @@ import {
   READY_SECONDS,
   RESULTS_SECONDS,
   RACE_TIMEOUT_S,
+  SEASON_STANDINGS_CAP,
   SIM_BUDGET_MUL,
   SIM_HZ,
   SNAPSHOT_HZ,
+  buildCalendar,
   buildTrack,
   clampToBarrier,
+  compareSeason,
   gridSlot,
   makeSim,
   parseKartC2S,
+  pointsForPlace,
   resetSim,
   resolveKartPair,
   stepDrive,
@@ -80,7 +101,10 @@ import type {
   KartPlayerInfo,
   KartPlayerSnap,
   KartS2C,
+  KartSeason,
+  KartSeasonSettings,
   KartSim,
+  KartStandingRow,
   KartYou,
   RaceEvent,
   TrackDef,
@@ -158,14 +182,46 @@ interface Player {
   msg: SnapshotMsg;
 }
 
+/**
+ * One driver's championship record — the SERVER side of a KartStandingRow.
+ *
+ * It is deliberately NOT keyed off the Player map: a driver who disconnects
+ * keeps their points (as in F1), so the entry outlives the seat. `seq` is the
+ * unique 0-based order of first appearance THIS season and is what makes
+ * compareSeason a TOTAL order (see the tie-break note on rebuildStandings).
+ */
+interface SeasonEntry {
+  id: PlayerId;
+  name: string; // last known display name; refreshed whenever the driver is seen
+  points: number; // season total
+  delta: number; // points from the most recently SCORED round (the "+18")
+  wins: number; // first countback rung
+  bestFinish: number; // lowest finishing place; 0 = has never finished
+  joinedRound: number; // 1-based round of first appearance
+  seq: number; // unique join order this season; the final tie-break
+}
+
 export class KartRoom implements GameRoomHandle {
   readonly id: RoomId;
   readonly code: string | null;
   readonly visibility: Visibility;
-  readonly trackId: TrackId; // this room's circuit; never changes after construction
+
+  /**
+   * The LIVE circuit. It used to be a fixed field — a room raced one track for
+   * its whole life — but a championship changes circuit between rounds, so this
+   * is now a getter over the mutable `track`. Everything that reads a room's
+   * circuit (lobby list, joins, snapshots) therefore follows the calendar for
+   * free instead of reporting the track the room happened to be built with.
+   */
+  get trackId(): TrackId {
+    return this.track.id;
+  }
 
   private readonly io: RoomIO;
-  private readonly track: TrackDef; // shared TrackDef: gate positions for credit checks
+  // MUTABLE now (was readonly): resetToLobby swaps it for the next round's
+  // circuit. Everything positional — gridSlot, gate credit, barrier clamp —
+  // reads it live, which is why the swap happens BEFORE the grid reset.
+  private track: TrackDef; // shared TrackDef: gate positions for credit checks
   private readonly players = new Map<PlayerId, Player>(); // insertion order = join order
   // The ONE per-tick roster array, shared by every recipient's snapshot (see
   // buildSnapPlayers). Rebuilt in place each tick; never reallocated.
@@ -182,16 +238,83 @@ export class KartRoom implements GameRoomHandle {
   private countdownEndsAt = 0; // serverTime ms of the next countdown beat / GO
   private raceStartAt = 0; // serverTime ms of GO
   private raceEndsAt = 0; // serverTime ms; hard cap (RACE_TIMEOUT_S after GO)
-  private finishOrder: PlayerId[] = []; // finish sequence; kept even for disconnects
+  // Finish sequence; kept even for disconnects, and never reassigned (it is
+  // emptied in place). It is the round's CLASSIFICATION — championship points
+  // are read straight off it — so it may never contain an id twice.
+  private readonly finishOrder: PlayerId[] = [];
   private simTimer: ReturnType<typeof setInterval> | null = null;
   private snapTimer: ReturnType<typeof setInterval> | null = null;
   private stopped = false;
 
-  constructor(trackId: TrackId, visibility: Visibility, io: RoomIO) {
+  // -------------------------------------------------------------------------
+  // CHAMPIONSHIP (per-room-session; nothing is persisted anywhere — the season
+  // lives on this object and dies with it). A room IS a season: it races
+  // `season.rounds` circuits off `calendar`, scores each one on the way into
+  // 'results', crowns a champion on the final round and then starts a fresh
+  // season on the way back to the lobby.
+  // -------------------------------------------------------------------------
+  private readonly season: KartSeasonSettings;
+  // The track the season ALWAYS restarts from — not `track`, which moves with
+  // the calendar. Without it, season 2 would start wherever season 1 ended and
+  // the rotation would drift one circuit per season.
+  private readonly baseTrackId: TrackId;
+  private calendar: TrackId[] = []; // empty on a championship-disabled room
+  private round = 1; // 1-based; during 'results' it is the round just SCORED
+  private seasonOver = false; // final round scored: standings final, champion crowned
+  // Double-award guard. enterResults is reachable from three places (the last
+  // gate credit, the last racer leaving, the race timeout) and two of them can
+  // fire in the same tick — scoring is idempotent per round, not per call.
+  private scoredRound = 0;
+  private championId: PlayerId | null = null;
+  private readonly entries = new Map<PlayerId, SeasonEntry>();
+  private seasonSeq = 0; // next SeasonEntry.seq; reset only by startNewSeason
+  private standingsDirty = true;
+  // POOLED standings rows. The wire object below binds `.standings` to this
+  // array ONCE, so a snapshot costs zero allocations even though the table is
+  // mirrored on every tick (same discipline as snapPlayers / snap / you / msg).
+  private readonly standingRows: KartStandingRow[] = [];
+  // Scratch for the sort in rebuildStandings — refilled in place, never
+  // reallocated, so a churny room does not allocate one array per rebuild.
+  private readonly sortScratch: SeasonEntry[] = [];
+  // The ONE KartSeason object every snapshot points at, allocated once here.
+  // `null` on a championship-disabled room, which is exactly the wire value
+  // that tells a client to render nothing extra.
+  private readonly seasonWire: KartSeason | null;
+
+  constructor(
+    trackId: TrackId,
+    visibility: Visibility,
+    io: RoomIO,
+    // Optional with a full default so the 3-arg call site in module.ts keeps
+    // compiling AND every room still gets a season (championship on by default).
+    season: KartSeasonSettings = { championship: CHAMPIONSHIP_DEFAULT, rounds: DEFAULT_SEASON_ROUNDS },
+  ) {
     this.visibility = visibility;
     this.io = io;
-    this.track = buildTrack(TRACKS[trackId]); // deterministic: same gates the client renders
-    this.trackId = this.track.id;
+    this.season = season;
+    this.baseTrackId = trackId;
+    // The season's opening circuit is calendar[0], which buildCalendar anchors
+    // at `trackId` — so it IS `trackId` — but going through the calendar means
+    // round 1 and round n are produced by the same rule.
+    let first: TrackId = trackId;
+    if (season.championship) {
+      this.calendar = buildCalendar(trackId, season.rounds);
+      this.round = 1;
+      first = this.calendar[0] ?? trackId;
+    }
+    this.track = buildTrack(TRACKS[first]); // deterministic: same gates the client renders
+    this.seasonWire = season.championship
+      ? {
+          round: 1,
+          rounds: season.rounds,
+          trackId: this.track.id,
+          // null on a one-round season: there is no round 2 to name.
+          nextTrackId: this.calendar[1] ?? null,
+          over: false,
+          championId: null,
+          standings: this.standingRows, // bound ONCE; refilled in place forever after
+        }
+      : null;
     // server-side generation (room id, private code) uses rng(Date.now())
     const next = rng((Date.now() ^ (roomSeq++ * 0x9e3779b9)) >>> 0);
     this.id = randomToken(next, 8);
@@ -203,7 +326,12 @@ export class KartRoom implements GameRoomHandle {
       id: this.id,
       code: this.code,
       game: 'kart',
-      label: `3 laps · ${this.track.name}`,
+      // A championship room advertises WHERE IN THE SEASON it is, because that
+      // is what a browser needs to decide whether to join ("R7/8" is nearly
+      // over); a plain room keeps the old lap-count label verbatim.
+      label: this.season.championship
+        ? `R${this.round}/${this.season.rounds} · ${this.track.name}`
+        : `3 laps · ${this.track.name}`,
       players: this.playerCount(),
       maxPlayers: MAX_PLAYERS,
       phase: this.phase,
@@ -246,6 +374,12 @@ export class KartRoom implements GameRoomHandle {
       // room leaves 'lobby' only on an explicit `{t:'start'}` from a seated
       // player (tryStart) — joining never begins a race.
       const p = this.players.get(id)!;
+      // Championship registration happens AFTER the seat exists, so a joiner
+      // who was bounced for room_full above never lands in the standings. A
+      // mid-season arrival starts on zero with joinedRound = the current round;
+      // they cannot touch anybody else's row.
+      this.ensureEntry(p);
+      this.standingsDirty = true; // `here` flips, and a re-add may have renamed them
       this.io.send(id, this.joinedFor(p));
     } catch (err) {
       console.error('[kart] addPlayer failed', err);
@@ -259,6 +393,9 @@ export class KartRoom implements GameRoomHandle {
   removePlayer(id: PlayerId, _permanent?: boolean): void {
     try {
       if (!this.players.delete(id)) return;
+      // The row SURVIVES the seat (F1: you keep the points you scored), it just
+      // stops being `here`. Eviction of departed rows is the standings cap's job.
+      this.standingsDirty = true;
       const now = Date.now();
       const n = this.playerCount();
       if (n === 0 && this.phase !== 'lobby') {
@@ -551,6 +688,10 @@ export class KartRoom implements GameRoomHandle {
       p.nitroLeft = NITRO_CHARGES; // per-race charges refill at GO
       p.nitroUntil = 0;
       p.lapStartAt = now;
+      // Everyone on the grid is in the championship BEFORE a wheel turns, so a
+      // driver who DNFs this round still shows up in the table on 0 — the
+      // standings are the room's roster, not just its finishers.
+      this.ensureEntry(p);
     }
     this.updatePlaces();
     this.broadcastEvent({ kind: 'go' });
@@ -559,6 +700,7 @@ export class KartRoom implements GameRoomHandle {
   private enterResults(now: number): void {
     this.phase = 'results';
     this.phaseEndsAt = now + RESULTS_SECONDS * 1000;
+    this.scoreRound();
   }
 
   /**
@@ -569,12 +711,242 @@ export class KartRoom implements GameRoomHandle {
    * needs another explicit `{t:'start'}` (frozen lobby contract).
    */
   private resetToLobby(_now: number): void {
+    // ORDER IS LOAD-BEARING: the calendar advances FIRST, because the grid
+    // reset below calls gridSlot(this.track, ...) and has to place karts on the
+    // circuit they are about to race, not the one they just left.
+    this.advanceSeason();
     for (const p of this.players.values()) this.resetRaceState(p);
-    this.finishOrder = [];
+    this.finishOrder.length = 0; // pooled like every other per-race array here
     this.phase = 'lobby';
     this.phaseEndsAt = 0;
     this.countdown = 0;
     this.broadcastEvent({ kind: 'restart' });
+  }
+
+  // -------------------------------------------------------------------------
+  // Championship: scoring, calendar advance, standings
+  // -------------------------------------------------------------------------
+
+  /**
+   * Award the round's points. Called from enterResults ONLY, and IDEMPOTENT per
+   * round: enterResults has three callers (the last gate credit, the last racer
+   * leaving mid-race, the race timeout) and two of them can land in the same
+   * tick, so the guard is what stops a race paying out twice.
+   *
+   * DNF SCORES 0 BY OMISSION: a driver who never crossed the line is not in
+   * finishOrder, so this loop never reaches them and there is no special case
+   * to get wrong. They still get a row (the ensureEntry sweep below) with
+   * delta 0, which is how the results screen shows "started, scored nothing".
+   */
+  private scoreRound(): void {
+    if (!this.season.championship) return;
+    if (this.scoredRound === this.round) return; // already paid for this round
+    this.scoredRound = this.round;
+    // The "+N" column is per-round, so it is cleared for EVERYONE first —
+    // otherwise last round's delta would linger on this round's absentees.
+    for (const e of this.entries.values()) e.delta = 0;
+    for (let i = 0; i < this.finishOrder.length; i++) {
+      const id = this.finishOrder[i]!;
+      const place = i + 1; // finishOrder IS the classification, in order
+      const pts = pointsForPlace(place);
+      // Defensive: a driver can finish and then disconnect before this runs, so
+      // their Player record (and their name with it) may be gone. The points
+      // are theirs regardless — F1 does not un-award a race because someone
+      // left the paddock — so the row is created on the spot.
+      //
+      // `null`, NOT a placeholder string: they almost always DO have a row
+      // already (go() registers the whole grid), and passing a fallback name
+      // here would overwrite the real one with it for the rest of the season —
+      // "DRIVER — 25 pts" on the results screen of the driver who just won.
+      // The placeholder is only ever the name of a row that has none.
+      const seated = this.players.get(id);
+      const e = this.ensureEntryFor(id, seated?.name ?? null);
+      e.points += pts;
+      e.delta = pts;
+      if (place === 1) e.wins++;
+      if (e.bestFinish === 0 || place < e.bestFinish) e.bestFinish = place; // 0 = never finished
+    }
+    // Everyone still seated gets a row even if they scored nothing this round.
+    for (const p of this.players.values()) this.ensureEntry(p);
+    this.standingsDirty = true;
+    if (this.round >= this.season.rounds) {
+      this.seasonOver = true;
+      // The champion is whoever the FROZEN tie-break puts first — resolve the
+      // table now rather than trusting a later rebuild, so `championId` and the
+      // standings a client sees are computed from the same sort.
+      this.rebuildStandings();
+      this.championId = this.standingRows[0]?.id ?? null;
+    }
+  }
+
+  /**
+   * Calendar advance, on the way back to the lobby. A finished season rolls
+   * into a fresh one; otherwise the room moves to the next round and circuit.
+   * The room still does NOT re-arm: the next round waits for another explicit
+   * `{t:'start'}` (frozen lobby contract).
+   */
+  private advanceSeason(): void {
+    if (!this.season.championship) return;
+    if (this.seasonOver) {
+      this.startNewSeason();
+      return;
+    }
+    // AN ABANDONED ROUND DOES NOT BURN A CALENDAR SLOT. resetToLobby is also
+    // the abandon path — the last player leaves during ready/countdown/racing,
+    // so the round is never scored — and the rule is "the room moves to the
+    // next circuit when a race FINISHES". A race nobody raced did not finish.
+    // Without this gate a churny room drifts toward the final round on empty
+    // slots and then crowns a "champion" off a table of departed ghosts.
+    // `scoredRound === round` is precisely "this round paid out" (scoreRound
+    // stamps it), so it is the same guard that makes scoring idempotent.
+    if (this.scoredRound !== this.round) return; // stay on this round AND this circuit
+    // Clamp as belt-and-braces: `round` must never index past the calendar even
+    // if some future path advances without a score.
+    this.round = Math.min(this.round + 1, this.season.rounds);
+    this.setTrack(this.calendar[this.round - 1] ?? this.baseTrackId);
+  }
+
+  /**
+   * Wipe the table and race the calendar again from `baseTrackId`. Everyone
+   * seated is re-registered immediately on 0 points / joinedRound 1: the new
+   * season starts level, and nobody carries a mid-season badge into round 1.
+   */
+  private startNewSeason(): void {
+    this.entries.clear();
+    this.seasonSeq = 0;
+    this.round = 1;
+    this.seasonOver = false;
+    this.championId = null;
+    this.scoredRound = 0; // round 1 has not been paid yet
+    this.calendar = buildCalendar(this.baseTrackId, this.season.rounds);
+    this.setTrack(this.calendar[0] ?? this.baseTrackId);
+    for (const p of this.players.values()) this.ensureEntry(p);
+    this.standingsDirty = true;
+  }
+
+  /** Swap the room's circuit. Rebuilding an identical track is pure waste. */
+  private setTrack(id: TrackId): void {
+    if (this.track.id === id) return;
+    this.track = buildTrack(TRACKS[id]);
+  }
+
+  /** Register/refresh a seated player's championship row. */
+  private ensureEntry(p: Player): void {
+    if (!this.season.championship) return;
+    this.ensureEntryFor(p.id, p.name);
+  }
+
+  /**
+   * The one place a SeasonEntry is born. A new driver starts on zero, with
+   * `joinedRound` stamped at the CURRENT round (so the table can mark them as a
+   * mid-season arrival) and a unique `seq` — the tie-break's final rung.
+   */
+  private ensureEntryFor(id: PlayerId, name: string | null): SeasonEntry {
+    let e = this.entries.get(id);
+    if (e === undefined) {
+      // Trim BEFORE inserting, with one slot of headroom. Trimming AFTER would
+      // let the cap evict the row we were just asked to create — a departed
+      // finisher's brand-new entry is on 0 points with the highest seq, i.e.
+      // EXACTLY the victim the tie-break picks — and the caller would then add
+      // that round's points to a detached object that is in no table.
+      this.evictOverflow(1);
+      e = {
+        id,
+        name: name ?? 'DRIVER', // last resort: a row must have some label
+        points: 0,
+        delta: 0,
+        wins: 0,
+        bestFinish: 0, // 0 == never finished, which compareSeason ranks last
+        joinedRound: this.round,
+        seq: this.seasonSeq++,
+      };
+      this.entries.set(id, e);
+    } else if (name !== null) {
+      // Only a LIVE name overwrites: a same-session re-add can rename and the
+      // row should follow, but "we no longer know this driver's name" must
+      // never clobber the one we already had.
+      e.name = name;
+    }
+    this.standingsDirty = true;
+    return e;
+  }
+
+  /**
+   * Standings cap. A departed driver KEEPS their points, so a long-lived public
+   * room with heavy churn would otherwise grow one row per person who ever sat
+   * in it. Past SEASON_STANDINGS_CAP the cheapest rows go first: never a seated
+   * driver, then fewest points, then the LATEST joiner (highest seq) — i.e. we
+   * drop the person who contributed least and arrived last. MAX_PLAYERS (20) is
+   * below the cap (40), so a full grid can never evict itself, and the `break`
+   * below is unreachable defence rather than a real policy.
+   *
+   * `headroom` is how many rows the caller is ABOUT to add, so it can trim
+   * before inserting and keep the incoming row structurally un-evictable.
+   */
+  private evictOverflow(headroom: number): void {
+    while (this.entries.size + headroom > SEASON_STANDINGS_CAP) {
+      let victim: SeasonEntry | null = null;
+      for (const e of this.entries.values()) {
+        if (this.players.has(e.id)) continue; // seated drivers are untouchable
+        if (
+          victim === null ||
+          e.points < victim.points ||
+          (e.points === victim.points && e.seq > victim.seq)
+        ) {
+          victim = e;
+        }
+      }
+      if (victim === null) break; // everyone is seated: nothing may be evicted
+      this.entries.delete(victim.id);
+    }
+  }
+
+  /**
+   * Refill the pooled standings rows, sorted by the FROZEN tie-break
+   * (compareSeason): points desc, then wins desc, then best single finish asc
+   * (0 = never finished, ranked last), then join order asc. That last rung is
+   * unique per driver, so the comparator is a TOTAL order — the table has
+   * exactly one valid arrangement and a re-sort can never shuffle equals.
+   *
+   * Runs at most once per snapshot tick and only when something actually
+   * changed (award / join / leave / rename / new season), and allocates nothing
+   * in the steady state: rows are pushed only to GROW the pool.
+   */
+  private rebuildStandings(): void {
+    if (!this.standingsDirty) return;
+    this.standingsDirty = false;
+    const list = this.sortScratch;
+    list.length = 0;
+    for (const e of this.entries.values()) list.push(e);
+    list.sort(compareSeason);
+    const rows = this.standingRows;
+    while (rows.length < list.length) {
+      rows.push({
+        id: '',
+        name: '',
+        pos: 0,
+        points: 0,
+        delta: 0,
+        wins: 0,
+        bestFinish: 0,
+        here: false,
+        joinedRound: 1,
+      });
+    }
+    rows.length = list.length;
+    for (let i = 0; i < list.length; i++) {
+      const e = list[i]!;
+      const r = rows[i]!;
+      r.id = e.id;
+      r.name = e.name;
+      r.pos = i + 1; // championship position, 1-based and ascending in the array
+      r.points = e.points;
+      r.delta = e.delta;
+      r.wins = e.wins;
+      r.bestFinish = e.bestFinish;
+      r.here = this.players.has(e.id); // a departed driver keeps the row, loses the flag
+      r.joinedRound = e.joinedRound;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -607,8 +979,20 @@ export class KartRoom implements GameRoomHandle {
     if (p.progress >= LAPS_TO_WIN * GATES && !p.finished) {
       p.finished = true;
       p.finishMs = now - this.raceStartAt;
-      this.finishOrder.push(p.id);
-      this.broadcastEvent({ kind: 'finish', playerId: p.id, place: this.finishOrder.length });
+      // finishOrder ITSELF is the authority on "already classified", not the
+      // per-player `finished` flag above: a same-id rejoin mid-race deletes the
+      // Player and builds a FRESH one with finished:false, which can drive the
+      // distance again and reach this branch a second time. That was cosmetic
+      // when finishOrder only fed a results screen; it is now the SCORING
+      // INPUT, so a duplicate would pay the driver twice, invent a win, and
+      // shift every later finisher down a place. The array is at most
+      // MAX_PLAYERS long, so the linear scan is free.
+      let place = this.finishOrder.indexOf(p.id) + 1; // 0 => not classified yet
+      if (place === 0) {
+        this.finishOrder.push(p.id);
+        place = this.finishOrder.length;
+      }
+      this.broadcastEvent({ kind: 'finish', playerId: p.id, place });
     }
     this.updatePlaces();
     if (this.allFinished()) this.enterResults(now);
@@ -748,7 +1132,12 @@ export class KartRoom implements GameRoomHandle {
         playerCount: this.playerCount(),
         minPlayers: MIN_PLAYERS,
         canStart: this.canStart(),
-        trackId: this.track.id, // this room's circuit never changes; set once, not per tick
+        // Both of these are now REFRESHED PER TICK in broadcastSnapshot — the
+        // circuit moves with the calendar, so `trackId` can no longer be a
+        // set-once field. They are seeded here purely to satisfy the type at
+        // construction.
+        trackId: this.track.id,
+        championship: this.seasonWire, // the ONE shared season object (null when disabled)
         you, // same object: broadcastSnapshot mutates it, never replaces it
         players: this.snapPlayers,
       },
@@ -883,6 +1272,21 @@ export class KartRoom implements GameRoomHandle {
     const list = this.buildSnapPlayers(now);
     const count = this.playerCount();
     const canStart = this.canStart();
+    const trackId = this.track.id;
+    // ONCE per tick, not once per recipient: the season is one shared object
+    // (its `standings` array is bound to standingRows for the room's lifetime),
+    // so refreshing it here costs O(1) instead of O(players).
+    const season = this.seasonWire;
+    if (season !== null) {
+      season.round = this.round;
+      season.rounds = this.season.rounds;
+      season.trackId = trackId;
+      // null on the final round: there is no next circuit to preview.
+      season.nextTrackId = this.round < this.season.rounds ? (this.calendar[this.round] ?? null) : null;
+      season.over = this.seasonOver;
+      season.championId = this.championId;
+      this.rebuildStandings(); // no-op unless something actually changed
+    }
     for (const p of this.players.values()) {
       const you = p.you;
       you.lap = p.lap;
@@ -904,6 +1308,11 @@ export class KartRoom implements GameRoomHandle {
       m.playerCount = count;
       m.minPlayers = MIN_PLAYERS;
       m.canStart = canStart;
+      // Per tick, not per join: a room that changed circuit between rounds must
+      // tell clients that were already connected, and the snapshot is the only
+      // message they are guaranteed to keep receiving.
+      m.trackId = trackId;
+      m.championship = season;
       m.players = list;
       this.io.send(p.id, m);
     }

@@ -1094,6 +1094,50 @@ body {
   color: var(--steel);
 }
 
+/* ---- lobby championship placard --------------------------------------------------
+   The first thing a joiner reads: which round of which season, on which circuit,
+   and where THEY stand in it. Same chip idiom as the HUD (lit top face falling to
+   an ink bottom face over a steel edge, cream rim) so it reads as a card pinned
+   to the panel rather than as one more line of status text. The whole block is
+   `hidden` on a championship-disabled room — that lobby is unchanged. */
+
+.lobby-season {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 14px;
+  border: 1px solid color-mix(in srgb, var(--steel) 34%, transparent);
+  border-radius: 10px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--charcoal) 72%, transparent),
+    color-mix(in srgb, var(--ink) 74%, transparent)
+  );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--hud-text) 12%, transparent),
+    0 6px 18px color-mix(in srgb, var(--ink) 50%, transparent);
+}
+
+/* the round line is the headline of the placard — gold, tracked out like the
+   panel title it sits under */
+.lobby-round {
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.2em;
+  color: var(--gold);
+  text-align: center;
+}
+
+.lobby-season-note {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  color: var(--steel);
+  text-align: center;
+}
+
 /* ---- player chips (grid list) ---------------------------------------------------- */
 
 .player-chip {
@@ -1360,6 +1404,238 @@ body {
   font-size: 13px;
   letter-spacing: 0.18em;
   color: var(--steel);
+}
+
+/* ---- championship standings (inside the results panel) ---------------------------
+   The race you just ran, then the season it belongs to. Separated from the result
+   table by a rule rather than by whitespace: the two tables mean different things
+   (this race vs the year) and must never be read as one continuous list. Denser
+   than the result table by design — this is reference data, not the read a driver
+   takes at 200 km/h — which is also what makes 8 drivers fit at 1280x720 without
+   the overlay scrolling. */
+
+.results-standings {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid color-mix(in srgb, var(--steel) 26%, transparent);
+}
+
+.standings-title {
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.28em;
+  color: var(--steel);
+  text-align: center;
+}
+
+/* last-resort guard only: at 720p the cap clears a full 8-row table, so a normal
+   season never scrolls — a 20-kart one caps here instead of pushing the
+   auto-return note off the bottom of the panel */
+.standings-scroll {
+  max-height: min(38vh, 300px);
+  overflow-y: auto;
+}
+
+.standings-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.standings-table th {
+  padding: 4px 10px;
+  font-size: 10px;
+  letter-spacing: 0.24em;
+  text-align: left;
+  color: var(--steel);
+  border-bottom: 1px solid color-mix(in srgb, var(--asphalt-light) 72%, transparent);
+}
+
+.standings-table td {
+  padding: 2px 10px;
+  font-size: 13px;
+  color: var(--hud-text);
+  border-bottom: 1px solid color-mix(in srgb, var(--asphalt-light) 30%, transparent);
+}
+
+/* PTS and + are magnitudes, not labels: right-aligned and tabular so the column
+   of numbers can be compared without being read */
+.standings-table th:nth-child(3),
+.standings-table th:nth-child(4) {
+  text-align: right;
+}
+
+.standing-pos {
+  width: 3.2em;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: var(--steel);
+}
+
+.standing-name {
+  font-weight: 600;
+  max-width: 14em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* the season total is the loudest number in the table — it is the whole point */
+.standing-pts {
+  width: 4em;
+  text-align: right;
+  font-weight: 800;
+}
+
+/* base state is the em-dash: a scoreless round is dim, so '+18' is the thing that
+   catches the eye and 'nothing happened' never masquerades as a value */
+.standing-delta {
+  width: 3.6em;
+  text-align: right;
+  font-weight: 700;
+  color: color-mix(in srgb, var(--steel) 66%, transparent);
+}
+
+.standing-delta.standing-delta-up {
+  color: var(--grass-lit);
+}
+
+/* your own row: gold type AND a gold edge + tint, never colour-alone — the exact
+   idiom the result table above uses, so the eye finds you the same way twice */
+.standings-table tr.you td,
+.standings-table tr.standing-row-you td {
+  color: var(--gold);
+  font-weight: 700;
+  background: color-mix(in srgb, var(--gold) 10%, transparent);
+}
+
+.standings-table tr.you td.standing-pos,
+.standings-table tr.standing-row-you td.standing-pos,
+.standings-table tr.you td.standing-delta,
+.standings-table tr.standing-row-you td.standing-delta {
+  color: var(--gold);
+}
+
+.standings-table tr.you td:first-child,
+.standings-table tr.standing-row-you td:first-child {
+  box-shadow: inset 3px 0 0 var(--gold);
+}
+
+/* a driver who has left keeps their points (F1 rules) but is not on tonight's
+   grid — dimmed and italic, i.e. present but not current. Declared AFTER the
+   own-row rule so the two never fight; you cannot be gone and be seated. */
+.standings-table tr.standing-row-gone td {
+  color: color-mix(in srgb, var(--steel) 60%, transparent);
+  font-style: italic;
+}
+
+/* the champion's line outranks even the own-row highlight (declared last), which
+   is correct: at season end the champion IS the headline, even when it is you */
+.standings-table tr.standing-row-champion td {
+  color: var(--gold);
+  font-weight: 800;
+  background: color-mix(in srgb, var(--gold) 16%, transparent);
+}
+
+.standings-table tr.standing-row-champion td:first-child {
+  box-shadow: inset 3px 0 0 var(--gold);
+}
+
+.standings-next {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  color: var(--steel);
+  text-align: center;
+}
+
+/* ---- season end: the trophy ------------------------------------------------------
+   The one moment this screen is allowed to be loud. Gold plate, gold glow, the
+   champion's name at display size — everything else on the panel steps back for
+   it (see the .season-final compaction below, which buys the banner its room
+   without letting the overlay scroll at 720p). */
+
+.champion-banner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 10px 20px;
+  border: 1px solid var(--gold);
+  border-radius: 12px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--gold) 22%, transparent),
+    color-mix(in srgb, var(--ink) 80%, transparent)
+  );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--hud-text) 26%, transparent),
+    0 0 34px color-mix(in srgb, var(--gold) 26%, transparent),
+    0 14px 34px color-mix(in srgb, var(--ink) 70%, transparent);
+}
+
+.champion-label {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.42em;
+  color: color-mix(in srgb, var(--gold) 88%, transparent);
+}
+
+.champion-name {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 24px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  color: var(--gold);
+  text-shadow: var(--text-cast-big);
+}
+
+.champion-stat {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  color: var(--hud-text);
+}
+
+/* Championship compaction. Scoped to `.has-standings`, a class app.ts sets ONLY
+   while the season block is up — a championship-disabled results screen keeps
+   its original spacing to the pixel. Measured, not estimated: at 1280x720 with 8
+   drivers the panel is 680px final / 614px mid-season, both clear of the
+   viewport with no scroll anywhere. It is needed on BOTH championship screens,
+   not just the finale — mid-season is the taller of the two, because it carries
+   the full-size race table AND the next-round line where the finale trades the
+   race table's spacing for the trophy. */
+.results-panel.has-standings {
+  gap: 10px;
+  /* graceful degradation past 8 drivers: the panel scrolls as a whole rather
+     than growing off both edges of the screen. Never engages at 8. */
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+}
+
+.results-panel.has-standings .results-title {
+  font-size: 16px;
+}
+
+.results-panel.has-standings .results-table th {
+  padding: 4px 10px;
+}
+
+.results-panel.has-standings .results-table td {
+  padding: 5px 10px;
+}
+
+/* the finale tints the header gold to match the trophy it now sits above */
+.results-panel.season-final .results-title {
+  color: var(--gold);
+  text-shadow: 0 0 26px color-mix(in srgb, var(--gold) 40%, transparent);
 }
 
 /* ---- motion preference ------------------------------------------------------------ */

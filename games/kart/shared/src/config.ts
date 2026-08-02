@@ -81,6 +81,41 @@ export const NITRO_CHARGES = 3; // per player per race
 export const NITRO_TIME = 1.5; // s of boost per charge
 export const NITRO_BOOST = 10; // extra engine m/s^2 during nitro
 
+// ---- championship (PER-ROOM-SESSION; there is no persistence in this platform) ----
+// Points live on the KartRoom and die with it. A room IS a season: it runs
+// SEASON rounds over the circuit rotation, scores each one, crowns a champion
+// on the final round and then starts a fresh season. Nothing is written
+// anywhere — `ws` is the only dependency this server has.
+//
+// F1 2010-2025 scoring: 25-18-15-12-10-8-6-4-2-1 for the top ten, 0 below.
+// A DNF (never crossed the line before the race ended, or disconnected before
+// finishing) is not in finishOrder at all, so it scores 0 by construction.
+export const POINTS_TABLE: readonly number[] = [25, 18, 15, 12, 10, 8, 6, 4, 2, 1];
+export const SEASON_ROUNDS_MIN = 1;
+// 8 rounds = the calendar the owner asked for (one per authored circuit).
+export const SEASON_ROUNDS_MAX = 8;
+/**
+ * Rounds a room gets when `settings.rounds` is absent — a FULL calendar.
+ *
+ * Deliberately a constant and NOT `TRACK_LIST.length`: the calendar walks the
+ * registry with WRAPAROUND (buildCalendar, protocol.ts), so a season is always
+ * 8 rounds long whether the registry holds 1 circuit or 8. With one circuit
+ * that is 8 races at the same track; the moment the other seven land the same
+ * default becomes eight different ones, with no code change anywhere.
+ */
+export const DEFAULT_SEASON_ROUNDS = SEASON_ROUNDS_MAX;
+/** Championship on unless a room explicitly books `{ championship: false }`. */
+export const CHAMPIONSHIP_DEFAULT = true;
+/**
+ * Hard cap on standings rows a room keeps. A driver who leaves KEEPS their
+ * points (they are still in the championship, exactly as in F1), so a long-
+ * lived room with heavy churn would otherwise grow one row per person who ever
+ * sat in it. Past the cap the room evicts DEPARTED rows, lowest points first;
+ * seated drivers are never evicted, and MAX_PLAYERS (20) < this, so a full grid
+ * can never evict itself.
+ */
+export const SEASON_STANDINGS_CAP = 40;
+
 // ---- netcode (SERVER-AUTHORITATIVE simulation) ----
 // The wire carries INPUTS, never coordinates: the server integrates the shared
 // sim (shared/sim.ts stepDrive) from the input stream and owns every position.

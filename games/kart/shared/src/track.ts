@@ -31,7 +31,15 @@ import type { KPAL } from './palette.js';
  * here without a TRACKS entry is a COMPILE error — the union cannot silently
  * drift from the set of circuits that actually exist.
  */
-export type TrackId = 'greenvale';
+export type TrackId =
+  | 'greenvale'
+  | 'cobalt'
+  | 'lantern'
+  | 'thunder'
+  | 'copper'
+  | 'highland'
+  | 'crown'
+  | 'switchback';
 
 /**
  * Sky / sun / fog for one circuit, plus an optional palette re-skin.

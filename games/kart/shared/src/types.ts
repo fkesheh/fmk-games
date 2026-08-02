@@ -98,6 +98,56 @@ export interface KartYou {
   sim: KartSim;
 }
 
+/**
+ * One driver's line in the championship table. Every driver who has SAT in the
+ * room this season has a row, including one who has left (they keep their
+ * points, as in F1) and one who joined a moment ago on zero.
+ */
+export interface KartStandingRow {
+  id: string;
+  name: string;
+  /** Championship position after the tie-break; 1-based, ascending in the array. */
+  pos: number;
+  /** Season total after the most recently SCORED round. */
+  points: number;
+  /**
+   * Points scored in the most recently scored round — the "+18" the results
+   * screen shows next to the total. 0 for a DNF, an absentee, or before any
+   * round has been scored.
+   */
+  delta: number;
+  /** Race wins this season (the tie-break's first countback rung). */
+  wins: number;
+  /** Best (lowest) finishing place this season; 0 = has never finished a race. */
+  bestFinish: number;
+  /** Still seated in the room right now (a departed driver keeps their row). */
+  here: boolean;
+  /** The round this driver first appeared in — 1-based. > 1 means mid-season. */
+  joinedRound: number;
+}
+
+/**
+ * The room's championship, mirrored onto every snapshot. `null` on a room
+ * booked with `{ championship: false }` — that room behaves exactly as it did
+ * before championships existed and the client renders nothing extra.
+ */
+export interface KartSeason {
+  /**
+   * 1-based round. During 'results' this is the round that was just SCORED;
+   * in every other phase it is the round about to be raced. (The room advances
+   * it on the way back to the lobby, together with the circuit.)
+   */
+  round: number;
+  rounds: number; // total rounds this season
+  trackId: TrackId; // circuit of `round`
+  nextTrackId: TrackId | null; // circuit of round+1; null on the final round
+  /** The final round has been scored: `standings` is final and `championId` is set. */
+  over: boolean;
+  championId: string | null;
+  /** Sorted by `pos` ascending (points desc, then the documented tie-break). */
+  standings: KartStandingRow[];
+}
+
 export type RaceEvent =
   | { kind: 'countdown'; n: number } // 3,2,1
   | { kind: 'go' }
@@ -147,6 +197,12 @@ export type KartS2C =
       playerCount: number; // seated players (== players.length)
       minPlayers: number; // MIN_PLAYERS, mirrored so the UI needs no config import
       canStart: boolean; // phase === 'lobby' && playerCount >= minPlayers
+      // ---- championship contract (additive) ----
+      // The room's season: where we are in the calendar and the running points
+      // table. Mirrored on EVERY snapshot (not just results) so the lobby can
+      // say "ROUND 3 OF 8 · RIVERSIDE" and a mid-season joiner can see the
+      // table they just walked into. `null` on a championship-disabled room.
+      championship: KartSeason | null;
       you: KartYou;
       players: KartPlayerSnap[];
     }
