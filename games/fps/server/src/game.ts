@@ -118,6 +118,11 @@ interface PlayerState {
   kills: number;
   deaths: number;
   headshots: number;
+  // C5 end-of-match stats. Siblings of kills/deaths/headshots in every respect:
+  // written on the same paths, and cleared by the same resetMatchStats().
+  damageDealt: number; // post-armour HP actually removed from ENEMIES (no self/team damage, no overkill)
+  shotsFired: number; // trigger PULLS that consumed a round (a shotgun blast is 1, not 8; a pull dropped on an empty mag is 0)
+  shotsHit: number; // pulls that landed >= 1 damaging hit on an enemy (again 1 per blast, not per pellet)
   lastKillAt: number; // serverTime ms of this player's last kill, 0 = none
   streak: number; // multikill streak (kills within MULTIKILL_WINDOW of the previous)
   spawnProtectedUntil: number; // serverTime ms
@@ -161,6 +166,28 @@ function defaultAmmo(w: WeaponId): Ammo {
   return { mag: WEAPONS[w].mag, reserve: WEAPONS[w].reserve };
 }
 
+/**
+ * Clear the six per-MATCH scoreboard counters. C5 requires damageDealt /
+ * shotsFired / shotsHit to be reset wherever kills/deaths/headshots are, so the
+ * six live and die together in exactly one function — a stat that survives a
+ * reset the others do not is worse than no stat at all.
+ *
+ * The three EXISTING counters were previously zeroed only at player creation,
+ * which meant a room's second match reported the first match's frags. Every
+ * match boundary now calls this: handleStart (a new match begins), fullReset
+ * (the lobby return 6s after match_end) and abortToWarmup (low-population
+ * abort). It is deliberately NOT called at beginFreeze — stats accumulate
+ * across the rounds OF a match, which is the whole point of them.
+ */
+function resetMatchStats(p: PlayerState): void {
+  p.kills = 0;
+  p.deaths = 0;
+  p.headshots = 0;
+  p.damageDealt = 0;
+  p.shotsFired = 0;
+  p.shotsHit = 0;
+}
+
 export class GameRoom {
   readonly id: RoomId;
   readonly code: string | null;
@@ -182,6 +209,12 @@ export class GameRoom {
   private round = 0; // 0 during warmup, 1..N during a match
   private scoreT = 0;
   private scoreCT = 0;
+  // Consecutive rounds each side has lost, NOT on the wire (contract C3). Read
+  // before a round's result is applied to size that side's loss payout, then
+  // updated: the winner drops to 0, the loser climbs a rung, a draw climbs both.
+  // Reset alongside the halftime side swap — economic pressure belongs to the
+  // side, not to the players who just crossed over.
+  private readonly lossStreak: { t: number; ct: number } = { t: 0, ct: 0 };
   private tickN = 0;
   private buyOpenUntil = 0; // serverTime ms; canBuy while live && now < this
   private matchEndResetAt = 0; // serverTime ms; warmup reset 6s after match_end
@@ -286,6 +319,7 @@ export class GameRoom {
           self: {
             x: 0, y: 0, z: 0, yaw: 0, pitch: 0, hp: 0,
             mag: 0, reserve: 0, reloading: false, crouch: false,
+            weapon: 'pistol', // overwritten from PlayerState.weapon every tick
           },
           enemies: [],
           solids: this.solids,
@@ -367,6 +401,7 @@ export class GameRoom {
       reloadUntil: 0, nextShotAt: 0, bloom: 0, shotSeq: 0,
       hp: pending ? 0 : PLAYER.maxHp, alive: !pending,
       money: ECONOMY.start, kills: 0, deaths: 0, headshots: 0,
+      damageDealt: 0, shotsFired: 0, shotsHit: 0,
       armor: 0, hasKevlar: false, helmet: false,
       lastKillAt: 0, streak: 0,
       spawnProtectedUntil: 0, respawnAt: null, spectateTarget: null,
@@ -669,6 +704,9 @@ export class GameRoom {
     try {
       if (!this.players.has(id)) return; // only a seated player may start it
       if (!this.canStartMatch()) return; // wrong phase or below the minimum
+      // A fresh match starts from a clean scoreboard: warmup frags/damage are
+      // practice and must not land in this match's `match_end` stats.
+      for (const p of this.players.values()) resetMatchStats(p);
       this.beginFreeze(1, Date.now()); // round 1 of a fresh match (scores are 0 in warmup)
     } catch (err) {
       console.error('[game] handleStart failed', err);
@@ -801,6 +839,9 @@ export class GameRoom {
       self.yaw = p.yaw;
       self.pitch = p.pitch;
       self.hp = p.hp;
+      // The HELD weapon, not owned[0] — the brain resolves its WeaponDef from
+      // this, so it can never disagree with the fire path about what it holds.
+      self.weapon = p.weapon;
       const def = WEAPONS[p.weapon];
       const ammo = p.ammo.get(p.weapon);
       self.mag = def.mag === -1 ? -1 : ammo !== undefined ? ammo.mag : 0;
@@ -858,6 +899,10 @@ export class GameRoom {
         pitch: Math.min(1.45, Math.max(-1.45, cmd.pitch)),
         buttons: cmd.buttons & 0xf,
       });
+      // switch BEFORE reload: the bot services the gun it ends the tick
+      // holding, not the one it is putting away. Same handler as a client's
+      // { t: 'switch' } — it rejects unowned weapons and dead players itself.
+      if (cmd.switchTo !== null) this.handleSwitch(id, cmd.switchTo);
       if (cmd.reload) this.handleReload(id);
       if (cmd.buy !== null) this.handleBuy(id, cmd.buy);
     }
@@ -949,8 +994,12 @@ export class GameRoom {
   private endRound(winner: Team | null, reason: RoundEndReason, now: number): void {
     if (winner === 'T') this.scoreT++;
     else if (winner === 'CT') this.scoreCT++;
-    // winner null (mutual elimination) => both teams get the loss reward
-    const rewards = roundRewards(winner);
+    // Payouts use the PRE-round streaks: a side that has already lost twice is
+    // paid the third rung for losing this one. winner null (mutual
+    // elimination) pays both sides their own loss reward.
+    const rewards = roundRewards(winner, this.lossStreak);
+    this.lossStreak.t = winner === 'T' ? 0 : this.lossStreak.t + 1;
+    this.lossStreak.ct = winner === 'CT' ? 0 : this.lossStreak.ct + 1;
     for (const p of this.players.values()) {
       const gain = p.team === 'T' ? rewards.t : rewards.ct;
       p.money = Math.min(ECONOMY.max, p.money + gain); // clamp is caller-side per S3 table
@@ -975,6 +1024,10 @@ export class GameRoom {
       const tmp = this.scoreT;
       this.scoreT = this.scoreCT;
       this.scoreCT = tmp;
+      // loss streaks do NOT follow the players across the swap: both sides
+      // start the second half on the base rung (contract C3)
+      this.lossStreak.t = 0;
+      this.lossStreak.ct = 0;
       // per-recipient roster: each player sees only their own money
       for (const p of this.players.values()) {
         this.sendEvent(p.id, { t: 'halftime', roster: this.buildRoster(p.id) });
@@ -989,7 +1042,47 @@ export class GameRoom {
     this.phase = 'matchEnd';
     this.phaseEndsAt = 0; // wire contract: 0 during matchEnd
     this.matchEndResetAt = now + 6000;
-    this.broadcast({ t: 'match_end', winner, scoreT: this.scoreT, scoreCT: this.scoreCT });
+    this.broadcast({
+      t: 'match_end', winner, scoreT: this.scoreT, scoreCT: this.scoreCT,
+      stats: this.buildMatchStats(),
+    });
+  }
+
+  /**
+   * C5's end-of-match scoreboard: EVERY player still in the room, both teams,
+   * bots and mid-round joiners included (a joiner sitting out the last round is
+   * still present, and reports the zeroes that are the truth about their match).
+   *
+   * The order is the server's and is TOTAL, so the client renders it as received
+   * — including the top-3 cut the end screen makes — and never re-sorts:
+   *   kills DESC -> damage DESC -> deaths ASC -> joinSeq ASC.
+   * kills first because that is the number the match was scored on; damage
+   * breaks ties because it is the finer-grained measure of the same work (it is
+   * exactly the "did nothing but chip everyone" case the flat kill list hid);
+   * deaths next; and joinSeq — unique per room and never reused — makes the
+   * comparator a strict total order, so two identical lines can never swap
+   * between builds or between two players' copies of the same message.
+   */
+  private buildMatchStats(): Array<Extract<GameEvent, { t: 'match_end' }>['stats'][number]> {
+    const rows = [...this.players.values()];
+    rows.sort(
+      (a, b) =>
+        b.kills - a.kills ||
+        b.damageDealt - a.damageDealt ||
+        a.deaths - b.deaths ||
+        a.joinSeq - b.joinSeq,
+    );
+    return rows.map((p) => ({
+      id: p.id,
+      name: p.name,
+      team: p.team,
+      kills: p.kills,
+      deaths: p.deaths,
+      headshots: p.headshots,
+      damage: p.damageDealt,
+      shotsFired: p.shotsFired,
+      shotsHit: p.shotsHit,
+    }));
   }
 
   private fullReset(now: number): void {
@@ -1002,10 +1095,13 @@ export class GameRoom {
     this.round = 0;
     this.scoreT = 0;
     this.scoreCT = 0;
+    this.lossStreak.t = 0;
+    this.lossStreak.ct = 0;
     this.beginSpawnWave();
     for (const p of this.players.values()) {
       p.pending = false; // fresh match: nobody is sitting a round out any more
       p.balancedRound = -1;
+      resetMatchStats(p); // back in the lobby: the scoreboard clears with the scores
       p.money = ECONOMY.start;
       p.weapons = ['knife', 'pistol'];
       p.ammo.clear();
@@ -1024,10 +1120,13 @@ export class GameRoom {
     this.round = 0;
     this.scoreT = 0;
     this.scoreCT = 0;
+    this.lossStreak.t = 0;
+    this.lossStreak.ct = 0;
     for (const p of this.players.values()) {
       p.money = ECONOMY.start;
       p.spectateTarget = null;
       p.balancedRound = -1;
+      resetMatchStats(p); // the aborted match's scoreboard dies with the match
       // the match is over: a mid-round joiner is a normal warmup player again
       p.pending = false;
       if (!p.alive && p.respawnAt === null) {
@@ -1104,6 +1203,13 @@ export class GameRoom {
     p.shotSeq++;
     p.nextShotAt = now + def.interval * 1000;
     if (ammo !== undefined && def.mag !== -1) ammo.mag--;
+    // C5: ONE pull, counted once, whatever the pellet count. Everything that
+    // could have swallowed this pull — reloading, the fire-rate gate, an empty
+    // magazine — already returned above, so reaching here IS the trigger pull.
+    // The knife has no magazine (mag === -1) and consumes nothing, but a swing
+    // is still a pull and can still land, so it counts on both sides; excluding
+    // it would let knife hits push accuracy above 100%.
+    p.shotsFired++;
 
     const origin = eyePos(p.body);
     const maxDist = def.id === 'knife' ? def.rangeEnd : 200; // per S3 table
@@ -1129,11 +1235,16 @@ export class GameRoom {
     p.bloom = Math.min(def.maxSpreadDeg, p.bloom + def.spreadPerShot);
 
     let closest: ShotHit | null = null;
+    let credited = 0; // enemy HP this PULL removed, summed over its pellets
     for (const h of hits) {
       const victim = this.players.get(h.targetId);
-      if (victim !== undefined) this.applyDamage(victim, p, h, def, now);
+      if (victim !== undefined) credited += this.applyDamage(victim, p, h, def, now);
       if (closest === null || h.dist < closest.dist) closest = h;
     }
+    // C5: one pull that lands ANY damaging pellet is exactly one hit. Pellets
+    // that arrived after the victim died, or landed on a spawn-protected or
+    // same-team player, credited nothing and so do not make this a hit.
+    if (credited > 0) p.shotsHit++;
     // one volley => one shot event: drives remote muzzle flash, tracers, sounds
     this.broadcast({
       t: 'shot',
@@ -1144,8 +1255,22 @@ export class GameRoom {
     });
   }
 
-  private applyDamage(victim: PlayerState, shooter: PlayerState, hit: ShotHit, def: WeaponDef, now: number): void {
-    if (!victim.alive || now < victim.spawnProtectedUntil) return;
+  /**
+   * Apply one pellet's damage. Returns the enemy HP this pellet is CREDITED with
+   * removing, which is what C5's `damageDealt` is made of and what tells the
+   * caller whether the pull counts as a hit:
+   *  - post-ARMOUR: what the victim's hp bar actually lost, not what the weapon
+   *    rolled (`hit.dmg`) — the vest eats its share and the roll overstates it;
+   *  - no OVERKILL: a 40-damage hit on a 12-hp player is credited 12, because 12
+   *    is all the HP there was to take;
+   *  - never SELF- or TEAM damage. The target set in tryFire already excludes
+   *    both, so this is a belt-and-braces guard on the accounting only: the
+   *    damage itself still applies exactly as before if anything ever routes
+   *    here, it simply earns the shooter nothing.
+   * 0 means "nothing credited" — blocked, absorbed by the guards, or friendly.
+   */
+  private applyDamage(victim: PlayerState, shooter: PlayerState, hit: ShotHit, def: WeaponDef, now: number): number {
+    if (!victim.alive || now < victim.spawnProtectedUntil) return 0;
     // frozen armor model: with points left, hp loses round(dmg*(1-absorb)) and
     // armor loses round(dmg*absorb); when armor runs out mid-hit the unsoaked
     // remainder rolls into hp. Headshots BYPASS armor unless a helmet is owned.
@@ -1160,8 +1285,13 @@ export class GameRoom {
         victim.armor = 0;
       }
     }
+    const hpBefore = victim.hp;
     victim.hp -= hpDmg;
     const killed = victim.hp <= 0;
+    // hp can go negative on a killing blow; only what was actually there counts
+    const removed = hpBefore - Math.max(0, victim.hp);
+    const credited = shooter !== victim && shooter.team !== victim.team ? removed : 0;
+    shooter.damageDealt += credited;
     this.sendEvent(shooter.id, { t: 'hit', victimId: victim.id, dmg: hit.dmg, headshot: hit.headshot, killed });
     // yaw = world yaw from the victim towards the shooter (inverse of aimDir)
     this.sendEvent(victim.id, {
@@ -1171,6 +1301,7 @@ export class GameRoom {
       yaw: Math.atan2(-(shooter.body.x - victim.body.x), -(shooter.body.z - victim.body.z)),
     });
     if (killed) this.kill(victim, shooter, hit.headshot, def, now);
+    return credited;
   }
 
   private kill(victim: PlayerState, killer: PlayerState | null, headshot: boolean, def: WeaponDef, now: number): void {

@@ -1452,8 +1452,14 @@ const CSS = `
   box-shadow:inset 0 1px 0 rgba(var(--m9-hudText-rgb),.1),0 6px 16px rgba(var(--m9-ink-rgb),.6);}
 .fps-menus .m9-btn:active:not(:disabled){transform:translateY(0);}
 .fps-menus .m9-btn:disabled{opacity:.38;cursor:default;box-shadow:none;}
-.fps-menus .m9-btn-primary{color:var(--m9-ink);border-color:var(--m9-tLit);
-  background:linear-gradient(180deg,var(--m9-tLit),var(--m9-hudAccent) 55%,var(--m9-tBrown));
+/* Brand chrome (primary button, hero rule, meter fill, join scan, chip rail,
+   affordable-card rail) is AMBER: hudAccent and its lit companion. It used to
+   reach for tLit because tLit happened to be that amber. It no longer is - the
+   T family rotated to hue 6 so a T stops sinking into Dustbowl's sand, and menu
+   chrome painted in the live enemy colour would teach the wrong read.
+   Only .m9-t / .m9-th-t / .m9-btn-t / .m9-plate-t track the team. */
+.fps-menus .m9-btn-primary{color:var(--m9-ink);border-color:var(--m9-hazardAmberLit);
+  background:linear-gradient(180deg,var(--m9-hazardAmberLit),var(--m9-hudAccent) 55%,var(--m9-tBrown));
   box-shadow:inset 0 1px 0 rgba(var(--m9-paper-rgb),.4),0 6px 18px rgba(var(--m9-hudAccent-rgb),.25);}
 .fps-menus .m9-btn-primary:hover:not(:disabled){border-color:var(--m9-paper);}
 .m9-btn-small{padding:5px 10px;font-size:12px;}
@@ -1506,7 +1512,7 @@ const CSS = `
 .m9-rule{position:relative;overflow:hidden;height:3px;width:108px;margin:11px auto 15px;
   background:rgba(var(--m9-hudAccent-rgb),.28);border-radius:2px;}
 .m9-rule::after{content:'';position:absolute;top:0;bottom:0;width:38px;left:-44px;
-  background:linear-gradient(90deg,rgba(var(--m9-hudAccent-rgb),0),var(--m9-tLit),rgba(var(--m9-hudAccent-rgb),0));
+  background:linear-gradient(90deg,rgba(var(--m9-hudAccent-rgb),0),var(--m9-hazardAmberLit),rgba(var(--m9-hudAccent-rgb),0));
   border-radius:2px;animation:m9rulesweep 2.8s ease-in-out infinite;}
 @keyframes m9rulesweep{0%{left:-44px;}55%{left:100%;}100%{left:100%;}}
 .m9-field{margin-bottom:11px;}
@@ -1608,7 +1614,7 @@ const CSS = `
 .m9-gear-body{display:flex;flex-direction:column;gap:9px;min-width:0;}
 /* state rail: colour AND a worded footer, never colour alone */
 .m9-card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;}
-.m9-card.m9-st-ok::before{background:linear-gradient(180deg,var(--m9-tLit),var(--m9-hudAccent));}
+.m9-card.m9-st-ok::before{background:linear-gradient(180deg,var(--m9-hazardAmberLit),var(--m9-hudAccent));}
 .m9-card.m9-st-own::before{background:linear-gradient(180deg,var(--m9-leafLit),var(--m9-hpGreen));}
 .m9-card.m9-st-poor::before,.m9-card.m9-st-closed::before,.m9-card.m9-st-locked::before{
   background:linear-gradient(180deg,var(--m9-danger),var(--m9-roofRedDeep));}
@@ -1648,7 +1654,7 @@ const CSS = `
 .m9-meter-track{display:block;height:5px;border-radius:3px;overflow:hidden;
   background:rgba(var(--m9-ink-rgb),.92);box-shadow:inset 0 1px 2px rgba(var(--m9-ink-rgb),.95);}
 .m9-meter-fill{display:block;height:100%;border-radius:3px;
-  background:linear-gradient(90deg,var(--m9-tBrown),var(--m9-hudAccent) 58%,var(--m9-tLit));}
+  background:linear-gradient(90deg,var(--m9-tBrown),var(--m9-hudAccent) 58%,var(--m9-hazardAmberLit));}
 .m9-meter-val{text-align:right;font-size:11px;font-weight:700;color:var(--m9-hudText);
   font-variant-numeric:tabular-nums;}
 
@@ -1690,7 +1696,7 @@ const CSS = `
 .m9-score-vs{font-size:11px;font-weight:800;letter-spacing:.24em;color:var(--m9-steel);}
 .m9-plate-t,.m9-plate-ct{position:relative;overflow:hidden;}
 .m9-plate-t::before,.m9-plate-ct::before{content:'';position:absolute;top:0;bottom:0;width:4px;}
-.m9-plate-t::before{left:0;background:linear-gradient(180deg,var(--m9-tLit),var(--m9-tBrown));}
+.m9-plate-t::before{left:0;background:linear-gradient(180deg,var(--m9-tLit),var(--m9-tDark));}
 .m9-plate-ct::before{right:0;background:linear-gradient(180deg,var(--m9-ctLit),var(--m9-ctDark));}
 .m9-score-plate{display:grid;grid-template-columns:1fr auto;align-items:center;gap:12px;
   padding:12px 18px;border:1px solid var(--m9-metalDark);border-radius:10px;
@@ -1825,7 +1831,7 @@ const CSS = `
 .m9-join-bar{position:relative;width:240px;height:3px;border-radius:2px;overflow:hidden;
   background:rgba(var(--m9-hudAccent-rgb),.18);}
 .m9-join-bar-fill{position:absolute;top:0;bottom:0;width:80px;left:-90px;border-radius:2px;
-  background:linear-gradient(90deg,rgba(var(--m9-hudAccent-rgb),0),var(--m9-tLit),rgba(var(--m9-hudAccent-rgb),0));
+  background:linear-gradient(90deg,rgba(var(--m9-hudAccent-rgb),0),var(--m9-hazardAmberLit),rgba(var(--m9-hudAccent-rgb),0));
   animation:m9scan 1.5s ease-in-out infinite;}
 @keyframes m9scan{0%{left:-90px;}100%{left:240px;}}
 .m9-join-sub{font-size:11px;letter-spacing:.2em;color:var(--m9-steel);animation:m9pulse 1.8s ease-in-out infinite;}
@@ -1838,7 +1844,7 @@ const CSS = `
   background:linear-gradient(180deg,rgba(var(--m9-charcoal-rgb),.92),rgba(var(--m9-ink-rgb),.9));
   box-shadow:0 6px 18px rgba(var(--m9-ink-rgb),.6),inset 0 1px 0 rgba(var(--m9-hudText-rgb),.08);}
 .m9-chip::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;
-  background:linear-gradient(180deg,var(--m9-tLit),var(--m9-hudAccent));}
+  background:linear-gradient(180deg,var(--m9-hazardAmberLit),var(--m9-hudAccent));}
 .m9-chip-label{font-weight:700;letter-spacing:.1em;}
 .m9-chip-sep{display:block;width:1px;height:15px;background:rgba(var(--m9-steel-rgb),.35);}
 .m9-chip-cap{font-size:9px;font-weight:700;letter-spacing:.24em;color:var(--m9-steel);}

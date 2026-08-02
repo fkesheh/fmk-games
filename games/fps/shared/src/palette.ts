@@ -83,19 +83,64 @@ export const PALETTE = {
   shrubDead: '#7a6a3f', //       L 44
 
   // ---- teams (saturated on purpose: enemies MUST pop from the muted world) --
-  ctLit: '#5b7cc4', //           L 51
-  ctBlue: '#3d5a9b', //          L 39
-  ctDark: '#2a3f6e', //          L 27
-  tLit: '#e5b055', //            L 75
-  tAmber: '#c8912f', //          L 62
-  tBrown: '#6e5232', //          L 36
+  // READABILITY LAW (§1 L6, enforced by valueLadder.test.ts): every team BASE
+  // colour must clear BOTH the ground and the L1 reference wall of EVERY map by
+  // >= 18 L* OR >= 30 degrees of hue. The old ctBlue/tAmber failed 6 of 12 pairs
+  // — a CT sank into the cool tarmac/carpet floors, a T sank into the warm
+  // sand/plaster walls — which is a fairness bug, not a taste one.
+  //
+  // WHY THE HUES MOVED, and why a "true" blue and a "true" amber are BOTH
+  // unreachable (this is arithmetic, not preference):
+  //   CT — every cool ground/wall in the game sits at hue 210-215
+  //        (metalDark 26.6, carpet 28.9, tarmac 34.7, snowShadow 59.3, snow 89.4
+  //        in L*). No single L* is >= 18 away from all five (the gaps between
+  //        34.7/59.3 and 59.3/89.4 are only 24.6 and 30.1 wide), so L* alone
+  //        cannot solve it at ANY lightness. Hue must do the work, which forces
+  //        the family off 220 to >= 243. It sits at 250: a deep indigo that
+  //        still reads blue, and now clears carpet by 35 deg and tarmac by 37.
+  //   T  — the warm surfaces are dust L50.4 and plaster L83.5, only 33.1 L*
+  //        apart, and they share a hue (38.3 / 37.5). Clearing both by 18 needs
+  //        36 L* of room: 2.9 short. So an amber at hue ~40 is only legal below
+  //        L*32 — a dark rust that would then sink into the four DARK cool
+  //        floors instead. The family rotates to hue 6 (blaze / vermilion) and
+  //        KEEPS its brightness, which is the readable half of the trade.
+  // Team-vs-team separation is not weakened by this: dE76 rises 98.9 -> 121.2
+  // (117.0 under simulated protanopia, was 97.1) and dL* holds at 24.1 (was 24.9).
+  ctPale: '#b9aeeb', //          L 74  helmet shell — the long-range silhouette
+  ctLit: '#7e6cd8', //           L 52  shoulders / helmet brim
+  ctBlue: '#5239ca', //          L 36  uniform body (BASE — the tested tier)
+  ctDark: '#3b2898', //          L 26  limb value break
+  tPale: '#ffb4ab', //           L 80  helmet shell
+  tLit: '#ff8e81', //            L 71  shoulders / helmet brim
+  tAmber: '#ff5542', //          L 60  uniform body (BASE — the tested tier)
+  tDark: '#de230e', //           L 48  limb value break
+  // `tBrown` is NO LONGER a team tier — it lost that job when the T family
+  // rotated to hue 6, because a red-brown would have tinted every sandbag and
+  // barrel red. It stays exactly where it was as the WORLD's industrial brown
+  // (mapRenderer's sack/barrel bodies) and must not be dragged along by team
+  // retunes. The T dark tier is `tDark`.
+  tBrown: '#6e5232', //          L 36  world industrial brown (sacks, barrels)
   skin: '#e0ac69', //            L 74
+
+  // ---- signage / hazard dressing ----
+  // These two ARE the old `tAmber` / `tLit` hexes, kept byte-for-byte. When the
+  // T family rotated to hue 6 the maps' safety-amber stripes had to stop
+  // tracking it: a hazard plate painted in the live enemy colour is a
+  // false-positive enemy read every time you clear a corner, which is the same
+  // fairness bug this pass exists to remove. Hazard dressing is world dressing;
+  // it now has its own name and never moves with a team retune.
+  hazardAmber: '#c8912f', //     L 62  hazard stripes, dock edges, door plates
+  hazardAmberLit: '#e5b055', //  L 75  their lit companion + the shell accent
 
   // ---- fx ----
   muzzle: '#ffcf6e',
   tracer: '#ffd88a',
   blood: '#a03028',
-  fire: '#ff7733',
+  // Pushed from #ff7733 (hue 20) to hue 31 by the §1 L6 gate: it is the tracer
+  // glow and the explosion core, and at hue 20 it sat 14 deg and 5 L* from the
+  // retuned `tLit` — a tracer streak the colour of an enemy's shoulder. Hotter
+  // and yellower is also the truer flame; the T family now owns the red end.
+  fire: '#ff8e16',
 
   // ---- skies & fog (map themes only) ----
   // Each sky family is a THREE-stop gradient: …High (zenith) -> base (mid) ->

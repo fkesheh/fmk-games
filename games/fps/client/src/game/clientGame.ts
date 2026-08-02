@@ -71,7 +71,19 @@ import { ViewModel } from '../render/viewModel.js';
 import { Effects } from '../render/effects.js';
 import { AudioEngine } from '../audio/audio.js';
 import type { SfxKind } from '../audio/audio.js';
-import type { Hud, HudState } from '../ui/hud.js';
+import type { Hud, HudState, DeathCardInfo, WinStreak } from '../ui/hud.js';
+import {
+  NO_STREAK,
+  STREAK_MIN,
+  damageSeverity01,
+  nextWinStreak,
+  swapStreakSides,
+} from '../ui/hud.js';
+import {
+  SHAKE_FIRE_ADD,
+  SHAKE_FIRE_CEIL,
+  shakeTraumaForDamage,
+} from '../render/scene.js';
 import type { Menus } from '../ui/menus.js';
 import { ClientState } from './state.js';
 
@@ -209,7 +221,16 @@ export class ClientGame {
     spreadPx: 0, scoped: false, spectating: null,
     team: null, you: '', players: [],
     seated: 0, minPlayers: MIN_PLAYERS_FOR_MATCH, canStart: false,
+    streakTeam: null, streakCount: 0,
   };
+  /**
+   * Round-win run, folded from the `round_end` stream (C6's sibling — derived
+   * client-side, nothing on the wire). The server's private `lossStreak` pair
+   * is NOT this quantity: a draw increments BOTH of its counters, so the
+   * opponent's loss streak overstates a win streak the moment one draw lands.
+   * `nextWinStreak` handles the draw explicitly by breaking both runs.
+   */
+  private winStreak: WinStreak = NO_STREAK;
   private readonly syncOut: SyncEntry[] = []; // roster-merged remotes, reused array
   private readonly syncPool = new Map<PlayerId, SyncEntry>(); // per-id reused entries
   private readonly others = new Map<PlayerId, OtherTrack>(); // footstep tracking
@@ -637,6 +658,8 @@ export class ClientGame {
     this.snapCanStart = false;
     this.dbgMove = null;
     this.dbgButtons = 0;
+    this.winStreak = NO_STREAK;
+    this.hud.matchEnd(null); // a rejoin must never flash the last match's board
   }
 
   // ---- S2C dispatch (every handler wrapped by guard at the call site) --------------
@@ -784,6 +807,7 @@ export class ClientGame {
       s.round = 0;
       s.scoreT = 0;
       s.scoreCT = 0;
+      this.winStreak = NO_STREAK; // a new match starts with nobody on a run
     }
     // UX_BIBLE: name the pre-match phase, once per warmup entry
     if (msg.phase === 'warmup') {
@@ -808,6 +832,7 @@ export class ClientGame {
 
     // match end screen is dismissed by the return to warmup
     if (prevPhase === 'matchEnd' && msg.phase === 'warmup') {
+      this.hud.matchEnd(null);
       this.menus.hideAll();
       this.menus.showInRoom(w.mapName, s.code);
     }
@@ -896,6 +921,26 @@ export class ClientGame {
           killer?.team ?? null,
           victim?.team ?? null,
         );
+        // OUR death: the one moment the player most needs information and
+        // previously got none. killerId is already on the wire (C4) — no server
+        // or protocol change is needed to answer "who killed me?".
+        if (ev.victimId === s.youId) {
+          // A killer that is null (world damage, console `kill`) OR that is us
+          // (self-inflicted) is not a killer: C4 requires the neutral form, so
+          // the name is passed as null rather than as an id or "undefined".
+          const kid = ev.killerId;
+          const selfInflicted = kid === null || kid === ev.victimId;
+          const card: DeathCardInfo = {
+            // roster miss on a REAL killer falls back to the id, mirroring the
+            // killfeed's `victim?.name ?? ev.victimId` — losing the name is not
+            // a reason to also lose the fact that somebody killed you
+            killerName: selfInflicted ? null : (killer?.name ?? kid),
+            killerTeam: selfInflicted ? null : (killer?.team ?? null),
+            weapon: ev.weapon,
+            headshot: ev.headshot,
+          };
+          this.hud.deathCard(card);
+        }
         const pos = this.victimPoint(ev.victimId);
         const w = this.world;
         // first person: no burst at our own feet — the particles would fill
@@ -930,9 +975,13 @@ export class ClientGame {
         break;
       }
       case 'dmg_taken': {
-        // first person: no own blood — directional red edge flash + shake
-        this.hud.damageFrom(wrapPi(ev.yaw - this.input.yaw));
-        this.world?.rig.shake(0.3);
+        // first person: no own blood — directional red edge flash + shake.
+        // `ev.dmg` used to be dropped here, which made a 12-damage graze and an
+        // 89-damage near-kill pixel-identical. One severity drives both halves
+        // of the response so the flash and the shake always agree.
+        const sev = damageSeverity01(ev.dmg);
+        this.hud.damageFrom(wrapPi(ev.yaw - this.input.yaw), ev.dmg);
+        this.world?.rig.shake(shakeTraumaForDamage(sev));
         break;
       }
       case 'round_start': {
@@ -947,9 +996,17 @@ export class ClientGame {
       case 'round_end': {
         s.scoreT = ev.scoreT;
         s.scoreCT = ev.scoreCT;
+        // The round-win run is derived HERE, from this event stream and nothing
+        // else. A draw (winner === null) breaks both sides' runs — see
+        // nextWinStreak, and the warning beside `round_end` in types.ts about
+        // the server's lossStreak pair, which is a different quantity.
+        this.winStreak = nextWinStreak(this.winStreak, ev.winner);
+        const run = this.winStreak;
         this.hud.banner(
           ev.winner === null ? 'ROUND DRAW' : `${ev.winner} WINS THE ROUND`,
-          `T ${ev.scoreT} : ${ev.scoreCT} CT`,
+          run.count >= STREAK_MIN
+            ? `T ${ev.scoreT} : ${ev.scoreCT} CT  •  ${run.team} ${run.count} IN A ROW`
+            : `T ${ev.scoreT} : ${ev.scoreCT} CT`,
         );
         this.audio.sfx('round_end');
         this.closeBuy();
@@ -963,7 +1020,19 @@ export class ClientGame {
           this.buySig = '';
           this.menus.hideBuy();
         }
-        this.menus.showMatchEnd(ev.winner, ev.scoreT, ev.scoreCT, s.team, this.rosterArray());
+        // The end screen is the HUD's now, not the menus' — C5's stats array
+        // carries every player on both teams and the old menus panel could only
+        // show a top-3-by-kills list built from the roster. `ev.stats` is
+        // passed straight through in the order the server sent it.
+        this.menus.hideScoreboard(); // a held Tab must not cover the board
+        this.hud.matchEnd({
+          winner: ev.winner,
+          scoreT: ev.scoreT,
+          scoreCT: ev.scoreCT,
+          you: s.team,
+          youId: s.youId ?? '',
+          stats: ev.stats,
+        });
         this.audio.sfx(ev.winner === s.team ? 'win' : 'lose');
         break;
       }
@@ -973,6 +1042,10 @@ export class ClientGame {
         for (const r of ev.roster) s.roster.set(r.id, r);
         const me = s.youId !== null ? s.roster.get(s.youId) : undefined;
         if (me !== undefined) s.team = me.team;
+        // The server swaps the SCORES with the sides so they follow the players
+        // (game.ts advanceAfterRound). The run has to make the same trip or it
+        // would credit the wrong half of the room for the rest of the match.
+        this.winStreak = swapStreakSides(this.winStreak);
         this.hud.banner('HALFTIME', 'SIDES SWAPPED');
         break;
       }
@@ -1074,7 +1147,8 @@ export class ClientGame {
         (prevButtons & INPUT_FIRE) === 0
       ) {
         w.viewmodel.fire();
-        w.rig.shake(0.1);
+        // ceilinged: emptying a mag must not pin the camera at full amplitude
+        w.rig.shake(SHAKE_FIRE_ADD, SHAKE_FIRE_CEIL);
         const fireDef = WEAPONS[you.weapon];
         this.bloomDeg = Math.min(
           this.bloomDeg + fireDef.spreadPerShot,
@@ -1233,6 +1307,10 @@ export class ClientGame {
     h.seated = this.snapSeated;
     h.minPlayers = this.snapMinPlayers;
     h.canStart = this.snapCanStart;
+    // stakes row: the run we folded from round_end (match point is derived
+    // inside the HUD from scoreT/scoreCT + ROUNDS.winRounds)
+    h.streakTeam = this.winStreak.team;
+    h.streakCount = this.winStreak.count;
     this.hud.update(h);
 
     w.rig.render();

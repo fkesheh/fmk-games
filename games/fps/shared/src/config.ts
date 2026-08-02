@@ -39,7 +39,21 @@ export const ECONOMY = {
   start: 800,
   killReward: 300,
   winReward: 3250,
-  lossReward: 1900,
+  // Escalating loss bonus (C2, AMENDED after measurement). Payout for a team
+  // that loses a round =
+  //   min(lossRewardBase + lossRewardStep * lossStreak, lossRewardMax)
+  // where lossStreak is the consecutive rounds that team had ALREADY lost
+  // before this round. Ladder: 0->1400, 1->1800, 2->2200, 3->2600, 4+->2600.
+  //
+  // Tuned for a 10-round, first-to-6 match with halftime at 5 — NOT the 30-round
+  // CS ladder. Three structural constraints, pinned by economy.test.ts:
+  //   base 1400 < smg 1500              -> one loss cannot fund a gun (R1 eco, R2 force)
+  //   streak 2 -> 2200 >= smg+vest 2150 -> full SMG buy back by the SECOND loss
+  //   max 2600 < rifle 2700 < winReward -> a payout alone NEVER buys a rifle;
+  //                                        rifle money comes from saving or fragging
+  lossRewardBase: 1400,
+  lossRewardStep: 400,
+  lossRewardMax: 2600,
   max: 16000,
 } as const;
 

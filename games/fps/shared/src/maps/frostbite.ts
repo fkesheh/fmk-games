@@ -3,7 +3,11 @@
 //   - 3 lanes from T spawn (south) to CT spawn (north): west / mid / east, linked by
 //     two gaps per ice-ridge divider (south gap z 8..12, frozen creek z -9.2..-0.8)
 //   - frozen creek gully: 0.6-deep trench (snow banks) with ice floor; crossed by
-//     jumping the banks or via 0.4 step boxes at x = -21 / -6 / 6 / 21
+//     jumping the banks or via 0.4 step boxes at x = -21 / -6 / 6 / 21. Each of
+//     those four lanes carries FOUR steps, mirrored about the creek midline
+//     z = -5, so the walk-across works north->south as well as south->north
+//     (a 0.6 bank is above PLAYER.stepUp 0.42 and needs a step on the face you
+//     approach from). Asserted in maps/sightline.test.ts.
 //   - no T spawn visible from any CT spawn (twin ice screens at z=+-15 block all pairs)
 //   - cover (h>=0.9) at least every 8m along each lane; longest open sightline 41.4m <= 42m
 //     (bank-top creek lane capped by h=2.5 dam/boulders; gap-mouth diagonal by w=5 ice spikes)
@@ -94,15 +98,32 @@ export const frostbite: MapDef = {
     { x: 17.5, y: 1.25, z: -5, w: 2.5, h: 2.5, d: 3, mat: 'rock' },
     { x: -27.5, y: 1.1, z: -2, w: 4, h: 2.2, d: 3, mat: 'rockDeep' }, // creek-mouth rocks
     { x: 27.5, y: 1.1, z: -2, w: 4, h: 2.2, d: 3, mat: 'rockDeep' },
-    // step crossings (ground -> 0.4 step -> 0.6 bank): south side + inside creek
+    // step crossings (ground -> 0.4 step -> 0.6 bank), FOUR boxes per lane so the
+    // crossing is symmetric about the creek's midline z = -5. Both banks are 0.6
+    // tall and PLAYER.stepUp is 0.42, so a bank is only WALKABLE from a face that
+    // has a step against it. The original set had steps on the south face of the
+    // south bank and the south face of the north bank only, which made all four
+    // crossings one-way south->north: a T walked over, a CT had to jump both
+    // banks. The two boxes added per lane are the exact mirrors of the two that
+    // were already here (z -0.3 <-> -9.7 on ground = `snow`, z -7.5 <-> -2.5
+    // inside the creek = `ice`). Proven both ways by the stepUp-limited flood
+    // fill in maps/sightline.test.ts. No existing box moved.
     { x: -21, y: 0.2, z: -0.3, w: 2.4, h: 0.4, d: 1, mat: 'snow' },
+    { x: -21, y: 0.2, z: -2.5, w: 2.4, h: 0.4, d: 1, mat: 'ice' },
     { x: -21, y: 0.2, z: -7.5, w: 2.4, h: 0.4, d: 1, mat: 'ice' },
+    { x: -21, y: 0.2, z: -9.7, w: 2.4, h: 0.4, d: 1, mat: 'snow' },
     { x: -6, y: 0.2, z: -0.3, w: 2.4, h: 0.4, d: 1, mat: 'snow' },
+    { x: -6, y: 0.2, z: -2.5, w: 2.4, h: 0.4, d: 1, mat: 'ice' },
     { x: -6, y: 0.2, z: -7.5, w: 2.4, h: 0.4, d: 1, mat: 'ice' },
+    { x: -6, y: 0.2, z: -9.7, w: 2.4, h: 0.4, d: 1, mat: 'snow' },
     { x: 6, y: 0.2, z: -0.3, w: 2.4, h: 0.4, d: 1, mat: 'snow' },
+    { x: 6, y: 0.2, z: -2.5, w: 2.4, h: 0.4, d: 1, mat: 'ice' },
     { x: 6, y: 0.2, z: -7.5, w: 2.4, h: 0.4, d: 1, mat: 'ice' },
+    { x: 6, y: 0.2, z: -9.7, w: 2.4, h: 0.4, d: 1, mat: 'snow' },
     { x: 21, y: 0.2, z: -0.3, w: 2.4, h: 0.4, d: 1, mat: 'snow' },
+    { x: 21, y: 0.2, z: -2.5, w: 2.4, h: 0.4, d: 1, mat: 'ice' },
     { x: 21, y: 0.2, z: -7.5, w: 2.4, h: 0.4, d: 1, mat: 'ice' },
+    { x: 21, y: 0.2, z: -9.7, w: 2.4, h: 0.4, d: 1, mat: 'snow' },
 
     // ---- mid lane cover ----
     { x: 0, y: 1.1, z: 3, w: 4, h: 2.2, d: 3, mat: 'ice' }, // central ice block
@@ -232,18 +253,25 @@ export const frostbite: MapDef = {
     minH: 6.4,
     maxH: 7.4,
   },
-  // AAA accent: rescue amber (tAmber) — dam marker plate, gap-spike markers,
+  // AAA accent: rescue amber (hazardAmber) — dam marker plate, gap-spike markers,
   // creek-crossing step stripes: safety color against the snowfield
   accents: [
     // dam rock marker (south face, visible up the creek lane)
-    { x: 0, y: 1.3, z: -0.56, w: 1.6, h: 1.0, d: 0.06, hex: PALETTE.tAmber },
+    { x: 0, y: 1.3, z: -0.56, w: 1.6, h: 1.0, d: 0.06, hex: PALETTE.hazardAmber },
     // south-gap spike markers (south faces)
-    { x: -14.5, y: 1.4, z: 11.04, w: 1.8, h: 0.8, d: 0.06, hex: PALETTE.tAmber },
-    { x: 14.5, y: 1.4, z: 11.04, w: 1.8, h: 0.8, d: 0.06, hex: PALETTE.tAmber },
-    // creek step-crossing edge stripes (south steps)
-    { x: -21, y: 0.42, z: 0.23, w: 2.44, h: 0.1, d: 0.06, hex: PALETTE.tAmber },
-    { x: -6, y: 0.42, z: 0.23, w: 2.44, h: 0.1, d: 0.06, hex: PALETTE.tAmber },
-    { x: 6, y: 0.42, z: 0.23, w: 2.44, h: 0.1, d: 0.06, hex: PALETTE.tAmber },
-    { x: 21, y: 0.42, z: 0.23, w: 2.44, h: 0.1, d: 0.06, hex: PALETTE.tAmber },
+    { x: -14.5, y: 1.4, z: 11.04, w: 1.8, h: 0.8, d: 0.06, hex: PALETTE.hazardAmber },
+    { x: 14.5, y: 1.4, z: 11.04, w: 1.8, h: 0.8, d: 0.06, hex: PALETTE.hazardAmber },
+    // creek step-crossing edge stripes — one on the OUTWARD face of each approach
+    // step, so the crossing advertises itself from whichever side you arrive on.
+    // Same mirror about z = -5 as the step boxes, same existing hazardAmber: no
+    // new hex enters the map, so the value ladder is untouched.
+    { x: -21, y: 0.42, z: 0.23, w: 2.44, h: 0.1, d: 0.06, hex: PALETTE.hazardAmber },
+    { x: -6, y: 0.42, z: 0.23, w: 2.44, h: 0.1, d: 0.06, hex: PALETTE.hazardAmber },
+    { x: 6, y: 0.42, z: 0.23, w: 2.44, h: 0.1, d: 0.06, hex: PALETTE.hazardAmber },
+    { x: 21, y: 0.42, z: 0.23, w: 2.44, h: 0.1, d: 0.06, hex: PALETTE.hazardAmber },
+    { x: -21, y: 0.42, z: -10.23, w: 2.44, h: 0.1, d: 0.06, hex: PALETTE.hazardAmber },
+    { x: -6, y: 0.42, z: -10.23, w: 2.44, h: 0.1, d: 0.06, hex: PALETTE.hazardAmber },
+    { x: 6, y: 0.42, z: -10.23, w: 2.44, h: 0.1, d: 0.06, hex: PALETTE.hazardAmber },
+    { x: 21, y: 0.42, z: -10.23, w: 2.44, h: 0.1, d: 0.06, hex: PALETTE.hazardAmber },
   ],
 };

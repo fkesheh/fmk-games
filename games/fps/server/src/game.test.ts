@@ -6,9 +6,10 @@
 // ============================================================================
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ECONOMY, GEAR, INPUT_FIRE, MAPS, MAX_PLAYERS, MIN_PLAYERS_FOR_MATCH, MULTIKILL_WINDOW, PLAYER, ROUNDS, WEAPONS, boxToAABB, hitscan } from '@fps/shared';
-import type { C2S, GameEvent, HitscanTarget, MapId, PlayerId, RoomPhase, S2C, Team, Vec3 } from '@fps/shared';
+import type { C2S, GameEvent, HitscanTarget, MapId, PlayerId, RoomPhase, S2C, Team, Vec3, WeaponDef } from '@fps/shared';
 import { GameRoom } from './game.js';
 import type { RoomIO } from './game.js';
+import type { ShotHit } from './combat.js';
 
 type SnapshotMsg = Extract<S2C, { t: 'snapshot' }>;
 type JoinedMsg = Extract<S2C, { t: 'joined' }>;
@@ -550,6 +551,19 @@ function teamOf(io: FakeIO, id: PlayerId): Team {
   return io.joined(id).team;
 }
 
+/**
+ * Lose one whole round on purpose, without a firefight: wait for 'live', have
+ * `losers` kill themselves (console 'kill' — no killer, so no kill reward
+ * distorts the money curve), then settle in 'roundEnd'. Two losers on opposite
+ * sides is a mutual elimination, i.e. a draw. `watcher` must be a player whose
+ * snapshots keep arriving (any seated player does).
+ */
+function loseRound(room: GameRoom, io: FakeIO, watcher: PlayerId, losers: PlayerId[]): void {
+  advanceToPhase(io, watcher, 'live');
+  for (const id of losers) room.handleMessage(id, { t: 'suicide' });
+  advanceToPhase(io, watcher, 'roundEnd');
+}
+
 function eventsOfType<T extends GameEvent['t']>(io: FakeIO, id: PlayerId, t: T): Array<Extract<GameEvent, { t: T }>> {
   return io.events(id).filter((e): e is Extract<GameEvent, { t: T }> => e.t === t);
 }
@@ -783,7 +797,8 @@ describe('GameRoom combat + rounds', () => {
     const ok = advanceUntil(() => io.lastSnap('p1').phase === 'roundEnd');
     expect(ok).toBe(true);
     expect(io.lastSnap('p1').you.money).toBe(ECONOMY.start + ECONOMY.killReward + ECONOMY.winReward);
-    expect(io.lastSnap('p2').you.money).toBe(ECONOMY.start + ECONOMY.lossReward);
+    // first loss of the match: the escalating ladder pays its base rung
+    expect(io.lastSnap('p2').you.money).toBe(ECONOMY.start + ECONOMY.lossRewardBase);
     room.stop();
   });
 
@@ -817,37 +832,55 @@ describe('GameRoom combat + rounds', () => {
 });
 
 describe('GameRoom economy', () => {
-  it('rifle at $800 fails insufficient funds; succeeds in freeze after round rewards', () => {
+  it('a buy is refused while broke and succeeds in freeze once round rewards land', () => {
+    // Deliberately NOT a rifle any more. Under the escalating ladder one lost
+    // round banks start + lossRewardBase = $2200, which is short of the $2700
+    // rifle — that refusal is the intended balance, not a regression. What the
+    // test is actually about survives: broke => refused, funded => bought.
     const io = new FakeIO();
     const room = setupDuel(io);
     const feed = new InputFeed();
 
-    // freeze round 1: buy menu is open, rifle is unaffordable on starting money
+    // freeze round 1: buy menu is open, the SMG is unaffordable on $800
     advanceToPhase(io, 'p2', 'freeze');
-    room.handleBuy('p2', 'rifle');
+    room.handleBuy('p2', 'smg');
     const first = eventsOfType(io, 'p2', 'buy_result');
     expect(first.length).toBe(1);
     expect(first[0]?.ok).toBe(false);
     expect(first[0]?.reason).toBe('insufficient funds');
     expect(first[0]?.weapon).toBeNull();
 
-    // p1 eliminates p2 in round 1: p2 banks start + lossReward = exactly a rifle
+    // p1 eliminates p2 in round 1: p2 banks the base rung of the loss ladder
     advanceToPhase(io, 'p1', 'live');
     fightUntilKill(room, io, feed, 'p1', 'p2');
     advanceToPhase(io, 'p2', 'freeze'); // round 2 freeze
+    const banked = ECONOMY.start + ECONOMY.lossRewardBase;
+    expect(io.lastSnap('p2').you.money).toBe(banked);
 
+    // one lost round is NOT a rifle round any more
     room.handleBuy('p2', 'rifle');
-    const results = eventsOfType(io, 'p2', 'buy_result');
-    expect(results.length).toBe(2);
-    expect(results[1]?.ok).toBe(true);
-    expect(results[1]?.weapon).toBe('rifle');
-    expect(results[1]?.reason).toBeNull();
+    const denied = eventsOfType(io, 'p2', 'buy_result');
+    expect(denied.length).toBe(2);
+    expect(denied[1]?.ok).toBe(false);
+    expect(denied[1]?.reason).toBe('insufficient funds');
 
-    tick(); // let a snapshot reflect the purchase
+    // ...but it does cover SMG + vest, with change to spare
+    room.handleBuy('p2', 'smg');
+    const results = eventsOfType(io, 'p2', 'buy_result');
+    expect(results.length).toBe(3);
+    expect(results[2]?.ok).toBe(true);
+    expect(results[2]?.weapon).toBe('smg');
+    expect(results[2]?.reason).toBeNull();
+    room.handleMessage('p2', { t: 'buy_gear', item: 'kevlar' });
+    expect(eventsOfType(io, 'p2', 'buy_result')[3]?.ok).toBe(true);
+
+    tick(); // let a snapshot reflect the purchases
     const you = io.lastSnap('p2').you;
-    expect(you.money).toBe(ECONOMY.start + ECONOMY.lossReward - WEAPONS.rifle.price);
-    expect(you.weapons).toEqual(['pistol', 'knife', 'rifle']); // held weapon stays first
+    expect(you.money).toBe(banked - WEAPONS.smg.price - GEAR.kevlarPrice);
+    expect(you.money).toBeGreaterThanOrEqual(0);
+    expect(you.weapons).toEqual(['pistol', 'knife', 'smg']); // held weapon stays first
     expect(you.weapon).toBe('pistol');
+    expect(you.armor).toBe(GEAR.armorStart);
     expect(you.canBuy).toBe(true);
     room.stop();
   });
@@ -905,13 +938,88 @@ describe('GameRoom economy', () => {
 
     // p2 died in round 1 (death drops gear): its helmet buy is rejected even
     // though the loss reward covers the price — the vest must come first
-    expect(io.lastSnap('p2').you.money).toBe(ECONOMY.start + ECONOMY.lossReward);
+    expect(io.lastSnap('p2').you.money).toBe(ECONOMY.start + ECONOMY.lossRewardBase);
     room.handleMessage('p2', { t: 'buy_gear', item: 'helmet' });
     const p2results = eventsOfType(io, 'p2', 'buy_result');
     expect(p2results.length).toBe(1);
     expect(p2results[0]?.ok).toBe(false);
     expect(p2results[0]?.reason).toBe('requires kevlar');
     expect(p2results[0]?.weapon).toBeNull();
+    room.stop();
+  });
+
+  // --- escalating loss bonus (contract C2/C3) --------------------------------
+  // The room owns two loss-streak counters that never reach the wire. They are
+  // read BEFORE a round's result is applied, so the side that has already lost
+  // twice is paid the third rung for losing the third. These tests read the
+  // money curve through real rounds, which is the only place the wiring shows.
+
+  it('consecutive losses climb the ladder, and halftime puts both sides back on the base rung', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io);
+    // p2 throws every round; p1's side takes them all
+    const curve: number[] = [];
+    for (let r = 0; r < ROUNDS.halftimeAfter + 1; r++) {
+      loseRound(room, io, 'p1', ['p2']);
+      curve.push(io.lastSnap('p2').you.money);
+    }
+    const gains = curve.map((m, i) => m - (i === 0 ? ECONOMY.start : (curve[i - 1] ?? 0)));
+    expect(gains).toEqual([
+      ECONOMY.lossRewardBase, // streak 0
+      ECONOMY.lossRewardBase + ECONOMY.lossRewardStep, // streak 1
+      ECONOMY.lossRewardBase + 2 * ECONOMY.lossRewardStep, // streak 2
+      ECONOMY.lossRewardMax, // streak 3 — the cap
+      ECONOMY.lossRewardMax, // streak 4, still capped
+      ECONOMY.lossRewardBase, // round 6: halftime wiped the streak
+    ]);
+    room.stop();
+  });
+
+  it('a round win resets that side back to the base rung', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io);
+    loseRound(room, io, 'p1', ['p2']); // streak 0 -> base
+    expect(io.lastSnap('p2').you.money).toBe(ECONOMY.start + ECONOMY.lossRewardBase);
+    loseRound(room, io, 'p1', ['p2']); // streak 1 -> base + step
+    const afterTwo = ECONOMY.start + 2 * ECONOMY.lossRewardBase + ECONOMY.lossRewardStep;
+    expect(io.lastSnap('p2').you.money).toBe(afterTwo);
+
+    loseRound(room, io, 'p2', ['p1']); // p2's side WINS this one
+    expect(io.lastSnap('p2').you.money).toBe(afterTwo + ECONOMY.winReward);
+
+    loseRound(room, io, 'p1', ['p2']); // back to losing: the streak restarted
+    expect(io.lastSnap('p2').you.money).toBe(afterTwo + ECONOMY.winReward + ECONOMY.lossRewardBase);
+    room.stop();
+  });
+
+  it('a draw pays both sides their own rung and climbs both streaks', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io);
+    loseRound(room, io, 'p1', ['p1', 'p2']); // mutual elimination
+    const afterOne = ECONOMY.start + ECONOMY.lossRewardBase;
+    expect(io.lastSnap('p1').you.money).toBe(afterOne);
+    expect(io.lastSnap('p2').you.money).toBe(afterOne);
+    expect(eventsOfType(io, 'p1', 'round_end')[0]?.winner).toBeNull();
+
+    loseRound(room, io, 'p1', ['p1', 'p2']); // both were already on streak 1
+    const afterTwo = afterOne + ECONOMY.lossRewardBase + ECONOMY.lossRewardStep;
+    expect(io.lastSnap('p1').you.money).toBe(afterTwo);
+    expect(io.lastSnap('p2').you.money).toBe(afterTwo);
+    room.stop();
+  });
+
+  it('a fresh match starts both sides on the base rung again', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io);
+    // p2 loses enough rounds to be deep in the ladder, then p1 takes the match
+    for (let r = 0; r < ROUNDS.winRounds; r++) loseRound(room, io, 'p1', ['p2']);
+    advanceToPhase(io, 'p1', 'matchEnd');
+    advanceToPhase(io, 'p1', 'warmup', 400); // fullReset 6s later
+    expect(io.lastSnap('p2').you.money).toBe(ECONOMY.start);
+
+    startMatch(room, 'p1');
+    loseRound(room, io, 'p1', ['p2']);
+    expect(io.lastSnap('p2').you.money).toBe(ECONOMY.start + ECONOMY.lossRewardBase);
     room.stop();
   });
 });
@@ -1112,6 +1220,52 @@ describe('GameRoom bots', () => {
     expect(room.removeBot()).toBe(true);
     expect(room.botCount()).toBe(0);
     expect(room.playerCount()).toBe(1);
+    room.stop();
+  });
+
+  it('a bot EQUIPS the primary it buys — a successful buy alone never re-arms it', () => {
+    // THE DEFECT this guards. `handleBuy` re-equips only when the currently
+    // HELD weapon leaves the owned list; a pistol is never replaced by a rifle,
+    // so it stayed equipped. Combined with a BotCommand that had no weapon
+    // field at all, a bot had no mechanism to ever change weapons: measured, two
+    // bots completed 23 successful rifle/SMG purchases and the only weapon
+    // either was ever seen holding was 'pistol'. Fixed by BotCommand.switchTo,
+    // routed through the same handleSwitch a client's { t: 'switch' } hits.
+    const io = new FakeIO();
+    const room = new GameRoom('dustbowl', 'public', io);
+    room.addPlayer('p1', 'Alpha');
+    const botId = room.addBot();
+    if (botId === null) throw new Error('addBot returned null with a free slot');
+    room.start();
+    startMatch(room, 'p1');
+
+    const botHolds = (): string | undefined =>
+      io.lastSnap('p1').players.find((p) => p.id === botId)?.weapon;
+
+    // Round 1 is a genuine pistol round: 800 start money buys no primary.
+    advanceToPhase(io, 'p1', 'live');
+    expect(botHolds()).toBe('pistol');
+
+    // Hand round 1 to the bot's team. winReward 3250 on top of ECONOMY.start
+    // 800 puts a rifle (2700) inside its budget for round 2's freeze. The
+    // suicide leaves the bot alive, so it also keeps whatever it buys.
+    room.handleMessage('p1', { t: 'suicide' });
+    advanceToPhase(io, 'p1', 'roundEnd');
+    advanceToPhase(io, 'p1', 'freeze');
+
+    const feed = new InputFeed();
+    const held = new Set<string>();
+    for (let i = 0; i < 150; i++) {
+      if (i % 30 === 0) feed.send(room, 'p1');
+      tick();
+      const w = botHolds();
+      if (w !== undefined) held.add(w);
+    }
+
+    // Bought AND holding it. Holding is the whole assertion: ownership without
+    // equipping is exactly the state the bug left every bot in.
+    expect(botHolds()).toBe('rifle');
+    expect(held.has('rifle')).toBe(true);
     room.stop();
   });
 
@@ -1705,4 +1859,377 @@ describe('GameRoom auto-balance', () => {
     expect(survivors).toContain(moves[1]?.id); // an untouched candidate went
     room.stop();
   });
+});
+
+// ---------------------------------------------------------------------------
+// C5 — end-of-match stats. damageDealt / shotsFired / shotsHit are siblings of
+// kills/deaths/headshots on PlayerState, and only `match_end` puts them on the
+// wire. These tests read them off the room directly so a single hit can be
+// weighed exactly, and the last test proves the wire shape end to end.
+// ---------------------------------------------------------------------------
+
+/** The six per-match counters, read straight off the room's PlayerState. */
+interface MatchCounters {
+  kills: number;
+  deaths: number;
+  headshots: number;
+  damageDealt: number;
+  shotsFired: number;
+  shotsHit: number;
+}
+
+/** applyDamage is private; the guard tests call it with crafted participants. */
+interface RoomInternals {
+  players: Map<PlayerId, MatchCounters & { hp: number; alive: boolean; team: Team }>;
+  applyDamage(victim: unknown, shooter: unknown, hit: ShotHit, def: WeaponDef, now: number): number;
+}
+
+function internals(room: GameRoom): RoomInternals {
+  return room as unknown as RoomInternals;
+}
+
+function statsOf(room: GameRoom, id: PlayerId): MatchCounters {
+  const p = internals(room).players.get(id);
+  if (p === undefined) throw new Error(`no player ${id} in the room`);
+  return p;
+}
+
+function expectZeroed(room: GameRoom, id: PlayerId): void {
+  const s = statsOf(room, id);
+  expect(
+    [s.kills, s.deaths, s.headshots, s.damageDealt, s.shotsFired, s.shotsHit],
+    `every counter of ${id} is zeroed`,
+  ).toEqual([0, 0, 0, 0, 0, 0]);
+}
+
+/**
+ * Exactly ONE trigger pull, aimed by default at the sky (nothing to hit): the
+ * FIRE edge, then release, then enough idle ticks to clear the fire interval of
+ * any weapon in the table (0.9s for the shotgun).
+ */
+function pullTrigger(
+  room: GameRoom,
+  feed: InputFeed,
+  id: PlayerId,
+  opts: { pitch?: number; gapTicks?: number } = {},
+): void {
+  const pitch = opts.pitch ?? 1.4; // straight up, well inside the +-1.45 clamp
+  feed.send(room, id, { pitch, buttons: INPUT_FIRE });
+  tick();
+  feed.send(room, id, { pitch, buttons: 0 });
+  for (let i = 0; i < (opts.gapTicks ?? 7); i++) tick();
+}
+
+describe('GameRoom match stats (C5)', () => {
+  it('damageDealt is the HP the victim actually lost, through every armor path', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io);
+    const feed = new InputFeed();
+
+    const knifeDmg = WEAPONS.knife.damage; // 40
+    const headDmg = Math.round(knifeDmg * WEAPONS.knife.headshotMul); // 60
+    const through = (dmg: number): number => Math.round(dmg * (1 - GEAR.absorb));
+    const hpOf = (id: PlayerId): number => io.lastSnap(id).you.hp;
+    const dealt = (): number => statsOf(room, 'p1').damageDealt;
+
+    // ---- (1) NO VEST: the whole roll lands on hp, and all of it is credited --
+    advanceToPhase(io, 'p1', 'live');
+    room.handleSwitch('p1', 'knife'); // flat 40 inside 2.2m, zero spread
+    fightUntilHit(room, io, feed, 'p1', 'p2', { aimHeight: 0.75, fireDist: 1.8, strict: true });
+    expect(hpOf('p2')).toBe(PLAYER.maxHp - knifeDmg); // 60
+    expect(dealt()).toBe(knifeDmg);
+
+    // ---- OVERKILL: finishing p2 credits the HP that was there, not the roll --
+    // p2 started the round at 100 and p1 is its only source of damage, so once
+    // p2 is dead p1 must be credited exactly 100 however the 100 was taken —
+    // while the weapon ROLLS (the `hit` events) add up to strictly more.
+    room.handleSwitch('p1', 'pistol'); // the knife's 2.2m reach cannot chase a runner
+    fightUntilKill(room, io, feed, 'p1', 'p2', { strict: true });
+    expect(dealt()).toBe(PLAYER.maxHp);
+    const rolled = eventsOfType(io, 'p1', 'hit')
+      .filter((h) => h.victimId === 'p2')
+      .reduce((sum, h) => sum + h.dmg, 0);
+    expect(rolled).toBeGreaterThan(PLAYER.maxHp); // the last hit over-rolled...
+    expect(dealt()).toBeLessThan(rolled); // ...and the overkill was NOT credited
+
+    // ---- (2) VEST: the vest's share is not damage dealt --------------------
+    advanceToPhase(io, 'p2', 'freeze'); // round 2
+    room.handleMessage('p2', { t: 'buy_gear', item: 'kevlar' });
+    expect(eventsOfType(io, 'p2', 'buy_result')[0]?.ok).toBe(true);
+    tick();
+    expect(io.lastSnap('p2').you.armor).toBe(GEAR.armorStart);
+
+    advanceToPhase(io, 'p1', 'live');
+    room.handleSwitch('p1', 'knife'); // the round death reset p1 to the pistol
+    let before = dealt();
+    let hpBefore = hpOf('p2');
+    fightUntilHit(room, io, feed, 'p1', 'p2', { aimHeight: 0.75, fireDist: 1.8, strict: true });
+    expect(hpBefore - hpOf('p2')).toBe(through(knifeDmg)); // 20 of the 40
+    expect(dealt() - before).toBe(through(knifeDmg)); // credited 20, NOT 40
+
+    // ---- (3) HEADSHOT, NO HELMET: armor is bypassed, so all 60 is credited --
+    before = dealt();
+    hpBefore = hpOf('p2');
+    fightUntilHit(room, io, feed, 'p1', 'p2', {
+      aimHeight: PLAYER.heightStand - 0.15,
+      fireDist: 1.8,
+      strict: true,
+      headshot: true,
+    });
+    expect(hpBefore - hpOf('p2')).toBe(headDmg);
+    expect(dealt() - before).toBe(headDmg);
+
+    // the victim survives and wins the round: kill + win rewards fund a helmet
+    fightUntilKill(room, io, feed, 'p2', 'p1');
+    advanceToPhase(io, 'p2', 'freeze'); // round 3
+    room.handleMessage('p2', { t: 'buy_gear', item: 'helmet' });
+    expect(eventsOfType(io, 'p2', 'buy_result')[1]?.ok).toBe(true);
+    tick();
+    expect(io.lastSnap('p2').you.helmet).toBe(true);
+
+    // ---- (4) HEADSHOT + HELMET: the same head shot now splits like a body one
+    advanceToPhase(io, 'p1', 'live');
+    room.handleSwitch('p1', 'knife');
+    before = dealt();
+    hpBefore = hpOf('p2');
+    fightUntilHit(room, io, feed, 'p1', 'p2', {
+      aimHeight: PLAYER.heightStand - 0.15,
+      fireDist: 1.8,
+      strict: true,
+      headshot: true,
+    });
+    expect(hpBefore - hpOf('p2')).toBe(through(headDmg)); // 30 of the 60
+    expect(dealt() - before).toBe(through(headDmg));
+    room.stop();
+  }, 60_000);
+
+  it('the shotgun counts PULLS, not pellets: 9 pellets in a blast are one fired, one hit', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io);
+    const feed = new InputFeed();
+    expect(WEAPONS.shotgun.pellets).toBeGreaterThan(1); // the premise of the test
+
+    // round 1: p2 throws it, so p1 banks the win reward and can afford the gun
+    loseRound(room, io, 'p1', ['p2']);
+    advanceToPhase(io, 'p1', 'freeze');
+    room.handleMessage('p1', { t: 'buy', weapon: 'shotgun' });
+    expect(eventsOfType(io, 'p1', 'buy_result').pop()?.ok).toBe(true);
+    room.handleSwitch('p1', 'shotgun');
+    advanceToPhase(io, 'p1', 'live');
+    expect(io.lastSnap('p1').you.weapon).toBe('shotgun');
+
+    // ---- a blast that lands NOTHING: one fired, zero hit -------------------
+    const beforeSky = { ...statsOf(room, 'p1') };
+    pullTrigger(room, feed, 'p1', { pitch: 1.4, gapTicks: 30 }); // at the sky
+    expect(statsOf(room, 'p1').shotsFired - beforeSky.shotsFired).toBe(1);
+    expect(statsOf(room, 'p1').shotsHit - beforeSky.shotsHit).toBe(0);
+
+    // ---- the blast that kills: MANY pellets, still exactly ONE hit ---------
+    const before = { ...statsOf(room, 'p1') };
+    const hitsBefore = eventsOfType(io, 'p1', 'hit').length;
+    // cadence 30 ticks (~1.0s) clears the shotgun's 0.9s fire interval, so every
+    // pull the driver takes is a real one rather than a silently gated no-op
+    fightUntilKill(room, io, feed, 'p1', 'p2', { fireDist: 6, cadence: 30, strict: true });
+    const after = statsOf(room, 'p1');
+    const pelletHits = eventsOfType(io, 'p1', 'hit').length - hitsBefore;
+    const pulls = after.shotsFired - before.shotsFired;
+    const landed = after.shotsHit - before.shotsHit;
+
+    expect(landed).toBe(1); // ONE pull landed: the killing blast
+    expect(pelletHits).toBeGreaterThan(1); // ...and it was several pellets
+    expect(pelletHits).toBeGreaterThan(landed); // the pellet count is NOT the hit count
+    expect(pulls).toBeGreaterThanOrEqual(landed); // hits can never exceed pulls
+    expect(after.shotsHit).toBeLessThanOrEqual(after.shotsFired); // accuracy <= 100%
+    // the blast rolled 9 x 14 = 126 into a 100 hp player: only 100 is credited
+    expect(after.damageDealt).toBe(PLAYER.maxHp);
+    room.stop();
+  }, 60_000);
+
+  it('a pull dropped on an empty magazine increments neither counter', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io);
+    const feed = new InputFeed();
+    advanceToPhase(io, 'p1', 'live');
+
+    const mag = WEAPONS.pistol.mag; // 12
+    for (let i = 0; i < mag; i++) pullTrigger(room, feed, 'p1');
+    expect(io.lastSnap('p1').you.mag).toBe(0);
+    expect(statsOf(room, 'p1').shotsFired).toBe(mag);
+    const shotEvents = eventsOfType(io, 'p1', 'shot').length;
+    expect(shotEvents).toBe(mag); // one wire `shot` per counted pull
+
+    // the trigger is pulled twice more on a dead-empty magazine
+    pullTrigger(room, feed, 'p1');
+    pullTrigger(room, feed, 'p1');
+    expect(io.lastSnap('p1').you.mag).toBe(0);
+    expect(statsOf(room, 'p1').shotsFired).toBe(mag); // dropped, not fired
+    expect(statsOf(room, 'p1').shotsHit).toBe(0);
+    expect(eventsOfType(io, 'p1', 'shot').length).toBe(shotEvents); // no shot went out
+    room.stop();
+  }, 30_000);
+
+  it('self- and team damage move neither damageDealt nor shotsHit', () => {
+    const io = new FakeIO();
+    const room = new GameRoom('dustbowl', 'public', io);
+    for (const id of ['p1', 'p2', 'p3', 'p4']) room.addPlayer(id, id.toUpperCase());
+    room.start();
+    startMatch(room, 'p1');
+    advanceToPhase(io, 'p1', 'live');
+
+    const mate = (['p2', 'p3', 'p4'] as PlayerId[]).find((id) => teamOf(io, id) === teamOf(io, 'p1'));
+    const foe = (['p2', 'p3', 'p4'] as PlayerId[]).find((id) => teamOf(io, id) !== teamOf(io, 'p1'));
+    if (mate === undefined || foe === undefined) throw new Error('expected a 2v2');
+
+    const room2 = internals(room);
+    const shooter = room2.players.get('p1');
+    const friend = room2.players.get(mate);
+    const enemy = room2.players.get(foe);
+    if (shooter === undefined || friend === undefined || enemy === undefined) throw new Error('missing players');
+    // far past every spawn-protection window; the 10s below never kill anyone
+    const now = io.lastSnap('p1').serverTime + 60_000;
+    const probe = (victimId: PlayerId): ShotHit => ({
+      targetId: victimId, dmg: 10, headshot: false, point: { x: 0, y: 0, z: 0 }, dist: 1,
+    });
+
+    // ---- team damage: it still LANDS, it simply earns the shooter nothing ---
+    const friendHp = friend.hp;
+    expect(room2.applyDamage(friend, shooter, probe(mate), WEAPONS.knife, now)).toBe(0);
+    expect(friend.hp).toBe(friendHp - 10); // accounting-only guard, not a damage veto
+    expect(shooter.damageDealt).toBe(0);
+    expect(shooter.shotsHit).toBe(0);
+
+    // ---- self damage: same ------------------------------------------------
+    const selfHp = shooter.hp;
+    expect(room2.applyDamage(shooter, shooter, probe('p1'), WEAPONS.knife, now)).toBe(0);
+    expect(shooter.hp).toBe(selfHp - 10);
+    expect(shooter.damageDealt).toBe(0);
+    expect(shooter.shotsHit).toBe(0);
+
+    // ---- the control: the identical call against an ENEMY does credit ------
+    expect(room2.applyDamage(enemy, shooter, probe(foe), WEAPONS.knife, now)).toBe(10);
+    expect(shooter.damageDealt).toBe(10);
+
+    // ---- and a suicide is not damage dealt by anyone -----------------------
+    const beforeDeaths = shooter.deaths;
+    room.handleSuicide('p1');
+    expect(shooter.deaths).toBe(beforeDeaths + 1);
+    expect(shooter.damageDealt).toBe(10); // unmoved by its own death
+    room.stop();
+  }, 30_000);
+
+  it('reset: warmup practice never lands in the match that follows', () => {
+    const io = new FakeIO();
+    const room = new GameRoom('dustbowl', 'public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.addPlayer('p2', 'Bravo');
+    room.start();
+    const feed = new InputFeed();
+    tick();
+    expect(io.lastSnap('p1').phase).toBe('warmup');
+
+    fightUntilKill(room, io, feed, 'p1', 'p2'); // warmup is fully playable
+    const warm = statsOf(room, 'p1');
+    expect(warm.kills).toBe(1);
+    expect(warm.damageDealt).toBeGreaterThan(0);
+    expect(warm.shotsFired).toBeGreaterThan(0);
+    expect(warm.shotsHit).toBeGreaterThan(0);
+    expect(statsOf(room, 'p2').deaths).toBe(1);
+
+    startMatch(room, 'p1'); // match one begins from a clean scoreboard
+    expectZeroed(room, 'p1');
+    expectZeroed(room, 'p2');
+    room.stop();
+  }, 30_000);
+
+  it('reset: the lobby return after a match clears the scoreboard', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io);
+
+    for (let r = 0; r < ROUNDS.winRounds; r++) {
+      advanceToPhase(io, 'p2', 'live', 300);
+      room.handleSuicide('p1');
+      advanceToPhase(io, 'p2', 'roundEnd', 60);
+      if (r < ROUNDS.winRounds - 1) advanceToPhase(io, 'p2', 'freeze', 300);
+    }
+    advanceToPhase(io, 'p2', 'matchEnd', 300);
+    // the match ends with the scoreboard still standing — that IS the end screen
+    expect(statsOf(room, 'p1').deaths).toBe(ROUNDS.winRounds);
+    const ended = eventsOfType(io, 'p2', 'match_end');
+    expect(ended.length).toBe(1);
+    expect(ended[0]?.stats.find((s) => s.id === 'p1')?.deaths).toBe(ROUNDS.winRounds);
+
+    advanceToPhase(io, 'p2', 'warmup', 300); // fullReset, 6s later
+    expectZeroed(room, 'p1');
+    expectZeroed(room, 'p2');
+    room.stop();
+  }, 60_000);
+
+  it('reset: a low-population abort clears the scoreboard too', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io);
+    const feed = new InputFeed();
+    advanceToPhase(io, 'p1', 'live');
+    fightUntilKill(room, io, feed, 'p1', 'p2');
+    expect(statsOf(room, 'p1').kills).toBe(1);
+    expect(statsOf(room, 'p1').damageDealt).toBe(PLAYER.maxHp);
+
+    room.removePlayer('p2'); // 1 seated < MIN_PLAYERS_FOR_MATCH: the match collapses
+    advanceToPhase(io, 'p1', 'warmup', 300);
+    expectZeroed(room, 'p1');
+    room.stop();
+  }, 30_000);
+
+  it('match_end carries every player, both teams, in the server order', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io);
+    const feed = new InputFeed();
+
+    // one real round so the two lines are not identical: p1 frags, p2 does not
+    advanceToPhase(io, 'p1', 'live');
+    fightUntilKill(room, io, feed, 'p1', 'p2');
+    advanceToPhase(io, 'p1', 'roundEnd', 60);
+    // then p1 throws the rest away and the other side takes the match
+    for (let r = 0; r < ROUNDS.winRounds; r++) {
+      advanceToPhase(io, 'p2', 'freeze', 300);
+      advanceToPhase(io, 'p2', 'live', 300);
+      room.handleSuicide('p1');
+      advanceToPhase(io, 'p2', 'roundEnd', 60);
+    }
+    advanceToPhase(io, 'p2', 'matchEnd', 300);
+
+    const ev = eventsOfType(io, 'p2', 'match_end')[0];
+    if (ev === undefined) throw new Error('no match_end');
+    expect(ev.stats.length).toBe(2); // EVERY player present, not a top-3 slice
+    expect(new Set(ev.stats.map((s) => s.id))).toEqual(new Set(['p1', 'p2']));
+    expect(new Set(ev.stats.map((s) => s.team))).toEqual(new Set(['T', 'CT'])); // both sides
+    // both recipients get the identical, server-ordered list
+    expect(eventsOfType(io, 'p1', 'match_end')[0]?.stats).toEqual(ev.stats);
+
+    // ordering: kills DESC, then damage DESC, then deaths ASC
+    for (let i = 1; i < ev.stats.length; i++) {
+      const a = ev.stats[i - 1];
+      const b = ev.stats[i];
+      if (a === undefined || b === undefined) throw new Error('sparse stats');
+      expect(a.kills).toBeGreaterThanOrEqual(b.kills);
+      if (a.kills === b.kills) expect(a.damage).toBeGreaterThanOrEqual(b.damage);
+    }
+    const p1 = ev.stats.find((s) => s.id === 'p1');
+    const p2 = ev.stats.find((s) => s.id === 'p2');
+    expect(ev.stats[0]?.id).toBe('p1'); // the only fragger sorts first
+    expect(p1?.name).toBe('Alpha');
+    expect(p1?.kills).toBe(1);
+    expect(p1?.damage).toBe(PLAYER.maxHp);
+    expect(p1?.deaths).toBe(ROUNDS.winRounds); // six suicides
+    expect(p1?.shotsFired).toBeGreaterThan(0);
+    expect(p1?.shotsHit).toBeGreaterThan(0);
+    expect(p1?.shotsHit).toBeLessThanOrEqual(p1?.shotsFired ?? 0);
+    // p2 never pulled a trigger: the client renders accuracy as '—', and the
+    // server sends no float for it to divide by zero on
+    expect(p2?.shotsFired).toBe(0);
+    expect(p2?.shotsHit).toBe(0);
+    expect(p2?.damage).toBe(0);
+    expect(p2?.deaths).toBe(1);
+    expect(Object.keys(ev).sort()).toEqual(['scoreCT', 'scoreT', 'stats', 't', 'winner']);
+    room.stop();
+  }, 60_000);
 });

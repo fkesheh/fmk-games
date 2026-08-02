@@ -15,7 +15,7 @@
 // the vitals legible over snow and desert sand. No state is signalled by hue
 // alone: each pairs colour with an icon, a tag, motion or position.
 // ============================================================================
-import { MIN_PLAYERS_FOR_MATCH, PALETTE, WEAPONS } from '@fps/shared';
+import { MIN_PLAYERS_FOR_MATCH, PALETTE, ROUNDS, WEAPONS } from '@fps/shared';
 import type { RoomPhase, Team, WeaponId } from '@fps/shared';
 
 /**
@@ -52,6 +52,14 @@ export interface HudState {
   /** The snapshot's `minPlayers` (the server's threshold). <=0 = not yet known. */
   minPlayers: number;
   /**
+   * The side currently on a run of consecutive round wins, or null when nobody
+   * is (including immediately after a draw — see nextWinStreak). Derived by the
+   * caller from the `round_end` stream; NOTHING on the wire carries it.
+   */
+  streakTeam: Team | null;
+  /** How many rounds in a row `streakTeam` has won. 0 when there is no run. */
+  streakCount: number;
+  /**
    * The SERVER's verdict: would a `{t:'start'}` sent right now be accepted?
    * The START button is driven straight from this — the rule is NEVER
    * re-derived here, because a second judge is a judge that drifts.
@@ -86,6 +94,316 @@ const DNUM_POOL = 8;        // pooled floating damage numbers
 const DNUM_OFF: ReadonlyArray<readonly [number, number]> = [
   [-30, -36], [34, -32], [-44, -20], [46, -24], [-16, -46], [22, -44], [-38, -30], [40, -40],
 ];
+
+// ============================================================================
+// PAIN / DEATH FEEDBACK (contract C4 — client-only, nothing new on the wire).
+//
+// Before this, the victim got exactly one signal: an 800ms directional arc with
+// no magnitude. A 12-damage graze and an 89-damage near-kill were pixel
+// identical, low HP was a number you had to read, and death told you nothing
+// about who did it. `dmg` and `fromId`/`killerId` were already arriving and
+// being dropped on the floor.
+//
+// `damageSeverity01` is the SINGLE normalisation of "how bad was that hit".
+// Both consumers read it — the HUD flash here and the camera-shake trauma in
+// clientGame — so the flash and the shake can never drift out of agreement.
+// ============================================================================
+const PAIN_MS = 420; // full-screen pain flash; lives INSIDE the 800ms arc
+const PAIN_FULL_DMG = 60; // damage at/above which the response is maxed out
+const PAIN_CURVE = 0.8; // <1 so a graze still registers without flattening the top
+const PAIN_A_MIN = 0.1; // flash alpha at severity ~0
+const PAIN_A_SPAN = 0.42; // ...plus this much at severity 1
+const LOWHP_FLOOR = 8; // hp at/below which the low-hp edge is fully lit
+const LOWHP_STEP = 0.05; // quantisation: update() writes the var only on a step change
+const DEATH_NEUTRAL = 'ELIMINATED'; // C4: killerId === null — NEVER "KILLED BY undefined"
+const DEATH_KILLED = 'KILLED BY';
+
+/** What the killer's weapon glyph is drawn at on the death card. */
+const DEATH_GLYPH_SCALE = 1.6;
+
+/**
+ * 0..1 "how bad was that hit", from post-armour damage. Pure; the one place the
+ * damage->response curve is defined. 0 for a non-positive or non-finite dmg so
+ * a malformed event degrades to "no extra response" rather than to NaN styling.
+ */
+export function damageSeverity01(dmg: number): number {
+  if (!Number.isFinite(dmg) || dmg <= 0) return 0;
+  return Math.pow(Math.min(1, dmg / PAIN_FULL_DMG), PAIN_CURVE);
+}
+
+/** Peak opacity of the full-screen pain flash for a hit of `dmg`. 0 = no flash. */
+export function painFlashAlpha(dmg: number): number {
+  const sev = damageSeverity01(dmg);
+  return sev <= 0 ? 0 : PAIN_A_MIN + PAIN_A_SPAN * sev;
+}
+
+/**
+ * 0..1 strength of the persistent low-HP edge. 0 at or above LOW_HP, ramping to
+ * a full 1 at LOWHP_FLOOR and below — so "I am nearly dead" is legible from the
+ * screen edge without reading the number.
+ */
+export function lowHpIntensity01(hp: number): number {
+  if (!Number.isFinite(hp)) return 0;
+  if (hp >= LOW_HP) return 0;
+  if (hp <= LOWHP_FLOOR) return 1;
+  return (LOW_HP - hp) / (LOW_HP - LOWHP_FLOOR);
+}
+
+/**
+ * Death-card headline + killer name. C4 is explicit: a null killer (suicide,
+ * console `kill`, world damage) renders a NEUTRAL form. A blank or
+ * whitespace-only name is treated the same way, because a roster miss must
+ * never surface as an empty "KILLED BY".
+ */
+export function deathCardText(
+  killerName: string | null | undefined,
+): { readonly head: string; readonly name: string } {
+  const n = typeof killerName === 'string' ? killerName.trim() : '';
+  return n === '' ? { head: DEATH_NEUTRAL, name: '' } : { head: DEATH_KILLED, name: n };
+}
+
+/** Everything the death card shows. `killerName === null` => neutral form. */
+export interface DeathCardInfo {
+  readonly killerName: string | null;
+  readonly killerTeam: Team | null;
+  readonly weapon: WeaponId;
+  readonly headshot: boolean;
+}
+
+// ============================================================================
+// MATCH ARC — contracts C5 (end-of-match stats) and C6 (match point).
+//
+// The audit measured matches ending 6-0 in ~3 minutes (188s and 165s, mean live
+// round 23s) with the player taking NOTHING away from them. There is no
+// persistence anywhere in this project and cross-session progression is out of
+// scope, so the entire arc has to live inside the match: the round you are on
+// has to announce when it decides the match (C6), a run of wins has to be
+// visible while it is happening, and the match has to be summarised when it
+// ends (C5).
+//
+// Every derivation below is CLIENT-SIDE and adds nothing to the wire, which is
+// the contract, not an optimisation. All of it is pure and exported so the gate
+// can reach it — there is no jsdom in this repo, so the DOM half is verified on
+// pixels instead.
+// ============================================================================
+
+/**
+ * Rounds a side must win to take the match. Read from the shared config so the
+ * client can never disagree with the server about what "one round away" means;
+ * a literal 6 here would silently rot the moment ROUNDS is retuned.
+ */
+const WIN_ROUNDS = ROUNDS.winRounds;
+
+/** C5, verbatim: the accuracy cell for a player who never pulled a trigger. */
+export const ACC_NONE = '—';
+
+/** Consecutive round wins before a run is worth saying out loud. */
+export const STREAK_MIN = 2;
+
+/**
+ * C5: accuracy is DERIVED here and is never on the wire — the server sends
+ * `shotsFired`/`shotsHit` (trigger PULLS, not pellets) and never a float.
+ *
+ * `shotsFired === 0` renders ACC_NONE. That case is the whole reason this is a
+ * function: a player who never fired is not 0% (which is the score of someone
+ * who fired and missed everything) and is certainly not NaN%. Non-finite and
+ * negative inputs land in the same branch rather than propagating garbage into
+ * a string a human reads.
+ */
+export function accuracyText(shotsHit: number, shotsFired: number): string {
+  if (!Number.isFinite(shotsFired) || shotsFired <= 0) return ACC_NONE;
+  const hit = Number.isFinite(shotsHit) ? Math.max(0, shotsHit) : 0;
+  // clamped at the top too: hits can never exceed pulls, and if a future server
+  // bug says otherwise the HUD shows 100%, not 140%
+  return `${Math.round((Math.min(hit, shotsFired) / shotsFired) * 100)}%`;
+}
+
+/** Which side(s) are one round win away from taking the match. */
+export type MatchPoint = 'none' | 'T' | 'CT' | 'both';
+
+/** A stakes chip: a loud tag and a quiet line explaining it. */
+export interface ArcCopy {
+  readonly tag: string;
+  readonly line: string;
+}
+
+/**
+ * C6 — match point, derived from `round_start`'s scores plus ROUNDS.winRounds.
+ * NOTHING is added to the wire for this.
+ *
+ * `both` is a real state and not a defensive branch: the match is capped at
+ * ROUNDS.maxRounds (10) with halftime at 5, so a 5-5 tenth round genuinely has
+ * both sides one win from the match. C6 requires that read as a DECIDER rather
+ * than as two competing banners — see matchPointCopy, which is where that
+ * requirement is actually honoured.
+ *
+ * A score at or past `winRounds` is not match point: the match is already over
+ * and `match_end` owns the screen. A degenerate `winRounds` (< 2, non-finite)
+ * would make every 0-0 a match point, so it yields 'none' instead.
+ */
+export function matchPointOf(
+  scoreT: number,
+  scoreCT: number,
+  winRounds: number = WIN_ROUNDS,
+): MatchPoint {
+  if (!Number.isFinite(winRounds) || winRounds < 2) return 'none';
+  const at = (s: number): boolean =>
+    Number.isFinite(s) && s >= winRounds - 1 && s < winRounds;
+  const t = at(scoreT);
+  const ct = at(scoreCT);
+  if (t && ct) return 'both';
+  if (t) return 'T';
+  if (ct) return 'CT';
+  return 'none';
+}
+
+/**
+ * The match-point chip's words, or null when there is no match point.
+ *
+ * The `both` case names NO side and borrows NO team colour (see the caller):
+ * naming one of them there is precisely the "two competing banners" C6 forbids,
+ * and colouring it would pick a favourite in a round where neither side has
+ * one. It gets its own word — DECIDER — because it is its own state.
+ */
+export function matchPointCopy(mp: MatchPoint, you: Team | null): ArcCopy | null {
+  if (mp === 'none') return null;
+  if (mp === 'both') return { tag: 'DECIDER', line: 'WINNER TAKES ALL' };
+  // kept short on purpose: the chip lives in the top strip beside the score
+  // chips, which is the only lane an open buy menu does not cover
+  return you === mp
+    ? { tag: 'MATCH POINT', line: 'YOURS TO WIN' }
+    : { tag: 'MATCH POINT', line: `${mp} WINS IT HERE` };
+}
+
+/** A run of consecutive round wins by ONE side, folded from `round_end`. */
+export interface WinStreak {
+  readonly team: Team | null;
+  readonly count: number;
+}
+
+/** Nobody is on a run. Also the state a draw leaves behind. */
+export const NO_STREAK: WinStreak = { team: null, count: 0 };
+
+/**
+ * Fold one `round_end.winner` into the running streak.
+ *
+ * READ THIS BEFORE REACHING FOR THE SERVER'S `lossStreak` PAIR — it is NOT this
+ * quantity, and types.ts says so beside `round_end`. A draw increments BOTH of
+ * the server's loss counters, so "the opponent's loss streak" overstates a win
+ * streak from the first draw onwards. Here a draw (`winner === null`) breaks
+ * BOTH sides' runs and leaves nobody on one, which is the only reading that
+ * matches the words "consecutive round WINS".
+ *
+ * The run follows the HUMANS across halftime, not the side label — see
+ * swapStreakSides for why, and call it from the `halftime` event.
+ */
+export function nextWinStreak(prev: WinStreak, winner: Team | null): WinStreak {
+  if (winner === null) return NO_STREAK;
+  if (prev.team === winner) return { team: winner, count: prev.count + 1 };
+  return { team: winner, count: 1 };
+}
+
+/**
+ * Move a run across the halftime side swap.
+ *
+ * The server swaps the SCORES along with the sides ("side-scores swap too so
+ * they follow the players", game.ts advanceAfterRound), so a score follows the
+ * humans who earned it, not the label T/CT. A run that stayed with the label
+ * while the score moved would credit the wrong five people for the whole second
+ * half, and it would disagree with the very scoreboard sitting next to it.
+ */
+export function swapStreakSides(st: WinStreak): WinStreak {
+  if (st.team === null) return st;
+  return { team: st.team === 'T' ? 'CT' : 'T', count: st.count };
+}
+
+/**
+ * Does the stakes row belong on screen at all?
+ *
+ * Match point is a claim about the NEXT round, so it must not outlive the last
+ * one. The server holds `roundEnd` for ROUNDS.roundEndTime AFTER the final
+ * round before `match_end` fires, and a maxRounds tie ends 5-5 — both sides on
+ * winRounds - 1. Without this guard the last four seconds of an already-decided
+ * match would read "DECIDER / NEXT ROUND TAKES THE MATCH" with no next round.
+ *
+ * That tie is in fact the ONLY way C6's both-sides state is reachable under the
+ * current tuning — scores sum to the decisive rounds played, at most maxRounds,
+ * so two sides on winRounds - 1 needs a sum of 2*(winRounds-1) = maxRounds,
+ * which is one round more than any round START has seen — which is exactly why
+ * it must not be shown in that spot. The state itself is still handled, because
+ * the contract requires it and a retune of ROUNDS makes it reachable for real.
+ */
+export function stakesVisible(phase: RoomPhase, round: number): boolean {
+  if (!Number.isFinite(round) || round <= 0) return false;
+  if (phase === 'freeze' || phase === 'live') return true;
+  return phase === 'roundEnd' && round < ROUNDS.maxRounds;
+}
+
+/** The streak chip's words, or null while no run is long enough to name. */
+export function streakCopy(st: WinStreak, you: Team | null): ArcCopy | null {
+  if (st.team === null || st.count < STREAK_MIN) return null;
+  return {
+    tag: `${st.count} IN A ROW`,
+    line: st.team === you ? "YOU'RE ON A RUN" : `${st.team} ON A RUN`,
+  };
+}
+
+/** One row of `match_end.stats`, exactly as C5 puts it on the wire. */
+export interface MatchStatRow {
+  readonly id: string;
+  readonly name: string;
+  readonly team: Team;
+  readonly kills: number;
+  readonly deaths: number;
+  readonly headshots: number;
+  readonly damage: number;
+  readonly shotsFired: number;
+  readonly shotsHit: number;
+}
+
+/** Everything the end-of-match scoreboard renders. */
+export interface MatchEndInfo {
+  readonly winner: Team;
+  readonly scoreT: number;
+  readonly scoreCT: number;
+  /** YOUR side at match end; null when unknown (drives VICTORY / DEFEAT). */
+  readonly you: Team | null;
+  /** YOUR player id, '' when unknown — the row that gets marked. */
+  readonly youId: string;
+  /**
+   * C5: EVERY player at match end, BOTH teams, already ordered by the server
+   * (kills DESC, damage DESC, deaths ASC, join order ASC — a strict total
+   * order). Rendered in the order received and NEVER re-sorted here: a second
+   * sort is a second opinion, and it would diverge from the server's silently.
+   */
+  readonly stats: readonly MatchStatRow[];
+}
+
+/** VICTORY / DEFEAT / MATCH OVER — the first thing the end screen must answer. */
+export function matchResultTitle(winner: Team, you: Team | null): string {
+  return you === null ? 'MATCH OVER' : you === winner ? 'VICTORY' : 'DEFEAT';
+}
+
+/** The largest `damage` in a stats array; 0 for an empty or all-zero one. */
+export function maxDamageOf(stats: readonly MatchStatRow[]): number {
+  let m = 0;
+  for (const r of stats) {
+    if (Number.isFinite(r.damage) && r.damage > m) m = r.damage;
+  }
+  return m;
+}
+
+/**
+ * 0..1 width of a row's damage bar. Purely presentational — it changes nothing
+ * about the order, it just stops the damage column from being a wall of digits.
+ * Damage is the stat that rescues the player who chipped everybody and killed
+ * nobody, which the old top-3-by-kills list made literally invisible.
+ */
+export function damageBar01(damage: number, maxDamage: number): number {
+  if (!Number.isFinite(damage) || damage <= 0) return 0;
+  if (!Number.isFinite(maxDamage) || maxDamage <= 0) return 0;
+  return Math.min(1, damage / maxDamage);
+}
 
 // ============================================================================
 // Procedural weapon glyphs — tiny canvas silhouettes, one per WeaponId, drawn
@@ -707,6 +1025,216 @@ const CSS = `
 .fh-spec { position: absolute; left: 50%; bottom: 15%; transform: translateX(-50%);
   font-size: 15px; font-weight: 700; letter-spacing: 3px;
   padding: 7px 18px; white-space: nowrap; }
+
+/* ---- pain flash + low-hp edge ----------------------------------------------
+   Two drivers over one inset-vignette geometry, deliberately kept separate:
+   --fh-pain-a is punched once per hit by damageFrom() and decays through the
+   keyframe (transient, scaled by damage); --fh-low-a is a steady state that
+   update() writes only when it crosses a 0.05 step (persistent, scaled by HP).
+   Both animate opacity/filter on a fixed full-screen box — compositor-only, no
+   layout, and nothing is allocated per frame. The pain flash is 420ms so it
+   resolves well inside the 800ms directional arc it rides with, rather than
+   competing with it. */
+/* closest-side is load-bearing. With the default farthest-corner sizing the
+   100% stop lands outside the viewport, so the saturated red only ever reached
+   the extreme corners and the edge midpoints sat at the 0.34-alpha glow stop —
+   measured 0.18 effective opacity at a "0.52" peak, which was invisible over
+   Dustbowl's warm sand. closest-side puts the ellipse exactly on the four edge
+   midpoints, so the vignette actually reaches the border it is drawing. */
+.fh-pain { position: absolute; inset: 0; opacity: 0;
+  background: radial-gradient(ellipse closest-side at 50% 50%,
+    transparent 0, transparent 28%, var(--fh-danger-glow) 62%, var(--fh-danger) 100%); }
+.fh-pain.fh-on { animation: fh-painfade ${PAIN_MS}ms ease-out forwards; }
+@keyframes fh-painfade {
+  0% { opacity: 0; }
+  12% { opacity: var(--fh-pain-a, 0.3); }
+  100% { opacity: 0; }
+}
+/* The 0.55 factor keeps this a FLOOR, not a competitor. --fh-low-a is the raw
+   0..1 intensity from lowHpIntensity01 (tested as such); the scaling lives here
+   because it is presentation. At full intensity the steady edge must still sit
+   clearly below a near-kill pain spike, or the transient stops reading as an
+   event — verified on screen, where an unscaled 0.85 floor swamped the flash. */
+.fh-low { position: absolute; inset: 0; opacity: calc(var(--fh-low-a, 0) * 0.55);
+  transition: opacity 220ms linear;
+  background: radial-gradient(ellipse closest-side at 50% 50%,
+    transparent 0, transparent 42%, var(--fh-danger-glow) 100%); }
+.fh-low.fh-pulse { animation: fh-lowpulse 1100ms ease-in-out infinite; }
+@keyframes fh-lowpulse {
+  0%, 100% { filter: brightness(0.66); }
+  50% { filter: brightness(1.3); }
+}
+
+/* ---- death card -------------------------------------------------------------
+   Sits BELOW the crosshair at 63%, and that position is load-bearing, not
+   taste. At 34% it was completely occluded by the centre banner: in a small
+   bot match your death is very often the last of the round, so "T WINS THE
+   ROUND" landed on top of "KILLED BY <name>" nearly every time — caught on a
+   screenshot, invisible to every unit test. 63% clears the banner's lane
+   (~215-337px at 900p), the crosshair, the floating damage numbers, and the
+   respawn/spectate line at bottom 15%.
+
+   The killer's name is painted in the exact hex their soldier wears
+   (pass-through of the team vars, no literal), but the side is ALSO spelled
+   out in a word chip, so the identification never rides on hue alone — the
+   same rule the scoreboard and killfeed already follow. */
+.fh-death { position: absolute; left: 50%; top: 63%; transform: translate(-50%, -50%);
+  display: flex; flex-direction: column; align-items: center; gap: 7px;
+  padding: 15px 30px 17px; min-width: 250px; }
+.fh-death-head { font-size: 13px; font-weight: 800; letter-spacing: 4.5px;
+  color: var(--fh-text-mute); }
+.fh-death-name { font-size: 31px; font-weight: 900; letter-spacing: 1.5px;
+  line-height: 1.05; max-width: 460px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; color: var(--fh-death-c, var(--fh-text));
+  text-shadow: 0 0 4px var(--fh-ink), 0 2px 3px var(--fh-ink); }
+.fh-death-by { display: flex; align-items: center; justify-content: center; gap: 10px;
+  min-height: 20px; }
+.fh-death-side { font-size: 11px; font-weight: 900; letter-spacing: 2px;
+  padding: 2px 7px; border: 1px solid var(--fh-rim-hi);
+  color: var(--fh-death-c, var(--fh-text-dim)); }
+.fh-death-w { display: block; }
+.fh-death-hs { font-size: 11px; font-weight: 900; letter-spacing: 2px;
+  padding: 2px 7px; color: var(--fh-ink); background: var(--fh-danger); }
+
+/* ---- stakes row: match point (C6) + the round-win run ----------------------
+   POSITION IS LOAD-BEARING, and it was moved here after a screenshot, not
+   before one. The first build hung this under the ROUND label at ~y129, which
+   looked correct in isolation and was in fact INVISIBLE for the part of the
+   round that matters most: the buy menu auto-opens at every freeze, its panel
+   spans y 83-817 at 900p, and it stays open into the first 12s of live. The
+   announcement that this round decides the match landed behind it every single
+   time. Measured on the built client, caught on a screenshot, invisible to
+   every unit test.
+
+   The top strip above the buy panel is the one HUD lane that survives an open
+   buy menu, and it is also where this belongs semantically: match point is a
+   statement ABOUT the score, so it sits flush against the score chips, sharing
+   their height. It clears the centre banner (~215-337px), the death card at
+   63%, the left team rail (left:32px/top:98px) and the room chip (top-left),
+   all by construction — it never leaves the top cluster's own row.
+
+   The match-point chip is deliberately SINGULAR. At 5-5 both sides are one win
+   from the match and C6 requires that read as one decider, so the BOTH state
+   takes the neutral accent and names nobody; a single side at match point takes
+   that side's exact hex — a pass-through of the same var the soldier wears —
+   and ALSO spells the side out in the line beneath, so nothing rides on hue. */
+/* The 62px height is measured, not chosen. The top cluster's own box runs
+   y14-91 at 900p (the clock chip is the tall one) and the buy panel's top edge
+   is at y83 — so a chip stretched to the cluster's full height loses its bottom
+   8px, and with them the lit under-bar that is the match-point chip's second
+   signal. 62px ends the chip at y76, seven pixels clear. */
+.fh-stakes { position: absolute; left: 100%; top: 0; height: 62px; margin-left: 10px;
+  display: flex; align-items: stretch; gap: 8px; white-space: nowrap; }
+.fh-stake { display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 2px; padding: 4px 13px 6px; }
+.fh-stake-tag { font-size: 13px; font-weight: 900; letter-spacing: 2.8px;
+  line-height: 1.15; color: var(--fh-stake-c, var(--fh-text));
+  text-shadow: 0 0 5px var(--fh-ink), 0 1px 3px var(--fh-ink); }
+.fh-stake-line { font-size: 9px; font-weight: 800; letter-spacing: 1.7px;
+  color: var(--fh-text-dim); }
+/* the match-point chip carries a lit under-bar in the same colour as its tag —
+   the score chips' own idiom, so the two read as one family */
+.fh-stake-mp::after { content: ''; position: absolute; left: 0; right: 0; bottom: 0;
+  height: 3px; background: var(--fh-stake-c, var(--fh-accent));
+  animation: fh-stakepulse 1.7s ease-in-out infinite; }
+/* motion is the second channel here (colour is the first, the word the third).
+   Only the under-bar breathes: pulsing the TEXT of a chip that stays up for a
+   whole round is a nuisance to read past, which the timer's fh-pulse can get
+   away with because it only ever runs for the last 20 seconds. */
+@keyframes fh-stakepulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+/* ---- end-of-match scoreboard (C5) ------------------------------------------
+   Replaces a top-3-BY-KILLS list that hid two thirds of the room and every
+   stat that is not a kill. This renders the server's stats array whole, in
+   the order it arrived (a strict total order the server documents — re-sorting
+   here would diverge from it silently and nobody would ever notice), both
+   teams, with accuracy DERIVED per C5.
+
+   z-index 4 lifts it over the rest of the HUD layer, exactly as .fh-lobby's
+   z-index 1 lifts the START button; it stays far under .fps-menus (40), so a
+   pause menu still covers it, which is the pre-existing behaviour. */
+/* Three layers, and the FLAT BASE is the load-bearing one. The first build
+   used only the two radials, which left the centre of the screen at ~30%
+   opacity over Dustbowl's warm sand: the green victory wash multiplied into
+   the sand and the whole frame read olive, not "you won". Caught on a
+   screenshot. The base kills the world first; the wash then colours a dark
+   frame instead of tinting a bright one. */
+.fh-end { position: absolute; inset: 0; z-index: 4;
+  display: flex; align-items: center; justify-content: center; padding: 16px;
+  background:
+    radial-gradient(ellipse at 50% 46%, transparent 26%, var(--fh-ink-70) 100%),
+    radial-gradient(105% 80% at 50% 44%, var(--fh-end-wash, transparent) 0%,
+      transparent 62%),
+    var(--fh-ink-92); }
+.fh-end-panel { width: min(940px, 96vw); max-height: 95vh; overflow: hidden;
+  display: flex; flex-direction: column; padding: 0; }
+.fh-end-head { display: flex; flex-direction: column; align-items: center;
+  gap: 4px; padding: 16px 18px 12px; }
+.fh-end-eyebrow { font-size: 10px; font-weight: 800; letter-spacing: 3.6px;
+  color: var(--fh-text-mute); }
+.fh-end-title { font-size: 44px; font-weight: 900; letter-spacing: 7px;
+  line-height: 1; color: var(--fh-end-c, var(--fh-text));
+  text-shadow: 0 0 12px var(--fh-ink), 0 3px 6px var(--fh-ink); }
+.fh-end-rule { align-self: stretch; height: 2px; margin: 6px 0 2px;
+  background: linear-gradient(90deg, transparent,
+    var(--fh-end-c, var(--fh-accent)), transparent); }
+.fh-end-score { display: flex; align-items: center; justify-content: center;
+  gap: 12px; font-size: 22px; font-weight: 900; letter-spacing: 2px; }
+.fh-end-s-t { color: var(--fh-t-lit); }
+.fh-end-s-ct { color: var(--fh-ct-lit); }
+.fh-end-s-dash { color: var(--fh-text-mute); font-size: 15px; }
+.fh-end-s-win { font-size: 9px; font-weight: 900; letter-spacing: 1.6px;
+  padding: 1px 6px; border-radius: 2px; vertical-align: middle;
+  background: var(--fh-text); color: var(--fh-ink); text-shadow: none;
+  margin-left: 7px; }
+
+/* the table: one grid template shared by the header and every row, so the
+   columns cannot drift apart. K/D/HS/DMG/ACC are all present because the old
+   screen showed only kills, which made "chipped everyone, killed nobody"
+   indistinguishable from "did nothing". */
+.fh-end-tbl { --fh-end-cols: 42px minmax(0, 1fr) 40px 40px 44px 116px 62px;
+  overflow-y: auto; border-top: 1px solid var(--fh-edge); }
+.fh-end-row { display: grid; grid-template-columns: var(--fh-end-cols);
+  align-items: center; gap: 10px; padding: 4px 18px; }
+.fh-end-hrow { padding-top: 6px; padding-bottom: 6px;
+  background: var(--fh-track); border-bottom: 1px solid var(--fh-edge); }
+.fh-end-h { font-size: 9px; font-weight: 800; letter-spacing: 1.8px;
+  color: var(--fh-text-mute); }
+.fh-end-num { text-align: right; font-size: 14px; font-weight: 800; }
+.fh-end-h.fh-end-num { font-size: 9px; }
+.fh-end-tag { font-size: 10px; font-weight: 900; letter-spacing: 1.4px;
+  text-align: center; padding: 1px 0; border-radius: 2px;
+  color: var(--fh-ink); text-shadow: none; }
+.fh-end-tag-t { background: var(--fh-t); color: var(--fh-ink); }
+.fh-end-tag-ct { background: var(--fh-ct); color: var(--fh-text); }
+.fh-end-name { display: flex; align-items: center; gap: 8px; min-width: 0;
+  font-size: 14px; font-weight: 700; color: var(--fh-text); }
+.fh-end-nametext { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fh-end-you { flex: none; font-size: 9px; font-weight: 900; letter-spacing: 1.4px;
+  padding: 0 5px; border-radius: 2px; background: var(--fh-text);
+  color: var(--fh-ink); text-shadow: none; }
+/* YOUR row: a lit inset spine + a brighter face + the word YOU. Three signals,
+   because finding yourself is the single most useful thing on this screen. */
+.fh-end-me { background: var(--fh-rim-hi); box-shadow: inset 5px 0 0 var(--fh-text); }
+.fh-end-me .fh-end-name, .fh-end-me .fh-end-num, .fh-end-me .fh-end-acc {
+  color: var(--fh-text); font-weight: 900; }
+.fh-end-row + .fh-end-row { border-top: 1px solid var(--fh-edge); }
+/* a headshot count of ZERO is not a headshot: only a real one takes the colour,
+   or every empty cell would read as an alert */
+.fh-end-hs { color: var(--fh-danger); }
+/* damage gets a value read as well as a number: the bar is scaled to the top
+   damage on the board, so a support round is visible from across the room */
+.fh-end-dmg { display: flex; flex-direction: column; align-items: stretch; gap: 5px; }
+.fh-end-dmgbar { height: 4px; border-radius: 2px; overflow: hidden;
+  background: var(--fh-track); box-shadow: inset 0 1px 2px var(--fh-deep); }
+.fh-end-dmgfill { height: 100%; border-radius: 2px; background: var(--fh-accent);
+  box-shadow: inset 0 -1px 0 var(--fh-deep); }
+.fh-end-acc { text-align: right; font-size: 13px; font-weight: 800;
+  color: var(--fh-text-dim); }
+.fh-end-acc.fh-end-accnone { color: var(--fh-text-mute); }
+.fh-end-foot { padding: 8px 18px 10px; text-align: center; font-size: 10px;
+  font-weight: 800; letter-spacing: 2.4px; color: var(--fh-text-mute);
+  background: var(--fh-track); border-top: 1px solid var(--fh-edge); }
 `;
 
 export class Hud {
@@ -733,6 +1261,19 @@ export class Hud {
   private arcNext = 0;
   private readonly dnums: HTMLDivElement[] = [];
   private dnumNext = 0;
+
+  // pain flash / low-hp edge / death card. Single fixed elements, never pooled:
+  // a flash is a restart of one animation, and only one death card can be up.
+  private readonly pain: HTMLDivElement;
+  private readonly low: HTMLDivElement;
+  private readonly death: HTMLDivElement;
+  private readonly deathHead: HTMLDivElement;
+  private readonly deathName: HTMLDivElement;
+  private readonly deathBy: HTMLDivElement;
+  private readonly deathSide: HTMLSpanElement;
+  private readonly deathHs: HTMLSpanElement;
+  private deathGlyph: HTMLCanvasElement | null = null;
+  private cLowA = -1;
 
   // top center
   private readonly clockEl: HTMLDivElement;
@@ -806,6 +1347,20 @@ export class Hud {
   private readonly vig: HTMLDivElement;
   private readonly specEl: HTMLDivElement;
 
+  // match arc: the stakes row (C6 match point + the round-win run) and the
+  // end-of-match scoreboard (C5). Both are event-driven, never per frame.
+  private readonly stakesEl: HTMLDivElement;
+  private readonly mpEl: HTMLDivElement;
+  private readonly mpTag: HTMLDivElement;
+  private readonly mpLine: HTMLDivElement;
+  private readonly streakEl: HTMLDivElement;
+  private readonly streakTag: HTMLDivElement;
+  private readonly streakLine: HTMLDivElement;
+  private readonly endEl: HTMLDivElement;
+  private readonly endTitle: HTMLDivElement;
+  private readonly endScore: HTMLDivElement;
+  private readonly endTbl: HTMLDivElement;
+
   // change-detection cache (update() touches DOM only on change)
   private cHp = -1;
   private cArmor = -1;
@@ -832,6 +1387,10 @@ export class Hud {
   private cCanStart: boolean | null = null; // server's start verdict, as rendered
   private cSeated = -1;                   // seat counts as rendered on the START bar
   private cMinPlayers = -1;
+  private cMp: MatchPoint | '' = '';      // match-point state as rendered
+  private cStreakTeam: Team | null | '' = '';
+  private cStreakCount = -1;
+  private cArcYou: Team | null | '' = ''; // your side, as the stakes row read it
 
   constructor(root: HTMLElement) {
     // PALETTE -> CSS custom properties on the root (single source of truth).
@@ -851,6 +1410,7 @@ export class Hud {
     st.setProperty('--fh-ink-55', alpha(PALETTE.ink, 0.55));
     st.setProperty('--fh-ink-70', alpha(PALETTE.ink, 0.72));
     st.setProperty('--fh-ink-85', alpha(PALETTE.ink, 0.85));
+    st.setProperty('--fh-ink-92', alpha(PALETTE.ink, 0.92));
     st.setProperty('--fh-scope-ink', alpha(PALETTE.ink, 0.97));
     st.setProperty('--fh-scope-soft', alpha(PALETTE.ink, 0.55));
     st.setProperty('--fh-scope-line', alpha(PALETTE.hudText, 0.5));
@@ -863,9 +1423,20 @@ export class Hud {
     st.setProperty('--fh-track', alpha(PALETTE.ink, 0.72));
     st.setProperty('--fh-tick', alpha(PALETTE.ink, 0.65));
     st.setProperty('--fh-scrim', alpha(PALETTE.ink, 0.42));
+    // End-screen washes: the result is carried by the whole frame, not just by
+    // the word VICTORY. Still PALETTE, just translucent.
+    st.setProperty('--fh-end-wash-win', alpha(PALETTE.hpGreen, 0.3));
+    st.setProperty('--fh-end-wash-lose', alpha(PALETTE.danger, 0.32));
+    st.setProperty('--fh-end-wash-none', alpha(PALETTE.steel, 0.24));
     st.setProperty('--fh-rim', alpha(PALETTE.hudText, 0.16));
     st.setProperty('--fh-rim-hi', alpha(PALETTE.hudText, 0.26));
     st.setProperty('--fh-edge', alpha(PALETTE.hudText, 0.09));
+    // The four team vars are pass-throughs, deliberately: the HUD must show the
+    // exact hex worn by the soldier in the world, so the rail, the score chips,
+    // the killfeed and the enemy you just saw are one read. They moved with the
+    // §1 L6 readability retune (CT -> indigo, T -> blaze); nothing here encodes
+    // "amber" or "blue" as a literal, and every team signal in this file is also
+    // carried by an icon, a word, or a border, so the retune costs no channel.
     st.setProperty('--fh-t', PALETTE.tAmber);
     st.setProperty('--fh-t-lit', PALETTE.tLit);
     st.setProperty('--fh-ct', PALETTE.ctBlue);
@@ -887,6 +1458,13 @@ export class Hud {
     // spectate vignette (over the scrims, under everything else)
     this.vig = div('fh-vig fh-hidden');
     this.layer.appendChild(this.vig);
+
+    // low-hp edge sits under the pain flash: the steady state reads as the
+    // floor the transient hit spikes above, rather than fighting it.
+    this.low = div('fh-low');
+    this.layer.appendChild(this.low);
+    this.pain = div('fh-pain');
+    this.layer.appendChild(this.pain);
 
     // damage ring — fixed SVG, arcs pooled + reused round-robin. Each slot is
     // an ink outline under a danger arc so the direction reads over a bright
@@ -924,6 +1502,17 @@ export class Hud {
       this.layer.appendChild(d);
       this.dnums.push(d);
     }
+
+    // death card — built once, hidden; deathCard() only rewrites text/classes
+    this.death = div('fh-death fh-panel fh-hidden');
+    this.deathHead = div('fh-death-head');
+    this.deathName = div('fh-death-name');
+    this.deathBy = div('fh-death-by');
+    this.deathSide = span('fh-death-side');
+    this.deathHs = span('fh-death-hs', 'HEADSHOT');
+    this.deathBy.append(this.deathSide, this.deathHs);
+    this.death.append(this.deathHead, this.deathName, this.deathBy);
+    this.layer.appendChild(this.death);
 
     // crosshair
     this.cross = div('fh-cross');
@@ -1067,6 +1656,40 @@ export class Hud {
     this.startWhy = div('fh-start-why');
     this.startWhy.setAttribute('role', 'status'); // the reason must be announced, not just seen
     this.startBar.append(this.startBtn, this.startWhy);
+
+    // ---- match arc ----------------------------------------------------------
+    // Stakes row: two independent chips, built once and hidden; update() only
+    // ever rewrites their text and toggles them, and only when the derived
+    // state actually changed. Nothing here allocates on a steady frame.
+    this.stakesEl = div('fh-stakes');
+    this.mpEl = div('fh-stake fh-stake-mp fh-panel fh-hidden');
+    this.mpTag = div('fh-stake-tag');
+    this.mpLine = div('fh-stake-line');
+    this.mpEl.append(this.mpTag, this.mpLine);
+    this.streakEl = div('fh-stake fh-panel fh-hidden');
+    this.streakTag = div('fh-stake-tag');
+    this.streakLine = div('fh-stake-line');
+    this.streakEl.append(this.streakTag, this.streakLine);
+    this.stakesEl.append(this.mpEl, this.streakEl);
+    top.appendChild(this.stakesEl); // hangs off the top cluster, like fh-round
+
+    // End-of-match scoreboard: the shell is built once here, the rows once per
+    // MATCH in matchEnd(). It starts hidden and is never touched by update().
+    this.endEl = div('fh-end fh-hidden');
+    const endPanel = div('fh-end-panel fh-panel');
+    const endHead = div('fh-end-head');
+    this.endTitle = div('fh-end-title');
+    this.endScore = div('fh-end-score');
+    endHead.append(
+      div('fh-end-eyebrow', 'MATCH RESULT'),
+      this.endTitle,
+      div('fh-end-rule'),
+      this.endScore,
+    );
+    this.endTbl = div('fh-end-tbl');
+    endPanel.append(endHead, this.endTbl, div('fh-end-foot', 'RETURNING TO WARMUP…'));
+    this.endEl.appendChild(endPanel);
+    this.layer.appendChild(this.endEl);
   }
 
   update(s: HudState): void {
@@ -1186,6 +1809,7 @@ export class Hud {
       pill(this.scoreTPill, s.team === null ? null : mineT);
       pill(this.scoreCTPill, s.team === null ? null : mineCT);
     }
+    this.syncStakes(s);
     this.syncTeams(s);
     this.syncStart(s);
 
@@ -1208,6 +1832,21 @@ export class Hud {
     if (s.alive !== this.cAlive) {
       this.cAlive = s.alive;
       this.vig.classList.toggle('fh-hidden', s.alive);
+      // respawned (or joined a fresh round): the death card has said its piece
+      if (s.alive) this.deathCard(null);
+    }
+
+    // Low-HP edge. Quantised to LOWHP_STEP so a drifting hp never rewrites the
+    // custom property every frame — on the overwhelming majority of frames this
+    // is one compare and nothing else. Suppressed while dead, where the
+    // spectate vignette already owns the screen.
+    const lowQ = s.alive
+      ? Math.round(lowHpIntensity01(s.hp) / LOWHP_STEP) * LOWHP_STEP
+      : 0;
+    if (lowQ !== this.cLowA) {
+      this.cLowA = lowQ;
+      this.low.style.setProperty('--fh-low-a', lowQ.toFixed(2));
+      this.low.classList.toggle('fh-pulse', lowQ > 0);
     }
     if (s.spectating !== this.cSpec) {
       this.cSpec = s.spectating;
@@ -1219,6 +1858,68 @@ export class Hud {
           : `SPECTATING ${s.spectating}`;
       }
     }
+  }
+
+  /**
+   * The stakes row — C6 match point and the round-win run.
+   *
+   * Both are derived, not received: match point falls straight out of the
+   * scores `round_start` already carries plus ROUNDS.winRounds, and the run is
+   * folded from the `round_end` stream by the caller. NOTHING was added to the
+   * wire for either, which is the contract.
+   *
+   * Runs every frame, so it is written to the same cached-write discipline as
+   * the rest of update(): matchPointOf is pure and allocation-free, and the two
+   * copy objects are only built on the frames where the state actually changed
+   * — a handful of times per match.
+   */
+  private syncStakes(s: HudState): void {
+    // The row belongs to a live match only. Warmup has no scores worth reading
+    // and the lobby panel owns that lane; matchEnd has the full scoreboard up;
+    // and the LAST round's roundEnd has no next round to raise the stakes of.
+    const live = stakesVisible(s.phase, s.round);
+    const mp = live ? matchPointOf(s.scoreT, s.scoreCT) : 'none';
+    const stTeam = live ? s.streakTeam : null;
+    const stCount = live ? s.streakCount : 0;
+    const youChanged = s.team !== this.cArcYou;
+
+    if (mp !== this.cMp || youChanged) {
+      this.cMp = mp;
+      const copy = matchPointCopy(mp, s.team);
+      this.mpEl.classList.toggle('fh-hidden', copy === null);
+      if (copy !== null) {
+        this.mpTag.textContent = copy.tag;
+        this.mpLine.textContent = copy.line;
+        // A single side at match point wears that side's exact hex (a
+        // pass-through of the same var its soldiers wear). The DECIDER takes
+        // the neutral accent: C6 forbids that state reading as two competing
+        // banners, and colouring it for one side is how it would.
+        this.mpEl.style.setProperty(
+          '--fh-stake-c',
+          mp === 'both'
+            ? 'var(--fh-accent)'
+            : mp === 'T'
+              ? 'var(--fh-t-lit)'
+              : 'var(--fh-ct-lit)',
+        );
+      }
+    }
+
+    if (stTeam !== this.cStreakTeam || stCount !== this.cStreakCount || youChanged) {
+      this.cStreakTeam = stTeam;
+      this.cStreakCount = stCount;
+      const copy = streakCopy({ team: stTeam, count: stCount }, s.team);
+      this.streakEl.classList.toggle('fh-hidden', copy === null);
+      if (copy !== null) {
+        this.streakTag.textContent = copy.tag;
+        this.streakLine.textContent = copy.line;
+        this.streakEl.style.setProperty(
+          '--fh-stake-c',
+          stTeam === 'T' ? 'var(--fh-t-lit)' : 'var(--fh-ct-lit)',
+        );
+      }
+    }
+    if (youChanged) this.cArcYou = s.team;
   }
 
   /**
@@ -1417,8 +2118,13 @@ export class Hud {
   }
 
   /** Red arc pointing at the damage source. yawRelative 0 = ahead, positive =
-   *  source to the left (yaw increases CCW) — hence the negative CSS rotation. */
-  damageFrom(yawRelative: number): void {
+   *  source to the left (yaw increases CCW) — hence the negative CSS rotation.
+   *
+   *  `dmg` is the post-armour damage from the wire. It drives a full-screen
+   *  pain flash whose peak opacity scales with severity, so a 12-damage graze
+   *  and an 89-damage near-kill no longer read identically. Omitting it (or
+   *  passing 0) keeps the old arc-only behaviour. */
+  damageFrom(yawRelative: number, dmg = 0): void {
     const arc = this.arcs[this.arcNext];
     const rot = this.arcRots[this.arcNext];
     // pool is fixed-size; unreachable, satisfies noUncheckedIndexedAccess
@@ -1429,6 +2135,152 @@ export class Hud {
     arc.classList.add('fh-on');
     // restart the fade via WAAPI — no layout read on the combat hot path
     arc.getAnimations().forEach((a) => { a.cancel(); a.play(); });
+
+    const a = painFlashAlpha(dmg);
+    if (a <= 0) return;
+    this.pain.style.setProperty('--fh-pain-a', a.toFixed(3));
+    this.pain.classList.add('fh-on');
+    this.pain.getAnimations().forEach((x) => { x.cancel(); x.play(); });
+  }
+
+  /**
+   * The death card: who killed you, with what, and whether it was a headshot.
+   * Pass `null` to hide it (done automatically on respawn, from update()).
+   *
+   * C4: `killerName === null` means suicide, a console `kill`, or world damage.
+   * That case renders the NEUTRAL headline with no name, no side chip and no
+   * weapon glyph — never "KILLED BY undefined", and never a blank name row.
+   */
+  deathCard(info: DeathCardInfo | null): void {
+    if (info === null) {
+      this.death.classList.add('fh-hidden');
+      return;
+    }
+    const { head, name } = deathCardText(info.killerName);
+    const named = name !== '';
+    this.deathHead.textContent = head;
+    this.deathName.textContent = name;
+    this.deathName.classList.toggle('fh-hidden', !named);
+
+    // Team colour is a straight pass-through of the hex the killer's soldier
+    // wears; the side WORD carries the same signal so nothing rides on hue.
+    const team = named ? info.killerTeam : null;
+    this.death.style.setProperty(
+      '--fh-death-c',
+      team === null ? 'var(--fh-text)' : team === 'T' ? 'var(--fh-t-lit)' : 'var(--fh-ct-lit)',
+    );
+    this.deathSide.textContent = team ?? '';
+    this.deathSide.classList.toggle('fh-hidden', team === null);
+    this.deathHs.classList.toggle('fh-hidden', !(named && info.headshot));
+
+    // Weapon glyph is rebuilt per death (once), never per frame. A neutral
+    // death has no meaningful killer weapon, so it shows none.
+    if (this.deathGlyph !== null) {
+      this.deathGlyph.remove();
+      this.deathGlyph = null;
+    }
+    if (named) {
+      const g = weaponIcon(info.weapon, DEATH_GLYPH_SCALE);
+      g.classList.add('fh-death-w');
+      this.deathBy.insertBefore(g, this.deathHs);
+      this.deathGlyph = g;
+    }
+    this.death.classList.remove('fh-hidden');
+  }
+
+  /**
+   * The end-of-match scoreboard (C5). Pass `null` to hide it — done on the
+   * return to warmup and on any teardown, so a rejoin never flashes a stale
+   * board.
+   *
+   * Rebuilt once per MATCH, never per frame. Two rules are load-bearing:
+   *
+   *  - `info.stats` is rendered IN THE ORDER RECEIVED. The server documents a
+   *    strict total order (kills DESC, damage DESC, deaths ASC, join order ASC)
+   *    and a client-side re-sort would be a second opinion that diverges from
+   *    it silently — nobody would ever see the bug, they would just see a
+   *    different board than the one the server described.
+   *  - accuracy is DERIVED here via accuracyText, which renders `—` for a
+   *    player who never fired. It is never requested from the server.
+   */
+  matchEnd(info: MatchEndInfo | null): void {
+    if (info === null) {
+      this.endEl.classList.add('fh-hidden');
+      this.endTbl.textContent = '';
+      return;
+    }
+    const won = info.you !== null && info.you === info.winner;
+    const lost = info.you !== null && info.you !== info.winner;
+    this.endTitle.textContent = matchResultTitle(info.winner, info.you);
+    // the whole frame carries the result, not just the word: a wash behind the
+    // panel and the title, rule and score in the same value
+    const c = won ? 'var(--fh-hp)' : lost ? 'var(--fh-danger)' : 'var(--fh-text)';
+    this.endEl.style.setProperty('--fh-end-c', c);
+    this.endEl.style.setProperty(
+      '--fh-end-wash',
+      won ? 'var(--fh-end-wash-win)' : lost ? 'var(--fh-end-wash-lose)' : 'var(--fh-end-wash-none)',
+    );
+
+    // scoreline, T left / CT right — the same position-led reading order the
+    // top score chips use, with the winner tagged in WORDS as well as value
+    this.endScore.textContent = '';
+    const tSide = span('fh-end-s-t', `T ${info.scoreT}`);
+    if (info.winner === 'T') tSide.appendChild(span('fh-end-s-win', 'WINNER'));
+    const ctSide = span('fh-end-s-ct', `${info.scoreCT} CT`);
+    if (info.winner === 'CT') ctSide.appendChild(span('fh-end-s-win', 'WINNER'));
+    this.endScore.append(tSide, span('fh-end-s-dash', '—'), ctSide);
+
+    const maxDmg = maxDamageOf(info.stats);
+    this.endTbl.textContent = '';
+    const head = div('fh-end-row fh-end-hrow');
+    head.append(
+      div('fh-end-h', 'SIDE'),
+      div('fh-end-h', 'PLAYER'),
+      div('fh-end-h fh-end-num', 'K'),
+      div('fh-end-h fh-end-num', 'D'),
+      div('fh-end-h fh-end-num', 'HS'),
+      div('fh-end-h fh-end-num', 'DAMAGE'),
+      div('fh-end-h fh-end-num', 'ACC'),
+    );
+    this.endTbl.appendChild(head);
+    for (const r of info.stats) {
+      this.endTbl.appendChild(this.buildStatRow(r, r.id === info.youId && info.youId !== '', maxDmg));
+    }
+    this.endEl.classList.remove('fh-hidden');
+  }
+
+  /** One end-screen row. `isYou` is the whole point of the screen — mark it hard. */
+  private buildStatRow(r: MatchStatRow, isYou: boolean, maxDmg: number): HTMLDivElement {
+    const row = div(`fh-end-row${isYou ? ' fh-end-me' : ''}`);
+    // side is a coloured tag AND the word: never hue alone, same as every other
+    // team signal in this file
+    row.appendChild(div(`fh-end-tag fh-end-tag-${lc(r.team)}`, r.team));
+    const name = div('fh-end-name');
+    name.appendChild(span('fh-end-nametext', r.name));
+    if (isYou) name.appendChild(span('fh-end-you', 'YOU'));
+    row.appendChild(name);
+    row.append(
+      div('fh-end-num', `${r.kills}`),
+      div('fh-end-num', `${r.deaths}`),
+      // a ZERO headshot count is not a headshot — it must not wear the alert
+      // colour, or every empty cell on the board reads as something happened
+      div(`fh-end-num${r.headshots > 0 ? ' fh-end-hs' : ''}`, `${r.headshots}`),
+    );
+    // damage: number AND a bar scaled to the top damage on this board, so the
+    // player who chipped everybody and killed nobody is finally visible
+    const dmg = div('fh-end-dmg');
+    dmg.appendChild(div('fh-end-num', `${Math.round(r.damage)}`));
+    const bar = div('fh-end-dmgbar');
+    const fill = div('fh-end-dmgfill');
+    fill.style.width = `${(damageBar01(r.damage, maxDmg) * 100).toFixed(1)}%`;
+    bar.appendChild(fill);
+    dmg.appendChild(bar);
+    row.appendChild(dmg);
+    // C5: '—' when the trigger was never pulled. NOT 0%, which is what someone
+    // who fired and missed everything scores.
+    const acc = accuracyText(r.shotsHit, r.shotsFired);
+    row.appendChild(div(`fh-end-acc${acc === ACC_NONE ? ' fh-end-accnone' : ''}`, acc));
+    return row;
   }
 
   /** Big center text for 2.5s; queues while another banner is up. */

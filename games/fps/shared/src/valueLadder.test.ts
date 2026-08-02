@@ -16,10 +16,11 @@ import {
   MAPS,
   MAP_LIST,
   MAT_COLORS,
+  PALETTE,
   TRIM_MAT,
 } from '@fps/shared';
 import type { MapDef, MapId, MatId } from '@fps/shared';
-import { L, hexToRgb, hueDistance, hueSplitOk, saturation } from '@platform/shared';
+import { L, hexToRgb, hue, hueDistance, hueSplitOk, saturation } from '@platform/shared';
 
 // ---- §3a per-map ladder assignments (VISUAL_UPGRADE.md §3a) ----------------
 // The SINGLE material named as the L1 reference wall for each map. L1 is
@@ -48,6 +49,9 @@ const L1_MIN_MONOCHROME = 28; // harder floor bought in exchange for the L4 exem
 const L2A_MIN = 8; // wall plinth drop
 const L3_MIN = 8; // trim lift
 const S1_MIN = 12; // sky zenith / horizon separation
+const L6_DL_MIN = 18; // team colour vs background: value escape
+const L6_DHUE_MIN = 30; // team colour vs background: hue escape
+const TEAM_TIER_MIN = 8; // …Lit above / …Dark below the team base
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -311,6 +315,147 @@ describe('per-map ladder + sky law', () => {
           `(${map.theme.horizon}) — the Crossfire/Frostbite same-hex defect flattens the frame`,
       ).not.toBe(map.theme.horizon);
     });
+  });
+});
+
+// ============================================================================
+// L6 — TEAM READABILITY. The one law that is about FAIRNESS rather than looks:
+// you cannot shoot what you cannot see, and a round is one life.
+//
+// Every team colour must clear BOTH the ground and the L1 reference wall of
+// EVERY map by >= 18 L* OR >= 30 degrees of hue. Before this gate existed,
+// 6 of the 12 map/team BASE pairs failed: `ctBlue` #3d5a9b sat 4.3 L* and 8 deg
+// from `tarmac` (Crossfire + Urbana floors) and 10.1 L* / 6 deg from `carpet`
+// (Office floor); `tAmber` #c8912f sat 15.4 L* / 7 deg from `sand`, 19.5 L* /
+// 1 deg from `plaster` and 5.6 L* / 22 deg from `concrete`. A CT was
+// camouflaged against three floors and a T against three walls.
+//
+// The gate runs over ALL FOUR tiers of each team, not just the base, because
+// `playerModels.ts` paints the soldier in all four (PALE helmet, LIT shoulders,
+// BASE body, DARK limbs) — a readable base with an invisible helmet is still an
+// invisible enemy at range. The four-tone script is what made `ice`/`muzzle`/
+// `fire`/`tBrown` sneak onto the model in the first place; this gate is why
+// they cannot come back.
+//
+// NO IMPLEMENTER MAY WEAKEN A THRESHOLD. If a team colour cannot satisfy this,
+// the team colour moves — never the number.
+// ============================================================================
+describe('L6 — team colours clear every map ground and reference wall', () => {
+  const TEAM_TIERS: [team: string, tier: string, hex: string][] = [
+    ['CT', 'ctPale', PALETTE.ctPale],
+    ['CT', 'ctLit', PALETTE.ctLit],
+    ['CT', 'ctBlue (BASE)', PALETTE.ctBlue],
+    ['CT', 'ctDark', PALETTE.ctDark],
+    ['T', 'tPale', PALETTE.tPale],
+    ['T', 'tLit', PALETTE.tLit],
+    ['T', 'tAmber (BASE)', PALETTE.tAmber],
+    ['T', 'tDark', PALETTE.tDark],
+  ];
+
+  // one row per (tier, map, ground|wall) — 8 tiers x 6 maps x 2 = 96 checks
+  const ROWS: [label: string, teamHex: string, surface: string, bgHex: string][] = [];
+  for (const [team, tier, hex] of TEAM_TIERS) {
+    for (const map of MAP_LIST) {
+      const wall = L1_REFERENCE_WALL[map.id];
+      ROWS.push([`${team} ${tier} vs ${map.id} ground`, hex, map.floorMat, MAT_COLORS[map.floorMat]]);
+      ROWS.push([`${team} ${tier} vs ${map.id} wall`, hex, wall, MAT_COLORS[wall]]);
+    }
+  }
+
+  it.each(ROWS)('%s', (label, teamHex, surface, bgHex) => {
+    const dL = Math.abs(L(teamHex) - L(bgHex));
+    const dHue = hueDistance(teamHex, bgHex);
+    expect(
+      dL >= L6_DL_MIN || dHue >= L6_DHUE_MIN,
+      `L6 ${label}: team ${teamHex} (L=${n(L(teamHex))}, hue=${n(hue(teamHex))}) against ` +
+        `${surface} ${bgHex} (L=${n(L(bgHex))}, hue=${n(hue(bgHex))}) clears by only ` +
+        `dL=${n(dL)} (needs ${L6_DL_MIN}) and dHue=${n(dHue)} (needs ${L6_DHUE_MIN}). ` +
+        `An enemy in this tier is camouflaged on this surface.`,
+    ).toBe(true);
+  });
+
+  // The escape hatch this law must never grow: "solve" a failing pair by
+  // desaturating the team into the world. A team colour is a SIGNAL — it has to
+  // out-chroma every surface it is seen against.
+  it.each(TEAM_TIERS)('%s %s is more saturated than every map ground and wall', (_t, tier, hex) => {
+    for (const map of MAP_LIST) {
+      for (const m of [map.floorMat, L1_REFERENCE_WALL[map.id]]) {
+        expect(
+          saturation(hex) - saturation(MAT_COLORS[m]),
+          `L6-chroma ${tier} (${hex}, sat=${n(saturation(hex))}) must out-saturate ` +
+            `${map.id}'s ${m} (${MAT_COLORS[m]}, sat=${n(saturation(MAT_COLORS[m]))})`,
+        ).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  // §2 tier floors, applied to the character instead of a wall.
+  it.each([
+    ['ctLit', PALETTE.ctLit, 'ctBlue', PALETTE.ctBlue],
+    ['ctPale', PALETTE.ctPale, 'ctLit', PALETTE.ctLit],
+    ['tLit', PALETTE.tLit, 'tAmber', PALETTE.tAmber],
+    ['tPale', PALETTE.tPale, 'tLit', PALETTE.tLit],
+  ])('%s is >= 8 L* above %s', (hi, hiHex, lo, loHex) => {
+    expect(
+      L(hiHex) - L(loHex),
+      `team tier: expected L(${hi})=${n(L(hiHex))} - L(${lo})=${n(L(loHex))} = ` +
+        `${n(L(hiHex) - L(loHex))} >= ${TEAM_TIER_MIN}`,
+    ).toBeGreaterThanOrEqual(TEAM_TIER_MIN);
+  });
+
+  it.each([
+    ['ctDark', PALETTE.ctDark, 'ctBlue', PALETTE.ctBlue],
+    ['tDark', PALETTE.tDark, 'tAmber', PALETTE.tAmber],
+  ])('%s is >= 8 L* below %s (the limb value break)', (lo, loHex, hi, hiHex) => {
+    expect(
+      L(hiHex) - L(loHex),
+      `team tier: expected L(${hi})=${n(L(hiHex))} - L(${lo})=${n(L(loHex))} = ` +
+        `${n(L(hiHex) - L(loHex))} >= ${TEAM_TIER_MIN}`,
+    ).toBeGreaterThanOrEqual(TEAM_TIER_MIN);
+  });
+
+  // The other half of the fairness bargain: fixing "enemy vs world" must never
+  // cost "enemy vs ally". These floors are the separation the ORIGINAL
+  // #3d5a9b / #c8912f pair carried (dL* 24.9), frozen so no future retune trades
+  // one read for the other.
+  it('the two teams stay at least as separated from each other as they ever were', () => {
+    const dL = Math.abs(L(PALETTE.ctBlue) - L(PALETTE.tAmber));
+    const dHue = hueDistance(PALETTE.ctBlue, PALETTE.tAmber);
+    expect(
+      dL,
+      `team split: expected |L(ctBlue)=${n(L(PALETTE.ctBlue))} - ` +
+        `L(tAmber)=${n(L(PALETTE.tAmber))}| = ${n(dL)} >= 22`,
+    ).toBeGreaterThanOrEqual(22);
+    expect(
+      dHue,
+      `team split: expected hueDistance(ctBlue, tAmber) = ${n(dHue)} >= 100 — the two ` +
+        `sides must never converge on one hue family`,
+    ).toBeGreaterThanOrEqual(100);
+  });
+
+  // A hazard stripe painted in the live enemy colour is a false-positive enemy
+  // read on every corner you clear. Crossfire, Frostbite and Bunker all wear
+  // safety amber, and it used to BE `tAmber`.
+  it('no world dressing colour collides with a team colour', () => {
+    const WORLD: [string, string][] = [
+      ['hazardAmber', PALETTE.hazardAmber],
+      ['hazardAmberLit', PALETTE.hazardAmberLit],
+      ['tBrown (sacks/barrels)', PALETTE.tBrown],
+      ['fire', PALETTE.fire],
+      ['muzzle', PALETTE.muzzle],
+      ['ice', PALETTE.ice],
+    ];
+    for (const [wn, wh] of WORLD) {
+      for (const [, tier, th] of TEAM_TIERS) {
+        const dL = Math.abs(L(wh) - L(th));
+        const dHue = hueDistance(wh, th);
+        expect(
+          dL >= 12 || dHue >= 20,
+          `world/team collision: ${wn} (${wh}) is only dL=${n(dL)} / dHue=${n(dHue)} ` +
+            `from the team tier ${tier} (${th}) — world dressing must not read as an enemy`,
+        ).toBe(true);
+      }
+    }
   });
 });
 

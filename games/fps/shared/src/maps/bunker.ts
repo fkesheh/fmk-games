@@ -37,7 +37,7 @@
 //                                  have merged into the ground it stands on)
 //   crate  crate          L 52.6
 //   wall   concrete       L 58.4   the L1 REFERENCE (58.4 - 27.7 = 30.7 >= 28)
-//   accent tAmber         L 63.9   warm emergency dressing against the cold light
+//   accent hazardAmber         L 63.9   warm emergency dressing against the cold light
 //   pipes  metal (steel)  L 66.6   the brightest structure, reads in the gloom
 // Why metalDark and not concreteDeep (L 28.6, which also clears L1 at 29.8): its
 // CONTACT_MAT partner is metalDeep, 13.2 L* below, so plinths and prop contact
@@ -160,7 +160,7 @@ export const bunker: MapDef = {
     // stands on). concreteDark is DARK_MAT['concrete'], i.e. the sanctioned
     // secondary/shaded tier: the core reads 12.2 L* down from the outer shell it
     // sits inside, and 18.5 L* up from the floor, so it silhouettes both ways.
-    // It also keeps 17.7 L* under tAmber, which is what makes the hazard plates
+    // It also keeps 17.7 L* under hazardAmber, which is what makes the hazard plates
     // on the pillar below still pop.
     // N wall: door x[0.8,2.8]
     { x: -2.2, y: 1.5, z: -4.6, w: 6, h: 3, d: 1.2, mat: 'concreteDark' },
@@ -358,39 +358,39 @@ export const bunker: MapDef = {
     { kind: 'barrel', count: 8, x0: -4.7, z0: -11.3, x1: 4.7, z1: -9.4, minSpacing: 1.7 },
     { kind: 'barrel', count: 8, x0: -4.7, z0: 9.4, x1: 4.7, z1: 11.3, minSpacing: 1.7 },
   ],
-  // AAA accent: safety amber (tAmber) — hub pillar hazard plates + hub door
+  // AAA accent: safety amber (hazardAmber) — hub pillar hazard plates + hub door
   // markers + ring-nub hazard stripes, repeated on every main sightline
   accents: [
     // hub pillar hazard plates (N and S faces)
-    { x: -0.5, y: 1.2, z: -1.03, w: 0.34, h: 2.2, d: 0.05, hex: PALETTE.tAmber },
-    { x: 0.5, y: 1.2, z: 1.03, w: 0.34, h: 2.2, d: 0.05, hex: PALETTE.tAmber },
+    { x: -0.5, y: 1.2, z: -1.03, w: 0.34, h: 2.2, d: 0.05, hex: PALETTE.hazardAmber },
+    { x: 0.5, y: 1.2, z: 1.03, w: 0.34, h: 2.2, d: 0.05, hex: PALETTE.hazardAmber },
     // hub door markers (N door x[0.8,2.8] face z=-5.2; S door x[-3,-1] face z=5.2)
-    { x: 0.72, y: 1.1, z: -5.24, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.tAmber },
-    { x: 2.88, y: 1.1, z: -5.24, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.tAmber },
-    { x: -3.08, y: 1.1, z: 5.24, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.tAmber },
-    { x: -0.92, y: 1.1, z: 5.24, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.tAmber },
+    { x: 0.72, y: 1.1, z: -5.24, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.hazardAmber },
+    { x: 2.88, y: 1.1, z: -5.24, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.hazardAmber },
+    { x: -3.08, y: 1.1, z: 5.24, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.hazardAmber },
+    { x: -0.92, y: 1.1, z: 5.24, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.hazardAmber },
     // ring-nub hazard stripes (N/S corridor cover).
     // FIXED: these were at z=-+7.73, which is INSIDE the spawn-room wall the nub
     // grows out of (that wall spans z[-8.9,-7.7]) — they rendered buried and
     // invisible. The nub's corridor-facing face is z=-+6.7; 0.03 proud of that.
-    { x: 0, y: 0.9, z: -6.67, w: 1.0, h: 0.15, d: 0.05, hex: PALETTE.tAmber },
-    { x: 0, y: 0.9, z: 6.67, w: 1.0, h: 0.15, d: 0.05, hex: PALETTE.tAmber },
+    { x: 0, y: 0.9, z: -6.67, w: 1.0, h: 0.15, d: 0.05, hex: PALETTE.hazardAmber },
+    { x: 0, y: 0.9, z: 6.67, w: 1.0, h: 0.15, d: 0.05, hex: PALETTE.hazardAmber },
     // matching stripes on the W/E ring nubs (nubs span x -+[6.7,7.7]; the
     // corridor-facing face is x=-+6.7) so every leg of the loop carries the accent
-    { x: -6.67, y: 0.9, z: 0, w: 0.05, h: 0.15, d: 1.0, hex: PALETTE.tAmber },
-    { x: 6.67, y: 0.9, z: 0, w: 0.05, h: 0.15, d: 1.0, hex: PALETTE.tAmber },
+    { x: -6.67, y: 0.9, z: 0, w: 0.05, h: 0.15, d: 1.0, hex: PALETTE.hazardAmber },
+    { x: 6.67, y: 0.9, z: 0, w: 0.05, h: 0.15, d: 1.0, hex: PALETTE.hazardAmber },
     // spawn-room door jambs, ring side (wall z=-+8.3 d1.2 -> ring face z=-+7.7;
     // the solid centre block spans x[-2.2,2.2], so these sit flush to the inner
     // edge of each of the four openings)
-    { x: -2.13, y: 1.1, z: -7.66, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.tAmber },
-    { x: 2.13, y: 1.1, z: -7.66, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.tAmber },
-    { x: -2.13, y: 1.1, z: 7.66, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.tAmber },
-    { x: 2.13, y: 1.1, z: 7.66, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.tAmber },
+    { x: -2.13, y: 1.1, z: -7.66, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.hazardAmber },
+    { x: 2.13, y: 1.1, z: -7.66, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.hazardAmber },
+    { x: -2.13, y: 1.1, z: 7.66, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.hazardAmber },
+    { x: 2.13, y: 1.1, z: 7.66, w: 0.14, h: 2.2, d: 0.06, hex: PALETTE.hazardAmber },
     // low wayfinding strips on the four corner masses at the ring junctions
     // (clear of the junction crates, which end at x=-+6.8)
-    { x: -6, y: 0.35, z: -7.66, w: 1.4, h: 0.1, d: 0.06, hex: PALETTE.tAmber },
-    { x: 6, y: 0.35, z: -7.66, w: 1.4, h: 0.1, d: 0.06, hex: PALETTE.tAmber },
-    { x: -6, y: 0.35, z: 7.66, w: 1.4, h: 0.1, d: 0.06, hex: PALETTE.tAmber },
-    { x: 6, y: 0.35, z: 7.66, w: 1.4, h: 0.1, d: 0.06, hex: PALETTE.tAmber },
+    { x: -6, y: 0.35, z: -7.66, w: 1.4, h: 0.1, d: 0.06, hex: PALETTE.hazardAmber },
+    { x: 6, y: 0.35, z: -7.66, w: 1.4, h: 0.1, d: 0.06, hex: PALETTE.hazardAmber },
+    { x: -6, y: 0.35, z: 7.66, w: 1.4, h: 0.1, d: 0.06, hex: PALETTE.hazardAmber },
+    { x: 6, y: 0.35, z: 7.66, w: 1.4, h: 0.1, d: 0.06, hex: PALETTE.hazardAmber },
   ],
 };

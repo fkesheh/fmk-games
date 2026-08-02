@@ -48,10 +48,74 @@ import {
   type Vec3,
 } from '@fps/shared';
 
-// ---- shake tuning (frozen feel: "small and rare") ---------------------------
-const SHAKE_MAX_RAD = 0.02; // hard cap per axis
-const SHAKE_DECAY = 2.5; // trauma per second
-const SHAKE_SPEED = 18; // noise clock rate (rad/s of noise input)
+// ---- shake tuning -----------------------------------------------------------
+// RETUNED. The old numbers made the feature effectively non-existent: the
+// largest shake reachable in the game was the flat `shake(0.3)` on taking
+// damage, which peaked at 0.02 * 0.3^2 = 0.0018 rad = 0.10 DEGREES. Two
+// independent reasons it could not be seen, and both had to be fixed:
+//
+//   1. AMPLITUDE. trauma^2 is brutal at the low trauma values anyone actually
+//      passed — it turned 0.3 into 0.09. The exponent is now 1.5, which keeps
+//      the soft ease-out settle (no hard stop when trauma hits 0) while making
+//      mid-range trauma actually visible.
+//   2. DURATION. At 2.5 trauma/s a 0.3 event lived 0.12s, over which the noise
+//      clock advanced 18 * 0.12 = 2.16 rad — less than HALF of one wave. The
+//      player got a fraction of a single slow wobble, not an oscillation.
+//      Decay is slower and the clock faster, so a real hit now reads as ~2
+//      cycles of jolt-and-settle.
+//
+// Resulting peaks (mag = SHAKE_MAX_RAD * trauma^SHAKE_EXP):
+//   own fire, ceilinged at 0.34   -> 0.295 deg   (was 0.011)
+//   12 dmg graze,  trauma 0.545   -> 0.599 deg   (was 0.103)
+//   25 dmg body,   trauma 0.676   -> 0.828 deg   (was 0.103)
+//   89 dmg near-kill, trauma 0.98 -> 1.445 deg   (was 0.103)
+//   theoretical trauma 1.0        -> 1.489 deg
+//
+// The audit suggested a flat ~15x. A flat multiplier was rejected: it would
+// have put every graze and every one of your own shots at the same 1.5 deg as a
+// near-lethal hit, which harms aim on the SHOOTER'S side (this shake applies to
+// the firer too) and is the classic recipe for motion sickness. Instead the top
+// end lands at ~14x and the response is graded by damage, so the big number is
+// spent only on the rare event that has earned it.
+const SHAKE_MAX_RAD = 0.026; // hard cap per axis (1.49 deg at trauma 1)
+const SHAKE_EXP = 1.5; // trauma -> amplitude curve; >1 keeps the ease-out settle
+const SHAKE_DECAY = 1.9; // trauma per second (linear)
+const SHAKE_SPEED = 22; // noise clock rate (rad/s of noise input)
+// Roll is by far the most nausea-inducing axis and the least informative, so it
+// is deliberately damped relative to pitch/yaw rather than scaled with them.
+const SHAKE_ROLL = 0.45;
+
+/**
+ * Peak per-axis shake angle in radians for a given trauma. Pure and exported so
+ * the tuning can be asserted headlessly — `SceneRig` itself needs a WebGL
+ * context and cannot be constructed in a unit test.
+ */
+export function shakeMagnitudeRad(trauma: number): number {
+  if (!Number.isFinite(trauma) || trauma <= 0) return 0;
+  return SHAKE_MAX_RAD * Math.pow(Math.min(1, trauma), SHAKE_EXP);
+}
+
+/** Trauma remaining after `dt` seconds of linear decay. Pure; never negative. */
+export function shakeDecay(trauma: number, dt: number): number {
+  if (!Number.isFinite(trauma) || !Number.isFinite(dt)) return 0;
+  return Math.max(0, trauma - dt * SHAKE_DECAY);
+}
+
+/** Trauma range for taking damage: even the lightest graze clears the floor. */
+export const SHAKE_DMG_MIN = 0.38;
+export const SHAKE_DMG_SPAN = 0.6;
+
+/** Trauma for an incoming hit, from the shared 0..1 damage severity. */
+export function shakeTraumaForDamage(severity01: number): number {
+  const s = Number.isFinite(severity01) ? Math.min(1, Math.max(0, severity01)) : 0;
+  return SHAKE_DMG_MIN + SHAKE_DMG_SPAN * s;
+}
+
+/** Own-fire kick: added per shot, but never allowed to stack past this. A rifle
+ *  emptying a mag would otherwise saturate trauma to 1 and shake 1.5 deg
+ *  continuously while you are trying to hold a crosshair on someone. */
+export const SHAKE_FIRE_ADD = 0.16;
+export const SHAKE_FIRE_CEIL = 0.34;
 
 // ---- shadow rig ---------------------------------------------------------------
 // OUTDOOR: golden-hour art direction. The theme's sunDir sits at ~58 deg
@@ -656,7 +720,7 @@ export class SceneRig {
     const nowMs = performance.now();
     const dt = this.lastMs < 0 ? 0 : Math.min((nowMs - this.lastMs) / 1000, 0.1);
     this.lastMs = nowMs;
-    this.trauma = Math.max(0, this.trauma - dt * SHAKE_DECAY);
+    this.trauma = shakeDecay(this.trauma, dt);
     this.shakeT += dt * SHAKE_SPEED;
 
     this.camera.position.set(pos.x, pos.y, pos.z);
@@ -664,11 +728,15 @@ export class SceneRig {
     let ry = yaw;
     let rz = 0;
     if (this.trauma > 0) {
-      const mag = SHAKE_MAX_RAD * this.trauma * this.trauma; // trauma^2 scaled
+      const mag = shakeMagnitudeRad(this.trauma);
       rx += mag * this.noise(0);
       ry += mag * this.noise(1);
-      rz += mag * this.noise(2);
+      rz += mag * SHAKE_ROLL * this.noise(2);
     }
+    // rx/ry are re-seeded from the pitch/yaw ARGUMENTS every frame and the
+    // offset is written only into the three.js camera — never back into the
+    // input controller, never into anything the server sees. Shake therefore
+    // cannot accumulate and cannot desync the camera from where shots go.
     this.camera.rotation.set(rx, ry, rz);
 
     // fill light rides the view: from the camera, aimed ahead of it
@@ -683,9 +751,19 @@ export class SceneRig {
     }
   }
 
-  /** Add shake energy (clamped 0..1). Callers: own fire kick, damage taken. */
-  shake(amount: number): void {
-    this.trauma = Math.min(1, Math.max(0, this.trauma + amount));
+  /**
+   * Add shake energy. Callers: own fire kick, damage taken.
+   *
+   * `ceiling` bounds what THIS source may stack the trauma up to (default 1).
+   * The fire kick passes a low ceiling so that emptying a magazine cannot pin
+   * the camera at full amplitude while you are trying to hold an aim; an
+   * incoming hit is rare and uses the full range. A source never LOWERS trauma
+   * already present from a bigger event.
+   */
+  shake(amount: number, ceiling = 1): void {
+    const cap = Math.min(1, Math.max(0, ceiling));
+    const next = Math.min(cap, Math.max(0, this.trauma + amount));
+    this.trauma = Math.max(this.trauma, next);
   }
 
   /** Fit renderer + camera to the canvas' laid-out size (DPR capped at 2). */

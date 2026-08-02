@@ -8,6 +8,7 @@
 // allocates nothing beyond the small command object it must return.
 // ============================================================================
 import {
+  HEAD_BOX_H,
   INPUT_FIRE,
   INPUT_JUMP,
   PLAYER,
@@ -21,13 +22,18 @@ import type { AABB, MapDef, PlayerId, RoomPhase, Vec3, WeaponId } from '@fps/sha
 
 export interface BotPercept {
   self: { x: number; y: number; z: number; yaw: number; pitch: number; hp: number;
-          mag: number; reserve: number; reloading: boolean; crouch: boolean };
+          mag: number; reserve: number; reloading: boolean; crouch: boolean;
+          // The weapon the bot is holding RIGHT NOW — the same id the server's
+          // own fire path resolves (PlayerState.weapon). NOT owned[0]: owned is
+          // the ownership list and its first entry is always 'knife'.
+          weapon: WeaponId };
   enemies: Array<{ id: PlayerId; x: number; y: number; z: number; height: number; alive: boolean }>;
   solids: AABB[];
   map: MapDef;
   tick: number;
   phase: RoomPhase;
   money: number;
+  /** Everything owned, knife first. Ownership only — never "my gun". */
   owned: WeaponId[];
   canBuy: boolean;
 }
@@ -36,6 +42,16 @@ export interface BotCommand {
   moveX: number; moveZ: number; yaw: number; pitch: number; buttons: number; // INPUT_* bits
   reload: boolean;
   buy: WeaponId | null;
+  /**
+   * The weapon the bot wants to be HOLDING, or null when it is already holding
+   * it. The room feeds this straight into `handleSwitch` — the same handler a
+   * human client's `{ t: 'switch' }` message hits — so a bot can never equip
+   * something the switch rules would refuse a human (unowned, or while dead).
+   * Buying does NOT equip: `handleBuy` only re-equips when the held weapon
+   * LEAVES the owned list, so without this a bot that bought a rifle while
+   * holding a pistol kept the pistol forever.
+   */
+  switchTo: WeaponId | null;
 }
 
 type PerceptEnemy = BotPercept['enemies'][number];
@@ -44,7 +60,11 @@ const CELL = 0.75; // walkability grid resolution (m)
 const PERCEPT_RANGE = 45; // m, 360° awareness
 const TURN_RATE = 6; // rad/s, combined yaw+pitch aim speed
 const FIRE_ERR_RAD = (3 * Math.PI) / 180; // fire only when aim error < 3°
-const REACTION_TICKS = 9; // 300ms at 30Hz before firing on a new target
+// 233ms at 30Hz before firing on a newly acquired target. Was 9 (300ms), tuned
+// down once bots could actually hold a rifle. 233ms is a good human player's
+// visual reaction; going below ~200ms would be superhuman and is the line this
+// knob must not cross (I4 — bots stay beatable).
+const REACTION_TICKS = 7;
 const REPATH_TICKS = 150; // 5s max path age
 const BLOCKED_TICKS_REPATH = 15; // repath when blocked > 0.5s
 const BLOCKED_TICKS_JUMP = 2; // hop when stuck on the ground
@@ -54,6 +74,60 @@ const NODE_REACH_SQ = 0.45 * 0.45; // path node advance radius
 const MIN_GOAL_DIST_SQ = 4; // patrol goals must be >= 2m away (when possible)
 const PITCH_MAX = 1.45; // matches protocol clamp
 const LOOKAHEAD = 16; // max path nodes considered for string-pulling
+
+// Descending preference over weapons a bot will hold. Module-level and frozen
+// so `pickSwitch` allocates nothing per tick (I3). Weapons a bot never buys
+// (shotgun, sniper) are deliberately absent: an unlisted weapon is simply not
+// preferred, and the pistol below it is always owned, so the loop always
+// terminates on something real.
+const WEAPON_PREF: readonly WeaponId[] = ['rifle', 'smg', 'pistol', 'knife'];
+
+// ---- aim point (difficulty knob) -------------------------------------------
+// The head box is the top HEAD_BOX_H of a body, standing or crouched (see
+// playerHitboxes in @fps/shared/physics). Bots deliberately aim AIM_DROP below
+// its base — the upper chest — so the head is never the intended target but
+// residual aim error, target movement and weapon spread still clip it now and
+// then. That is the design call: bots should land the occasional headshot,
+// never hunt for one.
+// MEASURED at 0.12m: ~1 headshot per 5 hits (20.2% duel / 21.1% team over 80
+// matches). The previous "~1 per 8" was measured when every bot was stuck
+// holding a pistol; automatic fire sprays bloom across the head box far more
+// often, so the same drop now yields a materially higher rate. Left at 0.12m
+// because the balance measurement lands in target WITH that rate — but it is
+// the first knob to raise if bots start reading as unfair, since a rifle
+// headshot (33 x 4 = 132) is an outright one-shot kill.
+// A fixed drop (rather than a fraction of height) keeps the aim point on the
+// same part of the body whether the target is standing or crouched.
+// HEAD_BOX_H is imported from @fps/shared/physics — the same constant
+// playerHitboxes builds the head AABB from, so the aim point and the hitbox it
+// is aiming under can never drift apart.
+const AIM_DROP = 0.12;
+// Semi-auto trigger discipline, in ticks between shots. The floor is what makes
+// a pistol bot dangerous without becoming a metronome; the server's own
+// per-weapon `interval` still gates the actual rate.
+const SEMI_COOLDOWN_MIN = 6;
+const SEMI_COOLDOWN_MAX = 9;
+
+// ---- automatic burst discipline (difficulty knob) --------------------------
+// Counted in SHOTS, not ticks. This unit matters: the server gates the real
+// rate of fire by the weapon's `interval`, so a burst measured in HELD TICKS
+// buys a different number of bullets on every weapon. The old 4-8 TICK burst
+// was 4-8 bullets from a pistol but only 1-2 from a rifle (interval 0.1s = 3
+// ticks per shot) — which is why, once bots could finally hold a rifle, they
+// were no more dangerous than they had been with a pistol. 3-5 rounds is a
+// disciplined rifle burst and now means that on every automatic weapon.
+const BURST_SHOTS_MIN = 3;
+const BURST_SHOTS_MAX = 5;
+// Ticks between bursts. Sized to let the weapon's bloom recover: a rifle sheds
+// the ~2.8deg a 5-round burst adds in about 0.4s at spreadRecover 7deg/s.
+const PAUSE_TICKS_MIN = 8;
+const PAUSE_TICKS_MAX = 15;
+
+/** Held ticks that yield BURST_SHOTS_MIN..MAX actual shots from `def`. */
+function burstTicks(next: () => number, def: { interval: number }): number {
+  const ticksPerShot = Math.max(1, Math.ceil(def.interval / TICK_DT));
+  return rngInt(next, BURST_SHOTS_MIN, BURST_SHOTS_MAX) * ticksPerShot;
+}
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
@@ -89,7 +163,9 @@ export class BotBrain {
   // ---- engagement state ----
   private targetId: PlayerId | null = null;
   private acquiredTick = 0;
-  private burstLeft: number;
+  // Rolled on every target acquisition (which always precedes the first shot,
+  // since targetId starts null), sized from the HELD weapon's fire interval.
+  private burstLeft = 0;
   private pauseLeft = 0;
   private semiCooldown = 0;
 
@@ -106,7 +182,6 @@ export class BotBrain {
 
   constructor(seed: number) {
     this.next = rng(seed);
-    this.burstLeft = rngInt(this.next, 4, 8);
   }
 
   tick(p: BotPercept): BotCommand {
@@ -125,7 +200,7 @@ export class BotBrain {
 
     const cmd: BotCommand = {
       moveX: 0, moveZ: 0, yaw: p.self.yaw, pitch: p.self.pitch, buttons: 0,
-      reload: false, buy: null,
+      reload: false, buy: null, switchTo: null,
     };
 
     // buy is legal whenever the room says so (freeze + live buy window)
@@ -133,6 +208,14 @@ export class BotBrain {
       if (!p.owned.includes('rifle') && p.money >= WEAPONS.rifle.price) cmd.buy = 'rifle';
       else if (!p.owned.includes('smg') && p.money >= WEAPONS.smg.price) cmd.buy = 'smg';
     }
+
+    // Equip the best weapon we OWN. Unconditional (not gated on `active`): the
+    // buy happens in freeze, and the resulting switch must land in freeze too,
+    // so the bot walks out of the buy window already holding its rifle. A buy
+    // made this tick is not visible in `owned` until the room refreshes the
+    // percept, so the switch trails its buy by exactly one tick (33ms) — the
+    // same round trip a human client pays for a switch message.
+    cmd.switchTo = this.pickSwitch(p);
 
     // bodies only simulate in warmup/live; a dead bot (hp 0) stays put
     const active = (p.phase === 'warmup' || p.phase === 'live') && p.self.hp > 0;
@@ -149,6 +232,19 @@ export class BotBrain {
 
     this.intendedMove = cmd.moveX !== 0 || cmd.moveZ !== 0;
     return cmd;
+  }
+
+  /**
+   * The best owned weapon by WEAPON_PREF, or null when it is already held.
+   * Reads `owned` (ownership) and `self.weapon` (what is held) — the two are
+   * different things per C1, and conflating them is the bug this fixes.
+   */
+  private pickSwitch(p: BotPercept): WeaponId | null {
+    for (const w of WEAPON_PREF) {
+      if (!p.owned.includes(w)) continue;
+      return w === p.self.weapon ? null : w;
+    }
+    return null; // owns nothing preferred: hold whatever the room gave us
   }
 
   // -------------------------------------------------------------------------
@@ -191,7 +287,7 @@ export class BotBrain {
   private engage(p: BotPercept, target: PerceptEnemy, cmd: BotCommand): void {
     const selfHeight = p.self.crouch ? PLAYER.heightCrouch : PLAYER.heightStand;
     const eyeY = p.self.y + selfHeight - PLAYER.eyeOffset;
-    const chestY = target.y + target.height * 0.65;
+    const chestY = target.y + target.height - HEAD_BOX_H - AIM_DROP;
     const dx = target.x - p.self.x;
     const dz = target.z - p.self.z;
     const desiredYaw = Math.atan2(-dx, -dz);
@@ -201,11 +297,13 @@ export class BotBrain {
       PITCH_MAX,
     );
 
-    // target acquisition resets the 300ms reaction clock and the burst pattern
+    const def = WEAPONS[p.self.weapon];
+
+    // target acquisition resets the reaction clock and the burst pattern
     if (this.targetId !== target.id) {
       this.targetId = target.id;
       this.acquiredTick = p.tick;
-      this.burstLeft = rngInt(this.next, 4, 8);
+      this.burstLeft = burstTicks(this.next, def);
       this.pauseLeft = 0;
       this.semiCooldown = 0;
     }
@@ -230,7 +328,6 @@ export class BotBrain {
     const aimErr = Math.hypot(wrapPi(desiredYaw - cmd.yaw), desiredPitch - cmd.pitch);
     const reacted = p.tick - this.acquiredTick >= REACTION_TICKS;
 
-    const def = WEAPONS[p.owned[0] ?? 'pistol'];
     if (p.self.reloading) return;
     if (p.self.mag === 0 && def.mag !== -1) {
       cmd.reload = true; // never in the same tick as a fire press
@@ -239,20 +336,22 @@ export class BotBrain {
     if (!reacted || aimErr >= FIRE_ERR_RAD) return;
 
     if (def.auto) {
-      // bursts of 4-8 fire ticks separated by 8-15 tick pauses
+      // bursts of BURST_SHOTS_MIN..MAX rounds separated by 8-15 tick pauses
       if (this.burstLeft > 0) {
         cmd.buttons |= INPUT_FIRE;
         this.burstLeft--;
-        if (this.burstLeft === 0) this.pauseLeft = rngInt(this.next, 8, 15);
+        if (this.burstLeft === 0) {
+          this.pauseLeft = rngInt(this.next, PAUSE_TICKS_MIN, PAUSE_TICKS_MAX);
+        }
       } else {
         this.pauseLeft--;
-        if (this.pauseLeft <= 0) this.burstLeft = rngInt(this.next, 4, 8);
+        if (this.pauseLeft <= 0) this.burstLeft = burstTicks(this.next, def);
       }
     } else {
       // semi: single fire ticks every ~10 ticks (edge-triggered server-side)
       if (this.semiCooldown <= 0) {
         cmd.buttons |= INPUT_FIRE;
-        this.semiCooldown = rngInt(this.next, 9, 11);
+        this.semiCooldown = rngInt(this.next, SEMI_COOLDOWN_MIN, SEMI_COOLDOWN_MAX);
       } else {
         this.semiCooldown--;
       }

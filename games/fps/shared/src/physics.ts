@@ -208,10 +208,18 @@ export function raycastSolids(o: Vec3, d: Vec3, solids: AABB[], maxDist: number)
   return best;
 }
 
-/** Player hitboxes at a feet position. head = top 0.3m, body = rest. */
+/**
+ * Height of the head hitbox: the head is the TOP `HEAD_BOX_H` metres of a body,
+ * standing or crouched. Exported because the bot aim point (server/src/bots.ts)
+ * is defined relative to the head box; a private copy of this number there
+ * could silently drift away from the hitbox the hitscan actually tests.
+ */
+export const HEAD_BOX_H = 0.3;
+
+/** Player hitboxes at a feet position. head = top HEAD_BOX_H m, body = rest. */
 export function playerHitboxes(x: number, y: number, z: number, height: number): { head: AABB; body: AABB } {
   const r = PLAYER.radius;
-  const headH = 0.3;
+  const headH = HEAD_BOX_H;
   return {
     head: { minX: x - r * 0.8, minY: y + height - headH, minZ: z - r * 0.8, maxX: x + r * 0.8, maxY: y + height, maxZ: z + r * 0.8 },
     body: { minX: x - r, minY: y, minZ: z - r, maxX: x + r, maxY: y + height - headH, maxZ: z + r },

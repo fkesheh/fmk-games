@@ -11,22 +11,30 @@
 // FOUR-TONE TEAM SCRIPT (VISUAL_UPGRADE.md §1 value ladder, applied to the
 // character instead of a wall). Every tone is a named PALETTE team tier, so
 // the side reads at 30m in sun AND in shade, and the value ladder reads at 3m:
-//   - PALE   (helmet shell)                    CT `ice`    / T `muzzle`
+//   - PALE   (helmet shell)                    CT `ctPale` / T `tPale`
 //     the brightest thing on the model: the long-range silhouette read.
 //   - LIT    (helmet brim, shoulder patches,    CT `ctLit`  / T `tLit`
 //            upper-arm stripes)
 //     the saturated team hue, placed on the shoulders and head where a player
 //     sees an enemy first. This is the "team colours pop harder" lever.
-//   - BASE   (chest, shins, forearms)           CT `ctBlue` / T `fire`
+//   - BASE   (chest, shins, forearms)           CT `ctBlue` / T `tAmber`
 //     the high-chroma uniform body, shade-lifted (emissive = team DARK) so the
 //     silhouette never dies against same-hue walls, without washing out in sun.
-//     T stays on `fire` rather than `tAmber` on purpose: `tAmber` shares the
-//     desert wall hue and would sink into Dustbowl's sand.
-//   - DARK   (waist, shoulder pads, thighs,     CT `ctDark` / T `tBrown`
+//   - DARK   (waist, shoulder pads, thighs,     CT `ctDark` / T `tDark`
 //            upper arms, ankle cuffs)
 //     THE LIMB VALUE BREAK §3c demands: thigh in the Dark tier against a shin
 //     in the base tier, upper arm Dark against forearm base. No limb is one
 //     flat colour any more.
+//
+// ALL EIGHT TONES ARE NOW REAL TEAM TIERS. They used to borrow from elsewhere:
+// PALE was `ice` (a snow MatId — invisible against Frostbite's walls, 13 L* and
+// 13 deg from `snow`) and `muzzle`, BASE-T was `fire` (an explosion colour, 14.5
+// L* / 25.8 deg from Dustbowl's sand), DARK-T was `tBrown` (also the world's
+// sandbag brown, so it could never be retuned without repainting the props).
+// Every one of those borrowings pinned a tone to a colour chosen for a different
+// job. The palette's §1 L6 law is stated on the team tiers, so the model reads
+// team tiers — and `valueLadder.test.ts` proves all four CT and all four T tones
+// clear every map's ground and reference wall.
 //
 // GEAR LADDER — team-independent webbing/armour, resolved from the FROZEN
 // ladder tables (`MAT_COLORS` / `CONTACT_MAT` / `TRIM_MAT` keyed on `metalDark`)
@@ -117,7 +125,7 @@ const CONTACT_STRETCH = 1.3; // disc is an ellipse, longer along the facing axis
 // ---- four-tone team script (VISUAL_UPGRADE.md §3c) --------------------------
 /** Brightest tone: helmet shell. Carries the silhouette at long range. */
 function teamPaleHex(team: Team): string {
-  return team === 'CT' ? PALETTE.ice : PALETTE.muzzle;
+  return team === 'CT' ? PALETTE.ctPale : PALETTE.tPale;
 }
 /** Saturated team hue: helmet brim, shoulder patch, upper-arm stripe. */
 function teamLitHex(team: Team): string {
@@ -125,11 +133,11 @@ function teamLitHex(team: Team): string {
 }
 /** Uniform body: chest, shins, forearms. Shade-lifted by the DARK emissive. */
 function teamBaseHex(team: Team): string {
-  return team === 'CT' ? PALETTE.ctBlue : PALETTE.fire;
+  return team === 'CT' ? PALETTE.ctBlue : PALETTE.tAmber;
 }
 /** The limb value break: waist, shoulder pads, thighs, upper arms, cuffs. */
 function teamDarkHex(team: Team): string {
-  return team === 'CT' ? PALETTE.ctDark : PALETTE.tBrown;
+  return team === 'CT' ? PALETTE.ctDark : PALETTE.tDark;
 }
 
 // ---- gear ladder, resolved from the frozen partner tables -------------------

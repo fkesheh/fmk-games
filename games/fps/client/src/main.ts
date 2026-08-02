@@ -108,7 +108,11 @@ const PALETTE_CSS_VARS: ReadonlyArray<readonly [name: string, hex: string]> = [
   ['--c11-shell', PALETTE.charcoal], //      shell gradient lift
   ['--c11-text', PALETTE.hudText], //        body copy
   ['--c11-accent', PALETTE.hudAccent], //    focus ring, selection, boot bar
-  ['--c11-accent-lit', PALETTE.tLit], //     accent highlight
+  // The shell accent is `hudAccent` amber; its highlight must be the amber's own
+  // lit tier, NOT a team tier. It read `tLit` only because `tLit` happened to be
+  // that amber — it no longer is (the T family moved to hue 6), and the boot bar
+  // must not turn the enemy's colour.
+  ['--c11-accent-lit', PALETTE.hazardAmberLit], // accent highlight
   ['--c11-danger', PALETTE.danger], //       fatal banner
   ['--c11-danger-deep', PALETTE.blood], //   fatal banner floor
 ];

@@ -256,7 +256,7 @@ export const crossfire: MapDef = {
     // SE dead corner, east of the T spawn court
     { kind: 'crate', count: 8, x0: 12, z0: 14, x1: 27, z1: 19, minSpacing: 1.8 },
   ],
-  // AAA accent: safety amber (tAmber) — dock-edge hazard strip, painted
+  // AAA accent: safety amber (hazardAmber) — dock-edge hazard strip, painted
   // container doors, crane leg stripes: the industrial safety-yellow rhythm.
   // Both painted doors sit on the dark-tier containers, now `roofRed` (L 39)
   // rather than `metalDark` (L 26): the amber keeps a 23 L step instead of the
@@ -264,13 +264,13 @@ export const crossfire: MapDef = {
   // when that container face is on the shade side.
   accents: [
     // loading-dock edge hazard strip (front face of the dock platform)
-    { x: -20.5, y: 0.73, z: -2.96, w: 11, h: 0.14, d: 0.05, hex: PALETTE.tAmber },
+    { x: -20.5, y: 0.73, z: -2.96, w: 11, h: 0.14, d: 0.05, hex: PALETTE.hazardAmber },
     // painted container doors (end faces of two mid-lane containers)
-    { x: 7.5, y: 1.3, z: -7.54, w: 1.8, h: 1.8, d: 0.06, hex: PALETTE.tAmber },
-    { x: -7.5, y: 1.3, z: 8.04, w: 1.8, h: 1.8, d: 0.06, hex: PALETTE.tAmber },
+    { x: 7.5, y: 1.3, z: -7.54, w: 1.8, h: 1.8, d: 0.06, hex: PALETTE.hazardAmber },
+    { x: -7.5, y: 1.3, z: 8.04, w: 1.8, h: 1.8, d: 0.06, hex: PALETTE.hazardAmber },
     // crane leg hazard stripes
-    { x: -3.5, y: 0.9, z: -0.53, w: 1.04, h: 0.3, d: 0.05, hex: PALETTE.tAmber },
-    { x: 3.5, y: 0.9, z: -0.53, w: 1.04, h: 0.3, d: 0.05, hex: PALETTE.tAmber },
+    { x: -3.5, y: 0.9, z: -0.53, w: 1.04, h: 0.3, d: 0.05, hex: PALETTE.hazardAmber },
+    { x: 3.5, y: 0.9, z: -0.53, w: 1.04, h: 0.3, d: 0.05, hex: PALETTE.hazardAmber },
   ],
   // §1 S3 — skyline height band. Crossfire had NO SkylineDef, so the sky above
   // the 5 m outer walls was empty and the ground stopped at the 64x48 slab.

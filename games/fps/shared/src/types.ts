@@ -146,8 +146,31 @@ export type GameEvent =
   | { t: 'hit'; victimId: PlayerId; dmg: number; headshot: boolean; killed: boolean } // to shooter only
   | { t: 'dmg_taken'; fromId: PlayerId | null; dmg: number; yaw: number } // to victim only; yaw = world yaw towards shooter
   | { t: 'round_start'; round: number; scoreT: number; scoreCT: number; freezeUntil: number } // serverTime ms
-  | { t: 'round_end'; winner: Team | null; reason: RoundEndReason; scoreT: number; scoreCT: number } // winner null = mutual elimination, both teams get loss reward
-  | { t: 'match_end'; winner: Team; scoreT: number; scoreCT: number }
+  // winner null = mutual elimination, both teams get loss reward.
+  // Round-WIN streaks are derived from this event stream client-side (the same
+  // pattern as match point, which is derived from round_start's scores): a side's
+  // streak is the count of consecutive trailing `round_end`s it won, and a
+  // `winner: null` draw breaks BOTH sides' streaks. Nothing is added to the wire
+  // for it. NOTE for anyone tempted to shortcut it server-side: the room's
+  // private lossStreak pair is NOT the same quantity — a draw increments both
+  // counters, so "the opponent's loss streak" overstates a win streak after one.
+  | { t: 'round_end'; winner: Team | null; reason: RoundEndReason; scoreT: number; scoreCT: number }
+  // `stats` is the end-of-match scoreboard: EVERY player still in the room at
+  // match end, BOTH teams, bots and mid-round joiners included. Server-ordered,
+  // deterministically, so the client renders it as received and never re-sorts:
+  //   kills DESC, then damage DESC, then deaths ASC, then join order ASC
+  // (join order is unique per room, so the order is a total one — no ties).
+  // `damage` is post-armour HP actually removed from ENEMIES (self- and team
+  // damage never count, and overkill past a victim's remaining HP is not
+  // counted). `shotsFired`/`shotsHit` count TRIGGER PULLS, not pellets: one
+  // shotgun blast is one fired and, if any pellet lands, one hit; a pull dropped
+  // on an empty magazine is neither. Accuracy is DERIVED on the client as
+  // shotsHit / shotsFired and rendered as `—` when shotsFired === 0 — the server
+  // never sends a float.
+  | { t: 'match_end'; winner: Team; scoreT: number; scoreCT: number;
+      stats: Array<{ id: PlayerId; name: string; team: Team;
+                     kills: number; deaths: number; headshots: number;
+                     damage: number; shotsFired: number; shotsHit: number }> }
   | { t: 'halftime'; roster: RosterEntry[] } // sides swapped; REPLACE local roster with this one
   | { t: 'player_joined'; entry: RosterEntry }
   | { t: 'player_left'; id: PlayerId }

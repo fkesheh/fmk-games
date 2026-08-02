@@ -3,9 +3,31 @@
 //   - enclosed by outer walls (h>=4) with no gaps
 //   - 3 attack lanes from T spawn (south) to CT spawn (north)
 //   - no spawn has a direct unobstructed sightline to an enemy spawn
-//   - every lane has cover at least every 8m; longest open sightline <= 42m
 //   - >= 7 spawns per team (MAX_PLAYERS 14 => 7 a side), all on y=0 ground,
 //     none inside boxes
+//
+// SIGHTLINES + COVER — MEASURED, NOT ASSERTED. `maps/sightline.test.ts` computes
+// every number below from `boxes` using the engine's own `raycastSolids`, and
+// fails if the geometry drifts. The method (standing eye 1.62m, 1.0m grid over
+// ground-level walkable space, which pairs are sampled) is documented there;
+// the reading matters more than the figure, so each number names its reading.
+//   - longest open sightline, WHOLE MAP including diagonals: 66.85m. This is a
+//     corner-to-corner run across the open flanks, ~(-31,2) -> (31,-23).
+//   - longest open sightline DOWN A LANE (within a lane's x-band, |dx| <= 2m):
+//     mid 28.07m, left flank 46.04m, right flank 46.04m.
+//   - cover in PLAN VIEW: every walkable point is within 5.71m of a solid, so
+//     "cover at least every 8m" holds as a floor-plan statement.
+//   - cover that BREAKS A STANDING SIGHTLINE: gaps to 8.50m. Only 13 of the 41
+//     boxes reach above a 1.62m standing eye — every crate, sandbag block and
+//     step is see-over cover, which is why the flank lanes measure 46m clear.
+//
+// This block previously read "every lane has cover at least every 8m; longest
+// open sightline <= 42m". The 42m was never measured — it is the map's
+// spawn-to-spawn depth (z +21 to -21) — and NO reading of this map comes in
+// under it except the mid lane. The geometry is the frozen reference and was
+// not touched (STRICKEN_PASS.md §8, A3); the claim was what was wrong. Other
+// maps are held to these MEASURED figures, and to the split between plan-view
+// cover and cover a standing player cannot see over.
 //
 // VISUAL_UPGRADE.md §1/§3a value ladder (this round — geometry untouched):
 //   ground  `dust`      L 50  (floorMat; was `sand`, i.e. the SAME MatId as the
@@ -36,7 +58,10 @@ export const dustbowl: MapDef = {
     horizon: PALETTE.fogDusk, //    warm dusk haze band
     ground: PALETTE.dust, //        S4: distinct from the horizon
     fog: PALETTE.fogDusk, //        S2: fog === horizon, never the zenith
-    fogDensity: 0.012, // held: the 42m sightline invariant needs enemies readable
+    // Held: enemies must stay readable down the map's real longest sightline —
+    // 66.85m whole-map / 46.04m down a flank lane (measured, see the header),
+    // not the 42m this line used to cite.
+    fogDensity: 0.012,
     // Azimuth only — the rig overrides elevation with its golden-hour value.
     // Swung almost due east so the raking light crosses the lanes instead of
     // running down them: both spawns get the same treatment (the old

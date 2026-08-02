@@ -83,13 +83,45 @@ export function killReward(money: number): number {
 }
 
 /**
- * Per-team money GAINS after a round: winReward for the winner, lossReward
- * for the loser; winner null (mutual elimination) => both teams get the loss
- * reward. These are deltas — the CALLER adds them and clamps to ECONOMY.max.
+ * Normalise a loss-streak input to a whole, non-negative round count.
+ * Negative, fractional and non-finite values clamp to `max(0, floor(x))`
+ * (NaN/Infinity are treated as 0 rather than propagating into the payout).
  */
-export function roundRewards(winner: Team | null): { t: number; ct: number } {
+function normalizeStreak(streak: number): number {
+  if (!Number.isFinite(streak)) return 0;
+  return Math.max(0, Math.floor(streak));
+}
+
+/**
+ * Payout for a team that LOSES a round, given the consecutive rounds it had
+ * already lost before this one:
+ *   min(lossRewardBase + lossRewardStep * streak, lossRewardMax)
+ * Ladder: 0->1400, 1->1800, 2->2200, 3->2600, 4+->2600. Monotone in `streak`
+ * (I5: a longer streak never pays less). The cap is deliberately BELOW the
+ * rifle price: a loss payout alone never buys a rifle.
+ */
+function lossPayout(streak: number): number {
+  return Math.min(
+    ECONOMY.lossRewardBase + ECONOMY.lossRewardStep * normalizeStreak(streak),
+    ECONOMY.lossRewardMax,
+  );
+}
+
+/**
+ * Per-team money GAINS after a round.
+ * `lossStreak` = consecutive rounds each team has ALREADY lost, BEFORE this
+ * round's result is applied. A winner's entry is ignored.
+ * Loss payout = min(base + step * streak, max) — see `lossPayout`.
+ * `winner === null` (mutual elimination / draw) pays BOTH teams their own
+ * streak-based loss reward.
+ * These are deltas — the CALLER adds them and clamps to [0, ECONOMY.max].
+ */
+export function roundRewards(
+  winner: Team | null,
+  lossStreak: { t: number; ct: number },
+): { t: number; ct: number } {
   return {
-    t: winner === 'T' ? ECONOMY.winReward : ECONOMY.lossReward,
-    ct: winner === 'CT' ? ECONOMY.winReward : ECONOMY.lossReward,
+    t: winner === 'T' ? ECONOMY.winReward : lossPayout(lossStreak.t),
+    ct: winner === 'CT' ? ECONOMY.winReward : lossPayout(lossStreak.ct),
   };
 }
