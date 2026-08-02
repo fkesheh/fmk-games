@@ -51,13 +51,25 @@ import {
   CROWD_COLORS,
   KPAL,
   MAX_PLAYERS,
-  closestOnTrack,
   gridSlot,
   type TrackDef,
 } from '@kart/shared';
 
 /** The cached flat-shaded Lambert factory owned by render.ts (mat). */
 export type MatFn = (hex: string) => THREE.MeshLambertMaterial;
+
+/**
+ * Optional per-phase build profiler. `buildTrackMesh` calls it after each phase
+ * with that phase's name; it is a NO-OP unless something installs
+ * `globalThis.__kartBuildPhase`, which nothing in the shipped client does. It
+ * exists because "where does the circuit build spend its time" is a question
+ * this file has had to answer twice now, and guessing has been wrong both
+ * times. Cost when unset: one property read per build.
+ */
+type PhaseFn = (name: string) => void;
+const noPhase: PhaseFn = () => {};
+const phaseHook = (): PhaseFn =>
+  (globalThis as { __kartBuildPhase?: PhaseFn }).__kartBuildPhase ?? noPhase;
 
 type PalKey = keyof typeof KPAL;
 type Pal = Record<PalKey, string>;
@@ -320,29 +332,96 @@ export function at<T extends THREE.Object3D>(obj: T, x: number, y: number, z: nu
   return obj;
 }
 
+// ---- prototype geometry cache for the BAKED statics -----------------------------
+// A circuit builds ~5 000 prop meshes and most of them are the SAME primitive:
+// every barrier post is one of three shapes, every crowd seat is one of two
+// boxes, every checker cell / grid-stall bar / cone / lamp / gantry member is a
+// fixed size. Constructing each one from scratch was ~40 % of the build outside
+// bake(). These factories hand out ONE prototype per (shape, dimensions) and
+// let bake() transform each instance into the merged buffer — bake only ever
+// READS a source geometry, so sharing is invisible in the output (proven
+// byte-for-byte by the buildTrackMesh fingerprint).
+//
+// TWO rules keep this safe:
+//  * the cache is cleared at the top of every buildTrackMesh, so a prop built
+//    from a seeded RANDOM size (trees, rocks, bushes — a fresh key every time)
+//    cannot make it grow without bound across circuits;
+//  * the EXPORTED box/cyl/cone/sphere above stay uncached, because kartMesh.ts
+//    builds karts from them and render.ts disposes a removed kart's geometries
+//    — which would free a shared prototype out from under the next circuit.
+//    Nothing outside a buildTrackMesh call may use the s* factories.
+const protoCache = new Map<string, THREE.BufferGeometry>();
+function proto(key: string, make: () => THREE.BufferGeometry): THREE.BufferGeometry {
+  let g = protoCache.get(key);
+  if (g === undefined) {
+    g = make();
+    protoCache.set(key, g);
+  }
+  return g;
+}
+function sbox(matFn: MatFn, w: number, h: number, d: number, hex: string): THREE.Mesh {
+  return new THREE.Mesh(proto(`b|${w}|${h}|${d}`, () => new THREE.BoxGeometry(w, h, d)), matFn(hex));
+}
+function scyl(matFn: MatFn, rTop: number, rBottom: number, h: number, seg: number, hex: string): THREE.Mesh {
+  return new THREE.Mesh(
+    proto(`c|${rTop}|${rBottom}|${h}|${seg}`, () => new THREE.CylinderGeometry(rTop, rBottom, h, seg)),
+    matFn(hex),
+  );
+}
+function scone(matFn: MatFn, r: number, h: number, seg: number, hex: string): THREE.Mesh {
+  return new THREE.Mesh(proto(`k|${r}|${h}|${seg}`, () => new THREE.ConeGeometry(r, h, seg)), matFn(hex));
+}
+function ssphere(matFn: MatFn, r: number, seg: number, hex: string): THREE.Mesh {
+  return new THREE.Mesh(
+    proto(`s|${r}|${seg}`, () => new THREE.SphereGeometry(r, seg, Math.max(4, Math.floor(seg * 0.75)))),
+    matFn(hex),
+  );
+}
+
+/** The only attributes a baked static carries; anything else is dropped. */
+const BAKE_ATTRS = ['position', 'normal', 'uv'] as const;
+
+/** Plain, non-normalised Float32 storage, or null if the attribute is exotic. */
+function plainF32(attr: THREE.BufferAttribute | undefined): Float32Array | null {
+  if (attr === undefined || attr.normalized) return null;
+  return attr.array instanceof Float32Array ? attr.array : null;
+}
+
 /**
  * Merge all Mesh descendants of `root` into one mesh per material, preserving
  * world transforms. Used for EVERY static structure (ground, barriers, painted
  * markings, scatter, hills) to keep draw calls flat. Karts must NOT be baked —
  * their wheels/steering animate per frame.
+ *
+ * PERF (this was 57–68 % of the whole circuit build). The old body was
+ * `geometry.clone().applyMatrix4(m)` per prop and then `mergeGeometries`, which
+ * writes every prop's attribute arrays THREE times — once cloning, once
+ * transforming in place, once copying into the merged buffer — and allocates
+ * four typed arrays per prop, ~5 000 props per circuit. It is now a two-pass
+ * direct write: count, allocate the merged buffers ONCE, then transform each
+ * source vertex straight into its slot in them.
+ *
+ * The arithmetic is deliberately the same operations in the same order as
+ * THREE's BufferAttribute.applyMatrix4 (perspective-divided Matrix4 multiply)
+ * and applyNormalMatrix (Matrix3 multiply then normalise by 1/length), reading
+ * f32 and writing f32, so every float lands BIT-IDENTICAL to the old path.
+ * `mergeGeometries` is still the fallback for any bucket whose geometries are
+ * exotic (interleaved/normalised/unindexed, or disagreeing on which attributes
+ * they carry) — none of this file's primitives are, but the seam is public.
  */
 function bake(root: THREE.Group): THREE.Group {
   root.updateMatrixWorld(true);
-  const byMaterial = new Map<THREE.Material, THREE.BufferGeometry[]>();
+  const byMaterial = new Map<THREE.Material, THREE.Mesh[]>();
   root.traverse((child) => {
     if (!(child instanceof THREE.Mesh)) return;
-    const g = child.geometry.clone().applyMatrix4(child.matrixWorld);
-    // strip attributes that differ across primitives so merge succeeds
-    for (const name of Object.keys(g.attributes)) {
-      if (name !== 'position' && name !== 'normal' && name !== 'uv') g.deleteAttribute(name);
-    }
-    const arr = byMaterial.get(child.material as THREE.Material) ?? [];
-    arr.push(g);
-    byMaterial.set(child.material as THREE.Material, arr);
+    const arr = byMaterial.get(child.material as THREE.Material);
+    if (arr) arr.push(child);
+    else byMaterial.set(child.material as THREE.Material, [child]);
   });
   const out = new THREE.Group();
-  for (const [material, geoms] of byMaterial) {
-    const merged = mergeGeometries(geoms, false);
+  const nm = new THREE.Matrix3();
+  for (const [material, meshes] of byMaterial) {
+    const merged = mergeMeshes(meshes, nm) ?? mergeFallback(meshes);
     if (!merged) continue;
     const mesh = new THREE.Mesh(merged, material);
     mesh.castShadow = true;
@@ -350,6 +429,117 @@ function bake(root: THREE.Group): THREE.Group {
     out.add(mesh);
   }
   return out;
+}
+
+/**
+ * One material's worth of props transformed straight into shared buffers.
+ * Returns null (rather than a wrong answer) whenever the inputs are not the
+ * plain indexed Float32 primitives this file builds, so the caller can fall
+ * back to THREE's own merge.
+ */
+function mergeMeshes(meshes: readonly THREE.Mesh[], nm: THREE.Matrix3): THREE.BufferGeometry | null {
+  const first = meshes[0];
+  if (first === undefined) return null;
+  // the attribute set is the FIRST geometry's, exactly as mergeGeometries does;
+  // a geometry that disagrees makes the whole bucket a fallback
+  const names = BAKE_ATTRS.filter((n) => first.geometry.getAttribute(n) !== undefined);
+  if (!names.includes('position')) return null;
+  let verts = 0;
+  let indices = 0;
+  for (const m of meshes) {
+    const g = m.geometry;
+    const idx = g.getIndex();
+    if (idx === null || !(idx.array instanceof Uint16Array || idx.array instanceof Uint32Array)) return null;
+    for (const n of BAKE_ATTRS) {
+      if ((g.getAttribute(n) !== undefined) !== names.includes(n)) return null;
+      if (names.includes(n) && plainF32(g.getAttribute(n) as THREE.BufferAttribute) === null) return null;
+    }
+    verts += (g.getAttribute('position') as THREE.BufferAttribute).count;
+    indices += idx.count;
+  }
+  if (verts === 0) return null;
+  const pos = new Float32Array(verts * 3);
+  const nrm = names.includes('normal') ? new Float32Array(verts * 3) : null;
+  const uvs = names.includes('uv') ? new Float32Array(verts * 2) : null;
+  const idxOut = new Uint32Array(indices);
+  let vo = 0;
+  let io = 0;
+  let maxIndex = 0;
+  for (const m of meshes) {
+    const g = m.geometry;
+    const src = plainF32(g.getAttribute('position') as THREE.BufferAttribute)!;
+    const count = (g.getAttribute('position') as THREE.BufferAttribute).count;
+    const e = m.matrixWorld.elements;
+    const e0 = e[0]!, e4 = e[4]!, e8 = e[8]!, e12 = e[12]!;
+    const e1 = e[1]!, e5 = e[5]!, e9 = e[9]!, e13 = e[13]!;
+    const e2 = e[2]!, e6 = e[6]!, e10 = e[10]!, e14 = e[14]!;
+    const e3 = e[3]!, e7 = e[7]!, e11 = e[11]!, e15 = e[15]!;
+    for (let i = 0; i < count; i++) {
+      const x = src[i * 3]!;
+      const y = src[i * 3 + 1]!;
+      const z = src[i * 3 + 2]!;
+      const w = 1 / (e3 * x + e7 * y + e11 * z + e15);
+      const k = (vo + i) * 3;
+      pos[k] = (e0 * x + e4 * y + e8 * z + e12) * w;
+      pos[k + 1] = (e1 * x + e5 * y + e9 * z + e13) * w;
+      pos[k + 2] = (e2 * x + e6 * y + e10 * z + e14) * w;
+    }
+    if (nrm !== null) {
+      const ns = plainF32(g.getAttribute('normal') as THREE.BufferAttribute)!;
+      nm.getNormalMatrix(m.matrixWorld);
+      const t = nm.elements;
+      const t0 = t[0]!, t1 = t[1]!, t2 = t[2]!;
+      const t3 = t[3]!, t4 = t[4]!, t5 = t[5]!;
+      const t6 = t[6]!, t7 = t[7]!, t8 = t[8]!;
+      for (let i = 0; i < count; i++) {
+        const x = ns[i * 3]!;
+        const y = ns[i * 3 + 1]!;
+        const z = ns[i * 3 + 2]!;
+        const ax = t0 * x + t3 * y + t6 * z;
+        const ay = t1 * x + t4 * y + t7 * z;
+        const az = t2 * x + t5 * y + t8 * z;
+        // Vector3.normalize(): divideScalar(length() || 1) => multiply by 1/len
+        const inv = 1 / (Math.sqrt(ax * ax + ay * ay + az * az) || 1);
+        const k = (vo + i) * 3;
+        nrm[k] = ax * inv;
+        nrm[k + 1] = ay * inv;
+        nrm[k + 2] = az * inv;
+      }
+    }
+    if (uvs !== null) {
+      const us = plainF32(g.getAttribute('uv') as THREE.BufferAttribute)!;
+      uvs.set(us.subarray(0, count * 2), vo * 2);
+    }
+    const idx = g.getIndex()!;
+    const ia = idx.array as Uint16Array | Uint32Array;
+    for (let i = 0; i < idx.count; i++) {
+      const v = ia[i]! + vo;
+      idxOut[io + i] = v;
+      if (v > maxIndex) maxIndex = v;
+    }
+    vo += count;
+    io += idx.count;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  if (nrm !== null) geo.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
+  if (uvs !== null) geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+  // setIndex() picks Uint16 below 65536 — match it, or the buffer type (and so
+  // the GPU upload) would differ from the old path for small buckets
+  geo.setIndex(new THREE.BufferAttribute(maxIndex > 65535 ? idxOut : new Uint16Array(idxOut), 1));
+  return geo;
+}
+
+/** THREE's own merge, for a bucket mergeMeshes declined (see its contract). */
+function mergeFallback(meshes: readonly THREE.Mesh[]): THREE.BufferGeometry | null {
+  const geoms = meshes.map((child) => {
+    const g = child.geometry.clone().applyMatrix4(child.matrixWorld);
+    for (const name of Object.keys(g.attributes)) {
+      if (!(BAKE_ATTRS as readonly string[]).includes(name)) g.deleteAttribute(name);
+    }
+    return g;
+  });
+  return mergeGeometries(geoms, false);
 }
 
 // ---- track frames ---------------------------------------------------------------
@@ -781,7 +971,7 @@ function mownStripeGeometry(
  * same 220 patches spread twice as thin.
  */
 function grassPatchGeometry(
-  track: TrackDef,
+  absLateral: (x: number, z: number) => number,
   frames: SampleFrame[],
   halfW: number,
   w: TrackWorld,
@@ -791,7 +981,7 @@ function grassPatchGeometry(
   const nrm: number[] = [];
   const col: number[] = [];
   const idx: number[] = [];
-  const placed: Array<{ x: number; z: number }> = [];
+  const placed = new SpacedPoints(BLOB_SPACING);
 
   const blob = (x: number, z: number, r: number, y: number, c: readonly [number, number, number]): void => {
     const k = 12;
@@ -821,7 +1011,7 @@ function grassPatchGeometry(
   for (let p = 0; p < bigCount; p++) {
     const x = rngRange(next, w.cx - w.scatterX - 30, w.cx + w.scatterX + 30);
     const z = rngRange(next, w.cz - w.scatterZ - 30, w.cz + w.scatterZ + 30);
-    if (Math.abs(closestOnTrack(track, x, z).lateral) <= halfW + PROP_CLEARANCE) continue;
+    if (absLateral(x, z) <= halfW + PROP_CLEARANCE) continue;
     const hex = next() < 0.5 ? P.grassDark : P.grassLit;
     blob(x, z, rngRange(next, 10, 26), BLOB_Y - 0.006, shade(hex, rngRange(next, 0.95, 1.05)));
   }
@@ -831,9 +1021,9 @@ function grassPatchGeometry(
   for (let attempt = 0, done = 0; attempt < smallCount * 20 && done < smallCount; attempt++) {
     const x = rngRange(next, w.cx - w.scatterX - 15, w.cx + w.scatterX + 15);
     const z = rngRange(next, w.cz - w.scatterZ - 15, w.cz + w.scatterZ + 15);
-    if (Math.abs(closestOnTrack(track, x, z).lateral) <= halfW + CURB_W + 2.0) continue;
-    if (tooCloseR(x, z, placed, BLOB_SPACING)) continue;
-    placed.push({ x, z });
+    if (absLateral(x, z) <= halfW + CURB_W + 2.0) continue;
+    if (placed.has(x, z)) continue;
+    placed.add(x, z);
     const pick = next();
     const hex = pick < 0.14 ? P.grassDeep : pick < 0.46 ? P.grassDark : pick < 0.82 ? P.grassLit : P.grass;
     blob(x, z, rngRange(next, 1.6, 5.5), BLOB_Y, shade(hex, rngRange(next, 0.94, 1.06)));
@@ -998,25 +1188,142 @@ interface AvoidZone {
   r: number;
 }
 
-/** Min center distance `minDist` to every already-placed point. */
-function tooCloseR(
-  x: number,
-  z: number,
-  placed: ReadonlyArray<{ x: number; z: number }>,
-  minDist: number,
-): boolean {
-  const d2 = minDist * minDist;
-  for (const p of placed) {
-    const dx = p.x - x;
-    const dz = p.z - z;
-    if (dx * dx + dz * dz < d2) return true;
+/**
+ * "Is anything already placed within `minDist` of here?" — the min-spacing test
+ * every scatter loop runs before it commits a prop.
+ *
+ * It used to be a linear scan of the placed list, which is quadratic in the
+ * count and the count now scales with the circuit: the grass-patch field alone
+ * makes ~7 000 attempts against a list that grows to ~340, and the tree/rock
+ * pass another ~9 000 against its own. This is a uniform hash grid with the
+ * cell size set to `minDist`, so a point within `minDist` is ALWAYS in one of
+ * the nine cells around the query — the answer is exactly the linear scan's,
+ * the work is O(1). Cell keys pack the two cell indices into one integer,
+ * which is exact for any circuit inside ±8 000 cells of the origin.
+ */
+class SpacedPoints {
+  private readonly cell: number;
+  private readonly minD2: number;
+  private readonly grid = new Map<number, number[]>();
+
+  constructor(minDist: number) {
+    this.cell = minDist;
+    this.minD2 = minDist * minDist;
   }
-  return false;
+
+  private static key(cx: number, cz: number): number {
+    return (cx + 8192) * 16384 + (cz + 8192);
+  }
+
+  has(x: number, z: number): boolean {
+    const cx = Math.floor(x / this.cell);
+    const cz = Math.floor(z / this.cell);
+    for (let i = -1; i <= 1; i++) {
+      for (let j = -1; j <= 1; j++) {
+        const bucket = this.grid.get(SpacedPoints.key(cx + i, cz + j));
+        if (bucket === undefined) continue;
+        for (let k = 0; k < bucket.length; k += 2) {
+          const dx = bucket[k]! - x;
+          const dz = bucket[k + 1]! - z;
+          if (dx * dx + dz * dz < this.minD2) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  add(x: number, z: number): void {
+    const k = SpacedPoints.key(Math.floor(x / this.cell), Math.floor(z / this.cell));
+    const bucket = this.grid.get(k);
+    if (bucket === undefined) this.grid.set(k, [x, z]);
+    else bucket.push(x, z);
+  }
 }
 
-/** Min center distance to every already-placed prop (PROP_SPACING). */
-function tooClose(x: number, z: number, placed: ReadonlyArray<{ x: number; z: number }>): boolean {
-  return tooCloseR(x, z, placed, PROP_SPACING);
+/**
+ * |lateral| from `closestOnTrack`, without its O(SAMPLES) scan.
+ *
+ * Every scatter loop rejects candidates with
+ * `Math.abs(closestOnTrack(track, x, z).lateral) <= someClearance`, and
+ * closestOnTrack walks all 256 centreline samples per call. Across the grass
+ * patches, the tree clusters, the top-up, the rocks and the tree line that is
+ * ~20 000 calls — five million distance tests — and it was the largest cost in
+ * the build after bake().
+ *
+ * This is a bounding-box tree over CONTIGUOUS index ranges of the same
+ * centreline. It answers the same question exactly:
+ *  * children are visited in index order and a node is pruned only when its
+ *    box is STRICTLY farther than the best distance so far, so a sample that
+ *    ties the best is still visited — which reproduces the linear scan's
+ *    first-wins tie-break (lowest index) sample for sample;
+ *  * the squared distance is the same expression in the same order, so the
+ *    comparisons are made on bit-identical values;
+ *  * the lateral is then derived from the winning sample exactly as
+ *    closestOnTrack derives it.
+ * `closestOnTrack` itself is frozen shared code and is untouched.
+ */
+interface RangeNode {
+  minX: number; maxX: number; minZ: number; maxZ: number;
+  lo: number; hi: number;                       // sample range [lo, hi)
+  left: RangeNode | null; right: RangeNode | null;
+}
+const RANGE_LEAF = 8; // samples per leaf: below this the box test costs more than the scan
+
+function buildRangeTree(cl: ReadonlyArray<readonly [number, number]>, lo: number, hi: number): RangeNode {
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minZ = Infinity;
+  let maxZ = -Infinity;
+  for (let i = lo; i < hi; i++) {
+    const p = cl[i]!;
+    if (p[0] < minX) minX = p[0];
+    if (p[0] > maxX) maxX = p[0];
+    if (p[1] < minZ) minZ = p[1];
+    if (p[1] > maxZ) maxZ = p[1];
+  }
+  const leaf = hi - lo <= RANGE_LEAF;
+  const mid = (lo + hi) >> 1;
+  return {
+    minX, maxX, minZ, maxZ, lo, hi,
+    left: leaf ? null : buildRangeTree(cl, lo, mid),
+    right: leaf ? null : buildRangeTree(cl, mid, hi),
+  };
+}
+
+/** Build the accelerator for one circuit; returns |lateral| at any world point. */
+function lateralQuery(track: TrackDef): (x: number, z: number) => number {
+  const cl = track.centerline;
+  const n = cl.length;
+  const root = buildRangeTree(cl, 0, n);
+  return (x, z): number => {
+    let best = 0;
+    let bestD = Infinity;
+    const visit = (node: RangeNode): void => {
+      const dx = x < node.minX ? node.minX - x : x > node.maxX ? x - node.maxX : 0;
+      const dz = z < node.minZ ? node.minZ - z : z > node.maxZ ? z - node.maxZ : 0;
+      if (dx * dx + dz * dz > bestD) return; // strict: a tie must still be visited
+      if (node.left === null) {
+        for (let i = node.lo; i < node.hi; i++) {
+          const c = cl[i]!;
+          const d = (c[0] - x) * (c[0] - x) + (c[1] - z) * (c[1] - z);
+          if (d < bestD) {
+            bestD = d;
+            best = i;
+          }
+        }
+        return;
+      }
+      visit(node.left);
+      visit(node.right!);
+    };
+    visit(root);
+    const c = cl[best]!;
+    const nxt = cl[(best + 1) % n]!;
+    const tx = nxt[0] - c[0];
+    const tz = nxt[1] - c[1];
+    const l = Math.hypot(tx, tz) || 1;
+    return Math.abs(((x - c[0]) * (tz / l) - (z - c[1]) * (tx / l)) * -1);
+  };
 }
 
 /** Inside any furniture keep-clear disc (buildings, billboards, lamps, stacks)? */
@@ -1070,7 +1377,7 @@ function addBlockText(
         const row = mirror ? [...gl[r]!].reverse() : [...gl[r]!];
         for (let c = 0; c < row.length; c++) {
           if (row[c] !== 'X') continue;
-          g.add(at(box(matFn, cell * 0.84, cell * 0.84, 0.05, hex), (cursor + c + 0.5) * cell, cy + (3 - r) * cell, z));
+          g.add(at(sbox(matFn, cell * 0.84, cell * 0.84, 0.05, hex), (cursor + c + 0.5) * cell, cy + (3 - r) * cell, z));
         }
       }
     }
@@ -1088,7 +1395,7 @@ function addBlockText(
  * out on the field, dirtDeep on the shoulder, concreteDeep under a footing.
  */
 function contactPad(matFn: MatFn, w: number, d: number, hex: string): THREE.Mesh {
-  return at(box(matFn, w, PAD_H, d, hex), 0, PAD_H / 2, 0);
+  return at(sbox(matFn, w, PAD_H, d, hex), 0, PAD_H / 2, 0);
 }
 
 /**
@@ -1114,17 +1421,17 @@ function buildBroadleaf(matFn: MatFn, next: () => number): THREE.Group {
   const g = new THREE.Group();
   const [lit, body, deep] = canopyTiers(next);
   const h = rngRange(next, 1.0, 1.6);
-  g.add(at(cyl(matFn, 0.12, 0.18, h, 6, P.treeTrunk), 0, h / 2, 0));
-  g.add(at(cyl(matFn, 0.19, 0.26, 0.16, 6, P.treeTrunkDeep), 0, 0.08, 0)); // root flare
+  g.add(at(scyl(matFn, 0.12, 0.18, h, 6, P.treeTrunk), 0, h / 2, 0));
+  g.add(at(scyl(matFn, 0.19, 0.26, 0.16, 6, P.treeTrunkDeep), 0, 0.08, 0)); // root flare
   const r1 = rngRange(next, 0.9, 1.3);
-  const under = sphere(matFn, r1 * 0.92, 6, deep); // shaded underside of the mass
+  const under = ssphere(matFn, r1 * 0.92, 6, deep); // shaded underside of the mass
   under.scale.set(1, 0.55, 1);
   g.add(at(under, 0, h + r1 * 0.4, 0));
-  g.add(at(sphere(matFn, r1, 7, body), 0, h + r1 * 0.62, 0));
+  g.add(at(ssphere(matFn, r1, 7, body), 0, h + r1 * 0.62, 0));
   const r2 = r1 * rngRange(next, 0.55, 0.7);
   g.add(
     at(
-      sphere(matFn, r2, 6, lit),
+      ssphere(matFn, r2, 6, lit),
       rngRange(next, -0.25, 0.25),
       h + r1 * 0.62 + r2 * 0.85,
       rngRange(next, -0.25, 0.25),
@@ -1138,12 +1445,12 @@ function buildPine(matFn: MatFn, next: () => number): THREE.Group {
   const g = new THREE.Group();
   const [lit, body, deep] = canopyTiers(next);
   const h = rngRange(next, 0.7, 1.1);
-  g.add(at(cyl(matFn, 0.1, 0.16, h, 6, P.treeTrunk), 0, h / 2, 0));
-  g.add(at(cyl(matFn, 0.17, 0.24, 0.14, 6, P.treeTrunkDeep), 0, 0.07, 0)); // root flare
+  g.add(at(scyl(matFn, 0.1, 0.16, h, 6, P.treeTrunk), 0, h / 2, 0));
+  g.add(at(scyl(matFn, 0.17, 0.24, 0.14, 6, P.treeTrunkDeep), 0, 0.07, 0)); // root flare
   const r1 = rngRange(next, 0.75, 1.05);
-  g.add(at(cone(matFn, r1 * 1.12, rngRange(next, 1.0, 1.3), 7, deep), 0, h + 0.34, 0));
-  g.add(at(cone(matFn, r1, rngRange(next, 1.3, 1.7), 7, body), 0, h + 0.72, 0));
-  g.add(at(cone(matFn, r1 * 0.6, rngRange(next, 0.9, 1.2), 7, lit), 0, h + 0.72 + r1 * 0.85, 0));
+  g.add(at(scone(matFn, r1 * 1.12, rngRange(next, 1.0, 1.3), 7, deep), 0, h + 0.34, 0));
+  g.add(at(scone(matFn, r1, rngRange(next, 1.3, 1.7), 7, body), 0, h + 0.72, 0));
+  g.add(at(scone(matFn, r1 * 0.6, rngRange(next, 0.9, 1.2), 7, lit), 0, h + 0.72 + r1 * 0.85, 0));
   return g;
 }
 
@@ -1152,17 +1459,17 @@ function buildPoplar(matFn: MatFn, next: () => number): THREE.Group {
   const g = new THREE.Group();
   const [lit, body, deep] = canopyTiers(next);
   const h = rngRange(next, 1.5, 2.2);
-  g.add(at(cyl(matFn, 0.09, 0.14, h, 6, P.treeTrunk), 0, h / 2, 0));
-  g.add(at(cyl(matFn, 0.15, 0.21, 0.13, 6, P.treeTrunkDeep), 0, 0.065, 0)); // root flare
+  g.add(at(scyl(matFn, 0.09, 0.14, h, 6, P.treeTrunk), 0, h / 2, 0));
+  g.add(at(scyl(matFn, 0.15, 0.21, 0.13, 6, P.treeTrunkDeep), 0, 0.065, 0)); // root flare
   const r = rngRange(next, 0.5, 0.75);
-  const skirt = sphere(matFn, r * 1.02, 6, deep);
+  const skirt = ssphere(matFn, r * 1.02, 6, deep);
   skirt.scale.set(1, rngRange(next, 0.9, 1.15), 1);
   g.add(at(skirt, 0, h + r * 0.85, 0));
-  const crown = sphere(matFn, r, 7, body);
+  const crown = ssphere(matFn, r, 7, body);
   crown.scale.set(1, rngRange(next, 1.9, 2.4), 1);
   crown.position.y = h + r * 1.65;
   g.add(crown);
-  g.add(at(sphere(matFn, r * 0.5, 6, lit), 0, h + r * 3.1, 0));
+  g.add(at(ssphere(matFn, r * 0.5, 6, lit), 0, h + r * 3.1, 0));
   return g;
 }
 
@@ -1190,10 +1497,10 @@ function buildRock(matFn: MatFn, next: () => number): THREE.Group {
     const oz = rngRange(next, -0.4, 0.4);
     const sx = rngRange(next, 0.9, 1.4);
     const sz = rngRange(next, 0.9, 1.4);
-    const skirt = at(sphere(matFn, r * 1.05, 6, P.rockDeep), ox, r * 0.16, oz); // bedded-in base
+    const skirt = at(ssphere(matFn, r * 1.05, 6, P.rockDeep), ox, r * 0.16, oz); // bedded-in base
     skirt.scale.set(sx, 0.22, sz);
     g.add(skirt);
-    const m = at(sphere(matFn, r, 7, P.rock), ox, r * 0.5, oz);
+    const m = at(ssphere(matFn, r, 7, P.rock), ox, r * 0.5, oz);
     m.scale.set(sx, rngRange(next, 0.4, 0.65), sz);
     m.rotation.y = next() * Math.PI;
     g.add(m);
@@ -1205,9 +1512,9 @@ function buildRock(matFn: MatFn, next: () => number): THREE.Group {
 function buildTireStack(matFn: MatFn, hex: string): THREE.Group {
   const g = new THREE.Group();
   g.add(contactPad(matFn, 1.0, 1.0, P.grassDeep));
-  g.add(at(cyl(matFn, 0.44, 0.48, 0.06, 10, P.tire), 0, 0.05, 0)); // dark base ring
+  g.add(at(scyl(matFn, 0.44, 0.48, 0.06, 10, P.tire), 0, 0.05, 0)); // dark base ring
   for (let k = 0; k < 3; k++) {
-    const t = new THREE.Mesh(new THREE.TorusGeometry(0.3, 0.13, 7, 12), matFn(hex));
+    const t = new THREE.Mesh(proto('t|tire', () => new THREE.TorusGeometry(0.3, 0.13, 7, 12)), matFn(hex));
     t.rotation.x = Math.PI / 2; // lie flat, hole up
     t.position.y = 0.2 + k * 0.26;
     g.add(t);
@@ -1222,9 +1529,9 @@ function buildTireStack(matFn: MatFn, hex: string): THREE.Group {
  */
 function buildCone(matFn: MatFn): THREE.Group {
   const g = new THREE.Group();
-  g.add(at(box(matFn, 0.34, 0.045, 0.34, P.charcoal), 0, 0.022, 0));
-  g.add(at(cone(matFn, 0.16, 0.44, 8, P.kartOrange), 0, 0.28, 0));
-  g.add(at(cyl(matFn, 0.085, 0.105, 0.09, 8, P.curbWhite), 0, 0.3, 0));
+  g.add(at(sbox(matFn, 0.34, 0.045, 0.34, P.charcoal), 0, 0.022, 0));
+  g.add(at(scone(matFn, 0.16, 0.44, 8, P.kartOrange), 0, 0.28, 0));
+  g.add(at(scyl(matFn, 0.085, 0.105, 0.09, 8, P.curbWhite), 0, 0.3, 0));
   return g;
 }
 
@@ -1242,10 +1549,10 @@ function buildGantry(matFn: MatFn, track: TrackDef): THREE.Group {
 
   for (const side of [1, -1]) {
     const x = side * (w + GANTRY_OFF);
-    g.add(at(box(matFn, 1.25, PAD_H, 1.25, P.concreteDeep), x, PAD_H / 2, 0)); // footing pad
-    g.add(at(box(matFn, 0.9, 0.18, 0.9, P.steel), x, 0.11, 0)); // base plate
-    g.add(at(box(matFn, 0.34, 5.7, 0.34, P.charcoal), x, 2.94, 0)); // column
-    const brace = box(matFn, 0.16, 1.7, 0.16, P.steel); // angled brace inward
+    g.add(at(sbox(matFn, 1.25, PAD_H, 1.25, P.concreteDeep), x, PAD_H / 2, 0)); // footing pad
+    g.add(at(sbox(matFn, 0.9, 0.18, 0.9, P.steel), x, 0.11, 0)); // base plate
+    g.add(at(sbox(matFn, 0.34, 5.7, 0.34, P.charcoal), x, 2.94, 0)); // column
+    const brace = sbox(matFn, 0.16, 1.7, 0.16, P.steel); // angled brace inward
     brace.position.set(side * (w + GANTRY_OFF - 0.45), 4.75, 0);
     brace.rotation.z = side * 0.55;
     g.add(brace);
@@ -1253,16 +1560,16 @@ function buildGantry(matFn: MatFn, track: TrackDef): THREE.Group {
 
   // truss beam: two chords + verticals
   const span = 2 * (w + GANTRY_OFF) + 0.5;
-  g.add(at(box(matFn, span, 0.2, 0.2, P.steel), 0, 5.55, 0));
-  g.add(at(box(matFn, span, 0.2, 0.2, P.steel), 0, 4.95, 0));
+  g.add(at(sbox(matFn, span, 0.2, 0.2, P.steel), 0, 5.55, 0));
+  g.add(at(sbox(matFn, span, 0.2, 0.2, P.steel), 0, 4.95, 0));
   for (let i = -3; i <= 3; i++) {
-    g.add(at(box(matFn, 0.12, 0.6, 0.12, P.steel), (i * span) / 8, 5.25, 0));
+    g.add(at(sbox(matFn, 0.12, 0.6, 0.12, P.steel), (i * span) / 8, 5.25, 0));
   }
 
   // banner + gold trim, letters on both faces
-  g.add(at(box(matFn, 7.8, 1.6, 0.14, P.ink), 0, 3.9, 0));
-  g.add(at(box(matFn, 7.8, 0.09, 0.16, P.gold), 0, 4.66, 0));
-  g.add(at(box(matFn, 7.8, 0.09, 0.16, P.gold), 0, 3.14, 0));
+  g.add(at(sbox(matFn, 7.8, 1.6, 0.14, P.ink), 0, 3.9, 0));
+  g.add(at(sbox(matFn, 7.8, 0.09, 0.16, P.gold), 0, 4.66, 0));
+  g.add(at(sbox(matFn, 7.8, 0.09, 0.16, P.gold), 0, 3.14, 0));
   addBlockText(g, matFn, 'KART GP', 0.155, P.curbWhite, 3.9, 0.096, false);
   addBlockText(g, matFn, 'KART GP', 0.155, P.curbWhite, 3.9, -0.096, true);
 
@@ -1270,9 +1577,9 @@ function buildGantry(matFn: MatFn, track: TrackDef): THREE.Group {
   const LENSES = [P.kartRed, P.kartYellow, P.kartGreen, P.kartYellow, P.kartRed];
   for (let li = 0; li < LENSES.length; li++) {
     const x = (li - 2) * 0.55;
-    g.add(at(box(matFn, 0.34, 0.34, 0.18, P.ink), x, 4.66, 0));
+    g.add(at(sbox(matFn, 0.34, 0.34, 0.18, P.ink), x, 4.66, 0));
     for (const zSide of [1, -1]) {
-      const lens = cyl(matFn, 0.1, 0.1, 0.05, 10, LENSES[li]!);
+      const lens = scyl(matFn, 0.1, 0.1, 0.05, 10, LENSES[li]!);
       lens.rotation.x = Math.PI / 2; // face along the straight (both ways)
       lens.position.set(x, 4.66, zSide * 0.11);
       g.add(lens);
@@ -1289,37 +1596,37 @@ function buildBillboard(matFn: MatFn, design: number): THREE.Group {
   const g = new THREE.Group();
   g.add(contactPad(matFn, 3.6, 1.0, P.grassDeep));
   for (const x of [-1.4, 1.4]) {
-    g.add(at(box(matFn, 0.42, 0.16, 0.42, P.concreteDeep), x, 0.08, 0)); // footing
-    g.add(at(box(matFn, 0.16, 2.6, 0.16, P.steel), x, 1.3, 0));
+    g.add(at(sbox(matFn, 0.42, 0.16, 0.42, P.concreteDeep), x, 0.08, 0)); // footing
+    g.add(at(sbox(matFn, 0.16, 2.6, 0.16, P.steel), x, 1.3, 0));
   }
   const fields = [P.kartRed, P.charcoal, P.grassDark, P.ink, P.curbWhite];
-  g.add(at(box(matFn, 4.4, 2.2, 0.12, fields[design % fields.length]!), 0, 2.6, 0));
+  g.add(at(sbox(matFn, 4.4, 2.2, 0.12, fields[design % fields.length]!), 0, 2.6, 0));
   const z = 0.09; // poster blocks ride on the panel face
   switch (design % 5) {
     case 0: // red field: gold diagonal + ink foot + white chip
-      g.add(at(box(matFn, 4.4, 0.5, 0.06, P.ink), 0, 1.85, z));
-      g.add(rotZ(box(matFn, 3.6, 0.5, 0.06, P.gold), 0.45, 0, 2.75, z));
-      g.add(at(box(matFn, 0.5, 0.5, 0.06, P.curbWhite), 1.5, 3.15, z));
+      g.add(at(sbox(matFn, 4.4, 0.5, 0.06, P.ink), 0, 1.85, z));
+      g.add(rotZ(sbox(matFn, 3.6, 0.5, 0.06, P.gold), 0.45, 0, 2.75, z));
+      g.add(at(sbox(matFn, 0.5, 0.5, 0.06, P.curbWhite), 1.5, 3.15, z));
       break;
     case 1: // charcoal field: white band + orange block + gold foot
-      g.add(at(box(matFn, 4.4, 0.6, 0.06, P.curbWhite), 0, 2.95, z));
-      g.add(at(box(matFn, 1.2, 1.2, 0.06, P.kartOrange), -1.2, 2.2, z));
-      g.add(at(box(matFn, 4.4, 0.12, 0.06, P.gold), 0, 1.62, z));
+      g.add(at(sbox(matFn, 4.4, 0.6, 0.06, P.curbWhite), 0, 2.95, z));
+      g.add(at(sbox(matFn, 1.2, 1.2, 0.06, P.kartOrange), -1.2, 2.2, z));
+      g.add(at(sbox(matFn, 4.4, 0.12, 0.06, P.gold), 0, 1.62, z));
       break;
     case 2: // green field: gold disc + light chip + ink foot
-      g.add(rotX(cyl(matFn, 0.7, 0.7, 0.06, 14, P.gold), -1.2, 2.85, z));
-      g.add(at(box(matFn, 1.0, 1.0, 0.06, P.treeLeafLight), 1.3, 2.7, z));
-      g.add(at(box(matFn, 4.4, 0.4, 0.06, P.ink), 0, 1.8, z));
+      g.add(rotX(scyl(matFn, 0.7, 0.7, 0.06, 14, P.gold), -1.2, 2.85, z));
+      g.add(at(sbox(matFn, 1.0, 1.0, 0.06, P.treeLeafLight), 1.3, 2.7, z));
+      g.add(at(sbox(matFn, 4.4, 0.4, 0.06, P.ink), 0, 1.8, z));
       break;
     case 3: // ink field: red band + 3 white chips + gold foot
-      g.add(at(box(matFn, 4.4, 0.55, 0.06, P.kartRed), 0, 3.05, z));
-      for (const x of [-0.75, 0, 0.75]) g.add(at(box(matFn, 0.45, 0.45, 0.06, P.curbWhite), x, 2.2, z));
-      g.add(at(box(matFn, 4.4, 0.12, 0.06, P.gold), 0, 1.62, z));
+      g.add(at(sbox(matFn, 4.4, 0.55, 0.06, P.kartRed), 0, 3.05, z));
+      for (const x of [-0.75, 0, 0.75]) g.add(at(sbox(matFn, 0.45, 0.45, 0.06, P.curbWhite), x, 2.2, z));
+      g.add(at(sbox(matFn, 4.4, 0.12, 0.06, P.gold), 0, 1.62, z));
       break;
     default: // white field: ink text bars + red corner + gold chip
-      for (let r = 0; r < 3; r++) g.add(at(box(matFn, 1.7, 0.26, 0.06, P.ink), -1.05, 3.15 - r * 0.42, z));
-      g.add(at(box(matFn, 1.1, 1.1, 0.06, P.kartRed), 1.45, 2.05, z));
-      g.add(at(box(matFn, 0.5, 0.5, 0.06, P.gold), 1.45, 3.2, z));
+      for (let r = 0; r < 3; r++) g.add(at(sbox(matFn, 1.7, 0.26, 0.06, P.ink), -1.05, 3.15 - r * 0.42, z));
+      g.add(at(sbox(matFn, 1.1, 1.1, 0.06, P.kartRed), 1.45, 2.05, z));
+      g.add(at(sbox(matFn, 0.5, 0.5, 0.06, P.gold), 1.45, 3.2, z));
       break;
   }
   return g;
@@ -1343,11 +1650,11 @@ function rotX<T extends THREE.Object3D>(obj: T, x: number, y: number, z: number)
 function buildLamp(matFn: MatFn): THREE.Group {
   const g = new THREE.Group(); // local +z = toward the road
   g.add(contactPad(matFn, 0.85, 0.85, P.grassDeep));
-  g.add(at(cyl(matFn, 0.16, 0.2, 0.22, 8, P.steelDeep), 0, 0.11, 0)); // base collar
-  g.add(at(cyl(matFn, 0.07, 0.1, 5.6, 7, P.steel), 0, 2.9, 0));
-  g.add(at(box(matFn, 0.1, 0.1, 1.7, P.steel), 0, 5.52, 0.75));
-  g.add(at(box(matFn, 0.34, 0.12, 0.66, P.charcoal), 0, 5.42, 1.55));
-  g.add(at(box(matFn, 0.26, 0.03, 0.5, P.curbWhite), 0, 5.35, 1.55));
+  g.add(at(scyl(matFn, 0.16, 0.2, 0.22, 8, P.steelDeep), 0, 0.11, 0)); // base collar
+  g.add(at(scyl(matFn, 0.07, 0.1, 5.6, 7, P.steel), 0, 2.9, 0));
+  g.add(at(sbox(matFn, 0.1, 0.1, 1.7, P.steel), 0, 5.52, 0.75));
+  g.add(at(sbox(matFn, 0.34, 0.12, 0.66, P.charcoal), 0, 5.42, 1.55));
+  g.add(at(sbox(matFn, 0.26, 0.03, 0.5, P.curbWhite), 0, 5.35, 1.55));
   return g;
 }
 
@@ -1358,22 +1665,22 @@ function buildLamp(matFn: MatFn): THREE.Group {
 function buildPitBuilding(matFn: MatFn): THREE.Group {
   const g = new THREE.Group();
   g.add(contactPad(matFn, 13.5, 8.0, P.grassDeep)); // grounding band on the verge
-  g.add(at(box(matFn, 11.0, 0.34, 5.5, P.concreteDeep), 0, 0.17, 0)); // plinth
-  g.add(at(box(matFn, 10.5, 3.4, 5.0, P.curbWhite), 0, 2.04, 0));
-  g.add(at(box(matFn, 10.9, 0.14, 5.4, P.concrete), 0, 3.78, 0)); // eaves band
-  g.add(at(box(matFn, 11.3, 0.28, 5.9, P.charcoal), 0, 3.99, 0));
-  g.add(at(box(matFn, 11.3, 0.46, 0.12, P.kartRed), 0, 3.62, 2.92)); // fascia
+  g.add(at(sbox(matFn, 11.0, 0.34, 5.5, P.concreteDeep), 0, 0.17, 0)); // plinth
+  g.add(at(sbox(matFn, 10.5, 3.4, 5.0, P.curbWhite), 0, 2.04, 0));
+  g.add(at(sbox(matFn, 10.9, 0.14, 5.4, P.concrete), 0, 3.78, 0)); // eaves band
+  g.add(at(sbox(matFn, 11.3, 0.28, 5.9, P.charcoal), 0, 3.99, 0));
+  g.add(at(sbox(matFn, 11.3, 0.46, 0.12, P.kartRed), 0, 3.62, 2.92)); // fascia
   addBlockText(g, matFn, 'PIT', 0.13, P.curbWhite, 3.62, 3.0, false);
   for (const x of [-3.8, -1.3, 1.2]) {
-    g.add(at(box(matFn, 1.5, 1.1, 0.1, P.ink), x, 2.24, 2.52)); // windows
-    g.add(at(box(matFn, 1.66, 0.1, 0.08, P.concreteDeep), x, 1.63, 2.54)); // sill
+    g.add(at(sbox(matFn, 1.5, 1.1, 0.1, P.ink), x, 2.24, 2.52)); // windows
+    g.add(at(sbox(matFn, 1.66, 0.1, 0.08, P.concreteDeep), x, 1.63, 2.54)); // sill
   }
-  g.add(at(box(matFn, 1.1, 2.2, 0.1, P.charcoal), 3.9, 1.44, 2.52)); // door
-  g.add(at(box(matFn, 4.0, 0.3, 3.8, P.concreteDeep), -7.6, 0.15, -0.4)); // annex plinth
-  g.add(at(box(matFn, 3.6, 2.4, 3.4, P.steel), -7.6, 1.5, -0.4)); // annex
-  g.add(at(box(matFn, 3.8, 0.16, 3.6, P.steelDeep), -7.6, 2.78, -0.4)); // annex cap
-  g.add(at(box(matFn, 0.9, 0.4, 0.9, P.steel), -2.5, 4.34, 0.8)); // roof clutter
-  g.add(at(box(matFn, 0.9, 0.4, 0.9, P.charcoal), 1.8, 4.34, -1.2));
+  g.add(at(sbox(matFn, 1.1, 2.2, 0.1, P.charcoal), 3.9, 1.44, 2.52)); // door
+  g.add(at(sbox(matFn, 4.0, 0.3, 3.8, P.concreteDeep), -7.6, 0.15, -0.4)); // annex plinth
+  g.add(at(sbox(matFn, 3.6, 2.4, 3.4, P.steel), -7.6, 1.5, -0.4)); // annex
+  g.add(at(sbox(matFn, 3.8, 0.16, 3.6, P.steelDeep), -7.6, 2.78, -0.4)); // annex cap
+  g.add(at(sbox(matFn, 0.9, 0.4, 0.9, P.steel), -2.5, 4.34, 0.8)); // roof clutter
+  g.add(at(sbox(matFn, 0.9, 0.4, 0.9, P.charcoal), 1.8, 4.34, -1.2));
   return g;
 }
 
@@ -1390,15 +1697,15 @@ function buildGrandstand(matFn: MatFn, next: () => number): THREE.Group {
   const LEN = 20;
   const TIERS = 5;
   g.add(contactPad(matFn, LEN + 3.4, 10.4, P.grassDeep));
-  g.add(at(box(matFn, LEN + 0.6, 0.34, 7.6, P.concreteDeep), 0, 0.17, 0)); // plinth
-  g.add(at(box(matFn, LEN, 0.28, 7, P.steel), 0, 0.48, 0)); // deck
+  g.add(at(sbox(matFn, LEN + 0.6, 0.34, 7.6, P.concreteDeep), 0, 0.17, 0)); // plinth
+  g.add(at(sbox(matFn, LEN, 0.28, 7, P.steel), 0, 0.48, 0)); // deck
   let seat = rngInt(next, 0, CROWD_COLORS.length - 1);
   for (let k = 0; k < TIERS; k++) {
     const y = 0.62 + k * 0.55;
     const z = 2.5 - k * 1.35;
     // terraces overlap in y (0.62 tall on a 0.55 rise) so no slit shows between steps
-    g.add(at(box(matFn, LEN, 0.62, 1.45, P.asphaltLight), 0, y + 0.19, z));
-    g.add(at(box(matFn, LEN, 0.12, 0.1, P.concreteDeep), 0, y + 0.06, z + 0.72)); // riser shadow
+    g.add(at(sbox(matFn, LEN, 0.62, 1.45, P.asphaltLight), 0, y + 0.19, z));
+    g.add(at(sbox(matFn, LEN, 0.12, 0.1, P.concreteDeep), 0, y + 0.06, z + 0.72)); // riser shadow
     // two staggered crowd rows per terrace: front row sits, back row often stands
     for (let row = 0; row < 2; row++) {
       const rz = z + (row === 0 ? 0.34 : -0.3);
@@ -1411,21 +1718,21 @@ function buildGrandstand(matFn: MatFn, next: () => number): THREE.Group {
           const bh = stand ? 0.72 : 0.5;
           const cx = x + rngRange(next, -0.08, 0.08);
           const cz = rz + rngRange(next, -0.12, 0.12);
-          g.add(at(box(matFn, 0.44, bh, 0.42, hex), cx, y + 0.5 + bh / 2, cz));
-          g.add(at(box(matFn, 0.26, 0.24, 0.26, P.charcoal), cx, y + 0.5 + bh + 0.12, cz)); // head
+          g.add(at(sbox(matFn, 0.44, bh, 0.42, hex), cx, y + 0.5 + bh / 2, cz));
+          g.add(at(sbox(matFn, 0.26, 0.24, 0.26, P.charcoal), cx, y + 0.5 + bh + 0.12, cz)); // head
         }
         x += rngRange(next, 0.62, 0.92);
       }
     }
   }
-  g.add(at(box(matFn, LEN, 2.4, 0.35, P.charcoal), 0, 1.8, -3.4)); // back wall
-  g.add(at(box(matFn, LEN, 0.16, 0.42, P.steelDeep), 0, 0.68, -3.4)); // wall footing
+  g.add(at(sbox(matFn, LEN, 2.4, 0.35, P.charcoal), 0, 1.8, -3.4)); // back wall
+  g.add(at(sbox(matFn, LEN, 0.16, 0.42, P.steelDeep), 0, 0.68, -3.4)); // wall footing
   for (const px of [-LEN / 2 + 0.6, LEN / 2 - 0.6]) {
-    g.add(at(box(matFn, 0.3, 3.0, 0.3, P.charcoal), px, 2.3, 2.9)); // roof posts (meet the slab)
-    g.add(at(box(matFn, 0.46, 0.2, 0.46, P.steelDeep), px, 0.72, 2.9)); // post base
+    g.add(at(sbox(matFn, 0.3, 3.0, 0.3, P.charcoal), px, 2.3, 2.9)); // roof posts (meet the slab)
+    g.add(at(sbox(matFn, 0.46, 0.2, 0.46, P.steelDeep), px, 0.72, 2.9)); // post base
   }
-  g.add(at(box(matFn, LEN + 0.8, 0.22, 7.6, P.ink), 0, 3.85, -0.2)); // roof slab
-  g.add(at(box(matFn, LEN + 0.9, 0.14, 0.18, P.gold), 0, 3.7, 3.5)); // roof edge trim
+  g.add(at(sbox(matFn, LEN + 0.8, 0.22, 7.6, P.ink), 0, 3.85, -0.2)); // roof slab
+  g.add(at(sbox(matFn, LEN + 0.9, 0.14, 0.18, P.gold), 0, 3.7, 3.5)); // roof edge trim
   return g;
 }
 
@@ -1433,9 +1740,9 @@ function buildGrandstand(matFn: MatFn, next: () => number): THREE.Group {
 function buildBrakeBoard(matFn: MatFn, numeral: string): THREE.Group {
   const g = new THREE.Group(); // local +z faces approaching traffic
   g.add(contactPad(matFn, 0.46, 0.46, P.dirtDeep)); // boards stand on the shoulder
-  g.add(at(box(matFn, 0.16, 0.14, 0.16, P.steelDeep), 0, 0.07, 0)); // foot
-  g.add(at(box(matFn, 0.08, 1.05, 0.08, P.curbWhite), 0, 0.55, 0)); // post
-  g.add(at(box(matFn, 0.62, 0.48, 0.06, P.curbWhite), 0, 1.1, 0)); // board
+  g.add(at(sbox(matFn, 0.16, 0.14, 0.16, P.steelDeep), 0, 0.07, 0)); // foot
+  g.add(at(sbox(matFn, 0.08, 1.05, 0.08, P.curbWhite), 0, 0.55, 0)); // post
+  g.add(at(sbox(matFn, 0.62, 0.48, 0.06, P.curbWhite), 0, 1.1, 0)); // board
   addBlockText(g, matFn, numeral, 0.052, P.ink, 1.1, 0.045, false);
   addBlockText(g, matFn, numeral, 0.052, P.ink, 1.1, -0.045, true);
   return g;
@@ -1455,12 +1762,17 @@ function buildBrakeBoard(matFn: MatFn, numeral: string): THREE.Group {
  * index — see the file header.
  */
 export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
+  const ph = phaseHook();
+  protoCache.clear(); // prototypes live for exactly one build (see `proto`)
   P = { ...KPAL, ...track.theme.palette };
   const frames = trackFrames(track.centerline);
   const w = track.roadHalfW;
   const root = new THREE.Group();
   const n = frames.length;
   const world = trackWorld(track);
+  // every scatter loop's "not on the road" test, exactly as closestOnTrack
+  // answers it but without its full-centreline scan (see lateralQuery)
+  const absLateral = lateralQuery(track);
   const seed = `kart-${track.id}`; // per-circuit deco: two tracks never share scatter
   /**
    * Samples spanning `metres` of THIS circuit. SAMPLES is fixed at 256 for
@@ -1473,24 +1785,28 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
   // curvature drives the road's rubber lines, the apex skids/stacks, billboards
   const turn = smoothedTurn(frames);
   const apexes = findApexes(frames, turn, world.mPerSample, s(APEX_SPACING_M));
+  ph('frames');
 
   // ---- the grass field: a tier-mottled plane, NOT a flat slab ---------------
   const groundNext = rng(decoSeed(seed, 18));
   const ground = new THREE.Mesh(groundGeometry(world, groundNext), vertexPaintMaterial());
   ground.receiveShadow = true;
   root.add(ground);
+  ph('ground');
 
   // mown stripe bands along the verge (over the field, under the dirt wear)
   const mownNext = rng(decoSeed(seed, 19));
   const mown = new THREE.Mesh(mownStripeGeometry(frames, w, s(MOWN_STRIPE_M), mownNext), vertexPaintMaterial());
   mown.receiveShadow = true;
   root.add(mown);
+  ph('mownStripes');
 
   // ---- road ribbon + painted markings (flat, receive shadows only) -----------
   const roadNext = rng(decoSeed(seed, 10));
   const road = new THREE.Mesh(roadGeometry(frames, w, turn, roadNext), vertexPaintMaterial());
   road.receiveShadow = true;
   root.add(road);
+  ph('roadRibbon');
 
   // subtle center-line dashes: thin lighter strip, every other segment.
   // max(2, …) so the on/off pattern always has an off segment: at 1 the dashes
@@ -1502,6 +1818,7 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
   );
   dashes.receiveShadow = true;
   root.add(dashes);
+  ph('dashes');
 
   // curb stripes: alternating red/white every CURB_STRIPE_M of road, both edges
   const curbPeriod = s(CURB_STRIPE_M);
@@ -1520,6 +1837,7 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
     curb.receiveShadow = true;
     root.add(curb);
   }
+  ph('curbs');
 
   // dirt shoulder ring (the two dirt tiers, alternating in runs) followed by the
   // asphaltDeep CONTACT BAND where the whole road assembly meets the grass —
@@ -1550,6 +1868,7 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
     dirt.receiveShadow = true;
     root.add(dirt);
   }
+  ph('shoulders');
 
   // asphalt wear: repair patches + edge grime + apex skids (one vertex-color mesh)
   const detailNext = rng(decoSeed(seed, 12));
@@ -1559,12 +1878,14 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
   );
   detail.receiveShadow = true;
   root.add(detail);
+  ph('roadDetail');
 
   // grass tone patches: four-tier blobs + broad mottling + track-edge dirt wear
   const blobNext = rng(decoSeed(seed, 13));
-  const blobs = new THREE.Mesh(grassPatchGeometry(track, frames, w, world, blobNext), vertexPaintMaterial());
+  const blobs = new THREE.Mesh(grassPatchGeometry(absLateral, frames, w, world, blobNext), vertexPaintMaterial());
   blobs.receiveShadow = true;
   root.add(blobs);
+  ph('grassPatches');
 
   // ---- everything static below is baked into ~1 mesh per material ------------
   const statics = new THREE.Group();
@@ -1583,12 +1904,13 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
     for (const side of [1, -1]) {
       const px = f.cx + f.lx * (w + BARRIER_OFF) * side;
       const pz = f.cz + f.lz * (w + BARRIER_OFF) * side;
-      statics.add(at(box(matFn, 0.42, PAD_H, 0.42, P.dirtDeep), px, PAD_H / 2, pz));
-      statics.add(at(cyl(matFn, 0.13, 0.15, 0.1, 8, P.charcoal), px, 0.07, pz));
-      statics.add(at(cyl(matFn, 0.09, 0.09, BARRIER_H, 8, hex), px, BARRIER_H / 2 + 0.11, pz));
+      statics.add(at(sbox(matFn, 0.42, PAD_H, 0.42, P.dirtDeep), px, PAD_H / 2, pz));
+      statics.add(at(scyl(matFn, 0.13, 0.15, 0.1, 8, P.charcoal), px, 0.07, pz));
+      statics.add(at(scyl(matFn, 0.09, 0.09, BARRIER_H, 8, hex), px, BARRIER_H / 2 + 0.11, pz));
     }
   }
 
+  ph('barriers');
   // start/finish: checkered band of small quads across gate 0
   const g0 = track.gates[0]!;
   const cell = (w * 2) / CHECKER_COLS;
@@ -1600,7 +1922,7 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
       const hex = (r + c) % 2 === 0 ? P.startLine : P.ink;
       checker.add(
         at(
-          box(matFn, cell * 0.98, 0.02, cell * 0.98, hex),
+          sbox(matFn, cell * 0.98, 0.02, cell * 0.98, hex),
           (c + 0.5 - CHECKER_COLS / 2) * cell,
           0,
           (CHECKER_ROWS / 2 - r - 0.5) * cell,
@@ -1616,13 +1938,14 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
     const stall = new THREE.Group();
     stall.position.set(s.x, PAINT_Y, s.z);
     stall.rotation.y = s.yaw;
-    stall.add(at(box(matFn, 1.7, 0.02, 0.14, P.startLine), 0, 0, -1.25));
-    stall.add(at(box(matFn, 1.7, 0.02, 0.14, P.startLine), 0, 0, 1.25));
-    stall.add(at(box(matFn, 0.14, 0.02, 2.5, P.startLine), -0.85, 0, 0));
-    stall.add(at(box(matFn, 0.14, 0.02, 2.5, P.startLine), 0.85, 0, 0));
+    stall.add(at(sbox(matFn, 1.7, 0.02, 0.14, P.startLine), 0, 0, -1.25));
+    stall.add(at(sbox(matFn, 1.7, 0.02, 0.14, P.startLine), 0, 0, 1.25));
+    stall.add(at(sbox(matFn, 0.14, 0.02, 2.5, P.startLine), -0.85, 0, 0));
+    stall.add(at(sbox(matFn, 0.14, 0.02, 2.5, P.startLine), 0.85, 0, 0));
     statics.add(stall);
   }
 
+  ph('startPaint');
   // ---- furniture ---------------------------------------------------------------
   const furnNext = rng(decoSeed(seed, 16));
 
@@ -1781,6 +2104,7 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
     }
   }
 
+  ph('furniture');
   // ground scatter: low flowers/bushes/pebbles along both track edges (baked,
   // non-collidable — everything sits outside the kart's max reach of ~6.2m)
   const gsNext = rng(decoSeed(seed, 17));
@@ -1797,9 +2121,9 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
       if (pick < 0.45) {
         // flower tuft: dark stem cube + palette bloom cube
         const fl = new THREE.Group();
-        fl.add(at(box(matFn, 0.26, PAD_H, 0.26, P.grassDeep), 0, PAD_H / 2, 0));
-        fl.add(at(box(matFn, 0.07, 0.22, 0.07, P.grassDark), 0, 0.13, 0));
-        fl.add(at(box(matFn, 0.17, 0.12, 0.17, FLOWERS[rngInt(gsNext, 0, FLOWERS.length - 1)]!), 0, 0.29, 0));
+        fl.add(at(sbox(matFn, 0.26, PAD_H, 0.26, P.grassDeep), 0, PAD_H / 2, 0));
+        fl.add(at(sbox(matFn, 0.07, 0.22, 0.07, P.grassDark), 0, 0.13, 0));
+        fl.add(at(sbox(matFn, 0.17, 0.12, 0.17, FLOWERS[rngInt(gsNext, 0, FLOWERS.length - 1)]!), 0, 0.29, 0));
         fl.position.set(x, 0, z);
         statics.add(fl);
       } else if (pick < 0.8) {
@@ -1808,10 +2132,10 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
         const br = rngRange(gsNext, 0.28, 0.55);
         const sx = rngRange(gsNext, 0.9, 1.3);
         const sz = rngRange(gsNext, 0.9, 1.3);
-        const skirt = sphere(matFn, br * 1.06, 6, P.treeLeafDeep);
+        const skirt = ssphere(matFn, br * 1.06, 6, P.treeLeafDeep);
         skirt.scale.set(sx, 0.34, sz);
         bg.add(at(skirt, 0, 0.08, 0));
-        const bush = sphere(matFn, br, 6, leafTone(gsNext));
+        const bush = ssphere(matFn, br, 6, leafTone(gsNext));
         bush.scale.set(sx, rngRange(gsNext, 0.5, 0.7), sz);
         bg.add(at(bush, 0, 0.21, 0));
         bg.rotation.y = gsNext() * Math.PI;
@@ -1820,7 +2144,7 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
       } else {
         // pebble: small squashed rock
         const r = rngRange(gsNext, 0.14, 0.3);
-        const pebble = sphere(matFn, r, 5, P.rock);
+        const pebble = ssphere(matFn, r, 5, P.rock);
         pebble.scale.set(rngRange(gsNext, 0.9, 1.3), 0.55, rngRange(gsNext, 0.9, 1.3));
         pebble.position.set(x, r * 0.3, z);
         statics.add(pebble);
@@ -1828,6 +2152,7 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
     }
   }
 
+  ph('groundScatter');
   // seeded scatter: CLUSTERED trees (bare gaps between groves) + sparse rocks,
   // never on the road (|lateral| > halfW + 4). The rect is centred on the
   // CIRCUIT and its counts scale with the apron area, so a big circuit is not
@@ -1848,7 +2173,7 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
   ) {
     const cx = scatX();
     const cz = scatZ();
-    if (Math.abs(closestOnTrack(track, cx, cz).lateral) <= w + 6) continue;
+    if (absLateral(cx, cz) <= w + 6) continue;
     if (inAvoid(cx, cz, avoid)) continue;
     let clusterClash = false;
     for (const cl of clusters) {
@@ -1867,7 +2192,7 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
       const rr = rngRange(next, 1.5, CLUSTER_R) * (0.5 + next()); // uneven grove density
       const x = cx + Math.cos(ang) * rr;
       const z = cz + Math.sin(ang) * rr;
-      if (Math.abs(closestOnTrack(track, x, z).lateral) <= w + PROP_CLEARANCE) continue;
+      if (absLateral(x, z) <= w + PROP_CLEARANCE) continue;
       if (inAvoid(x, z, avoid)) continue;
       const tree = buildAnyTree(matFn, next);
       tree.position.set(x, 0, z);
@@ -1876,14 +2201,14 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
     }
   }
   // top-up: a few lone stragglers if the groves undershot the count
-  const placed: Array<{ x: number; z: number }> = [];
+  const placed = new SpacedPoints(PROP_SPACING);
   for (let attempt = 0; attempt < treeCount * 30 && trees < treeCount; attempt++) {
     const x = scatX();
     const z = scatZ();
-    if (Math.abs(closestOnTrack(track, x, z).lateral) <= w + PROP_CLEARANCE) continue;
-    if (tooClose(x, z, placed)) continue;
+    if (absLateral(x, z) <= w + PROP_CLEARANCE) continue;
+    if (placed.has(x, z)) continue;
     if (inAvoid(x, z, avoid)) continue;
-    placed.push({ x, z });
+    placed.add(x, z);
     const tree = buildAnyTree(matFn, next);
     tree.position.set(x, 0, z);
     statics.add(tree);
@@ -1894,37 +2219,39 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
   for (let attempt = 0; attempt < rockCount * 30 && rocks < rockCount; attempt++) {
     const x = scatX();
     const z = scatZ();
-    if (Math.abs(closestOnTrack(track, x, z).lateral) <= w + PROP_CLEARANCE) continue;
-    if (tooClose(x, z, placed)) continue;
+    if (absLateral(x, z) <= w + PROP_CLEARANCE) continue;
+    if (placed.has(x, z)) continue;
     if (inAvoid(x, z, avoid)) continue;
-    placed.push({ x, z });
+    placed.add(x, z);
     const rock = buildRock(matFn, next);
     rock.position.set(x, 0, z);
     statics.add(rock);
     rocks++;
   }
 
+  ph('scatterTreesRocks');
   // tree line: a mid-distance band of trees ringing the CIRCUIT (not the world
   // origin), just outside its bounding radius and well inside the near ridge
   const lineNext = rng(decoSeed(seed, 14));
   const lineCount = scaled(TREELINE_COUNT, world.density);
   let lineTrees = 0;
-  const linePlaced: Array<{ x: number; z: number }> = [];
+  const linePlaced = new SpacedPoints(PROP_SPACING);
   for (let attempt = 0; attempt < lineCount * 20 && lineTrees < lineCount; attempt++) {
     const ang = lineNext() * Math.PI * 2;
     const r = rngRange(lineNext, world.treelineMin, world.treelineMax);
     const x = world.cx + Math.cos(ang) * r;
     const z = world.cz + Math.sin(ang) * r * TREELINE_SQUASH; // slight ellipse, never a clean circle
-    if (Math.abs(closestOnTrack(track, x, z).lateral) <= w + 6) continue;
-    if (tooClose(x, z, linePlaced)) continue;
+    if (absLateral(x, z) <= w + 6) continue;
+    if (linePlaced.has(x, z)) continue;
     if (inAvoid(x, z, avoid)) continue;
-    linePlaced.push({ x, z });
+    linePlaced.add(x, z);
     const tree = buildAnyTree(matFn, lineNext);
     tree.position.set(x, 0, z);
     statics.add(tree);
     lineTrees++;
   }
 
+  ph('treeline');
   // horizon: THREE ridgeline layers on a distance ladder — a dark green near
   // ridge, a ridgeNear->ridgeFar mid ridge, and a tall far ridge faded toward
   // the fog with mix() (the one sanctioned use: atmospheric perspective, §0.7).
@@ -1956,6 +2283,8 @@ export function buildTrackMesh(track: TrackDef, matFn: MatFn): THREE.Group {
   );
   root.add(ridgeNear);
 
+  ph('ridgelines');
   root.add(bake(statics)); // one merged mesh per material, shadows on
+  ph('bake');
   return root;
 }

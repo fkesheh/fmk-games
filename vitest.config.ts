@@ -20,6 +20,9 @@ export default defineConfig({
       'games/bank/server/src/**/*.test.ts',
       'games/kart/shared/src/**/*.test.ts',
       'games/kart/server/src/**/*.test.ts',
+      // The kart CLIENT was missing an include, so any test written there would
+      // have silently never run — the same defect that hid games/bank/shared.
+      'games/kart/client/src/**/*.test.ts',
       'games/wordbomb/shared/src/**/*.test.ts',
       'games/wordbomb/server/src/**/*.test.ts',
     ],
