@@ -1686,6 +1686,13 @@ export class KartApp {
       this.updateHud(s, now);
       this.updateAudio(s, now);
       this.scene.render();
+    } else {
+      // Menu frames pay the race's first-render bill a slice at a time (shader
+      // programs, the shadow depth pass, first uploads) into the hidden canvas
+      // — otherwise all of it lands in one ~1s blocking task inside the join
+      // handler, right as the snapshot stream starts. Self-limiting, and a
+      // no-op once warm; see KartScene.prewarm().
+      this.scene.prewarm();
     }
     requestAnimationFrame(this.frameBound);
   }

@@ -54,7 +54,7 @@
 // is seeded, motion is a pure function of the input sequence.
 // ============================================================================
 import * as THREE from 'three';
-import { KPAL, type TrackDef, type TrackTheme } from '@kart/shared';
+import { KART_COLORS, KPAL, type TrackDef, type TrackTheme } from '@kart/shared';
 import { decoSeed, mix, rng, rngInt, rngRange } from '@platform/shared';
 import { buildTrackMesh } from './trackMesh.js';
 import { KartVisual } from './kartMesh.js';
@@ -395,6 +395,32 @@ function bakedTexSig(): string {
   return BAKED_TEX_KEYS.map((k) => P[k]).join('|');
 }
 
+// ---- menu pre-warm (see KartScene.prewarm) --------------------------------------
+// The whole WebGL pipeline — every shader program, the shadow-map depth program
+// set, the first geometry/texture uploads — used to be paid in ONE blocking task
+// inside the join handler, because app.ts only rendered once screen === 'race'.
+// Measured on a room whose circuit was ALREADY built at boot, so no mesh build
+// was involved at all: one 988 ms main-thread task under SwiftShader, during
+// which 19 snapshots of the 20 Hz stream landed inside a single millisecond.
+// The work is unavoidable, so it is MOVED: the menu frame loop drives one
+// pre-warm step per rAF, and the canvas it draws into is `display:none` behind
+// the menu (style.css `.hidden`), so nothing reaches the player. After: worst
+// join task 210 ms, at most 4 snapshots batched, and NO long task added to the
+// menu. On hardware (ANGLE Metal, Apple M2) the same pair is 52 ms -> 0 ms,
+// with the biggest pre-warm frame at 79 ms — under the menu's own boot task.
+/** rAF frames to leave alone before touching the driver — let the menu paint. */
+const WARM_IDLE_FRAMES = 2;
+/** id of the throwaway kart minted so kart-only materials get compiled early. */
+const WARM_KART_ID = ' prewarm';
+/** Its livery: a REAL grid colour, so the material bucket it mints is reused. */
+const WARM_KART_COLOR = KART_COLORS[0] ?? KPAL.kartRed;
+/** Saved visibility/culling of one object during a pre-warm draw. */
+interface WarmSaved {
+  readonly obj: THREE.Object3D;
+  readonly visible: boolean;
+  readonly frustumCulled: boolean;
+}
+
 export class KartScene {
   private readonly renderer: THREE.WebGLRenderer;
   private readonly scene: THREE.Scene;
@@ -433,6 +459,9 @@ export class KartScene {
 
   private trackRoot: THREE.Group | null = null;
   private readonly karts = new Map<string, KartVisual>();
+
+  // ---- menu pre-warm state (prewarm(); -1 == finished, never restarts) ---------
+  private warmStep = 0;
 
   // ---- camera feel state (derived from the setCamera stream; no per-frame alloc)
   private camReady = false; // first setCamera snaps instead of easing
@@ -620,8 +649,52 @@ export class KartScene {
     this.scene.add(this.trackRoot);
   }
 
+  /**
+   * ONE step of the menu pre-warm; returns true while steps remain. Safe to
+   * call every menu frame and safe to never call at all — it only ever moves
+   * work earlier. Cheap no-op (one integer compare) once finished, and it
+   * finishes itself the moment the race takes over (addKart / setCamera).
+   *
+   * WHY: the join handler used to pay the entire first-render bill in one
+   * blocking task (see the WARM_IDLE_FRAMES block above). The steps below pay
+   * it a slice per frame while the menu is up, one step per rAF:
+   *   1. mint a throwaway KartVisual — the roundel material (Lambert + map +
+   *      transparent) is its OWN program and no track mesh mints it;
+   *   2. `renderer.compile()` the scene: every program the race draws with,
+   *      built against the real lights so the shadow-aware variants are the
+   *      ones the race will actually ask for;
+   *   3. compile the post scene (grade + vignette quads);
+   *   4. four widening throwaway frames into the hidden canvas (sky, +clouds,
+   *      +fx and kart, +circuit). The DRAW is what makes the driver build
+   *      pipeline state and upload buffers/textures, and the last one is also
+   *      the ONLY thing that exercises the shadow-map depth program set
+   *      (compile() does not touch it — miss this and the first shadowed frame
+   *      is a second, smaller freeze). Four frames rather than one because a
+   *      single full draw is itself a 395 ms task on ANGLE Metal;
+   *   5. glFinish, which is what makes step 4 real — see its comment below.
+   * Everything is drawn with visibility and frustum culling forced on and
+   * restored exactly, so pooled fx that are invisible at menu time (and
+   * geometry behind the parked camera) are warmed too.
+   *
+   * What necessarily stays deferred: geometry for a circuit this page has not
+   * built yet (a championship round-2 swap still uploads its own buffers) and
+   * each real kart's own geometry and roundel texture. Those are uploads, not
+   * program builds — the expensive half is what moves here.
+   */
+  prewarm(): boolean {
+    if (this.warmStep < 0) return false;
+    try {
+      return this.warmStep_();
+    } catch {
+      // context lost / driver refusal: the race path is unchanged, so just stop
+      this.finishPrewarm();
+      return false;
+    }
+  }
+
   /** Add a kart; color MUST be its KART_COLORS hex (chassis + helmet). Idempotent. */
   addKart(id: string, color: string): void {
+    if (this.warmStep >= 0 && id !== WARM_KART_ID) this.finishPrewarm(); // the race owns the scene now
     this.removeKart(id);
     const v = new KartVisual(color, mat);
     this.karts.set(id, v);
@@ -665,6 +738,7 @@ export class KartScene {
    * caller knows the drift state; omitted, the slide is read off the motion.
    */
   setCamera(x: number, y: number, z: number, yaw: number, speed: number, dt: number, fx?: CameraFx): void {
+    if (this.warmStep >= 0) this.finishPrewarm(); // race frames render for real now
     const dtc = Math.min(Math.max(dt, 0), 0.1); // hitch clamp, same spirit as the ease
     const sp = Math.abs(speed);
     const first = !this.camReady;
@@ -816,6 +890,102 @@ export class KartScene {
   }
 
   // ---- private helpers -------------------------------------------------------------
+
+  /** One pre-warm step (see prewarm()); returns true while steps remain. */
+  private warmStep_(): boolean {
+    const s = this.warmStep++;
+    if (s < WARM_IDLE_FRAMES) return true; // let the menu paint before we stall it
+    switch (s - WARM_IDLE_FRAMES) {
+      case 0:
+        // kart-only materials exist only once a KartVisual does
+        this.addKart(WARM_KART_ID, WARM_KART_COLOR);
+        return true;
+      case 1:
+        this.renderer.compile(this.scene, this.camera);
+        return true;
+      case 2:
+        this.renderer.compile(this.postScene, this.postCam);
+        return true;
+      case 3:
+      case 4:
+      case 5:
+      case 6:
+        // Four widening draws, one per frame. A single full draw is one task
+        // big enough to be its OWN freeze (measured at 395 ms on ANGLE Metal),
+        // which would just move the stall rather than remove it; each tier
+        // adds one family of pipelines, so no menu frame carries them all.
+        this.warmDraw(s - WARM_IDLE_FRAMES - 3);
+        return true;
+      case 7:
+        return true; // one frame of slack — let the driver drain on its own first
+      case 8:
+        // LOAD-BEARING, and the whole reason this class of fix usually fails:
+        // the canvas is display:none, so the compositor never consumes a frame
+        // from it and the context is never flushed. Without this the draws
+        // above are only RECORDED — the driver builds no pipeline state, and
+        // the join still stalls (measured: 1404 ms with the draws but no
+        // finish, 178 ms with it). It costs ~0 ms here because the frame of
+        // slack above already let the driver drain.
+        this.renderer.getContext().finish();
+        return true;
+      default:
+        this.finishPrewarm();
+        return false;
+    }
+  }
+
+  /**
+   * Draw one throwaway frame into the hidden canvas, showing scene tiers 0..t
+   * and hiding the rest. Whatever IS shown is forced visible and unculled
+   * (pooled fx sprites that never show at menu, geometry behind the parked
+   * camera) so the driver builds every pipeline the race will ask for; every
+   * flag is restored exactly afterwards — this must be invisible to the race.
+   *
+   * Tiers, cheapest first, so each menu frame carries one family of pipelines:
+   *   0 sky dome + sun sprites · 1 + clouds · 2 + fx pools and the kart ·
+   *   3 + the circuit, which is also what gives the shadow pass real casters.
+   */
+  private warmDraw(tier: number): void {
+    const shown = (child: THREE.Object3D): boolean => {
+      if (child === this.sky || child === this.sunCore || child === this.sunHalo) return true;
+      if (child === this.trackRoot) return tier >= 3;
+      if (this.cloudLayers.some((l) => l.group === child)) return tier >= 1;
+      return tier >= 2; // fx pools, kart roots (lights carry no geometry)
+    };
+    const saved: WarmSaved[] = [];
+    for (const child of this.scene.children) {
+      const on = shown(child);
+      child.traverse((obj) => {
+        saved.push({ obj, visible: obj.visible, frustumCulled: obj.frustumCulled });
+        obj.visible = on;
+        obj.frustumCulled = false;
+      });
+    }
+    try {
+      this.render();
+    } finally {
+      for (const s of saved) {
+        s.obj.visible = s.visible;
+        s.obj.frustumCulled = s.frustumCulled;
+      }
+    }
+  }
+
+  /**
+   * Stop pre-warming for good: drop the throwaway kart and wipe the hidden
+   * canvas back to the clear colour, so the race screen can never flash a
+   * pre-warm frame in the gap between showRace() and its first real frame.
+   */
+  private finishPrewarm(): void {
+    this.warmStep = -1;
+    this.removeKart(WARM_KART_ID); // no-op if it was never minted
+    try {
+      this.renderer.setRenderTarget(null);
+      this.renderer.clear();
+    } catch {
+      // a lost context has nothing to clear — the race path is unaffected
+    }
+  }
 
   /**
    * Golden-hour grade over the theme: a warm key that actually carries the
