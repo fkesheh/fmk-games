@@ -1042,20 +1042,26 @@ async function main() {
         fast ? 1 : 0,
         Math.max(-1, Math.min(1, -diff * 2.2)),
       );
+      // ONE-SIDED window. The old rule trimmed the trail to <= 2.6 sim-s and then
+      // demanded a span >= 2.5 — a 0.1 sim-s acceptance band. `simS` is quantised
+      // to 1/30 s ticks and the poll cadence varies with CPU load, so at a regular
+      // 8, 9, 10 or 12 ticks per poll the retained span lands in (2.6-D, 2.6] and
+      // provably NEVER touches 2.5: the pin could not be confirmed at all, and the
+      // 1.5 m stillness threshold was never even evaluated. Measured, a wedged
+      // kart moves 0.16-0.46 m over 2.5 sim-s — 3-10x inside the threshold — so
+      // this was a test that could not pass, not a kart that would not wedge.
+      // Keep a longer trail and evaluate the OLDEST sample that is far enough back.
       pinTrail.push({ simS, x: pose.x, z: pose.z });
-      while (pinTrail.length > 0 && simS - pinTrail[0].simS > 2.6) pinTrail.shift();
-      if (
-        pinTrail.length > 1 &&
-        simS - pinTrail[0].simS >= 2.5 &&
-        Math.hypot(pose.x - pinTrail[0].x, pose.z - pinTrail[0].z) < 1.5
-      ) {
+      while (pinTrail.length > 0 && simS - pinTrail[0].simS > 6) pinTrail.shift();
+      const anchor = pinTrail.find((s) => simS - s.simS >= 2.5);
+      if (anchor !== undefined && Math.hypot(pose.x - anchor.x, pose.z - anchor.z) < 1.5) {
         pinPos = { x: pose.x, z: pose.z };
         pinSimS = simS; // the confirmed pin: the ~8 sim-s auto-respawn budget starts here
       }
       if (pinSideFlipAt !== null && simS >= pinSideFlipAt && pinSide === 1) {
         pinSide = -1; // this wall would not pin — try the other one
         pinSideFlipAt = simS + 7;
-        pinTrail.length = 0;
+        pinTrail.length = 0; // the other wall is elsewhere: this evidence is void
       }
     }
     await sleep(150);
@@ -1102,7 +1108,16 @@ async function main() {
   check(
     'kids stuck auto-respawn: pinned nose-first with KIDS MODE on, the client auto-respawns to a gate within ~8 sim-s (teleport, speed reset)',
     pinPos !== null && stuckAssistOn && jumpSimS !== null && jumpSimS <= 8 && jumpGateD !== null && jumpGateD <= 10 && jumpSpeed !== null && jumpSpeed < 10,
-    `pin=${pinPos !== null ? `(${pinPos.x.toFixed(1)},${pinPos.z.toFixed(1)})` : 'never pinned in 15 sim-s'} assist-on=${stuckAssistOn} ` +
+    // Distinguish "the kart would not wedge" from "we ran out of WALL clock" —
+    // the old message blamed sim time for both, which sent a diagnosis down the
+    // wrong path once already.
+    `pin=${
+      pinPos !== null
+        ? `(${pinPos.x.toFixed(1)},${pinPos.z.toFixed(1)})`
+        : Date.now() - pinWall0 >= 90000
+          ? 'never pinned — WALL clock ran out (90s), not sim time'
+          : 'never pinned in 15 sim-s'
+    } assist-on=${stuckAssistOn} ` +
       `jump=${jumpSimS !== null ? `${jumpSimS.toFixed(1)} sim-s after pin` : 'none within 10 sim-s'} gateDist=${jumpGateD !== null ? jumpGateD.toFixed(1) : '?'} ` +
       `postSpeed=${jumpSpeed !== null ? jumpSpeed.toFixed(1) : '?'}`,
   );

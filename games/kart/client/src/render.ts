@@ -1,28 +1,40 @@
 // ============================================================================
 // KART GP — scene shell + renderer (frozen export, docs/KART.md "Client
 // modules"). One WebGLRenderer (ACES, sRGB out, PCFSoft shadows, pixelRatio
-// <= 2, subtle exposure lift). Sky rig (VISUAL_UPGRADE.md §1 S1/S2): a
-// vertex-gradient dome whose stops are LITERAL palette entries — a thin
-// KPAL.horizon rim, KPAL.sky through the mid band, KPAL.skyHigh at the zenith
-// (cooler and 37 L* darker than the horizon, so S1 reads in the frame, not
-// just in the test) — plus a warm blob around the sun azimuth, a hard-edged
-// billboard sun disc with a tight halo, and three seeded cloud layers clumped
-// into gap-free formations (bottom-aligned puffs give real flat bases; the
-// puff texture ramps KPAL.cloud tops into KPAL.cloudShade undersides),
-// drifting at different rates, palette-tinted by sun proximity and hazed
-// toward the fog by layer distance. The directional light RIDES THE
-// VISIBLE DISC — same azimuth, same 15° elevation — so the golden-hour sun
-// and the long raking shadows always agree; the watched kart is kept readable
+// <= 2, subtle exposure lift).
+//
+// PER-CIRCUIT PALETTE. Eight circuits share this renderer, so NOTHING here may
+// read KPAL directly: every colour resolves through `P` = { ...KPAL,
+// ...theme.palette }, re-resolved once per setTheme (the same seam trackMesh.ts
+// resolves once per buildTrackMesh). A circuit that re-skins the ground but
+// keeps Greenvale's sky, clouds and — most visibly — Greenvale's warm ground
+// BOUNCE (P.dirt on the hemisphere light) is a circuit whose verges are lit by
+// somebody else's dirt. The only KPAL read left is the pre-theme WebGL failure
+// overlay, which exists before any track is known.
+//
+// Sky rig (VISUAL_UPGRADE.md §1 S1/S2): a vertex-gradient dome whose stops are
+// LITERAL palette entries — a thin P.horizon rim, P.sky through the mid band,
+// P.skyHigh at the zenith (cooler and >= 12 L* darker than the horizon on every
+// circuit, so S1 reads in the frame, not just in the test) — plus a warm blob
+// around the sun azimuth, a hard-edged billboard sun disc with a tight halo,
+// and three seeded cloud layers clumped into gap-free formations
+// (bottom-aligned puffs give real flat bases; the puff texture ramps P.cloud
+// tops into P.cloudShade undersides over a P.sky base band, and is REBAKED when
+// a circuit moves any of those three — an amber-sky circuit must not keep a
+// blue cloud underside), drifting at different rates, palette-tinted by sun
+// proximity and hazed toward the fog by layer distance. The directional light
+// RIDES THE VISIBLE DISC — same azimuth, same 15° elevation — so the golden-
+// hour sun and the long raking shadows always agree; the watched kart is readable
 // by two shadowless helpers: a weak camera-axis directional fill (cool, the
 // sky's counter-bounce to the warm key) plus a near-subject point fill
 // anchored between camera and kart (inverse-square — the kart reads, the
 // world barely sees it). All sky materials are unlit (MeshBasic/Sprite/Shader)
 // with fog:false — the only unlit-material exceptions. FogExp2 sits EXACTLY on
-// KPAL.fog (== KPAL.horizon, S2) so ground, ridgelines and dome fuse on one
-// value; hemi is a cool sky over a warm KPAL.dirt ground bounce and is
+// theme.fog (== theme.horizon, S2) so ground, ridgelines and dome fuse on one
+// value; hemi is a cool sky over a warm P.dirt ground bounce and is
 // deliberately WEAK so the sun's 4096 shadows actually register. The shadow
 // box follows the watched kart. Every other surface is flat-shaded
-// MeshLambertMaterial in KPAL colors via the cached mat() factory below.
+// MeshLambertMaterial in palette colors via the cached mat() factory below.
 // Track construction lives in trackMesh.ts (bakes all static deco into ~1
 // mesh per material); kart visuals live in kartMesh.ts (unbaked — front
 // wheels steer, all wheels spin, the body rolls while drifting, and a small
@@ -37,8 +49,8 @@
 // accel estimate, and a landing-dip spring fed by vertical velocity. All of
 // it derives from the frozen setCamera inputs (x,y,z,yaw,speed,dt); the
 // optional 7th fx param lets a caller hand in known drift ground truth.
-// A dependency-free post pass (two fullscreen quads: warm grade lift +
-// KPAL.ink vignette) closes the frame. Deterministic throughout — every rng
+// A dependency-free post pass (two fullscreen quads: warm P.gold grade lift +
+// P.ink vignette) closes the frame. Deterministic throughout — every rng
 // is seeded, motion is a pure function of the input sequence.
 // ============================================================================
 import * as THREE from 'three';
@@ -46,6 +58,17 @@ import { KPAL, type TrackDef, type TrackTheme } from '@kart/shared';
 import { decoSeed, mix, rng, rngInt, rngRange } from '@platform/shared';
 import { buildTrackMesh } from './trackMesh.js';
 import { KartVisual } from './kartMesh.js';
+
+type PalKey = keyof typeof KPAL;
+type Pal = Record<PalKey, string>;
+/**
+ * Resolved palette for the circuit CURRENTLY on screen ({ ...KPAL,
+ * ...theme.palette }). Set once per setTheme by usePalette(); every colour in
+ * this module reads through it, exactly as trackMesh.ts's `P` does per build.
+ * Defaults to bare KPAL so the constructor (which runs before any track is
+ * known) grades to the shared look.
+ */
+let P: Pal = { ...KPAL };
 
 // ---- chase camera (frozen feel: behind + above, modest speed effects) --------
 const BASE_FOV = 65;
@@ -97,18 +120,19 @@ const SUN_DISTANCE = 80; // sun sits at target + sunVec x 80 (sunVec = the VISIB
 // weak COOL sky over a WARM ground bounce, so shadows land AND every surface
 // picks up a free hue split (VISUAL_UPGRADE.md §3d) for zero cost.
 const EXPOSURE = 1.18; // subtle tone-map lift — ACES stays
-const SUN_WARM = 0.34; // sun color pull toward KPAL.gold
+const SUN_WARM = 0.34; // sun color pull toward P.gold
 const SUN_BOOST = 1.55; // key-light raise — the low sun grazes, verticals catch it
 const HEMI_BOOST = 0.75; // ambient CUT — the sun's shadows have to register
 const FILL_INTENSITY = 0.26; // camera-follow directional fill (world readability)
-const FILL_COOL = 0.55; // fill pull from curbWhite toward KPAL.sky (counter-bounce)
+const FILL_COOL = 0.55; // fill pull from curbWhite toward P.sky (counter-bounce)
 const FOG_DENSITY_SCALE = 0.8; // aerial-perspective knob over TrackTheme.fogDensity
 const KART_LIGHT_INTENSITY = 11; // near-subject point fill (candela, decay 1.8)
 const KART_LIGHT_DIST = 30; // hard cutoff — the world beyond ~15 m barely sees it
 const KART_LIGHT_DECAY = 1.8;
 const KART_LIGHT_LERP = 0.35; // anchor: camera -> look target mix (≈4 m off the kart)
+const KART_LIGHT_GOLD = 0.15; // its tint: curbWhite -> this far toward gold
 const GRADE_ALPHA = 0.05; // fullscreen warm lift, weighted to the GROUND half
-const VIGNETTE_ALPHA = 0.3; // corner darkening (KPAL.ink)
+const VIGNETTE_ALPHA = 0.3; // corner darkening (P.ink)
 
 // ---- sky dome ------------------------------------------------------------------
 const DOME_RADIUS = 400;
@@ -116,18 +140,22 @@ const SUN_ELEVATION = 0.26; // rad (~15°) — disc height AND the light's rakin
 const SUN_CORE_SCALE = 48; // sprite size in m at the dome (≈7° across)
 const SUN_HALO_SCALE = 130;
 const SUN_CORE_GOLD = 0.55; // disc center hue: curbWhite -> this far toward gold
+const SUN_TEX_SIZE = 128; // disc + halo canvas resolution
+const CLOUD_TEX_SIZE = 64; // cloud puff canvas resolution
 // Dome band breakpoints as a fraction of dome height (0 = horizon, 1 = zenith).
 // Weighted LOW on purpose: a chase camera looking near-level only ever frames
 // y < ~0.5, so the horizon->sky->skyHigh ramp has to finish inside that band or
 // S1's 37 L* of separation never appears on screen.
-const DOME_RIM_TOP = 0.06; // pure KPAL.horizon rim (fuses with the fog)
-const DOME_MID_TOP = 0.3; // ...ramping to KPAL.sky by here
-const DOME_ZENITH_TOP = 0.8; // ...and fully KPAL.skyHigh from here up
+const DOME_RIM_TOP = 0.06; // pure horizon rim (fuses with the fog)
+const DOME_MID_TOP = 0.3; // ...ramping to the theme sky by here
+const DOME_ZENITH_TOP = 0.8; // ...and fully P.skyHigh from here up
 const DOME_BELOW_LAND = 0.55; // below-horizon fade toward distant land
 const SUN_GLOW_POW = 5; // tighter, more directional warm blob than the old 4
 const SUN_GLOW_MAX = 0.72; // ...and it no longer bleaches the horizon rim white
 
 // ---- clouds (3 seeded layers, clumped but gap-free, slow drift) ----------------
+const CLOUD_SHADE_PULL = 0.28; // shade tier: cloud -> this far toward cloudShade
+const CLOUD_WARM_PULL = 0.42; // sun-side tier: cloud -> this far toward gold
 interface CloudLayerSpec {
   readonly count: number;
   readonly megas: number; // formation centers, ring-spaced so any ~60° heading has one
@@ -161,9 +189,11 @@ const CLOUD_LAYERS: readonly CloudLayerSpec[] = [
 const matCache = new Map<string, THREE.MeshLambertMaterial>();
 
 /**
- * Shared, cached flat-shaded Lambert material. hex MUST come from
- * KPAL/KART_COLORS — an ad-hoc literal here is a palette violation and there is
- * no second material path to hide it in.
+ * Shared, cached flat-shaded Lambert material. hex MUST come from the resolved
+ * circuit palette (KPAL + theme.palette) or KART_COLORS — an ad-hoc literal
+ * here is a palette violation and there is no second material path to hide it
+ * in. Keyed by hex, so two circuits sharing a colour share one bucket and a
+ * re-skin simply mints new ones.
  *
  * This factory is THE material source for the whole KART client: it is handed
  * to trackMesh.ts as `MatFn` and to KartVisual as its material factory, so the
@@ -205,13 +235,13 @@ function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
-/** rgba() css string from a KPAL hex — canvas gradients need sRGB components. */
+/** rgba() css string from a palette hex — canvas gradients need sRGB components. */
 function rgba(hex: string, a: number): string {
   const n = parseInt(hex.slice(1), 16);
   return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
 }
 
-/** Raw sRGB components of a KPAL hex for the post shader (no color management). */
+/** Raw sRGB components of a palette hex for the post shader (no color management). */
 function srgbUniform(hex: string): THREE.Vector3 {
   const n = parseInt(hex.slice(1), 16);
   return new THREE.Vector3(((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255);
@@ -236,9 +266,9 @@ function radialTexture(size: number, stops: ReadonlyArray<readonly [number, stri
  * Cloud puff texture: a soft radial alpha blob with the vertical shading
  * baked in — bright top, shaded bottom (sun overhead). The sprite material's
  * tint (cool/warm by sun proximity, hazed by layer distance) multiplies on
- * top. KPAL-derived only: KPAL.cloud is the lit top, KPAL.cloudShade the
+ * top. Resolved-palette-derived only: P.cloud is the lit top, P.cloudShade the
  * underside, and every intermediate comes from `mix()` between two palette
- * entries so it stays traceable.
+ * entries so it stays traceable. Re-baked per circuit — see BAKED_TEX_KEYS.
  *
  * Two things changed from the first pass. (1) The alpha core is now WIDE and
  * flat-topped (solid out to 0.45, still soft at the rim) — the old 0.35/0.65
@@ -254,25 +284,51 @@ function cloudTexture(size: number): THREE.CanvasTexture {
   const ctx = cv.getContext('2d');
   if (!ctx) throw new Error('2d canvas unavailable');
   const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
-  g.addColorStop(0, rgba(KPAL.cloud, 1));
-  g.addColorStop(0.45, rgba(KPAL.cloud, 1));
-  g.addColorStop(0.72, rgba(KPAL.cloud, 0.62));
-  g.addColorStop(0.9, rgba(KPAL.cloud, 0.16));
-  g.addColorStop(1, rgba(KPAL.cloud, 0));
+  g.addColorStop(0, rgba(P.cloud, 1));
+  g.addColorStop(0.45, rgba(P.cloud, 1));
+  g.addColorStop(0.72, rgba(P.cloud, 0.62));
+  g.addColorStop(0.9, rgba(P.cloud, 0.16));
+  g.addColorStop(1, rgba(P.cloud, 0));
   ctx.fillStyle = g;
   ctx.fillRect(0, 0, size, size);
   // source-atop repaints only inside the blob's alpha — a vertical light ramp
   ctx.globalCompositeOperation = 'source-atop';
   const v = ctx.createLinearGradient(0, 0, 0, size);
-  v.addColorStop(0, KPAL.cloud); // top: full lit cloud
-  v.addColorStop(0.45, mix(KPAL.cloud, KPAL.cloudShade, 0.18)); // still bright
-  v.addColorStop(0.72, mix(KPAL.cloud, KPAL.cloudShade, 0.78)); // the shading knee
-  v.addColorStop(1, mix(KPAL.cloudShade, KPAL.sky, 0.4)); // base: cool underside
+  v.addColorStop(0, P.cloud); // top: full lit cloud
+  v.addColorStop(0.45, mix(P.cloud, P.cloudShade, 0.18)); // still bright
+  v.addColorStop(0.72, mix(P.cloud, P.cloudShade, 0.78)); // the shading knee
+  v.addColorStop(1, mix(P.cloudShade, P.sky, 0.4)); // base: cool underside — the
+  // circuit's OWN sky, so an amber-evening cloud does not keep a blue belly
   ctx.fillStyle = v;
   ctx.fillRect(0, 0, size, size);
   const tex = new THREE.CanvasTexture(cv);
   tex.colorSpace = THREE.SRGBColorSpace;
   return tex;
+}
+
+/**
+ * Sun disc: SOLID amber core (alpha 1, brightest thing in the sky), fast faint
+ * falloff — no ring band, no translucent center. Re-baked per circuit so a
+ * circuit that re-skins `gold` or `curbWhite` moves its sun with it.
+ */
+function sunCoreTexture(): THREE.CanvasTexture {
+  const coreHex = mix(P.curbWhite, P.gold, SUN_CORE_GOLD);
+  return radialTexture(SUN_TEX_SIZE, [
+    [0, rgba(coreHex, 1)],
+    [0.55, rgba(coreHex, 1)],
+    [0.66, rgba(P.gold, 0.3)],
+    [0.78, rgba(P.gold, 0.08)],
+    [1, rgba(P.gold, 0)],
+  ]);
+}
+
+/** Tight warm halo hugging the disc. Re-baked per circuit alongside the core. */
+function sunHaloTexture(): THREE.CanvasTexture {
+  return radialTexture(SUN_TEX_SIZE, [
+    [0, rgba(P.gold, 0.35)],
+    [0.4, rgba(P.gold, 0.14)],
+    [1, rgba(P.gold, 0)],
+  ]);
 }
 
 /** Optional camera ground truth (additive; the app passes the frozen 6 args). */
@@ -295,14 +351,49 @@ interface CloudLayer {
   readonly rate: number;
 }
 
-// ---- module-level KPAL-derived colors (allocated once) ---------------------------
-const COL_GOLD = new THREE.Color(KPAL.gold);
-const COL_SKY = new THREE.Color(KPAL.sky);
-const COL_WARM_GLOW = new THREE.Color(KPAL.gold).lerp(new THREE.Color(KPAL.curbWhite), 0.3);
+// ---- palette-derived colors (allocated once, RE-RESOLVED per circuit) ------------
+// Allocated at module load and mutated in place by usePalette() — they are
+// derived views of `P`, not constants, so a circuit re-skin reaches them.
+const COL_GOLD = new THREE.Color();
+const COL_SKY = new THREE.Color();
+const COL_CURB_WHITE = new THREE.Color();
+const COL_WARM_GLOW = new THREE.Color();
 /** S1 zenith stop — a literal palette entry, not a derived tint. */
-const COL_ZENITH = new THREE.Color(KPAL.skyHigh);
+const COL_ZENITH = new THREE.Color();
 /** Below the horizon line the dome reads as distant land, not as more sky. */
-const COL_LAND_BELOW = new THREE.Color(KPAL.grassDeep);
+const COL_LAND_BELOW = new THREE.Color();
+
+/** Warm-glow tint around the sun: gold pulled this far toward the lit white. */
+const WARM_GLOW_WHITE = 0.3;
+
+/**
+ * Resolve the circuit palette and re-derive every module-level colour from it.
+ * The ONE place `theme.palette` is applied — call it before anything reads `P`.
+ * Passing no theme resets to the shared KPAL look (constructor / pre-track).
+ */
+function usePalette(theme?: TrackTheme): void {
+  P = { ...KPAL, ...theme?.palette };
+  COL_GOLD.set(P.gold);
+  COL_SKY.set(P.sky);
+  COL_CURB_WHITE.set(P.curbWhite);
+  COL_WARM_GLOW.set(P.gold).lerp(COL_CURB_WHITE, WARM_GLOW_WHITE);
+  COL_ZENITH.set(P.skyHigh);
+  COL_LAND_BELOW.set(P.grassDeep);
+}
+usePalette();
+
+/**
+ * Palette keys BAKED INTO a canvas texture (sun disc, halo, cloud puff) rather
+ * than applied as a material tint. A circuit that moves any of them needs the
+ * textures re-drawn — every circuit re-skins `sky`, which is the cloud's cool
+ * underside band, so this fires on essentially every track change.
+ */
+const BAKED_TEX_KEYS: readonly PalKey[] = ['gold', 'curbWhite', 'cloud', 'cloudShade', 'sky'];
+
+/** Signature of the currently resolved values of BAKED_TEX_KEYS. */
+function bakedTexSig(): string {
+  return BAKED_TEX_KEYS.map((k) => P[k]).join('|');
+}
 
 export class KartScene {
   private readonly renderer: THREE.WebGLRenderer;
@@ -322,13 +413,23 @@ export class KartScene {
   private readonly postCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
   private readonly disposables: Array<{ dispose(): void }> = [];
 
+  // Baked canvas textures: swapped (not tinted) when a circuit moves one of
+  // BAKED_TEX_KEYS, so they are owned here rather than parked in `disposables`.
+  private coreTex: THREE.CanvasTexture;
+  private haloTex: THREE.CanvasTexture;
+  private cloudTex: THREE.CanvasTexture;
+  private bakedSig: string;
+  /** Post-pass materials — their colour uniforms are re-resolved per circuit. */
+  private gradeMat!: THREE.ShaderMaterial;
+  private vignetteMat!: THREE.ShaderMaterial;
+
   // theme-derived sky state (recomputed in applyGrade)
   private sunDir: readonly [number, number, number] = [0.5, -1, 0.35];
   private sunAz = 0; // azimuth of the visible disc (from sunDir, clamped elevation)
   private readonly sunVec = new THREE.Vector3(); // unit vector TO the visible sun
-  private readonly cloudCool = new THREE.Color(KPAL.cloudShade);
-  private readonly cloudWarm = new THREE.Color(KPAL.cloud);
-  private readonly cloudHaze = new THREE.Color(KPAL.fog);
+  private readonly cloudCool = new THREE.Color(P.cloudShade);
+  private readonly cloudWarm = new THREE.Color(P.cloud);
+  private readonly cloudHaze = new THREE.Color(P.fog);
 
   private trackRoot: THREE.Group | null = null;
   private readonly karts = new Map<string, KartVisual>();
@@ -374,15 +475,15 @@ export class KartScene {
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
     this.scene = new THREE.Scene();
-    this.scene.fog = new THREE.FogExp2(KPAL.fog, 0.006);
+    this.scene.fog = new THREE.FogExp2(P.fog, 0.006);
     this.camera = new THREE.PerspectiveCamera(BASE_FOV, 1, 0.1, DOME_RADIUS * 1.5); // far covers the dome
 
     // lights are created once and re-tinted per theme — no add/remove churn
     // cool sky over a warm ground bounce (applyGrade re-tints per theme)
-    this.hemi = new THREE.HemisphereLight(KPAL.sky, KPAL.dirt, 0.6);
+    this.hemi = new THREE.HemisphereLight(P.sky, P.dirt, 0.6);
     this.scene.add(this.hemi);
 
-    this.sun = new THREE.DirectionalLight(KPAL.curbWhite, 1.6);
+    this.sun = new THREE.DirectionalLight(P.curbWhite, 1.6);
     this.sun.castShadow = true;
     this.sun.shadow.mapSize.set(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
     const sc = this.sun.shadow.camera;
@@ -407,7 +508,7 @@ export class KartScene {
     // sky bounce, so the shadow side of a kart goes blue rather than merely
     // dimmer, and the warm key reads as a key (position/target track the chase
     // cam every setCamera)
-    this.fill = new THREE.DirectionalLight(KPAL.curbWhite, FILL_INTENSITY);
+    this.fill = new THREE.DirectionalLight(P.curbWhite, FILL_INTENSITY);
     this.fill.castShadow = false;
     this.scene.add(this.fill);
     this.scene.add(this.fill.target);
@@ -415,7 +516,7 @@ export class KartScene {
     // near-subject point fill: anchored between camera and kart, inverse-
     // square so the kart's chase-view faces always read, world barely sees it
     this.kartLight = new THREE.PointLight(
-      new THREE.Color(KPAL.curbWhite).lerp(COL_GOLD, 0.15),
+      new THREE.Color(P.curbWhite).lerp(COL_GOLD, KART_LIGHT_GOLD),
       KART_LIGHT_INTENSITY,
       KART_LIGHT_DIST,
       KART_LIGHT_DECAY,
@@ -435,33 +536,25 @@ export class KartScene {
     this.sky.frustumCulled = false; // the dome always encloses the camera
     this.scene.add(this.sky);
 
-    // sun disc: SOLID amber core (alpha 1, brightest thing in the sky), fast
-    // faint falloff — no ring band, no translucent center
-    const sunCoreHex = mix(KPAL.curbWhite, KPAL.gold, SUN_CORE_GOLD);
-    const coreTex = radialTexture(128, [
-      [0, rgba(sunCoreHex, 1)],
-      [0.55, rgba(sunCoreHex, 1)],
-      [0.66, rgba(KPAL.gold, 0.3)],
-      [0.78, rgba(KPAL.gold, 0.08)],
-      [1, rgba(KPAL.gold, 0)],
-    ]);
-    const haloTex = radialTexture(128, [
-      [0, rgba(KPAL.gold, 0.35)],
-      [0.4, rgba(KPAL.gold, 0.14)],
-      [1, rgba(KPAL.gold, 0)],
-    ]);
-    this.disposables.push(coreTex, haloTex);
+    // sun disc, halo and cloud puff: the three canvas textures that BAKE
+    // palette colours instead of tinting them. Baked here at the shared look
+    // and re-baked by rebakeTextures() whenever a circuit moves one of
+    // BAKED_TEX_KEYS; owned as fields so the swap can dispose the old ones.
+    this.coreTex = sunCoreTexture();
+    this.haloTex = sunHaloTexture();
+    this.cloudTex = cloudTexture(CLOUD_TEX_SIZE);
+    this.bakedSig = bakedTexSig();
     const coreMat = new THREE.SpriteMaterial({
-      map: coreTex,
-      color: KPAL.curbWhite,
+      map: this.coreTex,
+      color: P.curbWhite,
       transparent: true,
       opacity: 0.98,
       depthWrite: false,
       fog: false,
     });
     const haloMat = new THREE.SpriteMaterial({
-      map: haloTex,
-      color: KPAL.gold,
+      map: this.haloTex,
+      color: P.gold,
       transparent: true,
       opacity: 0.5,
       depthWrite: false,
@@ -479,13 +572,25 @@ export class KartScene {
     this.buildPost();
 
     // default golden grade (setTheme re-applies per track); light rides the disc
-    this.applyGrade(KPAL.sky, KPAL.horizon, KPAL.fog, 0.006, KPAL.curbWhite, 1.6, 0.6);
+    this.applyGrade(P.sky, P.horizon, P.fog, 0.006, P.curbWhite, 1.6, 0.6);
     this.aimSun(0, 0, 0);
     this.resize();
   }
 
-  /** Re-tint lights/fog/sky from the track theme. Idempotent. */
+  /**
+   * Re-tint lights/fog/sky/clouds/post from the track theme. Idempotent.
+   *
+   * THIS IS THE PALETTE SEAM. `theme.palette` is resolved here — once, into the
+   * module-level `P` — and every colour the renderer owns is re-derived from it
+   * before anything is drawn: sky dome stops, sun disc and its warm pull, the
+   * cool fill, fog, BOTH hemisphere halves (the P.dirt ground bounce especially,
+   * which is what lights the verges), cloud lit/shade tiers and the post grade
+   * and vignette. app.ts calls this immediately before buildTrack(), so the
+   * renderer and trackMesh.ts resolve the same palette for the same circuit.
+   */
   setTheme(theme: TrackTheme): void {
+    usePalette(theme);
+    this.rebakeTextures();
     this.sunDir = theme.sunDir;
     this.applyGrade(
       theme.sky,
@@ -703,6 +808,9 @@ export class KartScene {
       if (obj instanceof THREE.Mesh) obj.geometry.dispose();
     });
     for (const d of this.disposables) d.dispose();
+    this.coreTex.dispose(); // owned outside `disposables` — they are hot-swapped
+    this.haloTex.dispose();
+    this.cloudTex.dispose();
     this.renderer.renderLists.dispose();
     this.renderer.dispose();
   }
@@ -716,7 +824,7 @@ export class KartScene {
    * placement. Every colour is a palette entry or a `mix()` of two.
    *
    * S2 (VISUAL_UPGRADE.md §1): the fog is `theme.fog` UNTOUCHED. The previous
-   * pass pulled it 30% toward KPAL.gold, which only survived S2 because the
+   * pass pulled it 30% toward gold, which only survived S2 because the
    * dome's horizon band happened to get the identical pull — two wrongs
    * agreeing. Now both sides are the literal hex, so the ground plane, the
    * ridgelines and the dome fuse on one value and the horizon line is drawn by
@@ -726,7 +834,9 @@ export class KartScene {
     // hemisphere: cool sky above, warm earth bounce below — free hue split on
     // every surface in the world, and weak enough that the key still reads
     this.hemi.color.set(skyHex);
-    this.hemi.groundColor.set(KPAL.dirt);
+    // the ground bounce is the CIRCUIT's dirt, not Greenvale's — this single
+    // read is what makes a clay or sand re-skin light its own verges
+    this.hemi.groundColor.set(P.dirt);
     this.hemi.intensity = hemiIntensity * HEMI_BOOST;
 
     this.sun.color.set(sunColor).lerp(COL_GOLD, SUN_WARM);
@@ -734,20 +844,59 @@ export class KartScene {
 
     // silhouette fill: cool sky-bounce, camera-locked — keeps karts readable
     // without washing the shadow side back to the lit value
-    this.fill.color.set(KPAL.curbWhite).lerp(COL_SKY, FILL_COOL);
+    this.fill.color.set(P.curbWhite).lerp(COL_SKY, FILL_COOL);
+    // near-subject fill rides the same warm tint (re-tinted, not set once)
+    this.kartLight.color.set(P.curbWhite).lerp(COL_GOLD, KART_LIGHT_GOLD);
 
     const fogCol = new THREE.Color(fogHex); // S2: exactly the horizon stop
     this.scene.fog = new THREE.FogExp2(fogCol, fogDensity * FOG_DENSITY_SCALE);
     this.renderer.setClearColor(fogCol);
 
-    // clouds read BRIGHT against the sky: KPAL.cloud is the lit tier, the
+    // clouds read BRIGHT against the sky: P.cloud is the lit tier, the
     // shade tier is its own palette entry, and the sun side pulls to gold
-    this.cloudCool.set(KPAL.cloud).lerp(new THREE.Color(KPAL.cloudShade), 0.28);
-    this.cloudWarm.set(KPAL.cloud).lerp(COL_GOLD, 0.42);
+    this.cloudCool.set(P.cloud).lerp(new THREE.Color(P.cloudShade), CLOUD_SHADE_PULL);
+    this.cloudWarm.set(P.cloud).lerp(COL_GOLD, CLOUD_WARM_PULL);
     this.cloudHaze.copy(fogCol);
+
+    // post pass: warm lift in the circuit's gold, vignette in its ink
+    this.gradeMat.uniforms.uColor!.value = srgbUniform(P.gold);
+    this.vignetteMat.uniforms.uColor!.value = srgbUniform(P.ink);
 
     this.placeSun();
     this.tintSky(skyHex, horizonHex);
+  }
+
+  /**
+   * Re-draw the three canvas textures that BAKE palette colours (sun core, sun
+   * halo, cloud puff) after a circuit re-skin, and hand them to the materials
+   * already using them. A no-op when the resolved values of BAKED_TEX_KEYS are
+   * unchanged, so re-selecting the same circuit costs nothing.
+   */
+  private rebakeTextures(): void {
+    const sig = bakedTexSig();
+    if (sig === this.bakedSig) return;
+    this.bakedSig = sig;
+    const oldCore = this.coreTex;
+    const oldHalo = this.haloTex;
+    const oldCloud = this.cloudTex;
+    this.coreTex = sunCoreTexture();
+    this.haloTex = sunHaloTexture();
+    this.cloudTex = cloudTexture(CLOUD_TEX_SIZE);
+    this.sunCore.material.map = this.coreTex;
+    this.sunCore.material.color.set(P.curbWhite);
+    this.sunCore.material.needsUpdate = true;
+    this.sunHalo.material.map = this.haloTex;
+    this.sunHalo.material.color.set(P.gold);
+    this.sunHalo.material.needsUpdate = true;
+    for (const cloud of this.clouds) {
+      for (const m of cloud.mats) {
+        m.map = this.cloudTex;
+        m.needsUpdate = true;
+      }
+    }
+    oldCore.dispose();
+    oldHalo.dispose();
+    oldCloud.dispose();
   }
 
   /** Pin the visible sun disc/halo to the theme sun azimuth, golden-hour height. */
@@ -781,15 +930,19 @@ export class KartScene {
 
   /**
    * Rewrite the dome's vertex colors. This is where VISUAL_UPGRADE.md §1 S1
-   * actually lands: the zenith stop is KPAL.skyHigh (L 48), the horizon stop is
-   * KPAL.horizon (L 85) — 37 L* of separation, and skyHigh is the cooler of the
-   * two by blueBias. Both are literal palette entries; the old code derived the
-   * zenith by lerping the theme sky 38% toward KPAL.kartBlue, which is a kart
-   * colour doing sky duty and produced barely 10 L* of ramp.
+   * actually lands: the zenith stop is P.skyHigh, the horizon stop is the
+   * theme's horizon — and skyHigh is the cooler of the two by blueBias with at
+   * least 12 L* of separation on EVERY registered circuit (tracks.test.ts §1 S1
+   * asserts exactly that per track, so the relationship survives the re-skin
+   * rather than being clamped here). On Greenvale that is 37 L*. Both are
+   * literal palette entries; the old code derived the zenith by lerping the
+   * theme sky 38% toward kartBlue, a kart colour doing sky duty, which produced
+   * barely 10 L* of ramp.
    *
-   * Bands, bottom to top: distant land below the horizon line, a thin pure
-   * KPAL.horizon rim that the fog fuses into, horizon -> KPAL.sky, then
-   * KPAL.sky -> KPAL.skyHigh, all weighted low so the ramp finishes inside the
+   * Bands, bottom to top: distant land below the horizon line (P.grassDeep, so
+   * a clay or moorland circuit's far ground reads as its own), a thin pure
+   * horizon rim that the fog fuses into, horizon -> theme sky, then
+   * theme sky -> P.skyHigh, all weighted low so the ramp finishes inside the
    * band a level chase camera can actually see. A warm blob around the sun
    * azimuth rides on top so the light reads directional.
    */
@@ -801,7 +954,7 @@ export class KartScene {
       this.sky.geometry.setAttribute('color', col);
     }
     const upper = new THREE.Color(topHex); // theme sky — the mid stop
-    const zenith = COL_ZENITH; // KPAL.skyHigh, straight from the palette (S1)
+    const zenith = COL_ZENITH; // P.skyHigh, straight from the resolved palette (S1)
     const horizon = new THREE.Color(bottomHex); // == the fog colour (S2)
     const below = new THREE.Color(bottomHex).lerp(COL_LAND_BELOW, DOME_BELOW_LAND);
     const c = new THREE.Color();
@@ -835,8 +988,7 @@ export class KartScene {
    * quotas) so any ~60° heading holds at least one, with no even-ring look.
    */
   private buildClouds(): void {
-    const blobTex = cloudTexture(64);
-    this.disposables.push(blobTex);
+    const blobTex = this.cloudTex; // baked in the constructor, re-baked per circuit
     for (let li = 0; li < CLOUD_LAYERS.length; li++) {
       const spec = CLOUD_LAYERS[li]!;
       const next = rng(decoSeed('kart-sky', li * 7 + 1));
@@ -885,7 +1037,7 @@ export class KartScene {
             const fall = pi === 0 ? 1 : rngRange(next, 0.5, 0.82);
             const puffMat = new THREE.SpriteMaterial({
               map: blobTex,
-              color: KPAL.cloud,
+              color: P.cloud, // seed tint; updateSky() re-tints every frame
               transparent: true,
               // trailings stay substantial — at the old 0.45..0.7 they read as
               // smoke drifting off the mass instead of part of the same cloud
@@ -927,7 +1079,7 @@ export class KartScene {
 
   /**
    * Dependency-free post pass: two fullscreen quads — a subtle warm grade
-   * lift (stronger toward the sky half) and a KPAL.ink vignette. Shader
+   * lift (stronger toward the sky half) and a P.ink vignette. Shader
    * outputs raw sRGB (ShaderMaterial skips tone mapping / color conversion),
    * so uniforms are hand-decoded sRGB components.
    */
@@ -951,7 +1103,7 @@ export class KartScene {
     const gradeMat = new THREE.ShaderMaterial({
       vertexShader: VERT,
       fragmentShader: GRADE_FRAG,
-      uniforms: { uColor: { value: srgbUniform(KPAL.gold) }, uAlpha: { value: GRADE_ALPHA } },
+      uniforms: { uColor: { value: srgbUniform(P.gold) }, uAlpha: { value: GRADE_ALPHA } },
       transparent: true,
       depthTest: false,
       depthWrite: false,
@@ -959,12 +1111,14 @@ export class KartScene {
     const vignetteMat = new THREE.ShaderMaterial({
       vertexShader: VERT,
       fragmentShader: VIGNETTE_FRAG,
-      uniforms: { uColor: { value: srgbUniform(KPAL.ink) }, uAlpha: { value: VIGNETTE_ALPHA } },
+      uniforms: { uColor: { value: srgbUniform(P.ink) }, uAlpha: { value: VIGNETTE_ALPHA } },
       transparent: true,
       depthTest: false,
       depthWrite: false,
     });
     this.disposables.push(gradeMat, vignetteMat);
+    this.gradeMat = gradeMat; // applyGrade re-resolves both uColor uniforms
+    this.vignetteMat = vignetteMat;
     const grade = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), gradeMat);
     grade.frustumCulled = false;
     grade.renderOrder = 1;
@@ -994,7 +1148,11 @@ export class KartScene {
   /** Tracked context-error overlay (single element; never duplicated). */
   private static contextErrorEl: HTMLDivElement | null = null;
 
-  /** Full-viewport readable failure message (KPAL colors); idempotent. */
+  /**
+   * Full-viewport readable failure message; idempotent. The ONE deliberate
+   * KPAL read left in this module: it fires from the constructor's WebGL guard,
+   * before any track — and therefore any circuit palette — exists.
+   */
   private static showContextError(): void {
     if (KartScene.contextErrorEl?.isConnected) return;
     const div = document.createElement('div');
