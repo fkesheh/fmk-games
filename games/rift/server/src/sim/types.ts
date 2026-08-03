@@ -23,6 +23,14 @@ export type Order =
   | { kind: 'attack'; target: EntId }
   | { kind: 'stop' };
 
+/** A queued cast, drained by the abilities engine each advance(). Item
+ *  entries are pre-validated and pre-spent by useItem (charges/cooldown/ward
+ *  stock) — the engine executes, never re-validates. Wardstone never enters
+ *  the queue (units.ts places wards directly). */
+export type QueuedCast =
+  | { kind: 'ability'; hero: EntId; slot: number; x: number | null; z: number | null; target: EntId }
+  | { kind: 'item'; hero: EntId; slot: number; x: number | null; z: number | null };
+
 /** One timed stat modifier on an entity. untilTick 0 = passive permanent.
  *  Radius > 0 passives re-evaluate membership every 5 ticks — that
  *  re-evaluation (and rank-up refresh of passive amounts) is owned by T3's
@@ -150,12 +158,20 @@ export interface World {
   spawnMobile(kind: EntKind, team: TeamId, x: number, z: number, lane: number, expireAtTick: number, owner: EntId): EntId;
   /** Shop + progression (units.ts owns): buy into first free slot (validates
    *  gold + at-fountain), spend a skill point (validates rank caps +
-   *  ULT_LEVEL_REQ), use an item active (validates charges/cooldown/ward
-   *  stock). All three silently no-op on illegal input. */
+   *  ULT_LEVEL_REQ), use an item (validates charges/cooldown/ward stock AND
+   *  SPENDS, then enqueues a {kind:'item'} cast for dash/aura actives;
+   *  wardstone places the ward directly, no queue entry). All three silently
+   *  no-op on illegal input. */
   buy(hero: EntId, item: ItemId): void;
   spendSkillPoint(hero: EntId, slot: number): void;
   useItem(hero: EntId, slot: number, x: number | null, z: number | null): void;
   wardStock(team: TeamId): number;
+  /** The event SINK for every sim module (combat kills, engine casts,
+   *  structure falls, surge, end). The room drains once per tick. */
+  pushEvent(ev: SimEvent): void;
+  /** Returns and clears the queued casts. Called by the abilities engine at
+   *  advance() step (2); the world never reads its own cast queue. */
+  drainCasts(): QueuedCast[];
   /** Events since the last drain; the room maps these to wire events and
    *  filters cast events by team vision. */
   drainEvents(): SimEvent[];

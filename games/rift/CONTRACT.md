@@ -157,9 +157,12 @@ are the MapDef ids; the no-entity sentinel is `NO_ENT = -1`).
   spawn/despawn, the intake queue (`order`/`cast` — queued, validated at
   apply time, illegal input silently no-ops), the mutation surface
   (`damage/heal/stun/slow/applyAura/dash/spawnMobile/buy/spendSkillPoint/
-  useItem/drainEvents`), and `advance()` — one tick, orchestration order:
-  (1) apply queued orders, (2) `abilities.step(world)` — cast execution +
-  projectile motion, (3) buff expiry + stat recompute + passive-aura
+  useItem/drainCasts/pushEvent/drainEvents`), and `advance()` — one tick,
+  orchestration order:
+  (1) apply queued orders, (2) `abilities.step(world)` — drains the cast
+  queue via `world.drainCasts()`, executes casts, moves projectiles; cast
+  SimEvents flow through `world.pushEvent()` (ability casts use slot 0-3;
+  item actives use slot 4 + itemSlot), (3) buff expiry + stat recompute + passive-aura
   membership re-evaluation (every 5 ticks) + passive rank-up refresh,
   (4) movement, (5) combat, (6) deaths/loot, (7) waves/respawns,
   (8) win/overtime checks.
