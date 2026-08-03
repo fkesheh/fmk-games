@@ -14,6 +14,7 @@ import path from 'node:path';
 import type { GameModule } from '@platform/shared';
 import { NetServer, probeDevServer, type Mount } from './net.js';
 import { Lobby } from './lobby.js';
+import { createPwaResolver, type PwaIdentity } from './pwa.js';
 import { GAMES } from './registry.js';
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -136,7 +137,45 @@ const COPY: Record<string, GameCopy | undefined> = {
  * game linking to its /<id>/ client. Responsive down to one column; all colour
  * comes from `LPAL`.
  */
-function launcherHtml(modules: readonly GameModule[]): string {
+const LAUNCHER_NAME = 'ARCADE — four browser multiplayer games';
+const LAUNCHER_SHORT_NAME = 'ARCADE'; // ≤ 12 chars so a home-screen label is not truncated (§1.2)
+
+/**
+ * Per-game identity colours, reusing the launcher's own card accents so the
+ * offline card and the launcher icon can never drift from the page (§1.2's
+ * single-source-of-truth rule applied to the PWA surface).
+ */
+const IDENTITY: Record<string, PwaIdentity | undefined> = {
+  fps: { accent: LPAL.fpsAccent, tint: LPAL.fpsTint },
+  bank: { accent: LPAL.bankAccent, tint: LPAL.bankTint },
+  kart: { accent: LPAL.kartAccent, tint: LPAL.kartTint },
+  wordbomb: { accent: LPAL.wordbombAccent, tint: LPAL.wordbombTint },
+};
+const NEUTRAL_IDENTITY: PwaIdentity = {
+  accent: LPAL.neutralAccent,
+  tint: LPAL.neutralTint,
+};
+
+/**
+ * `registerSw` is the §2.1 "disabled in dev" guard. Dev is defined as "a vite
+ * dev server is answering at least one game prefix" — precisely the situation
+ * the contract calls a debugging nightmare — rather than NODE_ENV, which the
+ * e2e harness does not set and which would silently switch the worker off in
+ * the one automated run that exercises it.
+ */
+function launcherHtml(modules: readonly GameModule[], registerSw: boolean): string {
+  const swScript = registerSw
+    ? `    <script>
+      // PWA (docs/TOUCH_PWA.md §2.0): scope '/' is the launcher's own, and the
+      // worker only touches launcher files — each game's page is controlled by
+      // its own /<gameId>/sw.js. Guarded so an absent worker is a no-op.
+      if ('serviceWorker' in navigator) {
+        addEventListener('load', function () {
+          navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(function () {});
+        });
+      }
+    </script>\n`
+    : '';
   const cards = modules
     .map((m) => {
       const known = Object.prototype.hasOwnProperty.call(COPY, m.id);
@@ -168,10 +207,23 @@ function launcherHtml(modules: readonly GameModule[]): string {
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="dark" />
     <meta name="description" content="Four browser multiplayer games on one server: STRICKEN, BANK, KART GP and WORDBOMB." />
     <title>ARCADE — STRICKEN · BANK · KART GP · WORDBOMB</title>
+    <!-- PWA install surface (docs/TOUCH_PWA.md §1). theme-color MUST stay
+         byte-equal to the page floor below (LPAL.ink) or the launch flashes.
+         The apple-* tags are not decoration: display:standalone alone does NOT
+         give iOS a fullscreen install — without them the home-screen icon opens
+         a Safari chrome window and the whole exercise fails on the iPad. -->
+    <meta name="theme-color" content="${LPAL.ink}" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="${LAUNCHER_SHORT_NAME}" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+    <link rel="icon" href="/icons/icon-192.png" type="image/png" />
     <style>
       * { box-sizing: border-box; }
       html { -webkit-text-size-adjust: 100%; }
@@ -196,7 +248,14 @@ function launcherHtml(modules: readonly GameModule[]): string {
       }
       .page {
         margin: auto; width: 100%; max-width: 1060px;
-        padding: clamp(36px, 7vh, 88px) clamp(16px, 4vw, 32px);
+        /* Safe-area insets (§3): an installed iOS launch uses
+           apple-mobile-web-app-status-bar-style: black-translucent, so the page
+           starts UNDER the status bar and the notch/home indicator. */
+        padding:
+          calc(clamp(36px, 7vh, 88px) + env(safe-area-inset-top, 0px))
+          calc(clamp(16px, 4vw, 32px) + env(safe-area-inset-right, 0px))
+          calc(clamp(36px, 7vh, 88px) + env(safe-area-inset-bottom, 0px))
+          calc(clamp(16px, 4vw, 32px) + env(safe-area-inset-left, 0px));
         display: flex; flex-direction: column; gap: clamp(26px, 4.4vh, 46px);
       }
 
@@ -382,7 +441,7 @@ ${cards}
       </main>
       <footer class="foot">Browser multiplayer &middot; instant rooms &middot; invite by link</footer>
     </div>
-  </body>
+${swScript}  </body>
 </html>
 `;
 }
@@ -396,7 +455,32 @@ const net = new NetServer({
 // Probing dev servers is async; everything else (lobby, sweep, signals) is
 // safe to set up now — net.close() tolerates a never-started NetServer.
 resolveMounts(GAMES)
-  .then((mounts) => net.start(PORT, mounts, launcherHtml(GAMES)))
+  .then((mounts) => {
+    // A live vite dev server on any prefix means "dev": no caching worker is
+    // registered, and every sw.js serves the kill switch instead (§2.1).
+    const dev = mounts.some((m) => m.kind === 'proxy');
+    const html = launcherHtml(GAMES, !dev);
+    const identities = GAMES.map((g) => IDENTITY[g.id] ?? NEUTRAL_IDENTITY);
+    const assets = createPwaResolver({
+      games: GAMES.map((g) => ({
+        id: g.id,
+        name: g.name,
+        identity: IDENTITY[g.id] ?? NEUTRAL_IDENTITY,
+      })),
+      colors: {
+        ink: LPAL.ink,
+        paper: LPAL.paper,
+        steel: LPAL.steel,
+        metalDark: LPAL.metalDark,
+      },
+      identities,
+      launcherHtml: html,
+      mounts,
+      launcherName: LAUNCHER_NAME,
+      launcherShortName: LAUNCHER_SHORT_NAME,
+    });
+    net.start(PORT, mounts, html, assets);
+  })
   .catch((err: unknown) => {
     console.error('[server] startup failed', err);
     process.exit(1);
