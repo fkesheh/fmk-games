@@ -1,0 +1,1124 @@
+/* ============================================================================
+   ANCIENTS (rift) — STYLE (T8). Styles EXACTLY the frozen DOM class list of
+   CONTRACT §6 (T7/T9 render only these classes). All colours are the APAL
+   custom properties below — the :root block duplicates palette.ts
+   APAL_CSS_VARS 1:1 as fallback literals (main.ts mirrors the same vars at
+   boot; the ladder test asserts the mirror is complete and exact). No ad-hoc
+   hex anywhere else in this file. Dark shell, every HUD numeric >= 12px at
+   1080p, paper-on-ink text, layout safe at 16:9 and 21:9, usable 1280x720.
+   ============================================================================ */
+
+:root {
+  /* --- app shell --- */
+  --ink: #0e1116;
+  --ink-lit: #20262f;
+  --ink-deep: #07090c;
+  /* --- terrain --- */
+  --moss: #2e3827;
+  --moss-lit: #424e38;
+  --moss-deep: #1a2114;
+  --leaf: #3a5230;
+  --leaf-deep: #24331f;
+  --trunk: #4a3b2c;
+  /* --- lanes + structures --- */
+  --stone: #6e675a;
+  --stone-lit: #8d8577;
+  --stone-deep: #4d483f;
+  --monument: #7d7466;
+  --monument-lit: #a39a88;
+  --monument-deep: #575046;
+  /* --- team identity --- */
+  --azure: #5a8fd6;
+  --azure-lit: #9dc0ec;
+  --azure-deep: #2f4f86;
+  --ember: #d96a3f;
+  --ember-lit: #f0a37c;
+  --ember-deep: #8a3a20;
+  /* --- hero accents --- */
+  --frost: #7fc4d9;
+  --arcane: #9a6fd6;
+  --heal: #6fc97f;
+  --shade: #7d6fa8;
+  --pine: #3f7a52;
+  --void: #c95aa8;
+  /* --- semantic / fx --- */
+  --gold: #d9b25f;
+  --gold-lit: #f0d79a;
+  --danger: #d94f4f;
+  --ward: #c9c2ae;
+  /* --- sky + fog --- */
+  --sky-high: #0b1024;
+  --horizon: #2b3242;
+  --fog: #2b3242;
+  --shroud: #07090c;
+  /* --- text --- */
+  --paper: #e8e6df;
+  --paper-dim: #a9a69c;
+  --paper-deep: #6f6d64;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--ink);
+  color: var(--paper);
+  font-family:
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    Roboto,
+    sans-serif;
+  font-size: 14px;
+}
+
+#app {
+  position: fixed;
+  inset: 0;
+}
+
+/* The scene canvas (T7) fills the shell; UI overlays sit above it. */
+#app > canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.hidden {
+  display: none !important;
+}
+
+/* ============================================================================
+   Shared chrome
+   ============================================================================ */
+
+.btn {
+  appearance: none;
+  border: 1px solid var(--stone-deep);
+  background: var(--ink-lit);
+  color: var(--paper);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 10px 18px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.btn:hover:not(:disabled) {
+  border-color: var(--azure);
+  background: var(--azure-deep);
+}
+
+.btn:disabled {
+  color: var(--paper-deep);
+  border-color: var(--ink-lit);
+  background: var(--ink);
+  cursor: default;
+}
+
+.btn-primary {
+  border-color: var(--azure);
+  background: var(--azure-deep);
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--azure);
+  color: var(--ink-deep);
+}
+
+.btn-small {
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+/* ============================================================================
+   Menu (.menu .menu-*) — T9 renders; these names are the concrete set behind
+   the contract's `.menu-*` wildcard (wordbomb-informed).
+   ============================================================================ */
+
+.menu {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 12px;
+  padding: calc(48px + var(--safe-top, 0px)) 24px 24px;
+  overflow-y: auto;
+  background: var(--ink);
+}
+
+.menu-title {
+  margin: 0;
+  font-size: 44px;
+  letter-spacing: 0.3em;
+  color: var(--gold-lit);
+  text-shadow: 0 2px 0 var(--ink-deep);
+}
+
+.menu-sub {
+  margin: 0;
+  font-size: 13px;
+  color: var(--paper-dim);
+}
+
+.menu-notice {
+  min-height: 18px;
+  font-size: 13px;
+  color: var(--danger);
+}
+
+.menu-name,
+.menu-code-input,
+.menu-select {
+  appearance: none;
+  background: var(--ink-deep);
+  border: 1px solid var(--stone-deep);
+  border-radius: 4px;
+  color: var(--paper);
+  font-size: 14px;
+  padding: 10px 12px;
+}
+
+.menu-name {
+  width: 240px;
+  text-align: center;
+  letter-spacing: 0.06em;
+}
+
+.menu-name:focus,
+.menu-code-input:focus,
+.menu-select:focus {
+  outline: none;
+  border-color: var(--azure);
+}
+
+.menu-options {
+  display: flex;
+  gap: 16px;
+}
+
+.menu-option {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.menu-option-label {
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--paper-deep);
+}
+
+.menu-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.menu-code {
+  display: flex;
+  gap: 8px;
+}
+
+.menu-code-input {
+  width: 110px;
+  text-align: center;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+}
+
+.menu-rooms-title {
+  margin: 18px 0 0;
+  font-size: 13px;
+  letter-spacing: 0.2em;
+  color: var(--paper-deep);
+}
+
+.menu-rooms {
+  width: min(560px, 92vw);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.room-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 14px;
+  background: var(--ink-lit);
+  border: 1px solid var(--ink-deep);
+  border-radius: 4px;
+}
+
+.room-row--joinable {
+  cursor: pointer;
+}
+
+.room-row--joinable:hover {
+  border-color: var(--azure);
+}
+
+.room-title {
+  font-size: 13px;
+  color: var(--paper);
+}
+
+.room-label {
+  font-size: 13px;
+  color: var(--gold);
+}
+
+.room-meta {
+  font-size: 12px;
+  color: var(--paper-dim);
+}
+
+.room-empty {
+  padding: 16px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--paper-deep);
+  border: 1px dashed var(--stone-deep);
+  border-radius: 4px;
+}
+
+.menu-rules {
+  margin-top: 18px;
+  max-width: 520px;
+}
+
+.menu-rule {
+  margin: 4px 0;
+  font-size: 12px;
+  color: var(--paper-deep);
+  text-align: center;
+}
+
+/* ============================================================================
+   Lobby (.lobby .lobby-* .pick-grid .pick-card)
+   ============================================================================ */
+
+.lobby {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: calc(32px + var(--safe-top, 0px)) 24px 24px;
+  overflow-y: auto;
+  background: var(--ink);
+}
+
+.lobby-head {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+}
+
+.lobby-title {
+  font-size: 24px;
+  letter-spacing: 0.25em;
+  color: var(--paper);
+}
+
+.lobby-count {
+  font-size: 13px;
+  color: var(--paper-dim);
+}
+
+.lobby-count-value {
+  color: var(--gold-lit);
+  font-weight: 700;
+}
+
+.lobby-count-min {
+  color: var(--paper-deep);
+}
+
+.lobby-invite {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  background: var(--ink-lit);
+  border: 1px solid var(--stone-deep);
+  border-radius: 4px;
+}
+
+.lobby-invite-code {
+  font-size: 15px;
+  letter-spacing: 0.25em;
+  color: var(--gold-lit);
+}
+
+.lobby-roster {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  width: min(760px, 94vw);
+}
+
+.lobby-team {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px;
+  background: var(--ink-lit);
+  border-radius: 6px;
+  border-top: 3px solid var(--azure);
+}
+
+.lobby-team--ember {
+  border-top-color: var(--ember);
+}
+
+.lobby-team-name {
+  font-size: 12px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--paper-dim);
+}
+
+.lobby-seat {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  background: var(--ink);
+  border: 1px solid var(--ink-deep);
+  border-radius: 4px;
+}
+
+.lobby-seat--you {
+  border-color: var(--gold);
+}
+
+.lobby-seat--empty {
+  border-style: dashed;
+  opacity: 0.6;
+}
+
+.lobby-seat-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--azure-deep);
+  color: var(--paper);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.lobby-team--ember .lobby-seat-avatar {
+  background: var(--ember-deep);
+}
+
+.lobby-seat-name {
+  font-size: 13px;
+  color: var(--paper);
+  flex: 1;
+}
+
+.lobby-seat-you {
+  margin-left: 6px;
+  font-size: 12px;
+  color: var(--gold);
+  letter-spacing: 0.1em;
+}
+
+.lobby-seat-state {
+  font-size: 12px;
+  color: var(--paper-deep);
+  letter-spacing: 0.08em;
+}
+
+.lobby-start {
+  min-width: 220px;
+}
+
+.lobby-reason {
+  min-height: 18px;
+  font-size: 13px;
+  color: var(--paper-dim);
+}
+
+.pick-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(180px, 1fr));
+  gap: 10px;
+  width: min(760px, 94vw);
+}
+
+.pick-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px;
+  background: var(--ink-lit);
+  border: 1px solid var(--stone-deep);
+  border-radius: 6px;
+  cursor: pointer;
+  text-align: left;
+  color: var(--paper);
+}
+
+.pick-card:hover {
+  border-color: var(--azure);
+}
+
+.pick-card--taken {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.pick-card--taken:hover {
+  border-color: var(--stone-deep);
+}
+
+.pick-card--picked {
+  border-color: var(--gold);
+  box-shadow: 0 0 12px var(--azure-deep);
+}
+
+.pick-card-name {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+}
+
+.pick-card-role {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--gold);
+}
+
+.pick-card-blurb {
+  font-size: 12px;
+  color: var(--paper-dim);
+}
+
+/* ============================================================================
+   Live HUD (.hud .topbar .killfeed .minimap .scoreboard .shop-panel)
+   Everything is position:fixed against the viewport + safe-area insets, so
+   16:9 and 21:9 share one layout; nothing lives in the ultrawide wings.
+   ============================================================================ */
+
+.hud {
+  position: fixed;
+  left: 50%;
+  bottom: calc(10px + var(--safe-bottom, 0px));
+  transform: translateX(-50%);
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  padding: 10px 14px;
+  background: var(--ink);
+  border: 1px solid var(--ink-deep);
+  border-radius: 8px;
+}
+
+.hud-portrait {
+  width: 64px;
+  height: 64px;
+  border-radius: 6px;
+  border: 1px solid var(--stone-deep);
+  background: var(--ink-lit);
+  display: grid;
+  place-items: center;
+  font-size: 28px;
+  color: var(--paper);
+  cursor: pointer; /* click centres the camera (UiActions.centerCamera) */
+}
+
+.hud-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 220px;
+}
+
+.bar {
+  position: relative;
+  height: 14px;
+  background: var(--ink-deep);
+  border: 1px solid var(--ink-deep);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.bar > span {
+  /* the fill element T9 widths inline (a percentage is data, not colour) */
+  position: absolute;
+  inset: 0 auto 0 0;
+}
+
+.bar-hp > span {
+  background: var(--heal); /* self is heal-green (UX: never colour alone —
+                             the numeric label rides inside every bar) */
+}
+
+.bar-mana > span {
+  background: var(--frost);
+}
+
+.bar-xp {
+  height: 8px;
+}
+
+.bar-xp > span {
+  background: var(--gold);
+}
+
+.bar em {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-style: normal;
+  font-size: 12px;
+  color: var(--paper);
+  text-shadow: 0 1px 2px var(--ink-deep);
+}
+
+.ability-bar {
+  display: flex;
+  gap: 6px;
+}
+
+.ability-slot {
+  position: relative;
+  width: 48px;
+  height: 48px;
+  border-radius: 6px;
+  border: 1px solid var(--stone-deep);
+  background: var(--ink-lit);
+  display: grid;
+  place-items: center;
+  font-size: 22px;
+  color: var(--paper);
+}
+
+.ability-slot--ready {
+  border-color: var(--azure);
+}
+
+.ability-slot--ult-locked {
+  opacity: 0.5;
+}
+
+.ability-cd {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: var(--ink-deep);
+  opacity: 0.85;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--paper);
+}
+
+.ability-rank {
+  position: absolute;
+  left: 3px;
+  right: 3px;
+  bottom: 2px;
+  display: flex;
+  gap: 2px;
+  justify-content: center;
+}
+
+.ability-rank i {
+  width: 6px;
+  height: 3px;
+  background: var(--stone-deep);
+}
+
+.ability-rank i.on {
+  background: var(--gold);
+}
+
+.ability-plus {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--gold);
+  color: var(--ink-deep);
+  font-size: 13px;
+  font-weight: 800;
+  cursor: pointer;
+  animation: rift-pulse 1s ease-in-out infinite; /* 1Hz — under the 3Hz law */
+}
+
+.item-bar {
+  display: grid;
+  grid-template-columns: repeat(3, 40px);
+  gap: 5px;
+}
+
+.item-slot {
+  position: relative;
+  width: 40px;
+  height: 40px;
+  border-radius: 5px;
+  border: 1px solid var(--ink-deep);
+  background: var(--ink-lit);
+  display: grid;
+  place-items: center;
+  font-size: 18px;
+  color: var(--paper);
+}
+
+.item-slot--empty {
+  opacity: 0.4;
+}
+
+.item-charges {
+  position: absolute;
+  right: 2px;
+  bottom: 1px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--gold-lit);
+  text-shadow: 0 1px 2px var(--ink-deep);
+}
+
+.item-cd {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: var(--ink-deep);
+  opacity: 0.85;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--paper);
+}
+
+.gold-readout {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--gold);
+  min-width: 72px;
+  justify-content: flex-end;
+}
+
+.kda {
+  font-size: 12px;
+  color: var(--paper-dim);
+  letter-spacing: 0.06em;
+}
+
+/* ---- top bar ------------------------------------------------------------- */
+
+.topbar {
+  position: fixed;
+  top: calc(8px + var(--safe-top, 0px));
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 6px 18px;
+  background: var(--ink);
+  border: 1px solid var(--ink-deep);
+  border-radius: 6px;
+}
+
+.match-clock {
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--paper);
+}
+
+.match-clock--surge {
+  color: var(--danger);
+}
+
+.team-score {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.team-score b {
+  /* names ride next to the numbers in the markup — never colour alone */
+  font-weight: 700;
+}
+
+.team-score .t0 {
+  color: var(--azure-lit);
+}
+
+.team-score .t1 {
+  color: var(--ember-lit);
+}
+
+.tower-count {
+  font-size: 12px;
+  color: var(--paper-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- killfeed -------------------------------------------------------------- */
+
+.killfeed {
+  position: fixed;
+  top: calc(56px + var(--safe-top, 0px));
+  right: calc(10px + var(--safe-right, 0px));
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-end;
+  pointer-events: none;
+}
+
+.kill-row {
+  padding: 5px 10px;
+  background: var(--ink);
+  border: 1px solid var(--ink-deep);
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--paper);
+}
+
+.kill-row b {
+  color: var(--danger);
+}
+
+/* ---- minimap ------------------------------------------------------------------ */
+
+.minimap {
+  position: fixed;
+  right: calc(10px + var(--safe-right, 0px));
+  bottom: calc(10px + var(--safe-bottom, 0px));
+  width: 200px;
+  height: 200px;
+  border: 1px solid var(--stone-deep);
+  border-radius: 6px;
+  background: var(--ink-deep);
+  overflow: hidden;
+  cursor: crosshair; /* click to pan */
+}
+
+.minimap canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* ---- scoreboard (TAB) ------------------------------------------------------------ */
+
+.scoreboard {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  min-width: min(560px, 92vw);
+  padding: 18px 22px;
+  background: var(--ink);
+  border: 1px solid var(--stone-deep);
+  border-radius: 8px;
+}
+
+.scoreboard table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.scoreboard th {
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--paper-deep);
+  text-align: left;
+  padding: 4px 8px;
+}
+
+.scoreboard td {
+  font-size: 13px;
+  color: var(--paper);
+  padding: 5px 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.scoreboard tr.you td {
+  color: var(--gold-lit);
+}
+
+.scoreboard .team0 th {
+  color: var(--azure-lit);
+}
+
+.scoreboard .team1 th {
+  color: var(--ember-lit);
+}
+
+/* ---- shop ------------------------------------------------------------------------ */
+
+.shop-panel {
+  position: fixed;
+  top: calc(56px + var(--safe-top, 0px));
+  right: calc(10px + var(--safe-right, 0px));
+  bottom: calc(220px + var(--safe-bottom, 0px));
+  width: min(360px, 92vw);
+  display: flex;
+  flex-direction: column;
+  padding: 14px;
+  background: var(--ink);
+  border: 1px solid var(--stone-deep);
+  border-radius: 8px;
+  overflow-y: auto;
+}
+
+.shop-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.shop-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px;
+  background: var(--ink-lit);
+  border: 1px solid var(--ink-deep);
+  border-radius: 5px;
+  color: var(--paper);
+  cursor: pointer;
+  text-align: left;
+}
+
+.shop-item:hover {
+  border-color: var(--gold);
+}
+
+.shop-item--disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.shop-item--disabled:hover {
+  border-color: var(--ink-deep);
+}
+
+.shop-cost {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--gold);
+}
+
+/* ============================================================================
+   End screen (.end-screen .end-*), death overlay, hints, banners, damage numbers
+   ============================================================================ */
+
+.end-screen {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  background: var(--ink);
+}
+
+.end-banner {
+  font-size: 40px;
+  letter-spacing: 0.25em;
+  color: var(--gold-lit);
+}
+
+.end-banner--win {
+  color: var(--azure-lit);
+}
+
+.end-banner--lose {
+  color: var(--ember-lit);
+}
+
+.end-sub {
+  font-size: 14px;
+  color: var(--paper-dim);
+}
+
+.end-stats {
+  border-collapse: collapse;
+  min-width: min(680px, 94vw);
+}
+
+.end-stats th {
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--paper-deep);
+  text-align: left;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--stone-deep);
+}
+
+.end-stats td {
+  font-size: 13px;
+  color: var(--paper);
+  padding: 6px 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.end-row--you td {
+  color: var(--gold-lit);
+}
+
+.end-back {
+  margin-top: 8px;
+}
+
+.death-overlay {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: var(--shroud);
+  opacity: 0.72;
+  pointer-events: none; /* death-spectate: the camera stays free */
+}
+
+.respawn-count {
+  font-size: 32px;
+  font-weight: 800;
+  color: var(--paper);
+  text-shadow: 0 2px 6px var(--ink-deep);
+}
+
+.hint {
+  position: fixed;
+  left: 50%;
+  bottom: 130px;
+  transform: translateX(-50%);
+  padding: 8px 16px;
+  background: var(--ink);
+  border: 1px solid var(--gold);
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--gold-lit);
+  pointer-events: none;
+  animation: rift-pulse 1s ease-in-out infinite; /* 1Hz — under the 3Hz law */
+}
+
+.banner {
+  position: fixed;
+  top: calc(64px + var(--safe-top, 0px));
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 8px 20px;
+  background: var(--ink);
+  border: 1px solid var(--stone-deep);
+  border-radius: 6px;
+  font-size: 14px;
+  color: var(--paper);
+  pointer-events: none;
+}
+
+.error-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  padding: calc(8px + var(--safe-top, 0px)) 16px 8px;
+  background: var(--ink-deep);
+  border-bottom: 2px solid var(--danger);
+  color: var(--paper); /* paper on ink-deep: >= 7:1 */
+  font-size: 13px;
+  text-align: center;
+  z-index: 100;
+}
+
+.dmg-number {
+  position: fixed;
+  font-size: 14px;
+  font-weight: 800;
+  color: var(--paper);
+  text-shadow: 0 1px 3px var(--ink-deep);
+  pointer-events: none;
+  animation: rift-dmg-rise 0.8s ease-out forwards;
+}
+
+.dmg-number.gold {
+  color: var(--gold);
+}
+
+.dmg-number.danger {
+  color: var(--danger);
+}
+
+.dmg-number.paper {
+  color: var(--paper);
+}
+
+/* ---- animations (all <= 1Hz pulses; the 3Hz flash law is never approached) ------ */
+
+@keyframes rift-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
+@keyframes rift-dmg-rise {
+  0% {
+    transform: translateY(0);
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(-36px);
+    opacity: 0;
+  }
+}
+
+/* ---- tight layouts: stay usable at 1280x720 --------------------------------------- */
+
+@media (max-width: 1400px) {
+  .hud-bars {
+    width: 170px;
+  }
+
+  .minimap {
+    width: 160px;
+    height: 160px;
+  }
+
+  .menu-title {
+    font-size: 34px;
+  }
+}
