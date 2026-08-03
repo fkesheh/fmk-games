@@ -8,6 +8,7 @@ export default defineConfig({
       '@bank/shared': fileURLToPath(new URL('./games/bank/shared/src', import.meta.url)),
       '@kart/shared': fileURLToPath(new URL('./games/kart/shared/src', import.meta.url)),
       '@wordbomb/shared': fileURLToPath(new URL('./games/wordbomb/shared/src', import.meta.url)),
+      '@rift/shared': fileURLToPath(new URL('./games/rift/shared/src', import.meta.url)),
       '@platform/shared': fileURLToPath(new URL('./platform/shared/src', import.meta.url)),
     },
   },
@@ -25,6 +26,9 @@ export default defineConfig({
       'games/kart/client/src/**/*.test.ts',
       'games/wordbomb/shared/src/**/*.test.ts',
       'games/wordbomb/server/src/**/*.test.ts',
+      'games/rift/shared/src/**/*.test.ts',
+      'games/rift/server/src/**/*.test.ts',
+      'games/rift/client/src/**/*.test.ts',
     ],
   },
 });

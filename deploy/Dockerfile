@@ -22,6 +22,9 @@ COPY games/kart/client/package.json games/kart/client/package.json
 COPY games/wordbomb/shared/package.json games/wordbomb/shared/package.json
 COPY games/wordbomb/server/package.json games/wordbomb/server/package.json
 COPY games/wordbomb/client/package.json games/wordbomb/client/package.json
+COPY games/rift/shared/package.json games/rift/shared/package.json
+COPY games/rift/server/package.json games/rift/server/package.json
+COPY games/rift/client/package.json games/rift/client/package.json
 # npm install (not ci): the committed lock skews across platforms (macOS vs linux
 # optional deps) and npm versions — let the image resolve on-platform.
 RUN npm install
@@ -49,6 +52,9 @@ COPY games/kart/client/package.json games/kart/client/package.json
 COPY games/wordbomb/shared/package.json games/wordbomb/shared/package.json
 COPY games/wordbomb/server/package.json games/wordbomb/server/package.json
 COPY games/wordbomb/client/package.json games/wordbomb/client/package.json
+COPY games/rift/shared/package.json games/rift/shared/package.json
+COPY games/rift/server/package.json games/rift/server/package.json
+COPY games/rift/client/package.json games/rift/client/package.json
 RUN npm install --omit=dev
 
 # ---- runtime. Each game module resolves its clientDist as
@@ -68,6 +74,7 @@ COPY --from=build /app/games/bank/client/dist ./games/bank/client/dist
 COPY --from=build /app/games/kart/client/dist ./games/kart/client/dist
 COPY --from=build /app/games/wordbomb/client/dist ./games/wordbomb/client/dist
 COPY --from=build /app/games/wordbomb/server/data ./games/wordbomb/server/data
+COPY --from=build /app/games/rift/client/dist ./games/rift/client/dist
 USER node
 EXPOSE 8080
 CMD ["node", "platform/server/dist/server.js"]

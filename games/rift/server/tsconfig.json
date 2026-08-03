@@ -1,0 +1,15 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+    "paths": {
+      "@platform/shared": ["../../../platform/shared/src/index.ts"],
+      "@platform/shared/*": ["../../../platform/shared/src/*"],
+      "@rift/shared": ["../shared/src/index.ts"],
+      "@rift/shared/*": ["../shared/src/*"]
+    }
+  },
+  "include": ["src"]
+}

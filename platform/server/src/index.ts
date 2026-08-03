@@ -88,6 +88,8 @@ const LPAL = {
   kartTint: '#4a7a3d', //   KPAL.grass       — KART GP: verge green
   wordbombAccent: '#f0a63c', // WPAL.fuse    — WORDBOMB: the lit fuse
   wordbombTint: '#28303a', //  WPAL.slate    — WORDBOMB: dark-room slate
+  riftAccent: '#d9b25f', //    APAL.gold     — ANCIENTS: ancient gold
+  riftTint: '#2e3827', //      APAL.moss     — ANCIENTS: dusk moss
 
   // ---- fallback identity for a game with no launcher copy yet ----
   neutralAccent: '#9aa3ad', // PALETTE.steel
@@ -127,6 +129,12 @@ const COPY: Record<string, GameCopy | undefined> = {
     blurb:
       "Same three letters for everyone, a fuse nobody can see. Match someone else's word and you split the points.",
     tags: ['10 rounds'],
+  },
+  rift: {
+    genre: 'Mini MOBA',
+    blurb:
+      'Push lanes, last-hit for gold, raze towers. Break their Ancient before they break yours — 2v2 to 8v8, bots fill the rest.',
+    tags: ['2v2–8v8', 'Bot fill'],
   },
 };
 
@@ -270,6 +278,7 @@ function launcherHtml(modules: readonly GameModule[]): string {
       /* WORDBOMB's tint is the darkest of the four (WPAL.slate, L 19), so its
          wash carries more alpha to land at the same visual weight. */
       .card--wordbomb { --accent: ${LPAL.wordbombAccent}; --tint: ${LPAL.wordbombTint}; --wash: ${LPAL.wordbombTint}70; --halo: ${LPAL.wordbombAccent}2b; }
+      .card--rift { --accent: ${LPAL.riftAccent}; --tint: ${LPAL.riftTint}; --wash: ${LPAL.riftTint}70; --halo: ${LPAL.riftAccent}2b; }
 
       .mark {
         width: 50px; height: 50px; border-radius: 13px; flex: none;
@@ -313,6 +322,17 @@ function launcherHtml(modules: readonly GameModule[]): string {
           radial-gradient(circle closest-side, var(--accent) 0 96%, transparent 100%);
         background-size: 22% 22%, 20% 24%, 16% 10%, 46% 46%;
         background-position: 94% 4%, 80% 30%, 58% 50%, 28% 82%;
+      }
+      /* ANCIENTS: a monolith gate — two leaning slabs and a floating crystal
+         diamond between them, the ancient's silhouette in three layers. */
+      .mark--rift {
+        background-image:
+          linear-gradient(45deg, transparent calc(50% - 1px), var(--accent) calc(50% - 1px) calc(50% + 1px), transparent calc(50% + 1px)),
+          linear-gradient(-45deg, transparent calc(50% - 1px), var(--accent) calc(50% - 1px) calc(50% + 1px), transparent calc(50% + 1px)),
+          linear-gradient(100deg, var(--accent), var(--accent)),
+          linear-gradient(80deg, var(--accent), var(--accent));
+        background-size: 26% 26%, 26% 26%, 14% 52%, 14% 52%;
+        background-position: 50% 26%, 50% 26%, 30% 72%, 70% 72%;
       }
 
       .head { display: flex; flex-direction: column; gap: 3px; }
