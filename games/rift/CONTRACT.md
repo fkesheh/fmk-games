@@ -291,80 +291,23 @@ Connection/lifecycle mirrors wordbomb exactly: one `/ws`, `rift.name` +
 `history.replaceState`, clock sync via platform ping/pong, reconnect with
 backoff, every create/join carries `game: 'rift'`, room list filtered to rift.
 
-**Frozen client seams** — these signatures are contract; T7/T8/T9 build
-against them in parallel. Implementations may add privates, never change the
-seams. `EntId` below = the wire entity id (number); `InterpEnt` is defined in
-interp.ts exactly as written here:
-
-```ts
-// interp.ts (T8 owns)
-export interface InterpEnt {
-  id: number; k: EntKind; team: TeamId; x: number; z: number;
-  hp: number; maxHp: number; lvl?: number; hero?: HeroId; pid?: string;
-  atk?: number; // basic-attack target since last snap (tracers)
-  tx?: number; tz?: number; fx?: string; // 'proj' flight target + school tag
-}
-export interface GhostEnt { id: number; k: EntKind; team: TeamId; x: number; z: number; fade: number }
-export interface InterpHandle {
-  push(msg: Extract<RiftS2C, { t: 'rift_snap' }>): void;
-  sample(): readonly InterpEnt[]; // interpolated, 2 snaps (100ms) behind
-  ghosts(): readonly GhostEnt[];  // fading last-known markers
-  latest(): Extract<RiftS2C, { t: 'rift_snap' }> | null; // newest raw snap (HUD data)
-}
-
-// render/scene.ts (T7 owns)
-export interface SceneHandle {
-  readonly canvas: HTMLCanvasElement;
-  setCamera(x: number, z: number, height: number): void; // fixed-angle MOBA cam
-  screenToGround(sx: number, sy: number, out: { x: number; z: number }): boolean;
-  pickUnit(sx: number, sy: number): number; // ent id under cursor, -1 = none
-  resize(): void;
-  render(dtMs: number): void;
-  drawCalls(): number; // renderer.info — the perf gate reads this
-}
-export function createScene(parent: HTMLElement): SceneHandle;
-
-// render/mapMesh.ts (T7 owns)
-export function buildMapMeshes(scene: SceneHandle, map: MapDef): void;
-
-// render/units.ts (T7 owns)
-export interface UnitsHandle {
-  sync(ents: readonly InterpEnt[], ghosts: readonly GhostEnt[], selfId: number): void;
-  setSelected(id: number): void; // -1 = none
-  orderMarker(x: number, z: number, attack: boolean): void;
-}
-export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle;
-
-// render/fog.ts (T7 owns)
-export interface FogHandle {
-  readonly maskCanvas: HTMLCanvasElement; // shared with the minimap (T9 reads it)
-  update(snap: Extract<RiftS2C, { t: 'rift_snap' }>): void; // ~5Hz from snapshots
-  isVisible(x: number, z: number): boolean;
-}
-export function createFog(scene: SceneHandle, map: MapDef): FogHandle;
-
-// render/fx.ts (T7 owns)
-export interface FxHandle {
-  burst(x: number, z: number, kind: 'gold' | 'death' | 'tower' | 'phys' | 'magic' | 'heal'): void;
-  tracer(x1: number, z1: number, x2: number, z2: number, kind: 'phys' | 'magic' | 'tower'): void;
-  shake(amount: number): void;
-  damageNumber(x: number, z: number, text: string, cls: 'gold' | 'danger' | 'paper'): void;
-  tick(dtMs: number): void;
-}
-export function createFx(scene: SceneHandle): FxHandle;
-
-// ui/* (T9 owns) — every ui module takes DOM root + callbacks, renders from
-// interp.latest() + game state; exact props are T9's own. The DOM CLASS
-// CONTRACT: T9/T7 render only these classes and T8's style.css styles exactly
-// this list (extend ONLY via the orchestrator):
-//   .hud .hud-portrait .hud-bars .bar .bar-hp .bar-mana .bar-xp
-//   .ability-bar .ability-slot .ability-cd .ability-rank .ability-plus
-//   .item-bar .item-slot .item-charges .item-cd .gold-readout .kda
-//   .topbar .match-clock .team-score .tower-count .killfeed .kill-row
-//   .shop-panel .shop-grid .shop-item .shop-cost .minimap .scoreboard
-//   .menu .menu-* .lobby .lobby-* .pick-grid .pick-card .end-screen .end-*
-//   .death-overlay .respawn-count .hint .banner .error-banner .dmg-number
-```
+**Frozen client seams** — `client/src/contract.ts` is Layer-1 (normative):
+`InterpEnt`/`GhostEnt`/`InterpHandle`, `SceneHandle`/`UnitsHandle`/`FogHandle`/
+`FxHandle`, `ClientState`/`UiActions`/`UiHandle`/`AudioHandle`,
+`ClientModules`, and the frozen create-function signatures (in its footer
+comment). T7/T8/T9 import ONLY these types from each other's territory.
+**main.ts and wire.ts are orchestrator-owned** (created at integration);
+T8's `Game` class takes `(root, modules: ClientModules)` and never imports an
+implementation module. The DOM CLASS
+CONTRACT: T9/T7 render only these classes and T8's style.css styles exactly
+this list (extend ONLY via the orchestrator):
+  .hud .hud-portrait .hud-bars .bar .bar-hp .bar-mana .bar-xp
+  .ability-bar .ability-slot .ability-cd .ability-rank .ability-plus
+  .item-bar .item-slot .item-charges .item-cd .gold-readout .kda
+  .topbar .match-clock .team-score .tower-count .killfeed .kill-row
+  .shop-panel .shop-grid .shop-item .shop-cost .minimap .scoreboard
+  .menu .menu-* .lobby .lobby-* .pick-grid .pick-card .end-screen .end-*
+  .death-overlay .respawn-count .hint .banner .error-banner .dmg-number
 
 - **main.ts** (T8) — mirror APAL onto CSS vars, `unhandledrejection` banner,
   `boot(root)` in try/catch with `.error-banner` fallback.
@@ -614,8 +557,9 @@ Wave 2 (parallel; depend on contract + T1's map.ts + the frozen sim seam):
   percept stream = identical commands).
 - **T7 client world render** — owns `render/scene.ts`, `render/mapMesh.ts`,
   `render/units.ts`, `render/fog.ts`, `render/fx.ts`. Gate: client tsc.
-- **T8 client app shell** — owns `main.ts`, `net.ts`, `game.ts`, `interp.ts`,
-  `input.ts`, `style.css` + interp tests (ghost/reappear rules). Gate: client
+- **T8 client app shell** — owns `net.ts`, `game.ts`, `interp.ts`,
+  `input.ts`, `style.css` + interp tests (ghost/reappear rules). `main.ts` +
+  `wire.ts` are orchestrator-owned (integration). Gate: client
   tsc + its tests green.
 - **T9 client UI** — owns `ui/hud.ts`, `ui/shop.ts`, `ui/minimap.ts`,
   `ui/menus.ts`, `audio.ts`. Gate: client tsc.
