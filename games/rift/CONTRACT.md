@@ -107,7 +107,9 @@ polylines from team 0's Ancient to team 1's, with `E = LANE_EDGE_INSET`:
 `B = BASE_INSET`; waypoints include both Ancients' positions as endpoints.
 Lane towers per team sit at `TOWER_LANE_FRACTIONS` of path length from their
 own Ancient, offset `TOWER_LANE_OFFSET` metres perpendicular to the path on
-the side facing AWAY from the map centre. Guards: two per team, flanking the
+the side facing AWAY from the map centre; on the mid diagonal both sides are
+equidistant, so the tiebreak there is LEFT of the team-0 -> team-1 travel
+direction. Guards: two per team, flanking the
 Ancient perpendicular to the diagonal at `GUARD_FLANK_DIST` (sized so the
 edge-to-edge gap to the Ancient is exactly `STRUCTURE_MARGIN`). Structure ids:
 0..N-1, deterministic: team 0 lane towers (lane-major, near-to-far), team 0
@@ -120,8 +122,9 @@ guards, team 0 ancient, then team 1 mirrored.
    versa) — both directions asserted;
 3. **pathability with the real movement rule**: a disc of `HERO_RADIUS`
    walking each lane polyline in BOTH directions never intersects any
-   structure's disc expanded by `HERO_RADIUS`, and every tower's centre is
-   within 6m of its lane polyline;
+   structure's disc expanded by `HERO_RADIUS` — the two Ancients at the path
+   endpoints are EXEMPT (units must reach them to attack) — and every tower's
+   centre is within 6m of its lane polyline;
 4. min pairwise structure EDGE-TO-EDGE clearance (centre distance minus both
    radii) >= `STRUCTURE_MARGIN`;
 5. both teams have identical structure counts per kind.
@@ -134,29 +137,40 @@ fail**: temporarily break symmetry, confirm red, revert.
 ## 4. Sim core (server/src/sim/)
 
 **The seam is frozen in `server/src/sim/types.ts`** (Layer-1): the `Ent`
-record, the `World` surface, `SimEvent`, `SeatDef`, `createWorld`,
-`computeTeamVisible`, `BotPercept`/`BotCommand`/`BotBrain`. T3, T4, T5, T6 all
-build against that file IN PARALLEL — nobody reads another task's
-implementation.
+record, the `World` surface (incl. the `order`/`cast` intake methods),
+`Order`, `AbilitiesEngine`, `SimEvent`, `SeatDef`,
+`BotPercept`/`BotCommand`/`BotBrain`. T3, T4, T5, T6 all build against that
+file IN PARALLEL — nobody reads another task's implementation. The ability
+engine is INJECTED into the world at construction (`createWorld(...,
+abilities)`), so T3 and T4 never import each other; T3's tests stub the
+engine with a test double.
 
 Pure TypeScript, no I/O, no `Date.now()` (match time is `tick * TICK_DT`), no
-`Math.random` (the injected `rand`). All hot-path state preallocated; tick()
-allocates nothing beyond drained event objects. Units are `Ent` structs in
-flat stores keyed by entity id (mobile ids >= 1000; structure ids are the
-MapDef ids).
+`Math.random` (the injected `rand`). All hot-path state preallocated;
+advance() allocates nothing beyond drained event objects. Units are `Ent`
+structs in flat stores keyed by entity id (mobile ids >= 1000; structure ids
+are the MapDef ids; the no-entity sentinel is `NO_ENT = -1`).
 
 - **world.ts** — `createWorld` + the `World` implementation: entity stores,
-  spawn/despawn, the mutation surface (`damage/heal/stun/slow/applyAura/dash/
-  spawnProjectile/spawnMobile/buy/spendSkillPoint/useItem/drainEvents`), and
-  `advance()` — one tick, orchestration order: (1) apply queued orders,
-  (2) abilities/projectiles, (3) buff expiry + stat recompute, (4) movement,
-  (5) combat, (6) deaths/loot, (7) waves/respawns, (8) win/overtime checks.
-  Frozen signatures (the room imports these; bodies are T3's/T5's):
-  `export function createWorld(map: MapDef, seats: readonly SeatDef[], rand: () => number): World;`
-  (world.ts) and
+  spawn/despawn, the intake queue (`order`/`cast` — queued, validated at
+  apply time, illegal input silently no-ops), the mutation surface
+  (`damage/heal/stun/slow/applyAura/dash/spawnMobile/buy/spendSkillPoint/
+  useItem/drainEvents`), and `advance()` — one tick, orchestration order:
+  (1) apply queued orders, (2) `abilities.step(world)` — cast execution +
+  projectile motion, (3) buff expiry + stat recompute + passive-aura
+  membership re-evaluation (every 5 ticks) + passive rank-up refresh,
+  (4) movement, (5) combat, (6) deaths/loot, (7) waves/respawns,
+  (8) win/overtime checks.
+  Frozen signatures (the room imports these; bodies are T3's/T4's/T5's/T6's):
+  `export function createWorld(map: MapDef, seats: readonly SeatDef[], rand: () => number, abilities: AbilitiesEngine): World;`
+  (world.ts),
+  `export function createAbilitiesEngine(): AbilitiesEngine;`
+  (abilities.ts),
   `export function computeTeamVisible(world: World, team: TeamId, out: Set<EntId>): void;`
   (vision.ts — clears `out`, fills it with the mobile ids visible to `team`;
-  the caller reuses two sets, one per team).
+  the caller reuses two sets, one per team), and
+  `export function createBotBrain(seed: number, hero: HeroId): BotBrain;`
+  (bots.ts).
 - **movement.ts** — heroes steer straight at their order target; structures
   are circle obstacles resolved by tangential slide (push-out + slide, no
   pathfinding — the map is open); soft unit separation between all mobiles
@@ -199,9 +213,15 @@ MapDef ids).
   charges into an existing wardstone slot), `spendSkillPoint` (rank caps +
   `ULT_LEVEL_REQ`), ward placement (1 item charge + 1 team stock per
   `WARD_TEAM_STOCK`/`WARD_RESTOCK_S`; placing with 0 stock silently no-ops).
-- **abilities.ts** — the engine for the 8 frozen primitives PLUS item actives
-  (blinkstone dash, warhorn aura reuse the same machinery; wardstone placement
-  lives in units.ts). Cast validation: alive, not stunned, not passive, rank
+- **abilities.ts** — `createAbilitiesEngine()` returns the injected engine;
+  its `step(world)` (advance step 2) drains the world's cast queue, validates
+  and executes casts, and OWNS projectiles end-to-end: it spawns 'proj' ents
+  via `world.spawnMobile`, keeps their payloads (effects, rank, homing target,
+  pierce-hit set, remaining range) in an engine-private side table keyed by
+  ent id, moves them each step, and applies effects on impact. The engine
+  covers the 8 frozen primitives PLUS item actives (blinkstone dash, warhorn
+  aura reuse the same machinery; wardstone placement lives in units.ts). Cast
+  validation: alive, not stunned, not passive, rank
   >= 1, off cooldown, mana sufficient, target legal (`targeting`/`targetTeam`,
   in `castRange`; a point cast missing valid coordinates is rejected). On
   success: spend mana, set cooldown, execute effects IN ARRAY ORDER (dash
@@ -209,10 +229,11 @@ MapDef ids).
   `cast` SimEvent. AoE: damage/stun/slow hit enemies, heal/aura hit allies,
   within `aoeRadius` of the impact. Slows do not stack — strongest active
   wins. Auras: `radius 0` = self; `duration 0` = passive permanent (radius > 0
-  passives re-evaluate membership every 5 ticks); active auras are timed buffs
-  on all eligible units in radius at cast time. Summons spawn friendly 'shade'
-  units capped by `SUMMON_MAX_ACTIVE` (oldest expires first). Projectiles are
-  sim entities (kind 'proj'): unit-targeted HOME onto their target;
+  passives re-evaluate membership every 5 ticks — applied by world.ts step
+  (3)); active auras are timed buffs on all eligible units in radius at cast
+  time. Summons spawn friendly 'shade'
+  units (owner = caster) capped by `SUMMON_MAX_ACTIVE` per owner (oldest
+  expires first). Projectiles: unit-targeted HOME onto their target;
   point-targeted fly straight to `range`; non-pierce applies effects to the
   first enemy unit within `radius` then despawns; pierce applies once per unit
   along the whole flight.
@@ -279,6 +300,7 @@ export interface InterpEnt {
   id: number; k: EntKind; team: TeamId; x: number; z: number;
   hp: number; maxHp: number; lvl?: number; hero?: HeroId; pid?: string;
   atk?: number; // basic-attack target since last snap (tracers)
+  tx?: number; tz?: number; fx?: string; // 'proj' flight target + school tag
 }
 export interface GhostEnt { id: number; k: EntKind; team: TeamId; x: number; z: number; fade: number }
 export interface InterpHandle {
@@ -293,7 +315,7 @@ export interface SceneHandle {
   readonly canvas: HTMLCanvasElement;
   setCamera(x: number, z: number, height: number): void; // fixed-angle MOBA cam
   screenToGround(sx: number, sy: number, out: { x: number; z: number }): boolean;
-  pickUnit(sx: number, sy: number): number; // ent id under cursor, 0 = none
+  pickUnit(sx: number, sy: number): number; // ent id under cursor, -1 = none
   resize(): void;
   render(dtMs: number): void;
   drawCalls(): number; // renderer.info — the perf gate reads this
@@ -306,7 +328,7 @@ export function buildMapMeshes(scene: SceneHandle, map: MapDef): void;
 // render/units.ts (T7 owns)
 export interface UnitsHandle {
   sync(ents: readonly InterpEnt[], ghosts: readonly GhostEnt[], selfId: number): void;
-  setSelected(id: number): void; // 0 = none
+  setSelected(id: number): void; // -1 = none
   orderMarker(x: number, z: number, attack: boolean): void;
 }
 export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle;
@@ -375,8 +397,7 @@ export function createFx(scene: SceneHandle): FxHandle;
 - **render/mapMesh.ts** (T7) — `buildMap(lanes)` (same shared code as the
   server) -> baked statics: ground plane `moss`; lane paving strips `stone`
   raised 0.02 (NEVER coplanar — `COPLANAR_EPS = 0.006` rule); base platforms
-  with team-tinted trim; scattered deco via `rng(decoSeed('rift-' + lanes,
-  'deco'))`: ruins fragments, foliage clusters (`leaf`/`leafDeep`/`trunk`),
+  with team-tinted trim; scattered deco via `rng(decoSeed('rift-' + lanes, 18))`: ruins fragments, foliage clusters (`leaf`/`leafDeep`/`trunk`),
   rocks — in organic clusters OFF the lane paths, denser toward map edges, ~1
   cluster per 150m² of off-path area, 3-8 pieces per cluster, all baked.
 - **render/units.ts** (T7) — every entity attaches a visible mesh built from
@@ -427,7 +448,7 @@ export function createFx(scene: SceneHandle): FxHandle;
   horn, victory/defeat sting, ambient wind loop. Hit feedback is visual AND
   audio (UX law).
 
-**Debug surface (frozen, for e2e):** `window.__rift = { state(), createPrivate(name, settings?), joinPrivate(name, code), start(), pick(hero), order(kind, x, z), cast(slot, x?, z?, target?), buy(item), skill(slot), item(slot, x?, z?), snaps(), lastEvents(), messageLog() }`. `state()` returns the client's parsed snapshot view (phase, you, ents count, gold, positions).
+**Debug surface (frozen, for e2e):** `window.__rift = { state(), createPrivate(name, settings?), joinPrivate(name, code), start(), pick(hero), order(kind, x?, z?, target?), cast(slot, x?, z?, target?), buy(item), skill(slot), item(slot, x?, z?), snaps(), lastEvents(), messageLog() }`. `state()` returns the client's parsed snapshot view (phase, you, ents count, gold, positions).
 
 ## 7. Art direction (style bible — binding on every visual task)
 
@@ -507,7 +528,9 @@ buy, when to force a fight. Targets the balance harness (T13) must MEASURE,
 not reason about (bands derived from the frozen config arithmetic, not
 wishful thinking): at even bot skill a match resolves by Ancient kill in
 12-18 min game-time median (hard cap is a backstop, hit in < 20% of sims);
-first tower falls at 5-8 min; heroes reach level 6 between 6 and 11 min;
+first tower falls at 5-8 min; heroes reach level 6 between 6 and 11 min at
+2v2-4v4, and by ~14 min at 8v8 (bigger teams level slower — intended, not a
+defect);
 gold at 10 min is 2200-5500 per hero; team gold divergence at 10 min < 40%;
 no NaN, no stalled sim (tick always advances; a match ALWAYS ends by hard
 cap). Fortify + lane-scaled income are the two load-bearing anti-sprawl

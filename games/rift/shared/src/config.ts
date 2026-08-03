@@ -33,10 +33,12 @@ export const STRUCTURE_MARGIN = 4; // min clearance between any two structures
 export const TOWERS_PER_LANE = 2; // per team per lane
 export const ANCIENT_GUARDS = 2; // per team, flanking the ancient
 /** Tower positions along a lane path, as fraction of path length measured
- *  from the owning team's base. */
-export const TOWER_LANE_FRACTIONS: readonly number[] = [0.3, 0.62];
-export const GUARD_FLANK_DIST = 7.5; // guards sit this far off the base diagonal
-// (ancient radius 2.3 + guard radius 1.2 + STRUCTURE_MARGIN 4 = 7.5 exactly)
+ *  from the owning team's base. Both sit on the owning team's half, so
+ *  opposing towers never open fire on each other. */
+export const TOWER_LANE_FRACTIONS: readonly number[] = [0.25, 0.45];
+export const GUARD_FLANK_DIST = 7.51; // guards sit this far off the base diagonal
+// (ancient radius 2.3 + guard radius 1.2 + STRUCTURE_MARGIN 4, + 0.01 so the
+// edge-to-edge clearance clears the margin in floating point, not just decimal)
 /** Lane towers stand this far off their lane polyline, perpendicular, on the
  *  side facing away from the map centre. */
 export const TOWER_LANE_OFFSET = 2.5;
@@ -115,8 +117,7 @@ export const FOUNTAIN_MANA_PCT = 0.06;
 
 // --- Heroes: shared curve ---------------------------------------------------------
 export const LEVEL_CAP = 10;
-/** Cumulative xp required to BE each level; index = level (0 unused).
- *  To-next = 100 + (level-1)*60. */
+/** Cumulative xp required to BE each level; index = level (0 unused). */
 export const XP_THRESHOLDS: readonly number[] = [
   0, 0, 200, 510, 930, 1460, 2100, 2860, 3750, 4780, 5960,
 ];

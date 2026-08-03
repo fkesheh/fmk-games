@@ -57,7 +57,7 @@ export type EntKind =
 /** One entity in a snapshot. Structures are sent to every client every tick
  *  (they are static objectives — position/alive/hp is public knowledge).
  *  Mobile units are fog-filtered per team. Optional fields are per-kind:
- *  lvl/hero/pid for heroes; tx/tz + slot for 'proj'. */
+ *  lvl/hero/pid for heroes; tx/tz + fx for 'proj'. */
 export interface EntSnap {
   id: number;
   k: EntKind;

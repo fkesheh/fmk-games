@@ -6,21 +6,27 @@
 // negotiates shapes with anybody; everything flows through this file.
 // ============================================================================
 import type { AuraStat } from '@rift/shared';
-import type { ProjectileSpec } from '@rift/shared';
-import type { Effect } from '@rift/shared';
-import type { EndReason, EntKind, MapDef, Phase, TeamId } from '@rift/shared';
+import type { EndReason, EntKind, MapDef, Phase, TeamId, Vec2 } from '@rift/shared';
 import type { HeroId, ItemId } from '@rift/shared';
 
 /** Structure entities use their MapDef structure id (0..999). Mobile entities
  *  (heroes, creeps, summons, wards, projectiles) are numbered from 1000. */
 export type EntId = number;
-/** "No entity" sentinel for target fields. */
-export const NO_ENT: EntId = 0;
+/** "No entity" sentinel for target fields. -1, never a legal structure id. */
+export const NO_ENT: EntId = -1;
 
-export type OrderKind = 'idle' | 'move' | 'attackmove' | 'attack' | 'hold';
+export type OrderKind = 'idle' | 'move' | 'attackmove' | 'attack';
 
-/** One timed stat modifier on an entity. untilTick 0 = passive permanent
- *  (membership re-evaluated every 5 ticks for radius > 0 auras). */
+/** A queued unit order (World.order intake). */
+export type Order =
+  | { kind: 'move' | 'attackmove'; x: number; z: number }
+  | { kind: 'attack'; target: EntId }
+  | { kind: 'stop' };
+
+/** One timed stat modifier on an entity. untilTick 0 = passive permanent.
+ *  Radius > 0 passives re-evaluate membership every 5 ticks — that
+ *  re-evaluation (and rank-up refresh of passive amounts) is owned by T3's
+ *  advance() step (3), reading the shared hero data; it is nobody else's job. */
 export interface AuraInstance {
   stat: AuraStat;
   amount: number;
@@ -88,6 +94,9 @@ export interface Ent {
   hero: HeroId | null;
   /** Owning player id for heroes; null for everything else. */
   pid: string | null;
+  /** Owning ENTITY for summons/wards/projectiles (the caster); NO_ENT
+   *  otherwise. Drives the per-hero summon cap. */
+  owner: EntId;
   abilityRanks: number[]; // 4
   abilityCdUntilTick: number[]; // 4
   items: (ItemId | null)[]; // 6
@@ -120,30 +129,25 @@ export interface World {
   /** Fill a caller-owned buffer with ents whose CIRCLE CENTRE is within r of
    *  (x, z); returns the count written. Never allocates. */
   inRadius(x: number, z: number, r: number, out: Ent[]): number;
-  // --- mutation surface (combat.ts + abilities.ts + units.ts) ---
+  // --- intake (queued, applied/validated at the next advance(); illegal
+  // input silently no-ops — bots and humans share this exact door) ---
+  order(hero: EntId, order: Order): void;
+  cast(hero: EntId, slot: number, x: number | null, z: number | null, target: EntId): void;
+  // --- mutation surface (combat.ts + the abilities engine + units.ts) ---
   damage(src: EntId, dst: EntId, amount: number, school: 'physical' | 'magic'): void;
   heal(dst: EntId, amount: number): void;
   stun(dst: EntId, durationS: number): void;
   slow(dst: EntId, pct: number, durationS: number): void;
+  /** durationS 0 = permanent passive instance. */
   applyAura(dst: EntId, stat: AuraStat, amount: number, pct: boolean, durationS: number, source: EntId): void;
   /** Scripted dash toward (tx, tz), clamped to map bounds and stopped at
    *  structure edges by movement. */
   dash(id: EntId, tx: number, tz: number): void;
-  /** Unit-targeted projectiles HOME onto their target; point-targeted fly
-   *  straight for spec.range. rank indexes the ability's per-rank arrays. */
-  spawnProjectile(
-    owner: EntId,
-    spec: ProjectileSpec,
-    effects: readonly Effect[],
-    rank: number,
-    fromX: number,
-    fromZ: number,
-    toX: number,
-    toZ: number,
-    target: EntId, // NO_ENT = straight flight
-  ): void;
-  /** Spawn a mobile unit; returns its id. kind 'shade' is a summon. */
-  spawnMobile(kind: EntKind, team: TeamId, x: number, z: number, lane: number, expireAtTick: number): EntId;
+  /** Spawn a mobile unit; returns its id. 'proj' ents are moved and resolved
+   *  by the abilities engine (it owns their payload side table); everything
+   *  else moves via movement.ts. owner attributes summons/wards/projs to
+   *  their caster (NO_ENT for wave creeps). */
+  spawnMobile(kind: EntKind, team: TeamId, x: number, z: number, lane: number, expireAtTick: number, owner: EntId): EntId;
   /** Shop + progression (units.ts owns): buy into first free slot (validates
    *  gold + at-fountain), spend a skill point (validates rank caps +
    *  ULT_LEVEL_REQ), use an item active (validates charges/cooldown/ward
@@ -165,6 +169,15 @@ export type SimEvent =
   | { k: 'surge' }
   | { k: 'end'; winner: TeamId | null; reason: EndReason };
 
+/** The ability engine (T4) is injected into the world at construction, so T3
+ *  and T4 build in parallel with zero cross-imports. `step` runs inside
+ *  advance() at orchestration step (2): it drains the cast queue, validates
+ *  and executes casts, and moves/resolves every 'proj' ent (its payload side
+ *  table is engine-private). */
+export interface AbilitiesEngine {
+  step(world: World): void;
+}
+
 /** One seat at match lock. */
 export interface SeatDef {
   pid: string;
@@ -174,11 +187,13 @@ export interface SeatDef {
   lane: number; // assigned lane index, round-robin per team at lock
 }
 
-// Two frozen function SIGNATURES live in CONTRACT.md §4/§5, not here (a types
+// Frozen function SIGNATURES live in CONTRACT.md §4/§5, not here (a types
 // file carries no declarations without bodies):
-//   T3 world.ts:   export function createWorld(map: MapDef, seats: readonly SeatDef[], rand: () => number): World;
-//   T5 vision.ts:  export function computeTeamVisible(world: World, team: TeamId, out: Set<EntId>): void;
-// The room (T10) imports those from './sim/world.js' / './sim/vision.js'.
+//   T3 world.ts:      export function createWorld(map: MapDef, seats: readonly SeatDef[], rand: () => number, abilities: AbilitiesEngine): World;
+//   T4 abilities.ts:  export function createAbilitiesEngine(): AbilitiesEngine;
+//   T5 vision.ts:     export function computeTeamVisible(world: World, team: TeamId, out: Set<EntId>): void;
+//   T6 bots.ts:       export function createBotBrain(seed: number, hero: HeroId): BotBrain;
+// The room (T10) imports those from the implementation modules directly.
 
 // --- Bot seam (T6 consumes, T10 builds) ----------------------------------------------
 /** The percept is TEAM-VISION-FILTERED: bots see exactly what their team's
@@ -189,6 +204,9 @@ export interface BotPercept {
   readonly self: Ent;
   readonly visible: readonly Ent[]; // reused buffer, valid until next tick
   readonly lane: number; // assigned at lock
+  /** Lane waypoint polylines (team-0 -> team-1 direction; team 1 walks them
+   *  reversed) — from the same MapDef the room built. */
+  readonly paths: readonly (readonly Vec2[])[];
   readonly wardStock: number;
   readonly atFountain: boolean;
   readonly overtime: boolean;
