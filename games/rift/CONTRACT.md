@@ -108,8 +108,10 @@ polylines from team 0's Ancient to team 1's, with `E = LANE_EDGE_INSET`:
 Lane towers per team sit at `TOWER_LANE_FRACTIONS` of path length from their
 own Ancient, offset `TOWER_LANE_OFFSET` metres perpendicular to the path on
 the side facing AWAY from the map centre; on the mid diagonal both sides are
-equidistant, so the tiebreak there is LEFT of the team-0 -> team-1 travel
-direction. Guards: two per team, flanking the
+equidistant, so the tiebreak there is LEFT of the OWNING team's travel
+direction (team 0 walks the polyline team-0 -> team-1; team 1 walks it
+reversed — equivalently, team 1's mid towers are the exact mirror image of
+team 0's, which is what rule 2 demands). Guards: two per team, flanking the
 Ancient perpendicular to the diagonal at `GUARD_FLANK_DIST` (sized so the
 edge-to-edge gap to the Ancient is exactly `STRUCTURE_MARGIN`). Structure ids:
 0..N-1, deterministic: team 0 lane towers (lane-major, near-to-far), team 0

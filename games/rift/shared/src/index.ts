@@ -5,3 +5,4 @@ export * from './hero.js';
 export * from './item.js';
 export * from './protocol.js';
 export * from './palette.js';
+export * from './map.js';
