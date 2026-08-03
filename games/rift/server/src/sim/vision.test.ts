@@ -13,7 +13,7 @@ import {
 } from '@rift/shared';
 import type { EntKind, ItemId, MapDef, TeamId } from '@rift/shared';
 import { computeTeamVisible } from './vision.js';
-import type { Ent, EntId, Order, SimEvent, World } from './types.js';
+import type { Ent, EntId, Order, QueuedCast, SimEvent, World } from './types.js';
 import type { AuraStat } from '@rift/shared';
 
 // --- Fake World ---------------------------------------------------------------
@@ -151,6 +151,10 @@ class FakeWorld implements World {
   useItem(_hero: EntId, _slot: number, _x: number | null, _z: number | null): void {}
   wardStock(_team: TeamId): number {
     return 0;
+  }
+  pushEvent(_ev: SimEvent): void {}
+  drainCasts(): QueuedCast[] {
+    return [];
   }
   drainEvents(): SimEvent[] {
     return [];
