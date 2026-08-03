@@ -33,7 +33,7 @@
 // ============================================================================
 import { rng } from '@platform/shared';
 import type { RiftEvent } from '@rift/shared';
-import type { AudioHandle } from './contract.js';
+import type { AudioHandle } from '../contract.js';
 
 // ---- tuning constants -------------------------------------------------------
 const MASTER_GAIN = 0.5;
