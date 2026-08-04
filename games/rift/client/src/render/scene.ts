@@ -1,6 +1,6 @@
 // ============================================================================
 // ANCIENTS (rift) — SCENE (CONTRACT §6 render/scene.ts). One WebGLRenderer:
-// ACESFilmicToneMapping, sRGB out, antialias, PCFSoftShadowMap 2048,
+// NeutralToneMapping, sRGB out, antialias, PCFSoftShadowMap 2048,
 // pixelRatio <= 2. Hemisphere light (cool sky / warm ground) + one shadow-
 // casting directional sun whose ortho frustum is fitted to the map bounds in
 // fitMap(). FogExp2 sits exactly on APAL.fog (sky law S2: fog IS the horizon
@@ -161,8 +161,15 @@ export function createScene(parent: HTMLElement): SceneHandle {
     parent.appendChild(div);
     throw err instanceof Error ? err : new Error(String(err));
   }
-  renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.65; // dusk, never moonless-night: moss must read at its palette value everywhere
+  // Round-4 art-judge amendment (recorded per §11): ACESFilmic was swapped for
+  // NeutralToneMapping. ACES compresses mid-tones and shifts hue, so sun-lit
+  // moss measured ~#141a10 (L*≈8) against palette #2e3827 (L*≈22) no matter
+  // how high the exposure went — the dark end never recovered. Khronos Neutral
+  // is near-identity through the dark/mid range, so palette values survive to
+  // the framebuffer; the exposure below is calibrated so sun-lit moss measures
+  // within ±10 L* of palette moss on the live-hud capture.
+  renderer.toneMapping = THREE.NeutralToneMapping;
+  renderer.toneMappingExposure = 2.75; // dusk, never moonless-night: calibrated so sun-lit moss measures ~palette L* and the 0.55 fog dim still clears 8 L* over the shroud (measured on live-hud/fog-edge captures)
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -190,16 +197,19 @@ export function createScene(parent: HTMLElement): SceneHandle {
 
   // Cool sky over warm ground bounce — dusk, but bright enough that moss
   // reads at its palette value at gameplay zoom (the ladder laws assume it).
+  // Skewed toward azureLit on purpose: Neutral tone mapping's desaturation
+  // offset crushes the blue channel of dark albedos, so the sky fill carries
+  // extra blue to hold moss at its grey-green palette hue.
   const hemi = new THREE.HemisphereLight(
-    mix(APAL.horizon, APAL.azureLit, 0.5),
+    mix(APAL.horizon, APAL.azureLit, 0.62),
     mix(APAL.trunk, APAL.ember, 0.35),
-    2.1,
+    2.45,
   );
   three.add(hemi);
 
   // Sun cooled toward desaturated goldLit so monument stone stays grey-stone
   // (a saturated warm sun reads brown on the monument tier).
-  const sun = new THREE.DirectionalLight(mix(APAL.goldLit, APAL.paper, 0.35), 3.0);
+  const sun = new THREE.DirectionalLight(mix(APAL.goldLit, APAL.paper, 0.35), 3.15);
   sun.castShadow = true;
   sun.shadow.mapSize.set(SUN_MAP_SIZE, SUN_MAP_SIZE);
   sun.shadow.bias = -0.0002;
