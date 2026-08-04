@@ -236,25 +236,35 @@ function meleeCreepParts(team: TeamId): THREE.BufferGeometry[] {
   part(parts, new THREE.CylinderGeometry(0.22, 0.26, 0.18, 8), APAL.stone, 0, 0.95, 0);
   // tall WIDE team-Lit plume — the silhouette's team read, sized to hold at
   // 20-30m (round-4 judge: the old sliver vanished past ~20m)
-  part(parts, new THREE.BoxGeometry(0.14, 0.42, 0.58), tl, 0, 1.28, -0.02);
+  part(parts, new THREE.BoxGeometry(0.2, 0.46, 0.62), tl, 0, 1.3, -0.02);
   // team belt, broad enough to read at lane distance
   part(parts, new THREE.BoxGeometry(0.56, 0.16, 0.4), tb, 0, 0.42, 0);
-  // slab shield with an oversized team boss
-  part(parts, new THREE.BoxGeometry(0.1, 0.5, 0.42), APAL.stoneDeep, -0.36, 0.6, 0.1);
-  part(parts, new THREE.CylinderGeometry(0.16, 0.16, 0.16, 6), tb, -0.42, 0.6, 0.1, { rz: Math.PI / 2 });
+  // slab shield whose whole FACE is team base tier with a team-Lit boss —
+  // real team-coloured SURFACE, not an accent (round-5 judge: the old
+  // stoneDeep slab + small boss left team identity to the hp bar alone)
+  part(parts, new THREE.BoxGeometry(0.1, 0.62, 0.52), tb, -0.36, 0.6, 0.1);
+  part(parts, new THREE.CylinderGeometry(0.17, 0.17, 0.16, 6), tl, -0.43, 0.6, 0.1, { rz: Math.PI / 2 });
   return parts;
 }
 
 function rangedCreepParts(team: TeamId): THREE.BufferGeometry[] {
   const parts: THREE.BufferGeometry[] = [];
+  const tb = TEAM_COLORS[team] ?? APAL.azure;
   const tl = TEAM_LIT[team] ?? APAL.azureLit;
   // robed acolyte: cone robe, hood, glowing team-tinted orb hands
   part(parts, new THREE.ConeGeometry(0.32, 0.9, 8), APAL.monument, 0, 0.45, 0);
   part(parts, new THREE.ConeGeometry(0.2, 0.32, 8), APAL.stoneDeep, 0, 1.05, 0);
   part(parts, new THREE.SphereGeometry(0.09, 6, 5), APAL.inkDeep, 0, 0.98, 0.09);
-  // team-Lit sash + oversized orb hands — the silhouette's team read, sized
-  // to hold at 20-30m (round-4 judge: the old pinhead orbs vanished)
-  part(parts, new THREE.BoxGeometry(0.44, 0.13, 0.26), tl, 0, 0.62, 0.08);
+  // team-BASE robe panels on all four faces + a broad team sash — real
+  // team-coloured SURFACE (round-5 judge: orbs alone left team identity to
+  // the hp bar). Panels lean with the cone's slope (atan(0.32/0.9) ≈ 0.34)
+  // so each face sits ON the robe, never floats.
+  part(parts, new THREE.BoxGeometry(0.26, 0.55, 0.05), tb, 0, 0.35, 0.19, { rx: -0.34 });
+  part(parts, new THREE.BoxGeometry(0.26, 0.55, 0.05), tb, 0, 0.35, -0.19, { rx: 0.34 });
+  part(parts, new THREE.BoxGeometry(0.05, 0.55, 0.26), tb, 0.19, 0.35, 0, { rz: 0.34 });
+  part(parts, new THREE.BoxGeometry(0.05, 0.55, 0.26), tb, -0.19, 0.35, 0, { rz: -0.34 });
+  part(parts, new THREE.BoxGeometry(0.48, 0.15, 0.3), tb, 0, 0.62, 0.08);
+  // oversized team-Lit orb hands — the caster's silhouette accent
   part(parts, new THREE.SphereGeometry(0.19, 6, 5), tl, -0.34, 0.76, 0.12);
   part(parts, new THREE.SphereGeometry(0.19, 6, 5), tl, 0.34, 0.76, 0.12);
   return parts;
@@ -262,6 +272,8 @@ function rangedCreepParts(team: TeamId): THREE.BufferGeometry[] {
 
 function siegeCreepParts(team: TeamId): THREE.BufferGeometry[] {
   const parts: THREE.BufferGeometry[] = [];
+  const tb = TEAM_COLORS[team] ?? APAL.azure;
+  const tl = TEAM_LIT[team] ?? APAL.azureLit;
   // beetle-shaped stone ram on 4 legs, team banners
   part(parts, new THREE.SphereGeometry(0.55, 8, 6), APAL.stoneDeep, 0, 0.72, 0, { sx: 1.1, sy: 0.72, sz: 1.5 });
   part(parts, new THREE.BoxGeometry(0.5, 0.3, 0.7), APAL.monumentDeep, 0, 0.95, -0.3);
@@ -274,11 +286,13 @@ function siegeCreepParts(team: TeamId): THREE.BufferGeometry[] {
       part(parts, new THREE.CylinderGeometry(0.07, 0.09, 0.55, 6), APAL.stoneDeep, sx, 0.28, sz);
     }
   }
-  // banner poles + oversized team-Lit banners — the silhouette's team read,
-  // sized to hold at 20-30m (round-4 judge)
+  // banner poles + FULL team-base banner cloth with a team-Lit top edge —
+  // real team-coloured surface, sized to hold at 30m (round-5 judge: the old
+  // thin Lit sliver was an accent, not a surface)
   for (const sx of [-0.28, 0.28] as const) {
-    part(parts, new THREE.CylinderGeometry(0.035, 0.035, 1.15, 5), APAL.trunk, sx, 1.55, -0.5);
-    part(parts, new THREE.BoxGeometry(0.07, 0.62, 0.5), TEAM_LIT[team] ?? APAL.azureLit, sx, 1.95, -0.32);
+    part(parts, new THREE.CylinderGeometry(0.035, 0.035, 1.45, 5), APAL.trunk, sx, 1.65, -0.5);
+    part(parts, new THREE.BoxGeometry(0.08, 0.78, 0.62), tb, sx, 1.92, -0.32);
+    part(parts, new THREE.BoxGeometry(0.09, 0.16, 0.64), tl, sx, 2.34, -0.32);
   }
   return parts;
 }

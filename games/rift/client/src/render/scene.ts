@@ -345,6 +345,15 @@ export function createScene(parent: HTMLElement): SceneHandle {
       out.z = ray.origin.z + ray.direction.z * t;
       return out.x >= 0 && out.x <= mapSide && out.z >= 0 && out.z <= mapSide;
     },
+    groundToScreen(x, z, out) {
+      // Project at a SMALL WORLD-HEIGHT offset (1.0m ≈ creep torso centre)
+      // above the ground point rather than exactly y=0: a world-space offset
+      // scales correctly with camera zoom under projection, whereas a CSS-px
+      // rise applied by the consumer would not — so DOM overlays (hero name
+      // labels) anchored here sit on the unit body at every zoom. Behind the
+      // camera, worldToScreen's z-range check returns false for us.
+      return core.worldToScreen(x, 1.0, z, out);
+    },
     pickUnit(sx, sy) {
       const rect = canvas.getBoundingClientRect();
       if (rect.width <= 0 || rect.height <= 0) return -1;
