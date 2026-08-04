@@ -18,6 +18,7 @@ import { createShop } from './ui/shop.js';
 import { createMinimap } from './ui/minimap.js';
 import { createMenus } from './ui/menus.js';
 import { createAudio } from './ui/audio.js';
+import { createNameLabels } from './ui/nameLabels.js';
 
 export function wire(root: HTMLElement): void {
   const scene = createScene(root);
@@ -65,6 +66,7 @@ export function wire(root: HTMLElement): void {
     minimap: createMinimap(root),
     menus: createMenus(root),
     audio: createAudio(),
+    nameLabels: createNameLabels(root),
   });
 
   game.onBegin = (begin) => {

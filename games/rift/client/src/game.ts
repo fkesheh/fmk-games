@@ -804,6 +804,13 @@ export class Game {
     m.scene.setCamera(this.camX, this.camZ, this.camH);
     if (inMatch) {
       m.units.sync(this.interp.sample(), this.interp.ghosts(), this.selfEntId);
+      m.nameLabels.update(
+        this.interp.sample(),
+        (x, z, out) => m.scene.groundToScreen(x, z, out),
+        (pid) => this.helloView?.roster.find((r) => r.id === pid)?.name,
+      );
+    } else {
+      m.nameLabels.update([], () => false, () => undefined);
     }
     m.scene.render(dtMs);
     m.fx.tick(dtMs);

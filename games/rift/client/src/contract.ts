@@ -151,6 +151,7 @@ export interface ClientModules {
   minimap: UiHandle;
   menus: UiHandle;
   audio: AudioHandle;
+  nameLabels: import('./ui/nameLabels.js').NameLabelsHandle;
 }
 
 // Frozen create-function SIGNATURES (bodies are T7's/T9's; wire.ts imports
