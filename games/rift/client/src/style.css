@@ -168,16 +168,45 @@ body {
   color: var(--paper-dim);
 }
 
-.menu-notice {
-  min-height: 18px;
+/* T9's menus.ts renders .menu-label (label wrapping its control),
+   .menu-heading, .menu-create / .menu-join (panel boxes), .menu-name +
+   .menu-code (text inputs), .menu-teamsize + .menu-speed (selects),
+   .menu-btn (+ .menu-quick primary), .menu-rooms list, .menu-note. */
+
+.menu-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--paper-deep);
+}
+
+.menu-heading {
+  margin: 0;
   font-size: 13px;
-  color: var(--danger);
+  letter-spacing: 0.2em;
+  color: var(--gold-lit);
+}
+
+.menu-create,
+.menu-join {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 12px;
+  padding: 14px 18px;
+  background: var(--ink-lit);
+  border: 1px solid var(--stone-deep);
+  border-radius: 6px;
 }
 
 .menu-name,
-.menu-code-input,
-.menu-select {
-  appearance: none;
+.menu-code,
+.menu-teamsize,
+.menu-speed {
   background: var(--ink-deep);
   border: 1px solid var(--stone-deep);
   border-radius: 4px;
@@ -186,61 +215,85 @@ body {
   padding: 10px 12px;
 }
 
+.menu-teamsize,
+.menu-speed {
+  cursor: pointer;
+}
+
 .menu-name {
   width: 240px;
   text-align: center;
   letter-spacing: 0.06em;
 }
 
-.menu-name:focus,
-.menu-code-input:focus,
-.menu-select:focus {
-  outline: none;
-  border-color: var(--azure);
-}
-
-.menu-options {
-  display: flex;
-  gap: 16px;
-}
-
-.menu-option {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.menu-option-label {
-  font-size: 12px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--paper-deep);
-}
-
-.menu-actions {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-  justify-content: center;
-}
-
 .menu-code {
-  display: flex;
-  gap: 8px;
-}
-
-.menu-code-input {
   width: 110px;
   text-align: center;
   text-transform: uppercase;
   letter-spacing: 0.2em;
 }
 
+.menu-name:focus,
+.menu-code:focus,
+.menu-teamsize:focus,
+.menu-speed:focus {
+  outline: none;
+  border-color: var(--azure);
+}
+
+.menu-btn {
+  border: 1px solid var(--stone);
+  border-radius: 4px;
+  background: var(--ink-deep);
+  color: var(--paper);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  padding: 10px 18px;
+  cursor: pointer;
+}
+
+.menu-btn:hover:not(:disabled) {
+  border-color: var(--gold);
+  color: var(--gold-lit);
+}
+
+.menu-btn:disabled {
+  color: var(--paper-deep);
+  border-color: var(--ink-lit);
+  background: var(--ink);
+  cursor: default;
+}
+
+.menu-quick {
+  /* the one gold primary on the menu — fastest path into a match */
+  border-color: var(--gold);
+  background: var(--gold);
+  color: var(--ink-deep);
+  font-weight: 800;
+}
+
+.menu-quick:hover:not(:disabled) {
+  background: var(--gold-lit);
+  color: var(--ink-deep);
+}
+
+.menu-quick:disabled {
+  border-color: var(--ink-lit);
+  background: var(--ink);
+  color: var(--paper-deep);
+}
+
+.menu-note {
+  max-width: 520px;
+  text-align: center;
+  color: var(--paper-dim);
+}
+
 .menu-rooms-title {
   margin: 18px 0 0;
   font-size: 13px;
   letter-spacing: 0.2em;
-  color: var(--paper-deep);
+  color: var(--gold-lit);
 }
 
 .menu-rooms {
@@ -259,6 +312,9 @@ body {
   background: var(--ink-lit);
   border: 1px solid var(--ink-deep);
   border-radius: 4px;
+  font: inherit;
+  color: var(--paper);
+  text-align: left;
 }
 
 .room-row--joinable {
@@ -291,18 +347,6 @@ body {
   color: var(--paper-deep);
   border: 1px dashed var(--stone-deep);
   border-radius: 4px;
-}
-
-.menu-rules {
-  margin-top: 18px;
-  max-width: 520px;
-}
-
-.menu-rule {
-  margin: 4px 0;
-  font-size: 12px;
-  color: var(--paper-deep);
-  text-align: center;
 }
 
 /* ============================================================================
@@ -338,36 +382,27 @@ body {
   color: var(--paper-dim);
 }
 
-.lobby-count-value {
-  color: var(--gold-lit);
-  font-weight: 700;
-}
-
-.lobby-count-min {
-  color: var(--paper-deep);
-}
-
-.lobby-invite {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 6px 12px;
+.lobby-code {
+  padding: 6px 14px;
   background: var(--ink-lit);
-  border: 1px solid var(--stone-deep);
+  border: 1px solid var(--gold);
   border-radius: 4px;
-}
-
-.lobby-invite-code {
-  font-size: 15px;
   letter-spacing: 0.25em;
   color: var(--gold-lit);
 }
 
-.lobby-roster {
+.lobby-teams {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 16px;
   width: min(760px, 94vw);
+}
+
+.lobby-heading {
+  margin: 0;
+  font-size: 13px;
+  letter-spacing: 0.2em;
+  color: var(--paper);
 }
 
 .lobby-team {
@@ -447,12 +482,42 @@ body {
 
 .lobby-start {
   min-width: 220px;
+  padding: 12px 22px;
+  border: 1px solid var(--gold);
+  border-radius: 5px;
+  background: var(--gold);
+  color: var(--ink-deep);
+  font-size: 16px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  cursor: pointer;
 }
 
-.lobby-reason {
-  min-height: 18px;
-  font-size: 13px;
+.lobby-start:hover:not(:disabled) {
+  background: var(--gold-lit);
+}
+
+/* grey ONLY when truly disabled — an enabled START is always the gold accent */
+.lobby-start:disabled {
+  border-color: var(--ink-lit);
+  background: var(--ink-lit);
+  color: var(--paper-deep);
+  cursor: default;
+}
+
+.lobby-leave {
+  padding: 8px 14px;
+  border: 1px solid var(--stone-deep);
+  border-radius: 4px;
+  background: var(--ink-lit);
   color: var(--paper-dim);
+  letter-spacing: 0.08em;
+  cursor: pointer;
+}
+
+.lobby-leave:hover {
+  border-color: var(--danger);
+  color: var(--paper);
 }
 
 .pick-grid {
@@ -517,11 +582,24 @@ body {
    16:9 and 21:9 share one layout; nothing lives in the ultrawide wings.
    ============================================================================ */
 
+/* The .hud root is a TRANSPARENT full-width row — it must NOT carry a
+   transform, because a transformed ancestor becomes the containing block for
+   every position:fixed descendant (.topbar, .killfeed, .banner, .hint,
+   .scoreboard, .death-overlay all live under .hud) and would pin them to the
+   bottom HUD instead of the viewport (round-1 UX failure). pointer-events
+   pass through except on the actual control panel. */
 .hud {
   position: fixed;
-  left: 50%;
+  left: 0;
+  right: 0;
   bottom: calc(10px + var(--safe-bottom, 0px));
-  transform: translateX(-50%);
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+
+/* the one classless child of .hud is the bottom control cluster (T9) */
+.hud > div:not([class]) {
   display: flex;
   align-items: flex-end;
   gap: 12px;
@@ -529,6 +607,7 @@ body {
   background: var(--ink);
   border: 1px solid var(--ink-deep);
   border-radius: 8px;
+  pointer-events: auto;
 }
 
 .hud-portrait {
@@ -538,10 +617,24 @@ body {
   border: 1px solid var(--stone-deep);
   background: var(--ink-lit);
   display: grid;
+  grid-template-rows: 1fr auto;
   place-items: center;
-  font-size: 28px;
-  color: var(--paper);
+  padding: 4px 0 3px;
   cursor: pointer; /* click centres the camera (UiActions.centerCamera) */
+}
+
+.hud-portrait > b {
+  /* hero glyph; T9 colours it inline with the hero's APAL accent */
+  font-size: 26px;
+  line-height: 1;
+}
+
+.hud-portrait > span {
+  /* hero level numeral */
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--gold-lit);
+  line-height: 1;
 }
 
 .hud-bars {
@@ -560,35 +653,35 @@ body {
   overflow: hidden;
 }
 
-.bar > span {
+.bar > i {
   /* the fill element T9 widths inline (a percentage is data, not colour) */
   position: absolute;
   inset: 0 auto 0 0;
 }
 
-.bar-hp > span {
+.bar-hp > i {
   background: var(--heal); /* self is heal-green (UX: never colour alone —
                              the numeric label rides inside every bar) */
 }
 
-.bar-mana > span {
+.bar-mana > i {
   background: var(--frost);
 }
 
 .bar-xp {
-  height: 8px;
+  height: 12px;
 }
 
-.bar-xp > span {
+.bar-xp > i {
   background: var(--gold);
 }
 
-.bar em {
+.bar > span {
+  /* the centred numeric label (T9 writes the text + inline font-size) */
   position: absolute;
   inset: 0;
   display: grid;
   place-items: center;
-  font-style: normal;
   font-size: 12px;
   color: var(--paper);
   text-shadow: 0 1px 2px var(--ink-deep);
@@ -603,26 +696,61 @@ body {
   position: relative;
   width: 48px;
   height: 48px;
+  padding: 0; /* a <button> — kill UA padding so the box stays 48px */
   border-radius: 6px;
   border: 1px solid var(--stone-deep);
   background: var(--ink-lit);
   display: grid;
   place-items: center;
-  font-size: 22px;
   color: var(--paper);
+}
+
+.ability-slot > b {
+  /* ability icon glyph — the only in-flow child, so it centres */
+  font-size: 22px;
+  line-height: 1;
+}
+
+.ability-slot > kbd {
+  /* Q/W/E/R hotkey badge */
+  position: absolute;
+  top: 1px;
+  left: 3px;
+  z-index: 2;
+  padding: 0 3px;
+  border-radius: 3px;
+  background: var(--ink-deep);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--gold-lit);
+}
+
+.ability-slot > span {
+  /* mana cost */
+  position: absolute;
+  top: 2px;
+  right: 3px;
+  z-index: 2;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--frost);
+  text-shadow: 0 1px 2px var(--ink-deep);
 }
 
 .ability-slot--ready {
   border-color: var(--azure);
+  box-shadow: 0 0 8px var(--azure-deep);
 }
 
 .ability-slot--ult-locked {
-  opacity: 0.5;
+  opacity: 0.9; /* the 'LV n' sweep label carries the lock, not a fade */
 }
 
 .ability-cd {
   position: absolute;
   inset: 0;
+  z-index: 1;
   display: grid;
   place-items: center;
   background: var(--ink-deep);
@@ -638,34 +766,31 @@ body {
   left: 3px;
   right: 3px;
   bottom: 2px;
+  z-index: 2;
   display: flex;
   gap: 2px;
   justify-content: center;
-}
-
-.ability-rank i {
-  width: 6px;
-  height: 3px;
-  background: var(--stone-deep);
-}
-
-.ability-rank i.on {
-  background: var(--gold);
+  color: var(--gold); /* T9 writes ●/○ rank pips as text */
+  font-size: 12px;
+  line-height: 1;
 }
 
 .ability-plus {
   position: absolute;
-  top: -6px;
-  right: -6px;
-  width: 18px;
-  height: 18px;
+  top: -7px;
+  right: -7px;
+  z-index: 3;
+  width: 20px;
+  height: 20px;
   border-radius: 50%;
+  border: 1px solid var(--gold-lit);
   display: grid;
   place-items: center;
   background: var(--gold);
   color: var(--ink-deep);
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 800;
+  line-height: 1;
   cursor: pointer;
   animation: rift-pulse 1s ease-in-out infinite; /* 1Hz — under the 3Hz law */
 }
@@ -680,13 +805,34 @@ body {
   position: relative;
   width: 40px;
   height: 40px;
+  padding: 0; /* a <button> — kill UA padding so the box stays 40px */
   border-radius: 5px;
   border: 1px solid var(--ink-deep);
   background: var(--ink-lit);
   display: grid;
   place-items: center;
-  font-size: 18px;
   color: var(--paper);
+}
+
+.item-slot > b {
+  /* item icon glyph — the only in-flow child, so it centres */
+  font-size: 18px;
+  line-height: 1;
+}
+
+.item-slot > kbd {
+  /* 1-6 hotkey badge */
+  position: absolute;
+  top: 1px;
+  left: 2px;
+  z-index: 2;
+  padding: 0 2px;
+  border-radius: 3px;
+  background: var(--ink-deep);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--paper-dim);
 }
 
 .item-slot--empty {
@@ -720,11 +866,20 @@ body {
   display: flex;
   align-items: center;
   gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--gold);
+  border-radius: 5px;
+  background: var(--ink-lit);
   font-size: 15px;
   font-weight: 700;
   color: var(--gold);
   min-width: 72px;
   justify-content: flex-end;
+  cursor: pointer;
+}
+
+.gold-readout:hover {
+  background: var(--ink-deep);
 }
 
 .kda {
@@ -842,11 +997,21 @@ body {
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
-  min-width: min(560px, 92vw);
+  width: max-content; /* every row — LV + KDA included — always fits */
+  max-width: 94vw;
+  max-height: 90vh;
+  overflow-y: auto;
   padding: 18px 22px;
   background: var(--ink);
   border: 1px solid var(--stone-deep);
   border-radius: 8px;
+  box-shadow: 0 8px 32px var(--ink-deep);
+}
+
+.scoreboard > div {
+  /* T9 renders classless header/team/row divs with the full text line */
+  white-space: nowrap;
+  line-height: 1.55;
 }
 
 .scoreboard table {
@@ -888,7 +1053,9 @@ body {
   position: fixed;
   top: calc(56px + var(--safe-top, 0px));
   right: calc(10px + var(--safe-right, 0px));
-  bottom: calc(220px + var(--safe-bottom, 0px));
+  /* anchored at the top and height-capped so EVERY item stays reachable even
+     at 1280x720 (round-1 UX failure: bottom:220px clipped 3 of 11 items) */
+  max-height: calc(100vh - 72px - var(--safe-top, 0px));
   width: min(360px, 92vw);
   display: flex;
   flex-direction: column;
@@ -901,7 +1068,9 @@ body {
 
 .shop-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  /* minmax(0, …) — plain 1fr keeps each track's automatic min-content
+     minimum and the grid overflows the 360px panel at 720p */
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
 }
 
@@ -909,6 +1078,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  min-width: 0; /* let long blurbs shrink inside their grid track */
   padding: 10px;
   background: var(--ink-lit);
   border: 1px solid var(--ink-deep);
@@ -1021,14 +1191,16 @@ body {
 .hint {
   position: fixed;
   left: 50%;
-  bottom: 130px;
+  bottom: 130px; /* anchored above the bottom HUD panel, never on top of it */
   transform: translateX(-50%);
+  z-index: 5;
   padding: 8px 16px;
   background: var(--ink);
   border: 1px solid var(--gold);
   border-radius: 6px;
   font-size: 13px;
   color: var(--gold-lit);
+  white-space: nowrap;
   pointer-events: none;
   animation: rift-pulse 1s ease-in-out infinite; /* 1Hz — under the 3Hz law */
 }
@@ -1120,5 +1292,29 @@ body {
 
   .menu-title {
     font-size: 34px;
+  }
+}
+
+/* short viewports (720p): compact shop rows so every item stays reachable
+   inside the max-height cap without scrolling */
+@media (max-height: 800px) {
+  .shop-panel {
+    padding: 10px;
+  }
+
+  .shop-grid {
+    gap: 6px;
+  }
+
+  .shop-item {
+    padding: 6px 8px;
+    gap: 2px;
+  }
+
+  .shop-item > i {
+    /* blurb: one line, ellipsised — the title attr carries the full text */
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 }

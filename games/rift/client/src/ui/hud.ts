@@ -2,8 +2,9 @@
 // ANCIENTS (rift) client — HUD (CONTRACT §6 ui/hud.ts + §8 UX bible, T9).
 // Bottom-centre portrait/hp/mana/ability/item cluster, top-centre match clock
 // + team score + towers standing, top-right kill feed, gold/shop button, K/D/A,
-// level + XP bar, TAB scoreboard, death overlay, first-60-seconds hints, and
-// the disconnect banner. Pure DOM — T8's style.css owns layout and static look;
+// level + XP bar, TAB scoreboard, death overlay, first-60-seconds hints (ONE at
+// a time — RMB-move > lane arrow > shop — dismissed on use, suppressed while
+// the scoreboard is open), and the disconnect banner. Pure DOM — T8's style.css owns layout and static look;
 // this file owns structure, text, dynamic widths/opacities, and the ONLY
 // colours it sets inline are APAL entries (team identity + hero accents).
 //
@@ -530,6 +531,7 @@ export function createHud(parent: HTMLElement): UiHandle {
       rebuildKillfeed(s, nowMs);
 
       // ---- personal cluster -----------------------------------------------------------
+      const boardOpen = s.scoreboardOpen && snap !== null; // hints + scoreboard never coexist
       if (you) {
         if (heroId !== you.hero) {
           heroId = you.hero;
@@ -556,6 +558,7 @@ export function createHud(parent: HTMLElement): UiHandle {
         setText(barManaText, `${Math.ceil(you.mana)} / ${Math.ceil(you.maxMana)}`);
 
         const lvl = Math.min(you.level, LEVEL_CAP);
+        setText(portraitName, `LV ${lvl}`); // hero level numeral lives on the portrait
         const lo = XP_THRESHOLDS[lvl] ?? 0;
         const hi = XP_THRESHOLDS[lvl + 1];
         const xpFrac = hi === undefined || hi <= lo ? 1 : Math.max(0, Math.min(1, (you.xp - lo) / (hi - lo)));
@@ -583,6 +586,17 @@ export function createHud(parent: HTMLElement): UiHandle {
           const unusable =
             ultLocked || (!ab.isPassive && rank === 0) || (!ab.isPassive && you.mana < cost);
           dom.slot.style.opacity = unusable ? '0.35' : '';
+          // control-surface states (frozen state classes, §6): a castable
+          // active glows --ready; a level-gated ult wears --ult-locked and its
+          // sweep overlay reads the unlock level ('LV 6') instead of a cooldown
+          const ready =
+            !ab.isPassive && !unusable && rank >= 1 && remainingS <= 0.05;
+          dom.slot.classList.toggle('ability-slot--ready', ready);
+          dom.slot.classList.toggle('ability-slot--ult-locked', ultLocked);
+          if (ultLocked) {
+            dom.cd.style.height = '100%';
+            setText(dom.cd, `LV ${ULT_LEVEL_REQ[rank] ?? '?'}`);
+          }
           // '+' : a skill point is waiting and this rank is legal
           const canRank =
             you.skillPoints > 0 &&
@@ -659,7 +673,11 @@ export function createHud(parent: HTMLElement): UiHandle {
         if (s.shopOpen) shopOpenedOnce = true;
         const inWindow = gameS <= HINT_WINDOW_S;
 
-        hintMove.style.display = inWindow && !movedEnough ? '' : 'none';
+        // ONE hint at a time (§8): stacking popups occluded the ability bar.
+        // Priority: RMB-move > lane arrow > shop. All are suppressed while the
+        // scoreboard is open so the overlay never fights a popup.
+        const showMove = inWindow && !movedEnough && !boardOpen;
+        hintMove.style.display = showMove ? '' : 'none';
 
         // lane arrow toward the assigned lane's midpoint (begin.laneAssignment)
         if (inWindow && laneTarget === null && s.begin && s.hello) {
@@ -673,7 +691,7 @@ export function createHud(parent: HTMLElement): UiHandle {
             }
           }
         }
-        const showLane = inWindow && laneTarget !== null;
+        const showLane = !showMove && inWindow && laneTarget !== null && !boardOpen;
         hintLane.style.display = showLane ? '' : 'none';
         if (showLane && laneTarget !== null) {
           hintLaneArrow.style.transform = `rotate(${laneArrowAngle(s.cameraX, s.cameraZ, laneTarget.x, laneTarget.z)}rad)`;
@@ -683,8 +701,15 @@ export function createHud(parent: HTMLElement): UiHandle {
         const nearFountain =
           ownAncientFound &&
           Math.hypot(you.x - ownAncientX, you.z - ownAncientZ) <= FOUNTAIN_RADIUS + 1;
-        hintShop.style.display =
-          inWindow && !shopOpenedOnce && you.gold >= SHOP_HINT_GOLD && nearFountain ? '' : 'none';
+        const showShop =
+          !showMove &&
+          !showLane &&
+          inWindow &&
+          !shopOpenedOnce &&
+          you.gold >= SHOP_HINT_GOLD &&
+          nearFountain &&
+          !boardOpen;
+        hintShop.style.display = showShop ? '' : 'none';
       } else {
         death.style.display = 'none';
         hintMove.style.display = 'none';
@@ -693,7 +718,7 @@ export function createHud(parent: HTMLElement): UiHandle {
       }
 
       // ---- scoreboard (TAB) ------------------------------------------------------------
-      const open = s.scoreboardOpen && snap !== null;
+      const open = boardOpen;
       scoreboard.style.display = open ? '' : 'none';
       if (open) {
         scoreboardWasOpen = true;

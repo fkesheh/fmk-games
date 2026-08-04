@@ -20,14 +20,16 @@
 // actions is the §6 debug surface window.__rift — createPrivate(name,
 // settings?) and joinPrivate(name, code) are FROZEN and game.ts (T8) must
 // implement them — so the menu's create/join buttons drive exactly those (the
-// same path the e2e drives; UI and e2e can never diverge). The browseable
-// public room list has NO frozen carrier (no rooms in ClientState, no
-// list_rooms/join_public/quick_join anywhere) and is therefore OMITTED rather
-// than stubbed — extending UiActions/ClientState is the orchestrator's call.
-// If __rift is absent (unit harness), the buttons disable honestly.
+// same path the e2e drives; UI and e2e can never diverge). The public room
+// list rides game.ts's ADDITIVE __rift extensions — rooms() / joinPublic() /
+// quickJoin() (ClientState still has no channel; extending UiActions is the
+// orchestrator's call) — each probed with typeof and degraded to an honest
+// unavailable state when absent (unit harness). If __rift is absent entirely,
+// every button disables honestly.
 // ============================================================================
 import { APAL, HERO_LIST, MAX_TEAM_SIZE, MIN_TEAM_SIZE, heroById } from '@rift/shared';
 import type { HeroDef, HeroId, RosterEntry } from '@rift/shared';
+import type { RoomInfo } from '@platform/shared';
 import type { ClientState, UiActions, UiHandle } from '../contract.js';
 
 const FONT_MIN_PX = 12;
@@ -35,10 +37,15 @@ const FONT_MIN_PX = 12;
 const TEAM_LABEL: readonly string[] = ['AZURE', 'EMBER'];
 const TEAM_APAL: readonly string[] = [APAL.azure, APAL.ember];
 
-/** The frozen §6 debug surface, the menu's create/join transport (see header). */
+/** The frozen §6 debug surface, the menu's create/join transport (see header).
+ *  rooms()/quickJoin()/joinPublic() are the ADDITIVE surface game.ts provides
+ *  for the public room list; they are probed per call and degrade honestly. */
 interface RiftDebugSurface {
   createPrivate(name: string, settings?: Record<string, unknown>): void;
   joinPrivate(name: string, code: string): void;
+  rooms?(): readonly RoomInfo[];
+  quickJoin?(name: string): void;
+  joinPublic?(name: string, roomId: string): void;
 }
 
 function debugSurface(): RiftDebugSurface | null {
@@ -169,6 +176,15 @@ export function createMenus(parent: HTMLElement): UiHandle {
   joinBtn.style.fontSize = '14px';
   joinBtn.textContent = 'JOIN PRIVATE ROOM';
 
+  const quickBtn = el('button', 'menu-btn menu-quick', menu);
+  quickBtn.style.fontSize = '14px';
+  quickBtn.textContent = 'QUICK MATCH — first open public room';
+
+  const roomsTitle = el('h2', 'menu-rooms-title', menu);
+  roomsTitle.style.fontSize = '14px';
+  roomsTitle.textContent = 'PUBLIC ROOMS';
+  const roomsList = el('div', 'menu-rooms', menu);
+
   const menuNote = el('p', 'menu-note', menu);
   menuNote.style.fontSize = `${FONT_MIN_PX}px`;
   menuNote.textContent =
@@ -200,6 +216,72 @@ export function createMenus(parent: HTMLElement): UiHandle {
     storeName(name);
     d.joinPrivate(name, code);
   };
+  quickBtn.onclick = () => {
+    const d = debugSurface();
+    if (!d || typeof d.quickJoin !== 'function') return;
+    const name = cleanName();
+    storeName(name);
+    d.quickJoin(name);
+  };
+
+  // -- public room list (additive __rift surface; game.ts polls list_rooms in
+  //    menu phase, this rebuilds only when the visible set actually changes) --
+  let roomsSig = '';
+
+  function roomEmptyState(text: string): void {
+    roomsList.replaceChildren();
+    const empty = el('div', 'room-empty', roomsList);
+    empty.style.fontSize = `${FONT_MIN_PX}px`;
+    empty.textContent = text;
+  }
+
+  function rebuildRooms(): void {
+    const d = debugSurface();
+    if (d === null || typeof d.rooms !== 'function' || typeof d.joinPublic !== 'function') {
+      if (roomsSig !== 'unavailable') {
+        roomsSig = 'unavailable';
+        roomEmptyState('room list unavailable — no connection layer');
+      }
+      return;
+    }
+    const rooms = d
+      .rooms()
+      .filter((r) => r.visibility === 'public')
+      .sort((a, b) => a.phase.localeCompare(b.phase) || b.players - a.players);
+    if (rooms.length === 0) {
+      if (roomsSig !== 'empty') {
+        roomsSig = 'empty';
+        roomEmptyState('No public rooms yet — create one and friends can find it here.');
+      }
+      return;
+    }
+    const sig = rooms
+      .map((r) => `${r.id}:${r.label}:${r.players}/${r.maxPlayers}:${r.phase}`)
+      .join('|');
+    if (sig === roomsSig) return;
+    roomsSig = sig;
+    roomsList.replaceChildren();
+    for (const room of rooms) {
+      const row = el('button', 'room-row room-row--joinable', roomsList);
+      const title = el('span', 'room-title', row);
+      title.style.fontSize = '14px';
+      title.textContent = room.label;
+      const label = el('span', 'room-label', row);
+      label.style.fontSize = `${FONT_MIN_PX}px`;
+      label.textContent = room.phase === 'lobby' ? 'IN LOBBY' : 'LIVE — join mid-match';
+      const meta = el('span', 'room-meta', row);
+      meta.style.fontSize = `${FONT_MIN_PX}px`;
+      meta.textContent = `${room.players}/${room.maxPlayers} seated`;
+      const roomId = room.id;
+      row.onclick = () => {
+        const d2 = debugSurface();
+        if (!d2 || typeof d2.joinPublic !== 'function') return;
+        const name = cleanName();
+        storeName(name);
+        d2.joinPublic(name, roomId);
+      };
+    }
+  }
 
   // ============================== LOBBY ======================================
   const lobby = el('div', 'lobby', root);
@@ -372,6 +454,14 @@ export function createMenus(parent: HTMLElement): UiHandle {
         joinBtn.disabled = d === null;
         createBtn.title = d === null ? 'unavailable — no connection layer' : 'Create a private room';
         joinBtn.title = d === null ? 'unavailable — no connection layer' : 'Join with an invite code';
+        const canQuick = d !== null && typeof d.quickJoin === 'function';
+        quickBtn.disabled = !canQuick;
+        quickBtn.title = canQuick
+          ? 'Join the first open public room (a fresh one is created if none exists)'
+          : 'unavailable — no connection layer';
+        rebuildRooms();
+      } else {
+        roomsSig = ''; // force a fresh rebuild on the next menu visit
       }
 
       if (showLobby) {
@@ -402,8 +492,10 @@ export function createMenus(parent: HTMLElement): UiHandle {
           rebuildLobby(s);
         }
         if (l) {
+          // CSS owns the look: .lobby-start is a gold accent when enabled and
+          // greys ONLY via :disabled — never inline opacity, so an enabled
+          // START can never read as disabled (round-1 UX failure)
           lobbyStart.disabled = !l.canStart;
-          lobbyStart.style.opacity = l.canStart ? '' : '0.4';
           if (l.countdownEndsAt > 0) {
             // countdownEndsAt is server-epoch ms; the clock offset lives in
             // T8's net layer, so this is the honest coarse readout
@@ -413,7 +505,6 @@ export function createMenus(parent: HTMLElement): UiHandle {
               leftMs > 0 ? `STARTING IN ${Math.max(1, Math.ceil(leftMs / 1000))}…` : 'STARTING…',
             );
             lobbyStart.disabled = true;
-            lobbyStart.style.opacity = '0.4';
           } else {
             setText(lobbyStart, l.canStart ? 'START MATCH' : 'START — waiting for players');
           }
