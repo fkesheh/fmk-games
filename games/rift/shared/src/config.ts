@@ -156,9 +156,11 @@ export const WARD_RESTOCK_S = 120; // +1 team stock per interval
  *  units are fog-filtered. Wards are visible to their own team only. */
 
 // --- Match arc ----------------------------------------------------------------------
-export const OVERTIME_AT_S = 1_200; // 20:00 — surge begins
+export const OVERTIME_AT_S = 660; // 11:00 — surge begins (measured: 1200 pushes the duration median past the §9 band)
 export const SURGE_WAVE_GROWTH = 0.11; // replaces WAVE_GROWTH in overtime
-export const SURGE_EXTRA_MELEE_PERIOD_S = 60; // +1 melee per wave per elapsed period of OT
+export const SURGE_EXTRA_MELEE_PERIOD_S = 600; // +1 melee per wave per elapsed period of OT
+// (slow by design: the unit flood at 60s broke the §10 2ms tick budget — surge
+// growth, not unit count, carries the anti-sprawl)
 export const MATCH_HARD_CAP_S = 1_800; // 30:00 — tiebreak end
 /** Tiebreak order at hard cap: 1) ancient hp fraction 2) structures standing
  *  3) hero kills 4) team gold earned. Still equal -> draw (winner null). */
