@@ -298,7 +298,9 @@ backoff, every create/join carries `game: 'rift'`, room list filtered to rift.
 `InterpEnt`/`GhostEnt`/`InterpHandle`, `SceneHandle`/`UnitsHandle`/`FogHandle`/
 `FxHandle`, `ClientState`/`UiActions`/`UiHandle`/`AudioHandle`,
 `ClientModules`, and the frozen create-function signatures (in its footer
-comment). T7/T8/T9 import ONLY these types from each other's territory.
+comment). `SceneHandle` includes `groundToScreen` (world -> CSS px) for DOM
+overlays — hero name labels (§8's name-label law) render as pooled DOM
+projected per frame. T7/T8/T9 import ONLY these types from each other's territory.
 **main.ts and wire.ts are orchestrator-owned** (created at integration);
 T8's `Game` class takes `(root, modules: ClientModules)` and never imports an
 implementation module. The DOM CLASS

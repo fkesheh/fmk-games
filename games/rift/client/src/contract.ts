@@ -65,6 +65,9 @@ export interface SceneHandle {
   /** Fixed-angle MOBA camera: look at (x, z) from `height` metres. */
   setCamera(x: number, z: number, height: number): void;
   screenToGround(sx: number, sy: number, out: { x: number; z: number }): boolean;
+  /** World ground point -> CSS pixel position (for DOM overlays like hero
+   *  name labels). Returns false when behind the camera. */
+  groundToScreen(x: number, z: number, out: { x: number; y: number }): boolean;
   /** Entity id under the cursor, -1 = none. */
   pickUnit(sx: number, sy: number): number;
   resize(): void;
