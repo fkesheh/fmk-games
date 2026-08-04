@@ -505,7 +505,12 @@ export function createMenus(parent: HTMLElement): UiHandle {
               leftMs > 0 ? `STARTING IN ${Math.max(1, Math.ceil(leftMs / 1000))}…` : 'STARTING…',
             );
             lobbyStart.disabled = true;
+            // the countdown is the most time-critical readout of the pre-match
+            // flow — it must NOT wear the disabled greys (round-5 UX: it read
+            // dimmer than LEAVE ROOM beneath it). CSS owns the bright state.
+            lobbyStart.classList.add('lobby-start--countdown');
           } else {
+            lobbyStart.classList.remove('lobby-start--countdown');
             setText(lobbyStart, l.canStart ? 'START MATCH' : 'START — waiting for players');
           }
           lobbyStart.onclick = l.canStart ? () => actionsRef?.send({ t: 'rift_start' }) : null;

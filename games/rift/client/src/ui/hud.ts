@@ -61,7 +61,10 @@ const SHOP_HINT_GOLD = 400; // §8: shop hint first appears at 400+ gold
 const FONT_MIN_PX = 12; // §8: smallest HUD text at 1080p
 const VALUE_FONT_PX = 13; // bar values + mana costs: above the 12px floor (round-2 UX)
 const LANE_ARROW_ARRIVE_M = 10; // hero this close to the lane midpoint = arrow used
-const LANE_ARROW_OFFSET_PX = 150; // screen-space orbit radius around the hero
+const LANE_ARROW_OFFSET_PX = 200; // screen-space orbit radius (round-5 UX: 150 sat ON the hero)
+const LANE_LABEL_MAX_S = 20; // hard fallback: the lane TEXT retires after 20s live (round-5 UX)
+const UI_SCALE_MIN_W = 2200; // 21:9 ultrawide breakpoint (matches style.css)
+const UI_SCALE_ULTRA = 1.2; // ultrawide HUD chrome scale (round-5 UX)
 
 const TEAM_LABEL: readonly string[] = ['AZURE', 'EMBER'];
 const TEAM_APAL: readonly string[] = [APAL.azure, APAL.ember];
@@ -181,18 +184,42 @@ export function createHud(parent: HTMLElement): UiHandle {
   const root = el('div', 'hud', parent);
   root.style.display = 'none';
 
+  // -- ultrawide inline-font scaling (round-5 UX) -------------------------------
+  // A stylesheet can NEVER override an inline font-size, and transform:scale
+  // never changes computed text size — so every inline px goes through
+  // fitText and is re-applied when the 2200px breakpoint flips. style.css
+  // owns the geometry side of the same 1.2x scale.
+  let uiScaleApplied = 1;
+  const scaledTexts: { e: HTMLElement; base: number }[] = [];
+  const scaledPx = (base: number): string =>
+    `${Math.round(base * uiScaleApplied * 10) / 10}px`;
+  function fitText(e: HTMLElement, basePx: number): void {
+    scaledTexts.push({ e, base: basePx });
+    e.style.fontSize = scaledPx(basePx);
+  }
+  function applyUiScale(): void {
+    const s = window.innerWidth >= UI_SCALE_MIN_W ? UI_SCALE_ULTRA : 1;
+    if (s === uiScaleApplied) return;
+    uiScaleApplied = s;
+    for (const t of scaledTexts) t.e.style.fontSize = scaledPx(t.base);
+    for (const row of Array.from(killfeed.children)) {
+      (row as HTMLElement).style.fontSize = scaledPx(FONT_MIN_PX);
+    }
+    scoreboardSig = ''; // force a rebuild at the new scale
+  }
+
   // -- top bar -------------------------------------------------------------------
   const topbar = el('div', 'topbar', root);
   const scoreA = el('span', 'team-score', topbar);
-  scoreA.style.fontSize = '18px';
+  fitText(scoreA, 18);
   const towersA = el('span', 'tower-count', topbar);
-  towersA.style.fontSize = '14px';
+  fitText(towersA, 14);
   const clock = el('span', 'match-clock', topbar);
-  clock.style.fontSize = '20px';
+  fitText(clock, 20);
   const towersB = el('span', 'tower-count', topbar);
-  towersB.style.fontSize = '14px';
+  fitText(towersB, 14);
   const scoreB = el('span', 'team-score', topbar);
-  scoreB.style.fontSize = '18px';
+  fitText(scoreB, 18);
 
   // -- kill feed (top right) -------------------------------------------------------
   const killfeed = el('div', 'killfeed', root);
@@ -200,7 +227,7 @@ export function createHud(parent: HTMLElement): UiHandle {
   // -- disconnect banner -------------------------------------------------------------
   const banner = el('div', 'banner', root);
   banner.style.display = 'none';
-  banner.style.fontSize = '16px';
+  fitText(banner, 16);
   banner.textContent = 'CONNECTION LOST — reconnecting…';
 
   // -- bottom-centre cluster ---------------------------------------------------------
@@ -209,21 +236,21 @@ export function createHud(parent: HTMLElement): UiHandle {
   const portrait = el('button', 'hud-portrait', bottom);
   const portraitGlyph = el('b', null, portrait);
   const portraitName = el('span', null, portrait);
-  portraitName.style.fontSize = `${FONT_MIN_PX}px`;
+  fitText(portraitName, FONT_MIN_PX);
 
   const bars = el('div', 'hud-bars', bottom);
   const barHp = el('div', 'bar bar-hp', bars);
   const barHpFill = el('i', null, barHp);
   const barHpText = el('span', null, barHp);
-  barHpText.style.fontSize = `${VALUE_FONT_PX}px`;
+  fitText(barHpText, VALUE_FONT_PX);
   const barMana = el('div', 'bar bar-mana', bars);
   const barManaFill = el('i', null, barMana);
   const barManaText = el('span', null, barMana);
-  barManaText.style.fontSize = `${VALUE_FONT_PX}px`;
+  fitText(barManaText, VALUE_FONT_PX);
   const barXp = el('div', 'bar bar-xp', bars);
   const barXpFill = el('i', null, barXp);
   const barXpText = el('span', null, barXp);
-  barXpText.style.fontSize = `${VALUE_FONT_PX}px`;
+  fitText(barXpText, VALUE_FONT_PX);
 
   const abilityBar = el('div', 'ability-bar', bottom);
   const abilityDoms: AbilitySlotDom[] = [];
@@ -232,15 +259,15 @@ export function createHud(parent: HTMLElement): UiHandle {
     const glyph = el('b', null, slot);
     const key = el('kbd', null, slot);
     key.textContent = SLOT_KEYS[i] ?? '';
-    key.style.fontSize = `${FONT_MIN_PX}px`;
+    fitText(key, FONT_MIN_PX);
     const cd = el('div', 'ability-cd', slot);
     const cost = el('span', null, slot); // T8: `.ability-slot > span` (mana cost)
-    cost.style.fontSize = `${VALUE_FONT_PX}px`;
+    fitText(cost, VALUE_FONT_PX);
     const rank = el('div', 'ability-rank', slot);
-    rank.style.fontSize = `${FONT_MIN_PX}px`;
+    fitText(rank, FONT_MIN_PX);
     const plus = el('button', 'ability-plus', slot);
     plus.textContent = '+';
-    plus.style.fontSize = '14px';
+    fitText(plus, 14);
     plus.style.display = 'none';
     abilityDoms.push({ slot, glyph, key, cost, cd, rank, plus });
   }
@@ -252,19 +279,19 @@ export function createHud(parent: HTMLElement): UiHandle {
     const glyph = el('b', null, slot);
     const key = el('kbd', null, slot);
     key.textContent = String(i + 1);
-    key.style.fontSize = `${FONT_MIN_PX}px`;
+    fitText(key, FONT_MIN_PX);
     const charges = el('span', 'item-charges', slot);
-    charges.style.fontSize = `${FONT_MIN_PX}px`;
+    fitText(charges, FONT_MIN_PX);
     const cd = el('div', 'item-cd', slot);
     itemDoms.push({ slot, glyph, key, charges, cd });
   }
 
   const gold = el('button', 'gold-readout', bottom);
-  gold.style.fontSize = '16px';
+  fitText(gold, 16);
   gold.title = 'Open the shop (must stand at your fountain to buy)';
 
   const kda = el('span', 'kda', bottom);
-  kda.style.fontSize = '14px';
+  fitText(kda, 14);
 
   // -- death overlay -----------------------------------------------------------------
   const death = el('div', 'death-overlay', root);
@@ -272,7 +299,7 @@ export function createHud(parent: HTMLElement): UiHandle {
   const deathText = el('div', null, death);
   deathText.textContent = 'YOU DIED';
   const respawn = el('div', 'respawn-count', death);
-  respawn.style.fontSize = '48px';
+  fitText(respawn, 48);
 
   // -- scoreboard (TAB) -------------------------------------------------------------
   const scoreboard = el('div', 'scoreboard', root);
@@ -281,7 +308,7 @@ export function createHud(parent: HTMLElement): UiHandle {
   // -- first-60-seconds onboarding -------------------------------------------------
   const hintMove = el('div', 'hint', root);
   hintMove.style.display = 'none';
-  hintMove.style.fontSize = '16px';
+  fitText(hintMove, 16);
   hintMove.textContent = 'RIGHT-CLICK the ground to move';
   // lane arrow: a SEPARATE directional indicator (§8), not one of the queued
   // text hints — it must read at spawn, so it never waits behind hintMove.
@@ -290,17 +317,17 @@ export function createHud(parent: HTMLElement): UiHandle {
   // transform override the pill's default bottom-centre anchor.
   const hintLane = el('div', 'hint', root);
   hintLane.style.display = 'none';
-  hintLane.style.fontSize = '16px';
+  fitText(hintLane, 16);
   hintLane.style.bottom = 'auto';
   hintLane.style.transform = 'translate(-50%, -50%)';
   const hintLaneArrow = el('b', null, hintLane);
   hintLaneArrow.textContent = '➤';
   hintLaneArrow.style.display = 'inline-block'; // transformable
-  hintLaneArrow.style.fontSize = '24px';
+  fitText(hintLaneArrow, 24);
   const hintLaneText = el('span', null, hintLane);
   const hintShop = el('div', 'hint', root);
   hintShop.style.display = 'none';
-  hintShop.style.fontSize = '16px';
+  fitText(hintShop, 16);
   hintShop.textContent = 'You have gold — open the SHOP at your fountain';
 
   // -- render-cycle state (no per-frame allocation beyond the killfeed rebuild) --------
@@ -311,6 +338,7 @@ export function createHud(parent: HTMLElement): UiHandle {
   let spawnZ = 0;
   let spawnKnown = false;
   let movedEnough = false;
+  let orderIssued = false; // first move ORDER retires the lane text + RMB hint
   let shopOpenedOnce = false;
   let laneTarget: { x: number; z: number } | null = null;
   let laneName = '';
@@ -323,10 +351,33 @@ export function createHud(parent: HTMLElement): UiHandle {
   function resetMatchHints(): void {
     spawnKnown = false;
     movedEnough = false;
+    orderIssued = false;
     shopOpenedOnce = false;
     laneTarget = null;
     laneName = '';
   }
+
+  // First move ORDER detection (round-5 UX: the 'your lane: MID' text and the
+  // RMB hint were both still up at 0:59). input.ts (T8) sends orders straight
+  // to the net — unreachable through the frozen ClientState/UiActions seams —
+  // so hud listens to the SAME raw verbs input.ts maps onto rift_order: RMB
+  // down (move/attack), A (attack-move arm), S (stop). Capture phase, inert
+  // in the unit harness, reset per match; the snap-observed position fallback
+  // (movedEnough) and the hard 20s clock (LANE_LABEL_MAX_S) back it up.
+  window.addEventListener(
+    'pointerdown',
+    (ev) => {
+      if (ev.button === 2) orderIssued = true;
+    },
+    true,
+  );
+  window.addEventListener(
+    'keydown',
+    (ev) => {
+      if (ev.code === 'KeyA' || ev.code === 'KeyS') orderIssued = true;
+    },
+    true,
+  );
 
   /** id -> display name, from hello.roster + the newest rift_roster event. */
   function buildNameMap(s: ClientState, out: Map<string, string>): void {
@@ -431,7 +482,7 @@ export function createHud(parent: HTMLElement): UiHandle {
         const row = document.createElement('div');
         row.className = 'kill-row';
         row.dataset.key = r.key;
-        row.style.fontSize = `${FONT_MIN_PX}px`;
+        row.style.fontSize = scaledPx(FONT_MIN_PX);
         row.innerHTML = r.html;
         return row;
       }),
@@ -455,11 +506,11 @@ export function createHud(parent: HTMLElement): UiHandle {
     // build into a detached host, then swap in one replaceChildren
     const host = document.createElement('div');
     const head = el('div', null, host);
-    head.style.fontSize = '14px';
+    head.style.fontSize = scaledPx(14);
     head.textContent = 'SCOREBOARD';
     for (const team of [0, 1] as const) {
       const label = el('div', null, host);
-      label.style.fontSize = '14px';
+      label.style.fontSize = scaledPx(14);
       label.style.color = TEAM_APAL[team] ?? APAL.paper;
       label.textContent = `${TEAM_LABEL[team] ?? ''} — ${snap.kills[team] ?? 0} kills`;
       const rows = snap.board
@@ -467,10 +518,12 @@ export function createHud(parent: HTMLElement): UiHandle {
         .sort((a, b2) => b2.kills - a.kills || a.deaths - b2.deaths);
       for (const b of rows) {
         const row = el('div', null, host);
-        row.style.fontSize = `${FONT_MIN_PX}px`;
+        row.style.fontSize = scaledPx(FONT_MIN_PX);
         const hero = heroById(b.hero);
         const name = nameMap.get(b.id) ?? (b.bot ? 'Bot' : 'Player');
-        const tags = `${b.bot ? ' [BOT]' : ''}${b.connected ? '' : ' [OFFLINE]'}`;
+        // [OFFLINE] marks a disconnected HUMAN seat only — a bot is never
+        // 'offline', it just plays (round-5 UX: bots read '[BOT] [OFFLINE]')
+        const tags = `${b.bot ? ' [BOT]' : ''}${!b.bot && !b.connected ? ' [OFFLINE]' : ''}`;
         row.textContent =
           `${hero.name} — ${name}${tags} — LV ${b.level} — ${b.kills}/${b.deaths}/${b.assists}`;
       }
@@ -485,6 +538,8 @@ export function createHud(parent: HTMLElement): UiHandle {
       const live = s.phase === 'live';
       root.style.display = live ? '' : 'none';
       if (!live) return;
+
+      applyUiScale(); // 21:9 ultrawide: inline fonts scale ~1.2x (round-5 UX)
 
       // match boundary: a new begin resets the onboarding hints
       if (s.begin !== beginRef) {
@@ -707,7 +762,7 @@ export function createHud(parent: HTMLElement): UiHandle {
         // screen-space orbit around the hero, and is dismissed on arrival at
         // the lane midpoint (or at the end of the onboarding window). All are
         // suppressed while the scoreboard is open so overlays never fight.
-        const showMove = inWindow && !movedEnough && !boardOpen;
+        const showMove = inWindow && !movedEnough && !orderIssued && !boardOpen;
         hintMove.style.display = showMove ? '' : 'none';
 
         // lane arrow toward the assigned lane's midpoint (begin.laneAssignment)
@@ -737,12 +792,15 @@ export function createHud(parent: HTMLElement): UiHandle {
           const py = window.innerHeight / 2 + Math.sin(angle) * LANE_ARROW_OFFSET_PX;
           hintLane.style.left = `${px.toFixed(0)}px`;
           hintLane.style.top = `${py.toFixed(0)}px`;
-          hintLaneArrow.style.transform = `rotate(${angle}rad`;
-          // text label rides only BEFORE the first move order (round-3 UX:
-          // past 0:58 the full text box persisted alongside the RMB hint — two
-          // hint boxes at once. Once the player has moved, the arrow alone
-          // carries the direction and the box collapses to it).
-          setText(hintLaneText, movedEnough ? '' : ` your lane: ${laneName}`);
+          hintLaneArrow.style.transform = `rotate(${angle}rad)`;
+          // The text label rides only until the player's first move ORDER
+          // (round-5 UX: past 0:58 the full text box persisted alongside the
+          // RMB hint — two hint boxes at once). Three retire signals, any one
+          // suffices: orderIssued (raw input verb), movedEnough (snap-observed
+          // position), and the hard 20s clock. The arrow-only indicator may
+          // persist per contract; the box collapses to it.
+          const labelRetired = orderIssued || movedEnough || gameS > LANE_LABEL_MAX_S;
+          setText(hintLaneText, labelRetired ? '' : ` your lane: ${laneName}`);
         }
 
         const nearFountain =

@@ -519,6 +519,20 @@ body {
   cursor: default;
 }
 
+/* countdown (round-5 UX): the most time-critical readout of the pre-match
+   flow. The button is inert while the clock runs, but it must read BRIGHT —
+   gold-lit, gently pulsing — never the disabled greys above (it rendered
+   dimmer than LEAVE ROOM beneath it). Two-class selector outranks
+   .lobby-start:disabled; the countdown class is a `.lobby-*` state class. */
+.lobby-start--countdown,
+.lobby-start--countdown:disabled {
+  border-color: var(--gold-lit);
+  background: var(--gold);
+  color: var(--ink-deep);
+  cursor: default;
+  animation: rift-pulse 1s ease-in-out infinite; /* 1Hz — under the 3Hz law */
+}
+
 .lobby-leave {
   padding: 8px 14px;
   border: 1px solid var(--stone-deep);
@@ -794,8 +808,12 @@ body {
 
 .ability-plus {
   position: absolute;
-  top: -7px;
-  right: -7px;
+  /* fully ABOVE the slot's top edge, right-aligned (round-5 UX: straddling
+     the top-right corner covered the mana-cost numeral — costs run to 3
+     digits/240, so any overlap of the top-right corner hides digits). The
+     1px gap keeps it visually attached while the cost row stays fully clear. */
+  top: -19px;
+  right: -3px;
   z-index: 3;
   width: 20px;
   height: 20px;
@@ -1345,15 +1363,11 @@ body {
     width: 170px;
   }
 
-  .minimap {
-    width: 160px;
-    height: 160px;
-  }
-
+  /* round-5 UX: the 160px minimap read as pinhead dots at 720p — keep the
+     full 200px at small widths; the shop keeps clearance parity below (at
+     720p the max-height:800px rule left-docks the shop anyway) */
   .shop-panel {
-    /* the minimap above shrank to 160px — hand the clearance back to the
-       shop so more cards fit before scrolling at 1280x720 */
-    max-height: calc(100vh - 72px - 188px - var(--safe-top, 0px));
+    max-height: calc(100vh - 72px - 228px - var(--safe-top, 0px));
   }
 
   .menu-title {
@@ -1398,29 +1412,106 @@ body {
 }
 
 /* ultrawide (21:9 at 2560x1080): the fixed-px HUD shrinks relative to the
-   canvas (round-3 UX) — scale the chrome ~1.2x. transform, NOT zoom, and
-   NEVER on .hud itself: a transformed .hud becomes the containing block for
-   its position:fixed descendants (see the .hud rule). The bottom cluster,
-   topbar and minimap carry no fixed descendants, so they scale safely; the
-   origins pin each to the edge it already anchors to. */
+   canvas (round-3 UX) — scale the chrome ~1.2x with REAL geometry, not
+   transform:scale (round-5 UX: a transform never changes computed text size
+   and the judge measured identical bar heights/digit sizes at 1920 vs 2560).
+   This block owns widths/heights/padding + stylesheet fonts; every INLINE
+   font-size (bar values, costs, clock, scores — a stylesheet can never beat
+   an inline style) scales in hud.ts's applyUiScale at the same breakpoint. */
 @media (min-width: 2200px) {
   .hud > div:not([class]) {
-    transform: scale(1.2);
-    transform-origin: bottom center;
+    gap: 14px;
+    padding: 12px 17px;
+  }
+
+  .hud-portrait {
+    width: 77px;
+    height: 77px;
+  }
+
+  .hud-portrait > b {
+    font-size: 31px;
+  }
+
+  .hud-bars {
+    width: 264px;
+  }
+
+  .bar {
+    height: 17px;
+  }
+
+  .bar-xp {
+    height: 14px;
+  }
+
+  .ability-bar {
+    gap: 7px;
+  }
+
+  .ability-slot {
+    width: 58px;
+    height: 58px;
+  }
+
+  .ability-slot > b {
+    font-size: 26px;
+  }
+
+  .ability-cd {
+    font-size: 17px;
+  }
+
+  .ability-plus {
+    top: -23px;
+    right: -4px;
+    width: 24px;
+    height: 24px;
+  }
+
+  .item-bar {
+    grid-template-columns: repeat(3, 48px);
+    gap: 6px;
+  }
+
+  .item-slot {
+    width: 48px;
+    height: 48px;
+  }
+
+  .item-slot > b {
+    font-size: 22px;
+  }
+
+  .item-cd {
+    font-size: 14px;
+  }
+
+  .gold-readout {
+    padding: 10px 12px;
   }
 
   .topbar {
-    transform: translateX(-50%) scale(1.2);
-    transform-origin: top center;
-  }
-
-  .minimap {
-    transform: scale(1.2);
-    transform-origin: bottom right;
+    gap: 22px;
+    padding: 8px 22px;
   }
 
   .killfeed {
-    transform: scale(1.2);
-    transform-origin: top right;
+    top: calc(64px + var(--safe-top, 0px));
+  }
+
+  .minimap {
+    width: 240px;
+    height: 240px;
+  }
+
+  /* the minimap above grew to 240px — grow the shop's bottom clearance to
+     match (same right anchor at heights where the shop is right-docked) */
+  .shop-panel {
+    max-height: calc(100vh - 72px - 268px - var(--safe-top, 0px));
+  }
+
+  .hint {
+    bottom: 150px; /* clear of the taller bottom cluster */
   }
 }
