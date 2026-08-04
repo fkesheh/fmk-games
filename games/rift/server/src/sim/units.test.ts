@@ -151,14 +151,20 @@ describe('wave spawner', () => {
     expect(surged).toBeGreaterThan(firstOt);
     const surgedExtra = extraMeleeAt(surged);
     expect(surgedExtra).toBeGreaterThanOrEqual(1);
-    // The march to the surged wave spans many unmanaged waves; survivors push
-    // lanes and would kill an ancient, ending the world (advance() no-ops
-    // once ended) before the checkpoint. Top both ancients up — structure
-    // damage is not what this test measures.
+    // The march to the surged wave spans many unmanaged waves; surge-grown
+    // survivors push lanes and would kill an ancient, ending the world
+    // (advance() no-ops once ended) before the checkpoint. Topping hp up
+    // between ticks is NOT enough: a surge creep pack out-damages a full
+    // ancient hp pool inside a single tick (deaths are processed within
+    // advance), so inflate the pool itself. Structure damage is not what
+    // this test measures.
     const advanceSafely = (ticks: number): void => {
       for (let i = 0; i < ticks; i++) {
         for (const e of w.all()) {
-          if (e.kind === 'ancient') e.hp = e.maxHp;
+          if (e.kind === 'ancient') {
+            e.maxHp = 1e9;
+            e.hp = 1e9;
+          }
         }
         w.advance();
       }
@@ -190,9 +196,14 @@ describe('wave spawner', () => {
       4,
     );
     clearCreeps();
+    // one full extra-melee period into overtime: +surgedExtra melee per wave.
+    // The march spans many intermediate waves whose survivors are NOT in the
+    // base snapshot — re-snapshot on the tick before the surged wave spawns
+    // so only its own creeps count as new.
+    advanceSafely(WAVE_TICK(surged) - 1 - w.tick);
+    seen.clear();
     for (const e of w.mobiles()) seen.add(e.id);
-    // one full extra-melee period into overtime: +surgedExtra melee per wave
-    advanceSafely(WAVE_TICK(surged) - w.tick);
+    w.advance();
     const surgedWave = mobilesOf(w, 'melee', 0).filter((c) => !seen.has(c.id));
     expect(surgedWave).toHaveLength(WAVE_MELEE + surgedExtra);
   }, 20000);
