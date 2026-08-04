@@ -802,7 +802,7 @@ export class Game {
 
     this.input.update(dtMs);
     m.scene.setCamera(this.camX, this.camZ, this.camH);
-    if (inMatch) {
+    if (inMatch && !this.state.scoreboardOpen) {
       m.units.sync(this.interp.sample(), this.interp.ghosts(), this.selfEntId);
       m.nameLabels.update(
         this.interp.sample(),
@@ -811,6 +811,7 @@ export class Game {
       );
     } else {
       m.nameLabels.update([], () => false, () => undefined);
+      if (inMatch) m.units.sync(this.interp.sample(), this.interp.ghosts(), this.selfEntId);
     }
     m.scene.render(dtMs);
     m.fx.tick(dtMs);
