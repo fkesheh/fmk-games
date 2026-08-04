@@ -35,8 +35,8 @@ const CAMERA_PITCH = THREE.MathUtils.degToRad(CAMERA_PITCH_DEG);
 const CAMERA_FOV = 50;
 const SUN_MAP_SIZE = 2048;
 const MAX_PIXEL_RATIO = 2;
-const FOG_DENSITY = 0.0056;
-/** Sun direction (dusk, low and warm) — elevation/azimuth in degrees. */
+const FOG_DENSITY = 0.003;
+/** Sun direction (dusk, low, desaturated gold) — elevation/azimuth in degrees. */
 const SUN_ELEVATION_DEG = 38;
 const SUN_AZIMUTH_DEG = 225;
 
@@ -162,7 +162,7 @@ export function createScene(parent: HTMLElement): SceneHandle {
     throw err instanceof Error ? err : new Error(String(err));
   }
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.15;
+  renderer.toneMappingExposure = 1.3;
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -193,11 +193,13 @@ export function createScene(parent: HTMLElement): SceneHandle {
   const hemi = new THREE.HemisphereLight(
     mix(APAL.horizon, APAL.azureLit, 0.5),
     mix(APAL.trunk, APAL.ember, 0.35),
-    0.8,
+    1.4,
   );
   three.add(hemi);
 
-  const sun = new THREE.DirectionalLight(mix(APAL.emberLit, APAL.goldLit, 0.5), 1.75);
+  // Sun cooled toward desaturated goldLit so monument stone stays grey-stone
+  // (a saturated warm sun reads brown on the monument tier).
+  const sun = new THREE.DirectionalLight(mix(APAL.goldLit, APAL.paper, 0.35), 2.2);
   sun.castShadow = true;
   sun.shadow.mapSize.set(SUN_MAP_SIZE, SUN_MAP_SIZE);
   sun.shadow.bias = -0.0002;

@@ -2,15 +2,17 @@
 // ANCIENTS (rift) — MAP MESHES (CONTRACT §6 render/mapMesh.ts + §7 world
 // population). buildMap(lanes) — the SAME shared code the server runs — is
 // compiled into baked statics, merged per material bucket:
-//   - ground disc `moss`, with 2-tone mottling decal quads in
-//     mix(moss, mossLit, t) raised 0.01 (never coplanar; COPLANAR_EPS 0.006);
+//   - ground disc `moss`, with many small tone-varied mottling decal quads
+//     (mix steps moss<->mossLit plus one mossDeep step) raised 0.01 (never
+//     coplanar; COPLANAR_EPS 0.006);
 //   - lane paving ribbons `stone`, raised 0.02, miter-joined so no two
 //     triangles of the strip are coplanar either;
-//   - base platforms under each Ancient with a team-tinted trim ring;
+//   - base platforms under each Ancient with a team-tinted trim ring
+//     (composited toward stone, narrow band — it frames the pad);
 //   - deco clusters (ruins / foliage / rocks) from the seeded stream
 //     rng(decoSeed('rift-' + lanes, 18)) — organic clusters OFF the lane
-//     paths, denser toward the map edges, ~1 per 150 m² of off-path area,
-//     3-8 pieces each, all baked.
+//     paths, ~55% hugging the lane shoulders and the rest denser toward the
+//     map edges, ~1 per 150 m² of off-path area, 3-8 pieces each, all baked.
 // ============================================================================
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
@@ -69,6 +71,35 @@ function pathLength(path: readonly Vec2[]): number {
     len += Math.hypot(b.x - a.x, b.z - a.z);
   }
   return len;
+}
+
+/** Arc-length sample of a waypoint polyline: point + unit tangent at t in [0,1]. */
+function samplePath(
+  path: readonly Vec2[],
+  t: number,
+): { x: number; z: number; tx: number; tz: number } | null {
+  const total = pathLength(path);
+  if (total <= 0) return null;
+  let d = t * total;
+  for (let i = 0; i + 1 < path.length; i++) {
+    const a = path[i];
+    const b = path[i + 1];
+    if (!a || !b) continue;
+    const len = Math.hypot(b.x - a.x, b.z - a.z);
+    if (len <= 0) continue;
+    if (d <= len) {
+      const u = d / len;
+      return {
+        x: a.x + (b.x - a.x) * u,
+        z: a.z + (b.z - a.z) * u,
+        tx: (b.x - a.x) / len,
+        tz: (b.z - a.z) / len,
+      };
+    }
+    d -= len;
+  }
+  const last = path[path.length - 1];
+  return last ? { x: last.x, z: last.z, tx: 1, tz: 0 } : null;
 }
 
 /** Convert to a merge-compatible geometry: mergeGeometries refuses to mix
@@ -195,18 +226,26 @@ export function buildMapMeshes(scene: SceneHandle, map: MapDef): void {
   ground.receiveShadow = true;
   core.three.add(ground);
 
-  // ---- ground mottling decals: 2-tone mix(moss, mossLit, t), raised 0.01 ------
+  // ---- ground mottling decals: small tone-varied quads, raised 0.01 ---------
+  // Many small quads (never sparse big tiles) across 4 tones: three steps of
+  // mix(moss, mossLit) plus one mossDeep step, so the ground reads as varied
+  // turf at gameplay zoom instead of random dark rectangles.
   {
-    const buckets: [THREE.BufferGeometry[], THREE.BufferGeometry[]] = [[], []];
-    const count = Math.floor((side * side) / 140);
+    const buckets: THREE.BufferGeometry[][] = [[], [], [], []];
+    const count = Math.floor((side * side) / 55);
     for (let i = 0; i < count; i++) {
       const x = rngRange(next, 2, side - 2);
       const z = rngRange(next, 2, side - 2);
-      const w = rngRange(next, 1.6, 5.2);
-      const d = rngRange(next, 1.6, 5.2);
-      buckets[rngInt(next, 0, 1)]?.push(mottleQuad(x, z, w, d, next() * Math.PI, MOTTLE_Y));
+      const w = rngRange(next, 0.8, 2.6);
+      const d = rngRange(next, 0.8, 2.6);
+      buckets[rngInt(next, 0, 3)]?.push(mottleQuad(x, z, w, d, next() * Math.PI, MOTTLE_Y));
     }
-    const tints = [mix(APAL.moss, APAL.mossLit, 0.35), mix(APAL.moss, APAL.mossLit, 0.65)];
+    const tints = [
+      mix(APAL.moss, APAL.mossLit, 0.3),
+      mix(APAL.moss, APAL.mossLit, 0.55),
+      mix(APAL.moss, APAL.mossLit, 0.85),
+      mix(APAL.moss, APAL.mossDeep, 0.5),
+    ];
     for (const [bi, parts] of buckets.entries()) {
       const merged = parts.length > 0 ? mergeGeometries(parts, false) : null;
       const tint = tints[bi];
@@ -242,9 +281,11 @@ export function buildMapMeshes(scene: SceneHandle, map: MapDef): void {
     platform.position.set(s.x, PLATFORM_Y, s.z);
     platform.receiveShadow = true;
     core.three.add(platform);
+    // team trim ring: composited well toward stone and cut to a narrow trim
+    // band so it frames the pad instead of being the loudest object on it
     const trim = new THREE.Mesh(
-      nonIndexed(new THREE.RingGeometry(PLATFORM_RADIUS - 0.9, PLATFORM_RADIUS, 32).rotateX(-Math.PI / 2)),
-      core.mat(s.team === 0 ? APAL.azure : APAL.ember),
+      nonIndexed(new THREE.RingGeometry(PLATFORM_RADIUS - 0.55, PLATFORM_RADIUS, 32).rotateX(-Math.PI / 2)),
+      core.mat(mix(s.team === 0 ? APAL.azure : APAL.ember, APAL.stone, 0.45)),
     );
     trim.position.set(s.x, TRIM_Y, s.z);
     core.three.add(trim);
@@ -284,15 +325,29 @@ export function buildMapMeshes(scene: SceneHandle, map: MapDef): void {
     };
 
     for (let c = 0; c < clusters; c++) {
-      // edge-dense: radius biased outward from the map centre
+      // ~55% of clusters hug a lane shoulder (foliage/ruins framing the
+      // roads); the rest stay edge-dense toward the map rim
+      const laneShoulder = map.paths.length > 0 && next() < 0.55;
       let ccx = 0;
       let ccz = 0;
       let placed = false;
       for (let attempt = 0; attempt < 12 && !placed; attempt++) {
-        const a = next() * Math.PI * 2;
-        const r = (0.3 + 0.7 * Math.sqrt(next())) * (side / 2 - 6);
-        ccx = cx + Math.cos(a) * r;
-        ccz = cz + Math.sin(a) * r;
+        if (laneShoulder) {
+          const path = map.paths[rngInt(next, 0, map.paths.length - 1)];
+          const s = path ? samplePath(path, next()) : null;
+          if (s) {
+            const sgn = next() < 0.5 ? 1 : -1;
+            const off = DECO_PATH_CLEAR + 0.6 + next() * 3.0;
+            ccx = s.x + -s.tz * sgn * off;
+            ccz = s.z + s.tx * sgn * off;
+          }
+        } else {
+          // edge-dense: radius biased outward from the map centre
+          const a = next() * Math.PI * 2;
+          const r = (0.3 + 0.7 * Math.sqrt(next())) * (side / 2 - 6);
+          ccx = cx + Math.cos(a) * r;
+          ccz = cz + Math.sin(a) * r;
+        }
         placed = clearOfStatics(ccx, ccz);
       }
       if (!placed) continue;

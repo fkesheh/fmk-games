@@ -8,8 +8,11 @@
 //
 // HP bars are INSTANCED: exactly TWO InstancedMesh (backgrounds `inkDeep`,
 // fills = team colour / `heal` for self / `danger` for enemies) — 2 draw
-// calls total no matter how many units. Selection ring + order-target marker
-// are single pooled meshes.
+// calls total no matter how many units — slim, so the bars annotate the
+// silhouette instead of replacing it. Team identity also reads by SHAPE, not
+// hue alone: two more InstancedMesh float a small marker above each bar
+// (azure = upward chevron, ember = diamond), emissive-locked in the team Lit
+// tier. Selection ring + order-target marker are single pooled meshes.
 //
 // ANIMATED CARVE-OUT (§7): the only unbaked moving parts here are tower
 // crystals (slow orbit), the Ancient heart (float/bob), ward eyes (pulse),
@@ -25,7 +28,6 @@ import { CAMERA_PITCH_DEG, paintGeo, sceneCore } from './scene.js';
 import type { SceneCore } from './scene.js';
 
 const TEAM_LIT: readonly [string, string] = [APAL.azureLit, APAL.emberLit];
-const TEAM_DEEP: readonly [string, string] = [APAL.azureDeep, APAL.emberDeep];
 
 /** Instanced HP-bar capacity — covers 8v8/3-lane peak (~120) with headroom. */
 const BAR_CAP = 176;
@@ -114,11 +116,13 @@ function towerParts(team: TeamId, guard: boolean): THREE.BufferGeometry[] {
   return parts;
 }
 
-/** The ONE animated tower part: the floating team crystal (octahedron). */
+/** The ONE animated tower part: the floating team crystal (octahedron).
+ *  Team BASE tier for the shell, Lit only for the inner core — a Lit shell
+ *  blows out to near-white under the sun. */
 function crystalGeo(team: TeamId): THREE.BufferGeometry {
   const parts: THREE.BufferGeometry[] = [];
-  part(parts, new THREE.OctahedronGeometry(0.34), TEAM_LIT[team] ?? APAL.azureLit, 0, 0, 0);
-  part(parts, new THREE.OctahedronGeometry(0.16), TEAM_DEEP[team] ?? APAL.azureDeep, 0, 0, 0);
+  part(parts, new THREE.OctahedronGeometry(0.34), TEAM_COLORS[team] ?? APAL.azure, 0, 0, 0);
+  part(parts, new THREE.OctahedronGeometry(0.16), TEAM_LIT[team] ?? APAL.azureLit, 0, 0, 0);
   return mergeParts(parts);
 }
 
@@ -143,7 +147,12 @@ function ancientParts(team: TeamId): THREE.BufferGeometry[] {
       { ry: a },
     );
   }
-  // stacked monolith slabs leaning inward around the heart
+  // CENTRAL MONOLITH CORE — the dominant mass (2-3x the slab width) so the
+  // Ancient reads as one looming stone, not a ring of rubble
+  part(parts, new THREE.BoxGeometry(2.1, 3.4, 1.5), APAL.monument, 0, 0.5 + 1.7, 0);
+  part(parts, new THREE.BoxGeometry(2.4, 0.35, 1.8), APAL.monumentLit, 0, 0.5 + 3.4 + 0.17, 0);
+  part(parts, new THREE.BoxGeometry(1.5, 0.3, 1.1), APAL.monumentDeep, 0, 0.72, 0);
+  // stacked monolith slabs leaning inward around the core
   for (let i = 0; i < 5; i++) {
     const a = (i / 5) * Math.PI * 2 + 0.35;
     const h = 2.6 + (i % 3) * 0.4;
@@ -168,17 +177,28 @@ function ancientParts(team: TeamId): THREE.BufferGeometry[] {
       );
     }
   }
-  // banner fins in team colour
+  // banner fins in team colour — tall, proud of the core, Lit-tipped so the
+  // team read survives at gameplay zoom
   for (const sgn of [1, -1] as const) {
-    part(parts, new THREE.BoxGeometry(0.08, 1.8, 0.7), tb, sgn * 1.1, 1.9, 0, { ry: Math.PI / 4 * sgn });
+    part(parts, new THREE.BoxGeometry(0.12, 2.3, 0.95), tb, sgn * 1.25, 2.35, 0, { ry: (Math.PI / 4) * sgn });
+    part(
+      parts,
+      new THREE.BoxGeometry(0.14, 0.5, 1.0),
+      TEAM_LIT[team] ?? APAL.azureLit,
+      sgn * 1.28,
+      3.6,
+      0,
+      { ry: (Math.PI / 4) * sgn },
+    );
   }
   return parts;
 }
 
-/** The animated Ancient heart: team-crystal shell + goldLit core. */
+/** The animated Ancient heart: team-base crystal shell + goldLit core (a Lit
+ *  shell blows out to near-white under the sun — only the core may be Lit). */
 function heartGeo(team: TeamId): THREE.BufferGeometry {
   const parts: THREE.BufferGeometry[] = [];
-  part(parts, new THREE.OctahedronGeometry(0.55), TEAM_LIT[team] ?? APAL.azureLit, 0, 0, 0);
+  part(parts, new THREE.OctahedronGeometry(0.55), TEAM_COLORS[team] ?? APAL.azure, 0, 0, 0);
   part(parts, new THREE.OctahedronGeometry(0.28), APAL.goldLit, 0, 0, 0);
   return mergeParts(parts);
 }
@@ -186,39 +206,40 @@ function heartGeo(team: TeamId): THREE.BufferGeometry {
 function meleeCreepParts(team: TeamId): THREE.BufferGeometry[] {
   const parts: THREE.BufferGeometry[] = [];
   const tb = TEAM_COLORS[team] ?? APAL.azure;
+  const tl = TEAM_LIT[team] ?? APAL.azureLit;
   // squat soldier: legs, box torso, cylinder arms, flat helm, team plume
   part(parts, new THREE.CylinderGeometry(0.09, 0.1, 0.35, 6), APAL.stoneDeep, -0.13, 0.18, 0);
   part(parts, new THREE.CylinderGeometry(0.09, 0.1, 0.35, 6), APAL.stoneDeep, 0.13, 0.18, 0);
-  part(parts, new THREE.BoxGeometry(0.5, 0.45, 0.34), APAL.monumentDeep, 0, 0.58, 0);
+  part(parts, new THREE.BoxGeometry(0.5, 0.45, 0.34), APAL.monument, 0, 0.58, 0);
   part(parts, new THREE.CylinderGeometry(0.07, 0.08, 0.34, 6), APAL.stoneDeep, -0.3, 0.62, 0.04, { rz: 0.3 });
   part(parts, new THREE.CylinderGeometry(0.07, 0.08, 0.34, 6), APAL.stoneDeep, 0.3, 0.62, 0.04, { rz: -0.3 });
   part(parts, new THREE.CylinderGeometry(0.22, 0.26, 0.18, 8), APAL.stone, 0, 0.95, 0);
-  part(parts, new THREE.BoxGeometry(0.06, 0.18, 0.3), tb, 0, 1.12, -0.02);
+  // tall team-Lit plume — the silhouette's team read
+  part(parts, new THREE.BoxGeometry(0.08, 0.26, 0.4), tl, 0, 1.16, -0.02);
   // team belt
-  part(parts, new THREE.BoxGeometry(0.52, 0.08, 0.36), tb, 0, 0.42, 0);
+  part(parts, new THREE.BoxGeometry(0.52, 0.11, 0.36), tb, 0, 0.42, 0);
   // slab shield with team boss
   part(parts, new THREE.BoxGeometry(0.1, 0.5, 0.42), APAL.stoneDeep, -0.36, 0.6, 0.1);
-  part(parts, new THREE.CylinderGeometry(0.09, 0.09, 0.12, 6), tb, -0.4, 0.6, 0.1, { rz: Math.PI / 2 });
+  part(parts, new THREE.CylinderGeometry(0.11, 0.11, 0.13, 6), tb, -0.41, 0.6, 0.1, { rz: Math.PI / 2 });
   return parts;
 }
 
 function rangedCreepParts(team: TeamId): THREE.BufferGeometry[] {
   const parts: THREE.BufferGeometry[] = [];
-  const tb = TEAM_COLORS[team] ?? APAL.azure;
   const tl = TEAM_LIT[team] ?? APAL.azureLit;
   // robed acolyte: cone robe, hood, glowing team-tinted orb hands
-  part(parts, new THREE.ConeGeometry(0.32, 0.9, 8), APAL.monumentDeep, 0, 0.45, 0);
+  part(parts, new THREE.ConeGeometry(0.32, 0.9, 8), APAL.monument, 0, 0.45, 0);
   part(parts, new THREE.ConeGeometry(0.2, 0.32, 8), APAL.stoneDeep, 0, 1.05, 0);
   part(parts, new THREE.SphereGeometry(0.09, 6, 5), APAL.inkDeep, 0, 0.98, 0.09);
-  part(parts, new THREE.BoxGeometry(0.34, 0.07, 0.2), tb, 0, 0.62, 0.08);
-  part(parts, new THREE.SphereGeometry(0.09, 6, 5), tl, -0.3, 0.72, 0.12);
-  part(parts, new THREE.SphereGeometry(0.09, 6, 5), tl, 0.3, 0.72, 0.12);
+  // team-Lit sash + oversized orb hands — the silhouette's team read
+  part(parts, new THREE.BoxGeometry(0.36, 0.09, 0.22), tl, 0, 0.62, 0.08);
+  part(parts, new THREE.SphereGeometry(0.13, 6, 5), tl, -0.32, 0.74, 0.12);
+  part(parts, new THREE.SphereGeometry(0.13, 6, 5), tl, 0.32, 0.74, 0.12);
   return parts;
 }
 
 function siegeCreepParts(team: TeamId): THREE.BufferGeometry[] {
   const parts: THREE.BufferGeometry[] = [];
-  const tb = TEAM_COLORS[team] ?? APAL.azure;
   // beetle-shaped stone ram on 4 legs, team banners
   part(parts, new THREE.SphereGeometry(0.55, 8, 6), APAL.stoneDeep, 0, 0.72, 0, { sx: 1.1, sy: 0.72, sz: 1.5 });
   part(parts, new THREE.BoxGeometry(0.5, 0.3, 0.7), APAL.monumentDeep, 0, 0.95, -0.3);
@@ -231,10 +252,10 @@ function siegeCreepParts(team: TeamId): THREE.BufferGeometry[] {
       part(parts, new THREE.CylinderGeometry(0.07, 0.09, 0.55, 6), APAL.stoneDeep, sx, 0.28, sz);
     }
   }
-  // banner poles + team banners
+  // banner poles + oversized team-Lit banners — the silhouette's team read
   for (const sx of [-0.25, 0.25] as const) {
-    part(parts, new THREE.CylinderGeometry(0.03, 0.03, 0.7, 5), APAL.trunk, sx, 1.35, -0.5);
-    part(parts, new THREE.BoxGeometry(0.04, 0.3, 0.24), tb, sx, 1.55, -0.38);
+    part(parts, new THREE.CylinderGeometry(0.03, 0.03, 0.85, 5), APAL.trunk, sx, 1.42, -0.5);
+    part(parts, new THREE.BoxGeometry(0.05, 0.44, 0.34), TEAM_LIT[team] ?? APAL.azureLit, sx, 1.68, -0.36);
   }
   return parts;
 }
@@ -372,25 +393,25 @@ interface Variant {
 function buildVariant(kind: EntKind, hero: HeroId | undefined, team: TeamId): Variant {
   switch (kind) {
     case 'tower':
-      return { body: mergeParts(towerParts(team, false)), anim: crystalGeo(team), animKind: 'orbit', animY: 4.1, barH: 4.5, barW: 2.3 };
+      return { body: mergeParts(towerParts(team, false)), anim: crystalGeo(team), animKind: 'orbit', animY: 4.1, barH: 4.5, barW: 1.9 };
     case 'guard':
-      return { body: mergeParts(towerParts(team, true)), anim: crystalGeo(team), animKind: 'orbit', animY: 4.7, barH: 5.1, barW: 2.3 };
+      return { body: mergeParts(towerParts(team, true)), anim: crystalGeo(team), animKind: 'orbit', animY: 4.7, barH: 5.1, barW: 1.9 };
     case 'ancient':
-      return { body: mergeParts(ancientParts(team)), anim: heartGeo(team), animKind: 'bob', animY: 3.6, barH: 6.6, barW: 3.4 };
+      return { body: mergeParts(ancientParts(team)), anim: heartGeo(team), animKind: 'bob', animY: 4.6, barH: 6.6, barW: 2.6 };
     case 'melee':
-      return { body: mergeParts(meleeCreepParts(team)), anim: null, animKind: null, animY: 0, barH: 1.5, barW: 0.95 };
+      return { body: mergeParts(meleeCreepParts(team)), anim: null, animKind: null, animY: 0, barH: 1.5, barW: 0.75 };
     case 'ranged':
-      return { body: mergeParts(rangedCreepParts(team)), anim: null, animKind: null, animY: 0, barH: 1.6, barW: 0.95 };
+      return { body: mergeParts(rangedCreepParts(team)), anim: null, animKind: null, animY: 0, barH: 1.6, barW: 0.75 };
     case 'siege':
-      return { body: mergeParts(siegeCreepParts(team)), anim: null, animKind: null, animY: 0, barH: 1.95, barW: 1.3 };
+      return { body: mergeParts(siegeCreepParts(team)), anim: null, animKind: null, animY: 0, barH: 1.95, barW: 1.05 };
     case 'shade':
-      return { body: mergeParts(shadeParts(team)), anim: null, animKind: null, animY: 0, barH: 1.55, barW: 0.95 };
+      return { body: mergeParts(shadeParts(team)), anim: null, animKind: null, animY: 0, barH: 1.55, barW: 0.75 };
     case 'hero': {
       const h = hero ?? 'reaver';
       const scale = heroById(h).visual.height / 1.8;
       const body = mergeParts(heroParts(h, team));
       body.scale(scale, scale, scale);
-      return { body, anim: null, animKind: null, animY: 0, barH: heroById(h).visual.height + 0.5, barW: 1.3 };
+      return { body, anim: null, animKind: null, animY: 0, barH: heroById(h).visual.height + 0.5, barW: 1.05 };
     }
     case 'ward': {
       const w = wardParts(team);
@@ -535,6 +556,41 @@ export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle {
   const nY = Math.sin(THREE.MathUtils.degToRad(CAMERA_PITCH_DEG)) * 0.03;
   const nZ = -Math.cos(THREE.MathUtils.degToRad(CAMERA_PITCH_DEG)) * 0.03;
 
+  // ---- team SHAPE markers (accessibility: team reads by shape, not hue only) --
+  // azure = upward chevron, ember = diamond — two more InstancedMesh, one per
+  // team, emissive-locked so the small shape reads against any backdrop.
+  const chevronGeo = ((): THREE.BufferGeometry => {
+    const arms: THREE.BufferGeometry[] = [];
+    part(arms, new THREE.BoxGeometry(0.3, 0.075, 0.05), APAL.paper, -0.13, 0, 0, { rz: 0.72 });
+    part(arms, new THREE.BoxGeometry(0.3, 0.075, 0.05), APAL.paper, 0.13, 0, 0, { rz: -0.72 });
+    const g = mergeParts(arms);
+    g.deleteAttribute('color'); // instanced material carries the colour
+    g.rotateX(barTilt);
+    return g;
+  })();
+  const diamondGeo = ((): THREE.BufferGeometry => {
+    const g = new THREE.OctahedronGeometry(0.17);
+    g.scale(1, 0.62, 0.5);
+    g.rotateX(barTilt);
+    return g;
+  })();
+  const markerMatOf = (team: TeamId): THREE.MeshLambertMaterial =>
+    new THREE.MeshLambertMaterial({
+      color: APAL.inkDeep, // lit contribution ≈ black; emissive carries the read
+      emissive: TEAM_LIT[team] ?? APAL.azureLit,
+      side: THREE.DoubleSide,
+    });
+  const markChevron = new THREE.InstancedMesh(chevronGeo, markerMatOf(0), BAR_CAP);
+  const markDiamond = new THREE.InstancedMesh(diamondGeo, markerMatOf(1), BAR_CAP);
+  markChevron.frustumCulled = false;
+  markDiamond.frustumCulled = false;
+  markChevron.renderOrder = 42;
+  markDiamond.renderOrder = 42;
+  core.three.add(markChevron);
+  core.three.add(markDiamond);
+  let markCount0 = 0;
+  let markCount1 = 0;
+
   // bar scratch buffers (reused every sync — no per-frame allocation)
   const barXs = new Float32Array(BAR_CAP);
   const barYs = new Float32Array(BAR_CAP);
@@ -542,6 +598,7 @@ export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle {
   const barWs = new Float32Array(BAR_CAP);
   const barFracs = new Float32Array(BAR_CAP);
   const barTeams = new Int8Array(BAR_CAP); // 0 self, 1 ally, 2 enemy
+  const markTeams = new Int8Array(BAR_CAP); // absolute TeamId per bar slot
   let barCount = 0;
 
   // ---- ghosts ---------------------------------------------------------------------
@@ -679,6 +736,8 @@ export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle {
     }
 
     barCount = 0;
+    markCount0 = 0;
+    markCount1 = 0;
     for (const e of ents) {
       seen.add(e.id);
       if (e.k === 'proj') {
@@ -739,6 +798,7 @@ export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle {
         barWs[i] = slot.variant.barW;
         barFracs[i] = e.maxHp > 0 ? Math.max(0, Math.min(1, e.hp / e.maxHp)) : 0;
         barTeams[i] = e.id === selfId ? 0 : e.team === selfTeam ? 1 : 2;
+        markTeams[i] = e.team;
       }
     }
 
@@ -790,12 +850,12 @@ export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle {
       const z = barZs[i] ?? 0;
       const w = barWs[i] ?? 1;
       const frac = barFracs[i] ?? 0;
-      barM.makeScale(w, 0.15, 1);
+      barM.makeScale(w, 0.085, 1);
       barM.setPosition(x, y, z);
       barBg.setMatrixAt(i, barM);
-      const fw = Math.max(0.001, (w - 0.06) * frac);
-      const xoff = -(w - 0.06) / 2 + fw / 2;
-      barM.makeScale(fw, 0.09, 1);
+      const fw = Math.max(0.001, (w - 0.05) * frac);
+      const xoff = -(w - 0.05) / 2 + fw / 2;
+      barM.makeScale(fw, 0.05, 1);
       barM.setPosition(x + xoff, y + nY, z + nZ);
       barFill.setMatrixAt(i, barM);
       const kind = barTeams[i];
@@ -807,12 +867,24 @@ export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle {
             : APAL.danger,
       );
       barFill.setColorAt(i, barC);
+      // team shape marker floats just above the bar
+      barM.makeScale(1, 1, 1);
+      barM.setPosition(x, y + 0.3, z);
+      if (markTeams[i] === 0) {
+        markChevron.setMatrixAt(markCount0++, barM);
+      } else {
+        markDiamond.setMatrixAt(markCount1++, barM);
+      }
     }
     barBg.count = barCount;
     barFill.count = barCount;
     barBg.instanceMatrix.needsUpdate = true;
     barFill.instanceMatrix.needsUpdate = true;
     if (barFill.instanceColor) barFill.instanceColor.needsUpdate = true;
+    markChevron.count = markCount0;
+    markDiamond.count = markCount1;
+    markChevron.instanceMatrix.needsUpdate = true;
+    markDiamond.instanceMatrix.needsUpdate = true;
 
     // ---- rings --------------------------------------------------------------------------
     const sel = selectedId >= 0 ? active.get(selectedId) : undefined;

@@ -8,9 +8,12 @@
 //   visNow   — this update's visible discs (white, soft radial falloff)
 //   explored — persistent 'lighten' accumulation of every visNow so far
 //   mask     — THE shared maskCanvas (the minimap reads this one): opaque
-//              `shroud` unexplored, 0.45 alpha explored (terrain composites
-//              toward shroud 0.55), clear where visible
+//              `shroud` unexplored, DIM_ALPHA explored (terrain composites
+//              toward shroud), clear where visible; alpha feathered to zero
+//              across a soft band at the map bounds so the overlay planes
+//              fall off radially, never on a straight rectangular edge
 //   hard     — unexplored-only shroud, for the high plane that hides props
+//              (same bounds feather)
 //
 // World overlay = two transparent Lambert planes (the material law holds —
 // emissive-locked so the shroud hex renders exactly): a LOW one at y=0.55
@@ -40,8 +43,12 @@ const RES = 256;
 const LOW_Y = 0.55;
 /** World height of the hard-shroud plane (above the 6 m Ancient + heart). */
 const HIGH_Y = 7.5;
-/** Explored-not-visible terrain darkens toward shroud by this alpha. */
-const DIM_ALPHA = 0.45;
+/** Explored-not-visible terrain darkens toward shroud by this alpha — kept low
+ *  enough that explored ground reads clearly lighter than unexplored shroud. */
+const DIM_ALPHA = 0.25;
+/** Width of the soft alpha falloff at the map bounds (fraction of the mask
+ *  resolution) — the shroud must feather out, never end on a straight edge. */
+const BOUNDS_FEATHER = 0.12;
 
 const VISION: Record<EntKind, number> = {
   hero: HERO_VISION,
@@ -74,6 +81,28 @@ function makeCanvas(): [HTMLCanvasElement, CanvasRenderingContext2D] {
   return [cv, ctx];
 }
 
+/** Feather a mask's alpha to zero across a soft band at the canvas edges (=
+ *  the map bounds), so the world overlay planes fade out radially instead of
+ *  ending on a hard rectangular edge. Runs LAST on every compose. */
+function featherBounds(ctx: CanvasRenderingContext2D): void {
+  const f = RES * BOUNDS_FEATHER;
+  const edges: readonly [number, number, number, number][] = [
+    [0, 0, 0, f], // top
+    [0, RES, 0, RES - f], // bottom
+    [0, 0, f, 0], // left
+    [RES, 0, RES - f, 0], // right
+  ];
+  ctx.globalCompositeOperation = 'destination-out';
+  for (const [x0, y0, x1, y1] of edges) {
+    const g = ctx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, rgbaOf(APAL.paper, 1));
+    g.addColorStop(1, rgbaOf(APAL.paper, 0));
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, RES, RES);
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+
 export function createFog(scene: SceneHandle, map: MapDef): FogHandle {
   const core = sceneCore(scene);
   const scale = RES / map.side;
@@ -82,11 +111,14 @@ export function createFog(scene: SceneHandle, map: MapDef): FogHandle {
   const [explored, ectx] = makeCanvas();
   const [mask, mctx] = makeCanvas();
   const [hard, hctx] = makeCanvas();
-  // boot state: everything unexplored
+  // boot state: everything unexplored (feathered so the overlay planes never
+  // show a straight edge at the map bounds before the first snapshot)
   mctx.fillStyle = APAL.shroud;
   mctx.fillRect(0, 0, RES, RES);
   hctx.fillStyle = APAL.shroud;
   hctx.fillRect(0, 0, RES, RES);
+  featherBounds(mctx);
+  featherBounds(hctx);
   let visData: ImageData = vctx.getImageData(0, 0, RES, RES);
 
   // ---- world overlay planes ----------------------------------------------------
@@ -148,6 +180,7 @@ export function createFog(scene: SceneHandle, map: MapDef): FogHandle {
     mctx.globalAlpha = 1;
     mctx.drawImage(visNow, 0, 0);
     mctx.globalCompositeOperation = 'source-over';
+    featherBounds(mctx);
 
     // hard shroud: opaque only where never explored
     hctx.globalCompositeOperation = 'source-over';
@@ -157,6 +190,7 @@ export function createFog(scene: SceneHandle, map: MapDef): FogHandle {
     hctx.globalCompositeOperation = 'destination-out';
     hctx.drawImage(explored, 0, 0);
     hctx.globalCompositeOperation = 'source-over';
+    featherBounds(hctx);
 
     visData = vctx.getImageData(0, 0, RES, RES);
     maskTex.needsUpdate = true;
