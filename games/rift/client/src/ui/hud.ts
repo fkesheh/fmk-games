@@ -2,9 +2,12 @@
 // ANCIENTS (rift) client — HUD (CONTRACT §6 ui/hud.ts + §8 UX bible, T9).
 // Bottom-centre portrait/hp/mana/ability/item cluster, top-centre match clock
 // + team score + towers standing, top-right kill feed, gold/shop button, K/D/A,
-// level + XP bar, TAB scoreboard, death overlay, first-60-seconds hints (ONE at
-// a time — RMB-move > lane arrow > shop — dismissed on use, suppressed while
-// the scoreboard is open), and the disconnect banner. Pure DOM — T8's style.css owns layout and static look;
+// level + XP bar, TAB scoreboard, death overlay, first-60-seconds onboarding
+// (ONE text hint at a time — RMB-move > shop — dismissed on use, plus the lane
+// arrow, a SEPARATE directional indicator that must read AT SPAWN (§8) and so
+// never queues behind the move hint; it is dismissed on arrival at the lane
+// midpoint; everything is suppressed while the scoreboard is open), and the
+// disconnect banner. Pure DOM — T8's style.css owns layout and static look;
 // this file owns structure, text, dynamic widths/opacities, and the ONLY
 // colours it sets inline are APAL entries (team identity + hero accents).
 //
@@ -22,9 +25,11 @@
 // Team identity is NEVER colour alone (§8): every team readout pairs the APAL
 // team colour with the AZURE/EMBER text label.
 //
-// The lane-arrow hint assumes the fixed camera yaw maps world +x to screen
-// right and world +z to screen down; if T7's scene flips that, flip the sign
-// in laneArrowAngle() (one line, flagged there).
+// The lane arrow assumes T7's fixed camera yaw (render/scene.ts: the camera
+// sits at targetZ - back and looks along world +z), which maps world +z to
+// screen UP and world +x to screen LEFT — verified against rendered shots
+// (mid (48,48) renders up-left of the team-0 fountain (11,11)). If T7's scene
+// ever changes that yaw, update laneArrowAngle() (one function, flagged there).
 // ============================================================================
 import {
   APAL,
@@ -54,6 +59,9 @@ const KILLFEED_MAX_ROWS = 5;
 const MOVE_HINT_DISMISS_M = 2; // hero moved this far from spawn = hint used
 const SHOP_HINT_GOLD = 400; // §8: shop hint first appears at 400+ gold
 const FONT_MIN_PX = 12; // §8: smallest HUD text at 1080p
+const VALUE_FONT_PX = 13; // bar values + mana costs: above the 12px floor (round-2 UX)
+const LANE_ARROW_ARRIVE_M = 10; // hero this close to the lane midpoint = arrow used
+const LANE_ARROW_OFFSET_PX = 150; // screen-space orbit radius around the hero
 
 const TEAM_LABEL: readonly string[] = ['AZURE', 'EMBER'];
 const TEAM_APAL: readonly string[] = [APAL.azure, APAL.ember];
@@ -134,12 +142,13 @@ function laneMidpoint(path: readonly { readonly x: number; readonly z: number }[
   return { x: last?.x ?? 0, z: last?.z ?? 0 };
 }
 
-/** Screen angle (radians, CSS rotate) for the lane arrow. ASSUMPTION: the
- *  fixed camera maps world +x -> screen right, world +z -> screen down; the
- *  atan2 form below then yields a direct CSS rotate() angle. If T7's scene
- *  uses the opposite z-handedness, negate the dz term here. */
+/** Screen angle (radians, CSS rotate) for the lane arrow. T7's camera looks
+ *  along world +z from behind (scene.ts applyCamera), so world +z is screen
+ *  UP and world +x is screen LEFT: screen dx = -(world dx), screen dy(screen
+ *  down) = -(world dz). Yields a direct CSS rotate() angle (0 = pointing
+ *  right, positive clockwise). */
 function laneArrowAngle(camX: number, camZ: number, tx: number, tz: number): number {
-  return Math.atan2(tz - camZ, tx - camX);
+  return Math.atan2(-(tz - camZ), -(tx - camX));
 }
 
 // ---- per-slot DOM structs ------------------------------------------------------
@@ -206,15 +215,15 @@ export function createHud(parent: HTMLElement): UiHandle {
   const barHp = el('div', 'bar bar-hp', bars);
   const barHpFill = el('i', null, barHp);
   const barHpText = el('span', null, barHp);
-  barHpText.style.fontSize = `${FONT_MIN_PX}px`;
+  barHpText.style.fontSize = `${VALUE_FONT_PX}px`;
   const barMana = el('div', 'bar bar-mana', bars);
   const barManaFill = el('i', null, barMana);
   const barManaText = el('span', null, barMana);
-  barManaText.style.fontSize = `${FONT_MIN_PX}px`;
+  barManaText.style.fontSize = `${VALUE_FONT_PX}px`;
   const barXp = el('div', 'bar bar-xp', bars);
   const barXpFill = el('i', null, barXp);
   const barXpText = el('span', null, barXp);
-  barXpText.style.fontSize = `${FONT_MIN_PX}px`;
+  barXpText.style.fontSize = `${VALUE_FONT_PX}px`;
 
   const abilityBar = el('div', 'ability-bar', bottom);
   const abilityDoms: AbilitySlotDom[] = [];
@@ -226,7 +235,7 @@ export function createHud(parent: HTMLElement): UiHandle {
     key.style.fontSize = `${FONT_MIN_PX}px`;
     const cd = el('div', 'ability-cd', slot);
     const cost = el('span', null, slot); // T8: `.ability-slot > span` (mana cost)
-    cost.style.fontSize = `${FONT_MIN_PX}px`;
+    cost.style.fontSize = `${VALUE_FONT_PX}px`;
     const rank = el('div', 'ability-rank', slot);
     rank.style.fontSize = `${FONT_MIN_PX}px`;
     const plus = el('button', 'ability-plus', slot);
@@ -269,16 +278,25 @@ export function createHud(parent: HTMLElement): UiHandle {
   const scoreboard = el('div', 'scoreboard', root);
   scoreboard.style.display = 'none';
 
-  // -- first-60-seconds hints -----------------------------------------------------------
+  // -- first-60-seconds onboarding -------------------------------------------------
   const hintMove = el('div', 'hint', root);
   hintMove.style.display = 'none';
   hintMove.style.fontSize = '16px';
   hintMove.textContent = 'RIGHT-CLICK the ground to move';
+  // lane arrow: a SEPARATE directional indicator (§8), not one of the queued
+  // text hints — it must read at spawn, so it never waits behind hintMove.
+  // T9 positions it inline (screen-space orbit toward the lane midpoint);
+  // T8's .hint rule supplies the pill look; the inline left/top/bottom/
+  // transform override the pill's default bottom-centre anchor.
   const hintLane = el('div', 'hint', root);
   hintLane.style.display = 'none';
   hintLane.style.fontSize = '16px';
+  hintLane.style.bottom = 'auto';
+  hintLane.style.transform = 'translate(-50%, -50%)';
   const hintLaneArrow = el('b', null, hintLane);
   hintLaneArrow.textContent = '➤';
+  hintLaneArrow.style.display = 'inline-block'; // transformable
+  hintLaneArrow.style.fontSize = '24px';
   const hintLaneText = el('span', null, hintLane);
   const hintShop = el('div', 'hint', root);
   hintShop.style.display = 'none';
@@ -563,8 +581,13 @@ export function createHud(parent: HTMLElement): UiHandle {
         const hi = XP_THRESHOLDS[lvl + 1];
         const xpFrac = hi === undefined || hi <= lo ? 1 : Math.max(0, Math.min(1, (you.xp - lo) / (hi - lo)));
         barXpFill.style.width = `${(xpFrac * 100).toFixed(1)}%`;
-        setText(barXpText, hi === undefined ? `LV ${lvl} MAX` : `LV ${lvl}`);
-        barXp.title = `${Math.floor(you.xp)} xp`;
+        // XP progress numerals — NOT a second 'LV n' (that lives only on the
+        // portrait; round-2 UX: the duplicate read as a broken XP bar)
+        setText(
+          barXpText,
+          hi === undefined ? 'MAX LEVEL' : `${Math.max(0, Math.floor(you.xp - lo))} / ${hi - lo} XP`,
+        );
+        barXp.title = `${Math.floor(you.xp)} xp total — level ${lvl}`;
 
         // abilities
         for (let i = 0; i < abilityDoms.length; i++) {
@@ -673,14 +696,18 @@ export function createHud(parent: HTMLElement): UiHandle {
         if (s.shopOpen) shopOpenedOnce = true;
         const inWindow = gameS <= HINT_WINDOW_S;
 
-        // ONE hint at a time (§8): stacking popups occluded the ability bar.
-        // Priority: RMB-move > lane arrow > shop. All are suppressed while the
-        // scoreboard is open so the overlay never fights a popup.
+        // ONE text hint at a time (§8): stacking popups occluded the ability
+        // bar. Priority: RMB-move > shop. The lane arrow is NOT part of this
+        // queue — it is a directional indicator that must read AT SPAWN, so
+        // it shows alongside whichever text hint is up, positioned on a
+        // screen-space orbit around the hero, and is dismissed on arrival at
+        // the lane midpoint (or at the end of the onboarding window). All are
+        // suppressed while the scoreboard is open so overlays never fight.
         const showMove = inWindow && !movedEnough && !boardOpen;
         hintMove.style.display = showMove ? '' : 'none';
 
         // lane arrow toward the assigned lane's midpoint (begin.laneAssignment)
-        if (inWindow && laneTarget === null && s.begin && s.hello) {
+        if (inWindow && laneTarget === null && laneName === '' && s.begin && s.hello) {
           const lane = s.begin.laneAssignment[s.hello.you];
           if (lane !== undefined) {
             const map = buildMap(s.begin.lanes);
@@ -691,10 +718,22 @@ export function createHud(parent: HTMLElement): UiHandle {
             }
           }
         }
-        const showLane = !showMove && inWindow && laneTarget !== null && !boardOpen;
+        // dismissed on use: arriving at the lane midpoint retires the arrow
+        if (
+          laneTarget !== null &&
+          Math.hypot(you.x - laneTarget.x, you.z - laneTarget.z) <= LANE_ARROW_ARRIVE_M
+        ) {
+          laneTarget = null;
+        }
+        const showLane = inWindow && laneTarget !== null && !boardOpen;
         hintLane.style.display = showLane ? '' : 'none';
         if (showLane && laneTarget !== null) {
-          hintLaneArrow.style.transform = `rotate(${laneArrowAngle(s.cameraX, s.cameraZ, laneTarget.x, laneTarget.z)}rad)`;
+          const angle = laneArrowAngle(you.x, you.z, laneTarget.x, laneTarget.z);
+          const px = window.innerWidth / 2 + Math.cos(angle) * LANE_ARROW_OFFSET_PX;
+          const py = window.innerHeight / 2 + Math.sin(angle) * LANE_ARROW_OFFSET_PX;
+          hintLane.style.left = `${px.toFixed(0)}px`;
+          hintLane.style.top = `${py.toFixed(0)}px`;
+          hintLaneArrow.style.transform = `rotate(${angle}rad)`;
           setText(hintLaneText, ` your lane: ${laneName}`);
         }
 
@@ -703,7 +742,6 @@ export function createHud(parent: HTMLElement): UiHandle {
           Math.hypot(you.x - ownAncientX, you.z - ownAncientZ) <= FOUNTAIN_RADIUS + 1;
         const showShop =
           !showMove &&
-          !showLane &&
           inWindow &&
           !shopOpenedOnce &&
           you.gold >= SHOP_HINT_GOLD &&

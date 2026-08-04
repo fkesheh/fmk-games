@@ -15,6 +15,21 @@
 //   engagement at mid lane), fog-edge (shroud boundary at an unexplored map
 //   corner). Saved under screenshots/rift/ (artifacts — never committed).
 //
+// OVERLAY STATE SHOTS (1920x1080 only — the §8 state ladder the per-viewport
+//   flow never reaches):
+//   countdown (lobby STARTING IN n… readout, shot immediately after start()),
+//   death (death overlay + respawn count; the human hero is driven into the
+//   enemy base with order() until it dies — the room runs at speed 2 so the
+//   6.5s-game respawn window is ~3.2s of wall clock, capturable), end (the
+//   rift_end stats screen — a second room at speed 20 resolves in ~1-4 min of
+//   wall clock, the e2e approach; the match runs at 640x360 because a
+//   1080p headless client cannot drain the ~400 snaps/s stream (the server
+//   drops it as a dead peer) and is resized UP for the capture inside the 20s
+//   ended-phase dwell; if an end dwells out before we look, the poller
+//   re-starts the room and catches the next one), disconnect (the
+//   platform server is SIGTERMed, the banner captured, then the server is
+//   restarted and the client's own reconnect must hide the banner again).
+//
 // ASSERTIONS (exit non-zero on ANY failure):
 //   - every shot landed as a non-trivial PNG;
 //   - zero console/page/request errors on any page;
@@ -22,7 +37,10 @@
 //   - HUD roots exist during live: .hud .ability-bar .item-bar .topbar
 //     .minimap .killfeed;
 //   - drawCalls() in (0, 400] sampled during live combat (CONTRACT §10 budget;
-//     > 0 proves the debug surface measures real frames, not a dead renderer).
+//     > 0 proves the debug surface measures real frames, not a dead renderer);
+//   - the countdown readout, the death overlay, the ended phase and the
+//     disconnect banner each actually APPEARED (not just a screenshot taken
+//     around them), and the banner hid again after the server came back.
 //
 // The LAST stdout line is a JSON manifest: one entry per shot {shot, viewport,
 // file, bytes, drawCalls, pageErrors} plus a summary — the judge loops pair
@@ -62,6 +80,22 @@ const COMBAT_MIN_TICK = 1200; // 60s game-time at 20Hz — waves have clashed at
 const ZOOM_STEPS_IN = 10; // 36m -> 18m clamp (1/1.12 per step)
 const ZOOM_STEPS_OUT = 6; // back to ≈ default 36m
 
+// ---- overlay state captures (1920x1080 only) -------------------------------------
+const OVERLAY_VIEWPORT = { width: 1920, height: 1080, tag: '1920x1080' };
+const OVERLAY_SHOTS = ['countdown', 'death', 'end', 'disconnect'];
+// speed 2: a match lasts 6+ wall-minutes (the disconnect capture needs the
+// room still live) and the level-1 respawn (6.5 game-s) is ~3.2s of wall
+// clock — long enough to detect + screenshot the death overlay.
+const OVERLAY_ROOM_SETTINGS = { teamSize: 2, speed: 2 };
+// speed 20 (the e2e hook, CONTRACT §2): a match resolves in ~1-4 min wall.
+const END_ROOM_SETTINGS = { teamSize: 2, speed: 20 };
+const ANCIENT_T0 = 11; // team-0 ancient (11,11) — mirrored map fact
+const ANCIENT_T1 = MAP_SIDE - ANCIENT_T0; // team-1 ancient (85,85)
+const DEATH_TIMEOUT_MS = 150000;
+const END_TIMEOUT_MS = Number(process.env.RIFT_END_TIMEOUT ?? 360000); // 6 min
+const COUNTDOWN_TIMEOUT_MS = 4500; // LOBBY_COUNTDOWN_MS 3000 + slack
+const RECONNECT_TIMEOUT_MS = 60000; // net.ts backoff caps at 10s
+
 const KEEP_SERVER = process.argv.slice(2).includes('--keep-server');
 
 // ---- state ---------------------------------------------------------------------
@@ -72,6 +106,7 @@ const browsers = [];
 let serverChild = null;
 let serverExit = null;
 let tearingDown = false;
+let expectDisconnect = false; // disconnect capture: ws errors are the POINT, not noise
 
 const T0 = Date.now();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -165,7 +200,7 @@ function trackErrors(page, tag) {
     const url = m.location()?.url ?? '';
     if (/favicon/.test(url) || /favicon/.test(m.text())) return;
     // Shutdown noise only: a killed server makes every client log socket errors.
-    if ((tearingDown || serverExit !== null) && /WebSocket connection to .* failed/.test(m.text())) return;
+    if ((tearingDown || serverExit !== null || expectDisconnect) && /WebSocket connection to .* failed/.test(m.text())) return;
     pageErrors.push(`[${tag}] console.error: ${m.text()} (${url})`);
   });
   page.on('pageerror', (e) => pageErrors.push(`[${tag}] pageerror: ${e.message}`));
@@ -449,6 +484,191 @@ async function captureViewport(vp) {
   }
 }
 
+// ---- the overlay-state flow (1920x1080 only) --------------------------------------
+
+/** goto + the app's own readiness gates (window.__rift, socket connected). */
+async function connectClient(page, tag) {
+  await page.goto(`${BASE}/rift/`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await waitFor(() => page.evaluate(() => window.__rift !== undefined), 20000, 'window.__rift');
+  await waitFor(
+    async () => (await riftState(page))?.connected === true,
+    15000,
+    `socket connected (${tag})`,
+  );
+}
+
+/** True when `sel` is actually painted — getClientRects() (unlike computed
+ *  display) also honours a display:none ANCESTOR such as the hidden .hud root. */
+const domVisible = (page, sel) =>
+  page
+    .evaluate((s) => {
+      const el = document.querySelector(s);
+      return el !== null && el.getClientRects().length > 0;
+    }, sel)
+    .catch(() => false);
+
+/** Drive the human hero into the enemy base until the death overlay appears.
+ *  Move orders are re-issued so a stun/interrupt never strands the hero. */
+async function driveToDeath(page, x, z, timeoutMs) {
+  const t0 = Date.now();
+  for (;;) {
+    if (await domVisible(page, '.hud .death-overlay')) return true;
+    if (Date.now() - t0 > timeoutMs) return false;
+    await page.evaluate((x2, z2) => window.__rift.order('move', x2, z2), x, z).catch(() => {});
+    await sleep(1200);
+  }
+}
+
+/** The speed-20 end room cycles live -> ended -> lobby (MATCH_END_MS dwell);
+ *  if its end flashed past while we weren't looking, re-start it (picks are
+ *  kept) and catch the next one. If the speed-20 snap stream got the client
+ *  dropped as a dead peer (the room vanishes: phase lands back on 'menu'),
+ *  recreate the room and try again — up to `maxRooms` rooms. */
+async function waitForEndedPhase(page, timeoutMs, maxRooms = 3) {
+  const t0 = Date.now();
+  let rooms = 1; // the caller already created room #1
+  let lastPhase = '?';
+  for (;;) {
+    const s = await riftState(page).catch(() => null);
+    lastPhase = s?.phase ?? lastPhase;
+    if (s?.phase === 'ended') return s;
+    if (s?.phase === 'lobby') {
+      // back in the lobby (post-reset, or countdown still running): (re)start
+      await page.evaluate(() => window.__rift.start()).catch(() => {});
+    } else if (s?.phase === 'menu') {
+      if (rooms >= maxRooms) {
+        throw new Error(`the end room dropped its client ${rooms} times — the speed-20 snap stream is not drainable here`);
+      }
+      rooms++;
+      log(`end-room: client dropped to menu — recreating the room (attempt ${rooms}/${maxRooms})`);
+      await page.evaluate((st) => window.__rift.createPrivate('VerifyEnd', st), END_ROOM_SETTINGS);
+      await waitFor(
+        async () => ((await riftState(page))?.phase ?? null) === 'lobby',
+        15000,
+        'end-room lobby (recreated)',
+      );
+      await page.evaluate((h) => window.__rift.pick(h), HERO_PICK);
+      await page.evaluate(() => window.__rift.start());
+    }
+    if (Date.now() - t0 > timeoutMs) {
+      throw new Error(`the speed-20 room never reached the ended phase (last phase ${lastPhase})`);
+    }
+    await sleep(500);
+  }
+}
+
+async function captureOverlayStates(vp) {
+  // -- page A: countdown + death + disconnect (speed 2) ------------------------------
+  const page = await launchOne(vp, 'overlay');
+  try {
+    await connectClient(page, 'overlay');
+
+    // -- countdown: shot immediately after start() is pressed ----------------------
+    await page.evaluate((s) => window.__rift.createPrivate('VerifyOverlay', s), OVERLAY_ROOM_SETTINGS);
+    await waitFor(
+      async () => ((await riftState(page))?.phase ?? null) === 'lobby',
+      15000,
+      'overlay-room lobby',
+    );
+    await page.evaluate((h) => window.__rift.pick(h), HERO_PICK);
+    await page.evaluate(() => window.__rift.start());
+    await waitFor(
+      () =>
+        page.evaluate(
+          () => document.querySelector('.lobby-start')?.textContent?.includes('STARTING IN') ?? false,
+        ),
+      COUNTDOWN_TIMEOUT_MS,
+      "lobby countdown readout ('STARTING IN n…')",
+    );
+    await shot(page, 'countdown', vp);
+
+    // -- live, then drive the hero into the enemy base until it dies ----------------
+    const live = await waitFor(
+      async () => {
+        const s = await riftState(page);
+        return s !== null && s.phase === 'live' && s.you !== null && (s.tick ?? 0) > 5 ? s : null;
+      },
+      45000,
+      'overlay-room live',
+    );
+    const enemyAncient = live.team === 0 ? ANCIENT_T1 : ANCIENT_T0;
+    log(`overlay: hero on team ${live.team ?? '?'} — marching it into the enemy base (${enemyAncient},${enemyAncient})`);
+    const died = await driveToDeath(page, enemyAncient, enemyAncient, DEATH_TIMEOUT_MS);
+    if (!died) {
+      fail(`${vp.tag}: the hero never died within ${DEATH_TIMEOUT_MS / 1000}s at the enemy base`);
+    } else {
+      await shot(page, 'death', vp); // no settle — the respawn window is short
+    }
+  } catch (err) {
+    fail(`${vp.tag}: overlay flow: ${errText(err)}`);
+  }
+
+  // -- end screen (page B) -------------------------------------------------------------
+  // Runs ALONE, after page A's captures: a second live client splitting the
+  // box starved the speed-20 snap stream in round-1 of this harness and the
+  // server dropped the end-room client as a dead peer before its match could
+  // resolve. Alone at 1920x1080 it STILL drops (~400 snaps/s against a
+  // software-rendered 1080p canvas) — so the match itself runs at 640x360
+  // (the e2e harness's own documented drain mitigation, E2E_VIEWPORT) and the
+  // page is resized UP to 1920x1080 only for the capture, inside the 20s
+  // ended-phase dwell. The end screen is pure DOM; a resize reflows it.
+  const endPage = await launchOne(vp, 'end');
+  try {
+    await endPage.setViewport({ width: 640, height: 360, deviceScaleFactor: 1 });
+    await connectClient(endPage, 'end');
+    await endPage.evaluate((s) => window.__rift.createPrivate('VerifyEnd', s), END_ROOM_SETTINGS);
+    await waitFor(
+      async () => ((await riftState(endPage))?.phase ?? null) === 'lobby',
+      15000,
+      'end-room lobby',
+    );
+    await endPage.evaluate((h) => window.__rift.pick(h), HERO_PICK);
+    await endPage.evaluate(() => window.__rift.start());
+    await waitForEndedPhase(endPage, END_TIMEOUT_MS);
+    await endPage.setViewport({ width: vp.width, height: vp.height, deviceScaleFactor: 1 });
+    await settle(endPage, { frames: 5, ms: 600 }); // reflow + a few frames at the new size
+    await shot(endPage, 'end', vp);
+  } catch (err) {
+    fail(`${vp.tag}: end screen: ${errText(err)}`);
+  } finally {
+    await closePage(endPage);
+  }
+
+  // -- disconnect: kill the platform server, capture the banner, restore --------------
+  try {
+    const s = await riftState(page);
+    if (s?.phase !== 'live') {
+      throw new Error(`the overlay room is no longer live (phase ${s?.phase ?? '?'}) — the banner only rides the live HUD`);
+    }
+    expectDisconnect = true;
+    serverChild.kill('SIGTERM');
+    await Promise.race([
+      new Promise((r) => serverChild.once('exit', r)),
+      sleep(5000).then(() => serverChild.kill('SIGKILL')),
+    ]);
+    await waitFor(() => domVisible(page, '.hud .banner'), 20000, 'disconnect banner');
+    await settle(page, { ms: 300 });
+    await shot(page, 'disconnect', vp);
+    // restore: same port, the client's own backoff reconnects it
+    serverExit = null;
+    await startServer();
+    await waitForServer();
+    await waitFor(
+      async () => (await riftState(page))?.connected === true,
+      RECONNECT_TIMEOUT_MS,
+      'client reconnect after server restart',
+    );
+    expectDisconnect = false;
+    if (await domVisible(page, '.hud .banner')) {
+      fail(`${vp.tag}: the disconnect banner is still visible after the reconnect`);
+    }
+  } catch (err) {
+    expectDisconnect = false;
+    fail(`${vp.tag}: disconnect: ${errText(err)}`);
+  } finally {
+    await closePage(page);
+  }
+}
 // ---- main ----------------------------------------------------------------------------
 await mkdir(OUT_DIR, { recursive: true });
 try {
@@ -459,6 +679,7 @@ try {
   for (const vp of VIEWPORTS) {
     await captureViewport(vp);
   }
+  await captureOverlayStates(OVERLAY_VIEWPORT);
 } finally {
   tearingDown = true;
   for (const b of browsers.splice(0)) {
@@ -478,10 +699,13 @@ try {
 }
 
 // ---- verdict ----------------------------------------------------------------------------
-const expected = VIEWPORTS.length * SHOT_NAMES.length;
+const expected = VIEWPORTS.length * SHOT_NAMES.length + OVERLAY_SHOTS.length;
 if (manifest.length < expected) {
   const got = new Set(manifest.map((m) => `${m.shot}-${m.viewport}`));
   const missing = VIEWPORTS.flatMap((vp) => SHOT_NAMES.filter((n) => !got.has(`${n}-${vp.tag}`)).map((n) => `${n}-${vp.tag}`));
+  for (const n of OVERLAY_SHOTS) {
+    if (!got.has(`${n}-${OVERLAY_VIEWPORT.tag}`)) missing.push(`${n}-${OVERLAY_VIEWPORT.tag}`);
+  }
   fail(`missing ${expected - manifest.length} shot(s): ${missing.join(', ')}`);
 }
 if (pageErrors.length > 0) {

@@ -670,6 +670,9 @@ body {
 
 .bar-xp {
   height: 12px;
+  /* the track must read against the --ink panel even at 0% fill (round-2 UX:
+     ink-deep-on-ink was invisible, so the XP bar looked absent) */
+  border-color: var(--stone-deep);
 }
 
 .bar-xp > i {
@@ -1312,9 +1315,12 @@ body {
   }
 
   .shop-item > i {
-    /* blurb: one line, ellipsised — the title attr carries the full text */
-    white-space: nowrap;
+    /* blurb: up to TWO lines at tight heights (round-2 UX: single-line
+       ellipsis truncated the item's one-line pitch at 720p; the title attr
+       still carries the full text as a backstop) */
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
     overflow: hidden;
-    text-overflow: ellipsis;
   }
 }
