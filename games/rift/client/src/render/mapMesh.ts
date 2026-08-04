@@ -2,16 +2,18 @@
 // ANCIENTS (rift) — MAP MESHES (CONTRACT §6 render/mapMesh.ts + §7 world
 // population). buildMap(lanes) — the SAME shared code the server runs — is
 // compiled into baked statics, merged per material bucket:
-//   - ground disc `moss`, with many small tone-varied mottling decal quads
-//     (mix steps moss<->mossLit plus one mossDeep step) raised 0.01 (never
-//     coplanar; COPLANAR_EPS 0.006);
+//   - ground disc `moss`, with LARGE soft 2-tone mottling decal quads
+//     (tight mix(moss, mossLit) steps, overlapping into drifting turf) raised
+//     0.01 (never coplanar; COPLANAR_EPS 0.006);
 //   - lane paving ribbons `stone`, raised 0.02, miter-joined so no two
-//     triangles of the strip are coplanar either;
-//   - base platforms under each Ancient with a team-tinted trim ring
-//     (composited toward stone, narrow band — it frames the pad);
+//     triangles of the strip are coplanar either, flanked by darker curb
+//     strips (a tone step) + dotted shoulder stones so lanes read as built;
+//   - base platforms under each Ancient: stepped stone rings with radial
+//     slab seams, a mottled walking ring, and a narrow team trim band
+//     desaturated toward stone;
 //   - deco clusters (ruins / foliage / rocks) from the seeded stream
 //     rng(decoSeed('rift-' + lanes, 18)) — organic clusters OFF the lane
-//     paths, ~55% hugging the lane shoulders and the rest denser toward the
+//     paths, ~70% hugging the lane shoulders and the rest denser toward the
 //     map edges, ~1 per 150 m² of off-path area, 3-8 pieces each, all baked.
 // ============================================================================
 import * as THREE from 'three';
@@ -27,10 +29,22 @@ import { sceneCore } from './scene.js';
 const LANE_HALF_W = 1.7;
 /** Lane strip lift above the ground — never coplanar (COPLANAR_EPS 0.006). */
 const LANE_Y = 0.02;
+/** Curb strip: width and lift (>= COPLANAR_EPS from the mottle height it can
+ *  overlap; it never overlaps the paving strip, only abuts it). */
+const CURB_W = 0.5;
+const CURB_Y = 0.016;
 const MOTTLE_Y = 0.01;
 const PLATFORM_Y = 0.02;
-const TRIM_Y = 0.032;
+const TRIM_Y = 0.04;
 const PLATFORM_RADIUS = 7.6;
+/** Stepped platform rings: upper step + central dais, each >= COPLANAR_EPS
+ *  above the surface below; the seam/mottle insets sit between them. */
+const PLATFORM_STEP_R = 6.1;
+const PLATFORM_STEP_Y = 0.044;
+const PLATFORM_DAIS_R = 3.4;
+const PLATFORM_DAIS_Y = 0.062;
+const PLATFORM_SEAM_Y = 0.052;
+const PLATFORM_MOTTLE_Y = 0.056;
 /** Deco must clear lane polylines by this much (lane shoulder + play space). */
 const DECO_PATH_CLEAR = 5.5;
 /** Deco must clear structure discs (expanded) by this much. */
@@ -108,15 +122,22 @@ function nonIndexed(geom: THREE.BufferGeometry): THREE.BufferGeometry {
   return geom.index ? geom.toNonIndexed() : geom;
 }
 
-/** Miter-joined flat ribbon along a lane polyline at height LANE_Y. */
-function laneRibbon(path: readonly Vec2[]): THREE.BufferGeometry | null {
+/** Miter-joined flat ribbon along a lane polyline, spanning the SIGNED lateral
+ *  offsets [a, b] (negative = right of travel) at height `y`. Used for the
+ *  paving strip itself and for the darker curb strips hugging both edges. */
+function laneStrip(
+  path: readonly Vec2[],
+  a: number,
+  b: number,
+  y: number,
+): THREE.BufferGeometry | null {
   const n = path.length;
   if (n < 2) return null;
   const positions: number[] = [];
   const normals: number[] = [];
   const uvs: number[] = [];
   const push = (x: number, z: number, u: number): void => {
-    positions.push(x, LANE_Y, z);
+    positions.push(x, y, z);
     normals.push(0, 1, 0);
     uvs.push(u, 0);
   };
@@ -143,11 +164,11 @@ function laneRibbon(path: readonly Vec2[]): THREE.BufferGeometry | null {
     // miter compensation at joints so corners neither gap nor overlap
     let scale = 1;
     if (i > 0 && i + 1 < n) {
-      const a = path[i - 1];
-      const b = path[i + 1];
-      if (a && b) {
-        const s1x = p.x - a.x;
-        const s1z = p.z - a.z;
+      const pin = path[i - 1];
+      const pout = path[i + 1];
+      if (pin && pout) {
+        const s1x = p.x - pin.x;
+        const s1z = p.z - pin.z;
         const l1 = Math.hypot(s1x, s1z) || 1;
         // normal of the incoming segment
         const n1x = -s1z / l1;
@@ -156,10 +177,10 @@ function laneRibbon(path: readonly Vec2[]): THREE.BufferGeometry | null {
         scale = 1 / dot;
       }
     }
-    leftX.push(p.x + nx * LANE_HALF_W * scale);
-    leftZ.push(p.z + nz * LANE_HALF_W * scale);
-    rightX.push(p.x - nx * LANE_HALF_W * scale);
-    rightZ.push(p.z - nz * LANE_HALF_W * scale);
+    leftX.push(p.x + nx * b * scale);
+    leftZ.push(p.z + nz * b * scale);
+    rightX.push(p.x + nx * a * scale);
+    rightZ.push(p.z + nz * a * scale);
   }
   const count = Math.min(leftX.length, rightX.length);
   for (let i = 0; i + 1 < count; i++) {
@@ -226,25 +247,24 @@ export function buildMapMeshes(scene: SceneHandle, map: MapDef): void {
   ground.receiveShadow = true;
   core.three.add(ground);
 
-  // ---- ground mottling decals: small tone-varied quads, raised 0.01 ---------
-  // Many small quads (never sparse big tiles) across 4 tones: three steps of
-  // mix(moss, mossLit) plus one mossDeep step, so the ground reads as varied
-  // turf at gameplay zoom instead of random dark rectangles.
+  // ---- ground mottling decals: large soft overlapping patches, raised 0.01 ---
+  // CONTRACT §7: subtle 2-tone mottling via mix(moss, mossLit, t). Patches are
+  // LARGE (2.4-4.8m) and densely scattered so they overlap into drifting turf
+  // tones; the t-range is tight (0.12 / 0.28) so no patch reads as a near-pale
+  // scrap or an isolated high-contrast rectangle — even under the fog dim.
   {
-    const buckets: THREE.BufferGeometry[][] = [[], [], [], []];
-    const count = Math.floor((side * side) / 55);
+    const buckets: THREE.BufferGeometry[][] = [[], []];
+    const count = Math.floor((side * side) / 48);
     for (let i = 0; i < count; i++) {
       const x = rngRange(next, 2, side - 2);
       const z = rngRange(next, 2, side - 2);
-      const w = rngRange(next, 0.8, 2.6);
-      const d = rngRange(next, 0.8, 2.6);
-      buckets[rngInt(next, 0, 3)]?.push(mottleQuad(x, z, w, d, next() * Math.PI, MOTTLE_Y));
+      const w = rngRange(next, 2.4, 4.8);
+      const d = rngRange(next, 2.4, 4.8);
+      buckets[rngInt(next, 0, 1)]?.push(mottleQuad(x, z, w, d, next() * Math.PI, MOTTLE_Y));
     }
     const tints = [
-      mix(APAL.moss, APAL.mossLit, 0.3),
-      mix(APAL.moss, APAL.mossLit, 0.55),
-      mix(APAL.moss, APAL.mossLit, 0.85),
-      mix(APAL.moss, APAL.mossDeep, 0.5),
+      mix(APAL.moss, APAL.mossLit, 0.12),
+      mix(APAL.moss, APAL.mossLit, 0.28),
     ];
     for (const [bi, parts] of buckets.entries()) {
       const merged = parts.length > 0 ? mergeGeometries(parts, false) : null;
@@ -256,12 +276,21 @@ export function buildMapMeshes(scene: SceneHandle, map: MapDef): void {
     }
   }
 
-  // ---- lane paving ribbons ------------------------------------------------------
+  // ---- lane paving ribbons + curb tone-step ------------------------------------
+  // The paving strip is flanked by two darker curb strips (a tone step, same
+  // bake) so lanes read as BUILT roads, not paint on moss. Curbs sit beside
+  // the paving (never overlapping it) at CURB_Y — clear of the mottle/lane
+  // heights by >= COPLANAR_EPS.
   {
     const parts: THREE.BufferGeometry[] = [];
+    const curbs: THREE.BufferGeometry[] = [];
     for (const path of map.paths) {
-      const ribbon = laneRibbon(path);
+      const ribbon = laneStrip(path, -LANE_HALF_W, LANE_HALF_W, LANE_Y);
       if (ribbon) parts.push(ribbon);
+      const curbL = laneStrip(path, LANE_HALF_W, LANE_HALF_W + CURB_W, CURB_Y);
+      if (curbL) curbs.push(curbL);
+      const curbR = laneStrip(path, -LANE_HALF_W - CURB_W, -LANE_HALF_W, CURB_Y);
+      if (curbR) curbs.push(curbR);
     }
     const merged = parts.length > 0 ? mergeGeometries(parts, false) : null;
     if (merged) {
@@ -269,26 +298,78 @@ export function buildMapMeshes(scene: SceneHandle, map: MapDef): void {
       mesh.receiveShadow = true;
       core.three.add(mesh);
     }
+    const mergedCurbs = curbs.length > 0 ? mergeGeometries(curbs, false) : null;
+    if (mergedCurbs) {
+      const mesh = new THREE.Mesh(mergedCurbs, core.mat(mix(APAL.stone, APAL.stoneDeep, 0.55)));
+      mesh.receiveShadow = true;
+      core.three.add(mesh);
+    }
   }
 
-  // ---- base platforms with team trim ---------------------------------------------
+  // ---- base platforms: stepped rings, slab seams, mottled surface --------------
+  // Three stepped discs (base -> step -> dais) with a dark seam ring between
+  // the steps and radial slab seams on the upper step, soft stone mottling on
+  // the walking ring, and a NARROW trim band desaturated well toward stone —
+  // the pad reads as a built monument plinth, never a flat tan pancake.
   for (const s of map.structures) {
     if (s.kind !== 'ancient') continue;
-    const platform = new THREE.Mesh(
-      nonIndexed(new THREE.CircleGeometry(PLATFORM_RADIUS, 24).rotateX(-Math.PI / 2)),
-      core.mat(APAL.stone),
-    );
-    platform.position.set(s.x, PLATFORM_Y, s.z);
-    platform.receiveShadow = true;
-    core.three.add(platform);
-    // team trim ring: composited well toward stone and cut to a narrow trim
-    // band so it frames the pad instead of being the loudest object on it
-    const trim = new THREE.Mesh(
-      nonIndexed(new THREE.RingGeometry(PLATFORM_RADIUS - 0.55, PLATFORM_RADIUS, 32).rotateX(-Math.PI / 2)),
-      core.mat(mix(s.team === 0 ? APAL.azure : APAL.ember, APAL.stone, 0.45)),
-    );
-    trim.position.set(s.x, TRIM_Y, s.z);
-    core.three.add(trim);
+    const teamHex = s.team === 0 ? APAL.azure : APAL.ember;
+    const stepHex = mix(APAL.stone, APAL.stoneLit, 0.25);
+    const daisHex = mix(APAL.stone, APAL.monument, 0.5);
+    const mottleA = mix(APAL.stone, APAL.stoneLit, 0.14);
+    const mottleB = mix(APAL.stone, APAL.stoneDeep, 0.25);
+    const buckets = new Map<string, THREE.BufferGeometry[]>();
+    const put = (hex: string, geom: THREE.BufferGeometry): void => {
+      let list = buckets.get(hex);
+      if (!list) {
+        list = [];
+        buckets.set(hex, list);
+      }
+      list.push(nonIndexed(geom));
+    };
+    const disc = (r: number, y: number): THREE.BufferGeometry =>
+      new THREE.CircleGeometry(r, 28).rotateX(-Math.PI / 2).translate(s.x, y, s.z);
+    const ring = (r0: number, r1: number, y: number): THREE.BufferGeometry =>
+      new THREE.RingGeometry(r0, r1, 32).rotateX(-Math.PI / 2).translate(s.x, y, s.z);
+    put(APAL.stone, disc(PLATFORM_RADIUS, PLATFORM_Y));
+    put(APAL.stoneDeep, ring(PLATFORM_STEP_R, PLATFORM_STEP_R + 0.3, PLATFORM_SEAM_Y));
+    put(stepHex, disc(PLATFORM_STEP_R, PLATFORM_STEP_Y));
+    put(daisHex, disc(PLATFORM_DAIS_R, PLATFORM_DAIS_Y));
+    // radial slab seams on the upper step (8 flat insets, never coplanar)
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * Math.PI * 2 + 0.19;
+      const r = (PLATFORM_DAIS_R + PLATFORM_STEP_R) / 2;
+      put(
+        APAL.stoneDeep,
+        mottleQuad(s.x + Math.cos(a) * r, s.z + Math.sin(a) * r, 0.12, PLATFORM_STEP_R - PLATFORM_DAIS_R - 0.5, Math.PI / 2 - a, PLATFORM_SEAM_Y),
+      );
+    }
+    // soft stone mottling on the walking ring between dais and step edge
+    for (let i = 0; i < 9; i++) {
+      const a = next() * Math.PI * 2;
+      const r = PLATFORM_DAIS_R + 0.9 + next() * (PLATFORM_STEP_R - PLATFORM_DAIS_R - 2.2);
+      const tint = next() < 0.5 ? mottleA : mottleB;
+      put(
+        tint,
+        mottleQuad(
+          s.x + Math.cos(a) * r,
+          s.z + Math.sin(a) * r,
+          rngRange(next, 1.0, 1.9),
+          rngRange(next, 1.0, 1.9),
+          next() * Math.PI,
+          PLATFORM_MOTTLE_Y,
+        ),
+      );
+    }
+    // narrow team trim, desaturated toward stone so it frames the pad
+    put(mix(teamHex, APAL.stone, 0.7), ring(PLATFORM_RADIUS - 0.3, PLATFORM_RADIUS, TRIM_Y));
+    for (const [hex, parts] of buckets) {
+      const merged = mergeGeometries(parts, false);
+      if (!merged) continue;
+      const mesh = new THREE.Mesh(merged, core.mat(hex));
+      mesh.receiveShadow = true;
+      core.three.add(mesh);
+    }
   }
 
   // ---- deco clusters (seeded; organic, off-path, edge-dense) ----------------------
@@ -325,9 +406,9 @@ export function buildMapMeshes(scene: SceneHandle, map: MapDef): void {
     };
 
     for (let c = 0; c < clusters; c++) {
-      // ~55% of clusters hug a lane shoulder (foliage/ruins framing the
-      // roads); the rest stay edge-dense toward the map rim
-      const laneShoulder = map.paths.length > 0 && next() < 0.55;
+      // ~70% of clusters hug a lane shoulder (foliage/ruins framing the
+      // roads) so mid-map never reads bare; the rest stay edge-dense
+      const laneShoulder = map.paths.length > 0 && next() < 0.7;
       let ccx = 0;
       let ccz = 0;
       let placed = false;
@@ -337,7 +418,7 @@ export function buildMapMeshes(scene: SceneHandle, map: MapDef): void {
           const s = path ? samplePath(path, next()) : null;
           if (s) {
             const sgn = next() < 0.5 ? 1 : -1;
-            const off = DECO_PATH_CLEAR + 0.6 + next() * 3.0;
+            const off = DECO_PATH_CLEAR + 0.4 + next() * 2.2;
             ccx = s.x + -s.tz * sgn * off;
             ccz = s.z + s.tx * sgn * off;
           }
@@ -411,6 +492,46 @@ export function buildMapMeshes(scene: SceneHandle, map: MapDef): void {
             ),
           );
         }
+      }
+    }
+
+    // ---- shoulder stones: small slabs dotted along both lane edges ----------
+    // Baked into the SAME material buckets as the deco clusters (zero extra
+    // draw calls). They hug the curb line so lanes read as built roads; they
+    // intentionally sit INSIDE DECO_PATH_CLEAR (on the shoulder, never on the
+    // paving) and only check structure/bounds clearance.
+    const clearOfStructures = (x: number, z: number): boolean => {
+      if (x < 3 || x > side - 3 || z < 3 || z > side - 3) return false;
+      for (const s of map.structures) {
+        const need = STRUCTURE_RADIUS[s.kind] + 1.6;
+        if (Math.hypot(x - s.x, z - s.z) < need) return false;
+      }
+      return true;
+    };
+    const shoulderStoneHexes = [APAL.stoneDeep, mix(APAL.stone, APAL.stoneDeep, 0.35)];
+    for (const path of map.paths) {
+      const len = pathLength(path);
+      const steps = Math.floor(len / 2.6);
+      for (let i = 0; i < steps; i++) {
+        if (next() < 0.35) continue; // gaps keep it organic, not a railing
+        const s = samplePath(path, (i + 0.5) / steps);
+        if (!s) continue;
+        const sgn = i % 2 === 0 ? 1 : -1;
+        const off = LANE_HALF_W + CURB_W + 0.35 + next() * 0.7;
+        const px = s.x + -s.tz * sgn * off;
+        const pz = s.z + s.tx * sgn * off;
+        if (!clearOfStructures(px, pz)) continue;
+        const w = rngRange(next, 0.28, 0.6);
+        const h = rngRange(next, 0.1, 0.24);
+        const d = rngRange(next, 0.24, 0.55);
+        pushPiece(
+          shoulderStoneHexes[rngInt(next, 0, 1)] ?? APAL.stoneDeep,
+          nonIndexed(
+            new THREE.BoxGeometry(w, h, d)
+              .rotateY(next() * Math.PI)
+              .translate(px, h / 2 - 0.02, pz),
+          ),
+        );
       }
     }
 

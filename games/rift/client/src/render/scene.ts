@@ -162,7 +162,7 @@ export function createScene(parent: HTMLElement): SceneHandle {
     throw err instanceof Error ? err : new Error(String(err));
   }
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.3;
+  renderer.toneMappingExposure = 1.65; // dusk, never moonless-night: moss must read at its palette value everywhere
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -193,13 +193,13 @@ export function createScene(parent: HTMLElement): SceneHandle {
   const hemi = new THREE.HemisphereLight(
     mix(APAL.horizon, APAL.azureLit, 0.5),
     mix(APAL.trunk, APAL.ember, 0.35),
-    1.4,
+    2.1,
   );
   three.add(hemi);
 
   // Sun cooled toward desaturated goldLit so monument stone stays grey-stone
   // (a saturated warm sun reads brown on the monument tier).
-  const sun = new THREE.DirectionalLight(mix(APAL.goldLit, APAL.paper, 0.35), 2.2);
+  const sun = new THREE.DirectionalLight(mix(APAL.goldLit, APAL.paper, 0.35), 3.0);
   sun.castShadow = true;
   sun.shadow.mapSize.set(SUN_MAP_SIZE, SUN_MAP_SIZE);
   sun.shadow.bias = -0.0002;

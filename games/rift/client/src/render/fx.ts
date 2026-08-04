@@ -19,7 +19,7 @@ import { sceneCore } from './scene.js';
 const PARTICLE_CAP = 240;
 const TRACER_CAP = 24;
 const NUMBER_CAP = 26;
-const TRACER_LIFE_S = 0.16;
+const TRACER_LIFE_S = 0.26; // long enough to read at 20Hz snap cadence
 const NUMBER_LIFE_S = 0.9;
 /** Golden angle — deterministic scatter, no rng stream needed for pure fx. */
 const GOLDEN_ANGLE = 2.399963229728653;
@@ -95,7 +95,8 @@ export function createFx(scene: SceneHandle): FxHandle {
   if (pMesh.instanceColor) pMesh.instanceColor.needsUpdate = true;
 
   // ---- tracer pool ------------------------------------------------------------------
-  const tracerGeo = new THREE.BoxGeometry(1, 0.07, 0.07);
+  // 0.12m-square beam cross-section: readable at default gameplay zoom (36m).
+  const tracerGeo = new THREE.BoxGeometry(1, 0.12, 0.12);
   const tracers: TracerSlot[] = [];
   for (let i = 0; i < TRACER_CAP; i++) {
     const mat = new THREE.MeshLambertMaterial({

@@ -43,9 +43,10 @@ const RES = 256;
 const LOW_Y = 0.55;
 /** World height of the hard-shroud plane (above the 6 m Ancient + heart). */
 const HIGH_Y = 7.5;
-/** Explored-not-visible terrain darkens toward shroud by this alpha — kept low
- *  enough that explored ground reads clearly lighter than unexplored shroud. */
-const DIM_ALPHA = 0.25;
+/** Explored-not-visible terrain darkens toward shroud by this alpha (CONTRACT
+ *  §6/§7: composites toward `shroud` 0.55). The scene exposure is tuned so
+ *  explored ground at 0.55 still reads plainly lighter than the opaque shroud. */
+const DIM_ALPHA = 0.55;
 /** Width of the soft alpha falloff at the map bounds (fraction of the mask
  *  resolution) — the shroud must feather out, never end on a straight edge. */
 const BOUNDS_FEATHER = 0.12;
@@ -169,7 +170,7 @@ export function createFog(scene: SceneHandle, map: MapDef): FogHandle {
     ectx.drawImage(visNow, 0, 0);
     ectx.globalCompositeOperation = 'source-over';
 
-    // shared mask: shroud, punched to 0.45 by explored, to 0 by visible
+    // shared mask: shroud, punched to DIM_ALPHA by explored, to 0 by visible
     mctx.globalCompositeOperation = 'source-over';
     mctx.globalAlpha = 1;
     mctx.fillStyle = APAL.shroud;
