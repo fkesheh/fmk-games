@@ -147,11 +147,23 @@ body {
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: flex-start;
+  /* safe centre: content centres in the viewport when it fits (round-3 UX:
+     the form floated in a top-anchored void) and degrades to top-anchored
+     scrolling when it overflows a short viewport */
+  justify-content: safe center;
   gap: 12px;
   padding: calc(48px + var(--safe-top, 0px)) 24px 24px;
   overflow-y: auto;
-  background: var(--ink);
+  /* palette-conformant night-sky motif (pure CSS, no assets): sky-high
+     overhead falling through the horizon band into the ink of the rift */
+  background: linear-gradient(
+    180deg,
+    var(--sky-high) 0%,
+    var(--horizon) 26%,
+    var(--ink) 52%,
+    var(--ink) 78%,
+    var(--ink-deep) 100%
+  );
 }
 
 .menu-title {
@@ -180,7 +192,9 @@ body {
   font-size: 12px;
   letter-spacing: 0.12em;
   text-transform: uppercase;
-  color: var(--paper-deep);
+  /* --paper on --ink/--ink-lit: >= 7:1 (round-3 UX: --paper-deep read as
+     disabled chrome, not a label) */
+  color: var(--paper);
 }
 
 .menu-heading {
@@ -1057,8 +1071,13 @@ body {
   top: calc(56px + var(--safe-top, 0px));
   right: calc(10px + var(--safe-right, 0px));
   /* anchored at the top and height-capped so EVERY item stays reachable even
-     at 1280x720 (round-1 UX failure: bottom:220px clipped 3 of 11 items) */
-  max-height: calc(100vh - 72px - var(--safe-top, 0px));
+     at 1280x720 (round-1 UX failure: bottom:220px clipped 3 of 11 items).
+     The 228px bottom clearance keeps the panel above the 200px minimap (same
+     right anchor) and the bottom HUD cluster — round-3 UX failure: the uncapped
+     panel painted over the minimap and the Wardstone card sat on the gold
+     readout, making the bottom cards unreachable at 720p. overflow-y:auto
+     below scrolls the remainder. */
+  max-height: calc(100vh - 72px - 228px - var(--safe-top, 0px));
   width: min(360px, 92vw);
   display: flex;
   flex-direction: column;
@@ -1122,13 +1141,23 @@ body {
   align-items: center;
   justify-content: center;
   gap: 16px;
-  background: var(--ink);
+  /* same night-sky motif as the menu — one non-live screen language */
+  background: linear-gradient(
+    180deg,
+    var(--sky-high) 0%,
+    var(--horizon) 26%,
+    var(--ink) 52%,
+    var(--ink) 78%,
+    var(--ink-deep) 100%
+  );
 }
 
 .end-banner {
+  margin: 0 0 8px; /* h1 UA margins killed; the banner breathes above the card */
   font-size: 40px;
   letter-spacing: 0.25em;
   color: var(--gold-lit);
+  text-shadow: 0 2px 0 var(--ink-deep);
 }
 
 .end-banner--win {
@@ -1139,39 +1168,67 @@ body {
   color: var(--ember-lit);
 }
 
-.end-sub {
+.end-reason {
   font-size: 14px;
   color: var(--paper-dim);
 }
 
-.end-stats {
-  border-collapse: collapse;
+/* the stats table is a card in the lobby-panel language (round-3 UX: bare
+   rows floated on the void) — inkLit fill, stone-deep border, generous
+   padding; T9 renders .end-row lines inside, the first is the column key */
+.end-table {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   min-width: min(680px, 94vw);
+  max-width: 94vw;
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 16px 20px;
+  background: var(--ink-lit);
+  border: 1px solid var(--stone-deep);
+  border-radius: 8px;
 }
 
-.end-stats th {
-  font-size: 12px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--paper-deep);
-  text-align: left;
-  padding: 4px 10px;
-  border-bottom: 1px solid var(--stone-deep);
-}
-
-.end-stats td {
-  font-size: 13px;
-  color: var(--paper);
-  padding: 6px 10px;
+.end-row {
+  padding: 5px 2px;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
-.end-row--you td {
-  color: var(--gold-lit);
+.end-row:first-child {
+  /* the column key row */
+  letter-spacing: 0.14em;
+  color: var(--paper-deep);
+  border-bottom: 1px solid var(--stone-deep);
+  margin-bottom: 6px;
+  padding-bottom: 8px;
+}
+
+.end-note {
+  color: var(--paper-dim);
 }
 
 .end-back {
   margin-top: 8px;
+  /* a real button in the shared chrome language — the UA default grey
+     undercut the card (round-3 UX: end screen read as unfinished) */
+  appearance: none;
+  border: 1px solid var(--stone-deep);
+  border-radius: 4px;
+  background: var(--ink-lit);
+  color: var(--paper);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 10px 18px;
+  cursor: pointer;
+}
+
+.end-back:hover {
+  border-color: var(--azure);
+  background: var(--azure-deep);
 }
 
 .death-overlay {
@@ -1293,15 +1350,29 @@ body {
     height: 160px;
   }
 
+  .shop-panel {
+    /* the minimap above shrank to 160px — hand the clearance back to the
+       shop so more cards fit before scrolling at 1280x720 */
+    max-height: calc(100vh - 72px - 188px - var(--safe-top, 0px));
+  }
+
   .menu-title {
     font-size: 34px;
   }
 }
 
-/* short viewports (720p): compact shop rows so every item stays reachable
-   inside the max-height cap without scrolling */
+/* short viewports (720p): the right column is contested (minimap + HUD gold
+   readout), so the shop docks to the empty LEFT edge at near-full height —
+   all 11 items fit without scrolling (round-3 UX: even with the 188px bottom
+   clearance, 6 card rows cannot fit the ~460px the right column offers at
+   720p; the cap below keeps the panel's bottom edge above the centre HUD
+   cluster, and compact rows keep the total inside the cap) */
 @media (max-height: 800px) {
   .shop-panel {
+    left: calc(10px + var(--safe-left, 0px));
+    right: auto;
+    top: calc(8px + var(--safe-top, 0px));
+    max-height: calc(100vh - 106px - var(--safe-top, 0px));
     padding: 10px;
   }
 
@@ -1312,15 +1383,44 @@ body {
   .shop-item {
     padding: 6px 8px;
     gap: 2px;
+    line-height: 1.2; /* buys the third blurb line below without growing rows */
   }
 
   .shop-item > i {
-    /* blurb: up to TWO lines at tight heights (round-2 UX: single-line
-       ellipsis truncated the item's one-line pitch at 720p; the title attr
-       still carries the full text as a backstop) */
+    /* blurb: up to THREE lines at tight heights — Warhorn's full pitch is 3
+       lines at card width and round-3 UX flagged its truncation; the title
+       attr still carries the full text as a backstop */
     display: -webkit-box;
-    -webkit-line-clamp: 2;
+    -webkit-line-clamp: 3;
     -webkit-box-orient: vertical;
     overflow: hidden;
+  }
+}
+
+/* ultrawide (21:9 at 2560x1080): the fixed-px HUD shrinks relative to the
+   canvas (round-3 UX) — scale the chrome ~1.2x. transform, NOT zoom, and
+   NEVER on .hud itself: a transformed .hud becomes the containing block for
+   its position:fixed descendants (see the .hud rule). The bottom cluster,
+   topbar and minimap carry no fixed descendants, so they scale safely; the
+   origins pin each to the edge it already anchors to. */
+@media (min-width: 2200px) {
+  .hud > div:not([class]) {
+    transform: scale(1.2);
+    transform-origin: bottom center;
+  }
+
+  .topbar {
+    transform: translateX(-50%) scale(1.2);
+    transform-origin: top center;
+  }
+
+  .minimap {
+    transform: scale(1.2);
+    transform-origin: bottom right;
+  }
+
+  .killfeed {
+    transform: scale(1.2);
+    transform-origin: top right;
   }
 }

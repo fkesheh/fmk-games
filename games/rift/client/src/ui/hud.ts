@@ -400,11 +400,15 @@ export function createHud(parent: HTMLElement): UiHandle {
       const ktName = kt === null ? '' : `${TEAM_LABEL[kt] ?? ''} `;
       const vtName = vt === null ? '' : `${TEAM_LABEL[vt] ?? ''} `;
       const fb = ev.firstBlood ? ' — FIRST BLOOD' : '';
+      // bounty suffix only when gold actually changed hands (round-3 UX:
+      // creep kills read '+0g' — pure noise on every wave clear)
+      const bounty = ev.gold > 0 ? ` +${ev.gold}g` : '';
+      const suffix = `${bounty}${fb}`;
       // team identity: colour AND the AZURE/EMBER label, never colour alone
       const html =
         `<span style="color:${kc}">${ktName}${escapeHtml(killer)}</span>` +
         ` ⚔ <span style="color:${vc}">${vtName}${escapeHtml(victim)}</span>` +
-        `<i> +${ev.gold}g${fb}</i>`;
+        (suffix === '' ? '' : `<i>${suffix}</i>`);
       fresh.push({ key, html, at: nowMs });
     }
     // drop expired rows and rows no longer in the events window
@@ -733,8 +737,12 @@ export function createHud(parent: HTMLElement): UiHandle {
           const py = window.innerHeight / 2 + Math.sin(angle) * LANE_ARROW_OFFSET_PX;
           hintLane.style.left = `${px.toFixed(0)}px`;
           hintLane.style.top = `${py.toFixed(0)}px`;
-          hintLaneArrow.style.transform = `rotate(${angle}rad)`;
-          setText(hintLaneText, ` your lane: ${laneName}`);
+          hintLaneArrow.style.transform = `rotate(${angle}rad`;
+          // text label rides only BEFORE the first move order (round-3 UX:
+          // past 0:58 the full text box persisted alongside the RMB hint — two
+          // hint boxes at once. Once the player has moved, the arrow alone
+          // carries the direction and the box collapses to it).
+          setText(hintLaneText, movedEnough ? '' : ` your lane: ${laneName}`);
         }
 
         const nearFountain =
