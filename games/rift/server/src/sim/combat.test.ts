@@ -12,6 +12,7 @@ import {
   ARMOR_K,
   ASSIST_GOLD,
   buildMap,
+  CREEP_MELEE,
   FIRST_BLOOD_BONUS,
   FORTIFY_HERO_DAMAGE_MULT,
   HERO_KILL_XP_BASE,
@@ -178,10 +179,11 @@ describe('creep loot', () => {
       ticks += 1;
     }
     expect(creep.alive).toBe(false);
-    expect(p0.gold - g0).toBeCloseTo(45 + PASSIVE_PER_TICK * ticks, 4); // bounty + passive
+    expect(p0.gold - g0).toBeCloseTo(CREEP_MELEE.bounty + PASSIVE_PER_TICK * ticks, 4); // bounty + passive
     expect(p2.gold - g2).toBeCloseTo(PASSIVE_PER_TICK * ticks, 4); // passive only
-    expect(p0.xp - x0).toBeCloseTo(20, 4); // 40 xp split two ways
-    expect(p2.xp - x2).toBeCloseTo(20, 4);
+    const sharedXp = CREEP_MELEE.xp / 2; // split two ways: p0 + p2 in radius
+    expect(p0.xp - x0).toBeCloseTo(sharedXp, 4);
+    expect(p2.xp - x2).toBeCloseTo(sharedXp, 4);
     expect(p3.xp - x3).toBeCloseTo(0, 9); // out of radius
     expect(p3.gold - g3).toBeCloseTo(PASSIVE_PER_TICK * ticks, 4);
   });
@@ -195,7 +197,7 @@ describe('creep loot', () => {
     const before = p0.gold;
     w.advance();
     expect(p0.gold - before).toBeCloseTo(PASSIVE_PER_TICK, 9);
-    expect(p0.gold - g0).toBeLessThan(45);
+    expect(p0.gold - g0).toBeLessThan(CREEP_MELEE.bounty);
   });
 });
 

@@ -15,10 +15,12 @@ import {
   FOUNTAIN_MANA_PCT,
   INVENTORY_SLOTS,
   ITEMS,
+  OVERTIME_AT_S,
   PASSIVE_GOLD_PER_S,
   RESPAWN_BASE_S,
   RESPAWN_PER_LEVEL_S,
   STARTING_GOLD,
+  SURGE_EXTRA_MELEE_PERIOD_S,
   SURGE_WAVE_GROWTH,
   TICK_DT,
   TICK_RATE,
@@ -131,9 +133,37 @@ describe('wave spawner', () => {
 
   it('overtime switches to SURGE_WAVE_GROWTH, emits one surge event, and adds melee over time', () => {
     const { w } = makeWorld();
-    // first wave fully inside overtime: spawn tick 24200 (index 40)
-    const firstOtWaveTick = WAVE_TICK(40);
-    advance(w, firstOtWaveTick);
+    // Every checkpoint below is DERIVED from the config, so balance retunes
+    // (an earlier OVERTIME_AT_S, a longer SURGE_EXTRA_MELEE_PERIOD_S) cannot
+    // stale this test. Wave index k (0-based) spawns at WAVE_TICK(k); the sim
+    // adds floor((tick*TICK_DT - OVERTIME_AT_S) / SURGE_EXTRA_MELEE_PERIOD_S)
+    // melee per wave in overtime — mirrored here with the same float ops.
+    const extraMeleeAt = (k: number): number =>
+      Math.floor((WAVE_TICK(k) * TICK_DT - OVERTIME_AT_S) / SURGE_EXTRA_MELEE_PERIOD_S);
+    // first wave spawned strictly AFTER overtime begins (waves spawning exactly
+    // at the boundary tick still use pre-overtime growth: stepUnits runs
+    // before the overtime flip inside advance())
+    const firstOt = Math.floor((OVERTIME_AT_S - WAVE_FIRST_AT_S) / WAVE_PERIOD_S) + 1;
+    // first wave at least one full extra-melee period into overtime
+    const surged = Math.ceil(
+      (OVERTIME_AT_S + SURGE_EXTRA_MELEE_PERIOD_S - WAVE_FIRST_AT_S) / WAVE_PERIOD_S,
+    );
+    expect(surged).toBeGreaterThan(firstOt);
+    const surgedExtra = extraMeleeAt(surged);
+    expect(surgedExtra).toBeGreaterThanOrEqual(1);
+    // The march to the surged wave spans many unmanaged waves; survivors push
+    // lanes and would kill an ancient, ending the world (advance() no-ops
+    // once ended) before the checkpoint. Top both ancients up — structure
+    // damage is not what this test measures.
+    const advanceSafely = (ticks: number): void => {
+      for (let i = 0; i < ticks; i++) {
+        for (const e of w.all()) {
+          if (e.kind === 'ancient') e.hp = e.maxHp;
+        }
+        w.advance();
+      }
+    };
+    advanceSafely(WAVE_TICK(firstOt));
     expect(w.overtime).toBe(true);
     const events = w.drainEvents();
     expect(events.filter((e) => e.k === 'surge')).toHaveLength(1);
@@ -141,7 +171,7 @@ describe('wave spawner', () => {
     const clearCreeps = (): void => {
       for (const kind of ['melee', 'ranged', 'siege'] as const) {
         for (const c of [...mobilesOf(w, kind, 0), ...mobilesOf(w, kind, 1)]) {
-          w.damage(NO_ENT, c.id, 9999999, 'physical');
+          w.damage(NO_ENT, c.id, 1e9, 'physical');
         }
       }
       w.advance();
@@ -149,20 +179,22 @@ describe('wave spawner', () => {
     clearCreeps();
     const seen = new Set<number>();
     for (const e of w.mobiles()) seen.add(e.id);
-    // wave index 41 at 24800: < 60 s of overtime elapsed -> base melee count
-    advance(w, WAVE_TICK(41) - w.tick);
-    const wave41 = mobilesOf(w, 'melee', 0).filter((c) => !seen.has(c.id));
-    expect(wave41).toHaveLength(WAVE_MELEE);
-    expect(wave41[0]?.maxHp).toBeCloseTo(
-      CREEP_MELEE.hp * Math.pow(1 + SURGE_WAVE_GROWTH, 41),
+    // first clean overtime wave: surge-growth hp, derived melee count
+    const base = firstOt + 1;
+    advanceSafely(WAVE_TICK(base) - w.tick);
+    const baseWave = mobilesOf(w, 'melee', 0).filter((c) => !seen.has(c.id));
+    expect(baseWave).toHaveLength(WAVE_MELEE + extraMeleeAt(base));
+    expect(extraMeleeAt(base)).toBe(0); // scenario premise: < 1 OT period elapsed
+    expect(baseWave[0]?.maxHp).toBeCloseTo(
+      CREEP_MELEE.hp * Math.pow(1 + SURGE_WAVE_GROWTH, base),
       4,
     );
     clearCreeps();
     for (const e of w.mobiles()) seen.add(e.id);
-    // wave index 42 at 25400: 70 s of overtime -> +1 melee per OT minute
-    advance(w, WAVE_TICK(42) - w.tick);
-    const wave42 = mobilesOf(w, 'melee', 0).filter((c) => !seen.has(c.id));
-    expect(wave42).toHaveLength(WAVE_MELEE + 1);
+    // one full extra-melee period into overtime: +surgedExtra melee per wave
+    advanceSafely(WAVE_TICK(surged) - w.tick);
+    const surgedWave = mobilesOf(w, 'melee', 0).filter((c) => !seen.has(c.id));
+    expect(surgedWave).toHaveLength(WAVE_MELEE + surgedExtra);
   }, 20000);
 });
 
