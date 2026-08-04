@@ -29,6 +29,7 @@ const FORTIFY_BYPASS_HP = 0.15; // fortified towers may be hit under this fracti
 const TOWER_HOLD_MARGIN = 2.5; // start holding this far outside tower range
 const TOWER_HOLD_GAP = 1; // hold position sits this far outside tower range
 const ENGAGE_RANGE = 12; // carries "in a fight" radius for cast-on-cooldown
+const OUTNUMBERED_MARGIN = 1; // fall back when nearby foes > nearby allies + this
 const ISOLATION_RADIUS = 8; // assassin: a hero with no ally hero this near is isolated
 const TANK_ENGAGE_COUNT = 2; // tank dashes in when this many enemies are in dash range
 const WARD_OWN_RADIUS = 12; // an own ward this near lane mid counts as covered
@@ -522,6 +523,26 @@ export function createBotBrain(seed: number, hero: HeroId): BotBrain {
 
     // --- archetype cast (at most one per tick) ---
     tryRoleCast(p, out);
+
+    // --- numbers discipline: never keep contesting when outnumbered nearby.
+    //  Feeding loops (walk back, die again) are the main even-skill failure
+    //  mode; a committed cast this tick rides, otherwise fall back toward
+    //  the fountain until the local numbers even out. ---
+    if (!out.some((c) => c.c === 'cast')) {
+      let foes = 0;
+      let allies = 0;
+      for (let i = 0; i < p.visible.length; i++) {
+        const e = p.visible[i];
+        if (!e || e.kind !== 'hero' || !e.alive || e.id === self.id) continue;
+        if (distSq(self.x, self.z, e.x, e.z) > ENGAGE_RANGE * ENGAGE_RANGE) continue;
+        if (e.team === self.team) allies += 1;
+        else foes += 1;
+      }
+      if (foes > allies + OUTNUMBERED_MARGIN && fountainPoint(p, wp)) {
+        out.push({ c: 'order', kind: 'move', x: wp.x, z: wp.z });
+        return out;
+      }
+    }
 
     // --- last-hit: seeded +-15% slop on the expected-damage threshold ---
     const lethality = self.damage * (1 - LASTHIT_SLOP + 2 * LASTHIT_SLOP * rand());

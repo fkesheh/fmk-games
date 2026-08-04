@@ -76,17 +76,17 @@ export interface CreepTuning {
 }
 export const CREEP_MELEE: CreepTuning = {
   hp: 450, damage: 21, armor: 2, attackPeriod: 1.25, attackRange: 1.3,
-  moveSpeed: 3.1, bounty: 45, xp: 40, vision: 8, radius: 0.42,
+  moveSpeed: 3.1, bounty: 45, xp: 70, vision: 8, radius: 0.42,
 };
 export const CREEP_RANGED: CreepTuning = {
   hp: 300, damage: 26, armor: 0, attackPeriod: 1.1, attackRange: 8,
-  moveSpeed: 3.1, bounty: 52, xp: 50, vision: 8, radius: 0.4,
+  moveSpeed: 3.1, bounty: 52, xp: 85, vision: 8, radius: 0.4,
 };
 export const CREEP_SIEGE: CreepTuning = {
   hp: 820, damage: 46, armor: 4, attackPeriod: 2.5, attackRange: 9,
-  moveSpeed: 2.7, bounty: 95, xp: 90, vision: 8, radius: 0.62,
+  moveSpeed: 2.7, bounty: 95, xp: 105, vision: 8, radius: 0.62,
 };
-export const SIEGE_BUILDING_MULT = 3; // siege damage multiplier vs structures
+export const SIEGE_BUILDING_MULT = 6; // siege damage multiplier vs structures
 
 // --- Structures -------------------------------------------------------------------
 export interface StructureTuning {
@@ -100,15 +100,15 @@ export interface StructureTuning {
   readonly bounty: number; // team gold, each living enemy hero, 0 = none
 }
 export const TOWER: StructureTuning = {
-  hp: 1400, armor: 8, damage: 110, attackPeriod: 1.0, attackRange: 10.5,
+  hp: 3300, armor: 18, damage: 150, attackPeriod: 1.0, attackRange: 10.5,
   vision: 12, radius: 1.2, bounty: 200,
 };
 export const GUARD_TOWER: StructureTuning = {
-  hp: 1600, armor: 10, damage: 130, attackPeriod: 1.0, attackRange: 10.5,
+  hp: 1100, armor: 12, damage: 150, attackPeriod: 1.0, attackRange: 10.5,
   vision: 12, radius: 1.2, bounty: 250,
 };
 export const ANCIENT = {
-  hp: 2600, armor: 10, vision: 12, radius: 2.3,
+  hp: 1700, armor: 10, vision: 12, radius: 2.3,
 } as const;
 /** An ancient is INVULNERABLE while any of its team's guard towers stands. */
 export const FOUNTAIN_RADIUS = 6; // centred on own ancient
@@ -119,7 +119,7 @@ export const FOUNTAIN_MANA_PCT = 0.06;
 export const LEVEL_CAP = 10;
 /** Cumulative xp required to BE each level; index = level (0 unused). */
 export const XP_THRESHOLDS: readonly number[] = [
-  0, 0, 200, 510, 930, 1460, 2100, 2860, 3750, 4780, 5960,
+  0, 0, 200, 510, 930, 1300, 1750, 2860, 3750, 4780, 5960,
 ];
 export const SKILL_POINTS_PER_LEVEL = 1;
 export const STARTING_SKILL_POINTS = 1; // heroes spawn with 1 point at level 1
@@ -127,15 +127,15 @@ export const BASIC_ABILITY_MAX_RANK = 4;
 export const ULT_MAX_RANK = 2;
 /** Hero level required to put a point into ult rank (index = rank-1). */
 export const ULT_LEVEL_REQ: readonly number[] = [6, 10];
-export const XP_SHARE_RADIUS = 12; // creep death xp splits among heroes in range
+export const XP_SHARE_RADIUS = 20; // creep death xp splits among heroes in range
 export const HERO_KILL_XP_BASE = 120;
 export const HERO_KILL_XP_PER_LEVEL = 40;
-export const RESPAWN_BASE_S = 6;
-export const RESPAWN_PER_LEVEL_S = 3;
+export const RESPAWN_BASE_S = 3;
+export const RESPAWN_PER_LEVEL_S = 3.5;
 export const HERO_VISION = 11;
 export const HERO_RADIUS = 0.5;
 export const STARTING_GOLD = 600;
-export const PASSIVE_GOLD_PER_S = 1.2;
+export const PASSIVE_GOLD_PER_S = 1.9;
 export const KILL_GOLD_BASE = 150;
 export const KILL_GOLD_PER_LEVEL = 15;
 export const FIRST_BLOOD_BONUS = 100;
@@ -157,8 +157,8 @@ export const WARD_RESTOCK_S = 120; // +1 team stock per interval
 
 // --- Match arc ----------------------------------------------------------------------
 export const OVERTIME_AT_S = 1_200; // 20:00 — surge begins
-export const SURGE_WAVE_GROWTH = 0.06; // replaces WAVE_GROWTH in overtime
-export const SURGE_EXTRA_MELEE_PERIOD_S = 60; // +1 melee per wave per elapsed minute of OT
+export const SURGE_WAVE_GROWTH = 0.11; // replaces WAVE_GROWTH in overtime
+export const SURGE_EXTRA_MELEE_PERIOD_S = 60; // +1 melee per wave per elapsed period of OT
 export const MATCH_HARD_CAP_S = 1_800; // 30:00 — tiebreak end
 /** Tiebreak order at hard cap: 1) ancient hp fraction 2) structures standing
  *  3) hero kills 4) team gold earned. Still equal -> draw (winner null). */
