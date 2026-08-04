@@ -133,6 +133,7 @@ export class Game {
   private lobby: LobbyMsg | null = null;
   private begin: BeginMsg | null = null;
   private snap: SnapMsg | null = null;
+  private prevSnap: SnapMsg | null = null; // atk-transition + death-diff source for fx
   private end: EndEvent | null = null;
   private readonly events: RiftEvent[] = [];
   private readonly snapsRing: SnapMsg[] = [];
@@ -468,6 +469,7 @@ export class Game {
   }
 
   private onSnap(msg: SnapMsg): void {
+    this.combatFx(msg);
     this.snap = msg;
     this.interp.push(msg);
     this.snapsRing.push(msg);
@@ -521,6 +523,49 @@ export class Game {
     if (now - this.lastFogMs >= FOG_EVERY_MS) {
       this.lastFogMs = now;
       this.modules.fog.update(msg);
+    }
+  }
+
+  /** Combat feedback off the snapshot stream (CONTRACT §6: tracers driven by
+   *  atk transitions, death bursts where units die). rift_kill only carries
+   *  hero pids, so creep deaths are detected here as "present last snap, gone
+   *  now, last position still inside our vision" — a unit that merely walked
+   *  out of the fog is NOT a death and must not burst. */
+  private combatFx(msg: SnapMsg): void {
+    const prev = this.prevSnap;
+    this.prevSnap = msg;
+    if (prev === null) return;
+    const fx = this.modules.fx;
+    const curById = new Map<number, SnapMsg['ents'][number]>();
+    for (const e of msg.ents) curById.set(e.id, e);
+    const prevById = new Map<number, SnapMsg['ents'][number]>();
+    for (const e of prev.ents) prevById.set(e.id, e);
+
+    // attack tracers: atk is transient per snap (set only on the swing tick)
+    for (const e of msg.ents) {
+      if (e.atk === undefined || e.k === 'proj') continue;
+      const p = prevById.get(e.id);
+      if (p !== undefined && p.atk === e.atk) continue; // same swing, already shown
+      const tgt = curById.get(e.atk) ?? prevById.get(e.atk);
+      if (tgt === undefined) continue;
+      const kind =
+        e.k === 'tower' || e.k === 'guard' || e.k === 'ancient'
+          ? 'tower'
+          : e.k === 'melee' || e.k === 'siege'
+            ? 'phys'
+            : 'magic';
+      fx.tracer(e.x, e.z, tgt.x, tgt.z, kind);
+    }
+
+    // creep death bursts: vanished while their last position stays visible
+    // (structures never vanish — rift_structure covers them; heroes carry pids
+    // and rift_kill covers them)
+    for (const p of prev.ents) {
+      if (p.hp <= 0 || p.pid !== undefined) continue;
+      if (p.k === 'tower' || p.k === 'guard' || p.k === 'ancient' || p.k === 'proj') continue;
+      if (curById.has(p.id)) continue;
+      if (!this.modules.fog.isVisible(p.x, p.z)) continue; // walked out of vision
+      fx.burst(p.x, p.z, 'death');
     }
   }
 
@@ -631,6 +676,7 @@ export class Game {
   private clearMatch(): void {
     this.begin = null;
     this.snap = null;
+    this.prevSnap = null;
     this.end = null;
     this.interp = createInterp();
     this.snapsRing.length = 0;
