@@ -1,9 +1,8 @@
 # RIFT — mini MOBA: handoff
 
-**Status: design decided, nothing built.** No `games/rift/` directory exists yet.
-This document is the complete brief for whoever picks it up. It contains the
-decisions already made and *why*, the decisions still open, and the repo
-knowledge that is expensive to rediscover.
+**Status: BUILT (branch rift-build, merged to main).** The game ships as
+**ANCIENTS** at `/rift/` per the contract at `games/rift/CONTRACT.md`. The
+sections below are the original handoff brief, kept for the reasoning.
 
 Read `docs/STRUCTURE.md` for the repo layout and `docs/WORDBOMB.md` for the best
 example of what a finished game contract in this repo looks like — WORDBOMB was

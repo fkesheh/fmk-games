@@ -1,11 +1,13 @@
-# STRICKEN (+ BANK + KART GP + WORDBOMB) — multiplayer game platform
+# STRICKEN (+ BANK + KART GP + WORDBOMB + ANCIENTS) — multiplayer game platform
 
-A browser multiplayer game platform with four games sharing one server:
+A browser multiplayer game platform with five games sharing one server:
 - **STRICKEN** (`/fps/`) — tactical FPS in the spirit of Counter-Strike
 - **BANK** (`/bank/`) — the classic push-your-luck dice party game (canonical Bank rules)
 - **KART GP** (`/kart/`) — multiplayer kart racing: drift physics, 3-lap races, one circuit
 - **WORDBOMB** (`/wordbomb/`) — simultaneous word game: one fragment, a hidden fuse, every
   answer revealed at once
+- **ANCIENTS** (`/rift/`) — a mini MOBA: push lanes, last-hit for gold, raze towers, break
+  the enemy Ancient. 2v2–8v8 with bot fill, fog of war, generated maps
 
 `/` is a launcher page; all games ride one WebSocket (`/ws`). Everything is
 procedural: no assets — flat-shaded low-poly 3D (FPS, KART), DOM/CSS 3D dice
@@ -74,7 +76,7 @@ with share codes, quick-join public rooms.
 
 ```bash
 npm install
-npm run dev        # server :8080 · fps :5173 · bank :5174 · kart :5175 · wordbomb :5176
+npm run dev        # server :8080 · fps :5173 · bank :5174 · kart :5175 · wordbomb :5176 · rift :5177
 ```
 
 Production (single process serves both HTTP and WS):
@@ -117,10 +119,14 @@ matchmaking, and rooms; games plug in via one registry entry. Adding a new game 
 - `games/kart/{shared,server,client}` — KART GP: kart physics contract, race room, three.js circuit
 - `games/wordbomb/{shared,server,client}` — WORDBOMB: scoring/protocol contract, round room +
   binary-searched dictionary blob (`server/data/words.blob`), DOM/CSS client
+- `games/rift/{shared,server,client}` — ANCIENTS mini MOBA: frozen config/heroes/items/map-gen
+  contract, 20Hz sim + vision-filtered snapshots, bot brains, three.js client with fog of war
 - `CONTRACT.md` — the frozen FPS contract; `docs/STRUCTURE.md` — the platform contract;
-  `docs/BANK.md`, `docs/KART.md`, `docs/WORDBOMB.md` — the per-game contracts
+  `docs/BANK.md`, `docs/KART.md`, `docs/WORDBOMB.md` — the per-game contracts;
+  `games/rift/CONTRACT.md` — the ANCIENTS contract
 - `scripts/e2e.mjs` — two-browser FPS suite · `scripts/e2e-bank.mjs` — BANK suite ·
-  `scripts/e2e-kart.mjs` — KART suite · `scripts/e2e-wordbomb.mjs` — WORDBOMB suite
+  `scripts/e2e-kart.mjs` — KART suite · `scripts/e2e-wordbomb.mjs` — WORDBOMB suite ·
+  `scripts/e2e-rift.mjs` — ANCIENTS suite · `scripts/verify-rift.mjs` — ANCIENTS visual/perf gate
 
 ## Gates
 
