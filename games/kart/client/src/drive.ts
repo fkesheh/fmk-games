@@ -13,10 +13,18 @@
 // What still lives here is everything DOM- and feel-shaped: the keyboard
 // (Arrows/WASD drive, Space/Shift drift, R respawn, N nitro; tracked by e.code,
 // cleared on window blur, ignored while typing in a lobby field), the external
-// setInput latch (e2e/debug driver), the pre-GO freeze, KIDS MODE (setAssist →
-// the shared pursuitSteer controller owns the steer channel, plus the stuck
-// auto-respawn kids can't press R for), the smoothed drift visual, and the
-// VISUAL error offset that hides a reconciliation correction over ~120ms.
+// setInput latch (e2e/debug driver AND the tablet touch pad — app.ts merges
+// both into ONE latched input, there is no second input path), the pre-GO
+// freeze, KIDS MODE (setAssist → the shared pursuitSteer controller owns the
+// steer channel), the stuck auto-respawn for players who cannot press R
+// (setStuckGuard: kids AND tablet, since the touch layout has no reverse), the
+// smoothed drift visual, and the VISUAL error offset that hides a
+// reconciliation correction over ~120ms.
+//
+// TouchPointers (below) is the DOM-FREE half of the tablet control surface:
+// pointerId -> control bookkeeping with no element, rect or event in it, so the
+// multi-touch rules that decide whether a child's steering sticks are unit
+// testable in node. app.ts owns the elements, the hit-test and the listeners.
 //
 // R / the stuck detector do NOT teleport directly: they raise a one-shot flag
 // consumed by the next input as `respawn: true`, so the teleport is part of the
@@ -60,6 +68,17 @@ const OUTBOX_CAP = PENDING_INPUT_CAP;
 // ERR_SNAP_M from where gates and collisions actually resolve). After this many
 // consecutive clamped corrections, stop hiding it and snap.
 const ERR_CLAMP_GIVE_UP = 3;
+// TABLET + KIDS MODE: the assist owns the steer channel (docs/KART.md), but the
+// touch layout in that combination renders two steering zones and nothing else
+// — zones that did nothing would be a lie to the one player who cannot be told
+// why. A held zone therefore adds this much steer ON TOP of the pursuit, and
+// only ever through the ext latch (the keyboard's kids-mode behaviour is
+// untouched: keys never reach `ext`). Strictly < 1 is the safety property —
+// pursuitSteer saturates at ±1, so the assist can always out-pull a held thumb
+// and the kart cannot be steered off the road no matter how long she holds.
+// With no touch steer latched this term is exactly +0: kids mode is bit-for-bit
+// what it was.
+const KIDS_TOUCH_NUDGE = 0.6;
 
 export interface DriveState extends KartSim {
   steer: number; // current effective steering input -1..1 (wheel visual)
@@ -108,6 +127,7 @@ export class DriveController {
   private driftVis = 0;
   private frozen = false; // pre-GO freeze: ticks are sent but never simulated
   private assistOn = false; // KIDS MODE — app-owned; reset()/blur never clear it
+  private stuckGuard = false; // TABLET — the stuck auto-respawn without the auto-steer
   private readonly assist: AssistState = makeAssistState();
   private respawnPending = false; // one-shot, consumed by the next input's `respawn`
 
@@ -197,6 +217,19 @@ export class DriveController {
    */
   setAssist(on: boolean): void {
     this.assistOn = on;
+  }
+
+  /**
+   * TABLET MODE: arm the stuck auto-respawn WITHOUT the auto-steer. The touch
+   * layout has no brake and no reverse, so a pad player who buries the kart in
+   * a barrier has no input that can back it out and no R key to press; this is
+   * the whole of their recovery. Independent of setAssist — a tablet player is
+   * not a child — and app-owned, like the assist: reset() and blur never clear
+   * it. Off by default, so a keyboard player is never teleported unasked.
+   */
+  setStuckGuard(on: boolean): void {
+    this.stuckGuard = on;
+    if (!on) this.assist.stuckT = 0; // leaving tablet mode must not carry a part-run timer
   }
 
   /** Server-approved nitro (the nitro event for the local player): start the boost. */
@@ -347,12 +380,31 @@ export class DriveController {
     const k = this.pred.state();
     e.throttle = clamp((this.keyUp ? 1 : 0) + this.ext.throttle, 0, 1);
     e.brake = clamp((this.keyDown ? 1 : 0) + this.ext.brake, 0, 1);
+    // STUCK AUTO-RESPAWN — for anyone with no R key within reach. That was
+    // originally only KIDS MODE; it is now every TABLET player too, because the
+    // touch layout deliberately has no brake/reverse (docs/TOUCH_PWA.md §4.2.1)
+    // and a fourth right-hand button would crowd the gas/nitro channel the
+    // layout is tuned around. Without this, a wedged pad player has no way out
+    // at all. The rule itself is shared + unit tested (sim.ts stuckStep)
+    // because losing it strands a player, and it is unchanged: throttle held
+    // above STUCK_THROTTLE while |speed| stays under STUCK_SPEED for
+    // STUCK_HOLD_S of SIM time. Off for a keyboard player with neither flag —
+    // they have R, and an unasked-for teleport would be worse than being stuck.
+    if (
+      (this.assistOn || this.stuckGuard) &&
+      stuckStep(this.assist, e.throttle, forwardSpeed(k), SIM_DT)
+    ) {
+      this.respawn();
+    }
     // KIDS MODE: the steer channel is fully owned by the assist controller.
     if (this.assistOn) {
-      // STUCK AUTO-RESPAWN (kids can't press R): the rule is shared + unit
-      // tested (sim.ts stuckStep) because losing it strands a wedged player.
-      if (stuckStep(this.assist, e.throttle, forwardSpeed(k), SIM_DT)) this.respawn();
-      e.steer = pursuitSteer(this.track, k, this.assist, SIM_DT);
+      // + the latched touch nudge (0 unless a tablet steering zone is held, so
+      // the keyboard/e2e path through kids mode is unchanged to the bit)
+      e.steer = clamp(
+        pursuitSteer(this.track, k, this.assist, SIM_DT) + this.ext.steer * KIDS_TOUCH_NUDGE,
+        -1,
+        1,
+      );
     } else {
       e.steer = clamp((this.keyRight ? 1 : 0) - (this.keyLeft ? 1 : 0) + this.ext.steer, -1, 1);
     }
@@ -388,7 +440,7 @@ export class DriveController {
     return msg;
   }
 
-  /** R / kids-mode stuck recovery — the teleport rides the NEXT input. */
+  /** R / the stuck guard's auto-recovery — the teleport rides the NEXT input. */
   private respawn(): void {
     this.respawnPending = true;
     this.driftVis = 0;
@@ -432,4 +484,113 @@ export class DriveController {
       case 'Space': case 'ShiftLeft': case 'ShiftRight': this.keyDrift = false; break;
     }
   };
+}
+
+// ============================================================================
+// TABLET TOUCH — the DOM-free half
+// ============================================================================
+
+/** One target on the tablet control surface. `null` is dead space (no control). */
+export type TouchControl = 'left' | 'right' | 'gas' | 'drift' | 'nitro';
+
+/** Every control, in hit-test order (the surfaces never overlap). */
+export const TOUCH_CONTROLS: readonly TouchControl[] = ['left', 'right', 'gas', 'drift', 'nitro'];
+
+/**
+ * Multi-touch bookkeeping for the tablet pad: which pointerId is currently on
+ * which control, and therefore which controls are held.
+ *
+ * This is a correctness object, not a convenience one. Two thumbs are down
+ * simultaneously for the whole race, and the failure mode of getting it wrong
+ * is STUCK STEERING — a kart that keeps turning after the child let go, which
+ * she cannot diagnose and cannot escape. Hence:
+ *
+ *  - state is keyed by `pointerId`, never by "the touch"; a second finger can
+ *    never overwrite the first, and releasing one never releases the other;
+ *  - `retarget()` moves a finger between controls (sliding out of a zone
+ *    releases it and engages whatever is under the finger now, dead space
+ *    included, WITHOUT forgetting the finger — sliding back re-engages);
+ *  - `release()` is what pointerup, pointercancel and lostpointercapture all
+ *    call, because a system-cancelled press must free the control exactly like
+ *    a lift; and
+ *  - `clear()` exists so blur / tab-hide / screen change cannot leave a control
+ *    latched with no pointer left alive to release it.
+ *
+ * Zero allocation after construction: presses mutate a Map and a small counter
+ * record, and the derived reads are arithmetic.
+ */
+export class TouchPointers {
+  /** pointerId -> the control it is on (null = the finger is down on dead space). */
+  private readonly byId = new Map<number, TouchControl | null>();
+  /** How many pointers are on each control (two thumbs on one zone is legal). */
+  private readonly held: Record<TouchControl, number> = {
+    left: 0, right: 0, gas: 0, drift: 0, nitro: 0,
+  };
+
+  /**
+   * A pointer went down on `control` (null = dead space; still tracked, so a
+   * slide onto a button from outside one engages it).
+   * @returns true if this press newly engaged the control (the nitro edge).
+   */
+  press(pointerId: number, control: TouchControl | null): boolean {
+    if (this.byId.has(pointerId)) return this.retarget(pointerId, control);
+    this.byId.set(pointerId, control);
+    if (control === null) return false;
+    return ++this.held[control] === 1;
+  }
+
+  /**
+   * A tracked pointer moved onto `control` (null = dead space). Untracked
+   * pointers are ignored — a mouse moving across the pad with no button down
+   * must not steer.
+   * @returns true if the move newly engaged the control (the nitro edge).
+   */
+  retarget(pointerId: number, control: TouchControl | null): boolean {
+    if (!this.byId.has(pointerId)) return false;
+    const prev = this.byId.get(pointerId) ?? null;
+    if (prev === control) return false;
+    if (prev !== null) this.held[prev]--;
+    this.byId.set(pointerId, control);
+    if (control === null) return false;
+    return ++this.held[control] === 1;
+  }
+
+  /** pointerup / pointercancel / lostpointercapture — all release identically. */
+  release(pointerId: number): void {
+    const prev = this.byId.get(pointerId);
+    if (prev === undefined) return;
+    if (prev !== null) this.held[prev]--;
+    this.byId.delete(pointerId);
+  }
+
+  /** Blur / tab hide / leaving the race screen: nothing may stay held. */
+  clear(): void {
+    this.byId.clear();
+    this.held.left = 0;
+    this.held.right = 0;
+    this.held.gas = 0;
+    this.held.drift = 0;
+    this.held.nitro = 0;
+  }
+
+  /** Is anything holding this control down? */
+  isDown(control: TouchControl): boolean {
+    return this.held[control] > 0;
+  }
+
+  /** Pointers currently tracked (dead-space fingers included). */
+  count(): number {
+    return this.byId.size;
+  }
+
+  /**
+   * Merged steering, -1..1. BOTH zones held is 0 — deliberately, and not by
+   * accident of ordering: two thumbs down means "straight", and lifting one of
+   * them must leave the kart steering toward the thumb that is STILL DOWN
+   * rather than snapping to neutral. That falls straight out of reading both
+   * counters every time instead of remembering "the last zone touched".
+   */
+  steer(): number {
+    return (this.held.right > 0 ? 1 : 0) - (this.held.left > 0 ? 1 : 0);
+  }
 }

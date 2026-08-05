@@ -122,6 +122,30 @@ in-game toggle key T, HUD badge while active. When on, the CLIENT steers automat
 ignores keyboard steer; the kid controls ONLY throttle/brake (and nitro). Server-side
 indistinguishable from normal input. Debug surface exposes `assist` for e2e.
 
+**Amended by `docs/TOUCH_PWA.md` — kids mode and TABLET MODE are independent axes.**
+Tablet mode is an input surface (see that contract §4.2.0) and is NOT a children's
+feature; kids mode is the assist, layered on top. All four combinations run.
+
+Two consequences for this section, both previously inaccurate here:
+
+- **Stuck auto-respawn is no longer assist-only.** It is armed by kids mode OR tablet
+  mode (`drive.setStuckGuard`). The touch layout deliberately has no brake and no
+  reverse, so a wedged touch player would otherwise have no recovery; a fourth
+  right-hand target would crowd the gas/nitro channel the pad ergonomics are tuned
+  around. A bare keyboard player still never gets it — they have R, and an
+  unasked-for teleport is worse than being stuck. Verified to recover an
+  adult-speed wedge (26.7 / 27.1 / 25.6 m/s impacts, ~3.3 sim-s to fire, drivable
+  again within 8s). **Known limit:** recovery requires throttle held above 0.5, so
+  a player who gives up and lifts off — or panic-mashes the accelerator — resets
+  the timer. Unreachable in kids mode (auto-throttle is forced).
+- **In tablet + kids the steering zones are NOT inert.** The assist owns the steer
+  channel, so the two zones would have done nothing at all. `KIDS_TOUCH_NUDGE = 0.6`
+  is added on top of pursuit steer, from the ext latch only — the term is exactly
+  `+0` without touch, so keyboard kids mode and every e2e assist path are
+  bit-identical. Because pursuit steer saturates at ±1 and the nudge is below 1,
+  the assist always out-pulls a held thumb: the child gets real agency and still
+  cannot steer off the road.
+
 ## Track (frozen, shared/track.ts)
 
 One circuit: closed Catmull-Rom through TRACK_POINTS (authored below), road half-width

@@ -126,6 +126,24 @@ body {
   font-family:
     -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
+
+  /* ---- TOUCH SAFETY (docs/TOUCH_PWA.md §3) -------------------------------
+     iOS Safari IGNORES `user-scalable=no` in the viewport meta, so none of
+     this can be delegated to the page's <head>. These two properties are what
+     actually hold on a tablet:
+       overscroll-behavior: none  — no pull-to-refresh, and no rubber-band
+         bounce revealing the page background when a thumb drags past the edge
+         of a control (the drag NEVER ends where the finger started, so the
+         bounce fires constantly under normal steering).
+       touch-action: manipulation — kills the double-tap-to-zoom gesture and
+         the 300ms click delay that comes with it. The race screen and every
+         control surface tighten this to `none` below, which also removes
+         pinch-zoom and panning there; the MENU keeps manipulation so a long
+         room list is still scrollable. */
+  overscroll-behavior: none;
+  touch-action: manipulation;
+  -webkit-text-size-adjust: 100%; /* no reflow when an iPad is rotated */
+  -webkit-tap-highlight-color: transparent; /* no grey flash under a steering thumb */
 }
 
 #app {
@@ -161,6 +179,7 @@ body {
   flex-direction: column;
   align-items: center;
   overflow-y: auto;
+  overscroll-behavior: contain; /* a flick past the end of the menu never scrolls the page */
 }
 
 /* ---- menu -------------------------------------------------------------------- */
@@ -265,8 +284,12 @@ body {
 }
 
 /* kids-mode toggle: a real togglable pill (it had no rule at all before, so it
-   rendered as a bare checkbox and a stray word). Whole label is the hit area. */
-.menu-kids {
+   rendered as a bare checkbox and a stray word). Whole label is the hit area.
+   `.menu-toggle` (TABLET CONTROLS / AUTO GAS / LEFT-HANDED, docs/TOUCH_PWA.md
+   §4.2.0) is the same pill one size down — one source of truth for the look, so
+   the settings row can never drift into a second visual language. */
+.menu-kids,
+.menu-toggle {
   display: inline-flex;
   align-items: center;
   gap: 10px;
@@ -280,12 +303,14 @@ body {
   transition: border-color 120ms ease, background 120ms ease;
 }
 
-.menu-kids:hover {
+.menu-kids:hover,
+.menu-toggle:hover {
   border-color: color-mix(in srgb, var(--gold) 60%, transparent);
   background: color-mix(in srgb, var(--charcoal) 82%, transparent);
 }
 
-.menu-kids input[type='checkbox'] {
+.menu-kids input[type='checkbox'],
+.menu-toggle input[type='checkbox'] {
   width: 15px;
   height: 15px;
   margin: 0;
@@ -293,12 +318,14 @@ body {
   cursor: pointer;
 }
 
-.menu-kids:has(input:checked) {
+.menu-kids:has(input:checked),
+.menu-toggle:has(input:checked) {
   border-color: var(--gold);
   background: color-mix(in srgb, var(--gold) 12%, transparent);
 }
 
-.menu-kids-label {
+.menu-kids-label,
+.menu-toggle-label {
   font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.18em;
@@ -306,8 +333,33 @@ body {
   transition: color 120ms ease;
 }
 
-.menu-kids:has(input:checked) .menu-kids-label {
+.menu-kids:has(input:checked) .menu-kids-label,
+.menu-toggle:has(input:checked) .menu-toggle-label {
   color: var(--gold);
+}
+
+/* the three tablet settings ride one wrapping row under KIDS MODE: three more
+   full-width pills would push the track list off a 720p menu */
+.menu-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+}
+
+.menu-toggle {
+  padding: 5px 12px 5px 9px;
+  gap: 8px;
+}
+
+.menu-toggle input[type='checkbox'] {
+  width: 13px;
+  height: 13px;
+}
+
+.menu-toggle-label {
+  font-size: 10px;
+  letter-spacing: 0.14em;
 }
 
 .menu-rooms-title {
@@ -437,6 +489,31 @@ body {
   position: relative;
   padding: 0;
   overflow: hidden;
+  /* the race screen is a control surface end to end: no scroll, no pinch, no
+     zoom, no selection lasso started by a steering thumb (docs/TOUCH_PWA.md §3) */
+  touch-action: none;
+  overscroll-behavior: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none; /* no long-press callout under a held control */
+
+  /* ---- tablet pad geometry (docs/TOUCH_PWA.md §4.2.1) --------------------
+     Declared HERE, not on .touch-pad, because the HUD is a sibling of the pad
+     and has to lift its bottom chips by exactly the pad's height — one set of
+     numbers, so the two can never disagree about where the thumb band ends. */
+  --pad-edge: 14px;
+  --pad-safe-l: calc(env(safe-area-inset-left, 0px) + var(--pad-edge));
+  --pad-safe-r: calc(env(safe-area-inset-right, 0px) + var(--pad-edge));
+  --pad-safe-b: calc(env(safe-area-inset-bottom, 0px) + var(--pad-edge));
+  --pad-steer-w: clamp(104px, 14vw, 176px);
+  --pad-steer-h: clamp(120px, 30vh, 240px);
+  --pad-gas: clamp(124px, 16vw, 196px); /* the large primary target */
+  --pad-aux: clamp(74px, 9vw, 104px); /* nitro / drift */
+  /* Separation between GAS and the two small buttons. This is a FEEL number,
+     not a spacing token: it is the margin by which a thumb pulling accelerate
+     mid-corner misses nitro. Anything tighter and a hard corner fires nitro. */
+  --pad-aux-gap: 40px;
+  --pad-band: var(--pad-steer-h); /* how much of the bottom belongs to thumbs */
 }
 
 .race-canvas {
@@ -445,12 +522,21 @@ body {
   width: 100%;
   height: 100%;
   display: block;
+  touch-action: none; /* a steering drag must never scroll or zoom the page */
+}
+
+/* the invite code is the one thing on the race screen a player copies by hand */
+.race-invite-code,
+.race input,
+.race textarea {
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 .race-top {
   position: absolute;
   top: 50%;
-  right: 12px;
+  right: calc(12px + env(safe-area-inset-right, 0px));
   transform: translateY(-50%);
   z-index: 6;
 }
@@ -459,7 +545,12 @@ body {
 
 .hud {
   position: absolute;
-  inset: 0;
+  /* NOT inset:0 — the HUD is inset by the safe area so that every chip
+     positioned against its edges (all of them) clears a notch, a rounded
+     corner and the home indicator in one place (docs/TOUCH_PWA.md §3). All
+     four values are 0 on a desktop, so this is a no-op off a device. */
+  inset: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+    env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
   pointer-events: none;
   z-index: 4;
 }
@@ -1247,7 +1338,7 @@ body {
 .hint-card {
   position: absolute;
   left: 50%;
-  bottom: 16px;
+  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
   transform: translateX(-50%);
   max-width: 92vw;
   padding: 9px 18px;
@@ -1638,6 +1729,250 @@ body {
   text-shadow: 0 0 26px color-mix(in srgb, var(--gold) 40%, transparent);
 }
 
+/* ---- TABLET CONTROL SURFACE (docs/TOUCH_PWA.md §4) ---------------------------------
+   The pad is a racing control layout for anyone on a touch device — an adult
+   running a serious race on an iPad is the thing it is judged by — and KIDS
+   MODE is an assist that collapses it, not the reason it exists.
+
+   Geometry rules that are load-bearing rather than decorative:
+     · Steering is TWO ADJACENT ZONES, never a stick. A stick under a thumb is
+       imprecise for an adult and unusable for a child, and it needs a
+       continuously tracked origin; a zone is a boolean the eye can find without
+       looking down.
+     · GAS is the largest target and sits lowest and outermost — where the
+       right thumb already rests — so the hand never repositions to hold it.
+     · NITRO and DRIFT are set inboard and up, `--pad-aux-gap` clear of GAS, off
+       the arc a thumb sweeps while pulling it.
+     · Nothing is drawn in the middle third: that is where the track is, and it
+       is where the driver is actually looking.
+   Everything is measured from `env(safe-area-inset-*)` so no control lands
+   under a notch, a rounded corner or the home indicator.
+
+   The pad is `display:none` unless `.race.tablet` — a desktop pointer never
+   renders it at all (§4.4), which is why the visibility rule keys off a class
+   the app only sets from a media query or a real touch/pen pointer event. */
+
+.touch-pad {
+  position: absolute;
+  inset: 0;
+  /* over the canvas (0) and the HUD (4, and pointer-transparent anyway), under
+     the lobby (5), transient messages (6), the countdown (7) and results (8) —
+     a pad covering the START button would strand the room */
+  z-index: 4;
+  pointer-events: none; /* only the buttons themselves take input */
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* §4.4 — invisible to keyboard players. `.tablet` is set from
+   (hover: none) and (pointer: coarse), or from the first real touch/pen
+   pointerdown, or from the explicit TABLET CONTROLS setting. Never from a UA. */
+.race:not(.tablet) .touch-pad {
+  display: none;
+}
+
+.touch-steer {
+  position: absolute;
+  left: var(--pad-safe-l);
+  bottom: var(--pad-safe-b);
+  display: flex;
+  gap: 10px;
+}
+
+.touch-steer-btn {
+  width: var(--pad-steer-w);
+  height: var(--pad-steer-h);
+  --pad-tint: var(--steel);
+}
+
+/* zero-size anchor at the bottom-right corner; the three buttons hang off it */
+.touch-drive {
+  position: absolute;
+  right: var(--pad-safe-r);
+  bottom: var(--pad-safe-b);
+  width: 0;
+  height: 0;
+}
+
+.touch-gas {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: var(--pad-gas);
+  height: var(--pad-gas);
+  border-radius: 50%;
+  --pad-tint: var(--gold);
+}
+
+.touch-drift {
+  position: absolute;
+  right: calc(var(--pad-gas) + var(--pad-aux-gap));
+  bottom: 0;
+  width: var(--pad-aux);
+  height: var(--pad-aux);
+  border-radius: 50%;
+  --pad-tint: var(--curb-red);
+}
+
+.touch-nitro {
+  position: absolute;
+  right: calc(var(--pad-gas) + var(--pad-aux-gap));
+  bottom: calc(var(--pad-aux) + 16px);
+  width: var(--pad-aux);
+  height: var(--pad-aux);
+  border-radius: 50%;
+  --pad-tint: var(--kart-teal);
+}
+
+/* ---- left-handed swap (§4.2.1) — mirror the two halves, never the arrows --- */
+.race.lefty .touch-steer {
+  left: auto;
+  right: var(--pad-safe-r);
+}
+
+.race.lefty .touch-drive {
+  right: auto;
+  left: var(--pad-safe-l);
+}
+
+.race.lefty .touch-gas,
+.race.lefty .touch-drift,
+.race.lefty .touch-nitro {
+  right: auto;
+}
+
+.race.lefty .touch-gas {
+  left: 0;
+}
+
+.race.lefty .touch-drift,
+.race.lefty .touch-nitro {
+  left: calc(var(--pad-gas) + var(--pad-aux-gap));
+}
+
+/* There is ONE touch layout (§4.2.1). KIDS MODE has no rule here at all — it is
+   the auto-steer assist and nothing else, so gas, nitro and drift are rendered
+   for a 4-year-old exactly as they are for an adult. Holding one button is
+   easier than steering, and steering is the part the assist already does for
+   her; nitro is the cause-and-effect she enjoys most. Do not reintroduce a
+   second layout — the old one hid controls, resized the pad, hid the nitro
+   readout, and had to be kept consistent with this one forever. */
+
+/* ---- the buttons: the HUD's chip idiom, sized for a thumb ------------------ */
+.touch-btn {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: auto; /* the only thing on the pad that takes input */
+  touch-action: none;
+  border-radius: 20px;
+  border: 1px solid color-mix(in srgb, var(--pad-tint) 46%, transparent);
+  background:
+    radial-gradient(
+      120% 120% at 50% 0%,
+      color-mix(in srgb, var(--pad-tint) 16%, transparent),
+      transparent 70%
+    ),
+    linear-gradient(180deg, var(--chip-face-top), var(--chip-face-bot));
+  box-shadow:
+    inset 0 1px 0 var(--chip-rim),
+    0 8px 22px var(--chip-cast);
+  backdrop-filter: var(--chip-blur);
+  -webkit-backdrop-filter: var(--chip-blur);
+  transition:
+    background 90ms ease,
+    border-color 90ms ease,
+    transform 90ms ease;
+}
+
+/* Round, and declared AFTER `.touch-btn` on purpose: the two selectors have
+   equal specificity, so the 20px slab radius above would otherwise win and the
+   three drive controls would render as squares — which is exactly what the
+   first screenshot showed. Circles also matter functionally here: a round
+   target tells a thumb where its centre is without being looked at. */
+.touch-gas,
+.touch-drift,
+.touch-nitro {
+  border-radius: 50%;
+}
+
+/* GAS is the primary control; its label carries the size to match */
+.touch-gas .touch-label {
+  font-size: clamp(13px, 1.9vw, 19px);
+}
+
+/* Pressed. The feedback is deliberately loud — a thumb COVERS its own target,
+   so the only part of a pressed control the driver can see is its rim and the
+   glow around it, and "is my finger still on it?" must be answerable at 200
+   km/h from peripheral vision. */
+.touch-btn.is-down {
+  border-color: var(--pad-tint);
+  background:
+    radial-gradient(
+      120% 120% at 50% 0%,
+      color-mix(in srgb, var(--pad-tint) 52%, transparent),
+      transparent 76%
+    ),
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--pad-tint) 30%, var(--chip-face-top)),
+      var(--chip-face-bot)
+    );
+  box-shadow:
+    inset 0 2px 12px color-mix(in srgb, var(--ink) 55%, transparent),
+    0 0 30px color-mix(in srgb, var(--pad-tint) 42%, transparent);
+  transform: translateY(1px) scale(0.99);
+}
+
+/* steering chevrons: CSS triangles, so there is no glyph, font or asset to
+   depend on and they scale with the zone (the repo bans external assets) */
+.touch-arrow-l,
+.touch-arrow-r {
+  width: 0;
+  height: 0;
+  border-top: clamp(20px, 3.6vh, 32px) solid transparent;
+  border-bottom: clamp(20px, 3.6vh, 32px) solid transparent;
+  filter: drop-shadow(0 2px 0 color-mix(in srgb, var(--ink) 82%, transparent));
+}
+
+.touch-arrow-l {
+  border-right: clamp(24px, 4.4vh, 38px) solid color-mix(in srgb, var(--hud-text) 90%, transparent);
+}
+
+.touch-arrow-r {
+  border-left: clamp(24px, 4.4vh, 38px) solid color-mix(in srgb, var(--hud-text) 90%, transparent);
+}
+
+.touch-btn.is-down .touch-arrow-l,
+.touch-btn.is-down .touch-arrow-r {
+  filter: drop-shadow(0 0 12px color-mix(in srgb, var(--hud-text) 60%, transparent));
+}
+
+.touch-label {
+  font-size: clamp(10px, 1.4vw, 14px);
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  color: color-mix(in srgb, var(--pad-tint) 62%, var(--hud-text));
+  text-shadow: var(--text-cast);
+}
+
+/* ---- the HUD gets out of the way of the thumbs ------------------------------
+   The lap times and the nitro pips live in the bottom corners — exactly where
+   the pad now is. Occluding either would be the same failure this project has
+   shipped before (a death card behind a banner). They lift by the pad's own
+   height variable, so the two can never drift apart. */
+.race.tablet .hud-times,
+.race.tablet .hud-nitro {
+  bottom: calc(var(--pad-band) + 26px);
+}
+
+.race.tablet .hint-card {
+  bottom: calc(env(safe-area-inset-bottom, 0px) + var(--pad-band) + 26px);
+  max-width: 52vw; /* the sides belong to the controls now */
+}
+
 /* ---- motion preference ------------------------------------------------------------ */
 
 @media (prefers-reduced-motion: reduce) {
@@ -1647,7 +1982,8 @@ body {
   }
 
   .room-row,
-  .hud-speed-bar {
+  .hud-speed-bar,
+  .touch-btn {
     transition: none;
   }
 }

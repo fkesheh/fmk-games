@@ -143,7 +143,36 @@ tablet with a keyboard attached should work with either.
 
 ### 4.2 Scheme
 
-**There are TWO layouts, and which one you get is decided by KIDS MODE.**
+### 4.2.0 TABLET MODE and KIDS MODE are INDEPENDENT
+
+This is the most important distinction in this section and the easiest to get
+wrong.
+
+- **TABLET MODE is an input surface.** It is for anyone playing on a touch
+  device — adults included. It is not a children's feature and must not be
+  built as one. It is the full, capable racing layout.
+- **KIDS MODE is an assist.** It already exists (`localStorage` key
+  `kart.kids`) and its existing behaviour is **auto-steer** — that behaviour
+  STAYS exactly as it is. Do not remove it, do not replace it with
+  auto-throttle, and do not repurpose the flag.
+
+All four combinations must work:
+
+| | kids mode OFF | kids mode ON |
+|---|---|---|
+| **keyboard** | today's game, unchanged | today's auto-steer, unchanged |
+| **tablet** | full 5-control touch layout | two steering zones, auto-steer + auto-throttle |
+
+Tablet mode is **auto-detected from a real pointer event**, and is ALSO
+manually toggleable in settings — a desktop with a touchscreen, or an adult who
+simply prefers thumbs, must be able to turn it on deliberately. Never sniff the
+user agent.
+
+**Judge tablet mode by an adult playing a serious race on an iPad**, not by
+whether a 4-year-old can use it. The child is served by kids mode layered on
+top.
+
+### 4.2.1 The two touch layouts
 
 #### Default layout (the standard mobile-racing split — thumbs never share a job)
 
@@ -157,23 +186,41 @@ tablet with a keyboard attached should work with either.
 - Nitro maps to the existing nitro hook; handbrake maps to the existing `drift`
   input. Neither is a new mechanic — this is a new *surface* for controls KART
   already has.
+- **There is deliberately NO brake/reverse control**, which creates a recovery
+  gap: a touch player who wedges the kart against scenery cannot back out.
+  Closed by making the **stuck auto-respawn universal on touch**, not
+  kids-only — the recovery a child already gets applies to every touch player.
+  This is preferred over adding a fourth right-side target, because the pad's
+  ergonomics depend on nitro and handbrake staying clear of the gas arc and a
+  fourth control would crowd it. If stuck-recovery ever becomes unreliable, add
+  the button; until then, no new UI.
 - **Sides are swappable** in settings for left-handed players. Cheap to support,
   and irritating to retrofit.
 
-#### KIDS MODE layout (existing flag, `localStorage` key `kart.kids`)
+#### Tablet + KIDS MODE — SAME layout, assist only
 
-Collapses to the simplest possible surface:
+**There is ONE touch layout. KIDS MODE does not change it.** All three
+right-side controls — gas, nitro, handbrake — are rendered for everyone,
+children included.
 
-- **Steering zones only. Auto-throttle forced ON.** No accelerate, no nitro, no
-  handbrake — those controls are not rendered at all, not merely disabled.
-- The entire control surface is two zones and nothing else.
+- **KIDS MODE's only effect on touch is its existing auto-steer assist.** It
+  does not hide controls, does not resize the pad, and does not add a second
+  layout to maintain.
+- **There is NO auto-throttle anywhere.** No `kart.autogas` setting, no forced
+  throttle in kids mode, no hidden gas pedal. A child holds the gas herself.
 
-Do NOT invent a second assist flag — extend the existing KIDS MODE. The whole
-point is that one toggle turns an adult's five-control racing game into a
-two-button game for a 4-year-old, with no explanation required.
+Why this is right, and better than the hide-everything version it replaces:
+holding one button is *easier* than steering, and steering is the part the
+assist already does for her. So a 4-year-old's job is one thumb on gas while the
+car drives itself — and nitro stays available as pure delight, which is exactly
+the kind of cause-and-effect a small child enjoys most. Hiding it took that away
+for no benefit.
 
-Auto-throttle is also available as a standalone setting for an adult who wants
-it without the rest of KIDS MODE.
+It also removes an entire second layout, its state, and its interactions with
+the HUD from the codebase.
+
+Do NOT invent a second assist flag — KIDS MODE stays exactly what it already
+was: auto-steer.
 
 ### 4.3 Multi-touch is a correctness requirement, not a nicety
 

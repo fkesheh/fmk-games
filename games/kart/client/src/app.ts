@@ -58,7 +58,8 @@ import type {
 } from '@kart/shared';
 import type { LobbyC2S, RoomInfo } from '@platform/shared';
 import { KartScene } from './render.js';
-import { DriveController } from './drive.js';
+import { DriveController, TouchPointers } from './drive.js';
+import type { TouchControl } from './drive.js';
 import { KartAudio } from './audio.js';
 import { KartFx } from './fx.js';
 import { setKartTrack } from './kartMesh.js';
@@ -517,9 +518,14 @@ const MINIMAP_SIZE = 140; // css px (2x backing store for retina)
 const NAME_MAX = 16; // lobby cleanName cap (platform protocol)
 const CODE_MAX = 8;
 const KIDS_KEY = 'kart.kids'; // localStorage key for the KIDS MODE assist toggle
+// ---- tablet mode (docs/TOUCH_PWA.md §4) --------------------------------------
+// TABLET MODE is an input SURFACE for anyone on a touch device, adults
+// included; KIDS MODE is an ASSIST layered on top. They are independent axes and
+// all four combinations are live, so they are separate keys and separate
+// toggles. `kart.tablet` absent = auto-detect; '1'/'0' = the player decided.
+const TABLET_KEY = 'kart.tablet';
+const LEFTY_KEY = 'kart.lefty'; // swap the steering/driving halves for left-handers
 const TWO_PI = Math.PI * 2;
-
-const ZERO_INPUT: KartInput = { throttle: 0, brake: 0, steer: 0, drift: false };
 
 /** drive.state() shape per the frozen drive.ts signature (docs/KART.md). */
 type DriveState = KartState & { steer: number; driftVisual: number };
@@ -572,14 +578,34 @@ function el<K extends keyof HTMLElementTagNameMap>(
   return node;
 }
 
-/** KIDS MODE persisted toggle (localStorage 'kart.kids'); false when storage is blocked. */
-function readKidsStored(): boolean {
+/**
+ * A persisted settings flag. `null` means "never set" — which is NOT the same
+ * as false for tablet mode (absent = auto-detect) or auto-throttle (absent =
+ * follow KIDS MODE), so the tri-state is the return type rather than a default
+ * baked in here. Storage blocked (private mode) reads as never-set.
+ */
+function readFlag(key: string): boolean | null {
   try {
-    const v = localStorage.getItem(KIDS_KEY);
+    const v = localStorage.getItem(key);
+    if (v === null) return null;
     return v === '1' || v === 'true';
   } catch {
-    return false; // storage unavailable (private mode) — assist defaults off
+    return null;
   }
+}
+
+/** Persist a settings flag; a blocked store still leaves the toggle live for the session. */
+function writeFlag(key: string, on: boolean): void {
+  try {
+    localStorage.setItem(key, on ? '1' : '0');
+  } catch {
+    // storage unavailable — the toggle still works for this session
+  }
+}
+
+/** KIDS MODE persisted toggle (localStorage 'kart.kids'); false when storage is blocked. */
+function readKidsStored(): boolean {
+  return readFlag(KIDS_KEY) === true;
 }
 
 /** Trimmed, length-capped display name; 'Player' when whitespace-only (lobby rule). */
@@ -715,9 +741,25 @@ export class KartApp {
   private readonly visuals = new Map<string, RemoteVisual>(); // last drawn remote pose (telemetry)
 
   // ---- input -----------------------------------------------------------------------
-  // The keyboard is owned by drive.ts; the only input app.ts injects is the
-  // latched debug driver (e2e), via drive.setInput.
+  // The keyboard is owned by drive.ts. app.ts injects exactly ONE external
+  // input — `extInput`, the merge of the latched debug driver (e2e) and the
+  // tablet touch pad — through the single drive.setInput() latch. There is no
+  // second input path, and touch never disables the keyboard: a tablet with a
+  // keyboard attached drives with either, or both.
   private debugInput: KartInput | null = null; // __kart.setInput override (e2e driver)
+  /** The merged latch handed to drive.setInput(). Reused — never allocated per event. */
+  private readonly extInput: KartInput = { throttle: 0, brake: 0, steer: 0, drift: false };
+  /** Tablet pad: which pointerId is on which control (see drive.ts TouchPointers). */
+  private readonly touch = new TouchPointers();
+  /** Pad targets in hit-test order + a flat rect cache (x0,y0,x1,y1 per entry). */
+  private readonly touchTargets: { el: HTMLDivElement; control: TouchControl }[] = [];
+  private readonly touchRects: number[] = [];
+  private touchRectsDirty = true; // resize / layout change: re-measure before the next press
+  private tabletPref: boolean | null = null; // explicit settings override (null = auto-detect)
+  private tabletSeen = false; // a coarse/no-hover pointer exists (media query or a real event)
+  private padVisible = false; // last written pad visibility, so the phase sync is a no-op write
+  private lefty = false; // swap the halves for a left-handed player
+  private wakeLock: WakeLockSentinel | null = null; // screen wake lock while a race is live
 
   // ---- presentation state ------------------------------------------------------------
   private countdownShown = 0; // big number currently up (dedupes event + snapshot)
@@ -754,6 +796,9 @@ export class KartApp {
   private readonly nameInput: HTMLInputElement;
   private readonly codeInput: HTMLInputElement;
   private readonly kidsInput: HTMLInputElement; // menu KIDS MODE checkbox
+  private readonly tabletInput: HTMLInputElement; // menu TABLET CONTROLS checkbox
+  private readonly leftyInput: HTMLInputElement; // menu LEFT-HANDED checkbox
+  private readonly touchEl: HTMLDivElement; // the tablet control surface (hidden off touch)
   private readonly roomsEl: HTMLDivElement;
   private readonly menuButtons: HTMLButtonElement[] = [];
   private readonly raceEl: HTMLDivElement;
@@ -788,6 +833,7 @@ export class KartApp {
   private readonly lobbySeasonNoteEl: HTMLDivElement; // our own standing, in words
   private readonly lobbyPlayersEl: HTMLDivElement;
   private readonly lobbyStatusEl: HTMLDivElement;
+  private readonly lobbyHintEl: HTMLDivElement; // grid controls line (keyboard vs tablet)
   private readonly startBtn: HTMLButtonElement; // explicit race start (no auto-start)
   private readonly countdownEl: HTMLDivElement;
   private readonly msgEl: HTMLDivElement;
@@ -811,6 +857,19 @@ export class KartApp {
 
   constructor(root: HTMLElement) {
     this.assist = readKidsStored(); // KIDS MODE persisted toggle (localStorage 'kart.kids')
+    this.tabletPref = readFlag(TABLET_KEY); // null = auto-detect from the pointer
+    this.lefty = readFlag(LEFTY_KEY) === true;
+    // §4.4: no user-agent sniffing. A coarse pointer with no hover IS a touch
+    // device by the only definition the platform gives us; a real touch/pen
+    // pointerdown (wired below) arms it too, for the hybrids the query misses.
+    if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+      const coarse = window.matchMedia('(hover: none) and (pointer: coarse)');
+      this.tabletSeen = coarse.matches;
+      coarse.addEventListener('change', (e) => {
+        this.tabletSeen = this.tabletSeen || e.matches;
+        this.syncTouchUi();
+      });
+    }
 
     // ---- menu screen ----------------------------------------------------------
     this.menuEl = el('div', 'screen menu');
@@ -861,6 +920,25 @@ export class KartApp {
     kidsRow.appendChild(this.kidsInput);
     kidsRow.appendChild(el('span', 'menu-kids-label', 'KIDS MODE — auto steer'));
     this.menuEl.appendChild(kidsRow);
+
+    // TABLET MODE and its one shape setting. Deliberately a separate row from
+    // KIDS MODE: the pad is a full racing surface for an adult on an iPad, not
+    // a children's feature (docs/TOUCH_PWA.md §4.2.0), and KIDS MODE does not
+    // change it — there is ONE touch layout. Both are visible on desktop too —
+    // a touchscreen laptop must be able to opt IN, and a tablet player must be
+    // able to opt OUT, without any user-agent guessing.
+    const toggles = el('div', 'menu-toggles');
+    this.tabletInput = this.toggleChip(toggles, 'TABLET CONTROLS', this.tabletActive(), (on) => {
+      this.tabletPref = on;
+      writeFlag(TABLET_KEY, on);
+      this.syncTouchUi();
+    });
+    this.leftyInput = this.toggleChip(toggles, 'LEFT-HANDED', this.lefty, (on) => {
+      this.lefty = on;
+      writeFlag(LEFTY_KEY, on);
+      this.syncTouchUi();
+    });
+    this.menuEl.appendChild(toggles);
 
     this.menuEl.appendChild(el('h2', 'menu-rooms-title', 'TRACKS'));
     this.roomsEl = el('div', 'menu-rooms');
@@ -979,6 +1057,28 @@ export class KartApp {
     this.hudEl.appendChild(this.gateWrapEl);
     this.raceEl.appendChild(this.hudEl);
 
+    // ---- tablet control surface (docs/TOUCH_PWA.md §4) ------------------------
+    // Built once, hidden unless tablet mode is live, and appended HERE so the
+    // lobby / countdown / results overlays (added below, higher z-index) always
+    // paint over it — a pad on top of the START button would be unrecoverable.
+    // Left half steers, right half drives; KIDS MODE removes the right half
+    // from the DOM's reach via CSS `display:none`, so a child never sees a
+    // control she cannot use. Sides swap with `.lefty`.
+    this.touchEl = el('div', 'touch-pad hidden');
+    const steerWrap = el('div', 'touch-steer');
+    this.padButton(steerWrap, 'left', 'touch-btn touch-steer-btn', el('div', 'touch-arrow-l'));
+    this.padButton(steerWrap, 'right', 'touch-btn touch-steer-btn', el('div', 'touch-arrow-r'));
+    this.touchEl.appendChild(steerWrap);
+    const driveWrap = el('div', 'touch-drive');
+    // GAS is the largest target and sits lowest/outermost, under the resting
+    // thumb; NITRO and DRIFT are smaller and set inboard-and-up, off the arc a
+    // thumb sweeps while pulling gas.
+    this.padButton(driveWrap, 'gas', 'touch-btn touch-gas', el('div', 'touch-label', 'GAS'));
+    this.padButton(driveWrap, 'drift', 'touch-btn touch-drift', el('div', 'touch-label', 'DRIFT'));
+    this.padButton(driveWrap, 'nitro', 'touch-btn touch-nitro', el('div', 'touch-label', 'NITRO'));
+    this.touchEl.appendChild(driveWrap);
+    this.raceEl.appendChild(this.touchEl);
+
     // lobby overlay: the grid (player list) + phase status
     this.lobbyEl = el('div', 'lobby-overlay hidden');
     const lobbyPanel = el('div', 'lobby-panel');
@@ -1006,7 +1106,8 @@ export class KartApp {
       if (this.canStart) this.send({ t: 'start' });
     });
     lobbyPanel.appendChild(this.startBtn);
-    lobbyPanel.appendChild(el('div', 'lobby-hint', 'WASD / ARROWS to drive — SPACE to drift'));
+    this.lobbyHintEl = el('div', 'lobby-hint', 'WASD / ARROWS to drive — SPACE to drift');
+    lobbyPanel.appendChild(this.lobbyHintEl);
     this.lobbyEl.appendChild(lobbyPanel);
     this.raceEl.appendChild(this.lobbyEl);
 
@@ -1108,9 +1209,8 @@ export class KartApp {
     this.drive.setAssist(this.assist); // kids-mode assist restored before the first join
     // nitro key (N) asks the SERVER to spend a charge; only racing may spend one.
     // The boost itself starts when the server's nitro race event echoes back.
-    this.drive.onNitro = () => {
-      if (this.phase === 'racing') this.send({ t: 'nitro' });
-    };
+    // The pad's NITRO button lands on the SAME request — one hook, two surfaces.
+    this.drive.onNitro = () => this.requestNitro();
     this.scene.resize();
 
     // ---- fx pools + minimap precompute -------------------------------------------
@@ -1120,12 +1220,81 @@ export class KartApp {
     // ---- listeners (driving keys are owned by drive.ts; audio unlocks on clicks) ----
     window.addEventListener('resize', () => {
       if (this.screen === 'race') this.scene.resize();
+      this.touchRectsDirty = true; // the pad moved: its cached rects are lies now
+    });
+    window.addEventListener('orientationchange', () => {
+      this.touchRectsDirty = true;
     });
     // T toggles KIDS MODE in-game (docs/KART.md "Kids mode"); the menu uses the checkbox
     window.addEventListener('keydown', (e) => {
       if (e.code !== 'KeyT' || e.repeat || this.screen !== 'race') return;
       this.setAssist(!this.assist);
     });
+
+    // ---- tablet pad: pointer wiring (docs/TOUCH_PWA.md §4.3) --------------------
+    // Pointer Events, never Touch Events, so a mouse, a stylus and a thumb are
+    // one code path. Everything is keyed by pointerId.
+    //
+    // The listeners live on the PAD, not on each button, because a touch
+    // pointer is IMPLICITLY CAPTURED by whatever element it went down on: after
+    // pointerdown, every pointermove keeps reporting that first element no
+    // matter where the finger actually is. Sliding between zones is therefore
+    // resolved against cached rects, not against e.target — the same reason
+    // `touch-action: none` is on the pad in style.css.
+    const pad = this.touchEl;
+    pad.addEventListener('pointerdown', (e: PointerEvent) => {
+      this.armTablet(e.pointerType);
+      const control = this.hitTest(e.clientX, e.clientY);
+      if (control === null) return;
+      e.preventDefault(); // no scroll, no synthetic click, no text selection
+      if (this.touch.press(e.pointerId, control) && control === 'nitro') this.requestNitro();
+      this.audio.resume(); // first race touch may be the page's only gesture (iOS)
+      this.paintTouch();
+      this.applyExternalInput();
+    });
+    pad.addEventListener('pointermove', (e: PointerEvent) => {
+      if (this.touch.count() === 0) return; // nothing down: a hovering mouse must not steer
+      const control = this.hitTest(e.clientX, e.clientY);
+      if (!this.touch.retarget(e.pointerId, control)) {
+        this.paintTouch(); // the slide may still have RELEASED a control
+        this.applyExternalInput();
+        return;
+      }
+      if (control === 'nitro') this.requestNitro();
+      this.paintTouch();
+      this.applyExternalInput();
+    });
+    // pointerup, pointercancel (system interruption mid-press: notification,
+    // app switch, palm rejection) and a lost capture all release identically.
+    // If pointercancel did not release, the steering would stay latched until
+    // the next press — the single worst failure this control scheme has.
+    const releasePointer = (e: PointerEvent): void => {
+      this.touch.release(e.pointerId);
+      this.paintTouch();
+      this.applyExternalInput();
+    };
+    pad.addEventListener('pointerup', releasePointer);
+    pad.addEventListener('pointercancel', releasePointer);
+    pad.addEventListener('lostpointercapture', releasePointer);
+    // A pointer can also be lost with no event of its own: the tab is hidden,
+    // the window is blurred by an app switch, the page navigates away. Nothing
+    // may stay held through any of those.
+    window.addEventListener('blur', () => this.clearTouch());
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'visible') {
+        this.clearTouch();
+      } else if (this.screen === 'race') {
+        void this.acquireWakeLock(); // the lock is dropped whenever we are hidden
+      }
+    });
+    // Auto-detect: the first REAL touch/pen pointer anywhere arms tablet mode,
+    // which covers hybrids the media query calls a mouse. Capture phase so a
+    // tap on a menu button arms it before the click handler changes screens.
+    window.addEventListener(
+      'pointerdown',
+      (e: PointerEvent) => this.armTablet(e.pointerType),
+      { capture: true, passive: true },
+    );
 
     // ---- timers (setInterval for net: rAF pauses in background tabs) ---------------
     window.setInterval(() => {
@@ -1159,6 +1328,7 @@ export class KartApp {
       },
     };
 
+    this.syncTouchUi(); // pad + layout classes; a no-op on a desktop pointer
     this.connect();
     this.renderMenu();
   }
@@ -1423,7 +1593,9 @@ export class KartApp {
     this.ownFx.init = false;
     this.fx.clear();
     this.debugInput = null;
-    this.drive.setInput({ ...ZERO_INPUT }); // clear a latched debug driver
+    this.touch.clear(); // and any thumb still down when the room went away
+    this.paintTouch();
+    this.applyExternalInput(); // clears the latch (debug driver + pad both empty now)
     this.applyFreeze(); // back at the menu the sim is frozen ('lobby' !== 'racing')
     this.countdownShown = 0;
     this.goActive = false;
@@ -1535,6 +1707,7 @@ export class KartApp {
     }
     if (next === 'ready') this.countdownShown = 0; // arm the 3-2-1 dedupe for the new race
     if (prev === 'countdown' && next === 'racing' && !this.goActive) this.showGo(); // lost 'go' event
+    this.syncTouchUi(); // the pad is up from the countdown and down on the results screen
   }
 
   // ---- race events ---------------------------------------------------------------------
@@ -1650,11 +1823,146 @@ export class KartApp {
     this.assist = on;
     this.kidsInput.checked = on;
     this.drive.setAssist(on);
-    try {
-      localStorage.setItem(KIDS_KEY, on ? '1' : '0');
-    } catch {
-      // storage unavailable — the toggle still works for this session
+    writeFlag(KIDS_KEY, on);
+    // Nothing else to reconcile: KIDS MODE's ONLY effect on touch is the
+    // auto-steer above (docs/TOUCH_PWA.md §4.2.1). It does not reshape the pad,
+    // hide a control or change the throttle — there is one touch layout.
+  }
+
+  // ---- tablet mode (touch control surface, docs/TOUCH_PWA.md §4) ---------------------------
+
+  /** Is the touch pad live? Explicit setting wins; otherwise the detected pointer decides. */
+  private tabletActive(): boolean {
+    return this.tabletPref ?? this.tabletSeen;
+  }
+
+  /** A real touch/pen pointer proves this is a touch device (never the user agent). */
+  private armTablet(pointerType: string): void {
+    if (this.tabletSeen || (pointerType !== 'touch' && pointerType !== 'pen')) return;
+    this.tabletSeen = true;
+    this.syncTouchUi();
+  }
+
+  /**
+   * Reconcile every touch-shaped piece of the DOM with the settings: the two
+   * layout classes the stylesheet keys off, the pad's visibility, the hint text
+   * and the settings checkboxes. KIDS MODE is deliberately absent from all of
+   * it — the pad is identical with the assist on or off. Cheap and idempotent:
+   * the only DOM writes are class toggles classList already no-ops when
+   * unchanged, plus one guarded visibility flip.
+   */
+  private syncTouchUi(): void {
+    const on = this.tabletActive();
+    // The pad has no brake and no reverse (docs/TOUCH_PWA.md §4.2.1), so a
+    // tablet player who buries the kart cannot back out and has no R key: the
+    // stuck auto-respawn is armed for EVERY touch player, not just kids.
+    this.drive.setStuckGuard(on);
+    const cls = this.raceEl.classList;
+    cls.toggle('tablet', on);
+    cls.toggle('lefty', this.lefty);
+    this.tabletInput.checked = on;
+    this.leftyInput.checked = this.lefty;
+    // The pad is up on the race screen while the track is drivable. It stays
+    // DOWN in the lobby and on the results screen: those overlays own the
+    // screen and their buttons must be tappable.
+    const visible =
+      on && this.screen === 'race' && (this.phase === 'countdown' || this.phase === 'racing');
+    if (visible !== this.padVisible) {
+      this.padVisible = visible;
+      this.touchEl.classList.toggle('hidden', !visible);
+      this.touchRectsDirty = true;
+      if (!visible) this.clearTouch();
     }
+    this.touchRectsDirty = true; // a layout class change moves every target
+    // One hint for every touch player, child included — they have the same
+    // controls. KIDS MODE announces itself with the HUD's own KIDS badge.
+    const hint = on
+      ? `LEFT SIDE steers · GAS bottom right · NITRO ×${NITRO_CHARGES} · DRIFT to slide`
+      : `WASD/arrows drive · Space/Shift drift · N nitro ×${NITRO_CHARGES} · R respawn at last gate`;
+    if (this.hintEl.textContent !== hint) this.hintEl.textContent = hint;
+    const lobbyHint = on
+      ? 'TABLET CONTROLS — thumbs on the pad once the lights go out'
+      : 'WASD / ARROWS to drive — SPACE to drift';
+    if (this.lobbyHintEl.textContent !== lobbyHint) this.lobbyHintEl.textContent = lobbyHint;
+  }
+
+  /** Re-measure the pad targets. Layout read only — never inside a pointermove. */
+  private measurePad(): void {
+    const r = this.touchRects;
+    r.length = 0;
+    for (const t of this.touchTargets) {
+      const box = t.el.getBoundingClientRect();
+      // a hidden pad measures 0x0 at 0,0 — pushed anyway so the indices stay
+      // aligned with touchTargets, and the hit test can never match a zero-area
+      // rect
+      r.push(box.left, box.top, box.right, box.bottom);
+    }
+    this.touchRectsDirty = false;
+  }
+
+  /**
+   * Which control is under a viewport point. Rect-based, because a touch
+   * pointer's move events are implicitly captured by the element it started on
+   * and `e.target` would answer "the one you first pressed" forever.
+   */
+  private hitTest(x: number, y: number): TouchControl | null {
+    if (this.touchRectsDirty) this.measurePad();
+    const r = this.touchRects;
+    for (let i = 0; i < this.touchTargets.length; i++) {
+      const x0 = r[i * 4] ?? 0;
+      const y0 = r[i * 4 + 1] ?? 0;
+      const x1 = r[i * 4 + 2] ?? 0;
+      const y1 = r[i * 4 + 3] ?? 0;
+      if (x1 <= x0 || y1 <= y0) continue; // hidden target: zero-area, never hit
+      if (x >= x0 && x < x1 && y >= y0 && y < y1) return this.touchTargets[i]?.control ?? null;
+    }
+    return null; // dead space
+  }
+
+  /** Mirror the held set onto the buttons (pressed look). Event-driven, not per frame. */
+  private paintTouch(): void {
+    for (const t of this.touchTargets) {
+      t.el.classList.toggle('is-down', this.touch.isDown(t.control));
+    }
+  }
+
+  /** Drop every tracked pointer (blur / tab hide / leaving the race screen). */
+  private clearTouch(): void {
+    if (this.touch.count() === 0) return;
+    this.touch.clear();
+    this.paintTouch();
+    this.applyExternalInput();
+  }
+
+  /** The NITRO button and the N key make the identical request; only racing may spend. */
+  private requestNitro(): void {
+    if (this.phase === 'racing') this.send({ t: 'nitro' });
+  }
+
+  /** Screen Wake Lock while a race is live; silently absent where unsupported. */
+  private async acquireWakeLock(): Promise<void> {
+    if (this.wakeLock !== null || !('wakeLock' in navigator)) return;
+    try {
+      const lock = await navigator.wakeLock.request('screen');
+      if (this.screen !== 'race') {
+        void lock.release().catch(() => undefined); // we left while the request was in flight
+        return;
+      }
+      this.wakeLock = lock;
+      // the platform drops it on hide; forget it so the visibility handler re-takes it
+      lock.addEventListener('release', () => {
+        if (this.wakeLock === lock) this.wakeLock = null;
+      });
+    } catch {
+      // denied / unsupported / not visible — a race without it is still a race
+    }
+  }
+
+  private releaseWakeLock(): void {
+    const lock = this.wakeLock;
+    if (lock === null) return;
+    this.wakeLock = null;
+    void lock.release().catch(() => undefined);
   }
 
   // ---- input ------------------------------------------------------------------------------
@@ -1666,7 +1974,32 @@ export class KartApp {
       steer: clampNum(steer, -1, 1),
       drift: drift === true,
     };
-    this.drive.setInput(this.debugInput);
+    this.applyExternalInput();
+  }
+
+  /**
+   * The ONE external input drive.ts ever sees: the debug latch merged with the
+   * tablet pad. Event-driven (a press, a release, a settings change) — never
+   * per frame — and it writes into a single reused object, so the input path
+   * allocates nothing.
+   *
+   * Merged, not exclusive: a tablet with a keyboard attached drives with
+   * either, and the e2e driver keeps working with a pad on screen. drive.ts
+   * then merges THIS with the held keyboard state exactly as before.
+   */
+  private applyExternalInput(): void {
+    const d = this.debugInput;
+    const pad = this.padVisible;
+    const e = this.extInput;
+    // The throttle is always a held thumb — there is no auto-throttle anywhere,
+    // for anyone (docs/TOUCH_PWA.md §4.2.1). Holding one button is the easiest
+    // thing a small child does; steering is the hard part, and that is exactly
+    // what KIDS MODE's auto-steer already handles.
+    e.throttle = clampNum((d?.throttle ?? 0) + (pad && this.touch.isDown('gas') ? 1 : 0), 0, 1);
+    e.brake = clampNum(d?.brake ?? 0, 0, 1);
+    e.steer = clampNum((d?.steer ?? 0) + (pad ? this.touch.steer() : 0), -1, 1);
+    e.drift = (d?.drift ?? false) || (pad && this.touch.isDown('drift'));
+    this.drive.setInput(e);
   }
 
   // ---- frame loop (sim + render; net runs on packet ticks + setInterval) --------------------
@@ -2185,6 +2518,8 @@ export class KartApp {
     this.menuEl.classList.remove('hidden');
     this.setNotice(notice);
     this.renderMenu();
+    this.syncTouchUi(); // the pad comes down with the race screen
+    this.releaseWakeLock(); // ...and the screen may sleep again
   }
 
   private showRace(): void {
@@ -2192,6 +2527,8 @@ export class KartApp {
     this.menuEl.classList.add('hidden');
     this.raceEl.classList.remove('hidden');
     this.scene.resize(); // the canvas was display:none — measurable only now
+    this.syncTouchUi(); // pad geometry is measurable only now, too
+    void this.acquireWakeLock(); // a screen that sleeps mid-race is blamed on the game
   }
 
   // ---- menu rendering ---------------------------------------------------------------------------
@@ -2211,6 +2548,42 @@ export class KartApp {
       onClick();
     });
     parent.appendChild(btn);
+    return btn;
+  }
+
+  /** One compact settings toggle in the menu's toggle row (same idiom as .menu-kids). */
+  private toggleChip(
+    parent: HTMLElement,
+    label: string,
+    checked: boolean,
+    onChange: (on: boolean) => void,
+  ): HTMLInputElement {
+    const row = el('label', 'menu-toggle');
+    const input = el('input');
+    input.type = 'checkbox';
+    input.checked = checked;
+    input.addEventListener('change', () => {
+      this.audio.resume(); // browsers gate AudioContext on a user gesture
+      onChange(input.checked);
+    });
+    row.appendChild(input);
+    row.appendChild(el('span', 'menu-toggle-label', label));
+    parent.appendChild(row);
+    return input;
+  }
+
+  /** One target on the tablet pad. A div, not a button: nothing on the pad may
+   *  take focus, or the next SPACE/arrow press would go to it instead of the kart. */
+  private padButton(
+    parent: HTMLElement,
+    control: TouchControl,
+    className: string,
+    inner: HTMLElement,
+  ): HTMLDivElement {
+    const btn = el('div', className);
+    btn.appendChild(inner);
+    parent.appendChild(btn);
+    this.touchTargets.push({ el: btn, control });
     return btn;
   }
 
@@ -2477,8 +2850,11 @@ export class KartApp {
             },
       offsetMs: this.offset,
       rttMs: this.rttMs,
-      // the latched ext input only — the keyboard is drive-internal and not observable here
-      input: this.debugInput !== null ? { ...this.debugInput } : { ...ZERO_INPUT },
+      // the latched ext input only — the keyboard is drive-internal and not
+      // observable here. This is the MERGED latch (debug driver + tablet pad),
+      // i.e. exactly what drive.ts was handed, so a touch harness can read back
+      // what a thumb produced.
+      input: { ...this.extInput },
       own: {
         x: s.x,
         y: s.y,

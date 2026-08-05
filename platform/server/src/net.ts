@@ -38,7 +38,28 @@ const MIME_TYPES: Record<string, string> = {
   '.json': 'application/json',
   '.png': 'image/png',
   '.ico': 'image/x-icon',
+  // A game's manifest ships in its own dist (docs/TOUCH_PWA.md §2.0). Served
+  // as application/octet-stream it is rejected as a manifest and the install
+  // silently degrades to a browser bookmark.
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.webp': 'image/webp',
 };
+
+// Cache policy for the game dists. Vite content-hashes everything under
+// assets/, so those URLs are immutable and may be cached forever; a document
+// must NEVER be, or an HTTP-level cache strands a device on an old build just
+// as effectively as a bad service worker would (docs/TOUCH_PWA.md §2.1).
+const IMMUTABLE_CACHE = 'public, max-age=31536000, immutable';
+const DOC_CACHE = 'no-cache';
+const SHORT_CACHE = 'public, max-age=3600';
+
+function cachePolicy(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === '.html' || ext === '.webmanifest') return DOC_CACHE;
+  if (filePath.includes(`${path.sep}assets${path.sep}`)) return IMMUTABLE_CACHE;
+  return SHORT_CACHE;
+}
 
 const MAX_PAYLOAD = 16 * 1024; // wire messages are tiny; bigger frames are abuse
 
@@ -148,6 +169,24 @@ export interface ProxyMount {
 
 export type Mount = StaticMount | ProxyMount;
 
+/**
+ * One generated (not on-disk) asset: the PWA surface — service workers, the
+ * launcher manifest and icons, the offline card (docs/TOUCH_PWA.md §2.0).
+ */
+export interface AssetResponse {
+  readonly body: string | Buffer;
+  readonly contentType: string;
+  readonly cacheControl: string;
+}
+
+/**
+ * Resolves a generated asset for a pathname, or null to fall through to the
+ * normal routing. Consulted BEFORE the game mounts, because a mount answers
+ * every miss under its prefix with its own index.html (SPA fallback) and would
+ * otherwise swallow `/<gameId>/sw.js`.
+ */
+export type AssetResolver = (pathname: string) => Promise<AssetResponse | null>;
+
 // Response headers that describe the upstream hop, not the resource — node
 // re-chunks/re-frames the piped body for the downstream connection itself.
 const HOP_BY_HOP_HEADERS = new Set(['connection', 'transfer-encoding', 'keep-alive']);
@@ -184,9 +223,14 @@ export class NetServer {
     this.hooks = hooks;
   }
 
-  start(port: number, mounts: readonly Mount[], launcherHtml: string): void {
+  start(
+    port: number,
+    mounts: readonly Mount[],
+    launcherHtml: string,
+    assets: AssetResolver | null = null,
+  ): void {
     const http = createServer((req, res) => {
-      serveHttp(req, res, mounts, launcherHtml).catch((err: unknown) => {
+      serveHttp(req, res, mounts, launcherHtml, assets).catch((err: unknown) => {
         console.error('[net] http error', err);
         if (!res.headersSent) res.writeHead(500);
         res.end('Internal Server Error');
@@ -311,6 +355,7 @@ async function serveHttp(
   res: ServerResponse,
   mounts: readonly Mount[],
   launcherHtml: string,
+  assets: AssetResolver | null,
 ): Promise<void> {
   let pathname: string;
   try {
@@ -322,9 +367,29 @@ async function serveHttp(
   }
 
   if (pathname === '/') {
-    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': DOC_CACHE });
     res.end(launcherHtml);
     return;
+  }
+
+  if (assets !== null && (req.method === 'GET' || req.method === 'HEAD')) {
+    const asset = await assets(pathname);
+    if (asset !== null) {
+      const body = Buffer.isBuffer(asset.body) ? asset.body : Buffer.from(asset.body, 'utf8');
+      // content-length is explicit because of HEAD: ending a HEAD with no body
+      // and no length makes node fall back to chunked framing, and Chromium
+      // reports the (correct, empty) response as net::ERR_ABORTED — which
+      // scripts/e2e.mjs counts as a page error. A declared length terminates
+      // the response cleanly for both methods.
+      res.writeHead(200, {
+        'content-type': asset.contentType,
+        'cache-control': asset.cacheControl,
+        'content-length': body.byteLength,
+      });
+      if (req.method === 'HEAD') res.end();
+      else res.end(body);
+      return;
+    }
   }
 
   for (const mount of mounts) {
@@ -434,6 +499,6 @@ async function serveGameFile(dir: string, rel: string, res: ServerResponse): Pro
     }
   }
   const contentType = MIME_TYPES[path.extname(filePath).toLowerCase()] ?? 'application/octet-stream';
-  res.writeHead(200, { 'content-type': contentType });
+  res.writeHead(200, { 'content-type': contentType, 'cache-control': cachePolicy(filePath) });
   res.end(data);
 }

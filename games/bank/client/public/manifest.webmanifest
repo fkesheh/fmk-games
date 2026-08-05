@@ -1,0 +1,31 @@
+{
+  "name": "BANK",
+  "short_name": "BANK",
+  "id": "/bank/",
+  "start_url": "/bank/",
+  "scope": "/bank/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0e130f",
+  "theme_color": "#0e130f",
+  "icons": [
+    {
+      "src": "/bank/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/bank/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/bank/icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
