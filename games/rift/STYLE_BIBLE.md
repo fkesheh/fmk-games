@@ -173,9 +173,17 @@ are tuned so they are *pleasant* by day and *dominant* by night.
 
 ## 5. Camera & framing
 
-Unchanged where it works: fixed pitch **55°**, fixed yaw, perspective FOV **50**, height clamp
-**[18, 55]**, default **36**. Do not "improve" the camera into an orbit cam — the fixed MOBA framing
-is correct and every capture depends on it being stable.
+Unchanged where it works: fixed pitch **55°**, fixed yaw, perspective FOV **50**, default height
+**36**. Do not "improve" the camera into an orbit cam — the fixed MOBA framing is correct and every
+capture depends on it being stable.
+
+**One measured change: the minimum height drops from 18 to 11.** Verified against a baseline capture
+at full zoom-in — a hero occupies roughly 40 px of a 1080p frame at camH 18. At that size a 45–70
+part hero silhouette is *entirely wasted effort*: no headgear, cape, weapon or animation is legible,
+and the close-up shots the judge compares against Dota 2 hero shots cannot be won. Every argument in
+§7 for hero detail is void unless the camera can actually get close enough to see it. `CAM_MIN_H`
+becomes **11** (R_WIRE owns `game.ts`); `CAM_MAX_H` and the default are unchanged, so normal play
+framing does not move.
 
 What changes: the camera now looks at terrain with real height, so the **ground plane under the
 camera target must be height-sampled** — the camera rides the terrain rather than a flat y=0, or the
@@ -321,6 +329,32 @@ soft, slightly warm visibility falloff at the edge of vision. Team units stay re
 fog-darkened terrain — that ladder assertion still binds.
 
 ---
+
+## 10a. Baseline defects observed on pixels (fix these by name)
+
+Found by the orchestrator looking at rendered captures of the current build, not by reading code.
+Each is a specific, named thing to kill — a reviewer checks them off.
+
+1. **The ground mottling reads as visible rectangles.** The decal quads scattered over the moss are
+   plainly rectangular and axis-ish aligned at gameplay zoom, so the ground looks patched rather than
+   varied. Ground variation must come from the surface's own noise/normal maps and from irregular,
+   rotated, soft-edged forms — never from visible flat quads laid on the plane. (R_TERRAIN)
+2. **Shadows are huge soft blobs with no definition.** A tower casts a shapeless smear. This is the
+   whole-map shadow frustum at 2048 spending nearly all its resolution on empty ground. The
+   view-fitted, texel-snapped frustum at 4096 in §4 is the fix, and its success criterion is concrete:
+   a tower's shadow must show its cornice and brazier as distinct forms. (R_SCENE)
+3. **The lane reads as beige tape laid on grass.** Its edge is a pure colour step with no geometry.
+   Lanes need real edge treatment — a kerb with thickness, worn/broken margins where traffic spills
+   onto the verge, embedded flagstones, and dirt bleeding into the moss — so the lane looks *built
+   into* the ground rather than painted onto it. (R_MAPMESH)
+4. **Trees are the textbook lollipop**: one cylinder plus one green icosahedron. §7's six archetypes
+   with root flare, branch levels and layered canopy shells exist to end this. (R_VEG)
+5. **The fog-of-war edge is a hard flat darkening** that reads as a UI lid dropped over the world,
+   which §10 already calls out. Confirmed on pixels. (R_FOG)
+
+The palette, for the record, is **not** a defect — the moss/sand/team-colour relationships read well
+and are pleasant on screen. The failure is entirely form, detail and light, which is where the
+budget goes.
 
 ## 11. The hard bans
 

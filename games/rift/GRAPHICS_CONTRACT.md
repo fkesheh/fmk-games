@@ -235,6 +235,13 @@ camH 24), `river-mid`, `camp-brute`, `jungle-wall`, and the night variants `nigh
 `window.__rift.setDayPhase` before the shot, or captures become wall-clock dependent and no two judge
 rounds are comparable. Reference captures for the new shots are sourced into `judge/reference/` by
 S_HARNESS on the first green run.
+
+**Capture liveness (measured defect).** The baseline `wide-mid` capture was taken while the local
+hero was dead, so the entire frame came through the death-screen dim and was near-black — a judge
+scoring that frame would be scoring an overlay, not the game. **S_HARNESS must assert the local hero
+is alive and no full-screen overlay (death, countdown, end) is present before every in-world shot**,
+and must re-drive the state and retry rather than emit a dimmed frame. A shot that cannot reach a
+live state fails loudly instead of being captured.
 - **Robustness:** one exception must never white-screen; WebGL2 or post-processing failure degrades
   to a readable error div rather than a blank canvas; window blur clears held keys; resize reflows.
 
