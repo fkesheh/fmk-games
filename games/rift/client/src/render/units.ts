@@ -17,6 +17,16 @@
 // ANIMATED CARVE-OUT (§7): the only unbaked moving parts here are tower
 // crystals (slow orbit), the Ancient heart (float/bob), ward eyes (pulse),
 // and projectiles; everything else is one static merged mesh per unit.
+//
+// PROCEDURAL WHOLE-MESH ANIMATION (round-6 polish, "units are statues"):
+// every mobile mesh is posed per frame by TRANSFORMS ONLY (no skeletal rigs,
+// no extra draw calls, no per-frame allocation — all scratch lives on the
+// pooled UnitSlot): idle breathing bob/sway phase-offset by a deterministic
+// id seed; walk lean/bounce/waddle derived from smoothed per-unit velocity
+// (interp position deltas measured in the frame hook); an attack strike
+// (melee lunge toward the InterpEnt.atk target / ranged+tower recoil); a
+// 0.2s easeOutBack spawn pop; and deaths collapse+splat+topple the ghost
+// mesh over its 0.5s fade instead of a flat vanish.
 // ============================================================================
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
@@ -33,6 +43,35 @@ const TEAM_LIT: readonly [string, string] = [APAL.azureLit, APAL.emberLit];
 const BAR_CAP = 176;
 const GHOST_CAP = 16;
 const PROJ_CAP = 64;
+
+// ---- procedural-animation tuning ----------------------------------------------------
+/** Attack strike duration (s) — quick out-and-back, reads at 20Hz snap cadence. */
+const ATK_DUR_S = 0.3;
+/** Spawn scale-up pop duration (s). */
+const SPAWN_POP_S = 0.22;
+/** Speed (m/s) at which the walk cycle reaches full amplitude. */
+const WALK_REF_SPEED = 4.5;
+/** Walk-cycle style per kind: stride = rad per metre, bounce/lean/roll amplitudes.
+ *  Creeps waddle (roll-heavy, bouncy), heroes stride (lean-forward, low bounce). */
+const WALK_STYLE: Record<string, { stride: number; bounce: number; lean: number; roll: number }> = {
+  melee: { stride: 2.6, bounce: 0.09, lean: 0.09, roll: 0.11 },
+  ranged: { stride: 2.3, bounce: 0.08, lean: 0.07, roll: 0.06 },
+  siege: { stride: 1.7, bounce: 0.06, lean: 0.05, roll: 0.08 },
+  shade: { stride: 2.5, bounce: 0.09, lean: 0.11, roll: 0.08 },
+  hero: { stride: 2.0, bounce: 0.05, lean: 0.15, roll: 0.03 },
+};
+const WALK_DEFAULT = { stride: 2.2, bounce: 0.07, lean: 0.08, roll: 0.06 };
+
+function isStructureKind(k: EntKind): boolean {
+  return k === 'tower' || k === 'guard' || k === 'ancient';
+}
+
+/** Melee = the strike lunges toward the target; ranged/towers recoil instead. */
+function isMeleeKind(k: EntKind, hero: HeroId | undefined): boolean {
+  if (k === 'melee' || k === 'siege' || k === 'shade') return true;
+  if (k === 'hero') return heroById(hero ?? 'reaver').base.attackRange <= 3;
+  return false;
+}
 
 // ---- geometry helpers -----------------------------------------------------------
 
@@ -480,6 +519,30 @@ interface UnitSlot {
   lastX: number;
   lastZ: number;
   phase: number;
+  // ---- procedural-animation scratch (preallocated; mutated, never re-created)
+  /** Latest sync position — the animation base the frame hook poses from. */
+  px: number;
+  pz: number;
+  /** Previous frame's px/pz — the velocity probe. */
+  hx: number;
+  hz: number;
+  /** Smoothed speed in world metres/sec (0 when idle). */
+  speed: number;
+  /** Walk-cycle accumulator (radians; advances with distance covered). */
+  walkT: number;
+  /** Clock time of the last attack swing trigger; <0 = never. */
+  atkT: number;
+  /** Normalised direction toward the attack target. */
+  atkDx: number;
+  atkDz: number;
+  /** Last atk target id seen (transient-signal dedupe; -1 = none). */
+  lastAtk: number;
+  /** Clock time of the (re)spawn — drives the 0.2s scale-up pop. */
+  spawnT: number;
+  /** Melee = lunge toward the target; ranged/structures = recoil. */
+  melee: boolean;
+  /** Destroyed structure: stays collapsed, no procedural posing. */
+  destroyed: boolean;
 }
 
 interface ProjSlot {
@@ -577,6 +640,19 @@ export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle {
         lastX: e.x,
         lastZ: e.z,
         phase: (e.id % 97) * 0.651, // deterministic spread, no rng needed
+        px: e.x,
+        pz: e.z,
+        hx: e.x,
+        hz: e.z,
+        speed: 0,
+        walkT: 0,
+        atkT: -1,
+        atkDx: 0,
+        atkDz: 1,
+        lastAtk: -1,
+        spawnT: 0,
+        melee: isMeleeKind(e.k, e.hero),
+        destroyed: false,
       };
       core.three.add(mesh);
       core.registerPick(mesh);
@@ -584,8 +660,21 @@ export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle {
     slot.id = e.id;
     slot.kind = e.k;
     slot.team = e.team;
+    slot.melee = isMeleeKind(e.k, e.hero);
+    slot.destroyed = false;
+    slot.speed = 0;
+    slot.walkT = 0;
+    slot.atkT = -1;
+    slot.lastAtk = -1;
+    slot.px = e.x;
+    slot.pz = e.z;
+    slot.hx = e.x;
+    slot.hz = e.z;
+    slot.spawnT = clock; // the 0.2s scale-up pop starts now
     slot.mesh.visible = true;
     slot.mesh.scale.set(1, 1, 1);
+    slot.mesh.rotation.x = 0;
+    slot.mesh.rotation.z = 0;
     if (slot.anim) slot.anim.visible = true;
     slot.mesh.userData['entId'] = e.id;
     active.set(e.id, slot);
@@ -722,20 +811,39 @@ export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle {
   selfRing.visible = false;
   core.three.add(selfRing);
 
-  const markerMat = new THREE.MeshLambertMaterial({ color: APAL.heal, transparent: true, opacity: 0 });
+  // ---- order marker: an unmistakable ping ---------------------------------------
+  // Emissive-locked Lambert (the one legal unlit read) so the ping burns
+  // through dusk lighting at gameplay zoom: a bright centre flash + TWO
+  // staggered expanding rings. APAL gold = move, danger = attack.
+  const markerRingMat = new THREE.MeshLambertMaterial({
+    color: APAL.inkDeep, // lit contribution ≈ black; emissive carries the read
+    emissive: APAL.gold,
+    transparent: true,
+    opacity: 0,
+    depthWrite: false,
+  });
+  const markerRing2Mat = markerRingMat.clone();
+  const markerDotMat = markerRingMat.clone();
   const marker = new THREE.Group();
   const markerRing = new THREE.Mesh(
-    new THREE.RingGeometry(0.32, 0.46, 20).rotateX(-Math.PI / 2),
-    markerMat,
+    new THREE.RingGeometry(0.5, 0.64, 28).rotateX(-Math.PI / 2),
+    markerRingMat,
   );
-  const markerDot = new THREE.Mesh(new THREE.CircleGeometry(0.1, 12).rotateX(-Math.PI / 2), markerMat);
-  markerDot.position.y = 0.002;
+  const markerRing2 = new THREE.Mesh(
+    new THREE.RingGeometry(0.5, 0.58, 28).rotateX(-Math.PI / 2),
+    markerRing2Mat,
+  );
+  markerRing2.position.y = 0.004;
+  const markerDot = new THREE.Mesh(new THREE.CircleGeometry(0.2, 16).rotateX(-Math.PI / 2), markerDotMat);
+  markerDot.position.y = 0.008;
   marker.add(markerRing);
+  marker.add(markerRing2);
   marker.add(markerDot);
   marker.position.y = 0.06;
   marker.visible = false;
   core.three.add(marker);
   let markerAge = 1e9;
+  const MARKER_LIFE_S = 0.65;
 
   // ---- projectiles ------------------------------------------------------------------
   const projGeos = new Map<string, THREE.BufferGeometry>();
@@ -775,32 +883,124 @@ export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle {
     clock += dt;
     for (const slot of active.values()) {
       const anim = slot.anim;
-      if (!anim || !anim.visible) continue;
-      const bx = slot.mesh.position.x;
-      const bz = slot.mesh.position.z;
-      if (slot.variant.animKind === 'orbit') {
-        const a = clock * 0.7 + slot.phase;
-        anim.position.set(bx + Math.cos(a) * 0.55, slot.variant.animY, bz + Math.sin(a) * 0.55);
-        anim.rotation.y = a * 2;
-      } else if (slot.variant.animKind === 'bob') {
-        anim.position.set(bx, slot.variant.animY + Math.sin(clock * 1.1 + slot.phase) * 0.3, bz);
-        anim.rotation.y = clock * 0.5 + slot.phase;
-      } else {
-        const s = 1 + 0.22 * Math.sin(clock * 2.4 + slot.phase);
-        anim.scale.set(s, s, s);
-        anim.position.set(bx, slot.variant.animY, bz);
+      if (anim && anim.visible) {
+        const bx = slot.px;
+        const bz = slot.pz;
+        if (slot.variant.animKind === 'orbit') {
+          const a = clock * 0.7 + slot.phase;
+          anim.position.set(bx + Math.cos(a) * 0.55, slot.variant.animY, bz + Math.sin(a) * 0.55);
+          anim.rotation.y = a * 2;
+        } else if (slot.variant.animKind === 'bob') {
+          anim.position.set(bx, slot.variant.animY + Math.sin(clock * 1.1 + slot.phase) * 0.3, bz);
+          anim.rotation.y = clock * 0.5 + slot.phase;
+        } else {
+          const s = 1 + 0.22 * Math.sin(clock * 2.4 + slot.phase);
+          anim.scale.set(s, s, s);
+          anim.position.set(bx, slot.variant.animY, bz);
+        }
       }
+
+      // ---- procedural whole-mesh pose (transforms only, zero allocation) --------
+      const structure = isStructureKind(slot.kind);
+      if (slot.destroyed) continue; // rubble stump stays collapsed (sync owns it)
+
+      // spawn pop: easeOutBack scale-up, 0.2s, then a hard 1
+      const spawnAge = clock - slot.spawnT;
+      let pop = 1;
+      if (spawnAge < SPAWN_POP_S) {
+        const u = spawnAge / SPAWN_POP_S - 1;
+        pop = 1 + 2.6 * u * u * u + 1.6 * u * u;
+      }
+
+      // attack strike envelope: fast out-and-back (sin hump), shared by both
+      // the melee lunge and the ranged/tower recoil
+      const atkAge = clock - slot.atkT;
+      let env = 0;
+      if (slot.atkT >= 0 && atkAge < ATK_DUR_S) {
+        env = Math.sin((Math.PI * atkAge) / ATK_DUR_S);
+      }
+
+      if (structure) {
+        // tower/guard recoil: a brief squash straight down the firing axis
+        // (the mesh never yaws, so the squash IS the readable kick)
+        const sy = 1 - env * 0.07;
+        const sxz = 1 + env * 0.05;
+        slot.mesh.scale.set(sxz, sy, sxz);
+        continue;
+      }
+      if (slot.kind === 'ward') {
+        // placard: spawn pop only — the pulsing eye carries its life
+        slot.mesh.scale.set(pop, pop, pop);
+        continue;
+      }
+
+      // velocity probe: interp position delta since the last frame, smoothed
+      // (teleports/reappears clamp out via the 12 m/s cap)
+      const dx = slot.px - slot.hx;
+      const dz = slot.pz - slot.hz;
+      slot.hx = slot.px;
+      slot.hz = slot.pz;
+      if (dt > 0) {
+        const inst = Math.min(12, Math.sqrt(dx * dx + dz * dz) / dt);
+        slot.speed += (inst - slot.speed) * Math.min(1, dt * 8);
+      }
+      const walkAmt = Math.min(1, slot.speed / WALK_REF_SPEED);
+
+      const style = WALK_STYLE[slot.kind] ?? WALK_DEFAULT;
+      slot.walkT += dt * slot.speed * style.stride;
+      // walk: bounce + forward lean + waddle roll, all speed-scaled
+      const bounce = Math.abs(Math.sin(slot.walkT)) * style.bounce * walkAmt;
+      const lean = style.lean * walkAmt;
+      const roll = Math.sin(slot.walkT) * style.roll * walkAmt;
+      // idle: breathing bob + gentle sway, phase-offset per unit, fading out
+      // as the walk cycle takes over (never both at full strength)
+      const idleAmt = 1 - walkAmt;
+      const bob = Math.sin(clock * 1.7 + slot.phase) * 0.035 * idleAmt;
+      const sway = Math.sin(clock * 1.15 + slot.phase * 1.7) * 0.025 * idleAmt;
+
+      // attack: melee lunges toward the target and dips forward; ranged kicks
+      // back away from it. Models face +z, so +rotation.x is a forward tilt.
+      let offX = 0;
+      let offZ = 0;
+      let pitch = lean;
+      if (env > 0) {
+        if (slot.melee) {
+          offX = slot.atkDx * env * 0.34;
+          offZ = slot.atkDz * env * 0.34;
+          pitch += env * 0.22;
+        } else {
+          offX = -slot.atkDx * env * 0.18;
+          offZ = -slot.atkDz * env * 0.18;
+          pitch -= env * 0.14;
+        }
+      }
+
+      slot.mesh.position.set(slot.px + offX, bob + bounce, slot.pz + offZ);
+      slot.mesh.rotation.x = pitch;
+      slot.mesh.rotation.z = sway + roll;
+      slot.mesh.scale.set(pop, pop, pop);
     }
-    // order marker ping
+    // order marker ping: bright centre flash + two staggered expanding rings
     if (marker.visible) {
       markerAge += dt;
-      const t = markerAge / 0.55;
+      const t = markerAge / MARKER_LIFE_S;
       if (t >= 1) {
         marker.visible = false;
       } else {
-        const s = 1.35 - t * 0.55;
-        marker.scale.set(s, 1, s);
-        markerMat.opacity = 0.85 * (1 - t);
+        const fade = Math.pow(1 - t, 1.3);
+        const s1 = 0.4 + t * 3.2;
+        markerRing.scale.set(s1, 1, s1);
+        markerRingMat.opacity = 0.95 * fade;
+        // second ring chases the first, 40% delayed
+        const t2 = Math.max(0, (t - 0.18) / 0.82);
+        const s2 = 0.35 + t2 * 2.6;
+        markerRing2.scale.set(s2, 1, s2);
+        markerRing2Mat.opacity = 0.8 * Math.pow(1 - t2, 1.4);
+        // centre flash: pops bright, gone by a third of the life
+        const td = Math.min(1, markerAge / 0.22);
+        const sd = 1.6 - td * 0.8;
+        markerDot.scale.set(sd, 1, sd);
+        markerDotMat.opacity = 0.9 * (1 - td);
       }
     }
     // selection ring pulse
@@ -847,6 +1047,8 @@ export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle {
       }
 
       const slot = acquire(e);
+      slot.px = e.x;
+      slot.pz = e.z;
       slot.mesh.position.set(e.x, 0, e.z);
 
       // facing: snap yaw to motion direction (interp deltas are per-frame small)
@@ -863,11 +1065,50 @@ export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle {
 
       const isStructure = e.k === 'tower' || e.k === 'guard' || e.k === 'ancient';
       const destroyed = isStructure && e.hp <= 0;
+      slot.destroyed = destroyed;
       if (destroyed) {
         // collapse to a rubble stump; the animated part winks out
         slot.mesh.scale.y = 0.18;
         if (slot.anim) slot.anim.visible = false;
         slot.mesh.userData['entId'] = -1;
+      } else {
+        // attack strike trigger: atk is transient per snap (set only on the
+        // swing tick) — dedupe on the target id, re-armed when atk clears
+        if (e.atk !== undefined) {
+          if (slot.lastAtk !== e.atk) {
+            slot.lastAtk = e.atk;
+            slot.atkT = clock;
+            // strike direction toward the target (rare linear scan, no alloc)
+            let tx = e.x + Math.sin(slot.yaw);
+            let tz = e.z + Math.cos(slot.yaw);
+            for (const o of ents) {
+              if (o.id === e.atk) {
+                tx = o.x;
+                tz = o.z;
+                break;
+              }
+            }
+            let dx = tx - e.x;
+            let dz = tz - e.z;
+            const d = Math.hypot(dx, dz);
+            if (d > 1e-3) {
+              dx /= d;
+              dz /= d;
+            } else {
+              dx = Math.sin(slot.yaw);
+              dz = Math.cos(slot.yaw);
+            }
+            slot.atkDx = dx;
+            slot.atkDz = dz;
+            // melee turns to face its victim for the strike
+            if (!isStructure) {
+              slot.yaw = Math.atan2(dx, dz);
+              slot.mesh.rotation.y = slot.yaw;
+            }
+          }
+        } else {
+          slot.lastAtk = -1;
+        }
       }
 
       // hp bars: heroes/creeps always; structures only when damaged; wards never
@@ -919,6 +1160,12 @@ export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle {
         slot.mesh.geometry = v.body;
       }
       slot.mesh.visible = true;
+      // death collapse: squash+splat toward the ground with a slight topple
+      // (keel direction seeded by id — deterministic, no rng), running the
+      // full 0.5s ghost fade so a death reads as a fall, not a vanish
+      const p = Math.min(1, (1 - Math.max(0, Math.min(1, g.fade))) * 1.3);
+      slot.mesh.scale.set(1 + 0.3 * p, Math.max(0.08, 1 - 0.92 * p), 1 + 0.3 * p);
+      slot.mesh.rotation.z = (g.id % 2 === 0 ? 1 : -1) * 0.5 * p;
       slot.mesh.position.set(g.x, 0, g.z);
       slot.mat.opacity = 0.55 * Math.max(0, Math.min(1, g.fade));
     }
@@ -994,7 +1241,10 @@ export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle {
       if (id < 0) selRing.visible = false;
     },
     orderMarker(x, z, attack) {
-      markerMat.color.set(attack ? APAL.danger : APAL.heal);
+      const hex = attack ? APAL.danger : APAL.gold;
+      markerRingMat.emissive.set(hex);
+      markerRing2Mat.emissive.set(hex);
+      markerDotMat.emissive.set(hex);
       marker.position.set(x, 0.06, z);
       marker.visible = true;
       markerAge = 0;

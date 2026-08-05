@@ -3,7 +3,11 @@
 // allocation, zero Math.random (deterministic golden-angle scatter patterns):
 //   - particle bursts: ONE InstancedMesh pool (last-hit gold spark, death
 //     puff, tower collapse debris, cast flashes per school: physical `paper`,
-//     magic `arcane`, heal `heal`);
+//     magic `arcane`, heal `heal`) — each school with a distinct SILHOUETTE
+//     (phys a flat fast scatter, magic a tall violet geyser, heal a soft
+//     green rise) so the school reads at gameplay zoom, not just the hue;
+//   - cast glow: a pooled emissive expanding ring at the caster, school-
+//     coloured, so the cast origin itself flashes (round-6 polish);
 //   - attack tracers: a small pool of stretched-box beams with per-slot
 //     fade materials, driven by game.ts from InterpEnt.atk transitions;
 //   - screen shake: decaying sinusoid fed into the scene's camera rig;
@@ -42,9 +46,20 @@ const BURSTS: Record<BurstKind, BurstSpec> = {
   gold: { count: 10, a: APAL.gold, b: APAL.goldLit, speed: 2.2, up: 3.4, size: 1.0, life: 0.55, y0: 0.5, y1: 1.2 },
   death: { count: 12, a: APAL.paperDim, b: APAL.inkLit, speed: 2.6, up: 2.6, size: 1.3, life: 0.6, y0: 0.3, y1: 1.0 },
   tower: { count: 22, a: APAL.monumentLit, b: APAL.stoneDeep, speed: 4.2, up: 4.6, size: 2.0, life: 0.9, y0: 0.4, y1: 3.2 },
-  phys: { count: 8, a: APAL.paper, b: APAL.goldLit, speed: 2.4, up: 2.2, size: 0.8, life: 0.4, y0: 0.7, y1: 1.4 },
-  magic: { count: 10, a: APAL.arcane, b: APAL.void, speed: 2.6, up: 2.6, size: 1.0, life: 0.5, y0: 0.7, y1: 1.6 },
-  heal: { count: 10, a: APAL.heal, b: APAL.goldLit, speed: 1.6, up: 2.8, size: 0.9, life: 0.6, y0: 0.4, y1: 1.2 },
+  // school silhouettes (round-6): phys = flat fast paper scatter, magic =
+  // tall violet geyser, heal = soft green rise — shape first, hue second
+  phys: { count: 12, a: APAL.paper, b: APAL.goldLit, speed: 3.2, up: 1.4, size: 1.0, life: 0.42, y0: 0.6, y1: 1.2 },
+  magic: { count: 14, a: APAL.arcane, b: APAL.void, speed: 1.7, up: 4.4, size: 1.2, life: 0.55, y0: 0.7, y1: 1.8 },
+  heal: { count: 14, a: APAL.heal, b: APAL.goldLit, speed: 1.1, up: 3.1, size: 1.1, life: 0.7, y0: 0.4, y1: 1.3 },
+};
+
+/** Cast-glow ring: brief emissive flash at the caster, school-coloured. */
+const GLOW_CAP = 4;
+const GLOW_LIFE_S = 0.38;
+const GLOW_HEX: Record<'phys' | 'magic' | 'heal', string> = {
+  phys: APAL.paper,
+  magic: APAL.arcane,
+  heal: APAL.heal,
 };
 
 interface TracerSlot {
@@ -114,6 +129,25 @@ export function createFx(scene: SceneHandle): FxHandle {
   }
   let tCursor = 0;
 
+  // ---- cast glow pool (expanding emissive rings at the caster) ------------------
+  const glowGeo = new THREE.RingGeometry(0.7, 0.95, 24).rotateX(-Math.PI / 2);
+  const glows: TracerSlot[] = [];
+  for (let i = 0; i < GLOW_CAP; i++) {
+    const mat = new THREE.MeshLambertMaterial({
+      color: APAL.inkDeep, // lit contribution ≈ black; emissive carries the read
+      emissive: APAL.paper,
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+    });
+    const mesh = new THREE.Mesh(glowGeo, mat);
+    mesh.position.y = 0.07;
+    mesh.visible = false;
+    core.three.add(mesh);
+    glows.push({ mesh, mat, life: 0 });
+  }
+  let gCursor = 0;
+
   // ---- shake ---------------------------------------------------------------------------
   let shakeAmp = 0;
   let shakePhase = 0;
@@ -136,6 +170,17 @@ export function createFx(scene: SceneHandle): FxHandle {
   // ---- API --------------------------------------------------------------------------------
   function burst(x: number, z: number, kind: BurstKind): void {
     const spec = BURSTS[kind];
+    // cast schools also flash a school-coloured glow ring at the caster
+    if (kind === 'phys' || kind === 'magic' || kind === 'heal') {
+      const glow = glows[gCursor];
+      gCursor = (gCursor + 1) % GLOW_CAP;
+      if (glow) {
+        glow.mat.emissive.set(GLOW_HEX[kind]);
+        glow.mesh.position.set(x, 0.07, z);
+        glow.life = GLOW_LIFE_S;
+        glow.mesh.visible = true;
+      }
+    }
     for (let n = 0; n < spec.count; n++) {
       const i = pCursor;
       pCursor = (pCursor + 1) % PARTICLE_CAP;
@@ -234,6 +279,21 @@ export function createFx(scene: SceneHandle): FxHandle {
       } else {
         // hard ease-out fade: the beam spends most of its short life faint
         t.mat.opacity = 0.75 * Math.pow(t.life / TRACER_LIFE_S, 1.6);
+      }
+    }
+
+    // cast glows: fast expanding ring, emissive fade
+    for (const g of glows) {
+      if (g.life <= 0) continue;
+      g.life -= dt;
+      if (g.life <= 0) {
+        g.mesh.visible = false;
+        g.mat.opacity = 0;
+      } else {
+        const t = 1 - g.life / GLOW_LIFE_S;
+        const s = 0.5 + t * 2.1;
+        g.mesh.scale.set(s, 1, s);
+        g.mat.opacity = 0.85 * Math.pow(1 - t, 1.4);
       }
     }
 
