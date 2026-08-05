@@ -3,11 +3,15 @@
 // Bottom-centre portrait/hp/mana/ability/item cluster, top-centre match clock
 // + team score + towers standing, top-right kill feed, gold/shop button, K/D/A,
 // level + XP bar, TAB scoreboard, death overlay, first-60-seconds onboarding
-// (ONE text hint at a time — RMB-move > shop — dismissed on use, plus the lane
+// (ONE text hint at a time — RMB-move > learn-to-cast > shop — dismissed on
+// use, plus the lane
 // arrow, a SEPARATE directional indicator that must read AT SPAWN (§8) and so
 // never queues behind the move hint; it is dismissed on arrival at the lane
 // midpoint; everything is suppressed while the scoreboard is open), and the
-// disconnect banner. Pure DOM — T8's style.css owns layout and static look;
+// disconnect banner. Action feedback (round-6 UX): a successful BUY pops the
+// item slot it landed in (one-shot scale) and floats a '-Ng' gold number off
+// the gold readout; a spent skill point flashes the ability slot green
+// (one-shot). Pure DOM — T8's style.css owns layout and static look;
 // this file owns structure, text, dynamic widths/opacities, and the ONLY
 // colours it sets inline are APAL entries (team identity + hero accents).
 //
@@ -329,6 +333,14 @@ export function createHud(parent: HTMLElement): UiHandle {
   hintShop.style.display = 'none';
   fitText(hintShop, 16);
   hintShop.textContent = 'You have gold — open the SHOP at your fountain';
+  // learn-to-cast (round-6 UX): a hero with an unspent first point and every
+  // ability at rank 0 cannot cast at all — say so, between the move hint and
+  // the shop hint in priority. Retires on the first point spent (the
+  // all-rank-0 condition below) or at the end of the onboarding window.
+  const hintLearn = el('div', 'hint', root);
+  hintLearn.style.display = 'none';
+  fitText(hintLearn, 16);
+  hintLearn.textContent = 'Press + (or Ctrl+Q) to learn an ability — then Q/W/E/R to cast';
 
   // -- cast-denied toast (T8 bugfix: QWER used to fail in silence) ---------------
   // Same .hint pill, --denied modifier (frozen class list allows modifiers):
@@ -357,6 +369,58 @@ export function createHud(parent: HTMLElement): UiHandle {
   let scoreboardSig = '';
   let scoreboardWasOpen = false;
 
+  // ---- action feedback (buy pop + gold float + skill flash) -------------------
+  // Snap-diffed: baseline on the FIRST sight of `you` (a late joiner must not
+  // pop every owned slot), then a slot going empty -> filled pops it, a gold
+  // drop floats '-Ng' (buying is the ONLY gold sink), a rank going up flashes
+  // green. All animations are one-shot (no >1Hz flashing — § flash law).
+  let prevItems: readonly (ItemId | null)[] | null = null;
+  let prevGold: number | null = null;
+  const prevRanks = [0, 0, 0, 0]; // preallocated — no per-frame array churn
+  let ranksBaselined = false;
+  const poppingSlots = new Set<number>(); // item slots mid-pop
+  const flashingSlots = new Set<number>(); // ability slots mid-flash
+
+  function popItemSlot(i: number): void {
+    if (poppingSlots.has(i)) return;
+    const dom = itemDoms[i];
+    if (!dom) return;
+    poppingSlots.add(i);
+    dom.slot.classList.add('item-slot--pop');
+    window.setTimeout(() => {
+      poppingSlots.delete(i);
+      dom.slot.classList.remove('item-slot--pop');
+    }, 400); // > the 0.35s pop animation
+  }
+
+  function flashAbilitySlot(i: number): void {
+    if (flashingSlots.has(i)) return;
+    const dom = abilityDoms[i];
+    if (!dom) return;
+    flashingSlots.add(i);
+    dom.slot.classList.add('ability-slot--learned');
+    window.setTimeout(() => {
+      flashingSlots.delete(i);
+      dom.slot.classList.remove('ability-slot--learned');
+    }, 700); // > the 0.6s learn flash
+  }
+
+  /** '-Ng' off the gold readout — same .dmg-number pill as the world-space
+   *  numbers (fx sets the colour inline; so do we — APAL only). */
+  function floatGoldSpent(amount: number): void {
+    const rect = gold.getBoundingClientRect();
+    const n = document.createElement('div');
+    n.className = 'dmg-number';
+    n.textContent = `-${String(Math.round(amount))}g`;
+    n.style.position = 'fixed';
+    n.style.left = `${(rect.left + rect.width / 2).toFixed(0)}px`;
+    n.style.top = `${(rect.top - 8).toFixed(0)}px`;
+    n.style.color = APAL.gold;
+    n.style.pointerEvents = 'none';
+    root.appendChild(n);
+    window.setTimeout(() => n.remove(), 900); // > the 0.8s rise animation
+  }
+
   function resetMatchHints(): void {
     spawnKnown = false;
     movedEnough = false;
@@ -364,6 +428,9 @@ export function createHud(parent: HTMLElement): UiHandle {
     shopOpenedOnce = false;
     laneTarget = null;
     laneName = '';
+    prevItems = null; // re-baseline: a new match must not float the old gold delta
+    prevGold = null;
+    ranksBaselined = false;
   }
 
   // First move ORDER detection (round-5 UX: the 'your lane: MID' text and the
@@ -744,6 +811,29 @@ export function createHud(parent: HTMLElement): UiHandle {
           dom.slot.onclick = () => a.send({ t: 'rift_item', slot: i });
         }
 
+        // ---- action feedback diffs (buy pop + gold float + skill flash) ---------
+        // Baseline on first sight, then diff — a late joiner's existing items
+        // and ranks must NOT fire the feedback. Buying is the only gold sink,
+        // so any drop is a purchase.
+        for (let i = 0; i < 4; i++) {
+          const r = you.abilities[i]?.rank ?? 0;
+          if (ranksBaselined && r > (prevRanks[i] ?? 0)) flashAbilitySlot(i);
+          prevRanks[i] = r;
+        }
+        ranksBaselined = true;
+        if (prevItems !== null) {
+          for (let i = 0; i < 6; i++) {
+            if ((prevItems[i] ?? null) === null && (you.items[i] ?? null) !== null) {
+              popItemSlot(i);
+            }
+          }
+        }
+        prevItems = you.items;
+        if (prevGold !== null && you.gold < prevGold - 0.5) {
+          floatGoldSpent(prevGold - you.gold);
+        }
+        prevGold = you.gold;
+
         setText(gold, `${Math.floor(you.gold)}g — SHOP`);
         gold.onclick = () => a.toggleShop();
         setText(kda, `${you.kills} / ${you.deaths} / ${you.assists}`);
@@ -771,7 +861,8 @@ export function createHud(parent: HTMLElement): UiHandle {
         const inWindow = gameS <= HINT_WINDOW_S;
 
         // ONE text hint at a time (§8): stacking popups occluded the ability
-        // bar. Priority: RMB-move > shop. The lane arrow is NOT part of this
+        // bar. Priority: RMB-move > learn-to-cast > shop. The lane arrow is
+        // NOT part of this
         // queue — it is a directional indicator that must read AT SPAWN, so
         // it shows alongside whichever text hint is up, positioned on a
         // screen-space orbit around the hero, and is dismissed on arrival at
@@ -779,6 +870,18 @@ export function createHud(parent: HTMLElement): UiHandle {
         // suppressed while the scoreboard is open so overlays never fight.
         const showMove = inWindow && !movedEnough && !orderIssued && !boardOpen;
         hintMove.style.display = showMove ? '' : 'none';
+
+        // learn-to-cast: an unspent point with EVERY ability at rank 0 means
+        // the hero cannot cast at all — say how. Retires on the first point
+        // spent (any rank leaves 0) or with the window.
+        const allRankZero =
+          (you.abilities[0]?.rank ?? 0) === 0 &&
+          (you.abilities[1]?.rank ?? 0) === 0 &&
+          (you.abilities[2]?.rank ?? 0) === 0 &&
+          (you.abilities[3]?.rank ?? 0) === 0;
+        const showLearn =
+          !showMove && inWindow && you.skillPoints > 0 && allRankZero && !boardOpen;
+        hintLearn.style.display = showLearn ? '' : 'none';
 
         // lane arrow toward the assigned lane's midpoint (begin.laneAssignment)
         if (inWindow && laneTarget === null && laneName === '' && s.begin && s.hello) {
@@ -823,6 +926,7 @@ export function createHud(parent: HTMLElement): UiHandle {
           Math.hypot(you.x - ownAncientX, you.z - ownAncientZ) <= FOUNTAIN_RADIUS + 1;
         const showShop =
           !showMove &&
+          !showLearn &&
           inWindow &&
           !shopOpenedOnce &&
           you.gold >= SHOP_HINT_GOLD &&
@@ -833,6 +937,7 @@ export function createHud(parent: HTMLElement): UiHandle {
         death.style.display = 'none';
         hintMove.style.display = 'none';
         hintLane.style.display = 'none';
+        hintLearn.style.display = 'none';
         hintShop.style.display = 'none';
       }
 

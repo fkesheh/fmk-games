@@ -21,10 +21,12 @@ import {
   isHeroId,
   isItemId,
   heroById,
+  ITEMS,
   MAP_SIDE_BASE,
   MAP_SIDE_PER_LANE,
   TICK_DT,
   ULT_LEVEL_REQ,
+  WARD_PLACE_RANGE,
 } from '@rift/shared';
 import type { HeroId, RiftC2S, RiftEvent, RiftSettings, TeamId } from '@rift/shared';
 import type { LobbyC2S, RoomInfo } from '@platform/shared';
@@ -220,6 +222,7 @@ export class Game {
       setSelected: (id) => modules.units.setSelected(id),
       orderMarker: (x, z, attack) => modules.units.orderMarker(x, z, attack),
       castBlockReason: (slot, aim) => this.castBlockReason(slot, aim),
+      itemBlockReason: (slot, aim) => this.itemBlockReason(slot, aim),
       castDenied: (reason) => this.castDenied(reason),
     });
 
@@ -669,11 +672,12 @@ export class Game {
     return null;
   }
 
-  // ---- cast preflight + denial toast (the silent-no-op fix) ---------------------
+  // ---- cast/item preflight + denial toast (the silent-no-op fix) --------------
   // The server DROPS invalid casts in silence (parse-level: never an error),
   // so a rejected QWER used to be indistinguishable from a dead key. input.ts
   // preflights every quick-cast here against the latest snapshot — the same
   // data the server validates with — and toasts the reason instead of sending.
+  // Item actives (1-6) got the same treatment (itemBlockReason below).
 
   /** Null when the cast may be sent; otherwise the short player-facing reason. */
   private castBlockReason(slot: number, aim: { x?: number; z?: number; target?: number }): string | null {
@@ -712,6 +716,40 @@ export class Game {
       if (Math.hypot(ent.x - you.x, ent.z - you.z) > range) return 'out of range';
     } else if (aim.x !== undefined && aim.z !== undefined) {
       if (Math.hypot(aim.x - you.x, aim.z - you.z) > range) return 'out of range';
+    }
+    return null;
+  }
+
+  /** Item-active preflight (1-6 keys), mirroring the server's silent no-ops in
+   *  sim/world.ts useItem: dead / cooldown / ward charges / team ward stock /
+   *  ward place range. Null = the use may be sent. Empty slots and passive
+   *  items return null too — input.ts never reaches here for those. */
+  private itemBlockReason(slot: number, aim: { x?: number; z?: number }): string | null {
+    const snap = this.snap;
+    const you = snap?.you ?? null;
+    if (snap === null || you === null) return 'not in game yet';
+    const id = you.items[slot];
+    if (id === null || id === undefined) return null;
+    const active = ITEMS[id].active;
+    if (active === undefined) return null;
+    const tick = snap.matchTick;
+    if (you.respawnAtTick > tick) {
+      return `dead — respawn in ${String(Math.max(1, Math.ceil((you.respawnAtTick - tick) * TICK_DT)))}s`;
+    }
+    const cd = you.itemCdUntilTick[slot] ?? 0;
+    if (cd > tick) {
+      return `${ITEMS[id].name} on cooldown (${String(Math.max(1, Math.ceil((cd - tick) * TICK_DT)))}s)`;
+    }
+    if (active.kind === 'ward') {
+      if ((you.itemCharges[slot] ?? 0) < 1) return 'no ward charges left';
+      if (snap.wardStock < 1) return 'team ward stock empty — restocks over time';
+      if (
+        aim.x !== undefined &&
+        aim.z !== undefined &&
+        Math.hypot(aim.x - you.x, aim.z - you.z) > WARD_PLACE_RANGE
+      ) {
+        return 'out of range';
+      }
     }
     return null;
   }

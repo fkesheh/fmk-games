@@ -22,10 +22,10 @@
 // implement them — so the menu's create/join buttons drive exactly those (the
 // same path the e2e drives; UI and e2e can never diverge). The public room
 // list rides game.ts's ADDITIVE __rift extensions — rooms() / joinPublic() /
-// quickJoin() (ClientState still has no channel; extending UiActions is the
-// orchestrator's call) — each probed with typeof and degraded to an honest
-// unavailable state when absent (unit harness). If __rift is absent entirely,
-// every button disables honestly.
+// quickJoin() / createPublic() (ClientState still has no channel; extending
+// UiActions is the orchestrator's call) — each probed with typeof and degraded
+// to an honest unavailable state when absent (unit harness). If __rift is
+// absent entirely, every button disables honestly.
 // ============================================================================
 import { APAL, HERO_LIST, MAX_TEAM_SIZE, MIN_TEAM_SIZE, heroById } from '@rift/shared';
 import type { HeroDef, HeroId, RosterEntry } from '@rift/shared';
@@ -38,13 +38,15 @@ const TEAM_LABEL: readonly string[] = ['AZURE', 'EMBER'];
 const TEAM_APAL: readonly string[] = [APAL.azure, APAL.ember];
 
 /** The frozen §6 debug surface, the menu's create/join transport (see header).
- *  rooms()/quickJoin()/joinPublic() are the ADDITIVE surface game.ts provides
- *  for the public room list; they are probed per call and degrade honestly. */
+ *  rooms()/quickJoin()/createPublic()/joinPublic() are the ADDITIVE surface
+ *  game.ts provides for public rooms; they are probed per call and degrade
+ *  honestly. */
 interface RiftDebugSurface {
   createPrivate(name: string, settings?: Record<string, unknown>): void;
   joinPrivate(name: string, code: string): void;
   rooms?(): readonly RoomInfo[];
   quickJoin?(name: string): void;
+  createPublic?(name: string, settings?: Record<string, unknown>): void;
   joinPublic?(name: string, roomId: string): void;
 }
 
@@ -163,6 +165,13 @@ export function createMenus(parent: HTMLElement): UiHandle {
   const createBtn = el('button', 'menu-btn', createBox);
   createBtn.style.fontSize = '14px';
   createBtn.textContent = 'CREATE PRIVATE ROOM';
+  // CREATE PUBLIC shares the same teamSize/speed selectors (it is the listed,
+  // joinable-by-strangers twin of the private create — round-6 UX: 'where is
+  // the public room creation?'). It rides the additive __rift.createPublic and
+  // degrades honestly when the surface is absent.
+  const createPublicBtn = el('button', 'menu-btn menu-public', createBox);
+  createPublicBtn.style.fontSize = '14px';
+  createPublicBtn.textContent = 'CREATE PUBLIC ROOM';
 
   const joinBox = el('div', 'menu-join', menu);
   const joinTitle = el('h2', 'menu-heading', joinBox);
@@ -195,17 +204,29 @@ export function createMenus(parent: HTMLElement): UiHandle {
     return n || 'Player';
   }
 
-  createBtn.onclick = () => {
-    const d = debugSurface();
-    if (!d) return;
-    const name = cleanName();
-    storeName(name);
+  /** teamSize/speed selectors -> settings record, shared by both creates. */
+  function currentSettings(): Record<string, unknown> {
     const settings: Record<string, unknown> = {};
     const teamSize = Number(sizeSelect.value);
     if (teamSize >= MIN_TEAM_SIZE && teamSize <= MAX_TEAM_SIZE) settings.teamSize = teamSize;
     const speed = Number(speedSelect.value);
     if (speed > 1) settings.speed = speed;
-    d.createPrivate(name, settings);
+    return settings;
+  }
+
+  createBtn.onclick = () => {
+    const d = debugSurface();
+    if (!d) return;
+    const name = cleanName();
+    storeName(name);
+    d.createPrivate(name, currentSettings());
+  };
+  createPublicBtn.onclick = () => {
+    const d = debugSurface();
+    if (!d || typeof d.createPublic !== 'function') return;
+    const name = cleanName();
+    storeName(name);
+    d.createPublic(name, currentSettings());
   };
   joinBtn.onclick = () => {
     const d = debugSurface();
@@ -454,6 +475,11 @@ export function createMenus(parent: HTMLElement): UiHandle {
         joinBtn.disabled = d === null;
         createBtn.title = d === null ? 'unavailable — no connection layer' : 'Create a private room';
         joinBtn.title = d === null ? 'unavailable — no connection layer' : 'Join with an invite code';
+        const canCreatePublic = d !== null && typeof d.createPublic === 'function';
+        createPublicBtn.disabled = !canCreatePublic;
+        createPublicBtn.title = canCreatePublic
+          ? 'Create a public room — it is listed under PUBLIC ROOMS for anyone to join'
+          : 'unavailable — no connection layer';
         const canQuick = d !== null && typeof d.quickJoin === 'function';
         quickBtn.disabled = !canQuick;
         quickBtn.title = canQuick

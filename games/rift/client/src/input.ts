@@ -11,7 +11,13 @@
 //            casts aim at the cursor ground, 'unit' casts pick the unit under
 //            the cursor; Ctrl+Q/W/E/R spends a skill point instead
 //   1..6     item actives: warhorn (aura) fires immediately, blinkstone (dash)
-//            and wardstone (ward) target the cursor ground point
+//            and wardstone (ward) target the cursor ground point. Every use is
+//            preflighted through hooks.itemBlockReason (cooldown / ward stock /
+//            charges / range / dead) — a denied key toasts the reason instead
+//            of dying in silence on the server's drop floor.
+//   hover    an ENEMY unit under the cursor switches the canvas cursor to a
+//            crosshair (attack affordance); the pickUnit raycast is throttled
+//            to ~30Hz inside update(), never run per mousemove
 //   TAB      scoreboard overlay while held
 //   blur     clears every held key; resize reflows the scene
 //
@@ -53,6 +59,10 @@ export interface InputHooks {
    *  reason the SERVER would have silently dropped it for (unskilled /
    *  cooldown / no mana / dead / out of range / invalid target). */
   castBlockReason(slot: number, aim: { x?: number; z?: number; target?: number }): string | null;
+  /** Same preflight for ITEM actives (1-6): null = send; otherwise the reason
+   *  the server would no-op (cooldown / no ward charges / 0 team ward stock /
+   *  out of range / dead). */
+  itemBlockReason(slot: number, aim: { x?: number; z?: number }): string | null;
   /** Show a transient cast-denied note (the silent-no-op bug fix). */
   castDenied(reason: string): void;
 }
@@ -88,6 +98,18 @@ export function createInput(root: HTMLElement, scene: SceneHandle, hooks: InputH
   let lastDragX = 0;
   let lastDragY = 0;
   let attackMoveArmed = false;
+  // enemy-hover attack affordance: pickUnit is a raycast, so it NEVER runs per
+  // mousemove — update() re-picks at most ~30Hz from the last known cursor
+  // (a panning camera moves the world under a still cursor too, so a
+  // mousemove-only cache would go stale).
+  let hoverPickMs = 0;
+  let hoverEnemy = false;
+
+  function setHoverCursor(enemy: boolean): void {
+    if (enemy === hoverEnemy) return;
+    hoverEnemy = enemy;
+    scene.canvas.style.cursor = enemy ? 'crosshair' : '';
+  }
 
   /** Cursor ground point, or null when the ray misses the ground plane. */
   function cursorGround(out: { x: number; z: number }): boolean {
@@ -138,16 +160,33 @@ export function createInput(root: HTMLElement, scene: SceneHandle, hooks: InputH
 
   function useItem(slot: number): void {
     const id = hooks.ownItems()[slot];
-    if (id === null || id === undefined) return;
+    if (id === null || id === undefined) {
+      // same dead-key law as QWER: a denied press says WHY (round-6 UX)
+      hooks.castDenied('no item in that slot');
+      return;
+    }
     const active = ITEMS[id].active;
-    if (active === undefined) return;
+    if (active === undefined) return; // passive item: mirrors passive abilities (silent)
     if (active.kind === 'aura') {
+      const why = hooks.itemBlockReason(slot, {});
+      if (why !== null) {
+        hooks.castDenied(why);
+        return;
+      }
       hooks.send({ t: 'rift_item', slot });
       return;
     }
     // dash + ward both target the cursor ground point
     const pt = { x: 0, z: 0 };
-    if (!cursorGround(pt)) return;
+    if (!cursorGround(pt)) {
+      hooks.castDenied('aim at the ground to use this item');
+      return;
+    }
+    const why = hooks.itemBlockReason(slot, { x: pt.x, z: pt.z });
+    if (why !== null) {
+      hooks.castDenied(why);
+      return;
+    }
     hooks.send({ t: 'rift_item', slot, x: pt.x, z: pt.z });
   }
 
@@ -230,6 +269,7 @@ export function createInput(root: HTMLElement, scene: SceneHandle, hooks: InputH
     held.clear();
     middleDrag = false;
     attackMoveArmed = false;
+    setHoverCursor(false);
     hooks.setScoreboard(false);
   });
   window.addEventListener('resize', () => scene.resize());
@@ -279,7 +319,19 @@ export function createInput(root: HTMLElement, scene: SceneHandle, hooks: InputH
 
   // ---- per-frame pan --------------------------------------------------------------
   function update(dtMs: number): void {
-    if (!hooks.isLive()) return;
+    if (!hooks.isLive()) {
+      setHoverCursor(false);
+      return;
+    }
+    // enemy-hover crosshair, throttled to ~30Hz (the raycast budget)
+    hoverPickMs += dtMs;
+    if (pointerSeen && hoverPickMs >= 33) {
+      hoverPickMs = 0;
+      const id = scene.pickUnit(mouseX, mouseY);
+      const self = hooks.selfTeam();
+      const team = id >= 0 ? hooks.entTeam(id) : null;
+      setHoverCursor(self !== null && team !== null && team !== self);
+    }
     let dx = 0;
     let dz = 0;
     // Arrow-key pan. Screen-up is -z, screen-right is +x (fixed camera yaw; if

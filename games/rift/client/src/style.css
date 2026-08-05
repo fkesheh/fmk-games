@@ -297,6 +297,19 @@ body {
   color: var(--paper-deep);
 }
 
+/* CREATE PUBLIC sits beside CREATE PRIVATE in the create panel (round-6 UX:
+   'where is the public room creation?') — an azure secondary so the panel's
+   two creates read as siblings and QUICK MATCH keeps the lone gold primary. */
+.menu-public {
+  border-color: var(--azure);
+}
+
+.menu-public:hover:not(:disabled) {
+  border-color: var(--azure);
+  background: var(--azure-deep);
+  color: var(--paper);
+}
+
 .menu-note {
   max-width: 520px;
   text-align: center;
@@ -778,6 +791,12 @@ body {
   opacity: 0.9; /* the 'LV n' sweep label carries the lock, not a fade */
 }
 
+/* skill-point spend feedback (round-6 UX): the slot that just gained a rank
+   flashes heal-green ONCE (one-shot flash — exempt from the 1Hz pulse law) */
+.ability-slot--learned {
+  animation: rift-slot-learn 0.6s ease-out 1;
+}
+
 .ability-cd {
   position: absolute;
   inset: 0;
@@ -872,6 +891,13 @@ body {
 
 .item-slot--empty {
   opacity: 0.4;
+}
+
+/* buy feedback (round-6 UX): the slot a purchase just landed in pops once —
+   one-shot scale, never repeating (the flash law) */
+.item-slot--pop {
+  animation: rift-slot-pop 0.35s ease-out 1;
+  border-color: var(--gold);
 }
 
 .item-charges {
@@ -1362,6 +1388,31 @@ body {
   100% {
     transform: translateY(-36px);
     opacity: 0;
+  }
+}
+
+/* buy pop: one-shot overshoot settle on the freshly filled item slot */
+@keyframes rift-slot-pop {
+  0% {
+    transform: scale(1);
+  }
+  40% {
+    transform: scale(1.3);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+/* skill flash: one-shot heal-green glow that fades out (never repeats) */
+@keyframes rift-slot-learn {
+  0% {
+    border-color: var(--heal);
+    box-shadow: 0 0 12px var(--heal);
+  }
+  100% {
+    border-color: var(--stone-deep);
+    box-shadow: none;
   }
 }
 
