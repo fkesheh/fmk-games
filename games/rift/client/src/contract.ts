@@ -116,6 +116,10 @@ export interface ClientState {
   readonly cameraX: number;
   readonly cameraZ: number;
   readonly cameraHeight: number;
+  /** Transient cast-denied note from input.ts's preflight (via game.ts), or
+   *  null. hud.ts shows it as a `.hint.hint--denied` pill while
+   *  performance.now() < untilMs. Additive (T8 bugfix: silent cast failures). */
+  readonly toast: { readonly text: string; readonly untilMs: number } | null;
 }
 
 /** Everything any UI module may DO. Implemented by game.ts (T8). */

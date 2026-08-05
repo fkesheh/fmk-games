@@ -1283,6 +1283,15 @@ body {
   animation: rift-pulse 1s ease-in-out infinite; /* 1Hz — under the 3Hz law */
 }
 
+/* Cast-denied toast: a .hint that reads as a refusal, not a tutorial —
+   static (a pulsing error fights the eye), danger accents, paper text so the
+   reason itself stays >= 7:1 on ink. */
+.hint--denied {
+  border-color: var(--danger);
+  color: var(--paper);
+  animation: none;
+}
+
 .banner {
   position: fixed;
   top: calc(64px + var(--safe-top, 0px));

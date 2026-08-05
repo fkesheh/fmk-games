@@ -330,6 +330,15 @@ export function createHud(parent: HTMLElement): UiHandle {
   fitText(hintShop, 16);
   hintShop.textContent = 'You have gold — open the SHOP at your fountain';
 
+  // -- cast-denied toast (T8 bugfix: QWER used to fail in silence) ---------------
+  // Same .hint pill, --denied modifier (frozen class list allows modifiers):
+  // no pulse animation, danger accent. input.ts preflights each quick-cast
+  // through game.ts and pushes the reason into ClientState.toast.
+  const castToast = el('div', 'hint hint--denied', root);
+  castToast.style.display = 'none';
+  fitText(castToast, 14);
+  castToast.style.bottom = '176px'; // above the onboarding pill's 130px anchor
+
   // -- render-cycle state (no per-frame allocation beyond the killfeed rebuild) --------
   let heroId: HeroId | null = null; // hero of the current match (slot glyphs are static per match)
   let heroDefs: readonly AbilityDef[] = [];
@@ -549,6 +558,12 @@ export function createHud(parent: HTMLElement): UiHandle {
 
       // disconnect banner rides every live frame
       banner.style.display = s.connected ? 'none' : '';
+
+      // cast-denied toast (input.ts preflight; game.ts expires it via untilMs)
+      const toastNow = s.toast;
+      const showToast = toastNow !== null && performance.now() < toastNow.untilMs;
+      castToast.style.display = showToast ? '' : 'none';
+      if (showToast) setText(castToast, toastNow.text);
 
       const snap = s.snap;
       const you = snap?.you ?? null;

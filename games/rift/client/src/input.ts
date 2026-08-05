@@ -48,6 +48,13 @@ export interface InputHooks {
   setSelected(id: number): void;
   /** Immediate client-side order marker (the <100ms feedback law). */
   orderMarker(x: number, z: number, attack: boolean): void;
+  /** Client-side preflight against the latest snapshot (game.ts owns the
+   *  data): null = the cast may be sent; otherwise a short player-facing
+   *  reason the SERVER would have silently dropped it for (unskilled /
+   *  cooldown / no mana / dead / out of range / invalid target). */
+  castBlockReason(slot: number, aim: { x?: number; z?: number; target?: number }): string | null;
+  /** Show a transient cast-denied note (the silent-no-op bug fix). */
+  castDenied(reason: string): void;
 }
 
 export interface InputHandle {
@@ -89,22 +96,43 @@ export function createInput(root: HTMLElement, scene: SceneHandle, hooks: InputH
 
   function quickCast(slot: number): void {
     const hero = hooks.ownHero();
-    if (hero === null) return;
+    if (hero === null) {
+      hooks.castDenied('not in game yet');
+      return;
+    }
     const def = heroById(hero).abilities[slot];
     if (def === undefined || def.isPassive) return;
     if (def.targeting === 'none') {
+      const why = hooks.castBlockReason(slot, {});
+      if (why !== null) {
+        hooks.castDenied(why);
+        return;
+      }
       hooks.send({ t: 'rift_cast', slot });
       return;
     }
     if (def.targeting === 'point') {
       const pt = { x: 0, z: 0 };
       if (!cursorGround(pt)) return;
+      const why = hooks.castBlockReason(slot, { x: pt.x, z: pt.z });
+      if (why !== null) {
+        hooks.castDenied(why);
+        return;
+      }
       hooks.send({ t: 'rift_cast', slot, x: pt.x, z: pt.z });
       return;
     }
     // unit-targeted: pick the unit under the cursor
     const id = scene.pickUnit(mouseX, mouseY);
-    if (id < 0) return;
+    if (id < 0) {
+      hooks.castDenied('no target under the cursor');
+      return;
+    }
+    const why = hooks.castBlockReason(slot, { target: id });
+    if (why !== null) {
+      hooks.castDenied(why);
+      return;
+    }
     hooks.send({ t: 'rift_cast', slot, target: id });
   }
 

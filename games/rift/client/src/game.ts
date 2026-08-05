@@ -23,6 +23,8 @@ import {
   heroById,
   MAP_SIDE_BASE,
   MAP_SIDE_PER_LANE,
+  TICK_DT,
+  ULT_LEVEL_REQ,
 } from '@rift/shared';
 import type { HeroId, RiftC2S, RiftEvent, RiftSettings, TeamId } from '@rift/shared';
 import type { LobbyC2S, RoomInfo } from '@platform/shared';
@@ -52,6 +54,7 @@ const CAM_MAX_H = 55;
 const CAM_DEFAULT_H = 36;
 const ROOMS_EVERY_MS = 3000; // menu room-list poll (wordbomb pattern)
 const NAME_MAX = 16; // lobby cleanName cap (platform protocol)
+const TOAST_MS = 1500; // cast-denied note lifetime (UX: transient, not a banner)
 
 type Phase = ClientState['phase'];
 
@@ -141,6 +144,7 @@ export class Game {
   private selfEntId = -1;
   private lastYouHp: number | null = null;
   private lastYouLevel = 0;
+  private toast: { text: string; untilMs: number } | null = null; // cast-denied note
 
   // ---- camera ---------------------------------------------------------------------
   private camX = 0;
@@ -165,6 +169,7 @@ export class Game {
     cameraX: 0,
     cameraZ: 0,
     cameraHeight: CAM_DEFAULT_H,
+    toast: null,
   };
   private readonly actions: UiActions;
   private lastFrameMs = 0;
@@ -214,6 +219,8 @@ export class Game {
       },
       setSelected: (id) => modules.units.setSelected(id),
       orderMarker: (x, z, attack) => modules.units.orderMarker(x, z, attack),
+      castBlockReason: (slot, aim) => this.castBlockReason(slot, aim),
+      castDenied: (reason) => this.castDenied(reason),
     });
 
     // ---- frozen e2e debug surface (CONTRACT §6) -----------------------------------
@@ -662,6 +669,59 @@ export class Game {
     return null;
   }
 
+  // ---- cast preflight + denial toast (the silent-no-op fix) ---------------------
+  // The server DROPS invalid casts in silence (parse-level: never an error),
+  // so a rejected QWER used to be indistinguishable from a dead key. input.ts
+  // preflights every quick-cast here against the latest snapshot — the same
+  // data the server validates with — and toasts the reason instead of sending.
+
+  /** Null when the cast may be sent; otherwise the short player-facing reason. */
+  private castBlockReason(slot: number, aim: { x?: number; z?: number; target?: number }): string | null {
+    const snap = this.snap;
+    const you = snap?.you ?? null;
+    if (snap === null || you === null) return 'not in game yet';
+    const def = heroById(you.hero).abilities[slot];
+    if (def === undefined || def.isPassive) return null; // input.ts guards these
+    const tick = snap.matchTick;
+    if (you.respawnAtTick > tick) {
+      return `dead — respawn in ${String(Math.max(1, Math.ceil((you.respawnAtTick - tick) * TICK_DT)))}s`;
+    }
+    const st = you.abilities[slot];
+    const rank = st?.rank ?? 0;
+    if (rank < 1) {
+      return def.ult
+        ? `ult unlocks at LV ${String(ULT_LEVEL_REQ[rank] ?? '?')}`
+        : 'not learned — level it first (+ or Ctrl+key)';
+    }
+    const cd = st?.cdUntilTick ?? 0;
+    if (cd > tick) return `on cooldown (${String(Math.max(1, Math.ceil((cd - tick) * TICK_DT)))}s)`;
+    const cost = def.manaCost[rank - 1] ?? 0;
+    if (you.mana < cost) return 'not enough mana';
+    const range = def.castRange[rank - 1] ?? 0;
+    if (aim.target !== undefined) {
+      const ent = snap.ents.find((e) => e.id === aim.target);
+      if (ent === undefined) return 'target is not visible';
+      if (ent.k !== 'hero' && ent.k !== 'melee' && ent.k !== 'ranged' && ent.k !== 'siege' && ent.k !== 'shade') {
+        return 'invalid target';
+      }
+      const mine = this.helloView?.team ?? null;
+      if (mine !== null) {
+        if (def.targetTeam === 'enemy' && ent.team === mine) return 'needs an ENEMY target';
+        if (def.targetTeam === 'ally' && ent.team !== mine) return 'needs an ALLY target';
+      }
+      if (Math.hypot(ent.x - you.x, ent.z - you.z) > range) return 'out of range';
+    } else if (aim.x !== undefined && aim.z !== undefined) {
+      if (Math.hypot(aim.x - you.x, aim.z - you.z) > range) return 'out of range';
+    }
+    return null;
+  }
+
+  /** Transient denial note + the error blip (1.5s pill, hud reads state.toast). */
+  private castDenied(reason: string): void {
+    this.toast = { text: reason, untilMs: performance.now() + TOAST_MS };
+    this.modules.audio.ui('error');
+  }
+
   // ---- phase / lifecycle --------------------------------------------------------------
   private setPhase(p: Phase): void {
     if (this.state.phase === p) return;
@@ -829,6 +889,8 @@ export class Game {
     s.cameraX = this.camX;
     s.cameraZ = this.camZ;
     s.cameraHeight = this.camH;
+    if (this.toast !== null && performance.now() >= this.toast.untilMs) this.toast = null;
+    s.toast = this.toast;
 
     m.hud.render(s, this.actions);
     m.shop.render(s, this.actions);
