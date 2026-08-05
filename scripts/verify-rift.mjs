@@ -641,10 +641,14 @@ async function captureOverlayStates(vp) {
       throw new Error(`the overlay room is no longer live (phase ${s?.phase ?? '?'}) — the banner only rides the live HUD`);
     }
     expectDisconnect = true;
-    serverChild.kill('SIGTERM');
+    const victim = serverChild; // pin the child: after a fast clean SIGTERM
+    // exit startServer() reassigns the global, and a stale 5s SIGKILL timer
+    // aimed at the OLD server would murder the RESTARTED one mid-reconnect
+    // (measured: 'server EXITED mid-run (signal SIGKILL)' + reconnect timeout)
+    victim.kill('SIGTERM');
     await Promise.race([
-      new Promise((r) => serverChild.once('exit', r)),
-      sleep(5000).then(() => serverChild.kill('SIGKILL')),
+      new Promise((r) => victim.once('exit', r)),
+      sleep(5000).then(() => victim.kill('SIGKILL')),
     ]);
     await waitFor(() => domVisible(page, '.hud .banner'), 20000, 'disconnect banner');
     await settle(page, { ms: 300 });
