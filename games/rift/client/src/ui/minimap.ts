@@ -6,7 +6,9 @@
 // so drawing every mobile it contains can never leak), wards, the fog
 // maskCanvas composited on top, the camera frustum rect, and click-to-pan via
 // actions.panCameraTo. World [0,side]^2 maps linearly onto the square canvas,
-// world x -> right, world z -> down.
+// ROTATED 180° so the minimap agrees with the fixed camera rig (measured by
+// scripts/repro-pan.mjs: screen-right is world -x, screen-up is world +z):
+// world x -> canvas LEFT, world z -> canvas UP.
 //
 // DOM CLASS CONTRACT (§6): renders only .minimap (the wrapper); the canvas
 // itself is classless (T8: `.minimap > canvas`). All canvas colours are APAL
@@ -53,16 +55,19 @@ export function createMinimap(parent: HTMLElement): UiHandle {
     if (rect.width <= 0 || rect.height <= 0) return;
     const u = (ev.clientX - rect.left) / rect.width;
     const v = (ev.clientY - rect.top) / rect.height;
-    const x = Math.min(Math.max(u, 0), 1) * map.side;
-    const z = Math.min(Math.max(v, 0), 1) * map.side;
+    // the drawing is rotated 180° (see header): canvas right is world -x,
+    // canvas down is world -z
+    const x = (1 - Math.min(Math.max(u, 0), 1)) * map.side;
+    const z = (1 - Math.min(Math.max(v, 0), 1)) * map.side;
     actionsRef.panCameraTo(x, z);
   });
 
   function draw(s: ClientState): void {
     if (!ctx || !map) return;
     const side = map.side;
-    const px = (x: number): number => (x / side) * RES;
-    const pz = (z: number): number => (z / side) * RES;
+    // rotated 180°: canvas right = world -x, canvas down = world -z
+    const px = (x: number): number => (1 - x / side) * RES;
+    const pz = (z: number): number => (1 - z / side) * RES;
 
     // ground
     ctx.fillStyle = APAL.mossDeep;
@@ -141,22 +146,33 @@ export function createMinimap(parent: HTMLElement): UiHandle {
     }
 
     // fog shroud, composited over the world (T7 owns the mask pixels; §6 fog
-    // amendment makes it a map-aligned canvas, visible = clear)
+    // amendment makes it a map-aligned canvas, visible = clear). The mask is
+    // world x -> u, z -> v, so the 180°-rotated minimap draws it flipped.
     const mask = s.fog?.maskCanvas;
     if (mask && mask.width > 0 && mask.height > 0) {
       try {
+        ctx.save();
+        ctx.translate(RES, RES);
+        ctx.scale(-1, -1);
         ctx.drawImage(mask, 0, 0, RES, RES);
+        ctx.restore();
       } catch {
         // a mid-rebuild mask must never break the minimap
       }
     }
 
-    // camera frustum rect (estimate — see header)
+    // camera frustum rect (estimate — see header). px/pz DECREASE with
+    // x/z, so the rect's top-left corner is the +x/+z edge.
     const halfW = s.cameraHeight * FRUSTUM_HALF_W_PER_M;
     const halfH = s.cameraHeight * FRUSTUM_HALF_H_PER_M;
     ctx.strokeStyle = APAL.paper;
     ctx.lineWidth = 1;
-    ctx.strokeRect(px(s.cameraX - halfW), pz(s.cameraZ - halfH), px(halfW * 2), pz(halfH * 2));
+    ctx.strokeRect(
+      px(s.cameraX + halfW),
+      pz(s.cameraZ + halfH),
+      ((halfW * 2) / side) * RES,
+      ((halfH * 2) / side) * RES,
+    );
   }
 
   /** The ent id of the local hero (its snap row carries pid === hello.you). */

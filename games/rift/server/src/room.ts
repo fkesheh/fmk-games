@@ -31,6 +31,7 @@ import {
   HERO_VISION,
   heroById,
   INVENTORY_SLOTS,
+  isPlayerTeam,
   LANES_FOR_TEAM_SIZE,
   LOBBY_COUNTDOWN_MS,
   MATCH_END_MS,
@@ -81,6 +82,7 @@ import { NO_ENT } from './sim/types.js';
 import type {
   BotBrain,
   BotPercept,
+  CampPercept,
   Ent,
   EntId,
   Order,
@@ -136,7 +138,7 @@ interface Seat {
   /** True for bot-fill seats and for permanent leavers (seat converted). */
   bot: boolean;
   connected: boolean;
-  /** Manual lobby pick (unique across HUMANS); null = cycle-assigned. */
+  /** Manual lobby pick (duplicates allowed, CONTRACT §2); null = cycle-assigned. */
   pick: HeroId | null;
   /** Locked hero; null before lock and again after full-reset. */
   hero: HeroId | null;
@@ -226,12 +228,16 @@ export class RiftRoom implements GameRoomHandle {
   private readonly visSets: [Set<EntId>, Set<EntId>] = [new Set(), new Set()];
   /** Reused BotPercept.visible buffer — valid only during feedBot (T6 seam). */
   private readonly perceptBuf: Ent[] = [];
+  /** Reused camp table for bot percepts (TERRAIN_CONTRACT §5): ONE
+   *  CampPercept per World.camps entry, built at lock; only `up` is refreshed
+   *  in place each tick, so feeding eight bots allocates nothing. */
+  private readonly campPercepts: CampPercept[] = [];
   /** Fountain anchors (own ancient positions) for bot atFountain percepts. */
   private readonly fountainX: [number, number] = [0, 0];
   private readonly fountainZ: [number, number] = [0, 0];
   /** Caster ent id -> fx tag for colouring their projectiles (see noteCastFx). */
   private readonly projFx = new Map<EntId, string>();
-  /** Auto-assignment hero cycle (heroes not manually picked, wrapping). */
+  /** Auto-assignment hero cycle (LEAST-picked first at lock, wrapping). */
   private heroCycle: HeroId[] = HERO_LIST.map((d) => d.id);
   private heroCycleIdx = 0;
   /** Shared scoreboard rows, rebuilt per tick — identical for every client. */
@@ -272,7 +278,14 @@ export class RiftRoom implements GameRoomHandle {
       // seats, humans + bots — the lobby list's fullness signal (CONTRACT §2)
       players: this.seats.length,
       maxPlayers: MAX_PLAYERS,
-      phase: this.phase,
+      // RoomInfo.phase is game-defined, and the platform's quick_join PREFERS
+      // rooms reporting 'warmup' (fps convention) before falling back to any
+      // room with space. Rift's pre-match phase is named 'lobby', which the
+      // preference never matched — a quick-joiner was routed into an older
+      // IN-PROGRESS room instead of a rift lobby still waiting for players
+      // (proven by scripts/repro-quickjoin2.mjs). Report 'warmup' while this
+      // room waits for START.
+      phase: this.phase === 'lobby' ? 'warmup' : this.phase,
       visibility: this.visibility,
     };
   }
@@ -424,6 +437,12 @@ export class RiftRoom implements GameRoomHandle {
     // same sets, snapshots serialize from them (computed twice per tick).
     computeTeamVisible(w, 0, this.visSets[0]);
     computeTeamVisible(w, 1, this.visSets[1]);
+    // Refresh camp liveness in place (index === CampState.id by construction).
+    for (let i = 0; i < this.campPercepts.length; i++) {
+      const p = this.campPercepts[i];
+      const c = w.camps[i];
+      if (p !== undefined && c !== undefined) p.up = c.aliveCount > 0;
+    }
     // Bots think BEFORE the world ticks, and their commands go through the
     // SAME handlers human messages hit — no code path a human can't hit.
     for (const s of this.seats) {
@@ -493,15 +512,14 @@ export class RiftRoom implements GameRoomHandle {
   }
 
   /**
-   * Manual picks are unique across HUMANS; anything else — a pick outside the
-   * lobby, a hero another human already picked — is ignored in silence and
-   * never throws. Accepted picks broadcast a rift_pick event + fresh lobby.
+   * ANY hero is pickable in the lobby — duplicates are allowed and expected
+   * (six heroes, up to sixteen seats; CONTRACT §2). Only a pick outside the
+   * lobby is ignored, in silence and never throwing. Every ACCEPTED pick
+   * broadcasts the rift_pick event AND a fresh rift_lobby in the same call,
+   * so every seated client sees it the moment it lands.
    */
   private handlePick(seat: Seat, hero: HeroId): void {
     if (this.phase !== 'lobby') return;
-    for (const s of this.seats) {
-      if (s !== seat && s.pick === hero) return; // taken by another HUMAN
-    }
     seat.pick = hero;
     this.broadcastEvent({ t: 'rift_pick', id: seat.pid, hero });
     this.broadcastLobby();
@@ -537,13 +555,17 @@ export class RiftRoom implements GameRoomHandle {
     const teamSize = this.resolvedTeamSize();
     const lanes = LANES_FOR_TEAM_SIZE[teamSize] ?? 1;
 
-    // Heroes: manual picks first (already unique); the cycle starts at the
-    // first un-picked hero and wraps with duplicates allowed (CONTRACT §2).
-    const manual = new Set<HeroId>();
-    for (const s of this.seats) if (s.pick !== null) manual.add(s.pick);
-    const avail: HeroId[] = [];
-    for (const def of HERO_LIST) if (!manual.has(def.id)) avail.push(def.id);
-    this.heroCycle = avail.length > 0 ? avail : HERO_LIST.map((d) => d.id);
+    // Heroes: manual picks apply as-is (duplicates legal, CONTRACT §2); the
+    // cycle orders HERO_LIST by ascending pick count — stable sort, ties keep
+    // HERO_LIST order — so auto-assignment and bot fill take the LEAST-picked
+    // heroes first, wrapping with duplicates allowed.
+    const pickCount = new Map<HeroId, number>();
+    for (const s of this.seats) {
+      if (s.pick !== null) pickCount.set(s.pick, (pickCount.get(s.pick) ?? 0) + 1);
+    }
+    this.heroCycle = HERO_LIST.map((d) => d.id).sort(
+      (a, b) => (pickCount.get(a) ?? 0) - (pickCount.get(b) ?? 0),
+    );
     this.heroCycleIdx = 0;
     for (const s of this.seats) s.hero = s.pick ?? this.nextCycleHero();
 
@@ -598,6 +620,12 @@ export class RiftRoom implements GameRoomHandle {
     }));
     const w = createWorld(map, seatDefs, this.deps.rand, createAbilitiesEngine());
     this.world = w;
+    // Camp percept table: one entry per World.camps entry, in the same order
+    // (index === id); only `up` ever changes, refreshed per tick in tickOnce.
+    this.campPercepts.length = 0;
+    for (const c of w.camps) {
+      this.campPercepts.push({ id: c.id, tier: c.def.tier, x: c.def.x, z: c.def.z, up: c.aliveCount > 0 });
+    }
 
     // Bind hero ents to seats (pid is the join-order-unique seat key).
     const byPid = new Map<PlayerId, Seat>();
@@ -643,9 +671,11 @@ export class RiftRoom implements GameRoomHandle {
   // Live: bot percepts, the shared intake handlers, events, snapshots
   // -------------------------------------------------------------------------
 
-  private atFountain(ent: Ent): boolean {
-    const dx = ent.x - this.fountainX[ent.team];
-    const dz = ent.z - this.fountainZ[ent.team];
+  /** ent.team is the sim's EntTeam (neutral camps exist); the SEAT's team is
+   *  the player TeamId that indexes the two fountain anchors. */
+  private atFountain(team: TeamId, ent: Ent): boolean {
+    const dx = ent.x - this.fountainX[team];
+    const dz = ent.z - this.fountainZ[team];
     return dx * dx + dz * dz <= FOUNTAIN_RADIUS * FOUNTAIN_RADIUS;
   }
 
@@ -658,7 +688,11 @@ export class RiftRoom implements GameRoomHandle {
   private feedBot(seat: Seat, ent: Ent, brain: BotBrain, w: World): void {
     const buf = this.perceptBuf;
     buf.length = 0;
-    const vis = this.visSets[ent.team];
+    // The ent IS this seat's hero, so its team equals the seat's player
+    // TeamId — index the per-team tuples with seat.team, never with an
+    // entity's EntTeam (neutral camps are team 2; TERRAIN_CONTRACT §5's
+    // narrowing obligation).
+    const vis = this.visSets[seat.team];
     for (const e of w.all()) {
       if (isStructureKind(e.kind) || vis.has(e.id)) buf.push(e);
     }
@@ -669,8 +703,9 @@ export class RiftRoom implements GameRoomHandle {
       visible: buf,
       lane: seat.lane,
       paths: w.map.paths,
-      wardStock: w.wardStock(ent.team),
-      atFountain: this.atFountain(ent),
+      camps: this.campPercepts,
+      wardStock: w.wardStock(seat.team),
+      atFountain: this.atFountain(seat.team, ent),
       overtime: w.overtime,
     };
     const cmds = brain.tick(percept);
@@ -860,7 +895,8 @@ export class RiftRoom implements GameRoomHandle {
     const serverTime = Date.now(); // wall clock for clock sync; match time is ticks
     const kills: [number, number] = [0, 0];
     for (const e of w.mobiles()) {
-      if (e.kind === 'hero') kills[e.team] += e.kills;
+      // narrow before indexing the 2-tuple: camp creeps are neutral (team 2)
+      if (e.kind === 'hero' && isPlayerTeam(e.team)) kills[e.team] += e.kills;
     }
     this.buildBoard(w);
     for (const ch of this.channels.values()) {
@@ -1046,6 +1082,7 @@ export class RiftRoom implements GameRoomHandle {
     this.visSets[1].clear();
     this.channels.clear();
     this.boardRows.length = 0;
+    this.campPercepts.length = 0;
     this.lastEndEv = null;
     this.beginMsg = null;
     this.lockedTeamSize = 0;

@@ -101,6 +101,10 @@ export interface RiftDebugApi {
   inviteCode(): string | null; // ?code= prefill (already stripped from the URL)
   serverNow(): number; // lobby countdown rendering (offset-corrected)
   drawCalls(): number; // T14 perf gate
+  /** World ground point under a screen pixel via the scene's real raycast —
+   *  the camera-mapping probe the pan regression harness reads (at the canvas
+   *  centre this IS the camera target). Null when the ray misses the map. */
+  screenToGround(sx: number, sy: number): { x: number; z: number } | null;
 }
 
 declare global {
@@ -255,6 +259,10 @@ export class Game {
       inviteCode: () => this.invite,
       serverNow: () => this.net.serverNow(),
       drawCalls: () => this.modules.scene.drawCalls(),
+      screenToGround: (sx, sy) => {
+        const out = { x: 0, z: 0 };
+        return this.modules.scene.screenToGround(sx, sy, out) ? out : null;
+      },
     };
 
     // ---- rejoin record + invite link (wordbomb pattern) -----------------------------

@@ -2,7 +2,9 @@
 // ANCIENTS (rift) client — MENUS (CONTRACT §6 ui/menus.ts + §8, T9). The three
 // non-live screens: .menu (name entry, create with teamSize + speed settings,
 // join-by-code with ?code= prefill), .lobby (team roster, hero pick grid with
-// role/blurb/ability tooltips, human-taken heroes greyed, teamSize readout,
+// role/blurb/ability tooltips, a live picker-COUNT badge per hero — duplicates
+// are allowed (CONTRACT §2 amendment), the grid never greys out — teamSize
+// readout,
 // START reflecting canStart, invite code), and .end-screen (winner banner, the
 // full rift_end stats table, back-to-menu). All states per §8 look intentional:
 // every screen renders real copy even when its data is still arriving.
@@ -289,7 +291,7 @@ export function createMenus(parent: HTMLElement): UiHandle {
       title.textContent = room.label;
       const label = el('span', 'room-label', row);
       label.style.fontSize = `${FONT_MIN_PX}px`;
-      label.textContent = room.phase === 'lobby' ? 'IN LOBBY' : 'LIVE — join mid-match';
+      label.textContent = room.phase === 'warmup' ? 'IN LOBBY' : 'LIVE — join mid-match';
       const meta = el('span', 'room-meta', row);
       meta.style.fontSize = `${FONT_MIN_PX}px`;
       meta.textContent = `${room.players}/${room.maxPlayers} seated`;
@@ -325,7 +327,7 @@ export function createMenus(parent: HTMLElement): UiHandle {
   }
   const pickTitle = el('h2', 'lobby-heading', lobby);
   pickTitle.style.fontSize = '14px';
-  pickTitle.textContent = 'CHOOSE YOUR HERO — manual picks are unique across both teams';
+  pickTitle.textContent = 'CHOOSE YOUR HERO — duplicates allowed; ×N is the live picker count';
   const pickGrid = el('div', 'pick-grid', lobby);
   const lobbyStart = el('button', 'lobby-start', lobby);
   lobbyStart.style.fontSize = '16px';
@@ -360,17 +362,28 @@ export function createMenus(parent: HTMLElement): UiHandle {
         if (r.team !== t) continue;
         const seat = el('div', 'lobby-seat', col);
         seat.style.fontSize = '14px';
-        const hero = r.pick ? heroById(r.pick).name : 'choosing…';
+        // lobby.picks is FRESHER than the roster row: rift_lobby re-broadcasts
+        // on every accepted pick, rift_roster only on membership changes — a
+        // seat read from the roster showed 'choosing…' until someone joined or
+        // left (the pick-staleness half of the greying bug).
+        const seatPick = r.id in picks ? (picks[r.id] ?? null) : r.pick;
+        const hero = seatPick ? heroById(seatPick).name : 'choosing…';
         const tags = `${r.bot ? ' [BOT]' : ''}${r.connected || r.bot ? '' : ' [OFFLINE]'}`;
         seat.textContent = `${r.name}${tags} — ${hero}`;
         if (r.id === me) seat.style.textDecoration = 'underline';
       }
     }
 
-    // a hero is taken when another HUMAN picked it (bots/auto-fill may dupe)
-    const taken = new Set<HeroId>();
-    for (const r of roster) {
-      if (!r.bot && r.pick !== null && r.id !== me) taken.add(r.pick);
+    // Live picker counts, derived from lobby.picks (re-broadcast with EVERY
+    // accepted pick — room.ts handlePick — so this map is never stale; the old
+    // "taken" greying read the roster, which only updates on rift_roster, and
+    // lagged a pick until the next membership change). CONTRACT §2 amendment:
+    // duplicates are allowed, so NO card is ever disabled or dimmed — the
+    // badge carries the popularity signal and every hero stays clickable.
+    const counts = new Map<HeroId, number>();
+    for (const pid of Object.keys(picks)) {
+      const h = picks[pid];
+      if (h != null) counts.set(h, (counts.get(h) ?? 0) + 1);
     }
 
     pickGrid.replaceChildren();
@@ -378,9 +391,6 @@ export function createMenus(parent: HTMLElement): UiHandle {
       const card = el('button', 'pick-card', pickGrid);
       card.title = heroTooltip(def);
       const isMine = picks[me] === def.id;
-      const isTaken = taken.has(def.id);
-      card.disabled = isTaken;
-      card.style.opacity = isTaken ? '0.35' : '';
       card.style.outline = isMine ? `2px solid ${accentColor(def.visual.accent)}` : '';
       const glyph = el('b', null, card);
       glyph.textContent = def.name.slice(0, 1);
@@ -391,9 +401,10 @@ export function createMenus(parent: HTMLElement): UiHandle {
       const role = el('i', null, card);
       role.style.fontSize = `${FONT_MIN_PX}px`;
       role.textContent = `${def.role} — ${def.blurb}`;
-      if (!isTaken) {
-        card.onclick = () => actionsRef?.send({ t: 'rift_pick', hero: def.id });
-      }
+      // classless like its siblings; .pick-card > u owns the look (≥12px, APAL)
+      const badge = el('u', null, card);
+      badge.textContent = `×${String(counts.get(def.id) ?? 0)}`;
+      card.onclick = () => actionsRef?.send({ t: 'rift_pick', hero: def.id });
     }
   }
 

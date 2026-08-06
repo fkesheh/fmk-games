@@ -283,8 +283,11 @@ export function createInput(root: HTMLElement, scene: SceneHandle, hooks: InputH
     if (middleDrag) {
       const rect = scene.canvas.getBoundingClientRect();
       const mpp = rect.height > 0 ? (hooks.cameraHeight() * DRAG_SCALE) / rect.height : 0;
-      // grab-the-world: the terrain follows the cursor
-      hooks.panBy((lastDragX - e.clientX) * mpp, (lastDragY - e.clientY) * mpp);
+      // grab-the-world: the terrain follows the cursor. Screen-right is world
+      // -x and screen-up is world +z (the fixed camera rig), so a +px drag
+      // moves the camera target +x (screen-left) and a +py drag moves it +z
+      // (screen-up). Measured by scripts/repro-pan.mjs.
+      hooks.panBy((e.clientX - lastDragX) * mpp, (e.clientY - lastDragY) * mpp);
       lastDragX = e.clientX;
       lastDragY = e.clientY;
     }
@@ -334,18 +337,19 @@ export function createInput(root: HTMLElement, scene: SceneHandle, hooks: InputH
     }
     let dx = 0;
     let dz = 0;
-    // Arrow-key pan. Screen-up is -z, screen-right is +x (fixed camera yaw; if
-    // T7's yaw ever differs this mapping is the single line to revisit).
-    if (held.has('ArrowUp')) dz -= 1;
-    if (held.has('ArrowDown')) dz += 1;
-    if (held.has('ArrowLeft')) dx -= 1;
-    if (held.has('ArrowRight')) dx += 1;
+    // Arrow-key pan. MEASURED camera mapping (T7's rig in render/scene.ts:
+    // camera sits at targetZ - back looking along +z): screen-up is world +z,
+    // screen-right is world -x. Verified end-to-end by scripts/repro-pan.mjs.
+    if (held.has('ArrowUp')) dz += 1;
+    if (held.has('ArrowDown')) dz -= 1;
+    if (held.has('ArrowLeft')) dx += 1;
+    if (held.has('ArrowRight')) dx -= 1;
     // Screen-edge pan (not while middle-dragging — the drag owns the camera).
     if (pointerSeen && !middleDrag && document.hasFocus()) {
-      if (mouseX <= EDGE_PX) dx -= 1;
-      else if (mouseX >= window.innerWidth - EDGE_PX) dx += 1;
-      if (mouseY <= EDGE_PX) dz -= 1;
-      else if (mouseY >= window.innerHeight - EDGE_PX) dz += 1;
+      if (mouseX <= EDGE_PX) dx += 1;
+      else if (mouseX >= window.innerWidth - EDGE_PX) dx -= 1;
+      if (mouseY <= EDGE_PX) dz += 1;
+      else if (mouseY >= window.innerHeight - EDGE_PX) dz -= 1;
     }
     if (dx === 0 && dz === 0) return;
     const speed = hooks.cameraHeight() * PAN_SPEED_PER_HEIGHT;

@@ -192,7 +192,9 @@ describe('riftModule', () => {
     const a = riftModule.createRoom({ visibility: 'public', io });
     expect(a.info().game).toBe('rift');
     const b = riftModule.createRoom({ visibility: 'public', io, settings: { teamSize: 2, speed: 20 } });
-    expect(b.info().phase).toBe('lobby');
+    // a waiting rift lobby reports 'warmup' so the platform's quick_join
+    // preference can find it (the quick-join regression — see quickjoin.test.ts)
+    expect(b.info().phase).toBe('warmup');
     a.stop();
     b.stop();
   });
@@ -267,26 +269,35 @@ describe('lobby contract', () => {
     room.handleMessage('p1', { t: 'rift_buy', item: 'wardstone' });
     // all dropped: no error frame, no crash, state unchanged
     expect(io.all('p1').length).toBe(before);
-    expect(room.info().phase).toBe('lobby');
+    expect(room.info().phase).toBe('warmup'); // internal phase 'lobby' is reported as 'warmup'
     expect(io.last('p1', 'rift_lobby').countdownEndsAt).toBe(0);
   });
 
-  it('picks are unique across HUMANS; duplicates are ignored in silence', () => {
+  it('duplicate picks are accepted and visible to every client the moment they land', () => {
     const { room, io } = boot([
       ['p1', 'Ada'],
       ['p2', 'Bob'],
+      ['p3', 'Cy'],
     ]);
     room.handleMessage('p1', { t: 'rift_pick', hero: 'bullwark' });
     expect(io.last('p1', 'rift_lobby').picks['p1']).toBe('bullwark');
-    expect(io.events('p2', 'rift_pick').some((e) => e.id === 'p1' && e.hero === 'bullwark')).toBe(true);
 
-    const p2EventsBefore = io.events('p2', 'rift_pick').length;
-    room.handleMessage('p2', { t: 'rift_pick', hero: 'bullwark' }); // taken by p1
-    expect(io.last('p2', 'rift_lobby').picks['p2']).toBeNull(); // silently refused
-    expect(io.events('p2', 'rift_pick').length).toBe(p2EventsBefore); // no pick event
+    // p2 picks the SAME hero: accepted (CONTRACT §2 — six heroes, up to
+    // sixteen seats; duplicates expected), and every seated client — including
+    // the bystander p3 — sees it synchronously: the rift_pick event AND a
+    // fresh rift_lobby land in the same call.
+    room.handleMessage('p2', { t: 'rift_pick', hero: 'bullwark' });
+    for (const id of ['p1', 'p2', 'p3'] as const) {
+      const lobby = io.last(id, 'rift_lobby');
+      expect(lobby.picks['p1']).toBe('bullwark');
+      expect(lobby.picks['p2']).toBe('bullwark');
+      expect(io.events(id, 'rift_pick').some((e) => e.id === 'p2' && e.hero === 'bullwark')).toBe(true);
+    }
 
-    room.handleMessage('p2', { t: 'rift_pick', hero: 'longbow' }); // legal
-    expect(io.last('p1', 'rift_lobby').picks['p2']).toBe('longbow');
+    // a re-pick replaces, still immediately propagated to everyone
+    room.handleMessage('p2', { t: 'rift_pick', hero: 'longbow' });
+    expect(io.last('p3', 'rift_lobby').picks['p2']).toBe('longbow');
+    expect(io.events('p1', 'rift_pick').some((e) => e.id === 'p2' && e.hero === 'longbow')).toBe(true);
 
     // picks outside the lobby are ignored in silence
     pressStartAndLock(room, 'p1');
@@ -294,6 +305,29 @@ describe('lobby contract', () => {
     pump(room, 1);
     const snap = latestSnap(io, 'p1');
     expect(snap.you?.hero).toBe('bullwark'); // unchanged
+  });
+
+  it('auto-assign and bot fill cycle the LEAST-picked heroes first', () => {
+    const { room, io } = boot([
+      ['p1', 'Ada'],
+      ['p2', 'Bob'],
+      ['p3', 'Cy'],
+    ]);
+    room.handleMessage('p1', { t: 'rift_pick', hero: 'reaver' });
+    room.handleMessage('p2', { t: 'rift_pick', hero: 'reaver' }); // duplicate pick
+    pressStartAndLock(room, 'p1');
+    pump(room, 1);
+    const snap = latestSnap(io, 'p1');
+    const heroOf = (pid: string): string | undefined => snap.board.find((r) => r.id === pid)?.hero;
+    // both duplicate picks locked in as-is
+    expect(heroOf('p1')).toBe('reaver');
+    expect(heroOf('p2')).toBe('reaver');
+    // reaver (pick count 2) sorts LAST in the cycle, so the unpicked human
+    // and the bot fill take never-picked heroes in HERO_LIST order instead
+    expect(heroOf('p3')).toBe(HERO_LIST[0]?.id);
+    const bots = snap.board.filter((r) => r.bot);
+    expect(bots).toHaveLength(1); // 3 humans -> 2v2, one bot seat
+    expect(bots[0]?.hero).toBe(HERO_LIST[1]?.id);
   });
 });
 
@@ -660,7 +694,7 @@ describe('match end and full reset', () => {
 
     // MATCH_END_MS later: bots removed, sim discarded, picks KEPT, and it WAITS
     vi.advanceTimersByTime(MATCH_END_MS);
-    expect(room.info().phase).toBe('lobby');
+    expect(room.info().phase).toBe('warmup'); // internal phase 'lobby' is reported as 'warmup'
     expect(room.info().label).toBe('lobby');
     const lobby = io.last('p1', 'rift_lobby');
     expect(lobby.picks['p1']).toBe('reaver'); // picks kept
@@ -688,7 +722,7 @@ describe('robustness', () => {
     room.stop();
     room.stop();
     room.start();
-    expect(room.info().phase).toBe('lobby');
+    expect(room.info().phase).toBe('warmup'); // internal phase 'lobby' is reported as 'warmup'
     expect(room.playerCount()).toBe(0);
     expect(room.stalePlayers()).toEqual([]);
     room.removePlayer('nobody');

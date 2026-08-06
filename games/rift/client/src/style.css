@@ -585,13 +585,15 @@ body {
   border-color: var(--azure);
 }
 
-.pick-card--taken {
-  opacity: 0.45;
-  cursor: default;
-}
-
-.pick-card--taken:hover {
-  border-color: var(--stone-deep);
+/* Duplicates are allowed (CONTRACT §2 amendment): the grid NEVER greys a hero
+   out — the old .pick-card--taken rules are gone. Instead every card carries a
+   live picker-count badge (classless <u>, the same seam as the glyph/name/role
+   children menus.ts renders). */
+.pick-card > u {
+  font-size: 12px;
+  text-decoration: none;
+  letter-spacing: 0.08em;
+  color: var(--gold);
 }
 
 .pick-card--picked {

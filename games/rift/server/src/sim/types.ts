@@ -4,9 +4,14 @@
 // sim modules (T3 world/movement/combat/units, T4 abilities, T5 vision),
 // the bots (T6), and the room (T10) all build against IN PARALLEL — nobody
 // negotiates shapes with anybody; everything flows through this file.
+//
+// AMENDED for TERRAIN_CONTRACT §5 (frozen, orchestrator-authored): entities
+// carry `EntTeam` because neutral jungle camps are a third team, heroes carry
+// an A* path, and the world exposes the live camp table. The amendment adds
+// fields and widens `team`; it removes and re-values nothing.
 // ============================================================================
 import type { AuraStat } from '@rift/shared';
-import type { EndReason, EntKind, MapDef, Phase, TeamId, Vec2 } from '@rift/shared';
+import type { CampDef, EndReason, EntKind, EntTeam, MapDef, Phase, TeamId, Vec2 } from '@rift/shared';
 import type { HeroId, ItemId } from '@rift/shared';
 
 /** Structure entities use their MapDef structure id (0..999). Mobile entities
@@ -49,7 +54,28 @@ export interface AuraInstance {
 export interface Ent {
   readonly id: EntId;
   readonly kind: EntKind;
-  readonly team: TeamId;
+  /** `EntTeam`, not `TeamId`: a jungle camp creep carries `NEUTRAL_TEAM`
+   *  (TERRAIN_CONTRACT §5). Players, seats, structures and match results stay
+   *  `TeamId` — only ENTITIES may be neutral. Hostility falls out for free:
+   *  `attackable()` tests `t.team !== e.team`, so a camp is an enemy to both
+   *  player teams and each player team is an enemy to the camp.
+   *
+   *  **Narrowing obligation — read this before you index anything with it.**
+   *  The sim is built on two-element per-team tuples: `visSets`,
+   *  `wardStockArr`, `ancientId`/`ancientX`/`ancientZ`, `kills`,
+   *  `fountainX`/`fountainZ`, and the client's `TEAM_COLOUR`/`TEAM_MARKER`.
+   *  `NEUTRAL_TEAM` is 2 — indexing a two-element tuple with it is an
+   *  out-of-bounds read that yields `undefined` under
+   *  `noUncheckedIndexedAccess`, or silently wrong data on a typed array.
+   *
+   *  > Every site that indexes a per-team tuple, array or `Record` with an
+   *  > entity's `team` MUST narrow with `isPlayerTeam(e.team)` first and
+   *  > handle the neutral branch explicitly — that branch is the
+   *  > documentation. No `as TeamId` casts, no non-null assertions, no
+   *  > "cannot happen here". Grep the files you own for indexing by `.team`
+   *  > and narrow all of them; a fixed site next to an unfixed one is exactly
+   *  > the bug this rule exists to prevent. */
+  readonly team: EntTeam;
   // position
   x: number;
   z: number;
@@ -81,8 +107,24 @@ export interface Ent {
   ox: number; // move/attackmove destination
   oz: number;
   orderTarget: EntId; // attack-order target
+  /** Grid A* path toward (ox, oz) — HEROES ONLY (TERRAIN_CONTRACT §4). null
+   *  means "no path, steer straight at the destination", which is the state
+   *  of every non-hero forever: lane creeps are never pathed (their corridor
+   *  is validated cliff-free) and camp creeps never leave their clearing.
+   *  Written by movement.ts only when an order is issued or the current path
+   *  is invalidated — never per tick.
+   *  INVARIANT: every new order resets this to null and `pathIndex` to 0. A
+   *  surviving path is a unit walking to the previous order's destination. */
+  path: readonly Vec2[] | null;
+  /** Index into `path` of the next waypoint not yet reached; advances as
+   *  `steer()` consumes waypoints, and equals `path.length` once the final
+   *  waypoint is reached (from there on the unit behaves exactly as it does
+   *  today). Meaningless while `path` is null, where it holds 0. */
+  pathIndex: number;
   /** Creep wave progress: assigned lane and next waypoint index. -1/0 for
-   *  non-creeps. */
+   *  non-creeps — INCLUDING camp creeps, which are spawned with lane -1. A
+   *  camp creep with lane >= 0 walks a lane polyline, which is the single
+   *  most likely way the jungle breaks (TERRAIN_CONTRACT §5). */
   lane: number;
   waypoint: number;
   // timed modifiers
@@ -123,6 +165,40 @@ export interface Ent {
   recentDamagers: { id: EntId; tick: number }[];
 }
 
+// --- Neutral jungle camps ---------------------------------------------------------
+
+/** Live state of ONE jungle camp (TERRAIN_CONTRACT §5). The world builds one
+ *  of these per `map.terrain.camps` entry at construction and never adds or
+ *  removes another; `stepCamps` (sim/camps.ts, run between stepDeaths and
+ *  stepUnits) mutates them in place, and the bots read them through the
+ *  percept. Nothing here is allocated per tick — a respawn rewrites
+ *  `memberIds` in place.
+ *
+ *  A camp is NEVER owned: `def.half` says which map half it sits in, for
+ *  mirroring and validation only. Its creeps carry `NEUTRAL_TEAM`. */
+export interface CampState {
+  /** Mirrors `def.id`. Dense from 0, stable for the whole match, and equal to
+   *  this camp's index in `World.camps`. */
+  readonly id: number;
+  /** The immutable placement record this camp was built from: the clearing
+   *  centre (`def.x`, `def.z`) that the leash and the bots measure against,
+   *  and the tier that fixes composition, tuning, bounty and respawn time. */
+  readonly def: CampDef;
+  /** Entity ids of the CURRENT generation of this camp's creeps. Rewritten in
+   *  place on every respawn, so an id here may name a dead — or, after a
+   *  respawn, a recycled — entity. `aliveCount`, never `memberIds.length`, is
+   *  the liveness truth. */
+  readonly memberIds: EntId[];
+  /** How many of `memberIds` are still alive. Hits 0 on the tick the last
+   *  creep dies, which is the tick `respawnAtTick` is stamped; set back to
+   *  the tier's composition count when the camp respawns whole. */
+  aliveCount: number;
+  /** Match tick at which the camp respawns, or **-1 while the camp is up**.
+   *  -1 is the only "alive" encoding — 0 is a legal match tick and must not
+   *  be overloaded to mean anything else. */
+  respawnAtTick: number;
+}
+
 // --- The World surface ------------------------------------------------------------
 
 /** Everything T4/T5/T6/T10 may touch. Implementation is T3's; this interface
@@ -131,6 +207,11 @@ export interface World {
   readonly tick: number; // current match tick
   readonly map: MapDef;
   readonly overtime: boolean;
+  /** The live camp table, one entry per `map.terrain.camps` entry, in that
+   *  exact order — so `camps[i].id === i`. Built once at construction and
+   *  never resized. The reference is readonly; the entries are not: only
+   *  `stepCamps` mutates them, everybody else (bots, the room) reads. */
+  readonly camps: CampState[];
   get(id: EntId): Ent | undefined;
   all(): Iterable<Ent>; // every entity, structures included
   mobiles(): Iterable<Ent>; // non-structure entities only
@@ -154,8 +235,13 @@ export interface World {
   /** Spawn a mobile unit; returns its id. 'proj' ents are moved and resolved
    *  by the abilities engine (it owns their payload side table); everything
    *  else moves via movement.ts. owner attributes summons/wards/projs to
-   *  their caster (NO_ENT for wave creeps). */
-  spawnMobile(kind: EntKind, team: TeamId, x: number, z: number, lane: number, expireAtTick: number, owner: EntId): EntId;
+   *  their caster (NO_ENT for wave creeps).
+   *
+   *  `team` is `EntTeam`, not `TeamId`, for exactly one reason: camps spawn
+   *  through this same door with `team = NEUTRAL_TEAM, lane = -1,
+   *  owner = NO_ENT` (TERRAIN_CONTRACT §5). Every existing caller passes a
+   *  `TeamId`, which is assignable unchanged. */
+  spawnMobile(kind: EntKind, team: EntTeam, x: number, z: number, lane: number, expireAtTick: number, owner: EntId): EntId;
   /** Shop + progression (units.ts owns): buy into first free slot (validates
    *  gold + at-fountain), spend a skill point (validates rank caps +
    *  ULT_LEVEL_REQ), use an item (validates charges/cooldown/ward stock AND
@@ -212,8 +298,44 @@ export interface SeatDef {
 // The room (T10) imports those from the implementation modules directly.
 
 // --- Bot seam (T6 consumes, T10 builds) ----------------------------------------------
+
+/** One jungle camp as a bot sees it — the minimum needed to pick a camp and
+ *  know whether it is worth walking to, and deliberately nothing more
+ *  (TERRAIN_CONTRACT §5).
+ *
+ *  Why this and not `CampState`: a bot must not reach the world's mutable
+ *  state, and `memberIds`/`respawnAtTick` would hand it creep identities and
+ *  an exact respawn clock — information no human client receives. Camp
+ *  POSITIONS leak nothing: terrain is a pure function of the lane count and
+ *  every client rebuilds it locally, so both sides already know where every
+ *  clearing is. `up` is coarse camp-timer knowledge of the kind a human
+ *  tracks by watching the clock; it is intentionally NOT vision-gated,
+ *  because a bot that must stand in a clearing to learn it is empty can never
+ *  route a jungle circuit.
+ *
+ *  `id` indexes `World.camps`, so a bot may pass it straight back as an
+ *  identifier for the camp it committed to. */
+export interface CampPercept {
+  /** `CampState.id` — dense from 0, stable for the match. */
+  readonly id: number;
+  /** Tier, which is the danger/reward read: 'pack' is clearable early,
+   *  'hive' is ranged and chip-heavy, 'brute' is the level-6 test. */
+  readonly tier: CampDef['tier'];
+  /** Clearing centre. Attack-move here to engage the camp; the camp's leash
+   *  is measured from this same point, so a bot that walks away disengages. */
+  readonly x: number;
+  readonly z: number;
+  /** True while at least one creep of the camp is alive (`aliveCount > 0`).
+   *  MUTABLE by design: the room keeps ONE `CampPercept` object per camp for
+   *  the whole match and refreshes this field in place each tick, so feeding
+   *  camps to eight bots allocates nothing. A bot reads it and never writes
+   *  it. */
+  up: boolean;
+}
+
 /** The percept is TEAM-VISION-FILTERED: bots see exactly what their team's
- *  human clients see. A bot never gets information a human couldn't have. */
+ *  human clients see. A bot never gets information a human couldn't have.
+ *  (The one documented carve-out is `CampPercept.up` — see above.) */
 export interface BotPercept {
   readonly tick: number;
   readonly phase: Phase;
@@ -223,6 +345,11 @@ export interface BotPercept {
   /** Lane waypoint polylines (team-0 -> team-1 direction; team 1 walks them
    *  reversed) — from the same MapDef the room built. */
   readonly paths: readonly (readonly Vec2[])[];
+  /** Every neutral camp on the map, in `World.camps` order (so index === id).
+   *  A REUSED buffer owned by the room — valid only for this tick, exactly
+   *  like `visible`; never retain it across ticks, and never mutate it. The
+   *  set never changes size mid-match, only each entry's `up`. */
+  readonly camps: readonly CampPercept[];
   readonly wardStock: number;
   readonly atFountain: boolean;
   readonly overtime: boolean;
