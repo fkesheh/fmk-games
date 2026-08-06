@@ -30,18 +30,29 @@
  *
  * SCENE CROSSFADE MODEL — offline-safe, mirrors music.ts's `scheduleLayerGain`.
  *
- * `setScene`/`setBattleIntensity` never touch an `AudioParam` directly and never read
- * `ctx.currentTime`: they only record a pending target. The actual crossfade is scheduled
+ * `setScene`/`setBattleIntensity` never touch an `AudioParam` directly and never read a
+ * clock of their own: they only record a pending target. The actual crossfade is scheduled
  * on the NEXT `tick(nowSec)` call, anchored at the caller's own injected clock — the same
  * clock the render harness pumps from `-preRollS` up through `0` in fixed steps and the
- * live frame loop pumps every frame. `scheduleRamp` below is the generalisation of
- * music.ts's negative-time-safe fade: a crossfade that STARTS before the render's origin
- * (offline pre-roll) lands on its correctly-interpolated value exactly at `t=0` instead of
- * ever scheduling an `AudioParam` call at a negative time (which throws). Because
- * `AMBIENCE.fadeS` (1.4 s) is far shorter than every scene's `preRollS` (>= 2 s, and 6 s for
- * every scene that actually exercises a bed), every crossfade started on the harness's very
- * first tick call is fully settled well before `t=0` — the scene tests measure a bed that
- * has already reached steady state, never one still fading in.
+ * live frame loop pumps every frame. Because `AMBIENCE.fadeS` (1.4 s) is far shorter than
+ * every scene's `preRollS` (>= 2 s, and 6 s for every scene that actually exercises a bed),
+ * every crossfade started on the harness's very first tick call is fully settled well before
+ * `t=0` — the scene tests measure a bed that has already reached steady state.
+ *
+ * Every ramp (scene crossfade, battle-intensity change, and the `stop()` fade-out below) is
+ * scheduled by the same `scheduleRamp` helper, which handles TWO distinct discontinuities
+ * with one mechanism — a `RampState` recording exactly what was last scheduled, and
+ * `rampValueAt` interpolating the TRUE value of that ramp at an arbitrary query time:
+ *   1. Negative `fromSec` (offline pre-roll) — a fade that starts, or wholly completes,
+ *      before the render's `t=0` origin lands directly on its correctly-interpolated (or
+ *      final) value AT `0`, never scheduling an `AudioParam` call at a negative time (which
+ *      throws).
+ *   2. A ramp interrupted by another before it finishes (reachable via rapid
+ *      `setScene`/`setBattleIntensity` in live play) — the new ramp's start value is read
+ *      from `rampValueAt(prevRamp, fromSec)`, the actual interpolated position of the
+ *      in-flight ramp at the moment it is interrupted, not the value it was headed toward.
+ *      Anchoring on the requested target instead of the true current value is exactly the
+ *      class of bug that produces an audible jump when two fades collide.
  *
  * THE GUST LFO IS A NATIVE NODE, NOT A TICK-DRIVEN AUTOMATION LOOP. AUDIO_CONTRACT.md's
  * hard rules permit either "scheduled AudioParam automation OR LFO nodes" for continuous
@@ -49,10 +60,11 @@
  * pure function of context time with zero drift between the live frame loop's ~16 ms ticks
  * and the offline harness's fixed 250 ms pump step, which a hand-rolled tick-sampled sine
  * would not guarantee bit-for-bit without extra bookkeeping this bed does not need. `tick()`
- * therefore has nothing to do to keep the gust itself moving; it is used for the two things
- * that generally DO need the injected clock: applying pending scene/intensity crossfades
- * and walking the two sparse discrete-grain schedulers (battle, dead-pulse) via the same
- * look-ahead-with-a-monotonic-pointer pattern `music.ts` uses for its percussion layer.
+ * therefore has nothing to do to keep the gust itself moving; it is used for the three
+ * things that generally DO need the injected clock: applying pending scene/intensity
+ * crossfades, walking the two sparse discrete-grain schedulers (battle, dead-pulse) via the
+ * same look-ahead-with-a-monotonic-pointer pattern `music.ts` uses for its percussion layer,
+ * and recording `lastNowSec` so `stop()` has a clock to anchor its own fade-out on.
  *
  * LOOP-SEAM AVOIDANCE. The shared noise buffer (`g.noise`) is exactly 1 second and looped
  * (`AudioBufferSourceNode.loop = true`) per T0's contract — fine for a one-shot cue whose
@@ -62,6 +74,20 @@
  * (+/-8%); with three different periods no single click repeats at one obvious period, and
  * the shared lowpass (topping out at `AMBIENCE.windCutoffHz.max`, 480 Hz) removes most of
  * the broadband energy any residual discontinuity would carry.
+ *
+ * `stop()` — click-free and offline-safe. Every continuous source (the three wind voices,
+ * the gust LFO, the drone, both fountain oscillators) is left RUNNING and CONNECTED through
+ * a short `STOP_FADE_S` fade-to-zero on the same per-layer gain nodes the scene crossfade
+ * uses (via `scheduleRamp`, so an in-flight scene fade is interrupted correctly rather than
+ * jumped from the wrong value — see point 2 above). Only once that fade completes are the
+ * sources' own `.stop(atTime)` calls scheduled, and only their `onended` handlers — fired by
+ * the audio graph itself once playback actually reaches that time, never a `setInterval` or
+ * `setTimeout` — perform the disconnects. `stop()` never reads `ctx.currentTime`: its fade
+ * is anchored on `lastNowSec`, the last value `tick()` was actually given, for the same
+ * reason `setScene`/`setBattleIntensity` are — under `OfflineAudioContext`, `currentTime`
+ * stays pinned at 0 until `startRendering()` resolves, so anchoring on it would schedule
+ * every stop at time 0, silencing the bed before it ever renders and turning a real bug into
+ * a passing (silent) render.
  *
  * Every continuous node (the wind voices, the gust LFO, the drone, the fountain hum) is
  * built once and `start(0)`'d in the factory body — always a literal `0`, never a negative
@@ -108,6 +134,10 @@ const PULSE_MEAN_INTERVAL_S = 2.6;
 /** Smoothing time for `setBattleIntensity` ramps — independent of the scene crossfade. */
 const BATTLE_INTENSITY_RAMP_S = 0.6;
 
+/** `stop()`'s own fade-to-zero — short and decisive ("stop dead"), just long enough that
+ * cutting the underlying oscillators once it completes is never a sample-domain click. */
+const STOP_FADE_S = 0.06;
+
 function clamp01(v: number): number {
   return v < 0 ? 0 : v > 1 ? 1 : v;
 }
@@ -116,25 +146,52 @@ function makeEnv(attack: number, decay: number, sustain: number, release: number
   return { attack, decay, sustain, release, peak };
 }
 
+/** A linear ramp actually scheduled on an `AudioParam`: where it starts, where it ends, and
+ * the value at each end. Kept so a LATER ramp can read the TRUE current value instead of
+ * assuming this one already reached its target. */
+interface RampState {
+  readonly fromSec: number;
+  readonly fromValue: number;
+  readonly toSec: number;
+  readonly toValue: number;
+}
+
+/** The true value of a linear ramp at an arbitrary query time, clamped to the ramp's own
+ * endpoints (before it starts = `fromValue`; after it ends = `toValue`). */
+function rampValueAt(ramp: RampState, atSec: number): number {
+  if (atSec <= ramp.fromSec) return ramp.fromValue;
+  if (atSec >= ramp.toSec) return ramp.toValue;
+  const span = ramp.toSec - ramp.fromSec;
+  const t = (atSec - ramp.fromSec) / span;
+  return ramp.fromValue + (ramp.toValue - ramp.fromValue) * t;
+}
+
 /**
- * Generic linear ramp on an `AudioParam`, safe to start at a negative `fromSec` (offline
- * pre-roll). A fade that starts, or wholly completes, before the render's `t=0` origin
- * lands directly on its correctly-interpolated (or final) value AT `0` rather than ever
- * scheduling an automation call at a negative time, which throws. Mirrors music.ts's
- * `scheduleLayerGain`, generalised to an arbitrary (not just binary 0/1) `fromValue`.
+ * Schedule (or re-target) a linear ramp on `param`, safe against two distinct
+ * discontinuities — see the module doc comment for both:
+ *   - `fromSec < 0` (offline pre-roll): lands directly on the correctly-interpolated value
+ *     at `t=0` rather than ever scheduling an automation call at a negative time.
+ *   - `prev !== null` (this ramp interrupts one still in flight): the actual start value is
+ *     read from `rampValueAt(prev, fromSec)` — the in-flight ramp's TRUE position at the
+ *     moment of interruption — not `fallbackFromValue`, which is only used when there is no
+ *     ramp in flight at all (the very first call for a given param).
+ * Returns the `RampState` now actually scheduled, for the next call (or interruption) to
+ * read back.
  */
 function scheduleRamp(
   param: AudioParam,
+  prev: RampState | null,
   fromSec: number,
-  fromValue: number,
   toValue: number,
   fadeS: number,
-): void {
+  fallbackFromValue: number,
+): RampState {
+  const fromValue = prev ? rampValueAt(prev, fromSec) : fallbackFromValue;
   const endSec = fromSec + fadeS;
   if (endSec <= 0) {
     param.cancelScheduledValues(0);
     param.setValueAtTime(toValue, 0);
-    return;
+    return { fromSec: 0, fromValue: toValue, toSec: 0, toValue };
   }
   if (fromSec < 0) {
     const elapsed = clamp01((0 - fromSec) / fadeS);
@@ -142,11 +199,12 @@ function scheduleRamp(
     param.cancelScheduledValues(0);
     param.setValueAtTime(valueAtZero, 0);
     param.linearRampToValueAtTime(toValue, endSec);
-    return;
+    return { fromSec: 0, fromValue: valueAtZero, toSec: endSec, toValue };
   }
   param.cancelScheduledValues(fromSec);
   param.setValueAtTime(fromValue, fromSec);
   param.linearRampToValueAtTime(toValue, endSec);
+  return { fromSec, fromValue, toSec: endSec, toValue };
 }
 
 /** One "distant battle" grain: a short, bandpassed noise burst well under `INFO_FLOOR_HZ`,
@@ -190,7 +248,8 @@ export const createAmbience: CreateAmbience = (g) => {
   const ctx = g.ctx;
 
   // -------------------------------------------------------------------------------------
-  // Per-layer gain nodes. These are the ONLY nodes a scene crossfade ever touches.
+  // Per-layer gain nodes. These are the ONLY nodes a scene crossfade (or the stop fade)
+  // ever ramps; everything else stays connected and running underneath them.
   // -------------------------------------------------------------------------------------
   const layerGain: Record<Layer, GainNode> = {
     wind: ctx.createGain(),
@@ -233,6 +292,7 @@ export const createAmbience: CreateAmbience = (g) => {
 
   const WIND_VOICES = 3;
   const windSources: AudioBufferSourceNode[] = [];
+  const windVoiceTrims: GainNode[] = [];
   for (let i = 0; i < WIND_VOICES; i++) {
     const src = ctx.createBufferSource();
     src.buffer = g.noise;
@@ -248,6 +308,7 @@ export const createAmbience: CreateAmbience = (g) => {
     voiceTrim.connect(windFilter);
     src.start(0);
     windSources.push(src);
+    windVoiceTrims.push(voiceTrim);
   }
 
   // -------------------------------------------------------------------------------------
@@ -290,34 +351,51 @@ export const createAmbience: CreateAmbience = (g) => {
 
   // -------------------------------------------------------------------------------------
   // Scene / intensity state. `setScene`/`setBattleIntensity` only record intent; `tick`
-  // (given the injected clock) performs the actual offline-safe scheduling.
+  // (given the injected clock) performs the actual offline-safe, interruption-safe
+  // scheduling. `layerRamp`/`battleRamp` double as "what did we last ask for" (via
+  // `.toValue`) AND "what is actually in flight right now" (for `rampValueAt`).
   // -------------------------------------------------------------------------------------
   let currentScene: AmbienceScene = 'silent';
   let pendingScene: AmbienceScene | null = null;
-  const currentTarget: Record<Layer, number> = {
-    wind: 0,
-    drone: 0,
-    battle: 0,
-    fountain: 0,
-    pulse: 0,
+  const layerRamp: Record<Layer, RampState | null> = {
+    wind: null,
+    drone: null,
+    battle: null,
+    fountain: null,
+    pulse: null,
   };
 
-  let currentBattleLinear = db(AMBIENCE.battleDb.min);
+  let battleRamp: RampState | null = null;
   let pendingBattleIntensity: number | null = null;
 
   let nextBattleSec: number | null = null;
   let nextPulseSec: number | null = null;
 
+  let lastNowSec = 0;
   let stopped = false;
+
+  function currentLayerValue(layer: Layer): number {
+    return layerRamp[layer]?.toValue ?? 0;
+  }
+
+  function currentBattleValue(): number {
+    return battleRamp?.toValue ?? db(AMBIENCE.battleDb.min);
+  }
 
   function applyScene(nowSec: number): void {
     if (pendingScene === null) return;
     const targets = SCENE_LAYERS[pendingScene];
     for (const layer of ALL_LAYERS) {
       const to = targets[layer];
-      if (to !== currentTarget[layer]) {
-        scheduleRamp(layerGain[layer].gain, nowSec, currentTarget[layer], to, AMBIENCE.fadeS);
-        currentTarget[layer] = to;
+      if (to !== currentLayerValue(layer)) {
+        layerRamp[layer] = scheduleRamp(
+          layerGain[layer].gain,
+          layerRamp[layer],
+          nowSec,
+          to,
+          AMBIENCE.fadeS,
+          currentLayerValue(layer),
+        );
       }
     }
     currentScene = pendingScene;
@@ -330,21 +408,30 @@ export const createAmbience: CreateAmbience = (g) => {
     const targetDb =
       AMBIENCE.battleDb.min + (AMBIENCE.battleDb.max - AMBIENCE.battleDb.min) * clamped;
     const targetLinear = db(targetDb);
-    scheduleRamp(battleLevel.gain, nowSec, currentBattleLinear, targetLinear, BATTLE_INTENSITY_RAMP_S);
-    currentBattleLinear = targetLinear;
+    battleRamp = scheduleRamp(
+      battleLevel.gain,
+      battleRamp,
+      nowSec,
+      targetLinear,
+      BATTLE_INTENSITY_RAMP_S,
+      currentBattleValue(),
+    );
     pendingBattleIntensity = null;
   }
 
   /** Sparse look-ahead grain walk shared in shape by both discrete layers below: advance a
-   * monotonic pointer, never revisit an index, never schedule a negative-time grain, and
-   * reset the pointer whenever the layer goes inactive so re-activation starts a fresh
-   * schedule instead of bursting through a backlog of stale catch-up grains. */
+   * monotonic pointer — through negative pre-roll time too, exactly like music.ts's
+   * `nextEighth`, so the first post-activation grain lands at a naturally jittered offset
+   * rather than deterministically snapped to `t=0` — never revisit an index, never
+   * synthesise a negative-time grain, and reset the pointer whenever the layer goes
+   * inactive so re-activation starts a fresh schedule instead of bursting through a
+   * backlog of stale catch-up grains. */
   function runBattleGrains(nowSec: number): void {
     if (SCENE_LAYERS[currentScene].battle !== 1) {
       nextBattleSec = null;
       return;
     }
-    let cursor = nextBattleSec ?? Math.max(0, nowSec);
+    let cursor = nextBattleSec ?? nowSec;
     const horizon = nowSec + LOOKAHEAD_S;
     while (cursor < horizon) {
       const at = cursor;
@@ -359,7 +446,7 @@ export const createAmbience: CreateAmbience = (g) => {
       nextPulseSec = null;
       return;
     }
-    let cursor = nextPulseSec ?? Math.max(0, nowSec);
+    let cursor = nextPulseSec ?? nowSec;
     const horizon = nowSec + LOOKAHEAD_S;
     while (cursor < horizon) {
       const at = cursor;
@@ -380,6 +467,7 @@ export const createAmbience: CreateAmbience = (g) => {
 
     tick(nowSec) {
       if (stopped) return;
+      lastNowSec = nowSec;
       applyScene(nowSec);
       applyBattleIntensity(nowSec);
       runBattleGrains(nowSec);
@@ -389,30 +477,61 @@ export const createAmbience: CreateAmbience = (g) => {
     stop() {
       if (stopped) return;
       stopped = true;
-      // A one-off "silence everything now" teardown, not a wall-clock-driven synthesis
-      // decision — reading `ctx.currentTime` here mirrors engine.ts's own `rampParam`.
+
+      // Anchor on the injected clock's last known value, never `ctx.currentTime` — under
+      // `OfflineAudioContext` the latter stays pinned at 0 until `startRendering()`
+      // resolves, which would schedule every stop at time 0 and silence the bed before it
+      // ever renders (a silent render that still exits 0). `scheduleRamp` here reuses the
+      // exact same interruption-safe machinery the scene crossfade uses, so a `stop()`
+      // that lands mid-crossfade fades from the TRUE current level, not a stale target.
+      const at = lastNowSec;
+      for (const layer of ALL_LAYERS) {
+        layerRamp[layer] = scheduleRamp(
+          layerGain[layer].gain,
+          layerRamp[layer],
+          at,
+          0,
+          STOP_FADE_S,
+          currentLayerValue(layer),
+        );
+      }
+      battleRamp = scheduleRamp(battleLevel.gain, battleRamp, at, 0, STOP_FADE_S, currentBattleValue());
+
+      // Every continuous source keeps running, connected, THROUGH the fade above — only
+      // once it completes do the sources actually stop, and only their own `onended`
+      // (fired by the audio graph itself, never a timer) tears down the graph. Disconnecting
+      // anything synchronously here would truncate the signal before the fade reaches
+      // silence, reproducing exactly the click this fix removes.
+      const stopAt = at + STOP_FADE_S;
       try {
-        const now = ctx.currentTime;
-        for (const src of windSources) src.stop(now);
-        windLfo.stop(now);
-        droneOsc.stop(now);
-        fountainOscA.stop(now);
-        fountainOscB.stop(now);
+        for (const src of windSources) src.stop(stopAt);
+        windLfo.stop(stopAt);
+        droneOsc.stop(stopAt);
+        fountainOscA.stop(stopAt);
+        fountainOscB.stop(stopAt);
       } catch {
         // Already stopped/ended — degrade silently per the repo-wide audio law.
       }
-      for (const src of windSources) src.disconnect();
-      windLfo.disconnect();
-      windLfoGain.disconnect();
-      windFilter.disconnect();
-      windTrim.disconnect();
-      droneOsc.disconnect();
-      droneTrim.disconnect();
-      fountainOscA.disconnect();
-      fountainOscB.disconnect();
-      fountainTrim.disconnect();
-      battleLevel.disconnect();
-      for (const layer of ALL_LAYERS) layerGain[layer].disconnect();
+
+      windLfo.onended = () => {
+        try {
+          for (const src of windSources) src.disconnect();
+          for (const trim of windVoiceTrims) trim.disconnect();
+          windLfo.disconnect();
+          windLfoGain.disconnect();
+          windFilter.disconnect();
+          windTrim.disconnect();
+          droneOsc.disconnect();
+          droneTrim.disconnect();
+          fountainOscA.disconnect();
+          fountainOscB.disconnect();
+          fountainTrim.disconnect();
+          battleLevel.disconnect();
+          for (const layer of ALL_LAYERS) layerGain[layer].disconnect();
+        } catch {
+          // Disconnecting an already-disconnected node is a spec no-op; guard anyway.
+        }
+      };
     },
   };
 
