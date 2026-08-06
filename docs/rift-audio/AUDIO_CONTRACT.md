@@ -39,6 +39,18 @@ Where a rule looks oddly specific, that is why — do not "simplify" it.*
    visual build. Derive with the documented ratios (`MINOR_STEPS`, `INTERVAL`, `METAL_RATIOS`) when
    you need a pitch that is not literally in the table. `MINOR_STEPS` is 12-TET, matching the
    `PALETTE` tables to within 1 cent — the two are one tuning system, deliberately.
+
+   **Ruling (post-fan-out, after four authors read this four different ways):** the rule governs
+   PITCH — anything a listener hears as a note, including oscillator frequencies, ring-mod carriers,
+   and any tone whose interval carries meaning. It does NOT govern filter cutoffs, noise band
+   centres, or sweep endpoints: those are *timbre placement*, and the bible specifies them as ranges
+   ("physical: band-passed 300–2000 Hz"), not as palette members. A bare literal is therefore legal
+   for `filterHz` / `bandHz` / `sweepHz` / `openHz`, and illegal for a pitch. Pulling filter corners
+   from `PALETTE` is still welcome where it reads naturally — it is simply not required.
+
+   The one hard constraint that survives regardless: a sustained band centre in a non-`ui`/`ann` cue
+   must sit below `INFO_FLOOR_HZ`. Timbre freedom does not license squatting in the reserved
+   information register.
 10. **Only `info`-register cues may put meaningful energy above `INFO_FLOOR_HZ` (800 Hz).** That
     register is reserved for information: last-hit, level-up, skill point, cooldown ready, purchase,
     error, announcer. "Meaningful" is `INFO_BAND_MAX_PCT` (8 % of total energy above 800 Hz) and the

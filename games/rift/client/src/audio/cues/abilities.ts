@@ -547,6 +547,9 @@ const hexBlink: CueFn = (g, at, p) => {
     modHz: hz(40, g, 0.15),
     index: 140,
     tailHz: 560,
+    filterHz: 560,
+    sweepHz: 220,
+    sweepTime: 0.18,
     env: env(0.006, 0.08, 0.15, 0.12),
   }, lvl(g, p, -14));
 };

@@ -673,7 +673,9 @@ export const COMBAT_CUES = {
     fn: hitSelf,
     bus: 'sfx',
     priority: 3,
-    tail: 0.16,
+    // Real synthesis end: thump 0.005+0.06+0.11=0.175s; noise layer (offset <=0.008s late)
+    // 0.008+0.006+0.07+0.1=0.184s. Declare the honest worst case with a small margin.
+    tail: 0.19,
     variants: VARY.roundRobin,
     dry: false,
   },

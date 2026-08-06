@@ -67,6 +67,38 @@ interface DuckState {
   untilTime: number;
   /** dB depth of the currently scheduled duck (more negative = deeper). */
   depthDb: number;
+  /** Absolute ctx time the current envelope's attack phase began. */
+  attackStartTime: number;
+  /** Gain value at `attackStartTime` — the base the attack ramp climbs/falls from. */
+  attackStartValue: number;
+  /** Absolute ctx time the attack phase ends and the release phase begins. */
+  attackEnd: number;
+}
+
+/**
+ * Reconstructs the gain value the duck envelope described by `state` would hold at time
+ * `t`, without touching the AudioParam. Needed because `AudioParam.value` only reflects the
+ * PRESENT instant, never a future scheduled point — and Firefox has no
+ * `cancelAndHoldAtTime` to ask the param itself. Mirrors the exact linear-attack /
+ * exponential-release shape `triggerDuck` schedules below.
+ */
+function evalDuckValue(state: DuckState, t: number): number {
+  if (t <= state.attackStartTime) return state.attackStartValue;
+  const target = db(state.depthDb);
+  if (t < state.attackEnd) {
+    const span = state.attackEnd - state.attackStartTime;
+    if (span <= 0) return target;
+    const frac = (t - state.attackStartTime) / span;
+    return state.attackStartValue + (target - state.attackStartValue) * frac;
+  }
+  if (t < state.untilTime) {
+    const span = state.untilTime - state.attackEnd;
+    if (span <= 0) return 1;
+    const frac = (t - state.attackEnd) / span;
+    // Matches WebAudio's exponentialRampToValueAtTime interpolation: v0 * (v1/v0)^frac.
+    return target * (1 / target) ** frac;
+  }
+  return 1;
 }
 
 function rampParam(ctx: BaseAudioContext, param: AudioParam, target: number): void {
@@ -108,9 +140,9 @@ export const createEngine: CreateEngine = (
     sfx: ctx.createGain(),
   };
   const duckState: Record<DuckBus, DuckState> = {
-    music: { untilTime: -Infinity, depthDb: 0 },
-    amb: { untilTime: -Infinity, depthDb: 0 },
-    sfx: { untilTime: -Infinity, depthDb: 0 },
+    music: { untilTime: -Infinity, depthDb: 0, attackStartTime: -Infinity, attackStartValue: 1, attackEnd: -Infinity },
+    amb: { untilTime: -Infinity, depthDb: 0, attackStartTime: -Infinity, attackStartValue: 1, attackEnd: -Infinity },
+    sfx: { untilTime: -Infinity, depthDb: 0, attackStartTime: -Infinity, attackStartValue: 1, attackEnd: -Infinity },
   };
 
   const preMaster = ctx.createDynamicsCompressor();
@@ -201,23 +233,42 @@ export const createEngine: CreateEngine = (
       const releaseEnd = attackEnd + tail + DUCK.releasePadS;
 
       if (at >= state.untilTime) {
-        // No overlap with a still-active duck — schedule a fresh envelope.
+        // No overlap with a still-active duck — schedule a fresh envelope from unity.
         node.gain.cancelScheduledValues(at);
         node.gain.setValueAtTime(1, at);
         node.gain.linearRampToValueAtTime(db(depthDb), attackEnd);
         node.gain.exponentialRampToValueAtTime(1, releaseEnd);
         state.untilTime = releaseEnd;
         state.depthDb = depthDb;
+        state.attackStartTime = at;
+        state.attackStartValue = 1;
+        state.attackEnd = attackEnd;
       } else {
         // Overlapping duck: hold the current value (no stacking), move to whichever depth
         // is deeper, and extend the release to whichever end is later.
-        node.gain.cancelAndHoldAtTime(at);
+        //
+        // `cancelAndHoldAtTime` is unimplemented in Firefox — it throws there, and the
+        // outer try/catch's never-throw rule would otherwise swallow the whole branch,
+        // silently dropping every overlapping duck on that engine. Feature-detect it and
+        // fall back to computing the held value ourselves from `state` (never from
+        // `node.gain.value`, which only reflects the current instant, not the value the
+        // still-running ramp would reach at a future `at`).
+        const heldValue = evalDuckValue(state, at);
+        if (typeof node.gain.cancelAndHoldAtTime === 'function') {
+          node.gain.cancelAndHoldAtTime(at);
+        } else {
+          node.gain.cancelScheduledValues(at);
+          node.gain.setValueAtTime(heldValue, at);
+        }
         const deeperDb = Math.min(state.depthDb, depthDb);
         node.gain.linearRampToValueAtTime(db(deeperDb), attackEnd);
         const newUntil = Math.max(state.untilTime, releaseEnd);
         node.gain.exponentialRampToValueAtTime(1, newUntil);
         state.untilTime = newUntil;
         state.depthDb = deeperDb;
+        state.attackStartTime = at;
+        state.attackStartValue = heldValue;
+        state.attackEnd = attackEnd;
       }
     } catch {
       // never throw — a failed duck just means the bed stays at its current level.
@@ -243,17 +294,21 @@ export const createEngine: CreateEngine = (
   function stealVoice(idx: number): void {
     const v = voices[idx];
     if (v === undefined) return;
-    voices.splice(idx, 1);
     try {
       const now = ctx.currentTime;
       v.gain.gain.cancelScheduledValues(now);
       v.gain.gain.setValueAtTime(v.gain.gain.value, now);
       v.gain.gain.linearRampToValueAtTime(0, now + STEAL_FADE_S);
+      // Only shorten the deadline and move the voice out of the capped pool once the
+      // silence-ramp is actually scheduled. If any call above threw, `v` stays in `voices`
+      // at its original endTime — still counted against POLYPHONY_CAP and still sweepable
+      // by tick() — rather than leaking a full-volume, uncounted voice indefinitely.
       v.endTime = now + STEAL_FADE_S;
+      voices.splice(idx, 1);
+      fading.push(v);
     } catch {
-      // Fall through — it still gets swept and disconnected below, just without a fade.
+      // never throw — the voice simply isn't stolen this time.
     }
-    fading.push(v);
   }
 
   function sweep(list: Voice[]): void {
