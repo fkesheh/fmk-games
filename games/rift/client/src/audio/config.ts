@@ -117,7 +117,7 @@ export const LIMIT_CEILING_DB = -2.0;
 export const TRUE_PEAK_GATE_DBTP = -1.0;
 
 /** Master gain at settings.master === 1. Leaves headroom for the sum of busses. */
-export const MASTER_TRIM_DB = -3;
+export const MASTER_TRIM_DB = -4.5;
 
 // ---------------------------------------------------------------------------
 // 3. Priority and ducking. SONIC_BIBLE §8.

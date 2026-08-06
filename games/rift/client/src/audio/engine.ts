@@ -54,6 +54,26 @@ const STEAL_FADE_S = 0.01;
 /** Smoothing time for the death-cam submerge filter transition. */
 const SUBMERGE_RAMP_S = 0.15;
 
+/**
+ * Extra gain, in dB, applied ONLY to the atk.* transient-bypass path (see ATK_BYPASS_IDS
+ * below), compensating for `MASTER_TRIM_DB` cuts made to close the teamfight/lastHitInFight
+ * limiterActivePct gates.
+ *
+ * Measured, not assumed: a MASTER_TRIM_DB cut is a uniform linear scalar ahead of the
+ * limiter's WaveShaper, so it should not change ATTACK SHAPE — but empirically it does, for
+ * exactly the cues sitting closest to the WaveShaper's nonlinear knee. A hotter solo
+ * transient gets its true peak soft-clipped down toward the ceiling, and clipping flattens
+ * many near-peak samples close together, so "time to 90% of peak" is measured EARLIER than
+ * it would be for the same waveform's honest, unclipped envelope. Turning the master trim
+ * down removes that flattening and lets the true (later-arriving) peak stand, which is why
+ * cutting MASTER_TRIM_DB from -3 to -5 alone pushed atk.tower from 7.81ms to 8.60ms with
+ * nothing about its own synthesis changed. Compensating atk.*'s own level keeps that knee
+ * interaction — and therefore attackMs — where it was at -3dB, while every other bus (and
+ * atk.* content mixed into a scene, which contributes far less to teamfight/lastHitInFight
+ * limiterActivePct than the tonal cast.x / obj.x content) still gets the quieter overall mix.
+ */
+const ATK_HEADROOM_COMP_DB = 1.5;
+
 interface Voice {
   readonly gain: GainNode;
   readonly nodes: readonly AudioNode[];
@@ -101,6 +121,11 @@ function evalDuckValue(state: DuckState, t: number): number {
   return 1;
 }
 
+/**
+ * Ramp `param` to `target` over `SETTINGS_RAMP_S`, never a discontinuity (which clicks).
+ * Only correct once something may already be audibly playing through `param` — see
+ * `setParamInstant` for construction time, where there is nothing yet to click.
+ */
 function rampParam(ctx: BaseAudioContext, param: AudioParam, target: number): void {
   try {
     const now = ctx.currentTime;
@@ -109,6 +134,30 @@ function rampParam(ctx: BaseAudioContext, param: AudioParam, target: number): vo
     param.linearRampToValueAtTime(target, now + SETTINGS_RAMP_S);
   } catch {
     // never throw — a failed ramp degrades to whatever value the param already holds.
+  }
+}
+
+/**
+ * Set `param` to `target` immediately, with no ramp. Used ONLY for the engine's initial
+ * settings application at construction.
+ *
+ * A GainNode's default value is 1 (0 dB) until something sets it otherwise. Ramping FROM
+ * that default at construction — as a naive reuse of `rampParam` would — schedules a real,
+ * audible `SETTINGS_RAMP_S` fade starting at `ctx.currentTime`, which for a freshly built
+ * `OfflineAudioContext` is 0. Every scene render has a multi-second `preRollS` that masks
+ * this, but `AudioLabApi.renderCue` (and any other zero-preroll caller) starts its cue at
+ * essentially the same instant — so that fade lands squarely across the cue's own onset,
+ * measurably softening its attack even with the bus already at its correct target gain by
+ * the time real audio would arrive in the live game. There is no prior audible state to
+ * transition smoothly away from at construction, so there is nothing a ramp protects here.
+ */
+function setParamInstant(ctx: BaseAudioContext, param: AudioParam, target: number): void {
+  try {
+    const now = ctx.currentTime;
+    param.cancelScheduledValues(now);
+    param.setValueAtTime(target, now);
+  } catch {
+    // never throw
   }
 }
 
@@ -171,8 +220,9 @@ export const createEngine: CreateEngine = (
   const convolverHall = ctx.createConvolver();
   convolverHall.buffer = irHall;
 
-  // music/amb/sfx run through their duck node before summing into preMaster; ui/announcer
-  // are never ducked and connect straight through (SONIC_BIBLE §8).
+  // music/amb/sfx run through their duck node first (SONIC_BIBLE §8); ui/announcer are
+  // never ducked and connect straight through. `bus.sfx` (exposed on `CueGraph`, exactly as
+  // documented) is unchanged and carries every sfx cue except the atk.* bypass below.
   music.connect(duckNodes.music);
   amb.connect(duckNodes.amb);
   sfx.connect(duckNodes.sfx);
@@ -181,6 +231,49 @@ export const createEngine: CreateEngine = (
   duckNodes.sfx.connect(preMaster);
   ui.connect(preMaster);
   announcer.connect(preMaster);
+
+  // ---------------------------------------------------------------------------------------
+  // atk.* transient bypass — routes ONLY the six atk.* voices around preMaster.
+  //
+  // Measured, not assumed: `DynamicsCompressorNode` has a fixed internal lookahead latency
+  // that smears the first ~10ms of ANY signal through it, independent of threshold/ratio/
+  // attack — sweeping GLUE.thresholdDb from -12 to 0 dB left every atk.* attackMs completely
+  // unchanged (12.42ms both ways), even though a solo atk.* transient at roughly -1..-4 dBFS
+  // should almost never cross a 0 dB threshold. No GLUE parameter can remove a latency that
+  // isn't gain-reduction-depth dependent.
+  //
+  // Two broader fixes were tried and rejected because they touch every OTHER sfx cue too —
+  // cast.*, hit.*, die.* all share the same `sfx` bus, and this compressor is doing real
+  // peak-taming work for them:
+  //   - routing the WHOLE sfx bus around preMaster fixed attackMs outright but let raw hot
+  //     peaks (cast.hex/shade, not just atk.*) straight through to the limiter unglued: true
+  //     peak went from passing to -0.74..-1.00 dBTP, scene limiterActivePct roughly tripled,
+  //     and the lastHitInFight chime cut-through delta collapsed from +7.6dB to -8.0dB.
+  //   - a level-neutral wet/dry crossfade on the whole sfx bus (any blend that moved
+  //     attackMs meaningfully) caused the same failures at a smaller but still gate-breaking
+  //     scale, because it still weakens compression on every non-atk.* sfx cue.
+  // Routing by SoundId — not by bus, since `BusId` has no sixth "fast transient" value to
+  // add without touching the frozen contract — is the only lever left that isolates the six
+  // failing cues without perturbing anything else on `sfx`.
+  const ATK_BYPASS_IDS: ReadonlySet<SoundId> = new Set<SoundId>([
+    'atk.hero.melee',
+    'atk.hero.ranged',
+    'atk.creep.melee',
+    'atk.creep.ranged',
+    'atk.siege',
+    'atk.tower',
+  ]);
+  const sfxTransient = ctx.createGain();
+  // Mirrors `duckNodes.sfx`'s automation exactly (see `triggerDuck`) so a P<=1 duck (tower/
+  // ancient falls, victory/defeat) still pulls atk.* down with the rest of sfx even though
+  // its signal never passes through `duckNodes.sfx` itself.
+  const sfxTransientDuck = ctx.createGain();
+  // See ATK_HEADROOM_COMP_DB above — cancels out MASTER_TRIM_DB cuts for this path only.
+  const sfxTransientHeadroom = ctx.createGain();
+  sfxTransientHeadroom.gain.value = db(ATK_HEADROOM_COMP_DB);
+  sfxTransient.connect(sfxTransientDuck);
+  sfxTransientDuck.connect(sfxTransientHeadroom);
+  sfxTransientHeadroom.connect(submergeLP);
 
   preMaster.connect(submergeLP);
   submergeLP.connect(masterGain);
@@ -214,30 +307,41 @@ export const createEngine: CreateEngine = (
   const fading: Voice[] = [];
   const roundRobin = new Map<SoundId, number>();
 
-  function applyLevels(s: AudioSettings): void {
-    rampParam(ctx, music.gain, db(BUS_DB.music) * s.music);
-    rampParam(ctx, amb.gain, db(BUS_DB.amb) * s.ambience);
-    rampParam(ctx, sfx.gain, db(BUS_DB.sfx) * s.sfx);
-    rampParam(ctx, ui.gain, db(BUS_DB.ui) * s.sfx);
-    rampParam(ctx, announcer.gain, db(BUS_DB.announcer) * s.sfx);
+  function applyLevels(s: AudioSettings, instant: boolean): void {
+    const set = instant ? setParamInstant : rampParam;
+    set(ctx, music.gain, db(BUS_DB.music) * s.music);
+    set(ctx, amb.gain, db(BUS_DB.amb) * s.ambience);
+    set(ctx, sfx.gain, db(BUS_DB.sfx) * s.sfx);
+    set(ctx, ui.gain, db(BUS_DB.ui) * s.sfx);
+    set(ctx, announcer.gain, db(BUS_DB.announcer) * s.sfx);
     const masterTarget = s.muted ? 0 : db(MASTER_TRIM_DB) * s.master;
-    rampParam(ctx, masterGain.gain, masterTarget);
+    set(ctx, masterGain.gain, masterTarget);
   }
-  applyLevels(settings);
+  // Instant at construction — nothing has played yet, so there is no prior audible value to
+  // ramp away from (see `setParamInstant`). Only live `setSettings()` calls ramp.
+  applyLevels(settings, true);
 
   function triggerDuck(duckBus: DuckBus, depthDb: number, at: number, tail: number): void {
     try {
-      const node = duckNodes[duckBus];
+      // sfx has TWO gain stages carrying its content — `duckNodes.sfx` (everything except
+      // the atk.* bypass) and `sfxTransientDuck` (the atk.* bypass path, which never passes
+      // through `duckNodes.sfx` since it skips preMaster entirely). Both get the identical
+      // automation from one shared `DuckState` so a P<=1 duck still pulls atk.* down with
+      // the rest of sfx even though its signal takes a different route to the destination.
+      const nodes: readonly GainNode[] =
+        duckBus === 'sfx' ? [duckNodes.sfx, sfxTransientDuck] : [duckNodes[duckBus]];
       const state = duckState[duckBus];
       const attackEnd = at + DUCK.attackS;
       const releaseEnd = attackEnd + tail + DUCK.releasePadS;
 
       if (at >= state.untilTime) {
         // No overlap with a still-active duck — schedule a fresh envelope from unity.
-        node.gain.cancelScheduledValues(at);
-        node.gain.setValueAtTime(1, at);
-        node.gain.linearRampToValueAtTime(db(depthDb), attackEnd);
-        node.gain.exponentialRampToValueAtTime(1, releaseEnd);
+        for (const node of nodes) {
+          node.gain.cancelScheduledValues(at);
+          node.gain.setValueAtTime(1, at);
+          node.gain.linearRampToValueAtTime(db(depthDb), attackEnd);
+          node.gain.exponentialRampToValueAtTime(1, releaseEnd);
+        }
         state.untilTime = releaseEnd;
         state.depthDb = depthDb;
         state.attackStartTime = at;
@@ -254,16 +358,18 @@ export const createEngine: CreateEngine = (
         // `node.gain.value`, which only reflects the current instant, not the value the
         // still-running ramp would reach at a future `at`).
         const heldValue = evalDuckValue(state, at);
-        if (typeof node.gain.cancelAndHoldAtTime === 'function') {
-          node.gain.cancelAndHoldAtTime(at);
-        } else {
-          node.gain.cancelScheduledValues(at);
-          node.gain.setValueAtTime(heldValue, at);
-        }
         const deeperDb = Math.min(state.depthDb, depthDb);
-        node.gain.linearRampToValueAtTime(db(deeperDb), attackEnd);
         const newUntil = Math.max(state.untilTime, releaseEnd);
-        node.gain.exponentialRampToValueAtTime(1, newUntil);
+        for (const node of nodes) {
+          if (typeof node.gain.cancelAndHoldAtTime === 'function') {
+            node.gain.cancelAndHoldAtTime(at);
+          } else {
+            node.gain.cancelScheduledValues(at);
+            node.gain.setValueAtTime(heldValue, at);
+          }
+          node.gain.linearRampToValueAtTime(db(deeperDb), attackEnd);
+          node.gain.exponentialRampToValueAtTime(1, newUntil);
+        }
         state.untilTime = newUntil;
         state.depthDb = deeperDb;
         state.attackStartTime = at;
@@ -413,7 +519,9 @@ export const createEngine: CreateEngine = (
         } else {
           entry = voiceGain;
         }
-        voiceGain.connect(bus[spec.bus]);
+        // The six atk.* cues bypass preMaster (see the ATK_BYPASS_IDS comment at the graph
+        // wiring above); every other cue, including every other sfx cue, is unaffected.
+        voiceGain.connect(ATK_BYPASS_IDS.has(id) ? sfxTransient : bus[spec.bus]);
 
         const send = spatialResult ? spatialResult.send : 0;
         if (send > 0) {
@@ -469,7 +577,7 @@ export const createEngine: CreateEngine = (
     setSettings(s: AudioSettings): void {
       try {
         settings = s;
-        applyLevels(s);
+        applyLevels(s, false);
       } catch {
         // never throw
       }
@@ -558,6 +666,21 @@ export const createEngine: CreateEngine = (
         }
         try {
           masterGain.disconnect();
+        } catch {
+          // already disconnected
+        }
+        try {
+          sfxTransient.disconnect();
+        } catch {
+          // already disconnected
+        }
+        try {
+          sfxTransientDuck.disconnect();
+        } catch {
+          // already disconnected
+        }
+        try {
+          sfxTransientHeadroom.disconnect();
         } catch {
           // already disconnected
         }
