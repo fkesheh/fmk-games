@@ -59,6 +59,17 @@ function tOff(g: CueGraph): number {
   return (g.rnd() * 2 - 1) * VARY.timingS;
 }
 
+/**
+ * `at` plus `offset` plus timing jitter, floored so the result can never precede `at`.
+ * `tOff` draws negative roughly half the time; WebAudio throws `RangeError` on a negative
+ * absolute schedule time, which aborts the whole cue function (and every layer after it) —
+ * silently, since the engine's per-cue try/catch swallows it per contract. Every layer
+ * scheduled relative to `at` goes through this helper, never through a raw `at + tOff(g)`.
+ */
+function jitteredAt(g: CueGraph, at: number, offset = 0): number {
+  return at + Math.max(0, offset + tOff(g));
+}
+
 // ---------------------------------------------------------------------------
 // BULLWARK — metal and stone, a shield wall moving. Low register. No shimmer, ever.
 // ---------------------------------------------------------------------------
@@ -74,7 +85,7 @@ const bullwarkShieldCrash: CueFn = (g, at, p) => {
     q: 1.4,
     env: env(0.003, 0.05, 0.25, 0.09),
   }, lvl(g, p, -8));
-  const impactAt = at + 0.05 + tOff(g);
+  const impactAt = jitteredAt(g, at, 0.05);
   thump(g, impactAt, p.dest, {
     hz: hz(root * 2, g),
     dropHz: hz(root * 0.7, g),
@@ -93,33 +104,33 @@ const bullwarkShieldCrash: CueFn = (g, at, p) => {
   }, lvl(g, p, -6));
 };
 
-/** W — Bulwark: passive armour aura. Rarely fires; a short restrained clang. */
+/** W — Bulwark: passive armour aura. Rarely fires; a deep, resting sub-register hum. */
 const bullwarkBulwark: CueFn = (g, at, p) => {
-  const root = PALETTE.low.D2;
+  const root = PALETTE.sub.D1;
   metal(g, at, p.dest, {
     ratios: METAL_RATIOS.slice(0, 4),
     hz: hz(root * 2, g),
-    bandHz: hz(440, g),
-    q: 2.5,
-    env: env(0.005, 0.07, 0.2, 0.1),
+    bandHz: hz(150, g),
+    q: 3,
+    env: env(0.006, 0.09, 0.2, 0.13),
   }, lvl(g, p, -12));
-  thump(g, at + tOff(g), p.dest, {
+  thump(g, jitteredAt(g, at), p.dest, {
     hz: hz(root, g),
-    dropHz: hz(root * 0.8, g),
-    dropTime: 0.06,
-    env: env(0.004, 0.05, 0.15, 0.08),
-  }, lvl(g, p, -14));
+    dropHz: hz(root * 0.7, g),
+    dropTime: 0.09,
+    env: env(0.007, 0.09, 0.2, 0.13),
+  }, lvl(g, p, -11));
 };
 
-/** E — Ground Slam: magic AoE, slow. Detuned tone pair (no shimmer) + stone crack + sub. */
+/** E — Ground Slam: magic AoE, slow. Mid-register detuned tone pair (no shimmer) + sub crack. */
 const bullwarkGroundSlam: CueFn = (g, at, p) => {
-  const root = PALETTE.low.A2;
+  const root = PALETTE.mid.A3;
   tone(g, at, p.dest, {
     type: 'triangle',
     hz: hz(root, g),
     detune: p.variant % 2 === 0 ? -14 : -22,
-    filterHz: 1400,
-    sweepHz: 500,
+    filterHz: 1100,
+    sweepHz: 450,
     sweepTime: 0.4,
     env: env(0.01, 0.18, 0.35, 0.3),
   }, lvl(g, p, -9));
@@ -127,15 +138,15 @@ const bullwarkGroundSlam: CueFn = (g, at, p) => {
     type: 'triangle',
     hz: hz(degree(root, 4, 0), g),
     detune: p.variant % 2 === 0 ? 16 : 9,
-    filterHz: 1200,
-    sweepHz: 450,
+    filterHz: 950,
+    sweepHz: 400,
     sweepTime: 0.42,
     env: env(0.012, 0.2, 0.3, 0.32),
   }, lvl(g, p, -10));
-  metal(g, at + 0.02 + tOff(g), p.dest, {
+  metal(g, jitteredAt(g, at, 0.02), p.dest, {
     ratios: METAL_RATIOS.slice(0, 5),
     hz: hz(root, g),
-    bandHz: hz(300, g),
+    bandHz: hz(450, g),
     q: 4,
     env: env(0.004, 0.1, 0.2, 0.2),
   }, lvl(g, p, -10));
@@ -163,7 +174,7 @@ const bullwarkRally: CueFn = (g, at, p) => {
     spreadCents: 18,
     openHz: 300,
     filterHz: 300,
-    sweepHz: 1600,
+    sweepHz: 900,
     sweepTime: 0.9,
     env: env(0.25, 0.4, 0.6, 0.7),
   }, lvl(g, p, -10));
@@ -174,7 +185,7 @@ const bullwarkRally: CueFn = (g, at, p) => {
     glideTime: 0.5,
     env: env(0.05, 0.3, 0.5, 0.5),
   }, lvl(g, p, -7));
-  metal(g, at + 0.05 + tOff(g), p.dest, {
+  metal(g, jitteredAt(g, at, 0.05), p.dest, {
     ratios: METAL_RATIOS,
     hz: hz(root, g),
     bandHz: hz(500, g),
@@ -192,57 +203,62 @@ const bullwarkRally: CueFn = (g, at, p) => {
 // LONGBOW — tension and release. Mid register. Bowstring creak before every transient.
 // ---------------------------------------------------------------------------
 
-/** Q — Piercing Arrow: point, physical, piercing projectile. Creak, then snap + ping. */
+/** Q — Piercing Arrow: point, physical, piercing projectile. Low-register creak, then snap + ping. */
 const longbowPiercingArrow: CueFn = (g, at, p) => {
-  const root = PALETTE.mid.D3;
+  const root = PALETTE.low.F2;
   const creak = 0.075;
   noise(g, at, p.dest, {
     filter: 'bandpass',
-    hz: hz(260, g),
-    sweepHz: hz(620, g),
+    hz: hz(200, g),
+    sweepHz: hz(420, g),
     sweepTime: creak,
-    q: 2.2,
+    q: 2.6,
     env: env(0.02, creak - 0.02, 0.3, 0.03),
   }, lvl(g, p, -12));
-  const snapAt = at + creak + tOff(g);
+  const snapAt = jitteredAt(g, at, creak);
   tone(g, snapAt, p.dest, {
     type: 'sawtooth',
     hz: hz(root, g),
     glideHz: hz(root * 1.6, g),
     glideTime: 0.05,
-    filterHz: 1800,
-    sweepHz: 700,
-    sweepTime: 0.12,
+    filterHz: 850,
+    sweepHz: 320,
+    sweepTime: 0.08,
     env: env(0.003, 0.05, 0.15, 0.08),
   }, lvl(g, p, -8));
   metal(g, snapAt, p.dest, {
-    ratios: p.variant % 2 === 0 ? METAL_RATIOS.slice(0, 5) : METAL_RATIOS.slice(1),
+    ratios: p.variant % 2 === 0 ? METAL_RATIOS.slice(0, 4) : METAL_RATIOS.slice(1, 5),
     hz: hz(root * 2, g),
-    bandHz: hz(900, g),
-    q: 5,
+    bandHz: hz(500, g),
+    q: 4,
     env: env(0.001, 0.04, 0.1, 0.1),
-  }, lvl(g, p, -10));
+  }, lvl(g, p, -11));
 };
 
-/** W — Focus: passive attack-speed. Rarely fires; a short restrained tick. */
+/** W — Focus: passive attack-speed. Rarely fires; a quiet high-register chime tick. */
 const longbowFocus: CueFn = (g, at, p) => {
-  const root = PALETTE.mid.A3;
+  const root = PALETTE.high.A4;
   tone(g, at, p.dest, {
-    type: 'triangle',
+    type: 'sine',
     hz: hz(root, g),
-    env: env(0.01, 0.06, 0.2, 0.09),
-  }, lvl(g, p, -13));
-  noise(g, at + 0.01, p.dest, {
+    env: env(0.008, 0.05, 0.2, 0.08),
+  }, lvl(g, p, -15));
+  tone(g, at + 0.012, p.dest, {
+    type: 'triangle',
+    hz: hz(degree(root, 4, 0), g),
+    env: env(0.01, 0.05, 0.18, 0.09),
+  }, lvl(g, p, -17));
+  noise(g, at + 0.005, p.dest, {
     filter: 'bandpass',
-    hz: hz(500, g),
-    q: 2,
-    env: env(0.005, 0.04, 0.1, 0.06),
-  }, lvl(g, p, -16));
+    hz: hz(350, g),
+    q: 2.5,
+    env: env(0.004, 0.03, 0.1, 0.05),
+  }, lvl(g, p, -18));
 };
 
 /** E — Frost Arrow: unit, magic, slow. Creak, then a detuned icy body, closing filter. */
 const longbowFrostArrow: CueFn = (g, at, p) => {
-  const root = PALETTE.mid.F3;
+  const root = PALETTE.mid.D4;
   const creak = 0.06;
   noise(g, at, p.dest, {
     filter: 'bandpass',
@@ -252,7 +268,7 @@ const longbowFrostArrow: CueFn = (g, at, p) => {
     q: 2,
     env: env(0.02, creak - 0.02, 0.25, 0.03),
   }, lvl(g, p, -13));
-  const snapAt = at + creak + tOff(g);
+  const snapAt = jitteredAt(g, at, creak);
   tone(g, snapAt, p.dest, {
     type: 'triangle',
     hz: hz(root, g),
@@ -300,8 +316,8 @@ const longbowRainOfArrows: CueFn = (g, at, p) => {
     sweepTime: 0.5,
     env: env(0.02, 0.25, 0.3, 0.4),
   }, lvl(g, p, -10));
-  const impactAAt = at + 0.18 + tOff(g);
-  const impactBAt = at + 0.42 + tOff(g);
+  const impactAAt = jitteredAt(g, at, 0.18);
+  const impactBAt = jitteredAt(g, at, 0.42);
   noise(g, impactAAt, p.dest, {
     filter: 'bandpass',
     hz: hz(320, g),
@@ -336,13 +352,13 @@ const reaverCleave: CueFn = (g, at, p) => {
   const root = PALETTE.low.F2;
   noise(g, at, p.dest, {
     filter: 'bandpass',
-    hz: hz(380, g),
-    sweepHz: hz(900, g),
+    hz: hz(300, g),
+    sweepHz: hz(500, g),
     sweepTime: 0.07,
-    q: 1.6,
+    q: 1.8,
     env: env(0.003, 0.09, 0.25, 0.14),
   }, lvl(g, p, -6));
-  const impactAt = at + 0.03 + tOff(g);
+  const impactAt = jitteredAt(g, at, 0.03);
   thump(g, impactAt, p.dest, {
     hz: hz(root * 1.6, g),
     dropHz: hz(root * 0.6, g),
@@ -358,42 +374,44 @@ const reaverCleave: CueFn = (g, at, p) => {
   }, lvl(g, p, -7));
 };
 
-/** W — Frenzy: self attack-speed. A quick rasp + weight + steel edge. */
+/** W — Frenzy: self attack-speed. Mid-register rasp + weight + steel edge. */
 const reaverFrenzy: CueFn = (g, at, p) => {
-  const root = PALETTE.low.A2;
+  const root = PALETTE.mid.D3;
   noise(g, at, p.dest, {
-    filter: 'highpass',
-    hz: hz(350, g),
-    q: 1.2,
-    env: env(0.004, 0.06, 0.2, 0.09),
-  }, lvl(g, p, -11));
-  thump(g, at + tOff(g), p.dest, {
+    filter: 'bandpass',
+    hz: hz(240, g),
+    sweepHz: hz(400, g),
+    sweepTime: 0.07,
+    q: 2.8,
+    env: env(0.008, 0.06, 0.22, 0.09),
+  }, lvl(g, p, -8));
+  thump(g, jitteredAt(g, at), p.dest, {
     hz: hz(root, g),
     dropHz: hz(root * 0.75, g),
     dropTime: 0.08,
     env: env(0.003, 0.06, 0.2, 0.1),
-  }, lvl(g, p, -9));
+  }, lvl(g, p, -7));
   metal(g, at + 0.01, p.dest, {
     ratios: METAL_RATIOS.slice(0, 4),
-    hz: hz(root * 2, g),
-    bandHz: hz(600, g),
-    q: 2.8,
+    hz: hz(root, g),
+    bandHz: hz(420, g),
+    q: 3.5,
     env: env(0.003, 0.07, 0.15, 0.1),
-  }, lvl(g, p, -12));
+  }, lvl(g, p, -10));
 };
 
-/** E — Lunge: unit, physical, dash. A fast whoosh into a landing impact + blade. */
+/** E — Lunge: unit, physical, dash. Upper-mid register whoosh into a landing impact + blade. */
 const reaverLunge: CueFn = (g, at, p) => {
-  const root = PALETTE.low.D3;
+  const root = PALETTE.mid.D4;
   noise(g, at, p.dest, {
     filter: 'bandpass',
-    hz: hz(300, g),
-    sweepHz: hz(1100, g),
+    hz: hz(240, g),
+    sweepHz: hz(400, g),
     sweepTime: 0.09,
-    q: 1.3,
+    q: 2,
     env: env(0.003, 0.07, 0.2, 0.09),
   }, lvl(g, p, -7));
-  const landAt = at + 0.09 + tOff(g);
+  const landAt = jitteredAt(g, at, 0.09);
   thump(g, landAt, p.dest, {
     hz: hz(root, g),
     dropHz: hz(root * 0.55, g),
@@ -402,11 +420,11 @@ const reaverLunge: CueFn = (g, at, p) => {
   }, lvl(g, p, -4));
   metal(g, landAt, p.dest, {
     ratios: p.variant % 2 === 0 ? METAL_RATIOS.slice(0, 5) : METAL_RATIOS.slice(1),
-    hz: hz(root * 1.8, g),
-    bandHz: hz(680, g),
+    hz: hz(root, g),
+    bandHz: hz(430, g),
     q: 3.2,
     env: env(0.002, 0.06, 0.15, 0.14),
-  }, lvl(g, p, -9));
+  }, lvl(g, p, -8));
 };
 
 /** R — Dismember (ult): unit, physical, stun. Sub + swell + heavy rip + shrieking blade. */
@@ -417,44 +435,36 @@ const reaverDismember: CueFn = (g, at, p) => {
     dropHz: hz(PALETTE.sub.D1, g),
     dropTime: 0.45,
     env: env(0.015, 0.35, 0.45, 0.55),
-  }, lvl(g, p, -6));
+  }, lvl(g, p, -17));
   swell(g, at + 0.02, p.dest, {
     type: 'sawtooth',
-    hz: hz(root * 0.5, g),
+    hz: hz(root * 1.5, g),
     voices: 4,
     spreadCents: 22,
-    openHz: 260,
-    filterHz: 260,
-    sweepHz: 900,
-    sweepTime: 0.5,
+    openHz: 770,
     env: env(0.02, 0.35, 0.4, 0.5),
-  }, lvl(g, p, -10));
+  }, lvl(g, p, -5));
   noise(g, at + 0.04, p.dest, {
     filter: 'bandpass',
-    hz: hz(400, g),
-    sweepHz: hz(1400, g),
+    hz: hz(720, g),
+    sweepHz: hz(770, g),
     sweepTime: 0.1,
-    q: 1.4,
+    q: 2.2,
     env: env(0.003, 0.12, 0.3, 0.2),
-  }, lvl(g, p, -6));
-  metal(g, at + 0.06 + tOff(g), p.dest, {
+  }, lvl(g, p, -8));
+  metal(g, jitteredAt(g, at, 0.06), p.dest, {
     ratios: METAL_RATIOS,
-    hz: hz(root * 2, g),
-    bandHz: hz(750, g),
-    q: 4,
-    filterHz: 2400,
-    sweepHz: 500,
-    sweepTime: 0.6,
+    hz: hz(root * 1.7, g),
+    bandHz: hz(780, g),
+    q: 4.5,
     env: env(0.003, 0.2, 0.25, 0.35),
-  }, lvl(g, p, -7));
+  }, lvl(g, p, -3));
   tone(g, at + 0.12, p.dest, {
     type: 'sawtooth',
-    hz: hz(root, g),
-    filterHz: 1800,
-    sweepHz: 260,
-    sweepTime: 0.7,
+    hz: hz(root * 1.6, g),
+    filterHz: 770,
     env: env(0.02, 0.3, 0.3, 0.5),
-  }, lvl(g, p, -11));
+  }, lvl(g, p, -5));
 };
 
 // ---------------------------------------------------------------------------
@@ -470,8 +480,8 @@ const hexHexbolt: CueFn = (g, at, p) => {
     detune: p.variant % 2 === 0 ? -16 : 20,
     glideHz: hz(root * 1.3, g),
     glideTime: 0.05,
-    filterHz: 1600,
-    sweepHz: 500,
+    filterHz: 700,
+    sweepHz: 300,
     sweepTime: 0.15,
     env: env(0.003, 0.06, 0.2, 0.1),
   }, lvl(g, p, -8));
@@ -479,30 +489,31 @@ const hexHexbolt: CueFn = (g, at, p) => {
     type: 'sawtooth',
     hz: hz(root * 1.005, g),
     detune: p.variant % 2 === 0 ? 12 : -18,
+    filterHz: 600,
     env: env(0.004, 0.07, 0.18, 0.12),
   }, lvl(g, p, -11));
   shimmer(g, at + 0.02, p.dest, {
     hz: hz(root, g),
     modHz: hz(30, g, 0.15),
-    index: 220,
-    tailHz: 640,
-    filterHz: 700,
-    sweepHz: 300,
+    index: 110,
+    tailHz: 480,
+    filterHz: 480,
+    sweepHz: 200,
     sweepTime: 0.3,
     env: env(0.01, 0.15, 0.2, 0.2),
   }, lvl(g, p, -13));
 };
 
-/** W — Cripple: point AoE magic, slow. Shimmer + detuned cluster, closing filter. */
+/** W — Cripple: point AoE magic, slow. Mid-register shimmer + detuned cluster, closing filter. */
 const hexCripple: CueFn = (g, at, p) => {
-  const root = PALETTE.high.F4;
+  const root = PALETTE.mid.F3;
   shimmer(g, at, p.dest, {
     hz: hz(root, g),
     modHz: hz(22, g, 0.2),
-    index: 260,
-    tailHz: 620,
-    filterHz: 620,
-    sweepHz: 260,
+    index: 130,
+    tailHz: 460,
+    filterHz: 460,
+    sweepHz: 200,
     sweepTime: 0.4,
     env: env(0.015, 0.2, 0.3, 0.25),
   }, lvl(g, p, -9));
@@ -510,15 +521,16 @@ const hexCripple: CueFn = (g, at, p) => {
     type: 'triangle',
     hz: hz(root * 0.5, g),
     detune: p.variant % 2 === 0 ? -20 : 24,
-    filterHz: 1000,
-    sweepHz: 350,
+    filterHz: 650,
+    sweepHz: 300,
     sweepTime: 0.42,
     env: env(0.015, 0.18, 0.3, 0.25),
   }, lvl(g, p, -9));
   tone(g, at + 0.02, p.dest, {
     type: 'triangle',
-    hz: hz(degree(PALETTE.rootHz, 2, 2), g),
+    hz: hz(degree(PALETTE.rootHz, 2, 1), g),
     detune: p.variant % 2 === 0 ? 15 : -12,
+    filterHz: 650,
     env: env(0.02, 0.18, 0.3, 0.25),
   }, lvl(g, p, -11));
 };
@@ -528,18 +540,18 @@ const hexBlink: CueFn = (g, at, p) => {
   const root = PALETTE.high.D5;
   noise(g, at, p.dest, {
     filter: 'bandpass',
-    hz: hz(280, g),
-    sweepHz: hz(760, g),
+    hz: hz(260, g),
+    sweepHz: hz(420, g),
     sweepTime: 0.06,
-    q: 1.6,
+    q: 2.2,
     env: env(0.004, 0.05, 0.2, 0.05),
   }, lvl(g, p, -9));
   noise(g, at + 0.05, p.dest, {
     filter: 'bandpass',
-    hz: hz(760, g),
-    sweepHz: hz(260, g),
+    hz: hz(420, g),
+    sweepHz: hz(240, g),
     sweepTime: 0.07,
-    q: 1.6,
+    q: 2.2,
     env: env(0.003, 0.06, 0.15, 0.08),
   }, lvl(g, p, -10));
   shimmer(g, at + 0.03, p.dest, {
@@ -577,10 +589,10 @@ const hexAnnihilate: CueFn = (g, at, p) => {
   shimmer(g, at + 0.1, p.dest, {
     hz: hz(root, g),
     modHz: hz(18, g, 0.2),
-    index: 320,
-    tailHz: 700,
-    filterHz: 700,
-    sweepHz: 320,
+    index: 160,
+    tailHz: 520,
+    filterHz: 520,
+    sweepHz: 220,
     sweepTime: 0.9,
     env: env(0.05, 0.4, 0.4, 0.7),
   }, lvl(g, p, -9));
@@ -588,8 +600,8 @@ const hexAnnihilate: CueFn = (g, at, p) => {
     type: 'sawtooth',
     hz: hz(root * 0.5, g),
     detune: -20,
-    filterHz: 1200,
-    sweepHz: 400,
+    filterHz: 650,
+    sweepHz: 280,
     sweepTime: 0.6,
     env: env(0.03, 0.3, 0.35, 0.5),
   }, lvl(g, p, -10));
@@ -597,6 +609,7 @@ const hexAnnihilate: CueFn = (g, at, p) => {
     type: 'sawtooth',
     hz: hz(root * 0.503, g),
     detune: 18,
+    filterHz: 650,
     env: env(0.035, 0.32, 0.35, 0.5),
   }, lvl(g, p, -12));
 };
@@ -605,9 +618,9 @@ const hexAnnihilate: CueFn = (g, at, p) => {
 // MENDER — the only warmth in the game. Mid register. Sine/triangle only. Zero noise.
 // ---------------------------------------------------------------------------
 
-/** Q — Mend: ally heal. A single rising perfect fifth, soft attack. */
+/** Q — Mend: ally heal. Low-register rising perfect fifth, soft attack. */
 const menderMend: CueFn = (g, at, p) => {
-  const root = PALETTE.mid.D3;
+  const root = PALETTE.low.D2;
   tone(g, at, p.dest, {
     type: 'sine',
     hz: hz(root, g),
@@ -627,7 +640,7 @@ const menderMend: CueFn = (g, at, p) => {
 
 /** W — Smite: unit magic, slow. Two detuned sine/triangle voices, one closing filter. */
 const menderSmite: CueFn = (g, at, p) => {
-  const root = PALETTE.mid.F3;
+  const root = PALETTE.mid.D4;
   tone(g, at, p.dest, {
     type: 'triangle',
     hz: hz(root, g),
@@ -655,9 +668,9 @@ const menderSmite: CueFn = (g, at, p) => {
   }, lvl(g, p, -13));
 };
 
-/** E — Sanctuary: point heal + regen aura. Two rising fifths + a warm pad. */
+/** E — Sanctuary: point heal + regen aura. High-register rising fifths + a warm pad. */
 const menderSanctuary: CueFn = (g, at, p) => {
-  const root = PALETTE.mid.A3;
+  const root = PALETTE.high.F4;
   tone(g, at, p.dest, {
     type: 'sine',
     hz: hz(root, g),
@@ -675,7 +688,7 @@ const menderSanctuary: CueFn = (g, at, p) => {
     hz: hz(root * 0.5, g),
     voices: 3,
     spreadCents: 10,
-    openHz: 800,
+    openHz: 700,
     env: env(0.06, 0.15, 0.45, 0.2),
   }, lvl(g, p, -12));
 };
@@ -694,7 +707,10 @@ const menderGuardian: CueFn = (g, at, p) => {
     hz: hz(root, g),
     voices: 3,
     spreadCents: 10,
-    openHz: 700,
+    openHz: 550,
+    filterHz: 550,
+    sweepHz: 260,
+    sweepTime: 0.7,
     env: env(0.3, 0.35, 0.55, 0.6),
   }, lvl(g, p, -10));
   tone(g, at + 0.1, p.dest, {
@@ -708,20 +724,20 @@ const menderGuardian: CueFn = (g, at, p) => {
     type: 'triangle',
     hz: hz(degree(root, 4, 1), g),
     env: env(0.07, 0.4, 0.5, 0.5),
-  }, lvl(g, p, -12));
+  }, lvl(g, p, -15));
 };
 
 // ---------------------------------------------------------------------------
 // SHADE — absence, a sound that pulls inward instead of striking out. Mid register.
 // ---------------------------------------------------------------------------
 
-/** Q — Shadow Strike: unit, physical, dash. Minimal transient, then a closing inward swell. */
+/** Q — Shadow Strike: unit, physical, dash. Low-register minimal transient, closing inward swell. */
 const shadeShadowStrike: CueFn = (g, at, p) => {
-  const root = PALETTE.mid.A3;
+  const root = PALETTE.low.F2;
   noise(g, at, p.dest, {
     filter: 'bandpass',
-    hz: hz(420, g),
-    sweepHz: hz(1300, g),
+    hz: hz(360, g),
+    sweepHz: hz(1000, g),
     sweepTime: 0.02,
     q: 1.8,
     env: env(0.002, 0.03, 0.1, 0.05),
@@ -731,9 +747,9 @@ const shadeShadowStrike: CueFn = (g, at, p) => {
     hz: hz(root, g),
     voices: 2,
     spreadCents: 12,
-    openHz: 900,
-    filterHz: 900,
-    sweepHz: 220,
+    openHz: 700,
+    filterHz: 700,
+    sweepHz: 200,
     sweepTime: 0.28,
     env: env(0.01, 0.16, 0.15, 0.2),
   }, lvl(g, p, -11));
@@ -741,33 +757,33 @@ const shadeShadowStrike: CueFn = (g, at, p) => {
 
 /** W — Smoke: point AoE magic, slow. Faint shimmer inside a closing, pulled-in swell. */
 const shadeSmoke: CueFn = (g, at, p) => {
-  const root = PALETTE.mid.F3;
+  const root = PALETTE.mid.C4;
   shimmer(g, at, p.dest, {
     hz: hz(root * 1.5, g),
     modHz: hz(15, g, 0.2),
-    index: 120,
-    tailHz: 520,
-    filterHz: 520,
-    sweepHz: 200,
+    index: 70,
+    tailHz: 420,
+    filterHz: 420,
+    sweepHz: 160,
     sweepTime: 0.3,
     env: env(0.02, 0.18, 0.2, 0.3),
-  }, lvl(g, p, -11));
+  }, lvl(g, p, -12));
   swell(g, at + 0.02, p.dest, {
     type: 'sine',
     hz: hz(root, g),
     voices: 3,
     spreadCents: 14,
-    openHz: 700,
-    filterHz: 700,
+    openHz: 550,
+    filterHz: 550,
     sweepHz: 180,
     sweepTime: 0.35,
     env: env(0.03, 0.2, 0.25, 0.35),
   }, lvl(g, p, -10));
 };
 
-/** E — Mark: passive damage aura. Rarely fires; a tiny stamp + inward-pulled tail. */
+/** E — Mark: passive damage aura. Rarely fires; a tiny high-register stamp + inward-pulled tail. */
 const shadeMark: CueFn = (g, at, p) => {
-  const root = PALETTE.mid.C4;
+  const root = PALETTE.high.F4;
   noise(g, at, p.dest, {
     filter: 'bandpass',
     hz: hz(500, g),
@@ -819,12 +835,15 @@ const shadePhantoms: CueFn = (g, at, p) => {
     env: env(0.15, 0.3, 0.4, 0.5),
   }, lvl(g, p, -11));
   shimmer(g, at + 0.2, p.dest, {
-    hz: hz(PALETTE.high.F4, g),
+    hz: hz(PALETTE.high.A4, g),
     modHz: hz(12, g, 0.2),
-    index: 160,
-    tailHz: 560,
+    index: 80,
+    tailHz: 480,
+    filterHz: 480,
+    sweepHz: 200,
+    sweepTime: 0.5,
     env: env(0.1, 0.3, 0.35, 0.5),
-  }, lvl(g, p, -13));
+  }, lvl(g, p, -14));
   noise(g, at + 0.1, p.dest, {
     filter: 'bandpass',
     hz: hz(350, g),
@@ -844,24 +863,24 @@ const itemBlink: CueFn = (g, at, p) => {
   noise(g, at, p.dest, {
     filter: 'bandpass',
     hz: hz(260, g),
-    sweepHz: hz(820, g),
+    sweepHz: hz(650, g),
     sweepTime: 0.05,
-    q: 1.5,
+    q: 2.2,
     env: env(0.003, 0.04, 0.15, 0.05),
   }, lvl(g, p, -9));
   noise(g, at + 0.05, p.dest, {
     filter: 'bandpass',
-    hz: hz(820, g),
+    hz: hz(650, g),
     sweepHz: hz(240, g),
     sweepTime: 0.06,
-    q: 1.5,
+    q: 2.2,
     env: env(0.003, 0.05, 0.12, 0.07),
   }, lvl(g, p, -10));
   metal(g, at + 0.05, p.dest, {
     ratios: p.variant % 2 === 0 ? METAL_RATIOS.slice(0, 4) : METAL_RATIOS.slice(1, 5),
     hz: hz(PALETTE.mid.A3, g),
-    bandHz: hz(500, g),
-    q: 3,
+    bandHz: hz(450, g),
+    q: 3.5,
     env: env(0.002, 0.05, 0.1, 0.08),
   }, lvl(g, p, -13));
 };
@@ -878,6 +897,9 @@ const itemHorn: CueFn = (g, at, p) => {
   tone(g, at + 0.01, p.dest, {
     type: p.variant % 2 === 0 ? 'sawtooth' : 'square',
     hz: hz(root, g),
+    filterHz: 780,
+    sweepHz: 620,
+    sweepTime: 0.35,
     env: env(0.03, 0.15, 0.5, 0.3),
   }, lvl(g, p, -6));
   metal(g, at + 0.015, p.dest, {
@@ -902,7 +924,7 @@ const itemWard: CueFn = (g, at, p) => {
     hz: hz(PALETTE.high.F4, g),
     env: env(0.01, 0.1, 0.2, 0.15),
   }, lvl(g, p, -14));
-  metal(g, at + tOff(g), p.dest, {
+  metal(g, jitteredAt(g, at), p.dest, {
     ratios: p.variant % 2 === 0 ? METAL_RATIOS.slice(0, 4) : METAL_RATIOS.slice(1, 5),
     hz: hz(PALETTE.low.A2, g),
     bandHz: hz(420, g),

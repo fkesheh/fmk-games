@@ -158,11 +158,61 @@ const report = {
   baseline: {},
   pairs: [],
   assertions: [],
+  skips: [],
 };
 
 function check(name, ok, detail = '') {
   report.assertions.push({ name, ok, detail });
   if (!ok) fail(`${name}${detail ? ` — ${detail}` : ''}`);
+}
+
+/**
+ * A gate could not be evaluated for a reason that is NOT a measurement bug —
+ * e.g. fewer than two comparable slots exist, or an upstream render already
+ * failed loudly and there is nothing left to measure. This does NOT count as
+ * a pass. It is recorded and logged distinctly so the summary can never read
+ * as "full coverage" when coverage was partial.
+ */
+function skip(name, reason) {
+  report.skips.push({ name, reason });
+  log(`[SKIPPED] ${name} — ${reason}`);
+}
+
+/** Detail-string helper for values that are secondary to the assertion being
+ *  made (e.g. one side of a delta already validated via checkMetric below).
+ *  Never used to decide pass/fail — only to avoid a .toFixed() crash in a
+ *  log line if a secondary value is unexpectedly non-finite. */
+function safeFixed(v, digits) {
+  return typeof v === 'number' && Number.isFinite(v) ? v.toFixed(digits) : `N/A(${String(v)})`;
+}
+
+/**
+ * Assert a numeric metric. THE point of this wrapper: a metric that is not a
+ * finite number — null, undefined, NaN, whatever survived (or didn't survive)
+ * the browser round trip — is never coerced to a default and never silently
+ * skipped. It is recorded and logged as an explicit, named FAILURE, because a
+ * measurement that didn't happen is not evidence the audio is fine — exit 0
+ * must mean "measured and good", never "nothing crashed".
+ */
+/**
+ * A named gate could not even be attempted (its input never rendered). This
+ * is NOT the same thing as a skip: it is not "inapplicable", it is "we owed
+ * a measurement here and don't have one" — so, like checkMetric below, it is
+ * recorded in report.assertions as an explicit failure (never a pass, never
+ * silently dropped), which is also what keeps pass+fail+skip reconciling
+ * against the total number of gates this harness ever attempted to run.
+ */
+function failGate(name, reason) {
+  report.assertions.push({ name, ok: false, detail: reason });
+  fail(`${name} — ${reason}`);
+}
+
+function checkMetric(name, value, predicate, formatDetail) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    failGate(name, `metric is ${value === null ? 'null' : Number.isNaN(value) ? 'NaN' : String(value)} — the measurement did not happen, cannot evaluate this gate`);
+    return;
+  }
+  check(name, predicate(value), formatDetail(value));
 }
 
 // deterministic PRNG (mulberry32) — no Math.random anywhere in this file.
@@ -276,6 +326,18 @@ async function waitFor(fn, timeoutMs, label) {
 /** Defines window.__audioHarness. Call once per page, before any capture. */
 function installAudioHarness() {
   const LIMIT_CEILING_LINEAR = Math.pow(10, -2.0 / 20); // mirrors config.ts LIMIT_CEILING_DB
+  // dB is undefined at exactly zero linear amplitude (log10(0) = -Infinity). -Infinity is a
+  // real, meaningful measurement ("this channel is true digital silence"), but it cannot
+  // survive the page.evaluate() round trip: Puppeteer's returnByValue serialisation is JSON
+  // under the hood, and JSON has no representation for non-finite numbers — JSON.stringify
+  // turns Infinity/-Infinity/NaN into `null`. A `null` metric downstream then reads as "the
+  // measurement did not happen", which is a lie: the measurement DID happen, the result was
+  // silence. So instead of -Infinity, floor every dB conversion of a zero (or non-finite)
+  // linear value at a finite sentinel far below every gate in this file (the loosest is the
+  // -70 dBFS silence floor) — the value still correctly FAILS every floor/ceiling check that
+  // should fail on real silence; it just does so as a real number instead of vanishing.
+  const SILENCE_FLOOR_DB = -120;
+  const toDbOrFloor = (linear) => (linear > 0 && Number.isFinite(linear) ? 20 * Math.log10(linear) : SILENCE_FLOOR_DB);
 
   function downmix(l, r) {
     const n = l.length;
@@ -479,16 +541,16 @@ function installAudioHarness() {
         if (a > peak) peak = a;
       }
     }
-    return peak > 0 ? 20 * Math.log10(peak) : -Infinity;
+    return toDbOrFloor(peak);
   }
 
   async function computeMetrics(audio) {
     const { sampleRate, left, right, preLimitLeft, preLimitRight } = audio;
     const mono = downmix(left, right);
     const peak = Math.max(peakLinear(left), peakLinear(right));
-    const peakDbfs = peak > 0 ? 20 * Math.log10(peak) : -Infinity;
+    const peakDbfs = toDbOrFloor(peak);
     const rms = rmsLinear(mono);
-    const rmsDbfs = rms > 0 ? 20 * Math.log10(rms) : -Infinity;
+    const rmsDbfs = toDbOrFloor(rms);
     const crestDb = Number.isFinite(peakDbfs) && Number.isFinite(rmsDbfs) ? peakDbfs - rmsDbfs : 0;
     const spec = analyzeSpectrum(mono, sampleRate);
     const truePeak = await truePeakDbtp(left, right, sampleRate);
@@ -732,6 +794,35 @@ function isWorldCue(id) {
   return !id.startsWith('ui.') && !id.startsWith('ann.');
 }
 
+/**
+ * Cues that pass `isWorldCue` (not ui.* or ann.*) but are registered `dry: true`
+ * in their cue module and are therefore, BY CONSTRUCTION, exempt from the
+ * "space: |stereoCorrelation| < 0.98" gate below.
+ *
+ * engine.ts's spatialisation branch is `if (posX !== undefined && posZ !==
+ * undefined && !spec.dry)` — a dry cue never gets panned or sent to reverb,
+ * so its offsetM:18 render is byte-identical to its offsetM:0 render and
+ * stereoCorrelation is mathematically guaranteed to be 1.000. That is not a
+ * decorrelation defect; decorrelation is impossible for these cues, so the
+ * gate cannot be evaluated and must not be evaluated (see the `skip()` call
+ * at the assertion site — this is recorded as skipped, never as a pass).
+ *
+ * - 'obj.countdown' — the lobby/respawn timer tick, fired via
+ *   `RiftAudioHandle.countdown(secondsLeft)` with no world position at all.
+ * - 'hit.heartbeat'  — the local player's own low-HP pulse: a body signal,
+ *   not an event at a location (mirrors Dota 2's non-positional heartbeat).
+ *
+ * DRIFT WARNING: this harness runs under plain node and cannot read
+ * `CueSpec.dry` out of the TypeScript cue registries (cues/objectives.ts,
+ * cues/combat.ts) — this list is a hand-maintained MIRROR of that fact, not
+ * a derivation of it. If either id's `dry` flag ever changes, this list goes
+ * stale silently. Whoever touches those registries must re-check this list;
+ * it is deliberately an enumerated set, not a broadened predicate, so a
+ * future positional cue that regresses to 1.000 correlation still FAILS
+ * loudly instead of being swallowed by a wider rule.
+ */
+const NON_POSITIONAL_DRY_WORLD_CUES = new Set(['obj.countdown', 'hit.heartbeat']);
+
 /** Heuristic per-id render window, generous enough to cover the longest tail
  *  in each family (ultimates 0.8-1.6s, structure deaths up to 3.0s + IR_HALL
  *  2.8s tail, UI <=700ms) per SONIC_BIBLE §5 layer budget. */
@@ -929,8 +1020,8 @@ async function main() {
       if (m) allItems.push([`baseline ${id}`, m]);
     }
     for (const [label, m] of allItems) {
-      check(`silence floor: ${label} rmsDbfs > -70`, m.rmsDbfs > -70, `got ${m.rmsDbfs.toFixed(1)} dBFS`);
-      check(`silence floor: ${label} peakDbfs > -60`, m.peakDbfs > -60, `got ${m.peakDbfs.toFixed(1)} dBFS`);
+      checkMetric(`silence floor: ${label} rmsDbfs > -70`, m.rmsDbfs, (v) => v > -70, (v) => `got ${v.toFixed(1)} dBFS`);
+      checkMetric(`silence floor: ${label} peakDbfs > -60`, m.peakDbfs, (v) => v > -60, (v) => `got ${v.toFixed(1)} dBFS`);
     }
 
     // headroom — cues + scenes only (the baseline is an honest "before" picture and may
@@ -944,19 +1035,31 @@ async function main() {
       if (e.metrics) newBuildItems.push([`scene ${name}`, e.metrics]);
     }
     for (const [label, m] of newBuildItems) {
-      check(
+      checkMetric(
         `headroom: ${label} truePeakDbtp <= ${TRUE_PEAK_GATE_DBTP}`,
-        m.truePeakDbtp <= TRUE_PEAK_GATE_DBTP,
-        `got ${m.truePeakDbtp.toFixed(2)} dBTP`,
+        m.truePeakDbtp,
+        (v) => v <= TRUE_PEAK_GATE_DBTP,
+        (v) => `got ${v.toFixed(2)} dBTP`,
       );
-      check(`headroom: ${label} clippedSamples === 0`, m.clippedSamples === 0, `got ${m.clippedSamples}`);
+      checkMetric(
+        `headroom: ${label} clippedSamples === 0`,
+        m.clippedSamples,
+        (v) => v === 0,
+        (v) => `got ${v}`,
+      );
     }
+    // limiterActivePct is contractually present for every scene render (RenderedAudio carries
+    // a 4-channel preLimit tap for renderScene, per contract.ts). A scene with metrics but a
+    // null/non-finite limiterActivePct is therefore a measurement bug, not an inapplicable
+    // metric — assert it loudly rather than silently skipping, unlike the cue case (cues never
+    // carry a preLimit tap at all, so this loop never runs against report.cues).
     for (const [name, e] of Object.entries(report.scenes)) {
-      if (!e.metrics || e.metrics.limiterActivePct === null) continue;
-      check(
+      if (!e.metrics) continue; // scene never rendered — already a loud failure from the render phase
+      checkMetric(
         `headroom: scene ${name} limiterActivePct <= 2`,
-        e.metrics.limiterActivePct <= 2,
-        `got ${e.metrics.limiterActivePct.toFixed(2)}%`,
+        e.metrics.limiterActivePct,
+        (v) => v <= 2,
+        (v) => `got ${v.toFixed(2)}%`,
       );
     }
 
@@ -969,30 +1072,49 @@ async function main() {
     for (const [id, minPct] of subBassTargets) {
       const m = report.cues[id]?.primary;
       if (!m) {
-        fail(`sub-bass weight: ${id} was never rendered — cannot assert`);
+        failGate(`sub-bass weight: ${id}`, `${id} was never rendered — cannot assert`);
         continue;
       }
-      const pct = m.bandEnergyPct['0-120'];
-      check(`sub-bass weight: ${id} bandEnergyPct[0-120] >= ${minPct}`, pct >= minPct, `got ${pct.toFixed(1)}%`);
+      checkMetric(
+        `sub-bass weight: ${id} bandEnergyPct[0-120] >= ${minPct}`,
+        m.bandEnergyPct['0-120'],
+        (v) => v >= minPct,
+        (v) => `got ${v.toFixed(1)}%`,
+      );
     }
 
     // attack crispness — every atk.* cue.
     for (const id of soundIds) {
       if (!id.startsWith('atk.')) continue;
       const m = report.cues[id]?.primary;
-      if (!m) continue; // already failed as a render failure above
-      check(`attack crispness: ${id} attackMs < 8`, m.attackMs < 8, `got ${m.attackMs.toFixed(2)}ms`);
-      check(`attack crispness: ${id} lengthMs < 200`, m.lengthMs < 200, `got ${m.lengthMs.toFixed(1)}ms`);
-      check(`attack crispness: ${id} crestDb > 8`, m.crestDb > 8, `got ${m.crestDb.toFixed(1)}dB`);
+      if (!m) {
+        skip(`attack crispness: ${id}`, 'primary render failed above — no audio to measure');
+        continue;
+      }
+      checkMetric(`attack crispness: ${id} attackMs < 8`, m.attackMs, (v) => v < 8, (v) => `got ${v.toFixed(2)}ms`);
+      checkMetric(`attack crispness: ${id} lengthMs < 200`, m.lengthMs, (v) => v < 200, (v) => `got ${v.toFixed(1)}ms`);
+      checkMetric(`attack crispness: ${id} crestDb > 8`, m.crestDb, (v) => v > 8, (v) => `got ${v.toFixed(1)}dB`);
     }
 
     // the info-register law — every non-info cue (everything not in ui.*/ann.*).
     for (const id of soundIds) {
       if (id.startsWith('ui.') || id.startsWith('ann.')) continue;
       const m = report.cues[id]?.primary;
-      if (!m) continue;
-      const infoPct =
-        m.bandEnergyPct['800-2000'] + m.bandEnergyPct['2000-4000'] + m.bandEnergyPct['4000-20000'];
+      if (!m) {
+        skip(`info register: ${id}`, 'primary render failed above — no audio to measure');
+        continue;
+      }
+      const b = m.bandEnergyPct;
+      const bandKeys = ['800-2000', '2000-4000', '4000-20000'];
+      const bandVals = bandKeys.map((k) => b?.[k]);
+      if (bandVals.some((v) => typeof v !== 'number' || !Number.isFinite(v))) {
+        failGate(
+          `info register: ${id}`,
+          `bandEnergyPct has a missing/non-finite band (${bandKeys.map((k, i) => `${k}=${String(bandVals[i])}`).join(', ')}) — the measurement did not happen, cannot evaluate this gate`,
+        );
+        continue;
+      }
+      const infoPct = bandVals[0] + bandVals[1] + bandVals[2];
       check(
         `info register: ${id} energy above ${INFO_FLOOR_HZ}Hz <= ${INFO_BAND_MAX_PCT}%`,
         infoPct <= INFO_BAND_MAX_PCT,
@@ -1003,31 +1125,39 @@ async function main() {
     // the chime cuts through — lastHitInFight.
     const lastHit = report.scenes.lastHitInFight;
     if (lastHit?.chime) {
-      check(
-        `chime cut-through: lastHitInFight 2-4kHz onset >= bed + 8dB`,
-        lastHit.chime.deltaDb >= 8,
-        `chime ${lastHit.chime.chimeDb.toFixed(1)}dB, bed ${lastHit.chime.bedDb.toFixed(1)}dB, delta ${lastHit.chime.deltaDb.toFixed(1)}dB`,
+      checkMetric(
+        'chime cut-through: lastHitInFight 2-4kHz onset >= bed + 8dB',
+        lastHit.chime.deltaDb,
+        (v) => v >= 8,
+        (v) =>
+          `chime ${safeFixed(lastHit.chime.chimeDb, 1)}dB, bed ${safeFixed(lastHit.chime.bedDb, 1)}dB, delta ${v.toFixed(1)}dB`,
       );
     } else {
-      fail('chime cut-through: lastHitInFight scene did not render — cannot assert');
+      failGate('chime cut-through: lastHitInFight', 'lastHitInFight scene did not render — cannot assert');
     }
 
     // dynamic range.
     const laning = report.scenes.laning?.metrics;
     const teamfight = report.scenes.teamfight?.metrics;
     if (laning) {
-      check('dynamic range: laning rmsDbfs <= -30', laning.rmsDbfs <= -30, `got ${laning.rmsDbfs.toFixed(1)} dBFS`);
-    } else {
-      fail('dynamic range: laning scene did not render — cannot assert');
-    }
-    if (teamfight) {
-      check(
-        'dynamic range: teamfight rmsDbfs >= -18',
-        teamfight.rmsDbfs >= -18,
-        `got ${teamfight.rmsDbfs.toFixed(1)} dBFS`,
+      checkMetric(
+        'dynamic range: laning rmsDbfs <= -30',
+        laning.rmsDbfs,
+        (v) => v <= -30,
+        (v) => `got ${v.toFixed(1)} dBFS`,
       );
     } else {
-      fail('dynamic range: teamfight scene did not render — cannot assert');
+      failGate('dynamic range: laning', 'laning scene did not render — cannot assert');
+    }
+    if (teamfight) {
+      checkMetric(
+        'dynamic range: teamfight rmsDbfs >= -18',
+        teamfight.rmsDbfs,
+        (v) => v >= -18,
+        (v) => `got ${v.toFixed(1)} dBFS`,
+      );
+    } else {
+      failGate('dynamic range: teamfight', 'teamfight scene did not render — cannot assert');
     }
 
     // hero distinctness — within each hero, min pairwise centroid separation >= 15%.
@@ -1037,36 +1167,64 @@ async function main() {
       const parts = id.split('.');
       const hero = parts[1];
       if (hero === undefined || hero === 'item') continue;
-      const m = report.cues[id]?.primary;
-      if (!m) continue;
       if (!byHero.has(hero)) byHero.set(hero, []);
-      byHero.get(hero).push([id, m.spectralCentroidHz]);
+      const m = report.cues[id]?.primary;
+      const c = m?.spectralCentroidHz;
+      const usableC = typeof c === 'number' && Number.isFinite(c) ? c : null;
+      byHero.get(hero).push([id, usableC]);
     }
     for (const [hero, slots] of byHero) {
-      if (slots.length < 2) continue;
+      const usable = slots.filter(([, c]) => c !== null);
+      const missing = slots.filter(([, c]) => c === null).map(([id]) => id);
+      if (usable.length < 2) {
+        skip(
+          `hero distinctness: ${hero}`,
+          `only ${usable.length}/${slots.length} slot centroid(s) usable (missing/unmeasured: ${missing.join(', ') || 'none'}) — need >= 2 to compare`,
+        );
+        continue;
+      }
       let minPct = Infinity;
       let minPair = null;
-      for (let i = 0; i < slots.length; i++) {
-        for (let j = i + 1; j < slots.length; j++) {
-          const d = pctDiff(slots[i][1], slots[j][1]);
+      for (let i = 0; i < usable.length; i++) {
+        for (let j = i + 1; j < usable.length; j++) {
+          const d = pctDiff(usable[i][1], usable[j][1]);
           if (d < minPct) {
             minPct = d;
-            minPair = [slots[i][0], slots[j][0]];
+            minPair = [usable[i][0], usable[j][0]];
           }
         }
       }
+      const missingNote =
+        missing.length > 0 ? ` (NOTE: ${missing.join(', ')} unmeasured, compared only ${usable.length}/${slots.length})` : '';
       check(
         `hero distinctness: ${hero} min pairwise centroid separation >= 15%`,
         minPct >= 15,
-        `closest pair ${minPair?.join(' vs ')} at ${minPct.toFixed(1)}%`,
+        `closest pair ${minPair.join(' vs ')} at ${minPct.toFixed(1)}%${missingNote}`,
       );
     }
 
     // space — every world cue's offsetM:18 render has |stereoCorrelation| < 0.98.
     for (const [id, e] of Object.entries(report.cues)) {
-      if (!isWorldCue(id) || !e.offset18) continue;
-      const corr = Math.abs(e.offset18.stereoCorrelation);
-      check(`space: ${id} @18m |stereoCorrelation| < 0.98`, corr < 0.98, `got ${corr.toFixed(3)}`);
+      if (!isWorldCue(id)) continue;
+      if (NON_POSITIONAL_DRY_WORLD_CUES.has(id)) {
+        skip(
+          `space: ${id} @18m`,
+          `'${id}' is registered dry: true, so engine.ts never spatialises it (no pan, no reverb ` +
+            `send) — its offsetM:18 render is byte-identical to offsetM:0 by construction, so ` +
+            `decorrelation is impossible and this gate cannot be evaluated for it`,
+        );
+        continue;
+      }
+      if (!e.offset18) {
+        skip(`space: ${id} @18m`, 'offsetM:18 render failed above — no audio to measure');
+        continue;
+      }
+      checkMetric(
+        `space: ${id} @18m |stereoCorrelation| < 0.98`,
+        e.offset18.stereoCorrelation,
+        (v) => Math.abs(v) < 0.98,
+        (v) => `got ${Math.abs(v).toFixed(3)}`,
+      );
     }
 
     // page/console errors — any is a failure.
@@ -1093,18 +1251,60 @@ async function main() {
     }
   }
 
+  // Reconciliation. Every named gate this harness ever attempted lands in
+  // EXACTLY one of three buckets:
+  //   - report.assertions, ok:true   -> pass       (the gate ran and met its bar)
+  //   - report.assertions, ok:false  -> fail        (the gate ran, or owed a
+  //                                                   measurement it didn't get — see
+  //                                                   checkMetric/failGate — either way
+  //                                                   it is counted here, never silently)
+  //   - report.skips                 -> skip        (the gate is legitimately
+  //                                                   inapplicable to this item, e.g.
+  //                                                   a dry non-positional cue — logged,
+  //                                                   never counted as a pass)
+  // passCount + failCount are a partition of report.assertions BY CONSTRUCTION (they are
+  // the same array split by `.ok`), so the only thing worth asserting at runtime is that
+  // nothing was double-counted across the two ledgers (an id showing up in both).
+  const passCount = report.assertions.filter((a) => a.ok).length;
+  const failCount = report.assertions.filter((a) => !a.ok).length;
+  const skipCount = report.skips.length;
+  const totalGateOpportunities = report.assertions.length + skipCount;
+  if (passCount + failCount + skipCount !== totalGateOpportunities) {
+    // Can only happen if a future edit pushes into both report.assertions and
+    // report.skips for the same gate — refuse to print a reconciled-looking
+    // summary that is lying about its own arithmetic.
+    throw new Error(
+      `assertion bookkeeping is inconsistent: pass ${passCount} + fail ${failCount} + skip ${skipCount} ` +
+        `= ${passCount + failCount + skipCount}, expected ${totalGateOpportunities} ` +
+        `(${report.assertions.length} assertions + ${skipCount} skips)`,
+    );
+  }
+  // failures[] also carries messages for things that never became a named gate at all
+  // (an item that failed to RENDER, before any assertion could even be attempted; the
+  // one aggregate page-error message) — those are real build failures but are not part
+  // of the gate ledger above, so they are reported as a separate, explicit count rather
+  // than folded silently into failCount.
+  const nonGateFailureCount = failures.length - failCount;
   const ok = failures.length === 0;
   log(
     ok
-      ? `GREEN: ${report.assertions.length} assertions, 0 failures`
-      : `RED: ${failures.length} failure(s) of ${report.assertions.length} assertions`,
+      ? `GREEN: ${totalGateOpportunities} gate opportunities = ${passCount} pass + ${failCount} fail + ${skipCount} skip (reconciled); 0 failures`
+      : `RED: ${totalGateOpportunities} gate opportunities = ${passCount} pass + ${failCount} fail + ${skipCount} skip (reconciled); ` +
+          `+${nonGateFailureCount} non-gate failure(s) (render/page errors); ${failures.length} failure message(s) total`,
   );
+  // full ledger, every pass/fail/skip — no truncation. Exit 0 must mean "measured and good",
+  // so the manifest that proves it must be complete, not a sample.
   console.log(
     JSON.stringify({
       ok,
-      failureCount: failures.length,
-      failures: failures.slice(0, 30),
+      totalGateOpportunities,
       assertionCount: report.assertions.length,
+      passCount,
+      failCount,
+      skipCount,
+      nonGateFailureCount,
+      failures,
+      skips: report.skips,
       cueCount: Object.keys(report.cues).length,
       sceneCount: Object.keys(report.scenes).length,
       baselineCount: Object.keys(report.baseline).length,
@@ -1116,7 +1316,8 @@ async function main() {
 }
 
 main().catch((err) => {
-  log(`FATAL: ${errText(err)}`);
+  const stack = err instanceof Error && err.stack ? err.stack : String(err);
+  log(`FATAL:\n${stack}`);
   console.log(JSON.stringify({ ok: false, fatal: errText(err) }));
   process.exit(1);
 });

@@ -31,6 +31,20 @@ const EPS_GAIN = 0.0001;
 /** Floors every automation segment above zero so ramps never collapse to zero length. */
 const MIN_SEG_S = 0.0001;
 
+/**
+ * WebAudio throws a RangeError on any NEGATIVE absolute schedule time. Callers legitimately
+ * compute `at + jitter` where `jitter` can be negative (timing variation, SONIC_BIBLE §7);
+ * in an isolated render `at` can be exactly `ctx.currentTime === 0`, so that sum goes
+ * negative. Every scheduling primitive below normalises its incoming `at` (and therefore
+ * every time derived from it) through this before making a single AudioParam/start/stop
+ * call, so a formerly-throwing call now schedules at 0 instead of silently aborting the
+ * whole synchronous cue function. A negative absolute time is never valid, so this is a
+ * normalisation, not a workaround.
+ */
+function t0(at: number): number {
+  return Math.max(0, at);
+}
+
 // ---------------------------------------------------------------------------
 // Small pure helpers
 // ---------------------------------------------------------------------------
@@ -71,15 +85,18 @@ export function degree(root: number, deg: number, octave: number): number {
  * throws). Returns the envelope end time.
  */
 export function applyEnv(param: AudioParam, at: number, env: Env, scale: number): number {
+  const start = t0(at);
   const peakVal = Math.max(EPS_GAIN, env.peak * scale);
   const sustainVal = Math.max(EPS_GAIN, env.peak * env.sustain * scale);
 
-  const attackEnd = at + Math.max(env.attack, MIN_SEG_S);
+  // Every subsequent time is `start` plus a non-negative duration, so once `start` itself
+  // is clamped, attackEnd/decayEnd/releaseEnd can never go negative either.
+  const attackEnd = start + Math.max(env.attack, MIN_SEG_S);
   const decayEnd = attackEnd + Math.max(env.decay, MIN_SEG_S);
   const releaseEnd = decayEnd + Math.max(env.release, MIN_SEG_S);
 
-  param.cancelScheduledValues(at);
-  param.setValueAtTime(EPS_GAIN, at);
+  param.cancelScheduledValues(start);
+  param.setValueAtTime(EPS_GAIN, start);
   param.linearRampToValueAtTime(peakVal, attackEnd);
   param.exponentialRampToValueAtTime(sustainVal, decayEnd);
   param.exponentialRampToValueAtTime(EPS_GAIN, releaseEnd);
@@ -113,10 +130,11 @@ function filterSweep(
   filter.Q.value = Math.SQRT1_2;
   const nyquist = ctx.sampleRate / 2;
   const startHz = sweep.filterHz ?? nyquist;
-  filter.frequency.setValueAtTime(startHz, at);
+  const start = t0(at);
+  filter.frequency.setValueAtTime(startHz, start);
   if (sweep.sweepHz !== undefined) {
     const sweepTime = Math.max(sweep.sweepTime ?? envLength, MIN_SEG_S);
-    filter.frequency.linearRampToValueAtTime(sweep.sweepHz, at + sweepTime);
+    filter.frequency.linearRampToValueAtTime(sweep.sweepHz, start + sweepTime);
   }
   return filter;
 }
@@ -128,26 +146,27 @@ function filterSweep(
 /** Oscillator voice with ADSR + optional glide + optional swept lowpass. */
 export function tone(g: CueGraph, at: number, dest: AudioNode, spec: ToneSpec, gain: number): void {
   const ctx = g.ctx;
+  const start = t0(at);
   const envLength = spec.env.attack + spec.env.decay + spec.env.release;
 
   const osc = ctx.createOscillator();
   osc.type = spec.type;
-  osc.frequency.setValueAtTime(spec.hz, at);
+  osc.frequency.setValueAtTime(spec.hz, start);
   if (spec.glideHz !== undefined) {
     const glideTime = Math.max(spec.glideTime ?? envLength, MIN_SEG_S);
-    osc.frequency.linearRampToValueAtTime(spec.glideHz, at + glideTime);
+    osc.frequency.linearRampToValueAtTime(spec.glideHz, start + glideTime);
   }
   osc.detune.value = spec.detune ?? 0;
 
-  const filter = filterSweep(ctx, at, spec, envLength);
+  const filter = filterSweep(ctx, start, spec, envLength);
   const env = ctx.createGain();
 
   osc.connect(filter ?? env);
   if (filter) filter.connect(env);
   env.connect(dest);
 
-  const endTime = applyEnv(env.gain, at, spec.env, gain);
-  osc.start(at);
+  const endTime = applyEnv(env.gain, start, spec.env, gain);
+  osc.start(start);
   osc.stop(endTime);
   osc.onended = (): void => {
     osc.disconnect();
@@ -159,6 +178,7 @@ export function tone(g: CueGraph, at: number, dest: AudioNode, spec: ToneSpec, g
 /** Filtered burst from the shared seeded noise buffer, with optional filter sweep. */
 export function noise(g: CueGraph, at: number, dest: AudioNode, spec: NoiseSpec, gain: number): void {
   const ctx = g.ctx;
+  const start = t0(at);
   const envLength = spec.env.attack + spec.env.decay + spec.env.release;
 
   const src = ctx.createBufferSource();
@@ -170,11 +190,11 @@ export function noise(g: CueGraph, at: number, dest: AudioNode, spec: NoiseSpec,
 
   const filter = ctx.createBiquadFilter();
   filter.type = spec.filter;
-  filter.frequency.setValueAtTime(spec.hz, at);
+  filter.frequency.setValueAtTime(spec.hz, start);
   filter.Q.value = spec.q ?? 1;
   if (spec.sweepHz !== undefined) {
     const sweepTime = Math.max(spec.sweepTime ?? envLength, MIN_SEG_S);
-    filter.frequency.linearRampToValueAtTime(spec.sweepHz, at + sweepTime);
+    filter.frequency.linearRampToValueAtTime(spec.sweepHz, start + sweepTime);
   }
 
   const env = ctx.createGain();
@@ -182,8 +202,8 @@ export function noise(g: CueGraph, at: number, dest: AudioNode, spec: NoiseSpec,
   filter.connect(env);
   env.connect(dest);
 
-  const endTime = applyEnv(env.gain, at, spec.env, gain);
-  src.start(at);
+  const endTime = applyEnv(env.gain, start, spec.env, gain);
+  src.start(start);
   src.stop(endTime);
   src.onended = (): void => {
     src.disconnect();
@@ -195,20 +215,21 @@ export function noise(g: CueGraph, at: number, dest: AudioNode, spec: NoiseSpec,
 /** Sine sub with a fast downward pitch envelope. The weight archetype. */
 export function thump(g: CueGraph, at: number, dest: AudioNode, spec: ThumpSpec, gain: number): void {
   const ctx = g.ctx;
+  const start = t0(at);
 
   const osc = ctx.createOscillator();
   osc.type = 'sine';
-  osc.frequency.setValueAtTime(spec.hz, at);
+  osc.frequency.setValueAtTime(spec.hz, start);
   const dropTime = Math.max(spec.dropTime, MIN_SEG_S);
-  osc.frequency.exponentialRampToValueAtTime(Math.max(spec.dropHz, EPS_GAIN), at + dropTime);
+  osc.frequency.exponentialRampToValueAtTime(Math.max(spec.dropHz, EPS_GAIN), start + dropTime);
 
   const env = ctx.createGain();
   osc.connect(env);
   env.connect(dest);
 
-  const envEnd = applyEnv(env.gain, at, spec.env, gain);
-  const stopAt = Math.max(envEnd, at + dropTime);
-  osc.start(at);
+  const envEnd = applyEnv(env.gain, start, spec.env, gain);
+  const stopAt = Math.max(envEnd, start + dropTime);
+  osc.start(start);
   osc.stop(stopAt);
   osc.onended = (): void => {
     osc.disconnect();
@@ -219,6 +240,7 @@ export function thump(g: CueGraph, at: number, dest: AudioNode, spec: ThumpSpec,
 /** Inharmonic partial stack through a bandpass. Steel, armour, structures. */
 export function metal(g: CueGraph, at: number, dest: AudioNode, spec: MetalSpec, gain: number): void {
   const ctx = g.ctx;
+  const start = t0(at);
   const envLength = spec.env.attack + spec.env.decay + spec.env.release;
 
   const mix = ctx.createGain();
@@ -228,17 +250,17 @@ export function metal(g: CueGraph, at: number, dest: AudioNode, spec: MetalSpec,
   for (const ratio of spec.ratios) {
     const osc = ctx.createOscillator();
     osc.type = 'sine';
-    osc.frequency.setValueAtTime(spec.hz * ratio, at);
+    osc.frequency.setValueAtTime(spec.hz * ratio, start);
     osc.connect(mix);
     oscillators.push(osc);
   }
 
   const band = ctx.createBiquadFilter();
   band.type = 'bandpass';
-  band.frequency.setValueAtTime(spec.bandHz, at);
+  band.frequency.setValueAtTime(spec.bandHz, start);
   band.Q.value = spec.q;
 
-  const sweep = filterSweep(ctx, at, spec, envLength);
+  const sweep = filterSweep(ctx, start, spec, envLength);
   const env = ctx.createGain();
 
   mix.connect(band);
@@ -246,7 +268,7 @@ export function metal(g: CueGraph, at: number, dest: AudioNode, spec: MetalSpec,
   if (sweep) sweep.connect(env);
   env.connect(dest);
 
-  const endTime = applyEnv(env.gain, at, spec.env, gain);
+  const endTime = applyEnv(env.gain, start, spec.env, gain);
   const cleanup = (): void => {
     for (const osc of oscillators) osc.disconnect();
     mix.disconnect();
@@ -255,7 +277,7 @@ export function metal(g: CueGraph, at: number, dest: AudioNode, spec: MetalSpec,
     env.disconnect();
   };
   for (const osc of oscillators) {
-    osc.start(at);
+    osc.start(start);
     osc.stop(endTime);
     osc.onended = cleanup;
   }
@@ -270,15 +292,16 @@ export function shimmer(
   gain: number,
 ): void {
   const ctx = g.ctx;
+  const start = t0(at);
   const envLength = spec.env.attack + spec.env.decay + spec.env.release;
 
   const carrier = ctx.createOscillator();
   carrier.type = 'sine';
-  carrier.frequency.setValueAtTime(spec.hz, at);
+  carrier.frequency.setValueAtTime(spec.hz, start);
 
   const modulator = ctx.createOscillator();
   modulator.type = 'sine';
-  modulator.frequency.setValueAtTime(spec.modHz, at);
+  modulator.frequency.setValueAtTime(spec.modHz, start);
 
   const modDepth = ctx.createGain();
   modDepth.gain.value = spec.index;
@@ -286,16 +309,16 @@ export function shimmer(
   // True ring modulation: the modulator drives the ring gain's `gain` AudioParam, so the
   // carrier's output is multiplied by `index * sin(modHz * t)`.
   const ring = ctx.createGain();
-  ring.gain.setValueAtTime(0, at);
+  ring.gain.setValueAtTime(0, start);
   modulator.connect(modDepth);
   modDepth.connect(ring.gain);
   carrier.connect(ring);
 
   const tail = ctx.createBiquadFilter();
   tail.type = 'lowpass';
-  tail.frequency.setValueAtTime(spec.tailHz, at);
+  tail.frequency.setValueAtTime(spec.tailHz, start);
 
-  const sweep = filterSweep(ctx, at, spec, envLength);
+  const sweep = filterSweep(ctx, start, spec, envLength);
   const env = ctx.createGain();
 
   ring.connect(tail);
@@ -303,10 +326,10 @@ export function shimmer(
   if (sweep) sweep.connect(env);
   env.connect(dest);
 
-  const endTime = applyEnv(env.gain, at, spec.env, gain);
-  carrier.start(at);
+  const endTime = applyEnv(env.gain, start, spec.env, gain);
+  carrier.start(start);
   carrier.stop(endTime);
-  modulator.start(at);
+  modulator.start(start);
   modulator.stop(endTime);
 
   const cleanup = (): void => {
@@ -325,6 +348,7 @@ export function shimmer(
 /** Slow-attack detuned cluster. Ultimates, objectives, music pads. */
 export function swell(g: CueGraph, at: number, dest: AudioNode, spec: SwellSpec, gain: number): void {
   const ctx = g.ctx;
+  const start = t0(at);
   const envLength = spec.env.attack + spec.env.decay + spec.env.release;
 
   const mix = ctx.createGain();
@@ -338,7 +362,7 @@ export function swell(g: CueGraph, at: number, dest: AudioNode, spec: SwellSpec,
     const spread =
       voiceCount > 1 ? -spec.spreadCents / 2 + (spec.spreadCents * i) / (voiceCount - 1) : 0;
     osc.detune.value = spread;
-    osc.frequency.setValueAtTime(spec.hz, at);
+    osc.frequency.setValueAtTime(spec.hz, start);
     osc.connect(mix);
     oscillators.push(osc);
   }
@@ -347,10 +371,10 @@ export function swell(g: CueGraph, at: number, dest: AudioNode, spec: SwellSpec,
   // `openHz` is the start point; `FilterSweep.sweepHz` (if present) is where it moves to.
   const filter = ctx.createBiquadFilter();
   filter.type = 'lowpass';
-  filter.frequency.setValueAtTime(spec.openHz, at);
+  filter.frequency.setValueAtTime(spec.openHz, start);
   if (spec.sweepHz !== undefined) {
     const sweepTime = Math.max(spec.sweepTime ?? envLength, MIN_SEG_S);
-    filter.frequency.linearRampToValueAtTime(spec.sweepHz, at + sweepTime);
+    filter.frequency.linearRampToValueAtTime(spec.sweepHz, start + sweepTime);
   }
 
   const env = ctx.createGain();
@@ -358,7 +382,7 @@ export function swell(g: CueGraph, at: number, dest: AudioNode, spec: SwellSpec,
   filter.connect(env);
   env.connect(dest);
 
-  const endTime = applyEnv(env.gain, at, spec.env, gain);
+  const endTime = applyEnv(env.gain, start, spec.env, gain);
   const cleanup = (): void => {
     for (const osc of oscillators) osc.disconnect();
     mix.disconnect();
@@ -366,7 +390,7 @@ export function swell(g: CueGraph, at: number, dest: AudioNode, spec: SwellSpec,
     env.disconnect();
   };
   for (const osc of oscillators) {
-    osc.start(at);
+    osc.start(start);
     osc.stop(endTime);
     osc.onended = cleanup;
   }
