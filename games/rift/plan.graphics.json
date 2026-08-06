@@ -18,7 +18,8 @@
     "games/rift/server/src/sim/types.ts",
     "games/rift/client/src/contract.ts",
     "games/rift/client/src/render/core.ts",
-    "games/rift/client/src/render/kit.ts"
+    "games/rift/client/src/render/kit.ts",
+    "games/rift/client/src/render/kit.test.ts"
   ],
   "modules": {
     "S_VISION": [

@@ -1,6 +1,6 @@
 # RIFT graphics + terrain build — task specs
 
-This document is the dispatch spec for the 26 build modules in `plan.graphics.json`.
+This document is the dispatch spec for the 27 build modules in `plan.graphics.json`.
 Every implementer agent reads §0 (universal rules) plus exactly one task section.
 
 Authority order, highest first:
@@ -881,10 +881,12 @@ construction inside 150 ms.
 
 ---
 
-### R_MESH_HERO / R_MESH_CREEP / R_MESH_CAMP / R_MESH_STRUCT
+### R_MESH_SHARED — shared rules, read by all four mesh tasks
 
 Four independent net-new modules in a net-new directory. Same shape, so the shared rules are
-stated once; each task owns exactly one file and must not create the others.
+stated once here; each task owns exactly one file and must not create the others. **This is not
+a task.** If you were dispatched as `R_MESH_HERO`, `R_MESH_CREEP`, `R_MESH_CAMP` or
+`R_MESH_STRUCT`, read this section first, then your own `### R_MESH_*` section below.
 
 **Shared rules for all four.** Every module returns `UnitBuild`:
 
@@ -912,42 +914,94 @@ interface UnitBuild {
 - No per-frame allocation. Build once; the caller pools and reuses.
 - Call these builders once per archetype, never per entity.
 
+**Gate (all four):** typecheck clean for the owned file; a smoke render of every archetype the
+module builds; part counts inside the budget, reported per archetype in your summary.
+
+---
+
+### R_MESH_HERO
+
 ```
-R_MESH_HERO   — client/src/render/meshes/heroes.ts
-                export function buildHero(id: HeroId, team: EntTeam): UnitBuild
-                Model tier: LARGE — heroes carry the art bar.
-                45-70 parts. One distinct silhouette per HeroId in HERO_LIST — a player must
-                identify the hero from the shape alone at gameplay zoom. Read heroById(id) for
-                role/visual hints and honour them. Weapon and headgear are the two strongest
-                silhouette cues at this size; spend parts there, not on faces.
-
-R_MESH_CREEP  — client/src/render/meshes/creeps.ts
-                export function buildCreep(kind: EntKind, team: EntTeam): UnitBuild
-                Model tier: MEDIUM.
-                22-35 parts. Covers melee, ranged, siege, shade, ward, proj. Melee/ranged/siege
-                must be distinguishable at a glance — last-hitting depends on it. Siege reads
-                bulky and slow; ranged reads light with a visible implement; shade reads
-                translucent/spectral (and is the one creep that may use emissive + markBloom).
-
-R_MESH_CAMP   — client/src/render/meshes/camps.ts
-                export function buildCamp(tier: 'pack'|'brute'|'hive'): UnitBuild
-                Model tier: MEDIUM.
-                25-40 parts. Neutral palette only — no team colour, ever; these are team 2 and
-                reading them as an enemy creep is a gameplay error. The three tiers must be
-                distinguishable at a distance by mass and height, because that is how a player
-                judges whether a camp is safe to take.
-
-R_MESH_STRUCT — client/src/render/meshes/structures.ts
-                export function buildStructure(kind: StructureKind, team: TeamId): UnitBuild
-                Model tier: LARGE — towers and ancients are the map's landmarks.
-                Towers 55-80 parts, ancients 110-160. StructureKind is 'tower'|'guard'|'ancient'.
-                These are the tallest things on the map and orient the player; make them read
-                from across the map, and make a damaged-vs-healthy read possible if cheap.
-                Crystal/gold accents are the legitimate bloom targets here.
+Task:        Hero meshes — the modules that carry the art bar.
+Model tier:  LARGE
+Depends on:  contract only
+Owns:        client/src/render/meshes/heroes.ts
 ```
 
-**Gate (each):** typecheck clean for the owned file; a smoke render of every archetype the module
-builds; part counts inside the budget, reported per archetype in your summary.
+Read `### R_MESH_SHARED` above first — its rules bind you.
+
+`export function buildHero(id: HeroId, team: EntTeam): UnitBuild`
+
+**45–70 parts.** One distinct silhouette per `HeroId` in `HERO_LIST` — a player must identify the
+hero from shape alone at gameplay zoom. Read `heroById(id)` for role/visual hints and honour
+them. Weapon and headgear are the two strongest silhouette cues at this size; spend parts there,
+not on faces. At `CAM_MIN_H = 11` a hero is roughly 70 px tall, which is what makes this part
+budget worth spending at all — anything that reads only above that is wasted.
+
+---
+
+### R_MESH_CREEP
+
+```
+Task:        Lane creep, summon, ward and projectile meshes.
+Model tier:  MEDIUM
+Depends on:  contract only
+Owns:        client/src/render/meshes/creeps.ts
+```
+
+Read `### R_MESH_SHARED` above first — its rules bind you.
+
+`export function buildCreep(kind: EntKind, team: EntTeam): UnitBuild`
+
+**22–35 parts.** Covers `melee`, `ranged`, `siege`, `shade`, `ward`, `proj`. Melee/ranged/siege
+must be distinguishable at a glance — last-hitting depends on it, so this is a gameplay
+requirement, not an art one. Siege reads bulky and slow; ranged reads light with a visible
+implement; `shade` reads translucent/spectral and is the one creep that may use `emissiveSurface`
++ `markBloom`. Do not build camp creeps here — those are R_MESH_CAMP's.
+
+---
+
+### R_MESH_CAMP
+
+```
+Task:        Neutral jungle camp creature meshes.
+Model tier:  MEDIUM
+Depends on:  contract only
+Owns:        client/src/render/meshes/camps.ts
+```
+
+Read `### R_MESH_SHARED` above first — its rules bind you.
+
+`export function buildCamp(tier: 'pack' | 'brute' | 'hive'): UnitBuild`
+
+**25–40 parts.** **Neutral palette only — no team colour, ever.** These are `team === 2`; a
+player reading one as an enemy creep is a gameplay error, not a cosmetic one. Note the signature
+takes no team, deliberately. The three tiers must be distinguishable at a distance by mass and
+height, because that silhouette is how a player judges whether a camp is safe to take before
+committing.
+
+---
+
+### R_MESH_STRUCT
+
+```
+Task:        Tower, guard and ancient meshes — the map's landmarks.
+Model tier:  LARGE
+Depends on:  contract only
+Owns:        client/src/render/meshes/structures.ts
+```
+
+Read `### R_MESH_SHARED` above first — its rules bind you.
+
+`export function buildStructure(kind: StructureKind, team: TeamId): UnitBuild`
+
+`StructureKind` is `'tower' | 'guard' | 'ancient'`. **Towers 55–80 parts, ancients 110–160.**
+Note this signature takes `TeamId`, not `EntTeam` — structures are never neutral.
+
+These are the tallest things on the map and are what orient a player who has just panned; make
+them read from across the map. Make a damaged-vs-healthy read possible if it is cheap. Crystal
+and gold accents are the legitimate `markBloom` targets here — the ancient should be the single
+brightest thing in a wide base shot.
 
 ---
 
