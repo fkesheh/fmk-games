@@ -95,7 +95,18 @@ function scheduleLayerGain(node: GainNode, fromSec: number, target: number, fade
     return;
   }
   // Every fade here is binary (layer off -> on, or on -> off), so the "from" endpoint is
-  // simply the opposite of the target — no separate state tracking needed.
+  // reconstructed as simply the opposite of the target, not read from the param's true
+  // in-flight value. That reconstruction is only correct if no two fades on the same node
+  // can ever overlap — i.e. a fade started at one bar boundary must always have FINISHED
+  // (`fadeS` elapsed) before the next possible toggle of that same layer, which only ever
+  // happens at the next bar boundary. That holds today because `MUSIC.layerFadeS` (1.2s)
+  // < `BAR_SEC` (2.857s at bpm 84) and intensity changes only land on bar boundaries
+  // (`syncBar`) — so a fade always completes before the next one can start. If a future
+  // bpm increase or a shorter bar ever makes `layerFadeS >= BAR_SEC`, this invariant
+  // breaks: a new fade could be scheduled onto a node mid-ramp, this reconstructed `from`
+  // would be wrong, and `cancelScheduledValues` + `setValueAtTime` would snap the gain to
+  // the wrong value — an audible click. Fix at that point by reading the param's actual
+  // current value instead of assuming it, not by reintroducing this comment.
   const from = target > 0.5 ? 0 : 1;
   if (fromSec < 0) {
     const elapsed = clamp01((0 - fromSec) / fadeS);
@@ -134,7 +145,11 @@ function schedulePad(g: CueGraph, dest: AudioNode, atSec: number, barIdx: number
       hz,
       voices: 3,
       spreadCents: 8,
-      openHz: 900,
+      // <= INFO_FLOOR_HZ (800): the pad is the single most continuous signal in the mix,
+      // so it has more opportunity than any cue to crowd the band the last-hit chime and
+      // announcer stings depend on. A triangle's fast harmonic rolloff means this costs
+      // very little of the pad's character.
+      openHz: 780,
       sweepHz: 560,
       sweepTime: attack + decay + release,
       env: adsr(attack, decay, 0.82, release, 1),

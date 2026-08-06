@@ -417,18 +417,40 @@ const OBJ_RESPAWN: CueFn = (g, at, p) => {
   );
 };
 
-/** A single `info`-register tick. Fired once per whole second by `game.ts`; no internal loop. */
+/**
+ * A single `info`-register tick. Fired once per whole second by `game.ts`; no internal
+ * loop. Deliberately NOT `ui.abilityReady`'s bare `PALETTE.info.A5` sine: same register,
+ * different pitch (`D6`) plus a short highpass-noise click for a mechanical "clock tick"
+ * attack character, so the two unrelated meanings ("a second passed" vs "ability ready")
+ * stay distinguishable by ear and on a spectrogram.
+ */
 const OBJ_COUNTDOWN: CueFn = (g, at, p) => {
+  const dest = p.dest;
+  const level = p.gain;
+
   tone(
     g,
     at,
-    p.dest,
+    dest,
     {
-      type: 'sine',
-      hz: jitter(g, PALETTE.info.A5, VARY.pitchPct),
-      env: { attack: 0.003, decay: 0.05, sustain: 0.15, release: 0.12, peak: 0.55 },
+      type: 'triangle',
+      hz: jitter(g, PALETTE.info.D6, VARY.pitchPct),
+      env: { attack: 0.002, decay: 0.04, sustain: 0.1, release: 0.09, peak: 0.5 },
     },
-    p.gain * jitterDb(g, VARY.levelDb),
+    level * jitterDb(g, VARY.levelDb),
+  );
+
+  noise(
+    g,
+    at,
+    dest,
+    {
+      filter: 'highpass',
+      hz: 3000,
+      q: 0.8,
+      env: { attack: 0.001, decay: 0.02, sustain: 0.02, release: 0.03, peak: 0.22 },
+    },
+    level * jitterDb(g, VARY.levelDb),
   );
 };
 
@@ -488,7 +510,7 @@ const OBJ_MATCH_START: CueFn = (g, at, p) => {
     dest,
     {
       filter: 'bandpass',
-      hz: 900,
+      hz: 600,
       q: 1.2,
       env: { attack: 0.02, decay: 0.1, sustain: 0.05, release: 0.15, peak: 0.15 },
     },
@@ -730,15 +752,20 @@ const ANN_DRAW: CueFn = (g, at, p) => {
 
 export const OBJECTIVE_CUES = {
   'obj.tower': { fn: OBJ_TOWER, bus: 'sfx', priority: 1, tail: 2.0, variants: 1, dry: false },
-  'obj.guard': { fn: OBJ_GUARD, bus: 'sfx', priority: 1, tail: 1.7, variants: 1, dry: false },
+  // Real tail (swell layer): 1.715 s. Declared 1.8 s for an honest ~85 ms cushion —
+  // 1.7 undershot it by 15 ms and would have truncated the swell's release.
+  'obj.guard': { fn: OBJ_GUARD, bus: 'sfx', priority: 1, tail: 1.8, variants: 1, dry: false },
   'obj.ancient': { fn: OBJ_ANCIENT, bus: 'sfx', priority: 1, tail: 2.8, variants: 1, dry: false },
   'obj.surge': { fn: OBJ_SURGE, bus: 'sfx', priority: 1, tail: 1.6, variants: 1, dry: false },
   'obj.klaxon': { fn: OBJ_KLAXON, bus: 'sfx', priority: 1, tail: 1.7, variants: 1, dry: false },
-  'obj.respawn': { fn: OBJ_RESPAWN, bus: 'sfx', priority: 2, tail: 1.2, variants: 1, dry: false },
-  'obj.countdown': { fn: OBJ_COUNTDOWN, bus: 'sfx', priority: 4, tail: 0.25, variants: 1, dry: true },
+  // Real tail (tone layer): 1.4 s. Declared 1.45 s — 1.2 truncated the fountain-hum onset.
+  'obj.respawn': { fn: OBJ_RESPAWN, bus: 'sfx', priority: 2, tail: 1.45, variants: 1, dry: false },
+  'obj.countdown': { fn: OBJ_COUNTDOWN, bus: 'sfx', priority: 4, tail: 0.15, variants: 1, dry: true },
   'obj.matchStart': { fn: OBJ_MATCH_START, bus: 'sfx', priority: 1, tail: 1.6, variants: 1, dry: false },
   'ann.firstBlood': { fn: ANN_FIRST_BLOOD, bus: 'announcer', priority: 0, tail: 1.6, variants: 1, dry: true },
   'ann.victory': { fn: ANN_VICTORY, bus: 'announcer', priority: 0, tail: 3.0, variants: 1, dry: true },
   'ann.defeat': { fn: ANN_DEFEAT, bus: 'announcer', priority: 0, tail: 3.0, variants: 1, dry: true },
-  'ann.draw': { fn: ANN_DRAW, bus: 'announcer', priority: 0, tail: 2.5, variants: 1, dry: true },
+  // Real tail (swell layer): 2.8 s. Declared 2.9 s — 2.5 truncated the "holds and fades"
+  // moment that is the entire character of an unresolved draw.
+  'ann.draw': { fn: ANN_DRAW, bus: 'announcer', priority: 0, tail: 2.9, variants: 1, dry: true },
 } satisfies CueRegistry;
