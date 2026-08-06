@@ -127,7 +127,7 @@ export function makeImpulse(
 ): AudioBuffer;
 
 /** Soft-clip curve for the limiter WaveShaper. `ceilingDb` is a SAMPLE-domain asymptote. */
-export function makeLimiterCurve(ceilingDb: number): Float32Array;
+export function makeLimiterCurve(ceilingDb: number): Float32Array<ArrayBuffer>;
 ```
 
 `Env`, `FilterSweep`, `ToneSpec`, `NoiseSpec`, `ThumpSpec`, `MetalSpec`, `ShimmerSpec`, `SwellSpec`
@@ -255,7 +255,7 @@ used for exactly one thing: the out-of-order guard.
 | `gold` | **Only when `delta >= DERIVE.goldMinDelta`.** Passive income is fractional and lands every single tick, so `gold > prevGold` is true on every snapshot; without this floor the module would schedule a UI cue 20×/s all match (400×/s at the gates' `speed: 20`). `lastHit = delta >= DERIVE.lastHitMinGold` **and** a `unitDeath` was emitted this same snapshot. |
 | `levelUp` | `you.level > prev.level` and `you.level > 1`. |
 | `skillPointAvailable` | `you.skillPoints > prev.skillPoints`. Emits once per increase. |
-| `abilityReady` | Per slot: previously `cdUntilTick > snap.matchTick`, now `cdUntilTick <= snap.matchTick`, and `rank > 0`. |
+| `abilityReady` | Per slot: previously `prevCdUntilTick > prev.matchTick`, now `cdUntilTick <= snap.matchTick`, and `rank > 0`. **Each side compares against its OWN snapshot's `matchTick`.** Using `snap.matchTick` on both sides is wrong: on natural expiry `cdUntilTick` does not change, so both sides evaluate identically and the cue never fires. |
 | `respawn` | Previously `respawnAtTick > 0` with `snap.matchTick < respawnAtTick`, now `respawnAtTick === 0`. |
 | `ancientThreat` | Own team's `ancient` entity crossing below `DERIVE.ancientThreatFrac` of `maxHp`. Once per crossing. |
 
@@ -325,7 +325,7 @@ Item actives: `blinkstone` = 8 m dash, `warhorn` = damage-aura horn, `wardstone`
 
 ### T5 — `audio/cues/combat.ts`
 
-Export `const COMBAT_CUES = { ... } satisfies CueRegistry;` — **17** keys: `atk.hero.melee`,
+Export `const COMBAT_CUES = { ... } satisfies CueRegistry;` — **16** keys: `atk.hero.melee`,
 `atk.hero.ranged`, `atk.creep.melee`, `atk.creep.ranged`, `atk.siege`, `atk.tower`, `hit.physical`,
 `hit.magic`, `hit.self`, `hit.crit`, `hit.heartbeat`, `die.hero`, `die.hero.ally`, `die.hero.self`,
 `die.creep`, `die.ward`.
@@ -441,6 +441,17 @@ its own synthesis directly. Layers are keyed by the `MusicLayer` type (`'pad' | 
 Export `createAudio: CreateAudio`. The assembly point and the drop-in replacement for the old
 `ui/audio.ts` factory.
 
+**BINDING — structure allegiance is carried on `CuePlay.intensity`.** `CuePlay` has no `friendly`
+field, so T6 encodes ally/enemy structure colour through `intensity`: `>= 0.5` means *your own*
+structure fell (tense `INTERVAL.enemy` colour), `< 0.5` means an *enemy* structure fell (consonant
+`INTERVAL.ally` colour). The `structure` routing row in `index.ts` MUST therefore pass
+`intensity: friendly ? 1 : 0`.
+
+This is not optional polish. The default is `0`, so omitting it renders **every** structure fall —
+including your own ancient collapsing — as good news. That is the identical failure the pre-freeze
+review already caught on `heroDeath.friendly`, and it is inaudible in a typecheck. Wire it, and
+confirm by ear in the scene renders that a friendly tower loss reads as a loss.
+
 - Lazily create one `AudioContext` on the first `resume()`/`ui()`/`event()` call (never in
   `createAudio()` — autoplay policy). Feature-detect `webkitAudioContext`. On failure every method
   becomes a silent no-op and the game plays on.
@@ -510,6 +521,19 @@ Export `createAudio: CreateAudio`. The assembly point and the drop-in replacemen
 ### T11 — `audio/lab.ts` + `audio/baseline.legacy.ts` + `games/rift/client/audio-lab.html` + `games/rift/client/vite.config.ts`
 
 The render seam. **Without this there is no judge loop, so this task is as important as the cues.**
+
+**Binding interface with T12 (the harness is already written against these — they are not negotiable):**
+
+| Requirement | Exact value |
+| --- | --- |
+| Page path served by the platform server | `/rift/audio-lab.html` |
+| `document.title` | `RIFT AUDIO LAB` — verbatim, all caps |
+| New-build API global | `window.__riftAudio` implementing `AudioLabApi` |
+| Baseline API global | `window.__riftAudioBaseline` implementing `BaselineLabApi` |
+
+The title check exists because the platform server serves the game's `index.html` with HTTP 200 on
+any miss — without it, a missing lab page looks like a successful load and the harness would grade
+the wrong document. Both globals must be assigned before the page signals ready.
 
 **`audio/baseline.legacy.ts`** — a copy of the current `games/rift/client/src/ui/audio.ts`, modified
 in exactly these ways and no others (**no gain value, frequency, envelope or node topology may
