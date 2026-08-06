@@ -636,3 +636,36 @@ Three carve-outs from the Immutability rule are granted, and only these three:
 `wire.ts` and `main.ts` remain orchestrator-owned and the audio settings panel is
 mounted from `wire.ts`, preserving §6's rule that `game.ts` never imports an
 implementation module.
+
+---
+
+## Audio amendment (deliberate, recorded here)
+
+The audio rebuild (`docs/rift-audio/AUDIO_CONTRACT.md`, `docs/rift-audio/SONIC_BIBLE.md`)
+supersedes §6's `audio.ts` (T9) line. It replaces the single
+`client/src/ui/audio.ts` with the module directory `client/src/audio/`, whose own
+Layer-1 files are `client/src/audio/contract.ts` and `client/src/audio/config.ts`.
+Three carve-outs from the Immutability rule are granted, and only these three:
+
+1. **`client/src/contract.ts`** (Layer-1, normative) may be edited by the
+   ORCHESTRATOR ONLY, and only to re-export `RiftAudioHandle` from
+   `./audio/contract.js` as `AudioHandle`. `RiftAudioHandle` is a structural
+   superset of the previous `AudioHandle` — `event`/`ui`/`setPhase` keep their
+   meaning and every existing `game.ts` call site stays valid — so no other seam
+   in `ClientModules` changes. No implementer may touch this file.
+
+2. **The DOM CLASS CONTRACT** is extended by exactly four classes, owned by the
+   audio settings panel:
+     .audio-panel .audio-panel-row .audio-panel-slider .audio-panel-mute
+   plus `.audio-panel-toggle` for its self-contained open/close button. The panel
+   appends its CSS to the end of `client/src/style.css` in a delimited block and
+   modifies no existing rule.
+
+3. **`client/vite.config.ts`** (a workspace manifest, normally Layer-1) gains a
+   `build.rollupOptions.input` listing `index.html` AND `audio-lab.html`. The lab
+   page is the offline-render seam the audio judge loop measures against; without
+   it there is no way to score rendered audio. Nothing else in that file changes.
+
+`wire.ts` and `main.ts` remain orchestrator-owned and the audio settings panel is
+mounted from `wire.ts`, preserving §6's rule that `game.ts` never imports an
+implementation module.

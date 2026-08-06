@@ -23,7 +23,7 @@
       "games/rift/client/audio-lab.html",
       "games/rift/client/vite.config.ts"
     ],
-    "T12-harness": ["scripts/audio-render-rift.mjs", "package.json"],
+    "T12-harness": ["scripts/audio-render-rift.mjs"],
     "T13-tests": ["games/rift/client/src/audio/derive.test.ts"],
     "T14-settings": [
       "games/rift/client/src/audio/settingsPanel.ts",
@@ -33,10 +33,12 @@
       "games/rift/client/src/contract.ts",
       "games/rift/client/src/wire.ts",
       "games/rift/client/src/game.ts",
-      "games/rift/client/src/ui/audio.ts"
+      "games/rift/client/src/ui/audio.ts",
+      "package.json",
+      "games/rift/CONTRACT.md"
     ]
   },
   "integrator": "integration",
   "typecheck_cmd": "npx tsc --noEmit -p games/rift/client/tsconfig.json",
-  "root": "/Users/fkesheh/projects/fps-rift"
+  "root": "/private/tmp/claude-501/-Users-fkesheh-projects-fps/7109001e-a41d-4f85-bb5f-43f7804a5317/scratchpad/audio"
 }
