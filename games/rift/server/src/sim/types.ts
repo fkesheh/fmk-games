@@ -133,7 +133,12 @@ export interface Ent {
   slowUntilTick: number;
   /** Active dash: rapid scripted motion toward (ox, oz). */
   dashUntilTick: number;
-  /** Summons/wards: tick at which the entity expires. 0 = never. */
+  /** Summons/wards: tick at which the entity expires. **`<= 0` means never.**
+   *
+   *  AMENDMENT_1 §B.3 widened this from "0 = never". Camp members spawn with
+   *  -1, and three separate modules each independently rediscovered that and
+   *  widened their own predicate locally. The sentinel is now stated once here;
+   *  test `expireAtTick <= 0`, never `=== 0`. */
   expireAtTick: number;
   auras: AuraInstance[]; // pooled per ent; length managed by sim
   // hero progression (heroes only)
@@ -269,7 +274,19 @@ export type SimEvent =
   | { k: 'kill'; killerPid: string | null; victimPid: string; gold: number; firstBlood: boolean }
   | { k: 'structure'; team: TeamId; kind: 'tower' | 'guard' | 'ancient'; lane: number | null }
   | { k: 'surge' }
-  | { k: 'end'; winner: TeamId | null; reason: EndReason };
+  | { k: 'end'; winner: TeamId | null; reason: EndReason }
+  /** An auto-attack missed because the attacker was shooting uphill
+   *  (TERRAIN_CONTRACT §4). Added by AMENDMENT_1 §B.2.
+   *
+   *  `attacker` and `target` are ENTITY ids, matching `rift_miss` on the wire —
+   *  not player ids. room.ts maps this to RiftEvent `rift_miss` and must
+   *  vision-filter on the ATTACKER id, mirroring how it handles `cast`.
+   *
+   *  Without this variant, combat.ts pushed a local MissEvent through a
+   *  bivariance seam, which made `drainEvents(): SimEvent[]` return elements
+   *  that are not SimEvents — unsound, and rift_miss could never reach the
+   *  client, so a miss read to the player as a damage bug. */
+  | { k: 'miss'; attacker: EntId; target: EntId };
 
 /** The ability engine (T4) is injected into the world at construction, so T3
  *  and T4 build in parallel with zero cross-imports. `step` runs inside

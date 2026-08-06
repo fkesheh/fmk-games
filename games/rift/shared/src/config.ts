@@ -387,6 +387,42 @@ export const NIGHT_VISION_MULT = 0.75;
  *  0 = day / 1 = night phase so a reconnecting client's lighting is correct. */
 export const DAY_PERIOD_S = 600;
 
+/** The day/night phase at a given match tick: 0 = full day, 1 = full night.
+ *
+ *  AMENDMENT_1 §B.1 hoisted this out of vision.ts. It is the SINGLE definition
+ *  of the cycle — `sim/vision.ts` scales vision by it and `room.ts` puts it on
+ *  the wire as `rift_snap.dayPhase`, and they MUST call this same function.
+ *  They were about to derive it independently, and BUILD_SPECS had handed
+ *  room.ts a sawtooth (`(t / TICK_RATE / DAY_PERIOD_S) % 1`) while protocol.ts
+ *  freezes dayPhase as a wrapping TRIANGLE. Near a cycle boundary the sawtooth
+ *  reads 0.99 where the triangle reads 0.02: the client would have rendered
+ *  full day while the server ran full night.
+ *
+ *  Triangle, not sawtooth, because the value is a physical phase that must be
+ *  continuous across the wrap — a sawtooth's 1 -> 0 jump would snap every
+ *  light and every vision radius in the game in a single tick. */
+export function dayPhase(matchTick: number): number {
+  const cycle = DAY_PERIOD_S * TICK_RATE;
+  const t = ((matchTick % cycle) + cycle) % cycle; // non-negative even pre-start
+  const half = cycle / 2;
+  return t < half ? t / half : 2 - t / half;
+}
+
+/** Vision multiplier at a given day phase — a SMOOTH RAMP from 1 at full day to
+ *  NIGHT_VISION_MULT at full night.
+ *
+ *  AMENDMENT_1 §C ratifies the ramp and amends TERRAIN_CONTRACT §4.3, which had
+ *  written this as a boolean snap. A boolean `night` is undefined against a
+ *  dayPhase that protocol.ts freezes as continuous, and a snap would pop every
+ *  unit's vision radius by 25% in one tick at the threshold.
+ *
+ *  Applies to heroes and creeps (including camp creeps) ONLY. Wards, towers,
+ *  guards and ancients are lit and keep full radius — see NIGHT_VISION_MULT. */
+export function nightVisionScale(phase: number): number {
+  const p = phase < 0 ? 0 : phase > 1 ? 1 : phase;
+  return 1 - (1 - NIGHT_VISION_MULT) * p;
+}
+
 // --- Match arc ----------------------------------------------------------------------
 export const OVERTIME_AT_S = 660; // 11:00 — surge begins (measured: 1200 pushes the duration median past the §9 band)
 export const SURGE_WAVE_GROWTH = 0.11; // replaces WAVE_GROWTH in overtime

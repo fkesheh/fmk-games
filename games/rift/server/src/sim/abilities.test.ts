@@ -1,21 +1,53 @@
 // ============================================================================
 // ANCIENTS (rift) — ABILITY ENGINE TESTS (T4). Runs the engine against a
-// recording FAKE World (StubDict-style test double — world.ts is T3's,
-// built concurrently, and is never imported here). The fake implements the
-// frozen World interface plus the two seam-gap members the engine needs
-// (drainCasts/pushEvent — see the abilities.ts header).
+// recording FAKE World (StubDict-style test double — world.ts is T3's, built
+// concurrently, and is never imported here). The fake implements the frozen
+// World interface exactly: `drainCasts`/`pushEvent` are members of the seam
+// now, and `camps` is the live neutral camp table (TERRAIN_CONTRACT §5).
+//
+// Two halves: the player-target suite, which must be BIT-for-bit unchanged by
+// the neutral work, and the neutral suite, which pins the rule that a camp is
+// an enemy of both player teams and an ally of neither.
 // ============================================================================
 import { describe, expect, it } from 'vitest';
-import type { AuraStat, HeroId, MapDef, TeamId } from '@rift/shared';
-import { TICK_RATE } from '@rift/shared';
-import type { Ent, EntId, Order, SimEvent, World } from './types.js';
+import type { AuraStat, CampDef, EntTeam, HeroId, MapDef, TeamId, TerrainDef } from '@rift/shared';
+import { isPlayerTeam, NEUTRAL_TEAM, TICK_RATE } from '@rift/shared';
+import type { CampState, Ent, EntId, Order, QueuedCast, SimEvent, World } from './types.js';
 import { NO_ENT } from './types.js';
-import type { QueuedCast } from './abilities.js';
 import { createAbilitiesEngine, ITEM_EVENT_SLOT_BASE } from './abilities.js';
 
-const TEST_MAP: MapDef = { lanes: 1, side: 96, paths: [], structures: [] };
+const TEST_SIDE = 96;
+/** The clearing every neutral test spawns its camp in. Kept in one place so
+ *  the fixture terrain and the camp entities cannot drift apart. */
+const CAMP_X = 16;
+const CAMP_Z = 10;
 
-function mkEnt(over: Partial<Ent> & { id: EntId; kind: Ent['kind']; team: TeamId }): Ent {
+const TEST_CAMP: CampDef = { id: 0, tier: 'brute', x: CAMP_X, z: CAMP_Z, half: 0 };
+
+/** Flat, all-passable, all-low-ground terrain. The engine reads no terrain at
+ *  all by design (projectiles fly over cliffs, DESIGN_DELTA §1) — this exists
+ *  only because `MapDef.terrain` is required and never optional. */
+const TEST_TERRAIN: TerrainDef = {
+  grid: {
+    side: TEST_SIDE,
+    res: 1,
+    dim: TEST_SIDE,
+    kind: new Uint8Array(TEST_SIDE * TEST_SIDE), // 0 = 'ground'
+    elev: new Uint8Array(TEST_SIDE * TEST_SIDE), // 0 = ELEV_LOW
+  },
+  camps: [TEST_CAMP],
+  landmarks: [],
+};
+
+const TEST_MAP: MapDef = {
+  lanes: 1,
+  side: TEST_SIDE,
+  paths: [],
+  structures: [],
+  terrain: TEST_TERRAIN,
+};
+
+function mkEnt(over: Partial<Ent> & { id: EntId; kind: Ent['kind']; team: EntTeam }): Ent {
   return {
     x: 0,
     z: 0,
@@ -42,6 +74,8 @@ function mkEnt(over: Partial<Ent> & { id: EntId; kind: Ent['kind']; team: TeamId
     ox: 0,
     oz: 0,
     orderTarget: NO_ENT,
+    path: null,
+    pathIndex: 0,
     lane: -1,
     waypoint: 0,
     stunUntilTick: 0,
@@ -82,6 +116,10 @@ class FakeWorld implements World {
   readonly map = TEST_MAP;
   overtime = false;
   readonly ents = new Map<EntId, Ent>();
+  /** The live camp table. The engine targets ENTITIES and never reads this,
+   *  but the frozen World surface carries it, so the fake carries it too and
+   *  the neutral tests register their camp here exactly as camps.ts will. */
+  readonly camps: CampState[] = [];
   readonly log: string[] = [];
   private queue: QueuedCast[] = [];
   private events: SimEvent[] = [];
@@ -185,7 +223,7 @@ class FakeWorld implements World {
 
   spawnMobile(
     kind: Ent['kind'],
-    team: TeamId,
+    team: EntTeam,
     x: number,
     z: number,
     lane: number,
@@ -211,15 +249,6 @@ class FakeWorld implements World {
     return 0;
   }
 
-  drainEvents(): SimEvent[] {
-    const ev = this.events;
-    this.events = [];
-    return ev;
-  }
-
-  advance(): void {}
-
-  // --- seam-gap members (reported; not yet on the frozen World) ---
   drainCasts(): QueuedCast[] {
     const c = this.queue;
     this.queue = [];
@@ -229,6 +258,14 @@ class FakeWorld implements World {
   pushEvent(ev: SimEvent): void {
     this.events.push(ev);
   }
+
+  drainEvents(): SimEvent[] {
+    const ev = this.events;
+    this.events = [];
+    return ev;
+  }
+
+  advance(): void {}
 }
 
 function mkHero(
@@ -245,6 +282,52 @@ function mkHero(
 
 function mkCreep(w: FakeWorld, id: EntId, team: TeamId, x: number, z: number, over: Partial<Ent> = {}): Ent {
   return w.add(mkEnt({ id, kind: 'melee', team, x, z, hp: 450, maxHp: 450, radius: 0.42, ...over }));
+}
+
+type CampKind = 'campPack' | 'campBrute' | 'campHive';
+
+/** One neutral camp creep, spawned exactly the way sim/camps.ts will spawn it
+ *  (TERRAIN_CONTRACT §5): NEUTRAL_TEAM, lane -1, owner NO_ENT — and
+ *  `expireAtTick = -1`, the encoding that means "never expires" for a camp and
+ *  that a naive `expireAtTick !== 0` reaper reads as "already expired". */
+function mkCampCreep(
+  w: FakeWorld,
+  id: EntId,
+  kind: CampKind,
+  x: number,
+  z: number,
+  over: Partial<Ent> = {},
+): Ent {
+  return w.add(
+    mkEnt({
+      id,
+      kind,
+      team: NEUTRAL_TEAM,
+      x,
+      z,
+      lane: -1,
+      owner: NO_ENT,
+      expireAtTick: -1,
+      hp: 900,
+      maxHp: 900,
+      radius: 0.6,
+      ...over,
+    }),
+  );
+}
+
+/** Register a live CampState for `members`, mirroring what the world builds at
+ *  construction: id === index in World.camps, respawnAtTick -1 while up. */
+function registerCamp(w: FakeWorld, members: readonly Ent[]): CampState {
+  const camp: CampState = {
+    id: w.camps.length,
+    def: TEST_CAMP,
+    memberIds: members.map((m) => m.id),
+    aliveCount: members.length,
+    respawnAtTick: -1,
+  };
+  w.camps.push(camp);
+  return camp;
 }
 
 function setup() {
@@ -726,5 +809,176 @@ describe('item actives', () => {
     engine.step(world);
     expect(world.log).toEqual([]);
     expect(world.drainEvents()).toEqual([]);
+  });
+});
+
+// --- Neutral jungle camps (TERRAIN_CONTRACT §5, DESIGN_DELTA §2) --------------------
+
+describe('neutral camps', () => {
+  it('an AoE heal centred on a camp heals no camp member and buffs no camp member', () => {
+    const { world, engine } = setup();
+    const h = mkHero(world, 1, 0, 'mender', 10, 10, { abilityRanks: [0, 0, 1, 0] });
+    // Sanctuary: point cast, range 8, aoe 4, heal 60 + hpRegen aura (radius 4).
+    const a = mkCampCreep(world, 20, 'campBrute', CAMP_X, CAMP_Z, { hp: 100 });
+    const b = mkCampCreep(world, 21, 'campPack', CAMP_X + 1.5, CAMP_Z, { hp: 100 });
+    registerCamp(world, [a, b]);
+    const ally = mkCreep(world, 2, 0, 15, 10, { hp: 100 }); // 1m from the point
+    const foe = mkCreep(world, 3, 1, 18, 10, { hp: 100 }); // 2m from the point
+    world.cast(1, 2, CAMP_X, CAMP_Z, NO_ENT);
+    engine.step(world);
+    expect(ally.hp).toBe(160); // 100 + 60
+    expect(ally.auras).toHaveLength(1);
+    expect(a.hp).toBe(100);
+    expect(b.hp).toBe(100);
+    expect(a.auras).toEqual([]);
+    expect(b.auras).toEqual([]);
+    expect(foe.hp).toBe(100); // heals are ally-only, unchanged by the neutral rule
+    expect(h.mana).toBe(930); // 1000 - 70: the cast itself still happened
+  });
+
+  it('an AoE nuke damages camps and enemy heroes but never allies', () => {
+    const { world, engine } = setup();
+    mkHero(world, 1, 0, 'hex', 10, 10, { abilityRanks: [0, 0, 0, 1] });
+    // Annihilate: point cast, range 10, aoe 4.5, 350 magic + 1.0s stun.
+    const camp = mkCampCreep(world, 20, 'campBrute', CAMP_X, CAMP_Z);
+    registerCamp(world, [camp]);
+    const foe = mkHero(world, 2, 1, 'reaver', CAMP_X + 1, CAMP_Z, { hp: 900, maxHp: 900 });
+    const ally = mkCreep(world, 3, 0, CAMP_X - 1, CAMP_Z, { hp: 450 });
+    world.cast(1, 3, CAMP_X, CAMP_Z, NO_ENT);
+    engine.step(world);
+    expect(camp.hp).toBe(550); // 900 - 350
+    expect(camp.stunUntilTick).toBe(Math.round(1.0 * TICK_RATE));
+    expect(foe.hp).toBe(550);
+    expect(foe.stunUntilTick).toBe(Math.round(1.0 * TICK_RATE));
+    expect(ally.hp).toBe(450);
+    expect(ally.stunUntilTick).toBe(0);
+  });
+
+  it('a single-target ALLY ability cannot be cast on a neutral', () => {
+    const { world, engine } = setup();
+    const h = mkHero(world, 1, 0, 'mender', 10, 10, { abilityRanks: [1, 0, 0, 0] });
+    const camp = mkCampCreep(world, 20, 'campPack', 14, 10, { hp: 100 }); // 4m, well in range 9
+    registerCamp(world, [camp]);
+    world.cast(1, 0, null, null, 20); // Mend, targetTeam 'ally'
+    engine.step(world);
+    expect(camp.hp).toBe(100);
+    expect(h.mana).toBe(1000); // rejected before the commit step
+    expect(h.abilityCdUntilTick[0]).toBe(0);
+    expect(world.log).toEqual([]);
+    expect(world.drainEvents()).toEqual([]);
+  });
+
+  it('a single-target ENEMY ability CAN be cast on a neutral, from either team', () => {
+    for (const team of [0, 1] as const) {
+      const { world, engine } = setup();
+      mkHero(world, 1, team, 'mender', 10, 10, { abilityRanks: [0, 1, 0, 0] });
+      // Smite: unit, enemy-only, range 8, 60 magic + 25% slow for 1.5s.
+      const camp = mkCampCreep(world, 20, 'campHive', 15, 10);
+      registerCamp(world, [camp]);
+      world.cast(1, 1, null, null, 20);
+      engine.step(world);
+      expect(camp.hp).toBe(840); // 900 - 60
+      expect(camp.slowPct).toBeCloseTo(0.25);
+      expect(world.drainEvents()).toEqual([{ k: 'cast', id: 1, team, slot: 1, x: 15, z: 10 }]);
+    }
+  });
+
+  it('camp members are never skipped as expired: expireAtTick -1 means never', () => {
+    const { world, engine } = setup();
+    mkHero(world, 1, 0, 'hex', 10, 10, { abilityRanks: [0, 0, 0, 1] });
+    const camp = mkCampCreep(world, 20, 'campBrute', CAMP_X, CAMP_Z);
+    registerCamp(world, [camp]);
+    expect(camp.expireAtTick).toBe(-1);
+    world.tick = 500; // far past any tick a naive `<= tick` expiry test would use
+    world.cast(1, 3, CAMP_X, CAMP_Z, NO_ENT);
+    engine.step(world);
+    expect(camp.hp).toBe(550);
+  });
+
+  it('a projectile pierces neutrals and player enemies alike, sparing allies', () => {
+    const { world, engine } = setup();
+    mkHero(world, 1, 0, 'longbow', 10, 10, { abilityRanks: [1, 0, 0, 0] });
+    // Piercing Arrow: point, range 14, pierce, 80 physical.
+    const a = mkCampCreep(world, 20, 'campPack', 15, 10);
+    const b = mkCampCreep(world, 21, 'campPack', 20, 10);
+    registerCamp(world, [a, b]);
+    const foe = mkCreep(world, 2, 1, 22, 10);
+    const ally = mkCreep(world, 3, 0, 17, 10);
+    world.cast(1, 0, 24, 10, NO_ENT);
+    stepN(engine, world, 20);
+    expect(a.hp).toBe(820); // 900 - 80, once
+    expect(b.hp).toBe(820);
+    expect(foe.hp).toBe(370); // 450 - 80
+    expect(ally.hp).toBe(450);
+    expect(world.log.filter((l) => l.startsWith('damage:1>20:'))).toHaveLength(1);
+    expect(world.log.filter((l) => l.startsWith('damage:1>21:'))).toHaveLength(1);
+  });
+
+  it('casting inside a camp emits a well-formed player-team cast event and no neutral indexing', () => {
+    const { world, engine } = setup();
+    // Guardian: no targeting, aoe 12 heal 200 + armour aura (radius 12, 5s).
+    const h = mkHero(world, 1, 0, 'mender', CAMP_X, CAMP_Z, { hp: 200, maxHp: 900, abilityRanks: [0, 0, 0, 1] });
+    const a = mkCampCreep(world, 20, 'campBrute', CAMP_X + 1, CAMP_Z, { hp: 200 });
+    const b = mkCampCreep(world, 21, 'campPack', CAMP_X - 1, CAMP_Z, { hp: 200 });
+    const c = mkCampCreep(world, 22, 'campHive', CAMP_X, CAMP_Z + 2, { hp: 200 });
+    registerCamp(world, [a, b, c]);
+    const ally = mkHero(world, 2, 0, 'reaver', CAMP_X + 3, CAMP_Z, { hp: 200 });
+    const foe = mkHero(world, 3, 1, 'shade', CAMP_X - 3, CAMP_Z, { hp: 200 });
+    world.cast(1, 3, null, null, NO_ENT);
+    engine.step(world);
+
+    expect(h.hp).toBe(400); // self healed
+    expect(ally.hp).toBe(400);
+    expect(h.auras).toHaveLength(1);
+    expect(ally.auras).toHaveLength(1);
+    for (const n of [a, b, c]) {
+      expect(n.hp).toBe(200); // a camp is nobody's ally
+      expect(n.auras).toEqual([]);
+    }
+    expect(foe.hp).toBe(200);
+    expect(foe.auras).toEqual([]);
+
+    const events = world.drainEvents();
+    expect(events).toEqual([{ k: 'cast', id: 1, team: 0, slot: 3, x: CAMP_X, z: CAMP_Z }]);
+    const ev = events[0];
+    // The one TeamId in the module: it must be a PLAYER team, never NEUTRAL.
+    expect(ev && ev.k === 'cast' && isPlayerTeam(ev.team)).toBe(true);
+    // And nothing in the camp table was touched by a cast.
+    expect(world.camps).toHaveLength(1);
+    expect(world.camps[0]?.aliveCount).toBe(3);
+    expect(world.camps[0]?.respawnAtTick).toBe(-1);
+  });
+
+  it('warhorn never buffs a camp standing next to the caster', () => {
+    const { world, engine } = setup();
+    const h = mkHero(world, 1, 0, 'mender', CAMP_X, CAMP_Z, {
+      items: [null, 'warhorn', null, null, null, null],
+    });
+    const camp = mkCampCreep(world, 20, 'campBrute', CAMP_X + 1, CAMP_Z);
+    registerCamp(world, [camp]);
+    const ally = mkCreep(world, 2, 0, CAMP_X + 2, CAMP_Z);
+    world.useItem(1, 1, null, null);
+    engine.step(world);
+    expect(h.auras).toHaveLength(1);
+    expect(ally.auras).toHaveLength(1);
+    expect(camp.auras).toEqual([]);
+  });
+
+  it('an ally-side AoE over a camp-only clearing issues no heal call at all', () => {
+    // Stronger than "camp hp is unchanged": with only neutrals in radius the
+    // ally filter must find NOBODY, so world.heal is never called. A rule that
+    // healed a camp and then clamped, or that healed team 2 into a per-team
+    // array, would still leave hp equal here — the empty call log would not.
+    const { world, engine } = setup();
+    const h = mkHero(world, 1, 0, 'mender', 10, 10, { abilityRanks: [0, 0, 1, 0] });
+    const a = mkCampCreep(world, 20, 'campPack', CAMP_X, CAMP_Z, { hp: 100 });
+    const b = mkCampCreep(world, 21, 'campPack', CAMP_X + 1, CAMP_Z, { hp: 100 });
+    registerCamp(world, [a, b]);
+    world.cast(1, 2, CAMP_X, CAMP_Z, NO_ENT); // Sanctuary on the clearing
+    engine.step(world);
+    expect(a.hp).toBe(100);
+    expect(b.hp).toBe(100);
+    expect(world.log.filter((l) => l.startsWith('heal:'))).toEqual([]);
+    expect(h.mana).toBe(930);
   });
 });

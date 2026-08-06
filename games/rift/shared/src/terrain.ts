@@ -55,7 +55,7 @@ import {
   RAMP_WIDTH,
   RIVER_BAND_W,
 } from './config.js';
-import type { TeamId, Vec2 } from './types.js';
+import type { EntKind, TeamId, Vec2 } from './types.js';
 
 // ---- the data model (TERRAIN_CONTRACT §2) ------------------------------------
 
@@ -212,6 +212,29 @@ export function isPassable(t: TerrainDef, x: number, z: number): boolean {
 /** Concealment test: `'foliage'` and nothing else (§3, DESIGN_DELTA §3). */
 export function isConcealing(t: TerrainDef, x: number, z: number): boolean {
   return t.grid.kind[cellOf(t.grid, x, z)] === K_FOLIAGE;
+}
+
+/** Is this entity kind a neutral jungle camp creature?
+ *
+ *  AMENDMENT_1 §B.4. The camp kinds must be exempted from lane-wave sizing,
+ *  hero respawn and timed expiry, and S_UNITS had duplicated the list inline
+ *  with no compile-time link back to `EntKind` — so adding a fourth camp tier
+ *  would silently stop it being exempted, in three separate places, with a
+ *  clean typecheck. The `satisfies` binding below makes that a build error
+ *  instead: extend `EntKind` with a camp kind and this object stops compiling
+ *  until the kind is classified here.
+ *
+ *  Note this is about the CREATURE kind, not team. Use `isPlayerTeam(e.team)`
+ *  when the question is "does this entity belong to a player team" — a ward or
+ *  projectile is not a camp kind but can still be neutral-adjacent. */
+const CAMP_KINDS = {
+  campPack: true,
+  campBrute: true,
+  campHive: true,
+} as const satisfies Partial<Record<EntKind, true>>;
+
+export function isCampKind(k: EntKind): boolean {
+  return k in CAMP_KINDS;
 }
 
 // ---- the deterministic hash (TERRAIN_CONTRACT §4) ----------------------------

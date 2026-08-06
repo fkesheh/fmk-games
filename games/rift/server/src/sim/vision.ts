@@ -1,9 +1,9 @@
 // ============================================================================
 // ANCIENTS (rift) — VISION (T5). Fog-of-war filter sets, one per team,
 // recomputed every tick and REUSED by the caller (computeTeamVisible clears
-// and refills `out`; this module never allocates per call — source candidates
-// go into a module-level scratch array reused across calls; the room calls
-// this twice per tick, sequentially, so sharing the scratch is safe).
+// and refills `out`; this module never allocates per call — the per-source
+// scratch is a module-level pool reused across calls; the room calls this
+// twice per tick, sequentially, so sharing the pool is safe).
 //
 // Semantics (CONTRACT §4 vision.ts bullet):
 //   - vision sources: own LIVING heroes, creeps, summons, wards, structures,
@@ -15,23 +15,57 @@
 //   - wards are NEVER visible to the enemy team, even inside a vision radius.
 //   - 'proj' ents are in-flight ability effects, not intel: they are visible
 //     to both teams unconditionally so clients can render the flight.
+//
+// TERRAIN (TERRAIN_CONTRACT §4, DESIGN_DELTA §1/§3/§5) adds three modifiers,
+// and ONLY inside the "can viewer V see entity E" test. Pass 1 (collecting the
+// viewers) is untouched, and the two bypasses above — own team, projectiles —
+// are never subject to terrain.
+//
+//   1. NIGHT scales the radius BEFORE the range test, for heroes, creeps,
+//      summons and camp creeps; wards, towers, guards and ancients are lit
+//      installations and keep full radius (DESIGN_DELTA §5).
+//   2. UPHILL BLOCK is a veto after the range test: low never sees high, high
+//      sees low freely, equal elevations are unaffected.
+//   3. CONCEALMENT is a veto after that: a foliage cell hides its occupant from
+//      viewers farther than CONCEAL_REVEAL_RADIUS, unless the viewer is itself
+//      concealed or is looking DOWN from high ground (config.ts's three
+//      exceptions), and unless the target swung last tick — attacking reveals.
+//
+// A veto is absolute: it is not a range penalty, and no combination of vetoes
+// ever ADDS visibility. Structures and enemy wards never reach the concealment
+// test at all (structures are not in `mobiles()`, enemy wards are dropped
+// earlier), so "structures and wards are never concealed" holds by
+// construction rather than by a special case.
 // ============================================================================
 import {
   ANCIENT,
+  CAMP_BRUTE,
+  CAMP_HIVE,
+  CAMP_PACK,
+  CONCEAL_REVEAL_RADIUS,
   CREEP_MELEE,
   CREEP_RANGED,
   CREEP_SIEGE,
+  DAY_PERIOD_S,
   GUARD_TOWER,
   HERO_VISION,
+  NIGHT_VISION_MULT,
   SUMMON_SHADE,
+  TICK_RATE,
   TOWER,
   WARD_VISION,
+  elevationAt,
+  isConcealing,
 } from '@rift/shared';
-import type { TeamId } from '@rift/shared';
+import type { EntKind, TeamId, TerrainDef } from '@rift/shared';
+import { NO_ENT } from './types.js';
 import type { Ent, EntId, World } from './types.js';
 
 /** Vision radius of a source entity, from config by kind. Callers only ever
- *  ask about kinds that are legal sources; 'proj' is never a source. */
+ *  ask about kinds that are legal sources; 'proj' is never a source, and the
+ *  camp kinds are NEUTRAL_TEAM so they are never a source for a player team
+ *  either — both are listed because the switch is exhaustive over EntKind and
+ *  a silently missing arm would return undefined at some future kind. */
 function visionRadius(e: Ent): number {
   switch (e.kind) {
     case 'hero':
@@ -52,9 +86,66 @@ function visionRadius(e: Ent): number {
       return GUARD_TOWER.vision;
     case 'ancient':
       return ANCIENT.vision;
+    case 'campPack':
+      return CAMP_PACK.vision;
+    case 'campBrute':
+      return CAMP_BRUTE.vision;
+    case 'campHive':
+      return CAMP_HIVE.vision;
     case 'proj':
       return 0;
   }
+}
+
+/** Does night shrink this kind's radius? DESIGN_DELTA §5 names the exceptions
+ *  positively — "structures and wards are unaffected, they are lit" — so the
+ *  false arm is the closed list (ward, tower, guard, ancient) and everything
+ *  with living eyes scales. 'proj' is never a source; its arm is a formality. */
+function scalesAtNight(kind: EntKind): boolean {
+  switch (kind) {
+    case 'hero':
+    case 'melee':
+    case 'ranged':
+    case 'siege':
+    case 'shade':
+    case 'campPack':
+    case 'campBrute':
+    case 'campHive':
+      return true;
+    case 'ward':
+    case 'tower':
+    case 'guard':
+    case 'ancient':
+    case 'proj':
+      return false;
+  }
+}
+
+/**
+ * Day/night cycle position at a match tick: 0 = full day, 1 = full night,
+ * continuous and WRAPPING — it ramps 0->1 across the first half of a cycle and
+ * back across the second, exactly as `rift_snap.dayPhase` is specified in
+ * `protocol.ts`, so the sim's night and the client's lighting are the same
+ * function of the same clock and cannot drift.
+ *
+ * The sim derives this itself and never reads the wire field back (the field
+ * exists only so a RECONNECTING client lights correctly). It is a pure
+ * function of the tick — divide, multiply, compare, no trigonometry — so it is
+ * bit-identical on every engine and replay-safe.
+ */
+function dayPhaseAtTick(tick: number): number {
+  const cycle = (tick / TICK_RATE / DAY_PERIOD_S) % 1;
+  return cycle < 0.5 ? cycle * 2 : 2 - cycle * 2;
+}
+
+/** Multiplier on a living source's vision radius at a given day phase: 1 at
+ *  full day, NIGHT_VISION_MULT at full night, linear between. It RAMPS rather
+ *  than snapping — `dayPhase` is continuous by construction, and a step would
+ *  put a hard vision cliff in the middle of a dusk the renderer is drawing as
+ *  a gradient (DESIGN_DELTA §5: "a visible swing in initiative, not a
+ *  blackout"). */
+function nightVisionScale(dayPhase: number): number {
+  return 1 - (1 - NIGHT_VISION_MULT) * dayPhase;
 }
 
 /** Is `e` a living vision source for its team? Dead heroes/creeps/wards and
@@ -63,19 +154,70 @@ function isSource(e: Ent): boolean {
   return e.alive && e.kind !== 'proj';
 }
 
-/** Reused across calls; never escapes the module. Single-threaded sim, two
+/** Beyond this distance a foliage cell hides its occupant; inside it, an enemy
+ *  is close enough to see what it is standing next to (config.ts's "unless the
+ *  enemy is adjacent"). Squared once, at module load, for the inner loop. */
+const CONCEAL_REVEAL_R2 = CONCEAL_REVEAL_RADIUS * CONCEAL_REVEAL_RADIUS;
+
+/** Everything the inner loop needs from one vision source, flattened to
+ *  numbers so the loop touches no `Ent` and no terrain query per pair. */
+interface Viewer {
+  x: number;
+  z: number;
+  /** Squared radius, night scale already applied. */
+  r2: number;
+  /** ELEV_LOW | ELEV_HIGH at the viewer's own cell. */
+  elev: number;
+  /** Viewer stands in foliage itself, so foliage does not hide from it. */
+  concealed: boolean;
+}
+
+/** Pool of Viewer records, grown once to the largest source count ever seen
+ *  and never released. `viewers` is the active window into it: `length = 0`
+ *  plus `push` of an ALREADY POOLED object, so a steady-state tick allocates
+ *  nothing and the loop below can iterate it with `for..of` without an
+ *  index-undefined narrowing in the hot path. Single-threaded sim, two
  *  sequential calls per tick — no reentrancy. */
-const sourceScratch: Ent[] = [];
+const viewerPool: Viewer[] = [];
+const viewers: Viewer[] = [];
+
+/** Next free pooled Viewer, appended to the active window. */
+function pushViewer(): Viewer {
+  const i = viewers.length;
+  const pooled = viewerPool[i];
+  if (pooled !== undefined) {
+    viewers.push(pooled);
+    return pooled;
+  }
+  const fresh: Viewer = { x: 0, z: 0, r2: 0, elev: 0, concealed: false };
+  viewerPool.push(fresh);
+  viewers.push(fresh);
+  return fresh;
+}
 
 /** Frozen seam (CONTRACT §4): clears `out` and fills it with the MOBILE
  *  entity ids visible to `team`. Structures are never added. The caller
  *  keeps two sets (one per team) and reuses them every tick. */
 export function computeTeamVisible(world: World, team: TeamId, out: Set<EntId>): void {
   out.clear();
-  sourceScratch.length = 0;
+  const terrain: TerrainDef = world.map.terrain;
+  const night = nightVisionScale(dayPhaseAtTick(world.tick));
+
+  // Pass 1 — collect this team's living sources, with their radius (night
+  // applied), their own elevation and their own concealment resolved once.
+  viewers.length = 0;
   for (const e of world.all()) {
-    if (e.team === team && isSource(e)) sourceScratch.push(e);
+    if (e.team !== team || !isSource(e)) continue;
+    const r = scalesAtNight(e.kind) ? visionRadius(e) * night : visionRadius(e);
+    const v = pushViewer();
+    v.x = e.x;
+    v.z = e.z;
+    v.r2 = r * r;
+    v.elev = elevationAt(terrain, e.x, e.z);
+    v.concealed = isConcealing(terrain, e.x, e.z);
   }
+
+  // Pass 2 — one test per (enemy mobile, viewer) pair.
   for (const m of world.mobiles()) {
     if (m.kind === 'proj' || m.team === team) {
       out.add(m.id);
@@ -84,14 +226,25 @@ export function computeTeamVisible(world: World, team: TeamId, out: Set<EntId>):
     // Enemy mobile: wards are invisible to the enemy no matter what; the
     // dead leave no corpse on the wire (the kill event already carried it).
     if (m.kind === 'ward' || !m.alive) continue;
-    for (const s of sourceScratch) {
-      const r = visionRadius(s);
-      const dx = m.x - s.x;
-      const dz = m.z - s.z;
-      if (dx * dx + dz * dz <= r * r) {
-        out.add(m.id);
-        break;
-      }
+    const mElev = elevationAt(terrain, m.x, m.z);
+    // `atkTarget` is cleared at the top of every stepCombat and set on the
+    // swing, and computeTeamVisible runs BEFORE advance() — so a non-NO_ENT
+    // value here means "swung during the previous tick". Attacking reveals;
+    // casting does not (DESIGN_DELTA §3).
+    const hidden = m.atkTarget === NO_ENT && isConcealing(terrain, m.x, m.z);
+    for (const v of viewers) {
+      const dx = m.x - v.x;
+      const dz = m.z - v.z;
+      const d2 = dx * dx + dz * dz;
+      if (d2 > v.r2) continue;
+      // Uphill veto: low ground never sees high ground, at any range.
+      if (v.elev < mElev) continue;
+      // Concealment veto: the viewer is at or below the target's level here
+      // (the uphill veto already returned on the rest), so `v.elev <= mElev`
+      // is exactly "not looking down into the bush".
+      if (hidden && d2 > CONCEAL_REVEAL_R2 && !v.concealed && v.elev <= mElev) continue;
+      out.add(m.id);
+      break;
     }
   }
 }

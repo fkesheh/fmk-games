@@ -7,14 +7,25 @@
 // spendSkillPoint rank caps + ULT_LEVEL_REQ, useItem spend-then-enqueue for
 // dash/aura actives, and ward placement (charges + team stock + restock).
 // The abilities engine is a recording double; abilities.ts is never imported.
+//
+// Plus the NEUTRAL-SAFETY suite (TERRAIN_CONTRACT §5): a jungle full of camp
+// creeps must be completely invisible to everything units.ts does. The camps
+// are stood up here through the public `spawnMobile` door with the contract's
+// own recipe (team = NEUTRAL_TEAM, lane = -1, expireAtTick = -1,
+// owner = NO_ENT) rather than through sim/camps.ts, so this file tests the
+// unit under test and stays independent of the camp engine.
 // ============================================================================
 import { describe, expect, it } from 'vitest';
 import {
+  CAMP_BRUTE_COUNT,
+  CAMP_HIVE_COUNT,
+  CAMP_PACK_COUNT,
   CREEP_MELEE,
   FOUNTAIN_HEAL_PCT,
   FOUNTAIN_MANA_PCT,
   INVENTORY_SLOTS,
   ITEMS,
+  NEUTRAL_TEAM,
   OVERTIME_AT_S,
   PASSIVE_GOLD_PER_S,
   RESPAWN_BASE_S,
@@ -34,6 +45,7 @@ import {
   WAVE_RANGED,
   buildMap,
 } from '@rift/shared';
+import type { CampDef, EntKind, MapDef } from '@rift/shared';
 import { createWorld } from './world.js';
 import { NO_ENT } from './types.js';
 import type { AbilitiesEngine, Ent, QueuedCast, SeatDef, World } from './types.js';
@@ -53,6 +65,13 @@ const SEATS: SeatDef[] = [
 function makeWorld(seats: SeatDef[] = SEATS, lanes = 1): { w: World; engine: EngineDouble } {
   const engine = new EngineDouble();
   return { w: createWorld(buildMap(lanes), seats, () => 0.5, engine), engine };
+}
+
+/** Same world, but on a caller-supplied map, so the neutral-safety suite can
+ *  build one world with camps and one without on the SAME terrain. */
+function makeWorldOn(map: MapDef): { w: World; engine: EngineDouble } {
+  const engine = new EngineDouble();
+  return { w: createWorld(map, SEATS, () => 0.5, engine), engine };
 }
 
 function must<T>(v: T | undefined): T {
@@ -537,5 +556,183 @@ describe('expiry (advance step 7)', () => {
     expect(p0.alive).toBe(true);
     expect(w.get(p0.id)).toBeDefined();
     expect(p0.gold - gold).toBeCloseTo(PASSIVE_GOLD_PER_S * TICK_DT, 9);
+  });
+});
+
+// ============================================================================
+// NEUTRAL SAFETY — TERRAIN_CONTRACT §5. units.ts owns lane waves, hero respawn,
+// timed-entity expiry and the team ward stock. None of the four may notice that
+// a third team exists.
+// ============================================================================
+
+const CAMP_KIND: Readonly<Record<CampDef['tier'], EntKind>> = {
+  pack: 'campPack',
+  brute: 'campBrute',
+  hive: 'campHive',
+};
+const CAMP_COUNT: Readonly<Record<CampDef['tier'], number>> = {
+  pack: CAMP_PACK_COUNT,
+  brute: CAMP_BRUTE_COUNT,
+  hive: CAMP_HIVE_COUNT,
+};
+
+/** Stand up every camp on the map with the contract's spawn recipe: the neutral
+ *  team, lane -1 (a camp creep with lane >= 0 walks a lane polyline — the way
+ *  this feature breaks), expireAtTick -1 (the "alive" sentinel, deliberately
+ *  NOT 0), owner NO_ENT. Members are fanned inside the clearing, which §3.5
+ *  guarantees is CAMP_LANE_CLEARANCE away from every lane corridor. */
+function spawnCamps(w: World, map: MapDef): Ent[] {
+  const out: Ent[] = [];
+  for (const c of map.terrain.camps) {
+    const kind = CAMP_KIND[c.tier];
+    const n = CAMP_COUNT[c.tier];
+    for (let i = 0; i < n; i++) {
+      const id = w.spawnMobile(kind, NEUTRAL_TEAM, c.x + i * 0.7 - 1, c.z, -1, -1, NO_ENT);
+      out.push(must(w.get(id)));
+    }
+  }
+  return out;
+}
+
+/** Everything the wave spawner decides, for the creeps born on wave tick `k`
+ *  and nothing else: kind, team, lane, the growth-scaled stat pair, and the
+ *  fan-out spawn position. Entity ids are excluded on purpose — the jungle
+ *  world allocates ids for its camps, so ids legitimately differ and are not
+ *  part of "wave composition". Read on the spawn tick itself, where stepUnits
+ *  runs after movement and combat, so the creeps are pristine. */
+function waveSignatures(w: World, upto: number): string[] {
+  const seen = new Set<number>();
+  for (const e of w.mobiles()) seen.add(e.id);
+  const sigs: string[] = [];
+  for (let k = 0; k <= upto; k++) {
+    while (w.tick < WAVE_TICK(k)) w.advance();
+    const rows: string[] = [];
+    for (const e of w.mobiles()) {
+      if (seen.has(e.id)) continue;
+      seen.add(e.id);
+      if (e.kind !== 'melee' && e.kind !== 'ranged' && e.kind !== 'siege') continue;
+      rows.push(
+        [
+          e.kind,
+          e.team,
+          e.lane,
+          e.maxHp.toFixed(9),
+          e.damage.toFixed(9),
+          e.x.toFixed(9),
+          e.z.toFixed(9),
+        ].join(':'),
+      );
+    }
+    rows.sort();
+    sigs.push(rows.join('|'));
+  }
+  return sigs;
+}
+
+describe('neutral camps are invisible to units.ts', () => {
+  it('spawns identical waves with and without a full jungle on the map', () => {
+    // Same terrain both sides: buildMap is a pure function of the lane count.
+    const map = buildMap(1);
+    expect(map.terrain.camps.length).toBeGreaterThan(0);
+    const bare = makeWorldOn(map);
+    const jungle = makeWorldOn(map);
+    const members = spawnCamps(jungle.w, map);
+    expect(members.length).toBeGreaterThanOrEqual(2 * CAMP_PACK_COUNT);
+    // Through wave 3 (0-based 0..2), which covers first-wave timing, the
+    // period, and one compounding growth step.
+    const bareSigs = waveSignatures(bare.w, 2);
+    const jungleSigs = waveSignatures(jungle.w, 2);
+    expect(bareSigs[0]).not.toBe(''); // the signature actually saw creeps
+    expect(jungleSigs).toEqual(bareSigs);
+    // and the neutrals really were there the whole time, never wave-counted
+    for (const m of members) {
+      expect(jungle.w.get(m.id)?.alive).toBe(true);
+      expect(m.lane).toBe(-1);
+      expect(m.team).toBe(NEUTRAL_TEAM);
+    }
+  });
+
+  it('never reaps a camp member in the expiry step, while still reaping summons', () => {
+    const map = buildMap(1);
+    const { w } = makeWorldOn(map);
+    const members = spawnCamps(w, map);
+    // Control: a normal timed summon in the same world still dies on schedule.
+    const shade = w.spawnMobile('shade', 0, 30, 60, -1, w.tick + 2, NO_ENT);
+    for (const m of members) expect(m.expireAtTick).toBe(-1);
+    advance(w, 3);
+    expect(w.get(shade)).toBeUndefined();
+    for (const m of members) expect(w.get(m.id)).toBeDefined();
+    // A long run: -1 must never be read as "a tick already in the past".
+    advance(w, TICK_RATE * 10);
+    for (const m of members) {
+      expect(w.get(m.id)).toBeDefined();
+      expect(m.alive).toBe(true);
+    }
+  });
+
+  it('never hero-respawns a camp member carrying a respawn stamp', () => {
+    const map = buildMap(1);
+    const { w } = makeWorldOn(map);
+    const members = spawnCamps(w, map);
+    const m = must(members[0]);
+    // A camp's timer lives on CampState and is stepCamps' business; even if a
+    // stamp lands on the entity, the hero respawner must not act on it.
+    m.alive = false;
+    const stamp = w.tick + 2;
+    m.respawnAtTick = stamp;
+    const [mx, mz] = [m.x, m.z];
+    advance(w, 20);
+    expect(m.alive).toBe(false);
+    expect(m.respawnAtTick).toBe(stamp); // untouched by units.ts
+    expect(m.x).toBeCloseTo(mx, 9); // never teleported to a fountain
+    expect(m.z).toBeCloseTo(mz, 9);
+    // the real heroes still respawn normally in the same world
+    const p0 = hero(w, 'p0');
+    w.damage(NO_ENT, p0.id, 999999, 'physical');
+    w.advance();
+    expect(p0.alive).toBe(false);
+    advance(w, Math.round((RESPAWN_BASE_S + RESPAWN_PER_LEVEL_S * 1) * TICK_RATE));
+    expect(p0.alive).toBe(true);
+  });
+
+  it('restocks wards on the same cadence whether or not neutrals are dying', () => {
+    const map = buildMap(1);
+    const { w } = makeWorldOn(map);
+    const members = spawnCamps(w, map);
+    const p0 = hero(w, 'p0');
+    w.buy(p0.id, 'wardstone');
+    const slot = p0.items.indexOf('wardstone');
+    w.useItem(p0.id, slot, p0.x + 2, p0.z);
+    w.useItem(p0.id, slot, p0.x + 2, p0.z);
+    expect(w.wardStock(0)).toBe(0);
+    expect(w.wardStock(1)).toBe(WARD_TEAM_STOCK);
+    // Wipe the whole jungle. Neutral deaths pay no team stock and cost none.
+    for (const m of members) w.damage(NO_ENT, m.id, 1e9, 'physical');
+    w.advance();
+    for (const m of members) expect(w.get(m.id)).toBeUndefined();
+    expect(w.wardStock(0)).toBe(0);
+    expect(w.wardStock(1)).toBe(WARD_TEAM_STOCK);
+    // Exactly the documented cadence, unshifted by the mass death above.
+    advance(w, Math.round(WARD_RESTOCK_S * TICK_RATE) - 1);
+    expect(w.wardStock(0)).toBe(1);
+    advance(w, Math.round(WARD_RESTOCK_S * TICK_RATE));
+    expect(w.wardStock(0)).toBe(WARD_TEAM_STOCK);
+    advance(w, Math.round(WARD_RESTOCK_S * TICK_RATE));
+    expect(w.wardStock(0)).toBe(WARD_TEAM_STOCK); // capped
+    expect(w.wardStock(1)).toBe(WARD_TEAM_STOCK);
+  });
+
+  it('pays no passive gold and grants no xp to a neutral', () => {
+    const map = buildMap(1);
+    const { w } = makeWorldOn(map);
+    const m = must(spawnCamps(w, map)[0]);
+    const gold = m.gold;
+    const xp = m.xp;
+    const level = m.level;
+    advance(w, 50);
+    expect(m.gold).toBe(gold); // passive gold is a hero-only payout
+    expect(m.xp).toBe(xp);
+    expect(m.level).toBe(level);
+    expect(m.goldEarned).toBe(0);
   });
 });

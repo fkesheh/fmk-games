@@ -5,56 +5,37 @@
 // into the world at construction; step(world) runs as advance() step (2):
 // drain the cast queue, validate + execute casts, move/resolve projectiles.
 //
-// SEAM GAPS (reported to the orchestrator — sim/types.ts is Layer-1 and may
-// not be edited by this task): the frozen World surface has
-//   1. no cast-queue drain — the engine cannot read queued casts;
-//   2. no event sink — the engine cannot push the `cast` SimEvent that
-//      world.drainEvents() is documented to return.
-// Both are declared structurally below (WorldSeamGaps) and probed at runtime,
-// so this module typechecks against the frozen interface today and works
-// unchanged the moment the seam gains:
-//   World.drainCasts(): QueuedCast[];
-//   World.pushEvent(ev: SimEvent): void;
 // Item actives reach the engine as { kind: 'item' } queue entries: units.ts
 // validates + spends (charges/cooldown/ward stock) inside World.useItem and
 // enqueues dash/aura actives here for execution; wardstone placement never
 // leaves units.ts. Projectile/summon despawn uses Ent.expireAtTick = tick —
 // the frozen surface has no despawnMobile, and expiry reaping is the world's
 // own advance() step (7).
+//
+// NEUTRALS (TERRAIN_CONTRACT §5, DESIGN_DELTA §2). Entity teams are `EntTeam`,
+// so a jungle camp is a third team that is hostile to BOTH player teams and
+// allied to NEITHER. Every targeting decision in this file — single target,
+// AoE membership, projectile collision — routes through `targetTeamOk()`, the
+// one place the rule is written down. The only `TeamId` in the module is the
+// `cast` SimEvent's, which is emitted through `emitCast()` behind an
+// `isPlayerTeam` narrowing: nothing here ever indexes a per-team tuple.
+//
+// Projectiles fly STRAIGHT and are never blocked by cliffs (DESIGN_DELTA §1:
+// the uphill penalty is an auto-attack rule, owned by combat.ts). There is
+// deliberately no elevation query anywhere in this file.
 // ============================================================================
-import type { AbilityDef, Effect, TargetTeam, TeamId } from '@rift/shared';
-import { heroById, INVENTORY_SLOTS, ITEMS, SUMMON_MAX_ACTIVE, TICK_DT, TICK_RATE } from '@rift/shared';
-import type { AbilitiesEngine, Ent, EntId, SimEvent, World } from './types.js';
+import type { AbilityDef, Effect, EntTeam, TargetTeam } from '@rift/shared';
+import {
+  heroById,
+  INVENTORY_SLOTS,
+  isPlayerTeam,
+  ITEMS,
+  SUMMON_MAX_ACTIVE,
+  TICK_DT,
+  TICK_RATE,
+} from '@rift/shared';
+import type { AbilitiesEngine, Ent, EntId, QueuedCast, World } from './types.js';
 import { NO_ENT } from './types.js';
-
-/** One queued cast, drained by the engine at advance() step (2). 'ability'
- *  entries come from World.cast (slot 0..3 = q/w/e/r); 'item' entries are
- *  enqueued by World.useItem AFTER units.ts has validated and spent
- *  charges/cooldown (slot = inventory index 0..5). */
-export type QueuedCast =
-  | {
-      readonly kind: 'ability';
-      readonly hero: EntId;
-      readonly slot: number;
-      readonly x: number | null;
-      readonly z: number | null;
-      readonly target: EntId;
-    }
-  | {
-      readonly kind: 'item';
-      readonly hero: EntId;
-      readonly slot: number;
-      readonly x: number | null;
-      readonly z: number | null;
-    };
-
-/** The two World members the frozen seam is missing (see header). Probed with
- *  typeof so a world built against the frozen interface alone simply no-ops
- *  casts instead of throwing — the "illegal input silently no-ops" rule. */
-interface WorldSeamGaps {
-  drainCasts(): QueuedCast[];
-  pushEvent(ev: SimEvent): void;
-}
 
 /** Cast SimEvent slot base for item actives: ability casts report slot 0..3,
  *  item actives report ITEM_EVENT_SLOT_BASE + inventorySlot. */
@@ -66,7 +47,9 @@ export const ITEM_EVENT_SLOT_BASE = 4;
 interface ProjState {
   readonly id: EntId;
   readonly src: EntId;
-  readonly team: TeamId;
+  /** `EntTeam`: the firer's team, used only through `targetTeamOk('enemy', …)`
+   *  so a projectile hits neutrals as readily as it hits the other player. */
+  readonly team: EntTeam;
   readonly effects: readonly Effect[];
   readonly rankIdx: number; // 0-based rank index
   readonly aoeRadius: number; // 0 = single target
@@ -86,30 +69,52 @@ function rk(arr: readonly number[], rankIdx: number): number {
   return arr[rankIdx] ?? 0;
 }
 
-/** Ability effects hit units only: heroes, creeps, summons. Never wards,
- *  never projectiles, never structures (combat.ts owns structure damage). */
+/** Ability effects hit units only: heroes, creeps, summons and the three
+ *  neutral camp kinds. Never wards, never projectiles, never structures
+ *  (combat.ts owns structure damage). The camp kinds are load-bearing: leaving
+ *  them out makes every jungle creep immune to every ability, which is a
+ *  silent, total failure of the feature (TERRAIN_CONTRACT §5). */
 function isUnitTargetable(e: Ent): boolean {
   return (
     e.kind === 'hero' ||
     e.kind === 'melee' ||
     e.kind === 'ranged' ||
     e.kind === 'siege' ||
-    e.kind === 'shade'
+    e.kind === 'shade' ||
+    e.kind === 'campPack' ||
+    e.kind === 'campBrute' ||
+    e.kind === 'campHive'
   );
 }
 
-function teamOk(rule: TargetTeam, mine: TeamId, theirs: TeamId): boolean {
+/**
+ * THE targeting rule — the single place in this module that compares two
+ * teams, and therefore the single place a neutral has to be reasoned about.
+ * `'enemy' | 'ally'` (the internal effect sides) are a subset of `TargetTeam`,
+ * so damage/stun/slow, heal/aura, single-target validation and projectile
+ * collision all ask this same question.
+ *
+ * - `'any'`   — unchanged; every unit qualifies.
+ * - `'enemy'` — any DIFFERENT team, which correctly admits neutrals: a camp is
+ *               an enemy of both player teams, and each player team is an
+ *               enemy of the camp.
+ * - `'ally'`  — same team AND a player team. `isPlayerTeam` is what stops an
+ *               AoE heal, an armour aura or a warhorn from treating the jungle
+ *               as friendly: a camp is an ally of nobody, not even itself.
+ */
+function targetTeamOk(rule: TargetTeam, casterTeam: EntTeam, targetTeam: EntTeam): boolean {
   if (rule === 'any') return true;
-  if (rule === 'enemy') return theirs !== mine;
-  return theirs === mine; // 'ally' includes self
+  if (rule === 'enemy') return targetTeam !== casterTeam;
+  return isPlayerTeam(targetTeam) && targetTeam === casterTeam; // 'ally' includes self
 }
 
-function sideOk(side: 'enemy' | 'ally', mine: TeamId, theirs: TeamId): boolean {
-  return side === 'enemy' ? theirs !== mine : theirs === mine;
-}
-
+/** Expiry test for summons, wards and projectiles. `expireAtTick <= 0` means
+ *  "never expires": 0 is the frozen sentinel for permanent entities and camp
+ *  creeps are spawned with -1 (TERRAIN_CONTRACT §5), so a bare `!== 0` test
+ *  would read every neutral in the jungle as already expired and skip it in
+ *  every effect loop. */
 function expired(e: Ent, tick: number): boolean {
-  return e.expireAtTick !== 0 && e.expireAtTick <= tick;
+  return e.expireAtTick > 0 && e.expireAtTick <= tick;
 }
 
 export function createAbilitiesEngine(): AbilitiesEngine {
@@ -123,24 +128,27 @@ class AbilitiesEngineImpl implements AbilitiesEngine {
   private readonly radiusBuf: Ent[] = [];
 
   step(world: World): void {
-    const seam = world as World & Partial<WorldSeamGaps>;
-    if (seam.drainCasts) {
-      const casts = seam.drainCasts();
-      for (const c of casts) {
-        if (c.kind === 'ability') this.execAbilityCast(world, seam, c);
-        else this.execItemCast(world, seam, c);
-      }
+    for (const c of world.drainCasts()) {
+      if (c.kind === 'ability') this.execAbilityCast(world, c);
+      else this.execItemCast(world, c);
     }
     this.moveProjectiles(world);
   }
 
+  /** The only `TeamId` boundary in the engine. `SimEvent.cast.team` is a
+   *  PLAYER team by contract — the room fans cast events out per team — so the
+   *  neutral branch is narrowed away here rather than cast away. It is
+   *  unreachable in practice (only heroes cast, and a hero is never neutral),
+   *  and dropping the event is the correct behaviour if it ever is reached: a
+   *  neutral caster has no team whose clients could receive it. */
+  private emitCast(world: World, caster: Ent, slot: number, x: number, z: number): void {
+    if (!isPlayerTeam(caster.team)) return;
+    world.pushEvent({ k: 'cast', id: caster.id, team: caster.team, slot, x, z });
+  }
+
   // --- Cast execution ---------------------------------------------------------
 
-  private execAbilityCast(
-    world: World,
-    seam: Partial<WorldSeamGaps>,
-    cast: Extract<QueuedCast, { kind: 'ability' }>,
-  ): void {
+  private execAbilityCast(world: World, cast: Extract<QueuedCast, { kind: 'ability' }>): void {
     if (cast.slot < 0 || cast.slot > 3) return;
     const hero = world.get(cast.hero);
     if (!hero || hero.kind !== 'hero' || !hero.alive || hero.hero === null) return;
@@ -168,7 +176,7 @@ class AbilitiesEngineImpl implements AbilitiesEngine {
     } else if (def.targeting === 'unit') {
       const t = world.get(cast.target);
       if (!t || !t.alive || expired(t, world.tick) || !isUnitTargetable(t)) return;
-      if (!teamOk(def.targetTeam ?? 'any', hero.team, t.team)) return;
+      if (!targetTeamOk(def.targetTeam ?? 'any', hero.team, t.team)) return;
       if (Math.hypot(t.x - hero.x, t.z - hero.z) > range) return;
       primary = t;
       ix = t.x;
@@ -184,18 +192,14 @@ class AbilitiesEngineImpl implements AbilitiesEngine {
     } else {
       this.applyEffects(world, hero.id, hero.team, hero, def.effects, ri, aoe, ix, iz, primary);
     }
-    seam.pushEvent?.({ k: 'cast', id: hero.id, team: hero.team, slot: cast.slot, x: ix, z: iz });
+    this.emitCast(world, hero, cast.slot, ix, iz);
   }
 
   /** Item actives (blinkstone dash, warhorn aura). Validation + spend of
    *  charges/cooldown happened in units.ts before the entry was enqueued;
    *  the engine only re-checks that the caster lives and the slot still
    *  holds the item, then executes through the same effect machinery. */
-  private execItemCast(
-    world: World,
-    seam: Partial<WorldSeamGaps>,
-    cast: Extract<QueuedCast, { kind: 'item' }>,
-  ): void {
+  private execItemCast(world: World, cast: Extract<QueuedCast, { kind: 'item' }>): void {
     if (cast.slot < 0 || cast.slot >= INVENTORY_SLOTS) return;
     const hero = world.get(cast.hero);
     if (!hero || hero.kind !== 'hero' || !hero.alive) return;
@@ -208,14 +212,7 @@ class AbilitiesEngineImpl implements AbilitiesEngine {
       const { x, z } = cast;
       if (x === null || z === null || !Number.isFinite(x) || !Number.isFinite(z)) return;
       this.dashToward(world, hero, x, z, active.distance);
-      seam.pushEvent?.({
-        k: 'cast',
-        id: hero.id,
-        team: hero.team,
-        slot: ITEM_EVENT_SLOT_BASE + cast.slot,
-        x,
-        z,
-      });
+      this.emitCast(world, hero, ITEM_EVENT_SLOT_BASE + cast.slot, x, z);
       return;
     }
     // aura: timed buff on all allies within radius of the caster (0 = self).
@@ -226,14 +223,7 @@ class AbilitiesEngineImpl implements AbilitiesEngine {
         world.applyAura(id, active.stat, active.amount, active.pct, active.duration, hero.id),
       );
     }
-    seam.pushEvent?.({
-      k: 'cast',
-      id: hero.id,
-      team: hero.team,
-      slot: ITEM_EVENT_SLOT_BASE + cast.slot,
-      x: hero.x,
-      z: hero.z,
-    });
+    this.emitCast(world, hero, ITEM_EVENT_SLOT_BASE + cast.slot, hero.x, hero.z);
   }
 
   // --- Effect primitives --------------------------------------------------------
@@ -244,7 +234,7 @@ class AbilitiesEngineImpl implements AbilitiesEngine {
   private applyEffects(
     world: World,
     src: EntId,
-    team: TeamId,
+    team: EntTeam,
     caster: Ent | undefined,
     effects: readonly Effect[],
     ri: number,
@@ -303,10 +293,13 @@ class AbilitiesEngineImpl implements AbilitiesEngine {
 
   /** Run fn over every eligible unit: the primary target when there is no
    *  AoE, else every targetable unit within `radius` of (x, z) on the given
-   *  side ('enemy' for damage/stun/slow, 'ally' for heal/aura). */
+   *  side ('enemy' for damage/stun/slow, 'ally' for heal/aura). Membership is
+   *  `targetTeamOk`, so an AoE nuke centred on a jungle clearing hits the camp
+   *  AND any enemy hero standing in it, while an AoE heal or aura dropped on
+   *  the same clearing passes the camp over entirely. */
   private eachAffected(
     world: World,
-    team: TeamId,
+    team: EntTeam,
     radius: number,
     x: number,
     z: number,
@@ -315,14 +308,14 @@ class AbilitiesEngineImpl implements AbilitiesEngine {
     fn: (id: EntId) => void,
   ): void {
     if (radius <= 0) {
-      if (primary && primary.alive && sideOk(side, team, primary.team)) fn(primary.id);
+      if (primary && primary.alive && targetTeamOk(side, team, primary.team)) fn(primary.id);
       return;
     }
     const n = world.inRadius(x, z, radius, this.radiusBuf);
     for (let i = 0; i < n; i++) {
       const e = this.radiusBuf[i];
       if (!e || !e.alive || expired(e, world.tick) || !isUnitTargetable(e)) continue;
-      if (!sideOk(side, team, e.team)) continue;
+      if (!targetTeamOk(side, team, e.team)) continue;
       fn(e.id);
     }
   }
@@ -500,7 +493,7 @@ class AbilitiesEngineImpl implements AbilitiesEngine {
     for (let i = 0; i < n; i++) {
       const e = this.radiusBuf[i];
       if (!e || !e.alive || expired(e, world.tick) || !isUnitTargetable(e)) continue;
-      if (e.team === p.team || p.hit.has(e.id)) continue;
+      if (!targetTeamOk('enemy', p.team, e.team) || p.hit.has(e.id)) continue;
       if (p.pierce) {
         p.hit.add(e.id);
         this.impact(world, p, e.x, e.z, e);

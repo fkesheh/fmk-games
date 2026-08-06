@@ -6,8 +6,15 @@
 // parseRiftSettings is the opposite: it THROWS Error(message) on bad input
 // so the platform can convert it to {t:'error',code:'bad_settings'}.
 //
+// The S2C direction has no parser by design — the server authors it — so its
+// gate is different in kind: the shapes must survive the wire byte for byte
+// (JSON round-trip), the fields the terrain build added must be present and
+// unlossy, and nothing on the S2C side may be reachable through parseRiftC2S.
+// That covers `rift_snap.dayPhase` (TERRAIN_CONTRACT §6), the neutral camp
+// EntKinds and `EntSnap.team === NEUTRAL_TEAM` (§5), and `rift_miss` (§4).
+//
 // Frozen code under test (Layer-1, IMMUTABLE): protocol.ts, config.ts,
-// hero.ts, item.ts.
+// hero.ts, item.ts, types.ts.
 // ============================================================================
 import { describe, expect, it } from 'vitest';
 import {
@@ -15,10 +22,12 @@ import {
   MAP_COORD_MAX,
   MAX_TEAM_SIZE,
   MIN_TEAM_SIZE,
+  NEUTRAL_TEAM,
+  isPlayerTeam,
   parseRiftC2S,
   parseRiftSettings,
 } from '@rift/shared';
-import type { RiftC2S } from '@rift/shared';
+import type { EntKind, EntSnap, EntTeam, RiftC2S, RiftEvent, RiftS2C } from '@rift/shared';
 
 const HERO_IDS = ['bullwark', 'longbow', 'reaver', 'hex', 'mender', 'shade'] as const;
 const ITEM_IDS = [
@@ -340,5 +349,191 @@ describe('parseRiftSettings', () => {
         ).toBeGreaterThan(0);
       }
     }
+  });
+});
+
+// ============================================================================
+// S2C — the server-authored direction (TERRAIN_CONTRACT §4, §5, §6).
+// ============================================================================
+
+/** One trip through the wire: exactly what a WebSocket does to a message. */
+function overWire<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+/** Every EntKind, as a Record so the compiler rejects this list the moment a
+ *  kind is added to or removed from the union — a new kind that nobody
+ *  round-trips is a kind the client silently fails to draw. */
+const ALL_ENT_KINDS: Readonly<Record<EntKind, true>> = {
+  hero: true,
+  melee: true,
+  ranged: true,
+  siege: true,
+  shade: true,
+  tower: true,
+  guard: true,
+  ancient: true,
+  ward: true,
+  proj: true,
+  campPack: true,
+  campBrute: true,
+  campHive: true,
+};
+const ENT_KINDS = Object.keys(ALL_ENT_KINDS) as readonly EntKind[];
+
+/** The three neutral jungle tiers (TERRAIN_CONTRACT §5). */
+const CAMP_KINDS: readonly EntKind[] = ['campPack', 'campBrute', 'campHive'];
+
+function entSnap(over: Partial<EntSnap> & Pick<EntSnap, 'k' | 'team'>): EntSnap {
+  return { id: 1, x: 10, z: 20, hp: 400, maxHp: 400, ...over };
+}
+
+function snap(dayPhase: number, ents: readonly EntSnap[] = []): RiftS2C {
+  return {
+    t: 'rift_snap',
+    tick: 900,
+    serverTime: 1_700_000_000_000,
+    phase: 'live',
+    matchTick: 880,
+    overtime: false,
+    dayPhase,
+    wardStock: 2,
+    kills: [3, 5],
+    board: [],
+    you: null,
+    ents,
+  };
+}
+
+describe('rift_snap.dayPhase (TERRAIN_CONTRACT §6)', () => {
+  it('survives the wire exactly, at both ends of the cycle and in between', () => {
+    // 0 = full day, 1 = full night, continuous and WRAPPING. The client feeds
+    // it straight to SceneHandle.setTimeOfDay, so any lossy step here is a
+    // reconnecting client lit for the wrong half of the cycle.
+    for (const dayPhase of [0, 0.001, 0.25, 0.5, 0.75, 0.999, 1]) {
+      const wire = overWire(snap(dayPhase));
+      if (wire.t !== 'rift_snap') throw new Error(`expected rift_snap, got ${wire.t}`);
+      expect(wire.dayPhase, `dayPhase ${dayPhase} did not survive the wire`).toBe(dayPhase);
+    }
+  });
+
+  it('is a REQUIRED key — full day (0) is not dropped as falsy', () => {
+    const wire = overWire(snap(0));
+    expect(
+      Object.hasOwn(wire, 'dayPhase'),
+      `dayPhase 0 (full day) must travel as a present key, not be elided — got ` +
+        `${JSON.stringify(wire)}`,
+    ).toBe(true);
+    if (wire.t !== 'rift_snap') throw new Error(`expected rift_snap, got ${wire.t}`);
+    expect(wire.dayPhase).toBe(0);
+    expect(typeof wire.dayPhase).toBe('number');
+  });
+
+  it('is never interpolated into existence: two snaps carry two independent phases', () => {
+    const a = overWire(snap(0.98));
+    const b = overWire(snap(0.02));
+    if (a.t !== 'rift_snap' || b.t !== 'rift_snap') throw new Error('expected rift_snap');
+    // A wrap looks like a huge jump; the contract forbids interpolating across
+    // it, so both endpoints must arrive intact for the client to detect one.
+    expect(a.dayPhase).toBe(0.98);
+    expect(b.dayPhase).toBe(0.02);
+  });
+
+  it('cannot be injected by a client — protocol.ts exposes no S2C parser at all', () => {
+    // parseRiftC2S is the ONLY door into the sim and has no 'rift_snap' case,
+    // so a hostile client cannot post a dayPhase — in range or wildly out of
+    // it — into the simulation. That is precisely why protocol.ts performs no
+    // range check on the field: it is server-authored, derived from matchTick
+    // and DAY_PERIOD_S, and the [0,1] invariant is the PRODUCER's obligation
+    // (TERRAIN_CONTRACT §6), pinned by the capture harness's setDayPhase.
+    // If an S2C parser is ever added, it must reject out-of-range values and
+    // this test must be replaced by that rejection case.
+    const outOfRange: readonly number[] = [
+      -0.001,
+      -1,
+      1.001,
+      2,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+    ];
+    for (const dayPhase of [0, 0.5, 1, ...outOfRange]) {
+      expect(
+        parseRiftC2S({ t: 'rift_snap', dayPhase, tick: 1 }),
+        `a rift_snap carrying dayPhase ${dayPhase} must not parse as a client command`,
+      ).toBeNull();
+    }
+    // Nor through the settings door, which is the only other parser here.
+    expect(() => parseRiftSettings({ dayPhase: 5 })).not.toThrow();
+    expect(parseRiftSettings({ dayPhase: 5 })).toEqual({}); // unknown keys are ignored
+  });
+});
+
+describe('EntSnap — neutral jungle camps on the wire (TERRAIN_CONTRACT §5)', () => {
+  it('every EntKind round-trips, including the three camp tiers', () => {
+    for (const k of ENT_KINDS) {
+      const wire = overWire(entSnap({ k, team: CAMP_KINDS.includes(k) ? NEUTRAL_TEAM : 0 }));
+      expect(wire.k, `EntKind '${k}' did not survive the wire`).toBe(k);
+    }
+    for (const k of CAMP_KINDS) {
+      expect(ENT_KINDS, `camp kind '${k}' is missing from EntKind`).toContain(k);
+    }
+  });
+
+  it('team === NEUTRAL_TEAM (2) round-trips and is not coerced to a player team', () => {
+    for (const k of CAMP_KINDS) {
+      const wire = overWire(entSnap({ id: 77, k, team: NEUTRAL_TEAM }));
+      expect(wire.team, `'${k}' arrived on team ${wire.team}, not NEUTRAL_TEAM`).toBe(2);
+      expect(wire.team).not.toBe(0);
+      expect(wire.team).not.toBe(1);
+    }
+  });
+
+  it('a whole snapshot of mixed teams keeps every entity on its own team', () => {
+    const ents: readonly EntSnap[] = [
+      entSnap({ id: 1, k: 'hero', team: 0, lvl: 6, hero: 'reaver', pid: 'p1' }),
+      entSnap({ id: 2, k: 'melee', team: 1 }),
+      entSnap({ id: 3, k: 'campPack', team: NEUTRAL_TEAM }),
+      entSnap({ id: 4, k: 'campBrute', team: NEUTRAL_TEAM }),
+      entSnap({ id: 5, k: 'campHive', team: NEUTRAL_TEAM }),
+    ];
+    const wire = overWire(snap(0.4, ents));
+    if (wire.t !== 'rift_snap') throw new Error(`expected rift_snap, got ${wire.t}`);
+    expect(wire.ents.map((e) => [e.id, e.k, e.team])).toEqual([
+      [1, 'hero', 0],
+      [2, 'melee', 1],
+      [3, 'campPack', 2],
+      [4, 'campBrute', 2],
+      [5, 'campHive', 2],
+    ]);
+    // The tuple hazard: kills is [team0, team1] and a neutral team would index
+    // off the end of it. isPlayerTeam is the only sanctioned narrowing.
+    for (const e of wire.ents) {
+      const team: EntTeam = e.team;
+      if (isPlayerTeam(team)) {
+        expect(wire.kills[team], `kills[${team}] must exist`).toBeTypeOf('number');
+      } else {
+        expect(team).toBe(NEUTRAL_TEAM);
+        expect(CAMP_KINDS).toContain(e.k);
+      }
+    }
+  });
+
+  it('isPlayerTeam narrows exactly the two player teams', () => {
+    expect(isPlayerTeam(0)).toBe(true);
+    expect(isPlayerTeam(1)).toBe(true);
+    expect(isPlayerTeam(NEUTRAL_TEAM)).toBe(false);
+    expect(NEUTRAL_TEAM).toBe(2);
+  });
+});
+
+describe('rift_miss (TERRAIN_CONTRACT §4)', () => {
+  it('round-trips with ENTITY ids, like rift_cast', () => {
+    const ev: RiftEvent = { t: 'rift_miss', attacker: 1042, target: 1043 };
+    expect(overWire(ev)).toEqual({ t: 'rift_miss', attacker: 1042, target: 1043 });
+  });
+
+  it('is not a client command: a client cannot fabricate a miss', () => {
+    expect(parseRiftC2S({ t: 'rift_miss', attacker: 1, target: 2 })).toBeNull();
   });
 });

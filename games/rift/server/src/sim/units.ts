@@ -11,6 +11,19 @@
 // damage by (1 + growth)^i; growth is WAVE_GROWTH, replaced by
 // SURGE_WAVE_GROWTH in overtime, which also adds one melee per wave per
 // elapsed overtime minute (SURGE_EXTRA_MELEE_PERIOD_S).
+//
+// NEUTRAL SAFETY (TERRAIN_CONTRACT §5). Jungle camps are a third team and their
+// creeps live in this world's mobile map like everything else, so every rule in
+// this file is deliberately blind to them:
+//   - wave composition, growth and the overtime surge are derived from the wave
+//     counter and the match clock alone — never from a population count — so a
+//     jungle full of neutrals cannot perturb wave sizing;
+//   - hero respawn narrows with isPlayerTeam before it touches a per-team tuple,
+//     and camp respawn belongs to stepCamps (sim/camps.ts) alone;
+//   - the expiry reaper treats any non-positive expireAtTick as "never" and
+//     skips camp kinds outright — camp members are spawned with -1;
+//   - the per-team ward stock is indexed by literal team ids only, so a neutral
+//     death can never reach it.
 // ============================================================================
 import {
   FOUNTAIN_HEAL_PCT,
@@ -33,10 +46,18 @@ import {
   WAVE_RANGED,
   XP_THRESHOLDS,
   heroById,
+  isPlayerTeam,
 } from '@rift/shared';
 import type { TeamId } from '@rift/shared';
 import type { Ent } from './types.js';
 import type { SimWorld } from './world.js';
+
+/** True for the three neutral jungle kinds (TERRAIN_CONTRACT §5). Their whole
+ *  lifecycle — spawn, leash, respawn — is stepCamps' business; every loop in
+ *  this file that could otherwise claim one consults this first. */
+function isCampMember(e: Ent): boolean {
+  return e.kind === 'campPack' || e.kind === 'campBrute' || e.kind === 'campHive';
+}
 
 /** Grant xp to a hero and process any level-ups: thresholds from
  *  XP_THRESHOLDS (cumulative, index = level), +SKILL_POINTS_PER_LEVEL per
@@ -106,6 +127,13 @@ function spawnWaveLane(
   for (let i = 0; i < siege; i++) spawnOne('siege');
 }
 
+/** Wave spawner. Note what it does NOT read: the entity population. Wave size,
+ *  growth and the surge bonus are pure functions of `w.waveIndex`, `w.overtime`
+ *  and `w.tick`, and the two teams it spawns for are the literals 0 and 1 —
+ *  both `TeamId`. There is therefore no enumeration of units here for a neutral
+ *  to slip into, which is exactly the property TERRAIN_CONTRACT §5 asks for:
+ *  a jungle full of camps leaves lane waves bit-identical. Any future edit that
+ *  wants to count units here must filter with `isPlayerTeam(e.team)` first. */
 function stepWaves(w: SimWorld): void {
   if (w.tick < w.nextWaveTick) return;
   const waveNo = w.waveIndex + 1; // 1-based wave number
@@ -125,13 +153,21 @@ function stepWaves(w: SimWorld): void {
   w.nextWaveTick += Math.round(WAVE_PERIOD_S * TICK_RATE);
 }
 
+/** HERO respawn only. A neutral camp creep also carries a `respawnAtTick`-shaped
+ *  timer on its CampState, but camps respawn whole through stepCamps — nothing
+ *  here may pick one up. Two independent guards enforce that: the kind test
+ *  (no camp kind is 'hero') and the isPlayerTeam narrowing, which is also what
+ *  makes `fountainSpot` — a two-element per-team lookup — legal to call. */
 function stepRespawns(w: SimWorld): void {
   for (const e of w.mobileMap.values()) {
-    if (e.kind !== 'hero' || e.alive || e.respawnAtTick <= 0) continue;
+    if (e.kind !== 'hero' || isCampMember(e)) continue;
+    if (e.alive || e.respawnAtTick <= 0) continue;
     if (w.tick < e.respawnAtTick) continue;
+    const team = e.team;
+    if (!isPlayerTeam(team)) continue; // a neutral has no fountain to return to
     e.alive = true;
     e.respawnAtTick = 0;
-    const spot = w.fountainSpot(e.team, 0);
+    const spot = w.fountainSpot(team, 0);
     e.x = spot[0] ?? e.x;
     e.z = spot[1] ?? e.z;
     e.stunUntilTick = 0;
@@ -159,12 +195,19 @@ function stepRespawns(w: SimWorld): void {
 
 /** Lifetime expiry. The abilities engine retires its projectiles and capped
  *  summons by stamping expireAtTick = world.tick, so this reaps ALL expired
- *  mobiles — projs included. No loot on expiry; heroes are exempt. */
+ *  mobiles — projs included. No loot on expiry; heroes are exempt.
+ *
+ *  Camp members are exempt too, and doubly so. They are spawned with
+ *  expireAtTick = -1 (TERRAIN_CONTRACT §5), so the sentinel test is widened
+ *  from `=== 0` to `<= 0`: any non-positive stamp means "never expires", and
+ *  the old strict test would have read -1 as a tick already in the past and
+ *  reaped the entire jungle on its first tick. The kind test then makes the
+ *  exemption independent of how camps.ts happens to stamp its spawns. */
 function stepExpiry(w: SimWorld): void {
   w.deadBuf.length = 0;
   for (const e of w.mobileMap.values()) {
-    if (e.expireAtTick === 0 || w.tick < e.expireAtTick) continue;
-    if (e.kind === 'hero') continue;
+    if (e.expireAtTick <= 0 || w.tick < e.expireAtTick) continue;
+    if (e.kind === 'hero' || isCampMember(e)) continue;
     w.deadBuf.push(e);
   }
   for (const e of w.deadBuf) {
@@ -193,8 +236,12 @@ export function stepUnits(w: SimWorld): void {
     if (e.manaRegen > 0 && e.mana < e.maxMana) {
       e.mana = Math.min(e.maxMana, e.mana + e.manaRegen * TICK_DT);
     }
-    const ax = w.ancientX[e.team];
-    const az = w.ancientZ[e.team];
+    // ancientX/ancientZ are two-element per-team tuples: narrow before indexing.
+    // A neutral has no fountain, so the else branch is simply "no fountain tick".
+    const team = e.team;
+    if (!isPlayerTeam(team)) continue;
+    const ax = w.ancientX[team];
+    const az = w.ancientZ[team];
     if (ax === undefined || az === undefined) continue;
     if (Math.hypot(e.x - ax, e.z - az) <= FOUNTAIN_RADIUS) {
       e.hp = Math.min(e.maxHp, e.hp + e.maxHp * FOUNTAIN_HEAL_PCT * TICK_DT);
@@ -202,6 +249,9 @@ export function stepUnits(w: SimWorld): void {
     }
   }
   // Team ward stock restock: +1 per WARD_RESTOCK_S up to WARD_TEAM_STOCK.
+  // wardStockArr is a two-element per-team tuple and is indexed here by the
+  // TeamId literals 0 and 1 only — never by an entity's team — so no neutral
+  // event (a camp dying, a camp spawning) can reach it.
   const restockTicks = Math.round(WARD_RESTOCK_S * TICK_RATE);
   if (w.tick - w.lastRestockTick >= restockTicks) {
     w.lastRestockTick += restockTicks;
