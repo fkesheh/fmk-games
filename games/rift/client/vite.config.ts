@@ -15,4 +15,14 @@ export default defineConfig({
     strictPort: true,
     proxy: { '/ws': { target: 'ws://localhost:8080', ws: true } },
   },
+  build: {
+    rollupOptions: {
+      // Two HTML entries: the game itself, and the audio render lab (T11, driven offline by
+      // scripts/audio-render-rift.mjs). Omitting index.html here would delist the game.
+      input: {
+        main: fileURLToPath(new URL('index.html', import.meta.url)),
+        audioLab: fileURLToPath(new URL('audio-lab.html', import.meta.url)),
+      },
+    },
+  },
 });
