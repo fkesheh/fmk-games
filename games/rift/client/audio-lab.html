@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <meta
+      name="description"
+      content="RIFT audio render lab — offline render seam for scripts/audio-render-rift.mjs. Not a game page."
+    />
+    <!-- BINDING (AUDIO_CONTRACT.md T11/T12): this title must be exactly "RIFT AUDIO LAB",
+         verbatim, all caps. The platform server serves the game's index.html with HTTP 200
+         on any miss, so the harness asserts on this title to know it loaded the real page
+         instead of silently grading the wrong document. -->
+    <title>RIFT AUDIO LAB</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #0e1116;
+        color: #e8e8e8;
+        font: 13px monospace;
+      }
+    </style>
+  </head>
+  <body>
+    <p>RIFT audio render lab. Rendered offline via <code>window.__riftAudio</code> /
+      <code>window.__riftAudioBaseline</code> — no UI here, see
+      <code>scripts/audio-render-rift.mjs</code>.</p>
+    <script type="module" src="/src/audio/lab.ts"></script>
+  </body>
+</html>
