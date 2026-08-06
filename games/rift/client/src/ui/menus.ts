@@ -2,7 +2,8 @@
 // ANCIENTS (rift) client — MENUS (CONTRACT §6 ui/menus.ts + §8, T9). The three
 // non-live screens: .menu (name entry, create with teamSize + speed settings,
 // join-by-code with ?code= prefill), .lobby (team roster, hero pick grid with
-// role/blurb/ability tooltips, human-taken heroes greyed, teamSize readout,
+// role/blurb/ability tooltips — every card always pickable, duplicates legal,
+// a muted headcount marks heroes others already picked — teamSize readout,
 // START reflecting canStart, invite code), and .end-screen (winner banner, the
 // full rift_end stats table, back-to-menu). All states per §8 look intentional:
 // every screen renders real copy even when its data is still arriving.
@@ -137,6 +138,14 @@ export function createMenus(parent: HTMLElement): UiHandle {
   nameInput.placeholder = 'Player';
   nameInput.value = storedName();
 
+  // QUICK MATCH is the primary, first-seen action (D5): two players who each
+  // press the first button they see must land in the SAME room. It is wired
+  // below with the other buttons; only its DOM position (and style.css's
+  // existing .menu-quick gold treatment) makes it lead.
+  const quickBtn = el('button', 'menu-btn menu-quick', menu);
+  quickBtn.style.fontSize = '14px';
+  quickBtn.textContent = 'QUICK MATCH — first open public room';
+
   const createBox = el('div', 'menu-create', menu);
   const createTitle = el('h2', 'menu-heading', createBox);
   createTitle.style.fontSize = '14px';
@@ -184,10 +193,6 @@ export function createMenus(parent: HTMLElement): UiHandle {
   const joinBtn = el('button', 'menu-btn', joinBox);
   joinBtn.style.fontSize = '14px';
   joinBtn.textContent = 'JOIN PRIVATE ROOM';
-
-  const quickBtn = el('button', 'menu-btn menu-quick', menu);
-  quickBtn.style.fontSize = '14px';
-  quickBtn.textContent = 'QUICK MATCH — first open public room';
 
   const roomsTitle = el('h2', 'menu-rooms-title', menu);
   roomsTitle.style.fontSize = '14px';
@@ -325,7 +330,7 @@ export function createMenus(parent: HTMLElement): UiHandle {
   }
   const pickTitle = el('h2', 'lobby-heading', lobby);
   pickTitle.style.fontSize = '14px';
-  pickTitle.textContent = 'CHOOSE YOUR HERO — manual picks are unique across both teams';
+  pickTitle.textContent = 'CHOOSE YOUR HERO — duplicate picks are allowed';
   const pickGrid = el('div', 'pick-grid', lobby);
   const lobbyStart = el('button', 'lobby-start', lobby);
   lobbyStart.style.fontSize = '16px';
@@ -367,10 +372,15 @@ export function createMenus(parent: HTMLElement): UiHandle {
       }
     }
 
-    // a hero is taken when another HUMAN picked it (bots/auto-fill may dupe)
-    const taken = new Set<HeroId>();
+    // RIFT has 6 heroes and up to 16 seats: duplicate picks are legal (bots and
+    // auto-fill already dupe at teamSize > 3, and the server accepts manual
+    // dupes too). No card is ever disabled — everyone can always pick anything.
+    // othersOnHero is a non-blocking headcount only, shown as a small marker.
+    const othersOnHero = new Map<HeroId, number>();
     for (const r of roster) {
-      if (!r.bot && r.pick !== null && r.id !== me) taken.add(r.pick);
+      if (r.pick !== null && r.id !== me) {
+        othersOnHero.set(r.pick, (othersOnHero.get(r.pick) ?? 0) + 1);
+      }
     }
 
     pickGrid.replaceChildren();
@@ -378,9 +388,6 @@ export function createMenus(parent: HTMLElement): UiHandle {
       const card = el('button', 'pick-card', pickGrid);
       card.title = heroTooltip(def);
       const isMine = picks[me] === def.id;
-      const isTaken = taken.has(def.id);
-      card.disabled = isTaken;
-      card.style.opacity = isTaken ? '0.35' : '';
       card.style.outline = isMine ? `2px solid ${accentColor(def.visual.accent)}` : '';
       const glyph = el('b', null, card);
       glyph.textContent = def.name.slice(0, 1);
@@ -391,9 +398,14 @@ export function createMenus(parent: HTMLElement): UiHandle {
       const role = el('i', null, card);
       role.style.fontSize = `${FONT_MIN_PX}px`;
       role.textContent = `${def.role} — ${def.blurb}`;
-      if (!isTaken) {
-        card.onclick = () => actionsRef?.send({ t: 'rift_pick', hero: def.id });
+      const others = othersOnHero.get(def.id) ?? 0;
+      if (others > 0) {
+        const taken = el('i', null, card);
+        taken.style.fontSize = `${FONT_MIN_PX}px`;
+        taken.style.opacity = '0.6';
+        taken.textContent = `also picked by ${others}`;
       }
+      card.onclick = () => actionsRef?.send({ t: 'rift_pick', hero: def.id });
     }
   }
 
