@@ -40,13 +40,14 @@ Phases: `'lobby' | 'live' | 'ended'`.
   team 0). On join the room sends `rift_hello` + a fresh `rift_lobby`, and
   broadcasts `rift_roster`. `rift_lobby` is re-broadcast to all seated clients
   on EVERY lobby change (join, leave, pick, start-press, countdown).
-- **Picks.** `rift_pick` is accepted only in lobby, only for a hero not
-  manually picked by another HUMAN (manual picks are unique across both
-  teams); anything else is ignored in silence and never throws. Picks
-  broadcast via `rift_pick` events. **Uniqueness binds manual picks only**:
-  auto-assignment and bot fill cycle `HERO_LIST` from the first un-picked
-  hero, wrapping with duplicates allowed — at teamSize > 3 there will be
-  duplicate heroes, which is legal and expected.
+- **Picks.** `rift_pick` is accepted in lobby for ANY hero — duplicates are
+  allowed and expected at teamSize > 3 (six heroes, up to sixteen seats);
+  anything invalid is ignored in silence and never throws. Picks broadcast via
+  `rift_pick` events AND an immediate `rift_lobby` re-broadcast, so every
+  client sees the pick (and its running count) the moment it lands. The pick
+  grid never greys a hero out — it shows how many players currently hold each
+  hero. Auto-assignment and bot fill cycle `HERO_LIST` from the LEAST-picked
+  heroes first, wrapping with duplicates allowed.
 - **canStart** = phase is lobby AND no countdown running AND connected humans
   >= `MIN_PLAYERS` (1). Any seated human may send `rift_start`; illegal presses
   are ignored in silence. On accept: `countdownEndsAt = now +
@@ -593,3 +594,36 @@ Wave 3:
   errors and `window.__rift` health, reads draw calls via the debug surface,
   and feeds the art-director/UX-director judge loops (orchestrator-driven).
   Depends on T7-T11.
+
+---
+
+## Audio amendment (deliberate, recorded here)
+
+The audio rebuild (`docs/rift-audio/AUDIO_CONTRACT.md`, `docs/rift-audio/SONIC_BIBLE.md`)
+supersedes §6's `audio.ts` (T9) line. It replaces the single
+`client/src/ui/audio.ts` with the module directory `client/src/audio/`, whose own
+Layer-1 files are `client/src/audio/contract.ts` and `client/src/audio/config.ts`.
+Three carve-outs from the Immutability rule are granted, and only these three:
+
+1. **`client/src/contract.ts`** (Layer-1, normative) may be edited by the
+   ORCHESTRATOR ONLY, and only to re-export `RiftAudioHandle` from
+   `./audio/contract.js` as `AudioHandle`. `RiftAudioHandle` is a structural
+   superset of the previous `AudioHandle` — `event`/`ui`/`setPhase` keep their
+   meaning and every existing `game.ts` call site stays valid — so no other seam
+   in `ClientModules` changes. No implementer may touch this file.
+
+2. **The DOM CLASS CONTRACT** is extended by exactly four classes, owned by the
+   audio settings panel:
+     .audio-panel .audio-panel-row .audio-panel-slider .audio-panel-mute
+   plus `.audio-panel-toggle` for its self-contained open/close button. The panel
+   appends its CSS to the end of `client/src/style.css` in a delimited block and
+   modifies no existing rule.
+
+3. **`client/vite.config.ts`** (a workspace manifest, normally Layer-1) gains a
+   `build.rollupOptions.input` listing `index.html` AND `audio-lab.html`. The lab
+   page is the offline-render seam the audio judge loop measures against; without
+   it there is no way to score rendered audio. Nothing else in that file changes.
+
+`wire.ts` and `main.ts` remain orchestrator-owned and the audio settings panel is
+mounted from `wire.ts`, preserving §6's rule that `game.ts` never imports an
+implementation module.

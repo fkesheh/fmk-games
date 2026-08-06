@@ -1,0 +1,44 @@
+{
+  "contract": [
+    "games/rift/client/src/audio/contract.ts",
+    "games/rift/client/src/audio/config.ts",
+    "docs/rift-audio/SONIC_BIBLE.md",
+    "docs/rift-audio/AUDIO_CONTRACT.md"
+  ],
+  "modules": {
+    "T0-dsp": ["games/rift/client/src/audio/dsp.ts"],
+    "T1-engine": ["games/rift/client/src/audio/engine.ts"],
+    "T2-spatial": ["games/rift/client/src/audio/spatial.ts"],
+    "T3-derive": ["games/rift/client/src/audio/derive.ts"],
+    "T4-abilities": ["games/rift/client/src/audio/cues/abilities.ts"],
+    "T5-combat": ["games/rift/client/src/audio/cues/combat.ts"],
+    "T6-objectives": ["games/rift/client/src/audio/cues/objectives.ts"],
+    "T7-ui": ["games/rift/client/src/audio/cues/ui.ts"],
+    "T8-ambience": ["games/rift/client/src/audio/ambience.ts"],
+    "T9-music": ["games/rift/client/src/audio/music.ts"],
+    "T10-assembly": ["games/rift/client/src/audio/index.ts"],
+    "T11-lab": [
+      "games/rift/client/src/audio/lab.ts",
+      "games/rift/client/src/audio/baseline.legacy.ts",
+      "games/rift/client/audio-lab.html",
+      "games/rift/client/vite.config.ts"
+    ],
+    "T12-harness": ["scripts/audio-render-rift.mjs"],
+    "T13-tests": ["games/rift/client/src/audio/derive.test.ts"],
+    "T14-settings": [
+      "games/rift/client/src/audio/settingsPanel.ts",
+      "games/rift/client/src/style.css"
+    ],
+    "integration": [
+      "games/rift/client/src/contract.ts",
+      "games/rift/client/src/wire.ts",
+      "games/rift/client/src/game.ts",
+      "games/rift/client/src/ui/audio.ts",
+      "package.json",
+      "games/rift/CONTRACT.md"
+    ]
+  },
+  "integrator": "integration",
+  "typecheck_cmd": "npx tsc --noEmit -p games/rift/client/tsconfig.json",
+  "root": "/private/tmp/claude-501/-Users-fkesheh-projects-fps/7109001e-a41d-4f85-bb5f-43f7804a5317/scratchpad/audio"
+}
