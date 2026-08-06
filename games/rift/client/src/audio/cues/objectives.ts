@@ -56,6 +56,24 @@ function allegianceRatios(intensity: number): readonly number[] {
   return intensity >= 0.5 ? INTERVAL.enemy : INTERVAL.ally;
 }
 
+/**
+ * A layer's absolute schedule time: `at + offset`, jittered by up to `VARY.timingS`, but
+ * NEVER earlier than `at` itself. `AudioParam` scheduling (`setValueAtTime` and friends)
+ * throws a `RangeError` for a negative absolute time. In live play `at` is normally
+ * seconds into the match, so a stray -8ms jitter on a zero-offset layer is invisible; but
+ * the render harness's isolated single-cue render always starts at `ctx.currentTime ===
+ * 0`, and `g.rnd()` is seeded, so a layer with no positive offset ahead of `at` (e.g. the
+ * first blast of a repeated cue) can deterministically draw a negative jitter EVERY run.
+ * That throw propagates out of the whole synchronous `CueFn` and `engine.ts`'s per-cue
+ * try/catch swallows it silently by contract ("a cue that fails must not break the
+ * frame") — the confirmed root cause of `obj.klaxon` rendering complete digital silence.
+ * Every layer in this module that schedules at or near `at` goes through this instead of
+ * a bare jitter.
+ */
+function jitteredAt(g: CueGraph, at: number, offset = 0): number {
+  return Math.max(at, at + offset + (g.rnd() * 2 - 1) * VARY.timingS);
+}
+
 interface CollapseCfg {
   readonly subHz: number;
   readonly subDropHz: number;
@@ -102,7 +120,7 @@ function structureCollapse(g: CueGraph, at: number, p: CuePlay, cfg: CollapseCfg
   if (cfg.extraSub) {
     thump(
       g,
-      at + (g.rnd() * 2 - 1) * VARY.timingS,
+      jitteredAt(g, at),
       dest,
       {
         hz: jitter(g, cfg.extraSub.hz, VARY.pitchPct),
@@ -141,7 +159,7 @@ function structureCollapse(g: CueGraph, at: number, p: CuePlay, cfg: CollapseCfg
   // 3) Metal stress layer — the structure groaning before it gives, then settling.
   metal(
     g,
-    at + (g.rnd() * 2 - 1) * VARY.timingS,
+    jitteredAt(g, at),
     dest,
     {
       ratios: METAL_RATIOS.slice(0, 5),
@@ -161,7 +179,7 @@ function structureCollapse(g: CueGraph, at: number, p: CuePlay, cfg: CollapseCfg
   // fighting it.
   noise(
     g,
-    at + 0.03 + (g.rnd() * 2 - 1) * VARY.timingS,
+    jitteredAt(g, at, 0.03),
     dest,
     {
       filter: 'lowpass',
@@ -177,11 +195,10 @@ function structureCollapse(g: CueGraph, at: number, p: CuePlay, cfg: CollapseCfg
   // 5) Debris tail — repeated short seeded grains over the back half of the collapse.
   // T0's noise() loops the shared 1s buffer, so this is bounded only by each grain's own
   // envelope, never the buffer length.
-  const debrisStart = at + cfg.tailS * 0.3;
   const debrisSpan = cfg.tailS * 0.55;
   for (let i = 0; i < cfg.debrisCount; i++) {
     const frac = cfg.debrisCount > 1 ? i / (cfg.debrisCount - 1) : 0;
-    const t0 = debrisStart + frac * debrisSpan + (g.rnd() * 2 - 1) * VARY.timingS;
+    const t0 = jitteredAt(g, at, cfg.tailS * 0.3 + frac * debrisSpan);
     noise(
       g,
       t0,
@@ -202,7 +219,7 @@ function structureCollapse(g: CueGraph, at: number, p: CuePlay, cfg: CollapseCfg
   for (const r of ratios) {
     tone(
       g,
-      at + 0.05 + (g.rnd() * 2 - 1) * VARY.timingS,
+      jitteredAt(g, at, 0.05),
       dest,
       {
         type: 'triangle',
@@ -277,7 +294,7 @@ const OBJ_KLAXON: CueFn = (g, at, p) => {
   const minorSecond = ratioAt(INTERVAL.enemy, 1);
 
   for (let i = 0; i < 3; i++) {
-    const t0 = at + i * blastGap + (g.rnd() * 2 - 1) * VARY.timingS;
+    const t0 = jitteredAt(g, at, i * blastGap);
     const hz = jitter(g, PALETTE.mid.D3, VARY.pitchPct);
 
     tone(
@@ -352,7 +369,7 @@ const OBJ_SURGE: CueFn = (g, at, p) => {
   for (const r of INTERVAL.ally) {
     tone(
       g,
-      at + 0.85 + (g.rnd() * 2 - 1) * VARY.timingS,
+      jitteredAt(g, at, 0.85),
       dest,
       {
         type: 'triangle',
@@ -418,11 +435,19 @@ const OBJ_RESPAWN: CueFn = (g, at, p) => {
 };
 
 /**
- * A single `info`-register tick. Fired once per whole second by `game.ts`; no internal
- * loop. Deliberately NOT `ui.abilityReady`'s bare `PALETTE.info.A5` sine: same register,
- * different pitch (`D6`) plus a short highpass-noise click for a mechanical "clock tick"
- * attack character, so the two unrelated meanings ("a second passed" vs "ability ready")
- * stay distinguishable by ear and on a spectrogram.
+ * A once-per-second tick, fired for both the lobby start countdown and the respawn timer;
+ * no internal loop. NOT an `info`-register cue (it dropped that first attempt: a 3 kHz
+ * highpass click measured 100% of its energy above `INFO_FLOOR_HZ` against an 8% budget —
+ * `obj.*` is not licensed for that band the way `ui.*`/`ann.*` are). It still needs to stay
+ * clearly distinguishable from `ui.abilityReady`'s bare `PALETTE.info.A5` sine, so the
+ * differentiation now lives entirely below the info floor instead: a mid-register
+ * (`PALETTE.mid.A3`, an octave-plus below `abilityReady`'s pitch) triangle tick with a
+ * harder attack, plus a short low bandpassed noise knock for a mechanical "clock tick"
+ * body that a soft single sine has none of.
+ *
+ * Genuinely non-positional: fired via `RiftAudioHandle.countdown(secondsLeft)` with no
+ * world position (same as `hit.heartbeat`'s low-HP timer), so `dry: true` here is by
+ * design, not an oversight — see the registry note on the stereo-correlation assertion.
  */
 const OBJ_COUNTDOWN: CueFn = (g, at, p) => {
   const dest = p.dest;
@@ -434,8 +459,8 @@ const OBJ_COUNTDOWN: CueFn = (g, at, p) => {
     dest,
     {
       type: 'triangle',
-      hz: jitter(g, PALETTE.info.D6, VARY.pitchPct),
-      env: { attack: 0.002, decay: 0.04, sustain: 0.1, release: 0.09, peak: 0.5 },
+      hz: jitter(g, PALETTE.mid.A3, VARY.pitchPct),
+      env: { attack: 0.002, decay: 0.03, sustain: 0.1, release: 0.05, peak: 0.5 },
     },
     level * jitterDb(g, VARY.levelDb),
   );
@@ -445,10 +470,10 @@ const OBJ_COUNTDOWN: CueFn = (g, at, p) => {
     at,
     dest,
     {
-      filter: 'highpass',
-      hz: 3000,
-      q: 0.8,
-      env: { attack: 0.001, decay: 0.02, sustain: 0.02, release: 0.03, peak: 0.22 },
+      filter: 'bandpass',
+      hz: 380,
+      q: 2.2,
+      env: { attack: 0.001, decay: 0.015, sustain: 0.02, release: 0.025, peak: 0.3 },
     },
     level * jitterDb(g, VARY.levelDb),
   );
@@ -760,6 +785,13 @@ export const OBJECTIVE_CUES = {
   'obj.klaxon': { fn: OBJ_KLAXON, bus: 'sfx', priority: 1, tail: 1.7, variants: 1, dry: false },
   // Real tail (tone layer): 1.4 s. Declared 1.45 s — 1.2 truncated the fountain-hum onset.
   'obj.respawn': { fn: OBJ_RESPAWN, bus: 'sfx', priority: 2, tail: 1.45, variants: 1, dry: false },
+  // dry:true is intentional — countdown is fired with no world position (a timer tick,
+  // not a placed event), same class as combat.ts's hit.heartbeat. The render harness's
+  // isWorldCue() (audio-render-rift.mjs) exempts only the `ui.`/`ann.` id prefixes from
+  // its @18m stereo-decorrelation check, so it still asserts decorrelation on this
+  // legitimately-dry, non-`ui`/`ann`-prefixed cue and fails at 1.000 correlation — flagged
+  // for the coordinator to rule on (harness heuristic vs. this cue's dry classification),
+  // not silently special-cased here.
   'obj.countdown': { fn: OBJ_COUNTDOWN, bus: 'sfx', priority: 4, tail: 0.15, variants: 1, dry: true },
   'obj.matchStart': { fn: OBJ_MATCH_START, bus: 'sfx', priority: 1, tail: 1.6, variants: 1, dry: false },
   'ann.firstBlood': { fn: ANN_FIRST_BLOOD, bus: 'announcer', priority: 0, tail: 1.6, variants: 1, dry: true },

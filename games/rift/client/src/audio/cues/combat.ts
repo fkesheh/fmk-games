@@ -79,9 +79,12 @@ const atkHeroMelee: CueFn = (g, at, p) => {
     0.85 * p.gain,
   );
   const hz = jitter(g, rr4(p.variant, LOW.D2, LOW.F2, LOW.A2, LOW.D3), VARY.attackPitchPct);
+  // No layerOffset here: the attack-crispness gate (< 8ms to 90% of peak, measured on the
+  // summed signal) leaves no room for a staggered second layer — see the note atop the
+  // atk.* section.
   thump(
     g,
-    at + layerOffset(g),
+    at,
     p.dest,
     {
       hz,
@@ -112,7 +115,7 @@ const atkHeroRanged: CueFn = (g, at, p) => {
   const hz = jitter(g, rr4(p.variant, LOW.A2, LOW.D2, LOW.F2, LOW.D3), VARY.attackPitchPct);
   thump(
     g,
-    at + layerOffset(g),
+    at,
     p.dest,
     {
       hz,
@@ -143,7 +146,7 @@ const atkCreepMelee: CueFn = (g, at, p) => {
   const hz = jitter(g, rr4(p.variant, LOW.D2, LOW.F2, LOW.A2, LOW.D3), VARY.attackPitchPct);
   thump(
     g,
-    at + layerOffset(g),
+    at,
     p.dest,
     {
       hz,
@@ -174,7 +177,7 @@ const atkCreepRanged: CueFn = (g, at, p) => {
   const hz = jitter(g, rr4(p.variant, LOW.A2, LOW.D2, LOW.F2, LOW.D3), VARY.attackPitchPct);
   thump(
     g,
-    at + layerOffset(g),
+    at,
     p.dest,
     {
       hz,
@@ -205,7 +208,7 @@ const atkSiege: CueFn = (g, at, p) => {
   const hz = jitter(g, rr4(p.variant, LOW.F2, LOW.A2, LOW.D2, LOW.D3), VARY.attackPitchPct);
   thump(
     g,
-    at + layerOffset(g),
+    at,
     p.dest,
     {
       hz,
@@ -237,7 +240,7 @@ const atkTower: CueFn = (g, at, p) => {
   const subHz = jitter(g, rr4(p.variant, SUB.D1, SUB.A1, SUB.D2, SUB.A1), VARY.attackPitchPct);
   thump(
     g,
-    at + layerOffset(g),
+    at,
     p.dest,
     {
       hz: subHz,
