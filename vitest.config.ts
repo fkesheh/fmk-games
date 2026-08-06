@@ -29,6 +29,11 @@ export default defineConfig({
       'games/rift/shared/src/**/*.test.ts',
       'games/rift/server/src/**/*.test.ts',
       'games/rift/client/src/**/*.test.ts',
+      // The PLATFORM had no include at all, so platform/server/src/lobby.test.ts —
+      // the only coverage matchmaking has ever had — would have been silently
+      // skipped. Same defect that hid games/bank/shared and the kart client.
+      'platform/server/src/**/*.test.ts',
+      'platform/shared/src/**/*.test.ts',
     ],
   },
 });

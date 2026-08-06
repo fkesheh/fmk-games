@@ -89,6 +89,58 @@ function typingTarget(): boolean {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
 }
 
+// ---- pure pan math ----------------------------------------------------------------
+// The screen/world mapping (verified numerically against scene.ts's
+// applyCamera, which sits the camera south of its target looking toward +Z):
+//   screen-RIGHT = world -X     screen-LEFT = world +X
+//   screen-UP    = world +Z     screen-DOWN = world -Z
+// All three pan paths below feed a (dx, dz) world-space delta into
+// hooks.panBy, which adds it straight to the camera target (game.ts's
+// panCameraTo). A camera translation by world (dx, dz) shifts already-visible
+// terrain on screen by (dx, -dz) — i.e. pressing a direction should push the
+// accumulator toward the world axis that is the OPPOSITE of that direction's
+// screen sense, so the terrain already on screen slides away from the key
+// pressed and new terrain is revealed on that side.
+
+/** Raw pan accumulator from the held-key set (un-normalised, unscaled). */
+export function arrowPanDelta(held: ReadonlySet<string>): { dx: number; dz: number } {
+  let dx = 0;
+  let dz = 0;
+  if (held.has('ArrowUp')) dz += 1;
+  if (held.has('ArrowDown')) dz -= 1;
+  if (held.has('ArrowLeft')) dx += 1;
+  if (held.has('ArrowRight')) dx -= 1;
+  return { dx, dz };
+}
+
+/** Raw pan accumulator from cursor position + viewport size (screen-edge pan). */
+export function edgePanDelta(
+  mouseX: number,
+  mouseY: number,
+  viewportWidth: number,
+  viewportHeight: number,
+): { dx: number; dz: number } {
+  let dx = 0;
+  let dz = 0;
+  if (mouseX <= EDGE_PX) dx += 1;
+  else if (mouseX >= viewportWidth - EDGE_PX) dx -= 1;
+  if (mouseY <= EDGE_PX) dz += 1;
+  else if (mouseY >= viewportHeight - EDGE_PX) dz -= 1;
+  return { dx, dz };
+}
+
+/** World-space pan delta from a drag's pixel delta ("grab-the-world": the
+ *  terrain under the cursor follows the cursor). deltaX/deltaY are the
+ *  cursor's own movement in pixels (current minus last), positive = cursor
+ *  moved right / down. */
+export function dragPanDelta(
+  deltaX: number,
+  deltaY: number,
+  metresPerPixel: number,
+): { dx: number; dz: number } {
+  return { dx: deltaX * metresPerPixel, dz: deltaY * metresPerPixel };
+}
+
 export function createInput(root: HTMLElement, scene: SceneHandle, hooks: InputHooks): InputHandle {
   const held = new Set<string>();
   let mouseX = 0;
@@ -284,7 +336,8 @@ export function createInput(root: HTMLElement, scene: SceneHandle, hooks: InputH
       const rect = scene.canvas.getBoundingClientRect();
       const mpp = rect.height > 0 ? (hooks.cameraHeight() * DRAG_SCALE) / rect.height : 0;
       // grab-the-world: the terrain follows the cursor
-      hooks.panBy((lastDragX - e.clientX) * mpp, (lastDragY - e.clientY) * mpp);
+      const drag = dragPanDelta(e.clientX - lastDragX, e.clientY - lastDragY, mpp);
+      hooks.panBy(drag.dx, drag.dz);
       lastDragX = e.clientX;
       lastDragY = e.clientY;
     }
@@ -334,18 +387,16 @@ export function createInput(root: HTMLElement, scene: SceneHandle, hooks: InputH
     }
     let dx = 0;
     let dz = 0;
-    // Arrow-key pan. Screen-up is -z, screen-right is +x (fixed camera yaw; if
-    // T7's yaw ever differs this mapping is the single line to revisit).
-    if (held.has('ArrowUp')) dz -= 1;
-    if (held.has('ArrowDown')) dz += 1;
-    if (held.has('ArrowLeft')) dx -= 1;
-    if (held.has('ArrowRight')) dx += 1;
+    // Arrow-key pan + screen-edge pan share one accumulator; see the true
+    // screen/world mapping documented above arrowPanDelta.
+    const arrow = arrowPanDelta(held);
+    dx += arrow.dx;
+    dz += arrow.dz;
     // Screen-edge pan (not while middle-dragging — the drag owns the camera).
     if (pointerSeen && !middleDrag && document.hasFocus()) {
-      if (mouseX <= EDGE_PX) dx -= 1;
-      else if (mouseX >= window.innerWidth - EDGE_PX) dx += 1;
-      if (mouseY <= EDGE_PX) dz -= 1;
-      else if (mouseY >= window.innerHeight - EDGE_PX) dz += 1;
+      const edge = edgePanDelta(mouseX, mouseY, window.innerWidth, window.innerHeight);
+      dx += edge.dx;
+      dz += edge.dz;
     }
     if (dx === 0 && dz === 0) return;
     const speed = hooks.cameraHeight() * PAN_SPEED_PER_HEIGHT;
