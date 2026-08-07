@@ -1575,3 +1575,114 @@ body {
     bottom: 150px; /* clear of the taller bottom cluster */
   }
 }
+
+/* ============================================================================
+   AUDIO SETTINGS PANEL (T14, docs/rift-audio/AUDIO_CONTRACT.md). Self-contained:
+   .audio-panel-toggle is the always-visible open/close control, top-left —
+   the one screen corner nothing else docks to (topbar is top-centre,
+   killfeed/minimap/shop the right edge, .hud bottom-centre). .audio-panel is
+   the panel itself, same card language as .shop-panel (ink fill, stone-deep
+   border, 8px radius). Structural rows/labels are classless per the T7/T9
+   convention; only the five contract classes below carry a class name.
+   ============================================================================ */
+
+.audio-panel-toggle {
+  position: fixed;
+  top: calc(8px + var(--safe-top, 0px));
+  left: calc(10px + var(--safe-left, 0px));
+  z-index: 6;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--stone-deep);
+  border-radius: 6px;
+  background: var(--ink);
+  color: var(--paper);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.audio-panel-toggle:hover {
+  border-color: var(--azure);
+  background: var(--azure-deep);
+}
+
+.audio-panel-toggle[aria-expanded='true'] {
+  border-color: var(--gold);
+  color: var(--gold-lit);
+}
+
+.audio-panel {
+  position: fixed;
+  top: calc(52px + var(--safe-top, 0px));
+  left: calc(10px + var(--safe-left, 0px));
+  z-index: 6;
+  width: min(240px, 92vw);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  background: var(--ink);
+  border: 1px solid var(--stone-deep);
+  border-radius: 8px;
+  box-shadow: 0 8px 32px var(--ink-deep);
+}
+
+/* the heading (T14's classless <b>) — same weight/size treatment as
+   .shop-panel's title */
+.audio-panel > b {
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  color: var(--gold-lit);
+}
+
+.audio-panel-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* the row's classless <label> */
+.audio-panel-row > label {
+  flex: 0 0 68px;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--paper);
+}
+
+/* the row's classless percentage <span> */
+.audio-panel-row > span {
+  flex: 0 0 34px;
+  text-align: right;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--paper-dim);
+}
+
+.audio-panel-slider {
+  flex: 1 1 auto;
+  min-width: 0;
+  accent-color: var(--azure);
+  cursor: pointer;
+}
+
+.audio-panel-slider:focus-visible {
+  outline: 2px solid var(--azure);
+  outline-offset: 2px;
+}
+
+.audio-panel-mute {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--gold);
+  cursor: pointer;
+}
+
+.audio-panel-mute:focus-visible {
+  outline: 2px solid var(--azure);
+  outline-offset: 2px;
+}

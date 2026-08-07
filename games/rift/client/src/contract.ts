@@ -13,6 +13,7 @@ import type {
   RiftS2C,
   TeamId,
 } from '@rift/shared';
+import type { RiftAudioHandle } from './audio/contract.js';
 
 export type SnapMsg = Extract<RiftS2C, { t: 'rift_snap' }>;
 export type LobbyMsg = Extract<RiftS2C, { t: 'rift_lobby' }>;
@@ -137,11 +138,10 @@ export interface UiHandle {
   render(s: ClientState, a: UiActions): void;
 }
 
-export interface AudioHandle {
-  event(ev: RiftEvent): void;
-  ui(kind: 'click' | 'buy' | 'error' | 'levelup'): void;
-  setPhase(p: 'menu' | 'live'): void;
-}
+// AudioHandle is the audio module's own RiftAudioHandle (Audio amendment to
+// games/rift/CONTRACT.md, carve-out 1). `event`/`ui`/`setPhase` keep their
+// original meaning so every existing game.ts call site stays valid.
+export type AudioHandle = RiftAudioHandle;
 
 /** The full module set, constructed by wire.ts (orchestrator) and injected
  *  into the Game. game.ts (T8) never imports an implementation module. */
