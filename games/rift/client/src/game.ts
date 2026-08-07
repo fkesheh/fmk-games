@@ -20,6 +20,7 @@ import {
   BASE_INSET,
   isHeroId,
   isItemId,
+  isPlayerTeam,
   heroById,
   ITEMS,
   MAP_SIDE_BASE,
@@ -51,7 +52,30 @@ const NAME_KEY = 'rift.name'; // localStorage: last joined name
 const EVENTS_MAX = 32; // state.events ring (killfeed/audio), newest last
 const SNAPS_MAX = 32; // __rift.snaps() ring
 const FOG_EVERY_MS = 200; // fog mask refresh ≈ 5Hz (CONTRACT §6)
-const CAM_MIN_H = 18; // wheel zoom clamp (CONTRACT §6)
+/**
+ * Wheel-zoom lower clamp, in metres (CONTRACT §6, STYLE_BIBLE §5).
+ *
+ * 11, not 18, and it is a measurement rather than a preference: at camH 18 a
+ * hero occupies roughly 40 px of a 1080p frame, at which size the 45-70 part
+ * hero silhouettes the mesh tasks build carry no legible headgear, cape or
+ * weapon — every argument in STYLE_BIBLE §7 for hero detail is void unless the
+ * camera can reach the detail. `CAM_MAX_H` and `CAM_DEFAULT_H` are unchanged,
+ * so ordinary play framing does not move; only full zoom-in does.
+ *
+ * The camera cannot clip the ground at this height. render/scene.ts's rig puts
+ * the eye at `heightAt(target) + camH` and pulls it back `camH / tan(55°)` =
+ * 7.70 m along -z, so the worst case is the lowest possible target under the
+ * highest possible ground — the same two numbers R_FOG measured its lid
+ * against (fog.ts "WHY +6.0 AND NOT +7.5"):
+ *     lowest ground  = -(RIVER_DIP 0.4 + UNDULATION_RIVER 0.06)   = -0.46 m
+ *     lowest eye     = -0.46 + 11                                 = 10.54 m
+ *     highest ground = ELEV_STEP 2.6 + UNDULATION_HIGH 0.18       =  2.78 m
+ *     clearance      = 10.54 - 2.78                               =  7.76 m
+ * against a 0.5 m near plane. R_FOG's occluding lid sits at 8.78 m in that
+ * same case, 1.76 m under the eye, and that clearance was computed against
+ * this exact 11 — moving this number invalidates it.
+ */
+const CAM_MIN_H = 11;
 const CAM_MAX_H = 55;
 const CAM_DEFAULT_H = 36;
 const ROOMS_EVERY_MS = 3000; // menu room-list poll (wordbomb pattern)
@@ -101,6 +125,40 @@ export interface RiftDebugApi {
   inviteCode(): string | null; // ?code= prefill (already stripped from the URL)
   serverNow(): number; // lobby countdown rendering (offset-corrected)
   drawCalls(): number; // T14 perf gate
+  /** Triangles rasterised in the last frame — `renderer.info.render.triangles`,
+   *  read through {@link WireProbes}. A FROZEN debug-surface name
+   *  (AMENDMENT_1 §B.5); the capture harness reads it against the 1.2 M budget.
+   *
+   *  It ACCUMULATES THE SHADOW PASS by design: R_SCENE holds
+   *  `info.autoReset = false` and resets once per frame, so the figure is the
+   *  whole frame — scene pass, shadow map, AO, both bloom targets, grade,
+   *  output and AA — not one pass (render/core.ts, AMENDMENT_3 §D). */
+  triangles(): number;
+  /** `true` only once the chunked terrain AND vegetation bakes have BOTH
+   *  finished (`TerrainHandle.ready() && VegetationHandle.ready()`). A FROZEN
+   *  debug-surface name (AMENDMENT_1 §B.5) and the harness's only signal that
+   *  a shot will not photograph a half-built map.
+   *
+   *  It is `false` before `rift_begin` (neither module exists yet) and it stays
+   *  `false` forever if either bake FAILS — both handles report not-ready on a
+   *  failed build (AMENDMENT_3 §G.1) and wire.ts leaves a module that threw
+   *  during construction unset. A failure therefore surfaces as a harness
+   *  timeout with a named cause, never as a green light over a broken world. */
+  worldReady(): boolean;
+  /** Pin the day/night cycle at `t` (0 = full day, 1 = full night, clamped);
+   *  `null` releases the pin and resumes snapshot-driven updates, re-applying
+   *  the newest snapshot's phase immediately. Routed into BOTH sinks —
+   *  `SceneHandle.setTimeOfDay` and `PostHandle.setTimeOfDay`.
+   *
+   *  The capture harness pins before every in-world shot: unpinned, the
+   *  lighting depends on how long the match happened to have been running and
+   *  no two judge rounds can be compared. */
+  setDayPhase(t: number | null): void;
+  /** Entities dropped from otherwise-valid snapshots since load (net.ts). A
+   *  non-zero value means the wire carries something this client cannot parse
+   *  — a protocol drift that is now survivable instead of frame-blanking, but
+   *  still a defect. */
+  droppedEnts(): number;
   /** World ground point under a screen pixel via the scene's real raycast —
    *  the camera-mapping probe the pan regression harness reads (at the canvas
    *  centre this IS the camera target). Null when the ray misses the map. */
@@ -111,6 +169,30 @@ declare global {
   interface Window {
     __rift?: RiftDebugApi;
   }
+}
+
+/**
+ * The three things the Game needs that live in wire.ts's half of the world.
+ *
+ * `ClientModules` is frozen (contract.ts) and deliberately carries neither
+ * `TerrainHandle`, `VegetationHandle` nor `PostHandle` — game.ts has no
+ * business driving any of them. But the two frozen debug-surface members
+ * `worldReady()` and `triangles()` (AMENDMENT_1 §B.5) read exactly those
+ * handles, and `dayPhase` has a second sink on `PostHandle` that the scene
+ * cannot forward to (GRAPHICS_CONTRACT §6 makes `setFramePass` the only
+ * scene<->post link). So the orchestrator installs three narrow probes rather
+ * than the handles themselves — the same additive mechanism as {@link
+ * Game.onBegin}, and the constructor's `window.__rift` closures read the field
+ * lazily, so installing it immediately after `new Game(...)` is soon enough.
+ */
+export interface WireProbes {
+  /** `TerrainHandle.ready() && VegetationHandle.ready()`, and `false` while
+   *  either module is unbuilt or failed. Must never report a false `true`. */
+  worldReady(): boolean;
+  /** `sceneCore(scene).renderer.info.render.triangles` at read time. */
+  triangles(): number;
+  /** `PostHandle.setTimeOfDay` — the second of the two day/night sinks. */
+  postTimeOfDay(t: number): void;
 }
 
 function cleanName(v: string): string {
@@ -152,6 +234,15 @@ export class Game {
   private lastYouLevel = 0;
   private toast: { text: string; untilMs: number } | null = null; // cast-denied note
 
+  // ---- day/night --------------------------------------------------------------
+  /** Capture pin from `__rift.setDayPhase`; null = follow the snapshot. */
+  private dayPin: number | null = null;
+  /** Last value published to the two sinks; -1 = nothing published yet. Both
+   *  sinks are documented cheap-when-unchanged, and the scene's PMREM rebuild
+   *  is gated on a real change — this just keeps the two calls off the hot
+   *  path of every 20 Hz snapshot when the phase has not moved. */
+  private dayPhaseSent = -1;
+
   // ---- camera ---------------------------------------------------------------------
   private camX = 0;
   private camZ = 0;
@@ -183,6 +274,13 @@ export class Game {
   /** Orchestrator hook (wire.ts): fired with each rift_begin so map-dependent
    *  handles can be built/swapped. Additive to the frozen constructor seam. */
   onBegin: ((begin: BeginMsg) => void) | null = null;
+
+  /** Orchestrator probes (wire.ts), installed immediately after construction.
+   *  Null only in the microtask between `new Game(...)` and that assignment,
+   *  and in a unit test that constructs a Game without a wire — in which case
+   *  the world is genuinely not ready and no post stack exists, which is what
+   *  the fallbacks below report. See {@link WireProbes}. */
+  probes: WireProbes | null = null;
 
   constructor(root: HTMLElement, modules: ClientModules) {
     this.modules = modules;
@@ -259,6 +357,10 @@ export class Game {
       inviteCode: () => this.invite,
       serverNow: () => this.net.serverNow(),
       drawCalls: () => this.modules.scene.drawCalls(),
+      triangles: () => this.probes?.triangles() ?? 0,
+      worldReady: () => this.probes?.worldReady() ?? false,
+      setDayPhase: (t) => this.setDayPhase(t),
+      droppedEnts: () => this.net.droppedEntities(),
       screenToGround: (sx, sy) => {
         const out = { x: 0, z: 0 };
         return this.modules.scene.screenToGround(sx, sy, out) ? out : null;
@@ -480,6 +582,7 @@ export class Game {
       case 'rift_pick':
       case 'rift_roster':
       case 'rift_cast':
+      case 'rift_miss':
       case 'rift_end':
         this.onEvent(msg);
         break;
@@ -489,6 +592,10 @@ export class Game {
   private onSnap(msg: SnapMsg): void {
     this.combatFx(msg);
     this.snap = msg;
+    // The day/night cycle is server-authoritative (protocol.ts freezes
+    // `dayPhase` as a continuous wrapping triangle, AMENDMENT_1 §C) — except
+    // while a capture holds it pinned.
+    if (this.dayPin === null) this.applyDayPhase(msg.dayPhase);
     this.interp.push(msg);
     this.snapsRing.push(msg);
     if (this.snapsRing.length > SNAPS_MAX) this.snapsRing.splice(0, this.snapsRing.length - SNAPS_MAX);
@@ -638,7 +745,12 @@ export class Game {
       }
       case 'rift_surge':
       case 'rift_pick':
-        break; // events ring + audio already handled above
+      case 'rift_miss':
+        // No fx of their own: the surge sting and the pick chime come from
+        // `audio.event` above, and `rift_miss` is drawn by hud.ts off
+        // `state.events` (the MISS / EVADED float) — the swing's tracer was
+        // already emitted by combatFx, because a miss still spends the swing.
+        break;
     }
   }
 
@@ -671,11 +783,31 @@ export class Game {
     return null;
   }
 
+  /**
+   * The team of entity `id` as `input.ts` must read it, which is HOSTILITY,
+   * not identity.
+   *
+   * Both of input.ts's call sites reduce this to `team !== self` — "is this a
+   * legal right-click attack target / does the cursor show the crosshair" —
+   * and its hook is typed `TeamId | null` (input.ts is not R_WIRE's file and
+   * its signature cannot be widened here). `EntSnap.team` is the widened
+   * `EntTeam`, so a jungle camp arrives carrying `NEUTRAL_TEAM`, and a camp is
+   * hostile to BOTH player teams. Reporting it as the opposing player team is
+   * what that reduces to correctly; reporting `null` would make every
+   * right-click on a camp fall through to a MOVE order and leave the entire
+   * jungle unclickable, in the build whose whole server wave was the jungle.
+   *
+   * Unknown ids, and a neutral seen before `rift_hello` has told us our own
+   * side, stay null.
+   */
   private entTeam(id: number): TeamId | null {
     const snap = this.snap;
     if (snap === null) return null;
     for (const e of snap.ents) {
-      if (e.id === id) return e.team;
+      if (e.id !== id) continue;
+      if (isPlayerTeam(e.team)) return e.team;
+      const mine = this.helloView?.team ?? null;
+      return mine === null ? null : mine === 0 ? 1 : 0;
     }
     return null;
   }
@@ -834,6 +966,42 @@ export class Game {
   private sendGame(msg: RiftC2S): void {
     if (msg.t === 'rift_buy') this.modules.audio.ui('buy');
     this.net.send(msg);
+  }
+
+  // ---- day / night ------------------------------------------------------------------
+  /** The ONE place the day/night phase is published, and it publishes to BOTH
+   *  sinks. `setTimeOfDay` deliberately exists twice — on `SceneHandle` (sun
+   *  and moon direction and intensity, the sky gradient, the PMREM rebuild,
+   *  fog colour and density, tone-mapping exposure) and on `PostHandle` (bloom
+   *  strength and radius, AO intensity, the grade and vignette curve) —
+   *  because the scene holds no reference to the post stack and
+   *  GRAPHICS_CONTRACT §6 makes `setFramePass` the only link between them. The
+   *  Game holds the scene; wire.ts holds the post stack and lends it here as
+   *  `probes.postTimeOfDay`. Same value, same 0=day/1=night scale, same frame:
+   *  a night sky graded by a daytime vignette is exactly the split-brain this
+   *  routing exists to prevent. */
+  private applyDayPhase(t: number): void {
+    const v = Number.isFinite(t) ? clamp(t, 0, 1) : 0;
+    if (v === this.dayPhaseSent) return;
+    this.dayPhaseSent = v;
+    this.modules.scene.setTimeOfDay(v);
+    this.probes?.postTimeOfDay(v);
+  }
+
+  /** `__rift.setDayPhase`. Pinning is what makes a judge round reproducible;
+   *  releasing re-applies the newest snapshot's phase at once rather than
+   *  leaving the world stuck on the pinned value until the next snapshot. */
+  private setDayPhase(t: number | null): void {
+    if (t === null) {
+      this.dayPin = null;
+      const snap = this.snap;
+      if (snap !== null) this.applyDayPhase(snap.dayPhase);
+      return;
+    }
+    if (!Number.isFinite(t)) return; // a NaN pin would poison every sink
+    const v = clamp(t, 0, 1);
+    this.dayPin = v;
+    this.applyDayPhase(v);
   }
 
   // ---- debug surface helpers ------------------------------------------------------

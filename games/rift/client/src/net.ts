@@ -8,6 +8,13 @@
 // RiftEvent (events arrive inside the platform envelope {t:'event', ev} and
 // are unwrapped here). pong is consumed internally for clock sync and never
 // forwarded. Unknown tags are dropped in silence — the server may be newer.
+//
+// REJECTION GRANULARITY (BUILD_SPECS §R_WIRE item 1). A malformed MESSAGE is
+// dropped whole; a malformed ENTITY inside an otherwise-valid `rift_snap` is
+// dropped ALONE and counted (`NetHandle.droppedEntities`). The two are not the
+// same failure: nulling a snapshot because one row did not parse blanks every
+// unit, structure and projectile on screen for that frame, and it degrades
+// with load — the more the server sends, the likelier the whole frame is lost.
 // ============================================================================
 import { NET } from '@platform/shared';
 import type { LobbyC2S, RoomInfo } from '@platform/shared';
@@ -18,6 +25,7 @@ import type {
   EndReason,
   EntKind,
   EntSnap,
+  EntTeam,
   HeroId,
   Phase,
   PlayerStats,
@@ -52,6 +60,11 @@ export interface NetHandle {
   readonly connected: boolean;
   /** Every raw decoded frame this socket has received (ring, debug surface). */
   messageLog(): readonly unknown[];
+  /** How many entities have been DROPPED from otherwise-valid snapshots since
+   *  the page loaded, because they failed {@link parseEnt}. See
+   *  {@link droppedEnts} — this is the diagnosable half of "skip, never
+   *  fatal", and the debug surface reports it. */
+  droppedEntities(): number;
 }
 
 // ---- tuning --------------------------------------------------------------------
@@ -72,7 +85,22 @@ function str(v: unknown): v is string {
 function bool(v: unknown): v is boolean {
   return typeof v === 'boolean';
 }
-function teamOf(v: unknown): TeamId | null {
+/** An ENTITY's team: `0 | 1 | NEUTRAL_TEAM(2)`. Jungle camps ride the same
+ *  snapshot path as players' units and carry team 2 (types.ts `EntTeam`), so a
+ *  parser that admits only 0 and 1 rejects every camp on the wire. Anything
+ *  that INDEXES a per-team structure with the result must narrow with
+ *  `isPlayerTeam` first — this function deliberately does not do that for the
+ *  caller. */
+function teamOf(v: unknown): EntTeam | null {
+  return v === 0 || v === 1 || v === 2 ? v : null;
+}
+/** A PLAYER's team: `0 | 1` only, and `NEUTRAL_TEAM` is malformed here. Roster
+ *  rows, scoreboard rows, end-screen stats, `rift_hello` and the two
+ *  structure/winner event fields are all typed `TeamId` in protocol.ts — a
+ *  neutral in any of them is a protocol violation, not a jungle camp. Keeping
+ *  the two parsers apart is what lets {@link teamOf} widen without silently
+ *  widening five things that must not. */
+function playerTeamOf(v: unknown): TeamId | null {
   return v === 0 || v === 1 ? v : null;
 }
 function phaseOf(v: unknown): Phase | null {
@@ -90,10 +118,52 @@ function entKindOf(v: unknown): EntKind | null {
     case 'ancient':
     case 'ward':
     case 'proj':
+    // The three neutral jungle kinds (types.ts EntKind, AMENDMENT_2 §D.2).
+    // Omitting them rejected every camp member the server sends.
+    case 'campPack':
+    case 'campBrute':
+    case 'campHive':
       return v;
     default:
       return null;
   }
+}
+/** One-shot notice that the server is not sending `dayPhase`. */
+let dayPhaseMissingWarned = false;
+
+/**
+ * `dayPhase` (protocol.ts rift_snap): 0 = full day, 1 = full night,
+ * continuous, wraps. Finite number required; CLAMPED into [0, 1] rather than
+ * rejected, so a server whose wrapping triangle overshoots by a float epsilon
+ * cannot blank a frame. A present-but-corrupt value IS rejected, like every
+ * other scalar in this parser — a NaN here would poison the PMREM rebuild, the
+ * exposure ramp and the grade in one go.
+ *
+ * ABSENT is treated as 0 (full day) with a one-shot warning, and that is a
+ * live defect being tolerated, not a design: `dayPhase` is REQUIRED by
+ * protocol.ts, and `server/src/room.ts` does not put it on the wire —
+ * `SnapMut` has no such field and nothing there calls the `dayPhase(matchTick)`
+ * that AMENDMENT_1 §B.1 hoisted into config.ts for exactly this purpose. That
+ * is S_ROOM's outstanding obligation and R_WIRE does not own room.ts.
+ * Rejecting the snapshot instead would mean every snapshot from the current
+ * server is dropped and the client never leaves the lobby — a whole broken
+ * client to signal one missing scalar. Until S_ROOM lands, the cycle is pinned
+ * at day and only `__rift.setDayPhase` moves it.
+ */
+function dayPhaseOf(v: unknown): number | null {
+  if (v === undefined) {
+    if (!dayPhaseMissingWarned) {
+      dayPhaseMissingWarned = true;
+      console.warn(
+        'rift net: rift_snap carries no `dayPhase` — the server is not sending a protocol-required ' +
+          'field (room.ts must call config.ts dayPhase(matchTick), AMENDMENT_1 §B.1). ' +
+          'Assuming full day; the day/night cycle will not advance.',
+      );
+    }
+    return 0;
+  }
+  if (!num(v)) return null;
+  return v < 0 ? 0 : v > 1 ? 1 : v;
 }
 function structureKindOf(v: unknown): StructureKind | null {
   return v === 'tower' || v === 'guard' || v === 'ancient' ? v : null;
@@ -124,7 +194,7 @@ function parseRoster(v: unknown): RosterEntry[] | null {
   const out: RosterEntry[] = [];
   for (const raw of v) {
     if (!isObj(raw) || !str(raw.id) || !str(raw.name)) return null;
-    const team = teamOf(raw.team);
+    const team = playerTeamOf(raw.team);
     if (team === null || !bool(raw.bot) || !bool(raw.connected)) return null;
     if (!(isHeroId(raw.pick) || raw.pick === null)) return null;
     out.push({ id: raw.id, name: raw.name, team, bot: raw.bot, connected: raw.connected, pick: raw.pick });
@@ -137,7 +207,7 @@ function parseBoard(v: unknown): BoardEntry[] | null {
   const out: BoardEntry[] = [];
   for (const raw of v) {
     if (!isObj(raw) || !str(raw.id) || !isHeroId(raw.hero)) return null;
-    const team = teamOf(raw.team);
+    const team = playerTeamOf(raw.team);
     if (team === null) return null;
     if (!num(raw.level) || !num(raw.kills) || !num(raw.deaths) || !num(raw.assists)) return null;
     if (!bool(raw.bot) || !bool(raw.connected)) return null;
@@ -155,6 +225,16 @@ function parseBoard(v: unknown): BoardEntry[] | null {
   }
   return out;
 }
+
+/** Entities dropped from otherwise-valid snapshots since page load, and a
+ *  one-shot console warning so a drop is visible without opening the debug
+ *  surface. A malformed entity must NOT null the snapshot: the whole frame
+ *  would go blank over one unrecognised unit, which is exactly what happened
+ *  to every snapshot carrying a jungle camp before this pass. Skipping is only
+ *  safe if it is COUNTED — a silent skip is how a protocol drift survives a
+ *  whole build. */
+let droppedEnts = 0;
+let droppedEntsWarned = false;
 
 function parseEnt(v: unknown): EntSnap | null {
   if (!isObj(v) || !num(v.id)) return null;
@@ -279,7 +359,7 @@ function parseStats(v: unknown): PlayerStats[] | null {
   const out: PlayerStats[] = [];
   for (const raw of v) {
     if (!isObj(raw) || !str(raw.id) || !str(raw.name) || !isHeroId(raw.hero)) return null;
-    const team = teamOf(raw.team);
+    const team = playerTeamOf(raw.team);
     if (team === null) return null;
     if (!num(raw.kills) || !num(raw.deaths) || !num(raw.assists)) return null;
     if (!num(raw.goldEarned) || !num(raw.heroDamage) || !num(raw.structureDamage)) return null;
@@ -308,7 +388,7 @@ function parseEvent(raw: Record<string, unknown>): RiftEvent | null {
       return { t: 'rift_kill', killer: raw.killer, victim: raw.victim, gold: raw.gold, firstBlood: raw.firstBlood };
     }
     case 'rift_structure': {
-      const team = teamOf(raw.team);
+      const team = playerTeamOf(raw.team);
       const kind = structureKindOf(raw.kind);
       if (team === null || kind === null) return null;
       if (!(num(raw.lane) || raw.lane === null)) return null;
@@ -329,8 +409,15 @@ function parseEvent(raw: Record<string, unknown>): RiftEvent | null {
       if (!num(raw.id) || !num(raw.slot) || !num(raw.x) || !num(raw.z)) return null;
       return { t: 'rift_cast', id: raw.id, slot: raw.slot, x: raw.x, z: raw.z };
     }
+    case 'rift_miss': {
+      // ENTITY ids, exactly like rift_cast — never player ids (protocol.ts,
+      // AMENDMENT_1 §B.2). Without this arm every uphill miss fell through
+      // `default: return null` and hud.ts's MISS/EVADED float was unreachable.
+      if (!num(raw.attacker) || !num(raw.target)) return null;
+      return { t: 'rift_miss', attacker: raw.attacker, target: raw.target };
+    }
     case 'rift_end': {
-      const winner = teamOf(raw.winner);
+      const winner = playerTeamOf(raw.winner);
       if (winner === null && raw.winner !== null) return null;
       const reason = endReasonOf(raw.reason);
       const stats = parseStats(raw.stats);
@@ -363,7 +450,7 @@ function parseS2C(raw: unknown): NetMsg | null {
     case 'rift_hello': {
       if (!str(raw.you) || !str(raw.roomId)) return null;
       if (!(str(raw.code) || raw.code === null)) return null;
-      const team = teamOf(raw.team);
+      const team = playerTeamOf(raw.team);
       if (team === null || !num(raw.teamSize)) return null;
       const roster = parseRoster(raw.roster);
       if (roster === null) return null;
@@ -402,11 +489,24 @@ function parseS2C(raw: unknown): NetMsg | null {
       if (!(isObj(raw.you) || raw.you === null)) return null;
       const you = raw.you === null ? null : parseYou(raw.you);
       if (raw.you !== null && you === null) return null;
+      const dayPhase = dayPhaseOf(raw.dayPhase);
+      if (dayPhase === null) return null;
       if (!Array.isArray(raw.ents)) return null;
       const ents: EntSnap[] = [];
       for (const rawEnt of raw.ents) {
         const e = parseEnt(rawEnt);
-        if (e === null) return null;
+        if (e === null) {
+          // SKIP, never fatal: one bad row loses one unit for one frame,
+          // whereas returning null here loses the entire world for one frame.
+          droppedEnts++;
+          if (!droppedEntsWarned) {
+            droppedEntsWarned = true;
+            console.warn(
+              'rift net: dropped a malformed entity from a snapshot (running total: __rift.droppedEnts())',
+            );
+          }
+          continue;
+        }
         ents.push(e);
       }
       return {
@@ -416,6 +516,7 @@ function parseS2C(raw: unknown): NetMsg | null {
         phase,
         matchTick: raw.matchTick,
         overtime: raw.overtime,
+        dayPhase,
         wardStock: raw.wardStock,
         kills: [raw.kills[0], raw.kills[1]],
         board,
@@ -504,6 +605,9 @@ export function createNet(hooks: NetHooks): NetHandle {
     },
     messageLog(): readonly unknown[] {
       return log.slice();
+    },
+    droppedEntities(): number {
+      return droppedEnts;
     },
   };
 }

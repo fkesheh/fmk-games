@@ -12,6 +12,16 @@
 //   * structures NEVER ghost (they are in every snapshot by protocol; if one
 //     is ever absent it is simply dropped).
 //
+// NEUTRALS (`EntTeam` = `TeamId | 2`). `InterpEnt.team` and `GhostEnt.team` are
+// widened, so jungle camps arrive here on the same path as players' units. This
+// module indexes NOTHING per team — no colour tuple, no marker table, no
+// per-team array — so it needs no `isPlayerTeam` narrowing; its whole
+// obligation is to carry the value through unchanged (`copyAux`, `makeSlot`,
+// and the ghost copy in `push`), and to treat a camp as the ordinary mobile
+// entity it is: camps are not structures, so they DO ghost when they walk out
+// of vision. The narrowing obligation lands on the consumers that do index —
+// ui/nameLabels.ts, ui/minimap.ts, render/units.ts.
+//
 // No per-frame allocation: one Slot per entity id holds a pooled InterpEnt and
 // a pooled GhostEnt that are mutated in place; the two output arrays are
 // reused across calls. Slots live in an array kept sorted by entity id
