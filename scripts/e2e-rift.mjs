@@ -29,8 +29,24 @@
 //   STARTING_GOLD 600, bladestone cost 400, FOUNTAIN_RADIUS 6, side at 1 lane
 //   96, team0 ancient (11,11), team1 (85,85), LOBBY_COUNTDOWN_MS 3000 real ms.
 //
+// TERRAIN PASS (checks 15-16). Two wire-level facts the terrain build adds and
+// nothing else in this suite would notice if they silently stopped arriving:
+//   * rift_snap.dayPhase (TERRAIN_CONTRACT §6) — present, finite, inside
+//     [0,1] on every sampled snap, and actually MOVING across the match. At
+//     speed 20 a DAY_PERIOD_S=600 cycle takes 30s of wall clock, so a 12-18
+//     game-minute match sweeps well over one full cycle.
+//   * neutral jungle camps (TERRAIN_CONTRACT §5) — the hero is walked to a
+//     camp clearing whose coordinates come from buildTerrain(1) IN THIS
+//     PROCESS (terrain is a pure function of the lane count and never goes on
+//     the wire), and team-2 camp entities must then appear in its snapshots.
+//     That single check covers camp spawn, the third team on the wire, and
+//     neutral entities surviving the room's fog filter.
+//
 // Exit 0 only if every numbered check passes AND zero page/console/network
 // errors were seen on either page (benign favicon noise excluded).
+// SUBPROCESS DISCIPLINE: the platform server is never judged by its piped
+// output — its exit code and signal are recorded on the 'exit' event and an
+// unrequested death is a failed check, not a log line.
 // ============================================================================
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
@@ -38,6 +54,7 @@ import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
+import { CAMP_APPROACH_M, CAMP_VISIBLE_M, loadTerrain, terrainFacts } from './rift-terrain-facts.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = Number(process.env.E2E_PORT ?? 8091);
@@ -55,6 +72,27 @@ const EXPECT_LANES = 1;
 const EXPECT_TEAM_SIZE = 2;
 const END_TIMEOUT_MS = Number(process.env.E2E_END_TIMEOUT ?? 360000); // 6 min
 
+// ---- terrain facts for the camp check (pure function of the lane count) -----
+// Loaded from INSIDE main()'s try, never at module scope: the Node-version
+// check and the type-stripped import of terrain.ts can both throw, and at
+// module scope that killed the suite before its handler existed — no checks
+// recorded, no summary, indistinguishable from a suite that never ran.
+// CAMP_APPROACH_M / CAMP_VISIBLE_M come from the same shared module as the two
+// capture harnesses; all three used to carry their own copy.
+let MAP_SIDE = 0; // 96 at 1 lane — read, never assumed
+/** Camp clearings ordered nearest-first to the map centre, so the hero walks
+ *  to the one it can reach soonest from either fountain. */
+let CAMPS = [];
+// At speed 20 a second of wall clock is 20 game-seconds, so the old 90 s budget
+// was ~30 game-MINUTES — the match hard cap. With camps unwired this check
+// alone could consume the entire match and take the three checks after it down
+// with it. The walk itself is a few dozen metres at hero speed: under 20 game-
+// seconds. 20 s of wall clock is still ~400 game-seconds of slack.
+const CAMP_WALK_TIMEOUT_MS = 20000;
+const DAY_PHASE_SWEEP_MIN = 0.25; // a 12+ game-minute match at DAY_PERIOD_S 600
+//   sweeps more than one full cycle; anything under a quarter of one means the
+//   phase is pinned, frozen or not derived from matchTick at all
+
 // fields the CONTRACT.md §6 debug surface freezes for window.__rift.state()
 const RIFT_STATE_FIELDS = ['phase', 'connected', 'you', 'team', 'hero', 'gold', 'tick', 'ents', 'positions'];
 
@@ -63,6 +101,8 @@ const results = [];
 const pageErrors = [];
 const pages = []; // [page, tag] for state-at-abort dumps
 let serverChild = null;
+let serverDied = null; // a mid-run exit we did not ask for
+let tearingDown = false;
 const browsers = [];
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -108,8 +148,13 @@ function startServer() {
   serverChild = child;
   child.stdout.on('data', (d) => process.stdout.write(`[server] ${d}`));
   child.stderr.on('data', (d) => process.stdout.write(`[server!] ${d}`));
-  child.on('exit', (code) => {
-    if (code !== null && code !== 0) console.log(`[server] exited with code ${code}`);
+  child.on('exit', (code, signal) => {
+    // Recorded by EXIT CODE, never inferred from the piped log. A server that
+    // dies mid-run leaves both pages rendering their last snapshot, so every
+    // later assertion reads a frozen world as a healthy one.
+    if (tearingDown) return;
+    serverDied = { code, signal };
+    console.log(`[server] EXITED mid-run (code ${code}, signal ${signal})`);
   });
 }
 
@@ -258,12 +303,77 @@ const ownEntId = (page) =>
     return me ? me.id : null;
   });
 
+/** Live neutral (team 2) entities within `radius` of a camp clearing centre,
+ *  with their kinds — the wire-level proof that camps exist, are neutral, and
+ *  survive the room's per-team fog filter. */
+const neutralsNear = (page, cx, cz, radius) =>
+  page.evaluate(
+    (x, z, r) => {
+      const s = window.__rift?.snaps() ?? [];
+      if (s.length === 0) return [];
+      const snap = s[s.length - 1];
+      return snap.ents
+        .filter((e) => e.team === 2 && e.hp > 0 && Math.hypot(e.x - x, e.z - z) <= r)
+        .map((e) => ({ id: e.id, k: e.k, hp: e.hp }));
+    },
+    cx,
+    cz,
+    radius,
+  );
+
+// ---- dayPhase sampler -------------------------------------------------------
+// rift_snap.dayPhase is a scalar nothing else in this suite reads, so it can
+// stop arriving (or go out of range) with every other check still green. A
+// 1Hz background sampler over the whole live match is the cheapest way to
+// notice — and it also measures the SWEEP, which is what proves the value is
+// derived from matchTick rather than pinned.
+const dayPhases = [];
+const badDayPhases = [];
+let dayPhaseTimer = null;
+function startDayPhaseSampler(page) {
+  let busy = false;
+  dayPhaseTimer = setInterval(() => {
+    if (busy) return;
+    busy = true;
+    page
+      .evaluate(() => {
+        const s = window.__rift?.snaps() ?? [];
+        return s.length === 0 ? null : { has: 'dayPhase' in s[s.length - 1], v: s[s.length - 1].dayPhase };
+      })
+      .then((r) => {
+        if (r === null) return;
+        if (!r.has) badDayPhases.push('absent');
+        else if (typeof r.v !== 'number' || !Number.isFinite(r.v) || r.v < 0 || r.v > 1) badDayPhases.push(String(r.v));
+        else dayPhases.push(r.v);
+      })
+      .catch(() => {})
+      .finally(() => {
+        busy = false;
+      });
+  }, 1000);
+}
+function stopDayPhaseSampler() {
+  if (dayPhaseTimer !== null) clearInterval(dayPhaseTimer);
+  dayPhaseTimer = null;
+}
+
+/** Camps in `team`'s own half, nearest the map centre first. Deterministic:
+ *  CampDef.id breaks every tie, and buildTerrain is a pure function. */
+const campsForTeam = (team) => CAMPS.filter((c) => c.half === team);
+
 // ============================================================================
 // main
 // ============================================================================
 async function main() {
   await mkdir(SHOTS_DIR, { recursive: true });
   const t0 = Date.now();
+
+  const facts = terrainFacts(await loadTerrain(), EXPECT_LANES);
+  MAP_SIDE = facts.side;
+  CAMPS = [...facts.camps].sort(
+    (a, b) =>
+      Math.hypot(a.x - MAP_SIDE / 2, a.z - MAP_SIDE / 2) - Math.hypot(b.x - MAP_SIDE / 2, b.z - MAP_SIDE / 2) || a.id - b.id,
+  );
 
   startServer();
   await waitForServer();
@@ -412,6 +522,7 @@ async function main() {
       `gold=${flow.na.you.gold} ents=${flow.na.ents.length} board=${flow.na.board.length} bots=${botRows}`,
     { fatal: true },
   );
+  startDayPhaseSampler(A);
 
   // ==========================================================================
   // CREEPS SPAWN — the poll has been running since before check 7 (see above);
@@ -570,6 +681,68 @@ async function main() {
     `creep #${death.id} gone by matchTick=${death.s.matchTick} (tracked ${hurtIds.size} hurt-creep ids)`,
   );
 
+  // ==========================================================================
+  // (15) NEUTRAL JUNGLE CAMPS — walk the hero to a camp clearing in its own
+  // half and require team-2 entities to show up in its snapshots. The clearing
+  // coordinates are NOT hard-coded: they come from buildTerrain(1) in this
+  // process, which is the same pure function the server used (TERRAIN_CONTRACT
+  // §1), so this check follows the generator instead of rotting behind it.
+  // The stand-off point is on the map-centre side of the clearing, at
+  // CAMP_APPROACH_M: outside the camp's acquisition reach measured from the
+  // clearing centre (AGGRO_RADIUS 7 plus a resting member's ~2 m offset ≈ 9 m)
+  // and inside HERO_VISION (11) so the camp is revealed. See
+  // ./rift-terrain-facts.mjs — CAMP_LEASH_RADIUS, which this used to quote,
+  // caps how far an already-aggroed member may be dragged and says nothing
+  // about whether a loitering hero is pulled.
+  // ==========================================================================
+  const aTeam = (await riftState(A))?.team ?? 0;
+  const camp = campsForTeam(aTeam)[0] ?? CAMPS[0];
+  let campSeen = null;
+  let campTrace = 'never got near the clearing';
+  if (camp === undefined) {
+    check('(15) neutral jungle camps are on the wire (team 2 entities at a camp clearing)', false,
+      `buildTerrain(${EXPECT_LANES}) produced no camps at all — TERRAIN_CONTRACT §3 requires 2 per half at 1 lane`);
+  } else {
+    const dxc = MAP_SIDE / 2 - camp.x;
+    const dzc = MAP_SIDE / 2 - camp.z;
+    const dlc = Math.hypot(dxc, dzc) || 1;
+    const stand = { x: camp.x + (dxc / dlc) * CAMP_APPROACH_M, z: camp.z + (dzc / dlc) * CAMP_APPROACH_M };
+    const campDeadline = Date.now() + CAMP_WALK_TIMEOUT_MS;
+    for (;;) {
+      // The match ending under us is a different failure from "no camps on the
+      // wire", and walking a hero around an ended room forever is how one
+      // unwired feature took the buy/gold/end checks down with it.
+      const phase = (await riftState(A))?.phase ?? null;
+      if (phase !== 'live') {
+        campTrace = `the match left the live phase (phase=${String(phase)}) before any neutral was seen`;
+        break;
+      }
+      await A.evaluate((x, z) => window.__rift.order('move', x, z), stand.x, stand.z);
+      await sleep(700);
+      const near = await neutralsNear(A, camp.x, camp.z, CAMP_VISIBLE_M);
+      if (near.length > 0) {
+        campSeen = near;
+        break;
+      }
+      const s = await lastSnap(A);
+      if (s !== null && s.you !== null) {
+        campTrace =
+          `hero at (${s.you.x.toFixed(1)},${s.you.z.toFixed(1)}), ${Math.hypot(s.you.x - camp.x, s.you.z - camp.z).toFixed(1)}m ` +
+          `from the ${camp.tier} clearing, matchTick=${s.matchTick}`;
+      }
+      if (Date.now() > campDeadline) break;
+    }
+    check(
+      '(15) neutral jungle camps are on the wire (team 2 entities at a camp clearing)',
+      campSeen !== null,
+      campSeen !== null
+        ? `${camp.tier} camp #${camp.id} at (${camp.x},${camp.z}): ${campSeen.length} neutral(s) ` +
+          `kinds=${[...new Set(campSeen.map((e) => e.k))].join('/')} hp=[${campSeen.map((e) => e.hp.toFixed(0))}]`
+        : `no team-2 entity within ${CAMP_VISIBLE_M}m of the ${camp.tier} clearing (${camp.x},${camp.z}) in ` +
+          `${CAMP_WALK_TIMEOUT_MS / 1000}s — ${campTrace}`,
+    );
+  }
+
   // (11) buy at the fountain. The server (world.buy) silently no-ops unless
   // the hero is alive, has the gold, and stands within FOUNTAIN_RADIUS=6 of
   // its own ancient — and idle heroes spawn at ~5.5m out, where soft unit
@@ -702,6 +875,24 @@ async function main() {
   const stats = ended.end.stats.map((p) => `${p.name}(${p.hero},t${p.team}) ${p.kills}/${p.deaths}/${p.assists} gold=${p.goldEarned}`);
   console.log(`info  final stats: ${stats.join(' | ')}`);
   await shot(A, 'e2e-rift-end.png');
+
+  // ==========================================================================
+  // (16) DAY / NIGHT ON THE WIRE — collected by the 1Hz sampler for the whole
+  // match (TERRAIN_CONTRACT §6). Three distinct failures, one check: the field
+  // never arrives, it arrives out of [0,1], or it never moves (pinned, frozen,
+  // or not derived from matchTick at all).
+  // ==========================================================================
+  stopDayPhaseSampler();
+  const lo = dayPhases.length > 0 ? Math.min(...dayPhases) : NaN;
+  const hi = dayPhases.length > 0 ? Math.max(...dayPhases) : NaN;
+  const sweep = hi - lo;
+  check(
+    '(16) rift_snap.dayPhase arrives, stays in [0,1] and sweeps the cycle',
+    badDayPhases.length === 0 && dayPhases.length > 0 && sweep >= DAY_PHASE_SWEEP_MIN,
+    `${dayPhases.length} samples in [${Number.isNaN(lo) ? '?' : lo.toFixed(3)}, ${Number.isNaN(hi) ? '?' : hi.toFixed(3)}] ` +
+      `sweep=${Number.isNaN(sweep) ? '?' : sweep.toFixed(3)} (need >= ${DAY_PHASE_SWEEP_MIN}); ` +
+      `${badDayPhases.length} out-of-contract value(s)${badDayPhases.length > 0 ? `: [${[...new Set(badDayPhases)].slice(0, 5).join(', ')}]` : ''}`,
+  );
 }
 
 // ============================================================================
@@ -725,6 +916,8 @@ try {
     }
   }
 } finally {
+  stopDayPhaseSampler();
+  tearingDown = true;
   for (const b of browsers) await b.close().catch(() => {});
   if (serverChild !== null && serverChild.exitCode === null) serverChild.kill('SIGTERM');
 }
@@ -733,6 +926,13 @@ check(
   '(14) ZERO page errors across both browsers for the whole run',
   pageErrors.length === 0,
   pageErrors.length === 0 ? 'none seen' : `${pageErrors.length}:\n  ${pageErrors.slice(0, 12).join('\n  ')}`,
+);
+check(
+  '(17) the platform server survived the whole run (exit code, not log scraping)',
+  serverDied === null,
+  serverDied === null
+    ? 'still up at teardown'
+    : `exited mid-run with code ${serverDied.code}, signal ${serverDied.signal} — every check after that point read a frozen world`,
 );
 
 const failed = results.filter((r) => !r.ok);

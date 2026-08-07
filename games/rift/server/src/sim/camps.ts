@@ -412,7 +412,7 @@ export function spawnCamp(w: SimWorld, c: CampState): void {
     const e = w.get(id);
     if (!e) continue;
     applyCampStats(w, e, tuning);
-    e.lane = 0;
+    e.lane = -1;
     e.waypoint = 0;
     e.path = null;
     e.pathIndex = 0;

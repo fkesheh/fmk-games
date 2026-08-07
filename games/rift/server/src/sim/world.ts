@@ -318,6 +318,12 @@ export class SimWorld implements World {
   ended = false;
   firstBloodDone = false;
 
+  /** The live camp table (sim/types.ts `World.camps`): one entry per
+   *  `map.terrain.camps` entry, in that exact order, so `camps[i].id === i`.
+   *  Built once at construction and never resized — `stepCamps` is the only
+   *  writer of the entries, and it rewrites `memberIds` in place. */
+  readonly camps: CampState[] = [];
+
   readonly structures: Ent[] = []; // indexed by MapDef structure id
   readonly mobileMap = new Map<EntId, Ent>(); // ids >= 1000, insertion ordered
   nextMobileId = 1000;
@@ -355,6 +361,13 @@ export class SimWorld implements World {
     readonly abilities: AbilitiesEngine,
   ) {
     this.nextWaveTick = Math.round(WAVE_FIRST_AT_S * TICK_RATE);
+    // The jungle table. `aliveCount` 0 with `respawnAtTick` 0 is the "due now"
+    // encoding stepCamps reads: at tick 1 it finds every camp empty with its
+    // clock already served and stands the whole jungle up. (-1 would mean "up",
+    // and would leave the map permanently empty.)
+    for (const def of map.terrain.camps) {
+      this.camps.push({ id: def.id, def, memberIds: [], aliveCount: 0, respawnAtTick: 0 });
+    }
     for (const def of map.structures) {
       const radius =
         def.kind === 'ancient'
@@ -499,7 +512,10 @@ export class SimWorld implements World {
   dealDamage(src: EntId, dst: EntId, amount: number, school: 'physical' | 'magic'): number {
     const d = this.get(dst);
     if (!d || !d.alive || !(amount > 0)) return 0;
-    if (d.kind === 'ancient' && this.guardAlive(d.team)) return 0;
+    // `guardAlive` takes a TeamId: narrow rather than assert (sim/types.ts
+    // Ent.team). A neutral ancient does not exist and would have no guard ring
+    // to hide behind, so the neutral branch is "takes the damage".
+    if (d.kind === 'ancient' && isPlayerTeam(d.team) && this.guardAlive(d.team)) return 0;
     const s = src !== NO_ENT ? this.get(src) : undefined;
     let dealt = amount;
     if (d.id < 1000 && s) {
@@ -591,9 +607,14 @@ export class SimWorld implements World {
     e.dashUntilTick = this.tick + DASH_TICKS;
   }
 
+  /** Frozen signature (sim/types.ts): `team` is `EntTeam`, because camps spawn
+   *  through this same door with `NEUTRAL_TEAM, lane = -1, owner = NO_ENT`.
+   *  Nothing in here narrows it back to `TeamId` or indexes a per-team tuple
+   *  with it — the one place the team is read at all is the lane-waypoint seed
+   *  below, and that is guarded. */
   spawnMobile(
     kind: EntKind,
-    team: TeamId,
+    team: EntTeam,
     x: number,
     z: number,
     lane: number,
@@ -653,9 +674,17 @@ export class SimWorld implements World {
       };
     }
     // First waypoint to walk toward (team 1 walks the polyline reversed).
-    const path = lane >= 0 ? this.map.paths[lane] : undefined;
-    if (path && path.length >= 2) {
-      e.waypoint = team === 0 ? 1 : path.length - 2;
+    // `isPlayerTeam` is not decoration here: a lane polyline runs base-to-base
+    // between the two PLAYER bases, so "the other end" is undefined for a
+    // neutral, and a camp creep that ever picked up a waypoint would march
+    // down a lane (TERRAIN_CONTRACT §5 names this the most likely way the
+    // jungle breaks). Camps pass lane -1; this keeps them off a polyline even
+    // if some future caller does not.
+    if (lane >= 0 && isPlayerTeam(team)) {
+      const path = this.map.paths[lane];
+      if (path && path.length >= 2) {
+        e.waypoint = team === 0 ? 1 : path.length - 2;
+      }
     }
     this.mobileMap.set(id, e);
     this.base.set(id, core);
@@ -664,8 +693,11 @@ export class SimWorld implements World {
 
   // --- shop + progression (units.ts owns the rules; the door is here) ------------
 
-  /** True when the hero stands within its own fountain radius. */
+  /** True when the hero stands within its own fountain radius. A neutral has
+   *  no ancient and therefore no fountain, so it is never at one — narrowed
+   *  before the two-element ancient tuples are indexed. */
   atOwnFountain(h: Ent): boolean {
+    if (!isPlayerTeam(h.team)) return false;
     const ax = this.ancientX[h.team];
     const az = this.ancientZ[h.team];
     if (ax === undefined || az === undefined) return false;
@@ -745,12 +777,17 @@ export class SimWorld implements World {
       case 'ward': {
         // Wardstone places directly in units.ts machinery — never queued.
         if (x === null || z === null) return;
+        // `wardStockArr` is a two-element per-team tuple: narrow before
+        // indexing it (sim/types.ts Ent.team). The stock pool is a player-team
+        // resource, so a neutral holder has none and cannot place.
+        const team = h.team;
+        if (!isPlayerTeam(team)) return;
         if ((h.itemCharges[slot] ?? 0) < 1) return;
-        if ((this.wardStockArr[h.team] ?? 0) < 1) return; // 0 team stock: silent no-op
+        if ((this.wardStockArr[team] ?? 0) < 1) return; // 0 team stock: silent no-op
         if (Math.hypot(x - h.x, z - h.z) > WARD_PLACE_RANGE) return;
         h.itemCharges[slot] = (h.itemCharges[slot] ?? 0) - 1;
-        this.wardStockArr[h.team] = (this.wardStockArr[h.team] ?? 0) - 1;
-        this.spawnMobile('ward', h.team, x, z, -1, this.tick + Math.round(WARD_DURATION_S * TICK_RATE), hero);
+        this.wardStockArr[team] = (this.wardStockArr[team] ?? 0) - 1;
+        this.spawnMobile('ward', team, x, z, -1, this.tick + Math.round(WARD_DURATION_S * TICK_RATE), hero);
         if (h.itemCharges[slot] === 0) {
           h.items[slot] = null;
           h.itemCdUntilTick[slot] = 0;
@@ -908,6 +945,37 @@ export class SimWorld implements World {
 
   // --- orders (advance step 1) -----------------------------------------------------
 
+  /**
+   * Write an order destination onto `e`: clamped into the map, then SNAPPED to
+   * the nearest passable cell centre (AMENDMENT_1 §C).
+   *
+   * The clamp comes first and is separately observable — `nearestPassableCell`
+   * clamps into the grid on its own, so folding the two together would hide a
+   * broken bounds clamp behind the snap for out-of-bounds coordinates.
+   *
+   * The snap exists because cliffs are now solid and nothing but a hero is
+   * pathed: an order onto a cliff would otherwise steer the unit into the face
+   * and leave it pressed there for the rest of the match, having consumed the
+   * player's click. Only an IMPASSABLE destination moves — a legal click keeps
+   * its exact coordinate, so ordinary orders are unaffected to the last bit,
+   * and a destination buried more than {@link ORDER_SNAP_CELLS} deep in rock
+   * keeps its coordinate too (there is no sensible nearby ground to mean).
+   */
+  private setDest(e: Ent, x: number, z: number): void {
+    const cx = clamp(x, 0, this.map.side);
+    const cz = clamp(z, 0, this.map.side);
+    const g = this.map.terrain.grid;
+    const here = cellIndexAt(g, cx, cz);
+    const snapped = nearestPassableCell(g, cx, cz, ORDER_SNAP_CELLS);
+    if (snapped < 0 || snapped === here) {
+      e.ox = cx;
+      e.oz = cz;
+      return;
+    }
+    e.ox = cellMidX(g, snapped);
+    e.oz = cellMidZ(g, snapped);
+  }
+
   private applyOrders(): void {
     for (const q of this.orderQueue) {
       const e = this.get(q.hero);
@@ -916,14 +984,12 @@ export class SimWorld implements World {
       switch (o.kind) {
         case 'move':
           e.order = 'move';
-          e.ox = clamp(o.x, 0, this.map.side);
-          e.oz = clamp(o.z, 0, this.map.side);
+          this.setDest(e, o.x, o.z);
           e.orderTarget = NO_ENT;
           break;
         case 'attackmove':
           e.order = 'attackmove';
-          e.ox = clamp(o.x, 0, this.map.side);
-          e.oz = clamp(o.z, 0, this.map.side);
+          this.setDest(e, o.x, o.z);
           e.orderTarget = NO_ENT;
           break;
         case 'stop':
@@ -943,10 +1009,10 @@ export class SimWorld implements World {
             e.orderTarget = o.target;
           } else if (t !== undefined) {
             // Illegal target (dead / own team / ward): degrade to an
-            // attack-move toward its last known position.
+            // attack-move toward its last known position — through the same
+            // clamp-and-snap door, since a corpse can lie anywhere.
             e.order = 'attackmove';
-            e.ox = t.x;
-            e.oz = t.z;
+            this.setDest(e, t.x, t.z);
             e.orderTarget = NO_ENT;
           }
           // Unknown id: dropped entirely.
@@ -990,10 +1056,15 @@ export class SimWorld implements World {
       const f1 = a1 ? a1.hp / a1.maxHp : 0;
       let s0 = 0;
       let s1 = 0;
+      // Both tallies below branch on the team EXPLICITLY rather than falling
+      // through an `else`: `Ent.team` is EntTeam, and an `else` would silently
+      // score a neutral for team 1. Structures and heroes are always on a
+      // player team, so nothing is lost — but the tiebreak must not be the
+      // place where that assumption is discovered to be wrong.
       for (const s of this.structures) {
         if (!s.alive) continue;
         if (s.team === 0) s0 += 1;
-        else s1 += 1;
+        else if (s.team === 1) s1 += 1;
       }
       let k0 = 0;
       let k1 = 0;
@@ -1004,7 +1075,7 @@ export class SimWorld implements World {
         if (e.team === 0) {
           k0 += e.kills;
           g0 += e.goldEarned;
-        } else {
+        } else if (e.team === 1) {
           k1 += e.kills;
           g1 += e.goldEarned;
         }
@@ -1087,7 +1158,7 @@ export class SimWorld implements World {
     return [ax + dx * 4 - dz * lat, az + dz * 4 + dx * lat];
   }
 
-  // --- advance: the 8-step orchestration (CONTRACT §4) -------------------------------
+  // --- advance: the 9-step orchestration (CONTRACT §4 + AMENDMENT_1 §A) --------------
 
   advance(): void {
     if (this.ended) return;
@@ -1105,9 +1176,14 @@ export class SimWorld implements World {
     stepCombat(this);
     // (6) deaths / loot
     stepDeaths(this);
-    // (7) waves / respawns / fountain / passive gold / expiry
+    // (7) neutral camps: leash, acquisition, respawn. AFTER stepDeaths so a
+    // camp emptied this tick stamps its respawn on the same tick, and BEFORE
+    // stepUnits so a member spawned here is an ordinary mobile for the rest of
+    // it (AMENDMENT_1 §A, camps.ts header).
+    stepCamps(this);
+    // (8) waves / respawns / fountain / passive gold / expiry
     stepUnits(this);
-    // (8) win / overtime checks
+    // (9) win / overtime checks
     this.stepEndChecks();
   }
 }

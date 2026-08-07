@@ -10,14 +10,22 @@
 // screenshot -> art-director-judge -> fix loop can compare rounds pixel for
 // pixel.
 //
-// THE MATRIX (17 shots, `<out>/<name>.png`):
+// THE MATRIX (24 shots, `<out>/<name>.png`):
 //   wide-mid / wide-base-own / wide-base-enemy   camH 55 (fully out)
 //   mid-lane                                     camH ~35, live creep clash
 //   close-hero / close-creeps / close-tower /
-//   close-ancient / close-deco                   camH 18 (fully in)
+//   close-ancient / close-deco / camp-brute      camH 18 (fully in)
+//   high-ground / jungle-wall                    camH ~25 (GRAPHICS_CONTRACT §5)
+//   river-mid                                    camH ~35
 //   fx-cast / fx-combat / fog-edge               camH ~35
 //   hud-live / ui-shop / ui-scoreboard           camH ~35, HUD/overlay state
 //   ui-menu / ui-lobby                           pre-match DOM screens
+//   night-mid-lane / night-close-hero /
+//   night-wide-mid                               the day framings at dayPhase 1
+//
+// The last eleven names are GRAPHICS_CONTRACT §5's frozen judge shot list for
+// the terrain pass: the judge must photograph the features this build exists
+// to add, or the loop grades a world it cannot see.
 //
 // DETERMINISM (the judge diffs successive rounds — framing MUST NOT drift):
 //   * no Math.random anywhere;
@@ -25,24 +33,46 @@
 //     = 3 lanes -> side 128 (config.ts), speed 5. `lanes === 3` is ASSERTED
 //     off the rift_begin frame; a 1-lane test map fails the run;
 //   * every camera target is a MAP FACT (map centre, an Ancient, a tower read
-//     out of the snapshot — buildMap() is pure) or a fixed fraction along the
-//     own->enemy diagonal, mirrored through the map centre for team 1, so the
-//     same frames come back whichever side the human is seated on;
+//     out of the snapshot — buildMap() is pure), a TERRAIN FACT (a cliff edge,
+//     a river cell, a lane-adjacent foliage clump or a camp clearing, read out
+//     of buildTerrain(lanes) IN THIS PROCESS — terrain is a pure function of
+//     the lane count, TERRAIN_CONTRACT §1) or a fixed fraction along the
+//     own->enemy diagonal — each mirrored through the map centre for team 1,
+//     so the same frames come back whichever side the human is seated on;
 //   * zoom is driven to a CLAMP (12 wheel notches at 1.12/notch overshoots the
 //     18..55 range) and then stepped back a fixed count — never relative to an
 //     unknown current height;
+//   * dayPhase is PINNED before every in-world shot through
+//     window.__rift.setDayPhase — 0 for the day matrix, 1 for the night trio.
+//     Without this the lighting depends on how long the match happened to have
+//     been running and no two judge rounds are comparable (GRAPHICS_CONTRACT
+//     §5). A missing setDayPhase fails the shot; it never captures anyway.
 //   * shots that need a hero in frame POSE the hero first: order it to the
 //     fixed point and poll until it stands there, then aim the camera at the
 //     POINT, not at the hero;
 //   * every gameplay wait polls the real condition (opposing creeps in
-//     contact, units swinging, the cast event landing) with a timeout — the
-//     only fixed sleeps are the post-condition settles that land animations
-//     in the same phase each round.
+//     contact, units swinging, the cast event landing, neutrals visible in the
+//     camp clearing) with a timeout — the only fixed sleeps are the
+//     post-condition settles that land animations in the same phase each round.
+//
+// CAPTURE LIVENESS (GRAPHICS_CONTRACT §5, a measured defect): before EVERY
+// in-world shot the flow asserts the client phase is 'live', the local hero is
+// alive and no full-screen overlay is painted; after the shot it measures the
+// saved PNG's mean and standard deviation of luminance and fails the shot if
+// either collapses. A baseline `wide-mid` was once captured through the
+// death-screen dim and graded as art. Night shots get their own (lower) mean
+// floor — night is authored dark on purpose.
+//
+// SUBPROCESS DISCIPLINE: the platform server is the only child process and it
+// is never judged by its piped output — its exit code and signal are recorded
+// on the 'exit' event, and an unrequested death fails the run. A dead server
+// leaves every page rendering its last snapshot: big, pretty, frozen frames.
 //
 // One failed shot never aborts the run: it is recorded {ok:false, error} and
 // the flow continues. The LAST stdout line is the JSON manifest
-//   { ok, outDir, worstDrawCalls, pageErrors, shots:[{name,file,bytes,
-//     drawCalls,ok,error}] }
+//   { ok, outDir, worstDrawCalls, worstTriangles, pageErrors,
+//     shots:[{name,file,bytes,drawCalls,triangles,frameMean,frameStdDev,
+//     night,ok,error}] }
 // and everything human goes to stderr. Exit 0 only when every requested shot
 // landed and the page logged zero errors.
 //
@@ -57,6 +87,7 @@ import { mkdir, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
+import { CAMP_APPROACH_M, CAMP_VISIBLE_M, loadTerrain, terrainFacts } from './rift-terrain-facts.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = Number(process.env.RIFT_ART_PORT ?? 8093); // 8080 dev / 8091 e2e / 8092 verify
@@ -83,6 +114,13 @@ const KEEP_SERVER = process.argv.slice(2).includes('--keep-server');
 //   * the room is a wasting asset — a long match, a dropped socket or an
 //     ended phase kills everything downstream — so the cheap, always-available
 //     shots are taken FIRST and the expensive walking is deferred to the end.
+// The terrain shots (river-mid, camp-brute, high-ground, jungle-wall) sit
+// AFTER fog-edge — each poses the hero off-lane and permanently reveals the
+// ground it stands on — and BEFORE the enemy-base scouting run, which is the
+// point of no return for the fog state.
+// The night trio comes LAST: it reuses framings the day matrix has already
+// graded, so a judge can diff day against night with nothing else changed, and
+// by then the fog state cannot get any worse.
 const SHOT_ORDER = [
   'ui-menu',
   'ui-lobby',
@@ -98,10 +136,22 @@ const SHOT_ORDER = [
   'close-hero',
   'fx-cast',
   'close-deco',
+  'river-mid',
+  'camp-brute',
+  'high-ground',
+  'jungle-wall',
   'wide-mid',
   'wide-base-own',
   'wide-base-enemy',
+  'night-mid-lane',
+  'night-close-hero',
+  'night-wide-mid',
 ];
+/** Shots taken at dayPhase 1 — a lower frame-luminance floor applies. */
+const NIGHT_SHOTS = new Set(['night-mid-lane', 'night-close-hero', 'night-wide-mid']);
+/** Shots that photograph the world rather than a DOM screen: these get the
+ *  §5 capture-liveness gate and the frame-luminance floors. */
+const DOM_ONLY_SHOTS = new Set(['ui-menu', 'ui-lobby']);
 
 // ---- room / map facts ----------------------------------------------------------------
 // config.ts: LANES_FOR_TEAM_SIZE = [0,0,1,2,2,3,3,3,3] -> teamSize 5 is the
@@ -133,6 +183,14 @@ const SHOT_VIEWPORT = { width: 1920, height: 1080 };
 const WORK_VIEWPORT = { width: 960, height: 540 };
 const MIN_PNG_BYTES = 5000;
 
+// GRAPHICS_CONTRACT §5. verify-rift.mjs owns the GATE and measures it in a
+// 3-lane 8v8 room, which is where §5 specifies the budgets. This matrix runs
+// 5v5 for a shorter, more survivable art round, so its numbers UNDER-measure
+// the peak: an overrun here is real and fails the round, but staying under
+// these limits here proves nothing about the gate.
+const DRAW_CALL_BUDGET = 700;
+const TRIANGLE_BUDGET = 1_200_000;
+
 // ---- camera ------------------------------------------------------------------------
 // input.ts ZOOM_STEP = 1.12/notch, game.ts clamps camH to [18, 55] (default
 // 36). 12 notches move 3.9x — more than the 3.06x range — so 12 notches in
@@ -140,6 +198,39 @@ const MIN_PNG_BYTES = 5000;
 // reproducible. 'default' = 4 notches in from 55 -> 34.96m.
 const ZOOM_CLAMP_STEPS = 12;
 const ZOOM_DEFAULT_STEPS = 4;
+// GRAPHICS_CONTRACT §5 asks for camH 24 on `high-ground`. The wheel is
+// multiplicative, so 24 is not exactly reachable; 3 notches OUT from the 18 m
+// clamp is 18 * 1.12^3 = 25.29 m, the nearest rung that is — and because it is
+// reached FROM a clamp it cannot drift between rounds.
+const ZOOM_CAM24_STEPS = 3;
+
+// ---- day / night pins ---------------------------------------------------------------
+// TERRAIN_CONTRACT §6 / contract.ts SceneHandle.setTimeOfDay: 0 = full day,
+// 1 = full night, continuous, wraps.
+const DAY_PIN = 0;
+const NIGHT_PIN = 1;
+
+// ---- frame liveness (GRAPHICS_CONTRACT §5) --------------------------------------------
+// Floors on the saved PNG's luminance. A frame taken through a full-screen dim
+// collapses the mean; a blank or uniformly flooded frame collapses the standard
+// deviation. Night carries its own mean floor because night is authored dark.
+// MEASURED, not invented: in-world frames from verify-rift.mjs came back at
+// mean 30.0-49.5 with stddev 22.3-35.8, so these floors sit at about half the
+// lowest observed mean and a quarter of the lowest observed stddev — under
+// every real frame, over every dimmed or blank one.
+const MIN_FRAME_STDDEV = 6; // 0..255
+const MIN_FRAME_MEAN_DAY = 18;
+const MIN_FRAME_MEAN_NIGHT = 6;
+// Elements that cover the whole frame. `.shop-panel` and `.scoreboard` are NOT
+// here — they are the panels ui-shop and ui-scoreboard exist to photograph.
+const FULLSCREEN_OVERLAYS = ['.hud .death-overlay', '.death-overlay', '.end-screen', '.lobby-start', '.modal'];
+
+// ---- terrain-derived framing ------------------------------------------------------------
+// CAMP_APPROACH_M / CAMP_VISIBLE_M come from ./rift-terrain-facts.mjs — one
+// definition for all three harnesses (they had drifted apart, and all three
+// were standing inside camp aggro).
+const CAMP_VISIBLE_TIMEOUT_MS = 30000;
+const WORLD_READY_TIMEOUT_MS = 60000;
 
 // ---- deterministic waits --------------------------------------------------------------
 const LIVE_TIMEOUT_MS = 60000;
@@ -153,7 +244,9 @@ const CREEPS_TIMEOUT_MS = 90000;
 const CREEPS_MIN = 3;
 const CREEPS_RADIUS_M = 12; // camH 18 frames ~16m either side — keep them ON screen
 const SCOUT_TIMEOUT_MS = 90000; // reveal the enemy base for wide-base-enemy
-const FRESH_TICK_MS = 400; // liveness probe window (8 sim ticks at speed 2)
+const FRESH_TICK_MS = 400; // liveness probe window (20 sim ticks at speed 5)
+const RESPAWN_TIMEOUT_MS = 90000; // RESPAWN_BASE_S 3 + 3.5/level, /5 for speed
+const RESPAWN_SETTLE_MS = 500; // the overlay fades; do not shoot the fade
 const SCOUT_ARRIVE_M = 26;
 const POSE_TIMEOUT_MS = 90000;
 const POSE_TOLERANCE_M = 2.0;
@@ -166,6 +259,23 @@ const POSE_T = 0.3; // hero pose: 30% of the way to the enemy Ancient
 const DECO_OFFSET_M = 9; // ...pushed this far off the mid lane for close-deco
 const DECO_CAM_OFFSET_M = 4; // camera sits this much further off-lane than the hero
 const FOG_OFFSET_M = 24; // fog-edge centre: beyond the explored lane corridor
+const RETREAT_SAFE_M = 12; // "home" for retreatHome: inside the fountain's guard
+//                            ring, and comfortably wider than the soft unit
+//                            separation that nudges an idle hero around
+
+// ============================================================================
+// TERRAIN FACTS — the four terrain-shot camera targets (river cell, cliff edge,
+// lane-adjacent foliage, brute camp), derived rather than guessed. The
+// derivation lives in ./rift-terrain-facts.mjs so this matrix, verify-rift and
+// the e2e suite share ONE definition; they used to carry three copies and had
+// already diverged.
+//
+// LOADED FROM INSIDE THE FATAL HANDLER, not at module scope. The Node-version
+// check and the type-stripped import of terrain.ts can both throw, and at
+// module scope that killed the process before the try/catch existed — so the
+// harness exited with NO manifest, which its consumers treat as "never run".
+// ============================================================================
+let FACTS = null;
 
 // ---- state -----------------------------------------------------------------------------
 const shots = [];
@@ -173,6 +283,7 @@ const pageErrors = [];
 const browsers = [];
 let serverChild = null;
 let serverExit = null;
+let badServerExit = null; // an exit we did not ask for — a hard failure
 let tearingDown = false;
 let attempted = 0; // wanted shots resolved so far (ok or not)
 
@@ -208,11 +319,12 @@ async function startServer() {
   child.stderr.on('data', (d) => process.stderr.write(`[server!] ${d}`));
   child.on('exit', (code, signal) => {
     serverExit = { code, signal };
-    if (!tearingDown) {
-      process.stderr.write(
-        `[server] EXITED mid-run (code ${code}, signal ${signal}) — the page just lost its socket.\n`,
-      );
-    }
+    if (tearingDown) return;
+    // Recorded by EXIT CODE, never inferred from the piped log: a dead server
+    // leaves the page rendering its last snapshot forever, so the screenshots
+    // stay big and pretty while the world is frozen.
+    badServerExit = { code, signal };
+    process.stderr.write(`[server] EXITED mid-run (code ${code}, signal ${signal}) — the page just lost its socket.\n`);
   });
 }
 
@@ -386,6 +498,43 @@ async function settle(page, { frames = 3, ms = 350 } = {}) {
 const riftState = (page) => page.evaluate(() => window.__rift?.state() ?? null);
 const drawCalls = (page) => page.evaluate(() => window.__rift?.drawCalls() ?? -1);
 
+/** Per-frame triangle count (GRAPHICS_CONTRACT §5's second budget). -1 means
+ *  the meter is not exposed at all. */
+const triangles = (page) =>
+  page.evaluate(() => (typeof window.__rift?.triangles === 'function' ? window.__rift.triangles() : -1));
+
+/** `true` once the chunked terrain AND vegetation bakes have finished
+ *  (contract.ts TerrainHandle.ready / VegetationHandle.ready, reported by
+ *  R_WIRE). `null` when the accessor does not exist. A jungle shot of an
+ *  unplanted jungle grades nothing. */
+const worldReady = (page) =>
+  page.evaluate(() => (typeof window.__rift?.worldReady === 'function' ? window.__rift.worldReady() : null));
+
+/** Pin the renderer's time of day; `null` resumes snapshot-driven updates.
+ *  Returns false when the debug surface has no setDayPhase — in which case the
+ *  shot must NOT be taken, because its lighting would depend on the wall
+ *  clock and no two judge rounds would compare. */
+const pinDayPhase = (page, t) =>
+  page.evaluate((v) => {
+    if (typeof window.__rift?.setDayPhase !== 'function') return false;
+    window.__rift.setDayPhase(v);
+    return true;
+  }, t);
+
+/** Neutral (team 2) camp entities alive within `radius` of a clearing centre. */
+const neutralsNear = (page, cx, cz, radius) =>
+  page.evaluate(
+    (x, z, r) => {
+      const ring = window.__rift?.snaps() ?? [];
+      const s = ring.length > 0 ? ring[ring.length - 1] : null;
+      if (s === null || s === undefined) return 0;
+      return s.ents.filter((e) => e.team === 2 && e.hp > 0 && Math.hypot(e.x - x, e.z - z) <= r).length;
+    },
+    cx,
+    cz,
+    radius,
+  );
+
 /** Pan the camera by clicking the minimap canvas (world [0,side]^2 maps
  *  linearly onto it — ui/minimap.ts pointerdown -> actions.panCameraTo). */
 async function minimapPan(page, u, v) {
@@ -408,13 +557,19 @@ async function zoom(page, steps, dir) {
   }
 }
 
-let zoomLevel = null; // 'out' | 'default' | 'in'
+let zoomLevel = null; // 'out' | 'default' | 'cam24' | 'in'
 /** Drive camH to a reproducible height: always via a clamp, never relative. */
 async function zoomTo(page, level) {
   if (zoomLevel === level) return;
   await zoom(page, ZOOM_CLAMP_STEPS, +1); // -> clamp 55
-  if (level === 'in') await zoom(page, ZOOM_CLAMP_STEPS, -1); // -> clamp 18
-  else if (level === 'default') await zoom(page, ZOOM_DEFAULT_STEPS, -1); // -> 34.96
+  if (level === 'in') {
+    await zoom(page, ZOOM_CLAMP_STEPS, -1); // -> clamp 18
+  } else if (level === 'cam24') {
+    await zoom(page, ZOOM_CLAMP_STEPS, -1); // -> clamp 18
+    await zoom(page, ZOOM_CAM24_STEPS, +1); // -> 25.29, the rung nearest camH 24
+  } else if (level === 'default') {
+    await zoom(page, ZOOM_DEFAULT_STEPS, -1); // -> 34.96
+  }
   zoomLevel = level;
 }
 
@@ -544,39 +699,147 @@ async function assertConnectedLive(page) {
   return s;
 }
 
-/** The per-shot gate: connected, live, AND the snapshot stream is actually
- *  advancing. Nothing is captured over a stalled world. */
-async function assertLive(page) {
+/** True while the respawn overlay is painted. It is a FULL-SCREEN dim plus a
+ *  countdown digit, so a world shot taken over it grades as a dark, muddy
+ *  frame no matter how good the art is — measured: `wide-mid` came back
+ *  dimmed and stamped "YOU DIED / 3" because the enemy-base scouting run had
+ *  just got the hero killed. */
+const deathOverlayShown = (page) =>
+  page
+    .evaluate(() => {
+      const el = document.querySelector('.hud .death-overlay');
+      return el !== null && el.getClientRects().length > 0;
+    })
+    .catch(() => false);
+
+/** Block until the hero is up again and the overlay has faded off the frame. */
+async function waitAlive(page, timeoutMs) {
+  await waitFor(
+    async () => {
+      await assertConnectedLive(page);
+      const you = await latestYou(page);
+      return you !== null && you.respawnAtTick === 0 && !(await deathOverlayShown(page));
+    },
+    timeoutMs,
+    'the hero to respawn (the death overlay dims the whole frame)',
+  );
+  await sleep(RESPAWN_SETTLE_MS); // let the overlay finish fading out
+}
+
+/** Any FULL-SCREEN overlay currently painted, or null. Wider than
+ *  deathOverlayShown: the countdown and the end screen flood the frame just as
+ *  thoroughly, and a judge grading either of them is grading the overlay. */
+const overlayShown = (page) =>
+  page
+    .evaluate((sels) => {
+      for (const sel of sels) {
+        for (const el of document.querySelectorAll(sel)) {
+          if (el.getClientRects().length > 0) return sel;
+        }
+      }
+      return null;
+    }, FULLSCREEN_OVERLAYS)
+    .catch(() => null);
+
+/** The per-shot gate: connected, live, the snapshot stream actually
+ *  advancing, the hero ALIVE, no full-screen overlay, and the requested time
+ *  of day PINNED. Nothing is captured over a stalled world, behind the death
+ *  dim, or at whatever point of the day/night cycle the match happens to be. */
+async function assertLive(page, dayT = DAY_PIN) {
   const a = await assertConnectedLive(page);
   await sleep(FRESH_TICK_MS);
   const b = await assertConnectedLive(page);
   if ((b.tick ?? 0) <= (a.tick ?? 0)) {
     throw new Error(`the snapshot stream stalled (tick stuck at ${String(a.tick)}) — the frame would be stale`);
   }
+  const you = await latestYou(page);
+  if ((you !== null && you.respawnAtTick > 0) || (await deathOverlayShown(page))) {
+    await waitAlive(page, RESPAWN_TIMEOUT_MS);
+  }
+  const overlay = await overlayShown(page);
+  if (overlay !== null) {
+    throw new Error(`a full-screen overlay is painted (${overlay}) — the shot would grade the overlay, not the game`);
+  }
+  if (!(await pinDayPhase(page, dayT))) {
+    throw new Error(
+      'window.__rift.setDayPhase is missing — the capture would depend on the wall clock, so no two judge rounds ' +
+        'could be compared (GRAPHICS_CONTRACT §6 adds setDayPhase(t: number | null) to the debug surface)',
+    );
+  }
+}
+
+/** Block until the chunked terrain + vegetation bakes have finished.
+ *  `worldReady(): boolean` is a FROZEN debug-surface member (AMENDMENT_1 §B.5),
+ *  so its absence is a contract violation, not a condition to work around: a
+ *  fixed settle cannot tell a finished map from a half-built one, and a judge
+ *  round shot over an unplanted jungle grades a world that does not exist. */
+async function waitWorldBuilt(page) {
+  if ((await worldReady(page)) === null) {
+    throw new Error(
+      'window.__rift.worldReady() is missing — it is frozen by AMENDMENT_1 §B.5 and is the only signal that the ' +
+        'chunked terrain + vegetation bakes have finished (contract.ts TerrainHandle.ready/VegetationHandle.ready)',
+    );
+  }
+  await waitFor(async () => (await worldReady(page)) === true, WORLD_READY_TIMEOUT_MS, 'terrain + vegetation bakes to finish');
 }
 
 // ---- capture ---------------------------------------------------------------------------------
 /** Resize UP to 1920x1080, let the resized scene paint, shoot, drop back to
  *  the cheap working size. The whole 1080p exposure is a couple of frames
  *  instead of the whole match. */
+/** Mean and standard deviation of frame luminance, 0..255. The PNG we just
+ *  saved is decoded back INSIDE the page (the browser owns a PNG decoder;
+ *  node would need one) and sampled at 160px wide. A frame behind a
+ *  full-screen dim collapses the mean; a blank or uniformly flooded frame
+ *  collapses the standard deviation. */
+async function frameStats(page, buf) {
+  const b64 = Buffer.from(buf).toString('base64');
+  return page.evaluate(async (data) => {
+    const img = new Image();
+    img.src = `data:image/png;base64,${data}`;
+    await img.decode();
+    const w = 160;
+    const h = Math.max(1, Math.round((img.naturalHeight / img.naturalWidth) * w));
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(img, 0, 0, w, h);
+    const px = ctx.getImageData(0, 0, w, h).data;
+    const n = w * h;
+    let sum = 0;
+    let sumSq = 0;
+    for (let i = 0; i < px.length; i += 4) {
+      const y = 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2];
+      sum += y;
+      sumSq += y * y;
+    }
+    const mean = sum / n;
+    return { mean, stdDev: Math.sqrt(Math.max(0, sumSq / n - mean * mean)) };
+  }, b64);
+}
+
 async function captureRaw(page, name) {
   const file = path.join(OUT_DIR, `${name}.png`);
   const t0 = Date.now();
   await page.setViewport({ ...SHOT_VIEWPORT, deviceScaleFactor: 1 });
+  let buf = null;
   try {
     await settle(page, { frames: 3, ms: 120 }); // scene.resize() + a painted frame at the new size
     try {
-      await page.screenshot({ path: file, timeout: 30000, optimizeForSpeed: true });
+      buf = await page.screenshot({ path: file, timeout: 30000, optimizeForSpeed: true });
     } catch (err) {
       log(`[warn] ${name}: capture failed (${errText(err)}) — one retry`);
-      await page.screenshot({ path: file, timeout: 90000, optimizeForSpeed: true });
+      buf = await page.screenshot({ path: file, timeout: 90000, optimizeForSpeed: true });
     }
   } finally {
     await page.setViewport({ ...WORK_VIEWPORT, deviceScaleFactor: 1 });
   }
   const bytes = statSync(file).size;
   const dc = await drawCalls(page).catch(() => -1);
-  return { file, bytes, drawCalls: dc, ms: Date.now() - t0 };
+  const tris = await triangles(page).catch(() => -1);
+  const stats = await frameStats(page, buf).catch(() => ({ mean: -1, stdDev: -1 }));
+  return { file, bytes, drawCalls: dc, triangles: tris, ...stats, ms: Date.now() - t0 };
 }
 
 function record(name, res, error = null) {
@@ -585,22 +848,59 @@ function record(name, res, error = null) {
     file: res === null ? null : path.relative(ROOT, res.file),
     bytes: res === null ? 0 : res.bytes,
     drawCalls: res === null ? -1 : res.drawCalls,
+    triangles: res === null ? -1 : res.triangles,
+    frameMean: res === null ? -1 : Number(res.mean.toFixed(2)),
+    frameStdDev: res === null ? -1 : Number(res.stdDev.toFixed(2)),
+    night: NIGHT_SHOTS.has(name),
     ok: error === null,
     error,
   });
   if (error === null) {
-    log(`shot  ${name} (${(res.bytes / 1024).toFixed(0)}kB, ${res.drawCalls} draw calls, ${(res.ms / 1000).toFixed(1)}s at 1080p)`);
+    log(
+      `shot  ${name} (${(res.bytes / 1024).toFixed(0)}kB, ${res.drawCalls} calls, ${res.triangles} tris, ` +
+        `L̄ ${res.mean.toFixed(1)} σ ${res.stdDev.toFixed(1)}, ${(res.ms / 1000).toFixed(1)}s at 1080p)`,
+    );
   } else {
     log(`[FAILED] ${name}: ${error}`);
   }
 }
 
+/** GRAPHICS_CONTRACT §5 capture liveness, applied to the SAVED frame: a shot
+ *  that is dimmer or flatter than a real one is rejected loudly rather than
+ *  handed to the judge. DOM-only screens (ui-menu, ui-lobby) are exempt —
+ *  they are supposed to be a flat panel over a dark backdrop. */
+function assertFrameLive(name, res) {
+  if (DOM_ONLY_SHOTS.has(name) || res.mean < 0) return;
+  const meanFloor = NIGHT_SHOTS.has(name) ? MIN_FRAME_MEAN_NIGHT : MIN_FRAME_MEAN_DAY;
+  if (res.mean < meanFloor) {
+    throw new Error(
+      `frame mean luminance ${res.mean.toFixed(1)} is below the ${NIGHT_SHOTS.has(name) ? 'night' : 'day'} floor ` +
+        `${meanFloor} — the capture came through a dim, or nothing rendered`,
+    );
+  }
+  if (res.stdDev < MIN_FRAME_STDDEV) {
+    throw new Error(
+      `frame luminance stddev ${res.stdDev.toFixed(1)} is below ${MIN_FRAME_STDDEV} — the frame is flat ` +
+        '(blank, or flooded by a full-screen overlay)',
+    );
+  }
+}
+
 async function capture(page, name, settleOpts) {
   await settle(page, settleOpts);
+  // Re-check at the LAST possible moment: the per-shot gate ran before the
+  // zoom and the pan, and a hero can die inside those couple of seconds —
+  // measured, that is exactly how a "YOU DIED" dim reached wide-mid.
+  if (await deathOverlayShown(page)) {
+    log(`[warn] ${name}: the hero died during framing — waiting out the respawn dim`);
+    await waitAlive(page, RESPAWN_TIMEOUT_MS);
+    await settle(page, settleOpts);
+  }
   const res = await captureRaw(page, name);
   if (res.bytes < MIN_PNG_BYTES) {
     throw new Error(`only ${res.bytes} bytes — the frame did not render`);
   }
+  assertFrameLive(name, res);
   record(name, res);
 }
 
@@ -667,6 +967,30 @@ async function scoutEnemyBase(page, ex, ez, timeoutMs) {
   }
 }
 
+/** Walk the hero home after the scouting run. Without this the LAST move
+ *  order still points at the enemy Ancient, so the hero respawns and marches
+ *  straight back into the guards — and the wide trio that follows keeps
+ *  catching the full-screen "YOU DIED" dim (measured). Respawning AT the
+ *  fountain satisfies the arrival test immediately, so a death on the way
+ *  home simply ends the retreat. */
+async function retreatHome(page, ax, az, timeoutMs) {
+  const t0 = Date.now();
+  for (;;) {
+    const you = await latestYou(page).catch(() => null);
+    if (you !== null && you.respawnAtTick === 0 && Math.hypot(you.x - ax, you.z - az) <= RETREAT_SAFE_M) {
+      await page.evaluate(() => window.__rift.order('stop')).catch(() => {});
+      return true;
+    }
+    if (Date.now() - t0 > timeoutMs) {
+      await page.evaluate(() => window.__rift.order('stop')).catch(() => {});
+      return false;
+    }
+    await assertConnectedLive(page);
+    await page.evaluate((x2, z2) => window.__rift.order('move', x2, z2), ax, az).catch(() => {});
+    await sleep(1000);
+  }
+}
+
 // ---- the flow ------------------------------------------------------------------------------------
 async function run() {
   const page = await launchOne(WORK_VIEWPORT, 'art');
@@ -721,6 +1045,11 @@ async function run() {
       );
     }
     log(`live: ${String(begin.lanes)} lanes, teamSize ${String(begin.teamSize)}, side ${MAP_SIDE}`);
+    await waitWorldBuilt(page);
+    log(
+      `terrain facts: river ${JSON.stringify(FACTS.river)} cliff edge ${JSON.stringify(FACTS.cliff)} ` +
+        `jungle wall ${JSON.stringify(FACTS.wall)} brute camp ${JSON.stringify(FACTS.brute)}`,
+    );
 
     // -- geometry, mirrored so team 1 gets the same frames -----------------------------------------
     const team = (await riftState(page))?.team ?? 0;
@@ -734,6 +1063,20 @@ async function run() {
     const perp = { x: -dir.z, z: dir.x }; // left of travel (map.ts handedness)
     const along = (t) => ({ x: own.x + dx * t, z: own.z + dz * t });
     const offset = (p, m) => ({ x: p.x + perp.x * m, z: p.z + perp.z * m });
+
+    // Terrain targets are chosen in half 0 and mirrored the same way the
+    // diagonal poses are, so a team-1 seat gets the identical frames.
+    const mirrorT = (p) => (p === null ? null : team === 0 ? { x: p.x, z: p.z } : { x: MAP_SIDE - p.x, z: MAP_SIDE - p.z });
+    if (FACTS.side !== MAP_SIDE) {
+      throw new Error(
+        `buildTerrain(${WANT_LANES}) says side ${FACTS.side} but this harness frames against ${MAP_SIDE} — ` +
+          'the map-size constants have drifted apart',
+      );
+    }
+    const riverP = mirrorT(FACTS.river);
+    const cliffP = mirrorT(FACTS.cliff);
+    const wallP = mirrorT(FACTS.wall);
+    const campP = mirrorT(FACTS.brute === null ? null : { x: FACTS.brute.x, z: FACTS.brute.z });
 
     const poseP = along(POSE_T); // hero pose for close-hero / fx-cast
     const decoP = offset(poseP, DECO_OFFSET_M); // hero pose for close-deco
@@ -912,6 +1255,15 @@ async function run() {
         if (last.bytes < MIN_PNG_BYTES) {
           lastErr = `only ${last.bytes} bytes — the frame did not render`;
         } else if (await castEventSeen(page, id)) {
+          // The cast landed — but the frame still has to be a live, un-dimmed
+          // one, exactly like every other in-world shot.
+          try {
+            assertFrameLive('fx-cast', last);
+          } catch (err) {
+            lastErr = errText(err);
+            await sleep(CAST_RETRY_MS);
+            continue;
+          }
           record('fx-cast', last);
           return;
         } else {
@@ -931,12 +1283,66 @@ async function run() {
       await capture(page, 'close-deco', { ms: 900 });
     });
 
+    // ==========================================================================
+    // TERRAIN SHOTS (GRAPHICS_CONTRACT §5's frozen judge list). Each poses the
+    // hero on the nearest PASSABLE cell to the subject — vision is what lights
+    // the frame, and none of these subjects is somewhere a hero can stand:
+    // a cliff cell is impassable by definition, and a river/foliage/camp cell
+    // is only walkable by accident of where the generator put it.
+    // ==========================================================================
+    const terrainShot = async (name, target, level, settleMs, before = null) => {
+      await step(name, async () => {
+        if (target === null) {
+          throw new Error(`buildTerrain(${WANT_LANES}) produced no cell for this shot — the terrain model is missing a §5 feature`);
+        }
+        await assertLive(page);
+        if (before === null) {
+          const stand = FACTS.nearestPassable(target.x, target.z);
+          await poseHero(page, stand.x, stand.z, POSE_TIMEOUT_MS);
+        } else {
+          await before(target);
+        }
+        await assertLive(page);
+        await zoomTo(page, level);
+        await panTo(page, target.x, target.z);
+        await capture(page, name, { ms: settleMs });
+      });
+    };
+
+    await terrainShot('river-mid', riverP, 'default', 700);
+    await terrainShot('camp-brute', campP, 'in', 600, async (p) => {
+      // Stand off the clearing centre, on the map-centre side, at
+      // CAMP_APPROACH_M: outside the camp's acquisition reach measured from the
+      // centre (AGGRO_RADIUS 7 plus a resting member's ~2 m offset ≈ 9 m) and
+      // inside HERO_VISION (11) so the camp is revealed. See
+      // ./rift-terrain-facts.mjs for the full derivation — the leash radius,
+      // which this used to quote, governs a different thing entirely.
+      const dx = mid.x - p.x;
+      const dz = mid.z - p.z;
+      const dl = Math.hypot(dx, dz) || 1;
+      const stand = FACTS.nearestPassable(p.x + (dx / dl) * CAMP_APPROACH_M, p.z + (dz / dl) * CAMP_APPROACH_M);
+      await poseHero(page, stand.x, stand.z, POSE_TIMEOUT_MS);
+      await waitFor(
+        async () => (await neutralsNear(page, p.x, p.z, CAMP_VISIBLE_M)) > 0,
+        CAMP_VISIBLE_TIMEOUT_MS,
+        `neutral camp creeps within ${CAMP_VISIBLE_M}m of the brute clearing (${p.x.toFixed(1)}, ${p.z.toFixed(1)})`,
+      );
+    });
+    await terrainShot('high-ground', cliffP, 'cam24', 700);
+    await terrainShot('jungle-wall', wallP, 'cam24', 700);
+
     // -- reveal the enemy base, then the wide trio ------------------------------------------------------
     let scouted = Infinity;
     try {
       await assertLive(page);
       scouted = await scoutEnemyBase(page, enemyAncient.x, enemyAncient.z, SCOUT_TIMEOUT_MS);
       log(`scout: closest approach to the enemy Ancient ${scouted.toFixed(1)}m (persistent fog reveal)`);
+      // The scouting run leaves the hero's LAST order pointing at the enemy
+      // Ancient, so it respawns and marches straight back into the guards —
+      // and the wide trio below then keeps catching the "YOU DIED" dim
+      // (measured). Walking it home is what stops that.
+      const home = await retreatHome(page, ownAncient.x, ownAncient.z, SCOUT_TIMEOUT_MS);
+      log(`retreat: hero ${home ? 'is home at its own fountain' : 'never made it home — the wide trio may catch a respawn'}`);
     } catch (err) {
       log(`[warn] enemy-base scout aborted (${errText(err)}) — wide-base-enemy may be shrouded`);
     }
@@ -959,6 +1365,37 @@ async function run() {
       await panTo(page, enemyAncient.x, enemyAncient.z);
       await capture(page, 'wide-base-enemy', { ms: 900 });
     });
+
+    // ==========================================================================
+    // NIGHT TRIO — the SAME three framings the day matrix already graded, at
+    // dayPhase 1. Nothing else changes, so the judge is comparing lighting and
+    // only lighting (DESIGN_DELTA §5: night is the state where a dark world lit
+    // by team colours, braziers and ability FX is at its strongest).
+    // ==========================================================================
+    await step('night-mid-lane', async () => {
+      await assertLive(page, NIGHT_PIN);
+      await zoomTo(page, 'default');
+      await panTo(page, mid.x, mid.z);
+      await capture(page, 'night-mid-lane', { ms: 700 });
+    });
+    await step('night-close-hero', async () => {
+      await assertLive(page, NIGHT_PIN);
+      await poseHero(page, poseP.x, poseP.z, POSE_TIMEOUT_MS);
+      await assertLive(page, NIGHT_PIN);
+      await zoomTo(page, 'in');
+      await panTo(page, poseP.x, poseP.z);
+      await capture(page, 'night-close-hero', { ms: 700 });
+    });
+    await step('night-wide-mid', async () => {
+      await assertLive(page, NIGHT_PIN);
+      await zoomTo(page, 'out');
+      await panTo(page, mid.x, mid.z);
+      await capture(page, 'night-wide-mid', { ms: 900 });
+    });
+
+    // Hand the renderer back to the snapshot clock — a pinned scene would
+    // outlive this page in any --keep-server debugging session.
+    await pinDayPhase(page, null);
   } catch (err) {
     if (err !== EARLY_DONE) throw err;
     log('every requested shot resolved — stopping early');
@@ -970,7 +1407,19 @@ async function run() {
 // ---- main ------------------------------------------------------------------------------------------
 if (WANTED.length === 0) {
   console.error(`[art] --only ${String(ONLY)} matches no shot; known: ${SHOT_ORDER.join(', ')}`);
-  console.log(JSON.stringify({ ok: false, outDir: OUT_DIR, worstDrawCalls: 0, pageErrors: [], shots: [] }));
+  // Same manifest SHAPE as the real verdict below — a consumer must never have
+  // to special-case the "nothing matched" run.
+  console.log(
+    JSON.stringify({
+      ok: false,
+      outDir: path.relative(ROOT, OUT_DIR),
+      worstDrawCalls: 0,
+      worstTriangles: 0,
+      overBudget: [],
+      pageErrors: [],
+      shots: [],
+    }),
+  );
   process.exit(1);
 }
 
@@ -981,6 +1430,7 @@ for (const name of WANTED) await rm(path.join(OUT_DIR, `${name}.png`), { force: 
 
 let fatal = null;
 try {
+  FACTS = terrainFacts(await loadTerrain(), WANT_LANES);
   await startServer();
   await waitForServer();
   await assertProductionMount();
@@ -1011,18 +1461,44 @@ try {
 const got = new Set(shots.map((s) => s.name));
 for (const name of WANTED) {
   if (!got.has(name)) {
-    shots.push({ name, file: null, bytes: 0, drawCalls: -1, ok: false, error: fatal ?? 'never reached' });
+    shots.push({
+      name,
+      file: null,
+      bytes: 0,
+      drawCalls: -1,
+      triangles: -1,
+      frameMean: -1,
+      frameStdDev: -1,
+      night: NIGHT_SHOTS.has(name),
+      ok: false,
+      error: fatal ?? 'never reached',
+    });
   }
 }
 shots.sort((a, b) => SHOT_ORDER.indexOf(a.name) - SHOT_ORDER.indexOf(b.name));
 
 const failed = shots.filter((s) => !s.ok);
 const worstDrawCalls = Math.max(0, ...shots.map((s) => s.drawCalls));
-const ok = failed.length === 0 && pageErrors.length === 0;
+const worstTriangles = Math.max(0, ...shots.map((s) => s.triangles));
+// This harness is the ART loop, not the perf gate (verify-rift owns the
+// budgets) — but a matrix captured over budget is a matrix of frames nobody
+// can ship, so an overrun is reported here as a failed run rather than left
+// for someone to notice in the manifest.
+const overBudget = [];
+if (worstDrawCalls > DRAW_CALL_BUDGET) overBudget.push(`draw calls ${worstDrawCalls} > ${DRAW_CALL_BUDGET}`);
+if (worstTriangles > TRIANGLE_BUDGET) overBudget.push(`triangles ${worstTriangles} > ${TRIANGLE_BUDGET}`);
+if (badServerExit !== null) {
+  overBudget.push(`the platform server exited mid-run (code ${badServerExit.code}, signal ${badServerExit.signal})`);
+}
+for (const m of overBudget) log(`[FAILED] ${m}`);
+
+const ok = failed.length === 0 && pageErrors.length === 0 && overBudget.length === 0;
 log(
   ok
-    ? `GREEN: ${shots.length}/${WANTED.length} shots, worst draw calls ${worstDrawCalls}, zero page errors`
-    : `RED: ${failed.length} failed shot(s) [${failed.map((s) => s.name).join(', ')}], ${pageErrors.length} page error(s)`,
+    ? `GREEN: ${shots.length}/${WANTED.length} shots, worst draw calls ${worstDrawCalls}/${DRAW_CALL_BUDGET}, ` +
+      `worst triangles ${worstTriangles}/${TRIANGLE_BUDGET}, zero page errors`
+    : `RED: ${failed.length} failed shot(s) [${failed.map((s) => s.name).join(', ')}], ${pageErrors.length} page error(s)` +
+      (overBudget.length > 0 ? `, ${overBudget.length} budget/health failure(s)` : ''),
 );
 for (const e of pageErrors.slice(0, 12)) log(`  ${e}`);
 
@@ -1031,6 +1507,8 @@ console.log(
     ok,
     outDir: path.relative(ROOT, OUT_DIR),
     worstDrawCalls,
+    worstTriangles,
+    overBudget,
     pageErrors,
     shots,
   }),
