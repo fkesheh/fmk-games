@@ -79,6 +79,30 @@ pinning the snap itself.
 5. S_BOTS, S_ROOM, S_BALANCE (Wave 3), then R_WIRE integration.
 6. Only then the screenshot → judge → fix loop against `judge/reference/` (11 Dota 2 shots, ready).
 
+## PENDING: merge `origin/main` (PR #6, rift-lobby)
+
+`origin/main` moved to `ca1bc7e` — "un-invert edge scrolling, and close the four ways two
+players could collide in the lobby". 12 files, **5 of which overlap this branch**:
+
+`games/rift/CONTRACT.md`, `client/src/input.ts`, `client/src/ui/menus.ts`,
+`server/src/room.ts`, `server/src/room.test.ts`
+
+**Resolution: take UPSTREAM for all five.** This branch has no intentional work in any of them —
+they are the 08-05 dirty files my `git add -A` swept into `14abcbd` (see housekeeping debt
+below), and upstream is the finished version of that same work. `input.ts` upstream is +62/−11
+against my accidental +16/−12; `menus.ts` is near-identical in size but diverged.
+
+**Do this only when no agent is writing to the worktree.** Merging moves HEAD under running
+agents — several are told to run `git diff --stat` to prove they left no stray edits, and
+unrelated files in that diff produce false alarms or tempt an agent into touching a file it does
+not own. `vitest.config.ts` also changed and agents run vitest continuously.
+
+Prefer `git merge origin/main` over a rebase: a rebase rewrites every commit on this branch,
+and the amendment/decision history in these commit messages is the build's audit trail.
+
+After merging, re-run: shared typecheck, `games/rift/server/src` (expect 320/322, the 2 being
+the balance cases above), and the client build.
+
 ## Housekeeping debt
 
 - I used `git add -A games/rift` three times and swept unrelated dirty files into commits
