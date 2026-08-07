@@ -1,525 +1,372 @@
 // ============================================================================
-// ANCIENTS (rift) — UNIT MESHES (CONTRACT §6 render/units.ts + §7 model
-// sheets). Every entity gets a visible mesh built from primitive factories
-// (box/cyl/cone/sphere/octahedron), palette hexes baked into vertex colours,
-// merged into ONE geometry per (variant, team) — so one unit is ONE draw
-// call (<= 2 incl. team trim, which IS vertex-painted into the same merge).
-// Team tint: azure/ember (+ Lit/Deep tiers) on plumes, bands, banners, orbs.
+// ANCIENTS (rift) — UNIT RENDERING (CONTRACT §6 render/units.ts).
 //
-// HP bars are INSTANCED: exactly TWO InstancedMesh (backgrounds `inkDeep`,
-// fills = team colour / `heal` for self / `danger` for enemies) — 2 draw
-// calls total no matter how many units — slim, so the bars annotate the
-// silhouette instead of replacing it. Team identity also reads by SHAPE, not
-// hue alone: two more InstancedMesh float a small marker above each bar
-// (azure = upward chevron, ember = pennant triangle), emissive-locked in the
-// team Lit tier. Selection ring + order-target marker are single pooled meshes.
+// This module builds NO geometry. Every hero, creep, summon, ward, projectile
+// and jungle camp comes from the four mesh builders as a frozen `UnitBuild`
+// (kit.ts), and this file's whole job is to MOUNT and DRIVE them:
 //
-// ANIMATED CARVE-OUT (§7): the only unbaked moving parts here are tower
-// crystals (slow orbit), the Ancient heart (float/bob), ward eyes (pulse),
-// and projectiles; everything else is one static merged mesh per unit.
+//   archetype  ->  buildHero / buildCreep / buildCamp / buildProjectile,
+//                  called ONCE per (kind, hero, team) and cached
+//   mounting   ->  one InstancedMesh per baked bucket, plus one for the
+//                  `AnimPart`, materials taken straight off the bake
+//   driving    ->  procedural pose per entity per frame, written as instance
+//                  matrices; HP bars, team markers, rings, order ping, ghosts
 //
-// PROCEDURAL WHOLE-MESH ANIMATION (round-6 polish, "units are statues"):
-// every mobile mesh is posed per frame by TRANSFORMS ONLY (no skeletal rigs,
-// no extra draw calls, no per-frame allocation — all scratch lives on the
-// pooled UnitSlot): idle breathing bob/sway phase-offset by a deterministic
-// id seed; walk lean/bounce/waddle derived from smoothed per-unit velocity
-// (interp position deltas measured in the frame hook); an attack strike
-// (melee lunge toward the InterpEnt.atk target / ranged+tower recoil); a
-// 0.2s easeOutBack spawn pop; and deaths collapse+splat+topple the ghost
-// mesh over its 0.5s fade instead of a flat vanish.
+// WHY INSTANCED, AND NOT ONE GROUP PER UNIT. Bucket counts re-measured cold in
+// a fresh headless process AFTER K_AMEND (AMENDMENT_4 §F — bucketing is now
+// (surfaceId, tint, emissive), strictly finer than before, so pre-amendment
+// figures do not carry): hero 6 (bullwark) / 7 (the other five), melee 5,
+// ranged 5, siege 6, shade 6, ward 5, camp 4 (all three tiers), projectile 3
+// (all three schools). At the §5 room — 3-lane, 8v8, camps populated — one
+// cloned Group per entity is 454 body buckets + 34 anim parts before the
+// shadow pass. One InstancedMesh per (archetype, bucket) makes the cost
+// buckets x ARCHETYPES instead of buckets x ENTITIES, which is what BUILD_SPECS
+// §0 means by "repeated archetypes are InstancedMesh per archetype", and it
+// measures 275 accumulated draws at that same room (see the DRAW BUDGET note
+// below). The whole procedural pose is a position/rotation/scale triple, so it
+// composes into an instance matrix with nothing lost.
+//
+// DRAW BUDGET, MEASURED THROUGH `renderer.info` WITH THE SHADOW PASS ACCUMULATED
+// (AMENDMENT_3 §D.5 — not counted from an array), at the §5 room, in a fresh
+// process:
+//
+//   275  every archetype in frustum (camera framing the whole 128 m map)
+//   193  the same frame with the shadow map disabled
+//    82  therefore the shadow pass — which is EXACTLY the 12 hero archetypes'
+//        82 body buckets (6 + 7 + 7 + 7 + 7 + 7 per team, twice), confirming
+//        that heroes are the only §D.2 caster this module mounts and that no
+//        anim part, bar, marker, ring, ghost or camp casts
+//   168  the same census through the real camera rig — 55 deg pitch, FOV 50,
+//        camH 26, mid-zoom inside game.ts's [18, 55] clamp — i.e. what a played
+//        frame actually costs once the frustum culling below is doing its job.
+//        The 275 is the archetype-count worst case and the number to hold
+//        against the gate; this is the typical frame.
+//
+// The dominant term is hero ARCHETYPE COUNT x hero BUCKET COUNT: 82 scene + 82
+// shadow = 164, 60% of the module. Neither factor is this file's — 12 archetypes
+// is forced by an 8-seat team drawing from a 6-hero roster, and 6-7 buckets is
+// R_MESH_HERO's bake — and mounting cannot go below SUM(archetypes x buckets),
+// because two heroes that share a surface family still have different GEOMETRY
+// and so cannot share one InstancedMesh. If the 700 gate needs more room from
+// here, the lever is hero bucket count, exactly as AMENDMENT_3 §D.4 applied it
+// to R_MESH_STRUCT. What this file does own is not paying for archetypes the
+// camera cannot see: every instanced mount recomputes its bounding sphere from
+// the live instance matrices in `flushOne` and is frustum-culled there (see
+// that comment for why three.js cannot do this for us).
+//
+// PICKING SURVIVES INSTANCING. `SceneCore.registerPick` raycasts real objects
+// and reads a numeric `userData.entId`, which an InstancedMesh cannot carry per
+// instance. Every clickable entity therefore also owns an INVISIBLE box proxy
+// sized to its own bar footprint: `visible = false` costs zero draw calls (the
+// renderer drops it before it reaches a render list) and zero shadow, while the
+// raycaster does not consult `visible` at all. Projectiles are the one
+// exception — you do not click an arrow. `unregisterPick` on release is
+// mandatory — a stale entry keeps a dead entity clickable and holds its
+// geometry alive.
+//
+// STRUCTURES ARE NOT DRAWN HERE. `buildStructure` belongs to R_MAPMESH
+// (BUILD_SPECS §R_MAPMESH: "Structures come from buildStructure(kind, team). Do
+// not model them here any more."). What this module still owns for a structure
+// is its HP bar and its pick proxy — a tower you cannot right-click is a tower
+// you cannot order an attack on (`input.ts` `rightClick`). Both need
+// `barH`/`barW`; see `structFitOf` for how those two numbers are obtained
+// without drawing a second copy of the mesh, and `structPick`/`dropStructPick`
+// for the proxy, which appears while the structure stands and is unregistered
+// the moment it falls.
+//
+// PROCEDURAL WHOLE-MESH ANIMATION (transforms only, zero per-frame allocation,
+// all scratch preallocated): idle breathing bob/sway phase-offset by a
+// deterministic id seed; walk lean/bounce/waddle from smoothed interp velocity;
+// an attack strike (melee lunge / ranged recoil); a 0.22 s easeOutBack spawn
+// pop; and a collapse-and-fade ghost on death.
 // ============================================================================
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
-import { APAL, TEAM_COLORS, heroById } from '@rift/shared';
-import type { EntKind, HeroId, MapDef, TeamId } from '@rift/shared';
-import { mix } from '@platform/shared';
+import { APAL, TEAM_COLORS, heroById, isCampKind, isPlayerTeam } from '@rift/shared';
+import type { EntKind, EntTeam, HeroId, MapDef, StructureKind, TeamId } from '@rift/shared';
 import type { GhostEnt, InterpEnt, SceneHandle, UnitsHandle } from '../contract.js';
-import { CAMERA_PITCH_DEG, paintGeo, sceneCore } from './scene.js';
-import type { SceneCore } from './scene.js';
+import { CAMERA_PITCH_DEG, applyShadowPolicy, cameraNormalY, cameraNormalZ } from './scene.js';
+import { sceneCore, whiteVertexColors } from './core.js';
+import type { SceneCore } from './core.js';
+import { BLOOM_LAYER, markBloom, partMaterial, surface } from './kit.js';
+import type { UnitBuild } from './kit.js';
+import { buildHero } from './meshes/heroes.js';
+import { buildCamp } from './meshes/camps.js';
+import { buildCreep, buildProjectile } from './meshes/creeps.js';
+import type { ProjSchool } from './meshes/creeps.js';
+import { buildStructure } from './meshes/structures.js';
 
-const TEAM_LIT: readonly [string, string] = [APAL.azureLit, APAL.emberLit];
+// ---- the swept volume of an animated carve-out ------------------------------
+//
+// THE DECISION, stated because the review asked for one either way: the swept
+// volume is PUBLISHED FROM HERE as importable constants. It is NOT taken from
+// `AnimPart` — that type is frozen by AMENDMENT_3 §B and widening it is not
+// this module's to do, and the amplitude is a property of the DRIVER's motion,
+// not of the part being driven.
+//
+// Why it needed publishing at all: `UnitBuild` says WHERE an `AnimPart` rests
+// (`animY`) and HOW it moves (`animKind`), but never how far it travels, so
+// every mesh module had to quote these numbers from `units.ts` prose and hope
+// they stayed put. camps.ts filed exactly that as a CONTRACT_GAP and picked
+// `spin` for the brute because it could not trust the bob amplitude.
+//
+// STATE OF ADOPTION, so this comment does not outrun the tree: as of this
+// change the exports exist and nothing in `render/meshes/` imports them yet —
+// camps.ts still quotes 0.55 m and +/-0.30 m in a comment at meshes/camps.ts:181.
+// That is a mesh-module edit and those files are not mine. What is fixed here
+// is that a quote can now be replaced by an import; until it is, these three
+// values are the ones the shipped mesh geometry was measured against, and
+// changing any of them changes the swept volume of every anim part in the game.
+//
+// Import them at CALL time (inside a function), never at module scope:
+// `units.ts` imports the mesh modules, so a mesh module reading one during
+// module evaluation would read it through a cycle and get `undefined`.
+
+/** Radius in metres of the circle an `animKind: 'orbit'` part sweeps, centred
+ *  on the unit's own axis at `animY`. */
+export const ANIM_ORBIT_RADIUS_M = 0.55;
+/** Peak vertical excursion in metres of an `animKind: 'bob'` part: it travels
+ *  `animY - 0.3` to `animY + 0.3`. */
+export const ANIM_BOB_AMPLITUDE_M = 0.3;
+/** Peak uniform scale excursion of an `animKind: 'spin'` part. The part stays
+ *  at `animY` EXACTLY — spin is the one kind that does not translate — and
+ *  breathes between 0.78x and 1.22x. */
+export const ANIM_SPIN_PULSE = 0.22;
+
+// ---- pool sizes -------------------------------------------------------------
+// Instance capacity per ARCHETYPE, not per kind, so eight of one hero on one
+// team is the ceiling that matters for 'hero'. Over capacity an instance is
+// dropped and the archetype warns once — a missing unit is bad, but growing an
+// InstancedMesh mid-frame is a full buffer reallocation on the frame a teamfight
+// starts.
+const HERO_CAP = 10;
+const LANE_CREEP_CAP = 96;
+const HEAVY_CREEP_CAP = 48;
+const WARD_CAP = 24;
+const CAMP_CAP = 48;
+const PROJ_CAP = 64;
 
 /** Instanced HP-bar capacity — covers 8v8/3-lane peak (~120) with headroom. */
 const BAR_CAP = 176;
-const GHOST_CAP = 16;
-const PROJ_CAP = 64;
+/** Simultaneous death/vanish fades of one archetype. */
+const GHOST_CAP = 24;
 
-// ---- procedural-animation tuning ----------------------------------------------------
+/** Wall-clock this module will spend building NEW archetypes inside one
+ *  `sync()`. The budget gates whether a build is STARTED, so the true bound is
+ *  "at most one archetype build per frame once the budget is spent" — a builder
+ *  is not preemptible and pausing inside one is not this module's to do.
+ *
+ *  MEASURED COLD, in a fresh headless process with an empty `matCache` and no
+ *  R_SCENE prewarm (AMENDMENT_3 §E.1): the 31 unit archetypes cost 0.1-40.4 ms
+ *  each, 111.1 ms in total, and the six structure bar probes another 18.7 ms.
+ *  The 40.4 ms is the FIRST call only — it is the shared surface-texture
+ *  rasterisation that AMENDMENT_3 §E.3 hoists into `createScene`, and the same
+ *  build costs 1.5 ms once that has been paid. Second-worst is 12.7 ms.
+ *  Without this gate the first snapshot of a match builds all 31 back to back
+ *  in one frame; with it they ramp in over ~6 frames (measured) and no frame
+ *  starts a build once 6 ms of that frame have gone into building. */
+const ARCH_BUILD_BUDGET_MS = 6;
+
+// ---- procedural-animation tuning -------------------------------------------
 /** Attack strike duration (s) — quick out-and-back, reads at 20Hz snap cadence. */
 const ATK_DUR_S = 0.3;
 /** Spawn scale-up pop duration (s). */
 const SPAWN_POP_S = 0.22;
 /** Speed (m/s) at which the walk cycle reaches full amplitude. */
 const WALK_REF_SPEED = 4.5;
-/** Walk-cycle style per kind: stride = rad per metre, bounce/lean/roll amplitudes.
- *  Creeps waddle (roll-heavy, bouncy), heroes stride (lean-forward, low bounce). */
-const WALK_STYLE: Record<string, { stride: number; bounce: number; lean: number; roll: number }> = {
+
+interface WalkStyle {
+  readonly stride: number;
+  readonly bounce: number;
+  readonly lean: number;
+  readonly roll: number;
+}
+
+/** Walk-cycle style per kind: stride = rad per metre, bounce/lean/roll
+ *  amplitudes. Creeps waddle (roll-heavy, bouncy), heroes stride (lean-forward,
+ *  low bounce), camp beasts lope — the brute heavy and slow, the hive skittery. */
+const WALK_STYLE: Partial<Record<EntKind, WalkStyle>> = {
   melee: { stride: 2.6, bounce: 0.09, lean: 0.09, roll: 0.11 },
   ranged: { stride: 2.3, bounce: 0.08, lean: 0.07, roll: 0.06 },
   siege: { stride: 1.7, bounce: 0.06, lean: 0.05, roll: 0.08 },
   shade: { stride: 2.5, bounce: 0.09, lean: 0.11, roll: 0.08 },
   hero: { stride: 2.0, bounce: 0.05, lean: 0.15, roll: 0.03 },
+  campPack: { stride: 3.1, bounce: 0.11, lean: 0.1, roll: 0.13 },
+  campBrute: { stride: 1.4, bounce: 0.05, lean: 0.06, roll: 0.09 },
+  campHive: { stride: 2.8, bounce: 0.12, lean: 0.08, roll: 0.05 },
 };
-const WALK_DEFAULT = { stride: 2.2, bounce: 0.07, lean: 0.08, roll: 0.06 };
+const WALK_DEFAULT: WalkStyle = { stride: 2.2, bounce: 0.07, lean: 0.08, roll: 0.06 };
 
-function isStructureKind(k: EntKind): boolean {
+// ---- kind predicates --------------------------------------------------------
+
+function isStructureKind(k: EntKind): k is StructureKind {
   return k === 'tower' || k === 'guard' || k === 'ancient';
 }
 
-/** Melee = the strike lunges toward the target; ranged/towers recoil instead. */
+/** Melee = the strike lunges toward the target; ranged recoils instead. Every
+ *  camp beast fights in melee. */
 function isMeleeKind(k: EntKind, hero: HeroId | undefined): boolean {
   if (k === 'melee' || k === 'siege' || k === 'shade') return true;
+  if (isCampKind(k)) return true;
   if (k === 'hero') return heroById(hero ?? 'reaver').base.attackRange <= 3;
   return false;
 }
 
-// ---- geometry helpers -----------------------------------------------------------
-
-interface PartOpts {
-  rx?: number;
-  ry?: number;
-  rz?: number;
-  sx?: number;
-  sy?: number;
-  sz?: number;
+/** `campPack` -> `'pack'`, and so on. `buildCamp` takes the bare tier, so the
+ *  prefix is stripped here rather than in the builder — a caller that routes a
+ *  camp kind to `buildCreep` instead gets a lane soldier standing in the
+ *  jungle, which is the dispatch bug creeps.ts warns about by name. */
+function campTierOf(k: EntKind): 'pack' | 'brute' | 'hive' | null {
+  if (k === 'campPack') return 'pack';
+  if (k === 'campBrute') return 'brute';
+  if (k === 'campHive') return 'hive';
+  return null;
 }
 
-/** Transform, paint and collect one primitive part. */
-function part(
-  parts: THREE.BufferGeometry[],
-  geom: THREE.BufferGeometry,
-  hex: string,
-  x: number,
-  y: number,
-  z: number,
-  o?: PartOpts,
-): void {
-  const g = geom.index ? geom.toNonIndexed() : geom;
-  if (o && (o.sx !== undefined || o.sy !== undefined || o.sz !== undefined)) {
-    g.scale(o.sx ?? 1, o.sy ?? 1, o.sz ?? 1);
+function projSchoolOf(fx: string | undefined): ProjSchool {
+  if (fx !== undefined) {
+    const s = fx.toLowerCase();
+    if (s.includes('physical') || s.includes('phys')) return 'phys';
+    if (s.includes('heal')) return 'heal';
   }
-  if (o?.rx) g.rotateX(o.rx);
-  if (o?.rz) g.rotateZ(o.rz);
-  if (o?.ry) g.rotateY(o.ry);
-  g.translate(x, y, z);
-  parts.push(paintGeo(g, hex));
+  return 'magic';
 }
 
-function mergeParts(parts: THREE.BufferGeometry[]): THREE.BufferGeometry {
-  const merged = mergeGeometries(parts, false);
-  if (!merged) throw new Error('rift units: geometry merge failed');
+/** Instance ceiling for an archetype of this kind. */
+function capOf(k: EntKind): number {
+  switch (k) {
+    case 'hero':
+      return HERO_CAP;
+    case 'melee':
+    case 'ranged':
+      return LANE_CREEP_CAP;
+    case 'siege':
+    case 'shade':
+      return HEAVY_CREEP_CAP;
+    case 'ward':
+      return WARD_CAP;
+    case 'proj':
+      return PROJ_CAP;
+    default:
+      return CAMP_CAP;
+  }
+}
+
+/** The entity's own identity hex, and NEVER a team colour for a neutral.
+ *  `TEAM_COLORS` is a two-element array indexed by `TeamId`; `isPlayerTeam` is
+ *  the only sanctioned way in (shared/types.ts), and a raw `[2]` is an
+ *  out-of-bounds read that appears the first time a camp spawns and never in a
+ *  unit test. */
+function teamHexOf(team: EntTeam): string {
+  if (!isPlayerTeam(team)) return APAL.neutral;
+  return TEAM_COLORS[team] ?? APAL.azure;
+}
+
+// ---- bar / marker constants -------------------------------------------------
+
+const BAR_BG_H = 0.07; // world metres — high-aspect sliver, not a square
+const BAR_FILL_H = 0.042;
+const BAR_FILL_INSET = 0.06;
+/** How far above the bar the team shape marker floats, in metres. */
+const MARKER_LIFT = 0.22;
+
+/** Bar fill colour classes. One InstancedMesh each, so every bar lands on an
+ *  EXACT palette hex through `surface(id, tint)` — no per-instance colour
+ *  multiply, and so no chance of the palette-hex-times-palette-hex product the
+ *  vertex-colour law exists to prevent. At most three of the five are non-empty
+ *  in any one frame; an empty one is hidden, not drawn. */
+const FILL_SELF = 0;
+const FILL_AZURE = 1;
+const FILL_EMBER = 2;
+const FILL_ENEMY = 3;
+const FILL_NEUTRAL = 4;
+const FILL_CLASSES = 5;
+const FILL_TINTS: readonly string[] = [APAL.heal, APAL.azure, APAL.ember, APAL.danger, APAL.neutral];
+
+/** Team shape marker classes — team reads by SHAPE, not hue alone. */
+const MARK_AZURE = 0;
+const MARK_EMBER = 1;
+const MARK_NEUTRAL = 2;
+const MARK_CLASSES = 3;
+const MARK_TINTS: readonly string[] = [APAL.azureLit, APAL.emberLit, APAL.neutralLit];
+
+function mergeAll(geos: readonly THREE.BufferGeometry[], what: string): THREE.BufferGeometry {
+  const merged = mergeGeometries(geos as THREE.BufferGeometry[], false);
+  if (merged === null) throw new Error(`rift units: ${what} geometry merge failed`);
   return merged;
 }
 
-function accentHex(accent: string): string {
-  const v = (APAL as unknown as Record<string, string>)[accent];
-  return v ?? APAL.gold;
-}
-
-// ---- model sheets (§7) ------------------------------------------------------------
-// Models are built facing +z; yaw = atan2(dx, dz) turns them into their motion.
-
-function towerParts(team: TeamId, guard: boolean): THREE.BufferGeometry[] {
-  const parts: THREE.BufferGeometry[] = [];
-  const bulk = guard ? 1.15 : 1;
-  const tb = TEAM_COLORS[team] ?? APAL.azure;
-  const tl = TEAM_LIT[team] ?? APAL.azureLit;
-  // plinth (proud 0.05), tapering octagonal column, cornice (proud 0.06)
-  part(parts, new THREE.CylinderGeometry(1.35 * bulk, 1.5 * bulk, 0.4, 8), APAL.monumentDeep, 0, 0.2, 0);
-  part(parts, new THREE.CylinderGeometry(0.7 * bulk, 1.0 * bulk, 2.6, 8), APAL.monument, 0, 1.7, 0);
-  part(parts, new THREE.CylinderGeometry(1.05 * bulk, 0.85 * bulk, 0.3, 8), APAL.monumentLit, 0, 3.15, 0);
-  // brazier bowl
-  part(parts, new THREE.CylinderGeometry(0.7 * bulk, 0.45 * bulk, 0.25, 8), APAL.stoneDeep, 0, 3.4, 0);
-  // team trim band at the column base
-  part(parts, new THREE.CylinderGeometry(1.03 * bulk, 1.03 * bulk, 0.18, 8), tb, 0, 0.55, 0);
-  // cracks: 3 inset stoneDeep shards
-  for (let i = 0; i < 3; i++) {
-    const a = (i / 3) * Math.PI * 2 + 0.4;
-    part(
-      parts,
-      new THREE.BoxGeometry(0.18, 0.7, 0.12),
-      APAL.stoneDeep,
-      Math.cos(a) * 0.86 * bulk,
-      1.6,
-      Math.sin(a) * 0.86 * bulk,
-      { ry: -a },
-    );
+/**
+ * Write one greyscale value across a geometry's `color` attribute, in place.
+ *
+ * This is the fade channel for everything additive in this module. Under
+ * `AdditiveBlending` the emitted colour IS the intensity, so scaling the vertex
+ * colour toward black fades the object out — which is exactly what
+ * `fxAdditive`'s surface note means by "PER-EFFECT FADE RIDES THE VERTEX
+ * COLOUR, never `opacity`". The material is shared and cached; its `opacity` is
+ * not a call-site dial.
+ *
+ * Greyscale is deliberate: the hue already came from `surface(id, tint)`, so
+ * this multiplier is 1:1:1-shaped and no palette hex is ever multiplied by
+ * another palette hex.
+ *
+ * Allocation-free — `Float32Array.fill` writes the existing buffer — so it is
+ * safe to call from the frame hook. The attribute must already exist; every
+ * caller here runs the geometry through `whiteVertexColors` first.
+ */
+function tintVertexColors(geo: THREE.BufferGeometry, v: number): THREE.BufferGeometry {
+  const attr = geo.getAttribute('color');
+  if (attr === undefined) return geo;
+  const arr = attr.array;
+  if (arr instanceof Float32Array) {
+    arr.fill(v);
+    attr.needsUpdate = true;
   }
-  if (guard) {
-    // twin-horned crown
-    part(parts, new THREE.ConeGeometry(0.16, 0.55, 6), APAL.monumentLit, -0.5, 3.55, 0);
-    part(parts, new THREE.ConeGeometry(0.16, 0.55, 6), APAL.monumentLit, 0.5, 3.55, 0);
-  }
-  // small team pennant under the cornice
-  part(parts, new THREE.BoxGeometry(0.06, 0.5, 0.3), tl, 0, 2.85, 0.95 * bulk);
-  return parts;
+  return geo;
 }
 
-/** The ONE animated tower part: the floating team crystal (octahedron).
- *  Team BASE tier for the shell, Lit only for the inner core — a Lit shell
- *  blows out to near-white under the sun. */
-function crystalGeo(team: TeamId): THREE.BufferGeometry {
-  const parts: THREE.BufferGeometry[] = [];
-  part(parts, new THREE.OctahedronGeometry(0.34), TEAM_COLORS[team] ?? APAL.azure, 0, 0, 0);
-  part(parts, new THREE.OctahedronGeometry(0.16), TEAM_LIT[team] ?? APAL.azureLit, 0, 0, 0);
-  return mergeParts(parts);
+// ---- per-archetype state ----------------------------------------------------
+
+/** One mounted archetype: everything needed to draw any number of entities of
+ *  one (kind, hero, team) for the price of its bucket count. */
+interface Archetype {
+  readonly key: string;
+  readonly kind: EntKind;
+  readonly team: EntTeam;
+  readonly build: UnitBuild;
+  /** One InstancedMesh per baked bucket, sharing that bucket's geometry and the
+   *  material `bake()` built for it. */
+  readonly buckets: readonly THREE.InstancedMesh[];
+  /** The `AnimPart`, mounted through `partMaterial(surfaceId, tint, emissive)` —
+   *  the one resolver — and bloom-marked iff the part says so. */
+  readonly anim: THREE.InstancedMesh | null;
+  readonly cap: number;
+  /** Instances written this frame. */
+  count: number;
+  animCount: number;
+  overflowWarned: boolean;
+  /** Fading-silhouette mesh for this archetype's ghosts, built on first death. */
+  ghost: THREE.InstancedMesh | null;
+  ghostBuilt: boolean;
+  ghostCount: number;
 }
 
-function ancientParts(team: TeamId): THREE.BufferGeometry[] {
-  const parts: THREE.BufferGeometry[] = [];
-  const tb = TEAM_COLORS[team] ?? APAL.azure;
-  const tl = TEAM_LIT[team] ?? APAL.azureLit;
-  // base slab + team trim ring
-  part(parts, new THREE.CylinderGeometry(2.6, 2.9, 0.5, 8), APAL.monumentDeep, 0, 0.25, 0);
-  part(parts, new THREE.CylinderGeometry(2.62, 2.62, 0.14, 8), tb, 0, 0.55, 0);
-  // rubble ring
-  for (let i = 0; i < 8; i++) {
-    const a = (i / 8) * Math.PI * 2 + 0.2;
-    const s = 0.3 + (i % 3) * 0.12;
-    part(
-      parts,
-      new THREE.BoxGeometry(s, s * 0.7, s),
-      APAL.stoneDeep,
-      Math.cos(a) * 2.35,
-      s * 0.3,
-      Math.sin(a) * 2.35,
-      { ry: a },
-    );
-  }
-  // fountain basin under the heart: a shallow worn-stone bowl with a gold
-  // pool inset (desaturated toward monument so it glows warm, never neon)
-  part(parts, new THREE.CylinderGeometry(1.55, 1.75, 0.3, 8), APAL.monumentDeep, 0, 0.62, 0);
-  part(parts, new THREE.CylinderGeometry(1.3, 1.3, 0.08, 8), mix(APAL.gold, APAL.monument, 0.45), 0, 0.8, 0);
-  // KNEELING RING (§7 + round-4 judge): eight monolith slabs leaning INWARD
-  // around an open centre — a kneeling golem-fountain, never a stacked box
-  // with a roof. Broad faces turned to the heart; alternating tiers and
-  // heights so the ring reads as separate kneeling stones with shadow gaps.
-  const RING_R = 2.15;
-  const LEAN = 0.24; // rad inward — the kneel
-  for (let i = 0; i < 8; i++) {
-    const a = (i / 8) * Math.PI * 2 + 0.15;
-    const h = 3.5 + (i % 3) * 0.5; // 3.5 / 4.0 / 4.5 — an organic crown, not a wall
-    const w = 0.95 + (i % 2) * 0.25;
-    // lean: rotateX tips the top toward +z; ry then aims that tip at the
-    // centre — the INWARD direction is (-cos a, -sin a)
-    const ry = Math.atan2(-Math.cos(a), -Math.sin(a));
-    part(
-      parts,
-      new THREE.BoxGeometry(w, h, 0.55),
-      i % 2 === 0 ? APAL.monument : APAL.monumentDeep,
-      Math.cos(a) * RING_R,
-      0.45 + (h / 2) * Math.cos(LEAN),
-      Math.sin(a) * RING_R,
-      { rx: LEAN, ry },
-    );
-    // worn cap fragment on every third slab — slab-local offset so it rides
-    // the same lean (part() rotates about the slab centre, then translates)
-    if (i % 3 === 0) {
-      part(
-        parts,
-        new THREE.BoxGeometry(w * 0.7, 0.28, 0.5).translate(0, h / 2 + 0.1, 0),
-        APAL.monumentLit,
-        Math.cos(a) * RING_R,
-        0.45 + (h / 2) * Math.cos(LEAN),
-        Math.sin(a) * RING_R,
-        { rx: LEAN, ry },
-      );
-    }
-    // crack inset low on the broad inward face (stoneDeep shard), same lean
-    if (i % 2 === 1) {
-      part(
-        parts,
-        new THREE.BoxGeometry(0.14, 0.8, 0.1).translate(0, -h / 2 + 0.8, 0.31),
-        APAL.stoneDeep,
-        Math.cos(a) * RING_R,
-        0.45 + (h / 2) * Math.cos(LEAN),
-        Math.sin(a) * RING_R,
-        { rx: LEAN, ry },
-      );
-    }
-  }
-  // banner fins in team colour filling two ring gaps — tall, Lit-tipped, so
-  // the team read survives at gameplay zoom
-  for (const sgn of [1, -1] as const) {
-    const a = sgn > 0 ? Math.PI / 4 : Math.PI + Math.PI / 4;
-    const fx = Math.cos(a) * 2.3;
-    const fz = Math.sin(a) * 2.3;
-    part(parts, new THREE.BoxGeometry(0.14, 2.6, 0.9), tb, fx, 2.1, fz, { ry: -a + Math.PI / 2 });
-    part(parts, new THREE.BoxGeometry(0.16, 0.55, 0.95), tl, fx, 3.55, fz, { ry: -a + Math.PI / 2 });
-  }
-  return parts;
-}
-
-/** The animated Ancient heart: team-base crystal shell + an oversized goldLit
- *  core (a Lit shell blows out to near-white under the sun — only the core may
- *  be Lit). It floats INSIDE the kneeling slab ring at chest height (animY in
- *  buildVariant), never perched on top — the heart is the landmark's focal
- *  point, so the core is nearly 2/3 the shell and reads at gameplay zoom. */
-function heartGeo(team: TeamId): THREE.BufferGeometry {
-  const parts: THREE.BufferGeometry[] = [];
-  part(parts, new THREE.OctahedronGeometry(0.8), TEAM_COLORS[team] ?? APAL.azure, 0, 0, 0);
-  part(parts, new THREE.OctahedronGeometry(0.5), APAL.goldLit, 0, 0, 0);
-  return mergeParts(parts);
-}
-
-function meleeCreepParts(team: TeamId): THREE.BufferGeometry[] {
-  const parts: THREE.BufferGeometry[] = [];
-  const tb = TEAM_COLORS[team] ?? APAL.azure;
-  const tl = TEAM_LIT[team] ?? APAL.azureLit;
-  // squat soldier: legs, box torso, cylinder arms, flat helm, team plume
-  part(parts, new THREE.CylinderGeometry(0.09, 0.1, 0.35, 6), APAL.stoneDeep, -0.13, 0.18, 0);
-  part(parts, new THREE.CylinderGeometry(0.09, 0.1, 0.35, 6), APAL.stoneDeep, 0.13, 0.18, 0);
-  part(parts, new THREE.BoxGeometry(0.5, 0.45, 0.34), APAL.monument, 0, 0.58, 0);
-  part(parts, new THREE.CylinderGeometry(0.07, 0.08, 0.34, 6), APAL.stoneDeep, -0.3, 0.62, 0.04, { rz: 0.3 });
-  part(parts, new THREE.CylinderGeometry(0.07, 0.08, 0.34, 6), APAL.stoneDeep, 0.3, 0.62, 0.04, { rz: -0.3 });
-  part(parts, new THREE.CylinderGeometry(0.22, 0.26, 0.18, 8), APAL.stone, 0, 0.95, 0);
-  // tall WIDE team-Lit plume — the silhouette's team read, sized to hold at
-  // 20-30m (round-4 judge: the old sliver vanished past ~20m)
-  part(parts, new THREE.BoxGeometry(0.2, 0.46, 0.62), tl, 0, 1.3, -0.02);
-  // team belt, broad enough to read at lane distance
-  part(parts, new THREE.BoxGeometry(0.56, 0.16, 0.4), tb, 0, 0.42, 0);
-  // slab shield whose whole FACE is team base tier with a team-Lit boss —
-  // real team-coloured SURFACE, not an accent (round-5 judge: the old
-  // stoneDeep slab + small boss left team identity to the hp bar alone)
-  part(parts, new THREE.BoxGeometry(0.1, 0.62, 0.52), tb, -0.36, 0.6, 0.1);
-  part(parts, new THREE.CylinderGeometry(0.17, 0.17, 0.16, 6), tl, -0.43, 0.6, 0.1, { rz: Math.PI / 2 });
-  return parts;
-}
-
-function rangedCreepParts(team: TeamId): THREE.BufferGeometry[] {
-  const parts: THREE.BufferGeometry[] = [];
-  const tb = TEAM_COLORS[team] ?? APAL.azure;
-  const tl = TEAM_LIT[team] ?? APAL.azureLit;
-  // robed acolyte: cone robe, hood, glowing team-tinted orb hands
-  part(parts, new THREE.ConeGeometry(0.32, 0.9, 8), APAL.monument, 0, 0.45, 0);
-  part(parts, new THREE.ConeGeometry(0.2, 0.32, 8), APAL.stoneDeep, 0, 1.05, 0);
-  part(parts, new THREE.SphereGeometry(0.09, 6, 5), APAL.inkDeep, 0, 0.98, 0.09);
-  // team-BASE robe panels on all four faces + a broad team sash — real
-  // team-coloured SURFACE (round-5 judge: orbs alone left team identity to
-  // the hp bar). Panels lean with the cone's slope (atan(0.32/0.9) ≈ 0.34)
-  // so each face sits ON the robe, never floats.
-  part(parts, new THREE.BoxGeometry(0.26, 0.55, 0.05), tb, 0, 0.35, 0.19, { rx: -0.34 });
-  part(parts, new THREE.BoxGeometry(0.26, 0.55, 0.05), tb, 0, 0.35, -0.19, { rx: 0.34 });
-  part(parts, new THREE.BoxGeometry(0.05, 0.55, 0.26), tb, 0.19, 0.35, 0, { rz: 0.34 });
-  part(parts, new THREE.BoxGeometry(0.05, 0.55, 0.26), tb, -0.19, 0.35, 0, { rz: -0.34 });
-  part(parts, new THREE.BoxGeometry(0.48, 0.15, 0.3), tb, 0, 0.62, 0.08);
-  // oversized team-Lit orb hands — the caster's silhouette accent
-  part(parts, new THREE.SphereGeometry(0.19, 6, 5), tl, -0.34, 0.76, 0.12);
-  part(parts, new THREE.SphereGeometry(0.19, 6, 5), tl, 0.34, 0.76, 0.12);
-  return parts;
-}
-
-function siegeCreepParts(team: TeamId): THREE.BufferGeometry[] {
-  const parts: THREE.BufferGeometry[] = [];
-  const tb = TEAM_COLORS[team] ?? APAL.azure;
-  const tl = TEAM_LIT[team] ?? APAL.azureLit;
-  // beetle-shaped stone ram on 4 legs, team banners
-  part(parts, new THREE.SphereGeometry(0.55, 8, 6), APAL.stoneDeep, 0, 0.72, 0, { sx: 1.1, sy: 0.72, sz: 1.5 });
-  part(parts, new THREE.BoxGeometry(0.5, 0.3, 0.7), APAL.monumentDeep, 0, 0.95, -0.3);
-  part(parts, new THREE.BoxGeometry(0.42, 0.26, 0.5), APAL.monument, 0, 1.05, 0.35);
-  // ram head
-  part(parts, new THREE.BoxGeometry(0.34, 0.3, 0.45), APAL.monumentDeep, 0, 0.62, 0.95);
-  part(parts, new THREE.CylinderGeometry(0.07, 0.07, 0.5, 6), APAL.stoneLit, 0, 0.62, 1.2, { rx: Math.PI / 2 });
-  for (const sx of [-0.42, 0.42] as const) {
-    for (const sz of [-0.5, 0.5] as const) {
-      part(parts, new THREE.CylinderGeometry(0.07, 0.09, 0.55, 6), APAL.stoneDeep, sx, 0.28, sz);
-    }
-  }
-  // banner poles + FULL team-base banner cloth with a team-Lit top edge —
-  // real team-coloured surface, sized to hold at 30m (round-5 judge: the old
-  // thin Lit sliver was an accent, not a surface)
-  for (const sx of [-0.28, 0.28] as const) {
-    part(parts, new THREE.CylinderGeometry(0.035, 0.035, 1.45, 5), APAL.trunk, sx, 1.65, -0.5);
-    part(parts, new THREE.BoxGeometry(0.08, 0.78, 0.62), tb, sx, 1.92, -0.32);
-    part(parts, new THREE.BoxGeometry(0.09, 0.16, 0.64), tl, sx, 2.34, -0.32);
-  }
-  return parts;
-}
-
-function shadeParts(team: TeamId): THREE.BufferGeometry[] {
-  const parts: THREE.BufferGeometry[] = [];
-  const tb = TEAM_COLORS[team] ?? APAL.azure;
-  // summoned wraith: hooded cone + twin shade blades + team band
-  part(parts, new THREE.ConeGeometry(0.3, 1.05, 7), APAL.shade, 0, 0.55, 0);
-  part(parts, new THREE.SphereGeometry(0.16, 7, 6), APAL.void, 0, 1.12, 0.04);
-  part(parts, new THREE.BoxGeometry(0.36, 0.07, 0.2), tb, 0, 0.7, 0.06);
-  part(parts, new THREE.BoxGeometry(0.05, 0.42, 0.12), APAL.shade, -0.3, 0.75, 0.14, { rz: 0.5 });
-  part(parts, new THREE.BoxGeometry(0.05, 0.42, 0.12), APAL.shade, 0.3, 0.75, 0.14, { rz: -0.5 });
-  return parts;
-}
-
-/** Humanoid frame per visual.build; weapon/accent per hero. Nominal height is
- *  scaled to visual.height by the caller. */
-function heroParts(hero: HeroId, team: TeamId): THREE.BufferGeometry[] {
-  const def = heroById(hero);
-  const parts: THREE.BufferGeometry[] = [];
-  const tb = TEAM_COLORS[team] ?? APAL.azure;
-  const accent = accentHex(def.visual.accent);
-  const build = def.visual.build;
-  const torsoW = build === 'bulky' ? 0.62 : build === 'standard' ? 0.5 : 0.4;
-  const torsoH = build === 'bulky' ? 0.6 : build === 'standard' ? 0.55 : 0.5;
-  const torsoD = build === 'bulky' ? 0.42 : build === 'standard' ? 0.34 : 0.28;
-  const hipY = 0.55;
-  const torsoY = hipY + torsoH / 2;
-  const shoulderY = hipY + torsoH - 0.08;
-  const headY = hipY + torsoH + 0.24;
-
-  // legs + boots
-  part(parts, new THREE.CylinderGeometry(0.1, 0.11, 0.5, 6), APAL.stoneDeep, -torsoW * 0.26, 0.28, 0);
-  part(parts, new THREE.CylinderGeometry(0.1, 0.11, 0.5, 6), APAL.stoneDeep, torsoW * 0.26, 0.28, 0);
-  // torso armour
-  part(parts, new THREE.BoxGeometry(torsoW, torsoH, torsoD), APAL.monumentDeep, 0, torsoY, 0);
-  // team tabard stripe
-  part(parts, new THREE.BoxGeometry(torsoW * 0.4, torsoH * 0.85, 0.03), tb, 0, torsoY - 0.03, torsoD / 2 + 0.01);
-  // pauldrons (stacked plates on bulky)
-  const plates = build === 'bulky' ? 2 : 1;
-  for (let p = 0; p < plates; p++) {
-    for (const sgn of [-1, 1] as const) {
-      part(
-        parts,
-        new THREE.BoxGeometry(0.22, 0.1, 0.26),
-        APAL.monument,
-        sgn * (torsoW / 2 + 0.1),
-        shoulderY + p * 0.11,
-        0,
-      );
-    }
-  }
-  // arms
-  part(parts, new THREE.CylinderGeometry(0.07, 0.08, 0.42, 6), APAL.stoneDeep, -torsoW / 2 - 0.1, shoulderY - 0.24, 0.03, { rz: 0.18 });
-  part(parts, new THREE.CylinderGeometry(0.07, 0.08, 0.42, 6), APAL.stoneDeep, torsoW / 2 + 0.1, shoulderY - 0.24, 0.03, { rz: -0.18 });
-  // helm + team plume
-  part(parts, new THREE.CylinderGeometry(0.16, 0.19, 0.22, 8), APAL.monument, 0, headY, 0);
-  part(parts, new THREE.BoxGeometry(0.05, 0.16, 0.3), tb, 0, headY + 0.18, -0.04);
-
-  // --- weapon + accent per hero -------------------------------------------
-  if (hero === 'bullwark') {
-    // tower shield with pine boss
-    part(parts, new THREE.BoxGeometry(0.12, 0.9, 0.6), APAL.stoneDeep, -torsoW / 2 - 0.24, 0.75, 0.12);
-    part(parts, new THREE.CylinderGeometry(0.12, 0.12, 0.14, 6), accent, -torsoW / 2 - 0.3, 0.75, 0.12, { rz: Math.PI / 2 });
-    part(parts, new THREE.BoxGeometry(0.14, 0.12, 0.62), tb, -torsoW / 2 - 0.24, 1.1, 0.12);
-  } else if (hero === 'reaver') {
-    // greatblade with a gold edge
-    part(parts, new THREE.BoxGeometry(0.07, 1.25, 0.2), APAL.monumentLit, torsoW / 2 + 0.22, 1.0, 0.15, { rz: -0.35 });
-    part(parts, new THREE.BoxGeometry(0.03, 1.25, 0.06), accent, torsoW / 2 + 0.3, 1.0, 0.15, { rz: -0.35 });
-    part(parts, new THREE.CylinderGeometry(0.045, 0.045, 0.3, 6), APAL.trunk, torsoW / 2 + 0.14, 0.48, 0.15, { rz: -0.35 });
-  } else if (hero === 'mender') {
-    // staff with a heal orb
-    part(parts, new THREE.CylinderGeometry(0.04, 0.05, 1.5, 6), APAL.trunk, torsoW / 2 + 0.2, 0.85, 0.1);
-    part(parts, new THREE.SphereGeometry(0.12, 7, 6), accent, torsoW / 2 + 0.2, 1.68, 0.1);
-    part(parts, new THREE.TorusGeometry(0.16, 0.03, 5, 10), APAL.goldLit, torsoW / 2 + 0.2, 1.68, 0.1);
-  } else if (hero === 'longbow') {
-    // longbow (3-segment arc) + frost string + quiver
-    part(parts, new THREE.BoxGeometry(0.05, 0.55, 0.08), APAL.trunk, torsoW / 2 + 0.28, 1.05, 0.1, { rz: -0.5 });
-    part(parts, new THREE.BoxGeometry(0.05, 0.55, 0.08), APAL.trunk, torsoW / 2 + 0.28, 0.55, 0.1, { rz: 0.5 });
-    part(parts, new THREE.BoxGeometry(0.05, 0.3, 0.08), APAL.trunk, torsoW / 2 + 0.3, 0.8, 0.1);
-    part(parts, new THREE.BoxGeometry(0.012, 0.95, 0.012), accent, torsoW / 2 + 0.13, 0.8, 0.1);
-    part(parts, new THREE.CylinderGeometry(0.09, 0.09, 0.5, 6), APAL.trunk, -0.12, 1.05, -torsoD / 2 - 0.08, { rx: 0.25 });
-    part(parts, new THREE.CylinderGeometry(0.02, 0.02, 0.3, 4), APAL.stoneLit, -0.12, 1.32, -torsoD / 2 - 0.12, { rx: 0.25 });
-  } else if (hero === 'hex') {
-    // floating rings + void core
-    part(parts, new THREE.TorusGeometry(0.42, 0.035, 5, 14), accent, 0, torsoY + 0.1, 0, { rx: Math.PI / 2.4 });
-    part(parts, new THREE.TorusGeometry(0.58, 0.03, 5, 16), APAL.arcane, 0, torsoY, 0, { rx: -Math.PI / 2.6 });
-    part(parts, new THREE.SphereGeometry(0.13, 7, 6), accent, 0, torsoY + 0.05, torsoD / 2 + 0.04);
-  } else {
-    // shade: twin daggers + team scarf
-    part(parts, new THREE.BoxGeometry(0.04, 0.5, 0.1), accent, -torsoW / 2 - 0.2, 0.55, 0.18, { rz: 0.55 });
-    part(parts, new THREE.BoxGeometry(0.04, 0.5, 0.1), accent, torsoW / 2 + 0.2, 0.55, 0.18, { rz: -0.55 });
-    part(parts, new THREE.BoxGeometry(torsoW + 0.1, 0.12, torsoD + 0.08), TEAM_LIT[team] ?? APAL.azureLit, 0, shoulderY + 0.05, 0);
-    part(parts, new THREE.BoxGeometry(0.16, 0.5, 0.04), TEAM_LIT[team] ?? APAL.azureLit, -torsoW / 2 + 0.05, shoulderY - 0.25, -torsoD / 2 - 0.06, { rx: 0.2 });
-  }
-  return parts;
-}
-
-function wardParts(team: TeamId): { body: THREE.BufferGeometry; eye: THREE.BufferGeometry } {
-  const parts: THREE.BufferGeometry[] = [];
-  part(parts, new THREE.BoxGeometry(0.3, 0.12, 0.3), APAL.stoneDeep, 0, 0.06, 0);
-  part(parts, new THREE.CylinderGeometry(0.07, 0.15, 0.85, 4), APAL.monument, 0, 0.55, 0);
-  part(parts, new THREE.CylinderGeometry(0.09, 0.09, 0.06, 4), TEAM_COLORS[team] ?? APAL.azure, 0, 0.99, 0);
-  const eyeParts: THREE.BufferGeometry[] = [];
-  part(eyeParts, new THREE.SphereGeometry(0.1, 7, 6), APAL.ward, 0, 0, 0);
-  return { body: mergeParts(parts), eye: mergeParts(eyeParts) };
-}
-
-/** Projectile: elongated glowing body tipped in the school colour. */
-function projGeo(school: 'phys' | 'magic' | 'heal'): THREE.BufferGeometry {
-  const tip =
-    school === 'phys' ? APAL.paper : school === 'heal' ? APAL.heal : APAL.arcane;
-  const body = mix(tip, APAL.paper, 0.4);
-  const parts: THREE.BufferGeometry[] = [];
-  part(parts, new THREE.OctahedronGeometry(0.13), body, 0, 0, -0.08, { sz: 1.8 });
-  part(parts, new THREE.OctahedronGeometry(0.09), tip, 0, 0, 0.22, { sz: 1.5 });
-  return mergeParts(parts);
-}
-
-// ---- variant cache -----------------------------------------------------------------
-
-type AnimKind = 'orbit' | 'bob' | 'pulse';
-
-interface Variant {
-  readonly body: THREE.BufferGeometry;
-  readonly anim: THREE.BufferGeometry | null;
-  readonly animKind: AnimKind | null;
-  /** Local anchor of the animated part (crystal/heart/eye home position). */
-  readonly animY: number;
-  readonly barH: number;
-  readonly barW: number;
-}
-
-function buildVariant(kind: EntKind, hero: HeroId | undefined, team: TeamId): Variant {
-  switch (kind) {
-    case 'tower':
-      // barH hugs the mesh top (brazier rim ~3.5; the crystal orbits above it)
-      return { body: mergeParts(towerParts(team, false)), anim: crystalGeo(team), animKind: 'orbit', animY: 4.1, barH: 3.8, barW: 2.0 };
-    case 'guard':
-      return { body: mergeParts(towerParts(team, true)), anim: crystalGeo(team), animKind: 'orbit', animY: 4.7, barH: 4.2, barW: 2.0 };
-    case 'ancient':
-      // heart bobs INSIDE the slab ring at chest height; the bar rides the
-      // ring crown (~5.2m incl. cap fragments)
-      return { body: mergeParts(ancientParts(team)), anim: heartGeo(team), animKind: 'bob', animY: 2.5, barH: 5.5, barW: 2.8 };
-    case 'melee':
-      return { body: mergeParts(meleeCreepParts(team)), anim: null, animKind: null, animY: 0, barH: 1.5, barW: 0.9 };
-    case 'ranged':
-      return { body: mergeParts(rangedCreepParts(team)), anim: null, animKind: null, animY: 0, barH: 1.6, barW: 0.9 };
-    case 'siege':
-      return { body: mergeParts(siegeCreepParts(team)), anim: null, animKind: null, animY: 0, barH: 2.4, barW: 1.15 };
-    case 'shade':
-      return { body: mergeParts(shadeParts(team)), anim: null, animKind: null, animY: 0, barH: 1.55, barW: 0.9 };
-    case 'hero': {
-      const h = hero ?? 'reaver';
-      const scale = heroById(h).visual.height / 1.8;
-      const body = mergeParts(heroParts(h, team));
-      body.scale(scale, scale, scale);
-      return { body, anim: null, animKind: null, animY: 0, barH: heroById(h).visual.height + 0.35, barW: 1.2 };
-    }
-    case 'ward': {
-      const w = wardParts(team);
-      return { body: w.body, anim: w.eye, animKind: 'pulse', animY: 1.06, barH: 0, barW: 0 };
-    }
-    case 'proj':
-      // projectiles live in their own pool; never reach buildVariant
-      break;
-  }
-  // unreachable in practice — 'proj' is diverted before this call
-  return { body: mergeParts(shadeParts(team)), anim: null, animKind: null, animY: 0, barH: 1.5, barW: 0.95 };
-}
-
-// ---- slots --------------------------------------------------------------------------
-
+/** One live entity's render state. Every numeric field is scratch mutated in
+ *  place — nothing here is re-created, which is what makes the pose pass
+ *  allocation-free. */
 interface UnitSlot {
-  mesh: THREE.Mesh;
-  anim: THREE.Mesh | null;
-  variant: Variant;
-  /** Variant cache/freelist key — set once at creation, never changes. */
-  vkey: string;
+  readonly arch: Archetype;
   id: number;
   kind: EntKind;
-  team: TeamId;
+  team: EntTeam;
+  /** Index into `activeList`; kept current by the swap-remove in `release`. */
+  listIdx: number;
+  /** Invisible raycast target carrying `userData.entId`; null for projectiles. */
+  pick: THREE.Mesh | null;
   yaw: number;
   lastX: number;
   lastZ: number;
   phase: number;
-  // ---- procedural-animation scratch (preallocated; mutated, never re-created)
   /** Latest sync position — the animation base the frame hook poses from. */
   px: number;
   pz: number;
@@ -537,131 +384,318 @@ interface UnitSlot {
   atkDz: number;
   /** Last atk target id seen (transient-signal dedupe; -1 = none). */
   lastAtk: number;
-  /** Clock time of the (re)spawn — drives the 0.2s scale-up pop. */
+  /** Clock time of the (re)spawn — drives the spawn pop. */
   spawnT: number;
-  /** Melee = lunge toward the target; ranged/structures = recoil. */
+  /** Melee = lunge toward the target; ranged = recoil. */
   melee: boolean;
-  /** Destroyed structure: stays collapsed, no procedural posing. */
-  destroyed: boolean;
+  /** Footprint of the pick proxy, in metres. */
+  pickW: number;
+  pickH: number;
 }
 
-interface ProjSlot {
-  mesh: THREE.Mesh;
-  id: number;
-  lastX: number;
-  lastZ: number;
+interface StructFit {
+  readonly barH: number;
+  readonly barW: number;
 }
 
-function projSchool(fx: string | undefined): 'phys' | 'magic' | 'heal' {
-  if (fx !== undefined) {
-    const s = fx.toLowerCase();
-    if (s.includes('physical') || s.includes('phys')) return 'phys';
-    if (s.includes('heal')) return 'heal';
-  }
-  return 'magic';
-}
-
-// ---- createUnits ---------------------------------------------------------------------
+// ============================================================================
+// createUnits
+// ============================================================================
 
 export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle {
   const core: SceneCore = sceneCore(scene);
-  const vertexMat = core.vertexMat();
 
-  // Animated-part materials (Lambert law holds — emissive-locked or vertex-
-  // painted Lambert only): tower crystals glow in the team BASE tier — the
-  // two dying campfires of the §7 mood (a Lit-tier emissive blows out to
-  // white under the sun; the base tier stays a saturated azure/ember glow); the
-  // Ancient heart keeps its vertex paint (team shell / goldLit core) under a
-  // soft gold emissive lift so it reads as a lit brazier-heart at dusk; ward
-  // eyes stay on the shared vertex mat.
-  const crystalMats = new Map<TeamId, THREE.MeshLambertMaterial>();
-  const crystalMatOf = (team: TeamId): THREE.MeshLambertMaterial => {
-    let m = crystalMats.get(team);
-    if (!m) {
-      m = new THREE.MeshLambertMaterial({
-        color: APAL.inkDeep, // lit contribution ≈ black; emissive carries the read
-        emissive: TEAM_COLORS[team] ?? APAL.azure,
-        flatShading: true,
-      });
-      crystalMats.set(team, m);
+  let clock = 0;
+  /** Wall-clock left for building new archetypes in the current `sync()`. */
+  let buildBudgetMs = ARCH_BUILD_BUDGET_MS;
+
+  // ---- archetypes -----------------------------------------------------------
+  const archetypes = new Map<string, Archetype>();
+  const archList: Archetype[] = [];
+
+  function archKey(k: EntKind, hero: HeroId | undefined, team: EntTeam, school: ProjSchool): string {
+    if (k === 'hero') return `hero:${hero ?? 'reaver'}:${String(team)}`;
+    const tier = campTierOf(k);
+    if (tier !== null) return `camp:${tier}`;
+    if (k === 'proj') return `proj:${school}:${String(team)}`;
+    return `creep:${k}:${String(team)}`;
+  }
+
+  function buildFor(
+    k: EntKind,
+    hero: HeroId | undefined,
+    team: EntTeam,
+    school: ProjSchool,
+  ): UnitBuild {
+    if (k === 'hero') return buildHero(hero ?? 'reaver', team);
+    const tier = campTierOf(k);
+    if (tier !== null) return buildCamp(tier);
+    if (k === 'proj') return buildProjectile(team, school);
+    return buildCreep(k, team);
+  }
+
+  /** Mount a `UnitBuild`: one InstancedMesh per baked bucket plus one for the
+   *  anim part. Everything is read off `body.group.children`, which is where
+   *  `bake()` put the material AND where the mesh module's `markBloom` landed —
+   *  reading `body.parts` instead would silently drop the bloom flag. The group
+   *  itself is never added to the scene; only these instanced mounts are. */
+  function mount(key: string, k: EntKind, team: EntTeam, build: UnitBuild): Archetype {
+    const cap = capOf(k);
+    const buckets: THREE.InstancedMesh[] = [];
+    for (const child of build.body.group.children) {
+      if (!(child instanceof THREE.Mesh) || Array.isArray(child.material)) continue;
+      const im = new THREE.InstancedMesh(child.geometry, child.material, cap);
+      im.name = `rift:units:${key}`;
+      im.count = 0;
+      im.visible = false;
+      // Culling stays OFF until the first `flushOne` has given this mount a
+      // bounding sphere built from real instance matrices; see `flushOne`.
+      im.frustumCulled = false;
+      im.receiveShadow = true;
+      if (child.layers.isEnabled(BLOOM_LAYER)) markBloom(im);
+      buckets.push(im);
     }
-    return m;
-  };
-  const heartMat = new THREE.MeshLambertMaterial({
-    vertexColors: true,
-    flatShading: true,
-    emissive: APAL.gold,
-    emissiveIntensity: 0.12, // a candle-warm lift; higher washes the team shell pink
-  });
-  const animMatOf = (kind: AnimKind | null, team: TeamId): THREE.MeshLambertMaterial =>
-    kind === 'orbit' ? crystalMatOf(team) : kind === 'bob' ? heartMat : vertexMat;
-
-  const variantCache = new Map<string, Variant>();
-  const variantOf = (kind: EntKind, hero: HeroId | undefined, team: TeamId): Variant => {
-    const key = `${kind}:${hero ?? '-'}:${String(team)}`;
-    let v = variantCache.get(key);
-    if (!v) {
-      v = buildVariant(kind, hero, team);
-      variantCache.set(key, v);
+    // AMENDMENT_3 §D.2: shadow casters are a whitelist. Of everything this
+    // module mounts only heroes cast — lane creeps, summons, wards, camps,
+    // projectiles and every anim part do not, and the meter counts the shadow
+    // pass, so each caster is a draw call spent twice.
+    const cls = k === 'hero' ? 'hero' : null;
+    for (const im of buckets) {
+      applyShadowPolicy(im, cls);
+      core.three.add(im);
     }
-    return v;
-  };
 
+    let animMesh: THREE.InstancedMesh | null = null;
+    const anim = build.anim;
+    if (anim !== null) {
+      // The anim geometry never passes through `bake()`, so the vertex-colour
+      // law is the mesh module's to satisfy (the `AnimPart` doc says so). This
+      // call is idempotent by design — a geometry already carrying a correct
+      // `color` attribute is returned untouched — so it costs nothing when the
+      // module did its job and saves a black mesh when it did not.
+      //
+      // UV SCALING IS ACCEPTED AS THE MODULE BUILT IT, deliberately. The kit
+      // assigns anim-part UV layout to the mesh module ("build it with
+      // PartOpts.uvLocal; if it needs the world-space density instead, scale
+      // the UVs in the module"), and every shipped anim part is a sub-0.2 m
+      // primitive whose own normalised layout is the intended one. Reprojecting
+      // here would overrule a decision that is not this module's, on geometry
+      // whose author already measured it.
+      whiteVertexColors(anim.geo);
+      // THE ONE RESOLVER (AMENDMENT_4 §D). No surface-vs-emissive branch here,
+      // and no material chosen by animation kind — choosing by `animKind` is
+      // what put the ancient heart's material on the ward eye.
+      const animMat = partMaterial(anim.surfaceId, anim.tint, anim.emissive);
+      animMesh = new THREE.InstancedMesh(anim.geo, animMat, cap);
+      animMesh.name = `rift:units:${key}:anim`;
+      animMesh.count = 0;
+      animMesh.visible = false;
+      animMesh.frustumCulled = false; // see `flushOne`
+      animMesh.receiveShadow = true;
+      // Not derived from `emissive`: gold blooms without one, and a dim
+      // emissive filler may deliberately stay out of the pass. The part decides.
+      if (anim.bloom) markBloom(animMesh);
+      applyShadowPolicy(animMesh, null);
+      core.three.add(animMesh);
+    }
+
+    const a: Archetype = {
+      key,
+      kind: k,
+      team,
+      build,
+      buckets,
+      anim: animMesh,
+      cap,
+      count: 0,
+      animCount: 0,
+      overflowWarned: false,
+      ghost: null,
+      ghostBuilt: false,
+      ghostCount: 0,
+    };
+    archetypes.set(key, a);
+    archList.push(a);
+    return a;
+  }
+
+  let buildFailWarned = false;
+
+  /** The archetype for one entity, built on demand inside this frame's build
+   *  budget. Returns null when the budget is spent — the entity simply is not
+   *  drawn this frame and is picked up on a later one, which is a one-to-three
+   *  frame ramp-in at match start instead of one multi-hundred-millisecond
+   *  freeze. */
+  function archetypeFor(e: InterpEnt, school: ProjSchool): Archetype | null {
+    const key = archKey(e.k, e.hero, e.team, school);
+    const hit = archetypes.get(key);
+    if (hit !== undefined) return hit;
+    if (buildBudgetMs <= 0) return null;
+    const t0 = performance.now();
+    try {
+      const build = buildFor(e.k, e.hero, e.team, school);
+      return mount(key, e.k, e.team, build);
+    } catch (err) {
+      if (!buildFailWarned) {
+        buildFailWarned = true;
+        console.error(`rift units: archetype '${key}' failed to build — it will not be drawn`, err);
+      }
+      return null;
+    } finally {
+      buildBudgetMs -= performance.now() - t0;
+    }
+  }
+
+  // ---- structure bar + pick fit ---------------------------------------------
+  //
+  // A structure's mesh is R_MAPMESH's, but its HP BAR and its PICK PROXY are
+  // this module's, and both need `barH`/`barW` off the SAME build R_MAPMESH
+  // draws. They are read by calling `buildStructure` once per kind and disposing
+  // the geometry it returns: two numbers that cannot drift from the mesh,
+  // against one transient build. `barH` is team-independent — structures.ts
+  // derives it as `top + BAR_CLEAR` from geometry whose only per-team variation
+  // is tint — and re-measured cold on both teams it is 9.7900 / 9.4754 /
+  // 14.3060 m with `barW` 2.40 / 2.60 / 3.40 m for tower / guard / ancient, the
+  // same on team 0 and team 1. So this is three builds, not six. Materials are
+  // cached and shared with R_MAPMESH's own build; only the transient vertex
+  // buffers are freed.
+  //
+  // The pick proxy matters as much as the bar: `input.ts` right-click-attacks
+  // and left-click-selects whatever `SceneHandle.pickUnit` returns, so with no
+  // proxy a tower is not attackable by mouse at all. `BAR_CLEAR` is 0.38 m, so
+  // a box of height `barH` stands exactly 0.38 m proud of the structure's top —
+  // a click target very slightly larger than the building, which is the right
+  // direction for a click target to err in.
+  const structFit = new Map<StructureKind, StructFit>();
+  const structKindsInMap = new Set<StructureKind>();
+  for (const s of map.structures) structKindsInMap.add(s.kind);
+  let structProbeWarned = false;
+
+  function structFitOf(k: StructureKind): StructFit | null {
+    const hit = structFit.get(k);
+    if (hit !== undefined) return hit;
+    if (!structKindsInMap.has(k)) return null;
+    if (buildBudgetMs <= 0) return null;
+    const t0 = performance.now();
+    try {
+      const b = buildStructure(k, 0);
+      const fit: StructFit = { barH: b.barH, barW: b.barW };
+      for (const p of b.body.parts) p.geo.dispose();
+      if (b.anim !== null) b.anim.geo.dispose();
+      structFit.set(k, fit);
+      return fit;
+    } catch (err) {
+      if (!structProbeWarned) {
+        structProbeWarned = true;
+        console.error(`rift units: could not measure the '${k}' HP bar — it will not be drawn`, err);
+      }
+      return null;
+    } finally {
+      buildBudgetMs -= performance.now() - t0;
+    }
+  }
+
+  /** Live pick proxies for standing structures, keyed by entity id. Bounded by
+   *  `map.structures.length` — a structure is sent to every client every tick
+   *  (`shared/types.ts`: "Structures are sent to every client every tick"), so
+   *  an entry leaves this map exactly one way, by the structure being
+   *  destroyed. There is no vanish path to sweep. */
+  const structPicks = new Map<number, THREE.Mesh>();
+
+  /** Give a standing structure a raycast target. Structures do not move, so the
+   *  transform is written once, at creation. */
+  function structPick(e: InterpEnt, fit: StructFit): void {
+    if (structPicks.has(e.id)) return;
+    const m = takePick(e.id);
+    m.position.set(e.x, core.heightAt(e.x, e.z), e.z);
+    m.scale.set(fit.barW, fit.barH, fit.barW);
+    structPicks.set(e.id, m);
+  }
+
+  function dropStructPick(id: number): void {
+    const m = structPicks.get(id);
+    if (m === undefined) return;
+    structPicks.delete(id);
+    dropPick(m);
+  }
+
+  // ---- slots ----------------------------------------------------------------
   const active = new Map<number, UnitSlot>();
+  const activeList: UnitSlot[] = [];
   const freeByKey = new Map<string, UnitSlot[]>();
   const seen = new Set<number>();
 
-  function acquire(e: InterpEnt): UnitSlot {
-    const key = `${e.k}:${e.hero ?? '-'}:${String(e.team)}`;
-    let slot = active.get(e.id);
-    if (slot) return slot;
-    const free = freeByKey.get(key);
-    const pooled = free?.pop();
-    if (pooled) {
-      slot = pooled;
-    } else {
-      const variant = variantOf(e.k, e.hero, e.team);
-      const mesh = new THREE.Mesh(variant.body, vertexMat);
-      mesh.castShadow = true;
-      let anim: THREE.Mesh | null = null;
-      if (variant.anim) {
-        anim = new THREE.Mesh(variant.anim, animMatOf(variant.animKind, e.team));
-        core.three.add(anim);
-      }
-      slot = {
-        mesh,
-        anim,
-        variant,
-        vkey: key,
-        id: e.id,
-        kind: e.k,
-        team: e.team,
-        yaw: 0,
-        lastX: e.x,
-        lastZ: e.z,
-        phase: (e.id % 97) * 0.651, // deterministic spread, no rng needed
-        px: e.x,
-        pz: e.z,
-        hx: e.x,
-        hz: e.z,
-        speed: 0,
-        walkT: 0,
-        atkT: -1,
-        atkDx: 0,
-        atkDz: 1,
-        lastAtk: -1,
-        spawnT: 0,
-        melee: isMeleeKind(e.k, e.hero),
-        destroyed: false,
-      };
-      core.three.add(mesh);
-      core.registerPick(mesh);
+  // Pick proxies. An invisible unit box: `visible = false` keeps it out of every
+  // render list and out of the shadow pass, while the raycaster — which does not
+  // consult `visible` — still hits it. The material is a cached kit surface
+  // rather than three's implicit `MeshBasicMaterial` default, which the material
+  // law bans outright; it is never rasterised.
+  const pickGeo = whiteVertexColors(new THREE.BoxGeometry(1, 1, 1).translate(0, 0.5, 0));
+  const pickMat = surface('cliffRock');
+  const pickFree: THREE.Mesh[] = [];
+
+  function takePick(entId: number): THREE.Mesh {
+    const reused = pickFree.pop();
+    const m = reused ?? new THREE.Mesh(pickGeo, pickMat);
+    if (reused === undefined) {
+      m.visible = false;
+      m.castShadow = false;
+      m.receiveShadow = false;
+      m.name = 'rift:units:pick';
+      core.three.add(m);
     }
+    m.userData['entId'] = entId;
+    core.registerPick(m);
+    return m;
+  }
+
+  function dropPick(m: THREE.Mesh): void {
+    // MANDATORY on despawn: a stale pick entry keeps a dead entity clickable
+    // and holds a reference that outlives the entity.
+    core.unregisterPick(m);
+    m.userData['entId'] = -1;
+    pickFree.push(m);
+  }
+
+  function newSlot(e: InterpEnt, arch: Archetype): UnitSlot {
+    return {
+      arch,
+      id: e.id,
+      kind: e.k,
+      team: e.team,
+      listIdx: -1,
+      pick: null,
+      yaw: 0,
+      lastX: e.x,
+      lastZ: e.z,
+      phase: (e.id % 97) * 0.651, // deterministic spread, no rng needed
+      px: e.x,
+      pz: e.z,
+      hx: e.x,
+      hz: e.z,
+      speed: 0,
+      walkT: 0,
+      atkT: -1,
+      atkDx: 0,
+      atkDz: 1,
+      lastAtk: -1,
+      spawnT: 0,
+      melee: false,
+      pickW: 1,
+      pickH: 1,
+    };
+  }
+
+  function acquire(e: InterpEnt, arch: Archetype): UnitSlot {
+    const existing = active.get(e.id);
+    if (existing !== undefined) return existing;
+    const pooled = freeByKey.get(arch.key)?.pop();
+    const slot = pooled ?? newSlot(e, arch);
+
     slot.id = e.id;
     slot.kind = e.k;
     slot.team = e.team;
     slot.melee = isMeleeKind(e.k, e.hero);
-    slot.destroyed = false;
     slot.speed = 0;
     slot.walkT = 0;
     slot.atkT = -1;
@@ -670,75 +704,181 @@ export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle {
     slot.pz = e.z;
     slot.hx = e.x;
     slot.hz = e.z;
-    slot.spawnT = clock; // the 0.2s scale-up pop starts now
-    slot.mesh.visible = true;
-    slot.mesh.scale.set(1, 1, 1);
-    slot.mesh.rotation.x = 0;
-    slot.mesh.rotation.z = 0;
-    if (slot.anim) slot.anim.visible = true;
-    slot.mesh.userData['entId'] = e.id;
+    slot.lastX = e.x;
+    slot.lastZ = e.z;
+    slot.yaw = 0;
+    slot.spawnT = clock; // the spawn pop starts now
+    // A ward and a projectile report barH/barW 0; the ward still needs a
+    // clickable footprint (you dust wards), a projectile does not.
+    slot.pickW = arch.build.barW > 0 ? arch.build.barW : 0.6;
+    slot.pickH = arch.build.barH > 0 ? arch.build.barH : 1.4;
+    if (e.k !== 'proj') {
+      if (slot.pick === null) slot.pick = takePick(e.id);
+      else slot.pick.userData['entId'] = e.id;
+    }
+
+    slot.listIdx = activeList.length;
+    activeList.push(slot);
     active.set(e.id, slot);
     return slot;
   }
 
-  function release(id: number, slot: UnitSlot): void {
-    slot.mesh.visible = false;
-    if (slot.anim) slot.anim.visible = false;
-    slot.mesh.userData['entId'] = -1;
-    active.delete(id);
-    let list = freeByKey.get(slot.vkey);
-    if (!list) {
+  function release(slot: UnitSlot): void {
+    active.delete(slot.id);
+    const last = activeList[activeList.length - 1];
+    if (last !== undefined && slot.listIdx >= 0) {
+      activeList[slot.listIdx] = last;
+      last.listIdx = slot.listIdx;
+      activeList.pop();
+    }
+    slot.listIdx = -1;
+    if (slot.pick !== null) {
+      dropPick(slot.pick);
+      slot.pick = null;
+    }
+    // Remember which archetype this id wore so its ghost fades the right
+    // silhouette. `GhostEnt` carries no `hero`, so without this a dead hero
+    // could only ever be ghosted as an arbitrary stand-in.
+    rememberGhostArch(slot.id, slot.arch);
+    let list = freeByKey.get(slot.arch.key);
+    if (list === undefined) {
       list = [];
-      freeByKey.set(slot.vkey, list);
+      freeByKey.set(slot.arch.key, list);
     }
     list.push(slot);
   }
 
-  // ---- HP bars: TWO InstancedMesh total -----------------------------------------
+  // ---- ghosts ---------------------------------------------------------------
+  //
+  // A ghost is the unit's own silhouette, additive, fading to nothing. The fade
+  // rides the INSTANCE COLOUR, never `opacity`: `fxAdditive` is a shared cached
+  // material and mutating its opacity at a call site is banned, while under
+  // additive blending a colour scaled toward black IS the fade. The material is
+  // `surface('fxAdditive', teamHex)`, so the instance colour stays a pure
+  // greyscale multiplier and no palette hex multiplies another.
+  const ghostArchById = new Map<number, Archetype>();
+  const ghostSeen = new Set<number>();
+  /** How long a released id keeps its silhouette memory. Ghosts fade over
+   *  0.5 s; 2 s covers snapshot jitter without letting the memory grow. */
+  const GHOST_MEMORY_S = 2;
+  /** The expiry side of that memory, held as PARALLEL DENSE ARRAYS rather than
+   *  a second Map, purely so the per-frame sweep can be allocation-free.
+   *  `for (const id of map.keys())` mints a fresh iterator object on every
+   *  `sync()`, and `sync()` runs every frame over every visible entity — the
+   *  one thing this module's spec bans by name. An index loop over a
+   *  preallocated typed array mints nothing. `ghostArchById` stays a Map
+   *  because it is only ever `get`/`set`/`delete`, none of which iterate.
+   *
+   *  Capacity is the ceiling on ids that died inside `GHOST_MEMORY_S`; a 3-lane
+   *  8v8 wave wipe is ~40. When it is full, new memories are dropped rather
+   *  than evicting a live one — a missing silhouette for one death is a smaller
+   *  defect than an unbounded array in a frame path. */
+  const GHOST_MEM_CAP = 256;
+  const ghostMemIds = new Int32Array(GHOST_MEM_CAP);
+  const ghostMemAt = new Float32Array(GHOST_MEM_CAP);
+  let ghostMemN = 0;
+
+  /** Record (or refresh) the archetype an id wore when it left the world.
+   *  Called from `release`, i.e. on despawn — never per frame — so the linear
+   *  scan for an existing entry is bounded by `ghostMemN` and costs nothing. */
+  function rememberGhostArch(id: number, arch: Archetype): void {
+    ghostArchById.set(id, arch);
+    for (let i = 0; i < ghostMemN; i++) {
+      if (ghostMemIds[i] === id) {
+        ghostMemAt[i] = clock;
+        return;
+      }
+    }
+    if (ghostMemN >= GHOST_MEM_CAP) return;
+    ghostMemIds[ghostMemN] = id;
+    ghostMemAt[ghostMemN] = clock;
+    ghostMemN += 1;
+  }
+  /** Peak additive brightness of a ghost, carrying over the 0.55 opacity the
+   *  ghost fade used before the material law. */
+  const GHOST_PEAK = 0.55;
+
+  function ghostMeshOf(a: Archetype): THREE.InstancedMesh | null {
+    if (a.ghostBuilt) return a.ghost;
+    a.ghostBuilt = true;
+    const geos: THREE.BufferGeometry[] = [];
+    for (const p of a.build.body.parts) geos.push(p.geo.clone());
+    const first = geos[0];
+    if (first === undefined) return null;
+    try {
+      const silhouette = geos.length === 1 ? first : mergeAll(geos, `ghost ${a.key}`);
+      const im = new THREE.InstancedMesh(
+        silhouette,
+        surface('fxAdditive', teamHexOf(a.team)),
+        GHOST_CAP,
+      );
+      im.name = `rift:units:${a.key}:ghost`;
+      im.count = 0;
+      im.visible = false;
+      im.frustumCulled = false;
+      im.renderOrder = 20;
+      applyShadowPolicy(im, null);
+      core.three.add(im);
+      a.ghost = im;
+      return im;
+    } catch (err) {
+      console.error(`rift units: ghost silhouette for '${a.key}' failed`, err);
+      return null;
+    }
+  }
+
+  // ---- HP bars: one background + five colour classes -------------------------
   // Slim WIDE rectangles facing the camera: the tilt MUST live in the instance
   // quaternion (compose applies scale first, then rotation) — baking the tilt
-  // into the geometry puts the thin axis along world-z and the bar renders as
-  // a fat square (the round-2 judge finding).
+  // into the geometry puts the thin axis along world-z and the bar renders as a
+  // fat square.
   const barTilt = THREE.MathUtils.degToRad(-(180 - CAMERA_PITCH_DEG));
   const barQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(barTilt, 0, 0));
-  const barGeoBg = new THREE.PlaneGeometry(1, 1);
-  const barGeoFill = new THREE.PlaneGeometry(1, 1);
-  const BAR_BG_H = 0.07; // world metres — high-aspect sliver, not a square
-  const BAR_FILL_H = 0.042;
-  const BAR_FILL_INSET = 0.06;
-  const barBgMat = new THREE.MeshLambertMaterial({ color: APAL.inkDeep, side: THREE.DoubleSide });
-  const barFillMat = new THREE.MeshLambertMaterial({ color: APAL.paper, side: THREE.DoubleSide });
-  const barBg = new THREE.InstancedMesh(barGeoBg, barBgMat, BAR_CAP);
-  const barFill = new THREE.InstancedMesh(barGeoFill, barFillMat, BAR_CAP);
+  const barBg = new THREE.InstancedMesh(
+    whiteVertexColors(new THREE.PlaneGeometry(1, 1)),
+    surface('fxDecal', APAL.inkDeep),
+    BAR_CAP,
+  );
   barBg.frustumCulled = false;
-  barFill.frustumCulled = false;
   barBg.renderOrder = 40;
-  barFill.renderOrder = 41;
+  barBg.count = 0;
+  barBg.visible = false;
+  applyShadowPolicy(barBg, null);
   core.three.add(barBg);
-  core.three.add(barFill);
-  const barM = new THREE.Matrix4();
-  const barP = new THREE.Vector3();
-  const barS = new THREE.Vector3();
-  const barC = new THREE.Color();
-  // camera-facing nudge so fills sit proud of backgrounds
-  const nY = Math.sin(THREE.MathUtils.degToRad(CAMERA_PITCH_DEG)) * 0.03;
-  const nZ = -Math.cos(THREE.MathUtils.degToRad(CAMERA_PITCH_DEG)) * 0.03;
 
-  // ---- team SHAPE markers (accessibility: team reads by shape, not hue only) --
-  // azure = open upward chevron, ember = solid pennant triangle — two more
-  // InstancedMesh, one per team, emissive-locked so the small shape reads
-  // against any backdrop. Small and anchored just above the bar.
+  const barFills: THREE.InstancedMesh[] = [];
+  const barFillCounts = new Int32Array(FILL_CLASSES);
+  for (let c = 0; c < FILL_CLASSES; c++) {
+    const im = new THREE.InstancedMesh(
+      whiteVertexColors(new THREE.PlaneGeometry(1, 1)),
+      surface('fxDecal', FILL_TINTS[c] ?? APAL.paper),
+      BAR_CAP,
+    );
+    im.frustumCulled = false;
+    im.renderOrder = 41;
+    im.count = 0;
+    im.visible = false;
+    applyShadowPolicy(im, null);
+    core.three.add(im);
+    barFills.push(im);
+  }
+
+  // camera-facing nudge so fills sit proud of backgrounds. The normal comes off
+  // the camera rig itself rather than being re-derived from the pitch.
+  const nY = cameraNormalY() * 0.03;
+  const nZ = cameraNormalZ() * 0.03;
+
+  // ---- team SHAPE markers ----------------------------------------------------
+  // Team reads by shape, not hue alone: azure = open upward chevron, ember =
+  // solid pennant triangle, neutral = a diamond in the venom ladder. Three
+  // InstancedMesh, one per identity, so a camp can never wear a team colour.
   const chevronGeo = ((): THREE.BufferGeometry => {
-    const arms: THREE.BufferGeometry[] = [];
-    part(arms, new THREE.BoxGeometry(0.2, 0.055, 0.05), APAL.paper, -0.085, 0, 0, { rz: 0.72 });
-    part(arms, new THREE.BoxGeometry(0.2, 0.055, 0.05), APAL.paper, 0.085, 0, 0, { rz: -0.72 });
-    const g = mergeParts(arms);
-    g.deleteAttribute('color'); // instanced material carries the colour
+    const left = new THREE.BoxGeometry(0.2, 0.055, 0.05).rotateZ(0.72).translate(-0.085, 0, 0);
+    const right = new THREE.BoxGeometry(0.2, 0.055, 0.05).rotateZ(-0.72).translate(0.085, 0, 0);
+    const g = mergeAll([left, right], 'chevron');
     g.rotateX(barTilt);
-    return g;
+    return whiteVertexColors(g);
   })();
-  // pennant: a solid right-pointing flag triangle — unmistakably NOT the open
-  // azure chevron (the shape split is the team read, hue is the backup).
   const pennantGeo = ((): THREE.BufferGeometry => {
     const s = new THREE.Shape();
     s.moveTo(-0.11, 0.11);
@@ -747,193 +887,201 @@ export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle {
     s.closePath();
     const g = new THREE.ShapeGeometry(s);
     g.rotateX(barTilt);
-    return g;
+    return whiteVertexColors(g);
   })();
-  const markerMatOf = (team: TeamId): THREE.MeshLambertMaterial =>
-    new THREE.MeshLambertMaterial({
-      color: APAL.inkDeep, // lit contribution ≈ black; emissive carries the read
-      emissive: TEAM_LIT[team] ?? APAL.azureLit,
-      side: THREE.DoubleSide,
-    });
-  const markChevron = new THREE.InstancedMesh(chevronGeo, markerMatOf(0), BAR_CAP);
-  const markPennant = new THREE.InstancedMesh(pennantGeo, markerMatOf(1), BAR_CAP);
-  markChevron.frustumCulled = false;
-  markPennant.frustumCulled = false;
-  markChevron.renderOrder = 42;
-  markPennant.renderOrder = 42;
-  core.three.add(markChevron);
-  core.three.add(markPennant);
-  let markCount0 = 0;
-  let markCount1 = 0;
+  const diamondGeo = ((): THREE.BufferGeometry => {
+    const s = new THREE.Shape();
+    s.moveTo(0, 0.13);
+    s.lineTo(0.11, 0);
+    s.lineTo(0, -0.13);
+    s.lineTo(-0.11, 0);
+    s.closePath();
+    const g = new THREE.ShapeGeometry(s);
+    g.rotateX(barTilt);
+    return whiteVertexColors(g);
+  })();
+  const markGeos: readonly THREE.BufferGeometry[] = [chevronGeo, pennantGeo, diamondGeo];
+  const markMeshes: THREE.InstancedMesh[] = [];
+  const markCounts = new Int32Array(MARK_CLASSES);
+  for (let c = 0; c < MARK_CLASSES; c++) {
+    const geo = markGeos[c];
+    if (geo === undefined) continue;
+    const im = new THREE.InstancedMesh(geo, surface('fxAdditive', MARK_TINTS[c] ?? APAL.paper), BAR_CAP);
+    im.frustumCulled = false;
+    im.renderOrder = 42;
+    im.count = 0;
+    im.visible = false;
+    applyShadowPolicy(im, null);
+    core.three.add(im);
+    markMeshes.push(im);
+  }
 
-  // bar scratch buffers (reused every sync — no per-frame allocation)
+  // ---- rings + order marker --------------------------------------------------
+  // All three are additive: they must burn through dusk lighting at gameplay
+  // zoom, and additive output can only brighten what is already in the frame, so
+  // none of them can occlude a unit standing on one. Under additive the vertex
+  // colour IS the intensity, which is where the old materials' `opacity` went —
+  // a cached material's opacity is not a call-site dial.
+  const selRing = new THREE.Mesh(
+    tintVertexColors(
+      whiteVertexColors(new THREE.RingGeometry(0.85, 1.05, 28).rotateX(-Math.PI / 2)),
+      0.9,
+    ),
+    surface('fxAdditive', APAL.gold),
+  );
+  selRing.visible = false;
+  selRing.renderOrder = 18;
+  applyShadowPolicy(selRing, null);
+  core.three.add(selRing);
+  let selectedId = -1;
+
+  const selfRing = new THREE.Mesh(
+    tintVertexColors(
+      whiteVertexColors(new THREE.RingGeometry(0.62, 0.78, 24).rotateX(-Math.PI / 2)),
+      0.55,
+    ),
+    surface('fxAdditive', APAL.heal),
+  );
+  selfRing.visible = false;
+  selfRing.renderOrder = 18;
+  applyShadowPolicy(selfRing, null);
+  core.three.add(selfRing);
+
+  // An unmistakable ping: a bright centre flash plus two staggered expanding
+  // rings. APAL gold = move, danger = attack — swapped by re-pointing the mesh
+  // at the OTHER cached material, never by mutating one.
+  const markerMoveMat = surface('fxAdditive', APAL.gold);
+  const markerAttackMat = surface('fxAdditive', APAL.danger);
+  const marker = new THREE.Group();
+  const markerRing = new THREE.Mesh(
+    whiteVertexColors(new THREE.RingGeometry(0.5, 0.64, 28).rotateX(-Math.PI / 2)),
+    markerMoveMat,
+  );
+  const markerRing2 = new THREE.Mesh(
+    whiteVertexColors(new THREE.RingGeometry(0.5, 0.58, 28).rotateX(-Math.PI / 2)),
+    markerMoveMat,
+  );
+  markerRing2.position.y = 0.004;
+  const markerDot = new THREE.Mesh(
+    whiteVertexColors(new THREE.CircleGeometry(0.2, 16).rotateX(-Math.PI / 2)),
+    markerMoveMat,
+  );
+  markerDot.position.y = 0.008;
+  marker.add(markerRing);
+  marker.add(markerRing2);
+  marker.add(markerDot);
+  marker.visible = false;
+  applyShadowPolicy(marker, null);
+  core.three.add(marker);
+  let markerAge = 1e9;
+  const MARKER_LIFE_S = 0.65;
+
+  // ---- scratch (allocated once; the pose pass never allocates) ---------------
+  const mScratch = new THREE.Matrix4();
+  const vPos = new THREE.Vector3();
+  const vScale = new THREE.Vector3();
+  const qScratch = new THREE.Quaternion();
+  const eScratch = new THREE.Euler();
+  const cScratch = new THREE.Color();
   const barXs = new Float32Array(BAR_CAP);
   const barYs = new Float32Array(BAR_CAP);
   const barZs = new Float32Array(BAR_CAP);
   const barWs = new Float32Array(BAR_CAP);
   const barFracs = new Float32Array(BAR_CAP);
-  const barTeams = new Int8Array(BAR_CAP); // 0 self, 1 ally, 2 enemy
-  const markTeams = new Int8Array(BAR_CAP); // absolute TeamId per bar slot
+  const barFillClass = new Int8Array(BAR_CAP);
+  const barMarkClass = new Int8Array(BAR_CAP);
   let barCount = 0;
 
-  // ---- ghosts ---------------------------------------------------------------------
-  const ghostPool: { mesh: THREE.Mesh; mat: THREE.MeshLambertMaterial; id: number }[] = [];
-  for (let i = 0; i < GHOST_CAP; i++) {
-    const mat = new THREE.MeshLambertMaterial({
-      vertexColors: true,
-      flatShading: true,
-      transparent: true,
-      opacity: 0,
-      depthWrite: false,
-    });
-    const mesh = new THREE.Mesh(variantOf('shade', undefined, 0).body, mat);
-    mesh.visible = false;
-    core.three.add(mesh);
-    ghostPool.push({ mesh, mat, id: -1 });
-  }
-
-  // ---- selection ring, self ring, order marker --------------------------------------
-  const selMat = new THREE.MeshLambertMaterial({ color: APAL.gold, transparent: true, opacity: 0.9 });
-  const selRing = new THREE.Mesh(
-    new THREE.RingGeometry(0.85, 1.05, 28).rotateX(-Math.PI / 2),
-    selMat,
-  );
-  selRing.position.y = 0.05;
-  selRing.visible = false;
-  core.three.add(selRing);
-  let selectedId = -1;
-
-  const selfRing = new THREE.Mesh(
-    new THREE.RingGeometry(0.62, 0.78, 24).rotateX(-Math.PI / 2),
-    new THREE.MeshLambertMaterial({ color: APAL.heal, transparent: true, opacity: 0.55 }),
-  );
-  selfRing.position.y = 0.045;
-  selfRing.visible = false;
-  core.three.add(selfRing);
-
-  // ---- order marker: an unmistakable ping ---------------------------------------
-  // Emissive-locked Lambert (the one legal unlit read) so the ping burns
-  // through dusk lighting at gameplay zoom: a bright centre flash + TWO
-  // staggered expanding rings. APAL gold = move, danger = attack.
-  const markerRingMat = new THREE.MeshLambertMaterial({
-    color: APAL.inkDeep, // lit contribution ≈ black; emissive carries the read
-    emissive: APAL.gold,
-    transparent: true,
-    opacity: 0,
-    depthWrite: false,
-  });
-  const markerRing2Mat = markerRingMat.clone();
-  const markerDotMat = markerRingMat.clone();
-  const marker = new THREE.Group();
-  const markerRing = new THREE.Mesh(
-    new THREE.RingGeometry(0.5, 0.64, 28).rotateX(-Math.PI / 2),
-    markerRingMat,
-  );
-  const markerRing2 = new THREE.Mesh(
-    new THREE.RingGeometry(0.5, 0.58, 28).rotateX(-Math.PI / 2),
-    markerRing2Mat,
-  );
-  markerRing2.position.y = 0.004;
-  const markerDot = new THREE.Mesh(new THREE.CircleGeometry(0.2, 16).rotateX(-Math.PI / 2), markerDotMat);
-  markerDot.position.y = 0.008;
-  marker.add(markerRing);
-  marker.add(markerRing2);
-  marker.add(markerDot);
-  marker.position.y = 0.06;
-  marker.visible = false;
-  core.three.add(marker);
-  let markerAge = 1e9;
-  const MARKER_LIFE_S = 0.65;
-
-  // ---- projectiles ------------------------------------------------------------------
-  const projGeos = new Map<string, THREE.BufferGeometry>();
-  const projActive = new Map<number, ProjSlot>();
-  const projFree = new Map<string, ProjSlot[]>();
-  let projCreated = 0;
-
-  function acquireProj(e: InterpEnt): ProjSlot | null {
-    const existing = projActive.get(e.id);
-    if (existing) return existing;
-    const school = projSchool(e.fx);
-    let slot: ProjSlot | undefined = projFree.get(school)?.pop();
-    if (!slot) {
-      if (projCreated >= PROJ_CAP) return null; // pool exhausted: skip silently
-      let geo = projGeos.get(school);
-      if (!geo) {
-        geo = projGeo(school);
-        projGeos.set(school, geo);
+  // ---- the frame hook -------------------------------------------------------
+  let hookFailWarned = false;
+  core.addFrameHook((dtMs: number) => {
+    // GUARD MY OWN ENTRY POINT (core.ts, AMENDMENT_3 §G.2). A throwing hook
+    // takes the whole frame down with it, and the pose pass touches pooled
+    // state fed by three different producers.
+    try {
+      step(dtMs);
+    } catch (err) {
+      if (!hookFailWarned) {
+        hookFailWarned = true;
+        console.error('rift units: frame hook failed — units will stop animating', err);
       }
-      slot = { mesh: new THREE.Mesh(geo, vertexMat), id: e.id, lastX: e.x, lastZ: e.z };
-      projCreated++;
-      core.three.add(slot.mesh);
     }
-    slot.id = e.id;
-    slot.lastX = e.x;
-    slot.lastZ = e.z;
-    slot.mesh.visible = true;
-    slot.mesh.userData['school'] = school;
-    projActive.set(e.id, slot);
-    return slot;
-  }
+  });
 
-  // ---- animation clock (advance()s off render dt, never Date.now) -------------------
-  let clock = 0;
-  core.addFrameHook((dtMs) => {
+  function step(dtMs: number): void {
     const dt = dtMs / 1000;
     clock += dt;
-    for (const slot of active.values()) {
-      const anim = slot.anim;
-      if (anim && anim.visible) {
-        const bx = slot.px;
-        const bz = slot.pz;
-        if (slot.variant.animKind === 'orbit') {
-          const a = clock * 0.7 + slot.phase;
-          anim.position.set(bx + Math.cos(a) * 0.55, slot.variant.animY, bz + Math.sin(a) * 0.55);
-          anim.rotation.y = a * 2;
-        } else if (slot.variant.animKind === 'bob') {
-          anim.position.set(bx, slot.variant.animY + Math.sin(clock * 1.1 + slot.phase) * 0.3, bz);
-          anim.rotation.y = clock * 0.5 + slot.phase;
-        } else {
-          const s = 1 + 0.22 * Math.sin(clock * 2.4 + slot.phase);
-          anim.scale.set(s, s, s);
-          anim.position.set(bx, slot.variant.animY, bz);
-        }
-      }
 
-      // ---- procedural whole-mesh pose (transforms only, zero allocation) --------
-      const structure = isStructureKind(slot.kind);
-      if (slot.destroyed) continue; // rubble stump stays collapsed (sync owns it)
-
-      // spawn pop: easeOutBack scale-up, 0.2s, then a hard 1
-      const spawnAge = clock - slot.spawnT;
-      let pop = 1;
-      if (spawnAge < SPAWN_POP_S) {
-        const u = spawnAge / SPAWN_POP_S - 1;
-        pop = 1 + 2.6 * u * u * u + 1.6 * u * u;
+    for (let i = 0; i < archList.length; i++) {
+      const a = archList[i];
+      if (a !== undefined) {
+        a.count = 0;
+        a.animCount = 0;
       }
-
-      // attack strike envelope: fast out-and-back (sin hump), shared by both
-      // the melee lunge and the ranged/tower recoil
-      const atkAge = clock - slot.atkT;
-      let env = 0;
-      if (slot.atkT >= 0 && atkAge < ATK_DUR_S) {
-        env = Math.sin((Math.PI * atkAge) / ATK_DUR_S);
+    }
+    for (let i = 0; i < activeList.length; i++) {
+      const slot = activeList[i];
+      if (slot !== undefined) pose(slot, dt);
+    }
+    for (let i = 0; i < archList.length; i++) {
+      const a = archList[i];
+      if (a === undefined) continue;
+      for (let b = 0; b < a.buckets.length; b++) {
+        const im = a.buckets[b];
+        if (im !== undefined) flushOne(im, a.count);
       }
+      if (a.anim !== null) flushOne(a.anim, a.animCount);
+    }
 
-      if (structure) {
-        // tower/guard recoil: a brief squash straight down the firing axis
-        // (the mesh never yaws, so the squash IS the readable kick)
-        const sy = 1 - env * 0.07;
-        const sxz = 1 + env * 0.05;
-        slot.mesh.scale.set(sxz, sy, sxz);
-        continue;
-      }
-      if (slot.kind === 'ward') {
-        // placard: spawn pop only — the pulsing eye carries its life
-        slot.mesh.scale.set(pop, pop, pop);
-        continue;
-      }
+    tickMarker(dt);
+    if (selRing.visible) {
+      const s = 1 + 0.05 * Math.sin(clock * 3);
+      selRing.scale.set(s, 1, s);
+    }
+  }
 
+  /** Pose one entity and write its instance matrices. */
+  function pose(slot: UnitSlot, dt: number): void {
+    const a = slot.arch;
+    const gy = core.heightAt(slot.px, slot.pz);
+
+    if (slot.kind === 'proj') {
+      // A projectile has no gait, no pop and no strike: it is a dart in flight
+      // at a fixed carry height over whatever ground it is crossing.
+      if (a.count < a.cap) {
+        eScratch.set(0, slot.yaw, 0, 'XYZ');
+        qScratch.setFromEuler(eScratch);
+        mScratch.compose(vPos.set(slot.px, gy + 1.1, slot.pz), qScratch, vScale.set(1, 1, 1));
+        writeInstance(a, mScratch);
+      }
+      return;
+    }
+
+    // spawn pop: easeOutBack scale-up, then a hard 1
+    const spawnAge = clock - slot.spawnT;
+    let pop = 1;
+    if (spawnAge < SPAWN_POP_S) {
+      const u = spawnAge / SPAWN_POP_S - 1;
+      pop = 1 + 2.6 * u * u * u + 1.6 * u * u;
+    }
+
+    // attack strike envelope: fast out-and-back (sin hump), shared by the melee
+    // lunge and the ranged recoil
+    const atkAge = clock - slot.atkT;
+    let env = 0;
+    if (slot.atkT >= 0 && atkAge < ATK_DUR_S) env = Math.sin((Math.PI * atkAge) / ATK_DUR_S);
+
+    let bodyY = gy;
+    let offX = 0;
+    let offZ = 0;
+    let pitch = 0;
+    let roll = 0;
+
+    if (slot.kind === 'ward') {
+      // A placard does not walk, breathe or strike — the spinning eye carries
+      // its whole life.
+      slot.speed = 0;
+    } else {
       // velocity probe: interp position delta since the last frame, smoothed
       // (teleports/reappears clamp out via the 12 m/s cap)
       const dx = slot.px - slot.hx;
@@ -945,24 +1093,20 @@ export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle {
         slot.speed += (inst - slot.speed) * Math.min(1, dt * 8);
       }
       const walkAmt = Math.min(1, slot.speed / WALK_REF_SPEED);
-
       const style = WALK_STYLE[slot.kind] ?? WALK_DEFAULT;
       slot.walkT += dt * slot.speed * style.stride;
-      // walk: bounce + forward lean + waddle roll, all speed-scaled
       const bounce = Math.abs(Math.sin(slot.walkT)) * style.bounce * walkAmt;
-      const lean = style.lean * walkAmt;
-      const roll = Math.sin(slot.walkT) * style.roll * walkAmt;
-      // idle: breathing bob + gentle sway, phase-offset per unit, fading out
-      // as the walk cycle takes over (never both at full strength)
+      pitch = style.lean * walkAmt;
+      roll = Math.sin(slot.walkT) * style.roll * walkAmt;
+      // idle: breathing bob + gentle sway, phase-offset per unit, fading out as
+      // the walk cycle takes over (never both at full strength)
       const idleAmt = 1 - walkAmt;
       const bob = Math.sin(clock * 1.7 + slot.phase) * 0.035 * idleAmt;
-      const sway = Math.sin(clock * 1.15 + slot.phase * 1.7) * 0.025 * idleAmt;
+      roll += Math.sin(clock * 1.15 + slot.phase * 1.7) * 0.025 * idleAmt;
+      bodyY = gy + bob + bounce;
 
       // attack: melee lunges toward the target and dips forward; ranged kicks
       // back away from it. Models face +z, so +rotation.x is a forward tilt.
-      let offX = 0;
-      let offZ = 0;
-      let pitch = lean;
       if (env > 0) {
         if (slot.melee) {
           offX = slot.atkDx * env * 0.34;
@@ -974,261 +1118,418 @@ export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle {
           pitch -= env * 0.14;
         }
       }
-
-      slot.mesh.position.set(slot.px + offX, bob + bounce, slot.pz + offZ);
-      slot.mesh.rotation.x = pitch;
-      slot.mesh.rotation.z = sway + roll;
-      slot.mesh.scale.set(pop, pop, pop);
     }
-    // order marker ping: bright centre flash + two staggered expanding rings
-    if (marker.visible) {
-      markerAge += dt;
-      const t = markerAge / MARKER_LIFE_S;
-      if (t >= 1) {
-        marker.visible = false;
+
+    if (a.count < a.cap) {
+      eScratch.set(pitch, slot.yaw, roll, 'XYZ');
+      qScratch.setFromEuler(eScratch);
+      mScratch.compose(
+        vPos.set(slot.px + offX, bodyY, slot.pz + offZ),
+        qScratch,
+        vScale.set(pop, pop, pop),
+      );
+      writeInstance(a, mScratch);
+    } else if (!a.overflowWarned) {
+      a.overflowWarned = true;
+      console.warn(`rift units: archetype '${a.key}' exceeded its ${a.cap} instance cap`);
+    }
+
+    // The animated carve-out. It rides the unit's ground position but never its
+    // yaw or its gait — an orbiting mote that leaned with the walk would read as
+    // bolted to a shoulder rather than floating free.
+    const animMesh = a.anim;
+    const animKind = a.build.animKind;
+    if (animMesh !== null && animKind !== null && a.animCount < a.cap) {
+      const baseY = gy + a.build.animY;
+      let s = 1;
+      let ax = slot.px;
+      let ay = baseY;
+      let az = slot.pz;
+      let spin: number;
+      if (animKind === 'orbit') {
+        const ang = clock * 0.7 + slot.phase;
+        ax = slot.px + Math.cos(ang) * ANIM_ORBIT_RADIUS_M;
+        az = slot.pz + Math.sin(ang) * ANIM_ORBIT_RADIUS_M;
+        spin = ang * 2;
+      } else if (animKind === 'bob') {
+        ay = baseY + Math.sin(clock * 1.1 + slot.phase) * ANIM_BOB_AMPLITUDE_M;
+        spin = clock * 0.5 + slot.phase;
       } else {
-        const fade = Math.pow(1 - t, 1.3);
-        const s1 = 0.4 + t * 3.2;
-        markerRing.scale.set(s1, 1, s1);
-        markerRingMat.opacity = 0.95 * fade;
-        // second ring chases the first, 40% delayed
-        const t2 = Math.max(0, (t - 0.18) / 0.82);
-        const s2 = 0.35 + t2 * 2.6;
-        markerRing2.scale.set(s2, 1, s2);
-        markerRing2Mat.opacity = 0.8 * Math.pow(1 - t2, 1.4);
-        // centre flash: pops bright, gone by a third of the life
-        const td = Math.min(1, markerAge / 0.22);
-        const sd = 1.6 - td * 0.8;
-        markerDot.scale.set(sd, 1, sd);
-        markerDotMat.opacity = 0.9 * (1 - td);
+        // 'spin' — the one kind that leaves the part at animY EXACTLY, which is
+        // what camps.ts's brute heart and creeps.ts's ward eye are measured
+        // against. It turns in place and breathes.
+        spin = clock * 1.6 + slot.phase;
+        s = 1 + ANIM_SPIN_PULSE * Math.sin(clock * 2.4 + slot.phase);
       }
+      eScratch.set(0, spin, 0, 'XYZ');
+      qScratch.setFromEuler(eScratch);
+      mScratch.compose(vPos.set(ax, ay, az), qScratch, vScale.set(s, s, s));
+      animMesh.setMatrixAt(a.animCount, mScratch);
+      a.animCount += 1;
     }
-    // selection ring pulse
-    if (selRing.visible) {
-      const s = 1 + 0.05 * Math.sin(clock * 3);
-      selRing.scale.set(s, 1, s);
-    }
-  });
 
-  // ---- sync ---------------------------------------------------------------------------
+    const pick = slot.pick;
+    if (pick !== null) {
+      pick.position.set(slot.px, gy, slot.pz);
+      pick.scale.set(slot.pickW, slot.pickH, slot.pickW);
+    }
+  }
+
+  function writeInstance(a: Archetype, m: THREE.Matrix4): void {
+    const i = a.count;
+    for (let b = 0; b < a.buckets.length; b++) {
+      const im = a.buckets[b];
+      if (im !== undefined) im.setMatrixAt(i, m);
+    }
+    a.count = i + 1;
+  }
+
+  /** Publish an instanced mesh's live instance count, and give it a bounding
+   *  sphere that matches the instances actually in it.
+   *
+   *  TWO draw-meter savings, and the second is why this function exists rather
+   *  than three lines at each call site.
+   *
+   *  1. A mesh with nothing to draw is HIDDEN, not left visible with
+   *     `count = 0`: three issues the instanced draw call for a zero-instance
+   *     visible mesh and the meter charges for it.
+   *
+   *  2. FRUSTUM CULLING, which three cannot do for an InstancedMesh on its own.
+   *     `Frustum.intersectsObject` uses `object.boundingSphere` and only calls
+   *     `computeBoundingSphere()` when that sphere is `null` — i.e. exactly
+   *     once, off whatever matrices happened to be written at the time — and
+   *     from then on it culls against a sphere that no longer describes where
+   *     the instances are. That is why every mount below is created with
+   *     `frustumCulled = false`: with a stale sphere, culling is not an
+   *     optimisation, it is units vanishing. Recomputing here — after the
+   *     matrices for this frame are written and `count` is set, and before the
+   *     frame pass draws — makes the sphere current, so the flag can be turned
+   *     on and an archetype the camera cannot see stops costing a draw call in
+   *     both the scene pass and the shadow pass.
+   *
+   *  `computeBoundingSphere()` honours `this.count` and every instance matrix,
+   *  and after the first call (which allocates the one `Sphere`) it works
+   *  entirely in three's module-scope scratch — so this is allocation-free in
+   *  the steady state and legal in a frame hook. Cost is O(count): one matrix
+   *  read and one sphere union per instance, against a pose loop that already
+   *  composes a matrix per instance. */
+  function flushOne(im: THREE.InstancedMesh, count: number): void {
+    if (count > 0) {
+      im.count = count;
+      im.visible = true;
+      im.instanceMatrix.needsUpdate = true;
+      im.computeBoundingSphere();
+      im.frustumCulled = true;
+    } else if (im.visible) {
+      im.count = 0;
+      im.visible = false;
+    }
+  }
+
+  function tickMarker(dt: number): void {
+    if (!marker.visible) return;
+    markerAge += dt;
+    const t = markerAge / MARKER_LIFE_S;
+    if (t >= 1) {
+      marker.visible = false;
+      return;
+    }
+    const fade = Math.pow(1 - t, 1.3);
+    const s1 = 0.4 + t * 3.2;
+    markerRing.scale.set(s1, 1, s1);
+    tintVertexColors(markerRing.geometry, 0.95 * fade);
+    // second ring chases the first, 18% delayed
+    const t2 = Math.max(0, (t - 0.18) / 0.82);
+    const s2 = 0.35 + t2 * 2.6;
+    markerRing2.scale.set(s2, 1, s2);
+    tintVertexColors(markerRing2.geometry, 0.8 * Math.pow(1 - t2, 1.4));
+    // centre flash: pops bright, gone by a third of the life
+    const td = Math.min(1, markerAge / 0.22);
+    const sd = 1.6 - td * 0.8;
+    markerDot.scale.set(sd, 1, sd);
+    tintVertexColors(markerDot.geometry, 0.9 * (1 - td));
+  }
+
+  // ---- sync ------------------------------------------------------------------
   function sync(ents: readonly InterpEnt[], ghosts: readonly GhostEnt[], selfId: number): void {
+    buildBudgetMs = ARCH_BUILD_BUDGET_MS;
     seen.clear();
-    let selfTeam: TeamId = 0;
-    for (const e of ents) {
-      if (e.id === selfId) {
+
+    let selfTeam: TeamId | null = null;
+    for (let i = 0; i < ents.length; i++) {
+      const e = ents[i];
+      if (e !== undefined && e.id === selfId && isPlayerTeam(e.team)) {
         selfTeam = e.team;
         break;
       }
     }
 
     barCount = 0;
-    markCount0 = 0;
-    markCount1 = 0;
-    for (const e of ents) {
+    for (let i = 0; i < ents.length; i++) {
+      const e = ents[i];
+      if (e === undefined) continue;
       seen.add(e.id);
-      if (e.k === 'proj') {
-        const ps = acquireProj(e);
-        if (ps) {
-          ps.mesh.position.set(e.x, 1.1, e.z);
-          let dx = 0;
-          let dz = 1;
-          if (e.tx !== undefined && e.tz !== undefined) {
-            dx = e.tx - e.x;
-            dz = e.tz - e.z;
-          } else {
-            dx = e.x - ps.lastX;
-            dz = e.z - ps.lastZ;
+
+      if (isStructureKind(e.k)) {
+        // R_MAPMESH draws the structure; this module contributes its HP bar and
+        // its pick proxy, and both need `barH`/`barW` off the same build.
+        const fit = structFitOf(e.k);
+        if (fit === null) continue; // not measured yet: retried next frame
+        if (e.hp > 0) {
+          if (e.hp < e.maxHp) {
+            pushBar(e, selfId, selfTeam, core.heightAt(e.x, e.z) + fit.barH, fit.barW);
           }
-          if (Math.hypot(dx, dz) > 1e-4) ps.mesh.rotation.y = Math.atan2(dx, dz);
-          ps.lastX = e.x;
-          ps.lastZ = e.z;
+          structPick(e, fit);
+        } else {
+          // A destroyed structure gets neither bar nor pick target. Dropping
+          // the pick is what stops a right-click on a dead tower from issuing
+          // an attack order at rubble.
+          dropStructPick(e.id);
         }
         continue;
       }
 
-      const slot = acquire(e);
+      // THE HOT PATH RUNS WITHOUT ALLOCATING. An entity that already has a slot
+      // reuses the archetype that slot was pooled from and never touches
+      // `archKey` or `projSchoolOf` — both of which mint a string (a template
+      // literal, and `toLowerCase()`), which over ~110 entities at 60 Hz is
+      // ~6600 strings a second in a function whose spec bans per-frame
+      // allocation outright. Only a genuinely NEW entity pays for a key, and
+      // spawns are rare and bursty rather than continuous.
+      const live = active.get(e.id);
+      let arch: Archetype | null;
+      if (live !== undefined) {
+        arch = live.arch;
+      } else {
+        arch = archetypeFor(e, e.k === 'proj' ? projSchoolOf(e.fx) : 'magic');
+        if (arch === null) continue; // budget spent this frame; drawn on the next
+      }
+
+      const slot = acquire(e, arch);
       slot.px = e.x;
       slot.pz = e.z;
-      slot.mesh.position.set(e.x, 0, e.z);
 
       // facing: snap yaw to motion direction (interp deltas are per-frame small)
-      if (e.k !== 'tower' && e.k !== 'guard' && e.k !== 'ancient' && e.k !== 'ward') {
+      if (e.k === 'proj') {
+        let dx: number;
+        let dz: number;
+        if (e.tx !== undefined && e.tz !== undefined) {
+          dx = e.tx - e.x;
+          dz = e.tz - e.z;
+        } else {
+          dx = e.x - slot.lastX;
+          dz = e.z - slot.lastZ;
+        }
+        if (dx * dx + dz * dz > 1e-8) slot.yaw = Math.atan2(dx, dz);
+      } else if (e.k !== 'ward') {
         const dx = e.x - slot.lastX;
         const dz = e.z - slot.lastZ;
-        if (dx * dx + dz * dz > 0.0004) {
-          slot.yaw = Math.atan2(dx, dz);
-          slot.mesh.rotation.y = slot.yaw;
-        }
+        if (dx * dx + dz * dz > 0.0004) slot.yaw = Math.atan2(dx, dz);
       }
       slot.lastX = e.x;
       slot.lastZ = e.z;
 
-      const isStructure = e.k === 'tower' || e.k === 'guard' || e.k === 'ancient';
-      const destroyed = isStructure && e.hp <= 0;
-      slot.destroyed = destroyed;
-      if (destroyed) {
-        // collapse to a rubble stump; the animated part winks out
-        slot.mesh.scale.y = 0.18;
-        if (slot.anim) slot.anim.visible = false;
-        slot.mesh.userData['entId'] = -1;
-      } else {
-        // attack strike trigger: atk is transient per snap (set only on the
-        // swing tick) — dedupe on the target id, re-armed when atk clears
-        if (e.atk !== undefined) {
-          if (slot.lastAtk !== e.atk) {
-            slot.lastAtk = e.atk;
-            slot.atkT = clock;
-            // strike direction toward the target (rare linear scan, no alloc)
-            let tx = e.x + Math.sin(slot.yaw);
-            let tz = e.z + Math.cos(slot.yaw);
-            for (const o of ents) {
-              if (o.id === e.atk) {
-                tx = o.x;
-                tz = o.z;
-                break;
-              }
-            }
-            let dx = tx - e.x;
-            let dz = tz - e.z;
-            const d = Math.hypot(dx, dz);
-            if (d > 1e-3) {
-              dx /= d;
-              dz /= d;
-            } else {
-              dx = Math.sin(slot.yaw);
-              dz = Math.cos(slot.yaw);
-            }
-            slot.atkDx = dx;
-            slot.atkDz = dz;
-            // melee turns to face its victim for the strike
-            if (!isStructure) {
-              slot.yaw = Math.atan2(dx, dz);
-              slot.mesh.rotation.y = slot.yaw;
+      // attack strike trigger: atk is transient per snap (set only on the swing
+      // tick) — dedupe on the target id, re-armed when atk clears
+      if (e.atk !== undefined) {
+        if (slot.lastAtk !== e.atk) {
+          slot.lastAtk = e.atk;
+          slot.atkT = clock;
+          // strike direction toward the target (rare linear scan, no alloc)
+          let tx = e.x + Math.sin(slot.yaw);
+          let tz = e.z + Math.cos(slot.yaw);
+          for (let j = 0; j < ents.length; j++) {
+            const o = ents[j];
+            if (o !== undefined && o.id === e.atk) {
+              tx = o.x;
+              tz = o.z;
+              break;
             }
           }
-        } else {
-          slot.lastAtk = -1;
+          let dx = tx - e.x;
+          let dz = tz - e.z;
+          const d = Math.hypot(dx, dz);
+          if (d > 1e-3) {
+            dx /= d;
+            dz /= d;
+          } else {
+            dx = Math.sin(slot.yaw);
+            dz = Math.cos(slot.yaw);
+          }
+          slot.atkDx = dx;
+          slot.atkDz = dz;
+          // the attacker turns to face its victim for the strike
+          slot.yaw = Math.atan2(dx, dz);
         }
+      } else {
+        slot.lastAtk = -1;
       }
 
-      // hp bars: heroes/creeps always; structures only when damaged; wards never
-      const showBar =
-        !destroyed &&
-        e.k !== 'ward' &&
-        (!isStructure || e.hp < e.maxHp) &&
-        barCount < BAR_CAP;
-      if (showBar) {
-        const i = barCount++;
-        barXs[i] = e.x;
-        barYs[i] = slot.variant.barH;
-        barZs[i] = e.z;
-        barWs[i] = slot.variant.barW;
-        barFracs[i] = e.maxHp > 0 ? Math.max(0, Math.min(1, e.hp / e.maxHp)) : 0;
-        barTeams[i] = e.id === selfId ? 0 : e.team === selfTeam ? 1 : 2;
-        markTeams[i] = e.team;
+      // hp bars: everything the builder gave a bar. Wards and projectiles carry
+      // barH/barW 0, which is the builders' signal for "no bar".
+      if (arch.build.barH > 0 && arch.build.barW > 0) {
+        pushBar(e, selfId, selfTeam, core.heightAt(e.x, e.z) + arch.build.barH, arch.build.barW);
       }
     }
 
     // release vanished units (ghosts cover the visual fade)
-    for (const [id, slot] of active) {
-      if (!seen.has(id)) release(id, slot);
-    }
-    for (const [id, ps] of projActive) {
-      if (!seen.has(id)) {
-        ps.mesh.visible = false;
-        projActive.delete(id);
-        const school = (ps.mesh.userData['school'] as string | undefined) ?? 'magic';
-        let list = projFree.get(school);
-        if (!list) {
-          list = [];
-          projFree.set(school, list);
-        }
-        list.push(ps);
-      }
+    for (let i = activeList.length - 1; i >= 0; i--) {
+      const slot = activeList[i];
+      if (slot !== undefined && !seen.has(slot.id)) release(slot);
     }
 
-    // ---- ghosts ----------------------------------------------------------------------
-    const ghostSeen = new Set<number>();
-    for (const g of ghosts) {
-      ghostSeen.add(g.id);
-      let slot = ghostPool.find((s) => s.id === g.id);
-      if (!slot) {
-        slot = ghostPool.find((s) => s.id === -1);
-        if (!slot) continue; // pool exhausted: skip the fade, never throw
-        slot.id = g.id;
-        const v = variantOf(g.k === 'proj' ? 'shade' : g.k, undefined, g.team);
-        slot.mesh.geometry = v.body;
-      }
-      slot.mesh.visible = true;
-      // death collapse: squash+splat toward the ground with a slight topple
-      // (keel direction seeded by id — deterministic, no rng), running the
-      // full 0.5s ghost fade so a death reads as a fall, not a vanish
-      const p = Math.min(1, (1 - Math.max(0, Math.min(1, g.fade))) * 1.3);
-      slot.mesh.scale.set(1 + 0.3 * p, Math.max(0.08, 1 - 0.92 * p), 1 + 0.3 * p);
-      slot.mesh.rotation.z = (g.id % 2 === 0 ? 1 : -1) * 0.5 * p;
-      slot.mesh.position.set(g.x, 0, g.z);
-      slot.mat.opacity = 0.55 * Math.max(0, Math.min(1, g.fade));
-    }
-    for (const s of ghostPool) {
-      if (s.id !== -1 && !ghostSeen.has(s.id)) {
-        s.id = -1;
-        s.mesh.visible = false;
-      }
-    }
+    syncGhosts(ghosts);
+    flushBars();
+    flushRings(selfId);
+  }
 
-    // ---- hp bar instances --------------------------------------------------------------
+  function pushBar(
+    e: InterpEnt,
+    selfId: number,
+    selfTeam: TeamId | null,
+    y: number,
+    w: number,
+  ): void {
+    if (barCount >= BAR_CAP) return;
+    const i = barCount++;
+    barXs[i] = e.x;
+    barYs[i] = y;
+    barZs[i] = e.z;
+    barWs[i] = w;
+    barFracs[i] = e.maxHp > 0 ? Math.max(0, Math.min(1, e.hp / e.maxHp)) : 0;
+
+    // Every branch narrows before it colours: a neutral camp gets the venom
+    // ladder and can never be handed a team hex.
+    let fill: number;
+    let mark: number;
+    if (!isPlayerTeam(e.team)) {
+      fill = FILL_NEUTRAL;
+      mark = MARK_NEUTRAL;
+    } else {
+      mark = e.team === 0 ? MARK_AZURE : MARK_EMBER;
+      if (e.id === selfId) fill = FILL_SELF;
+      else if (selfTeam !== null && e.team !== selfTeam) fill = FILL_ENEMY;
+      else fill = e.team === 0 ? FILL_AZURE : FILL_EMBER;
+    }
+    barFillClass[i] = fill;
+    barMarkClass[i] = mark;
+  }
+
+  function flushBars(): void {
+    barFillCounts.fill(0);
+    markCounts.fill(0);
     for (let i = 0; i < barCount; i++) {
       const x = barXs[i] ?? 0;
       const y = barYs[i] ?? 0;
       const z = barZs[i] ?? 0;
       const w = barWs[i] ?? 1;
       const frac = barFracs[i] ?? 0;
-      barM.compose(barP.set(x, y, z), barQuat, barS.set(w, BAR_BG_H, 1));
-      barBg.setMatrixAt(i, barM);
+      mScratch.compose(vPos.set(x, y, z), barQuat, vScale.set(w, BAR_BG_H, 1));
+      barBg.setMatrixAt(i, mScratch);
+
       const fw = Math.max(0.001, (w - BAR_FILL_INSET) * frac);
       const xoff = -(w - BAR_FILL_INSET) / 2 + fw / 2;
-      barM.compose(barP.set(x + xoff, y + nY, z + nZ), barQuat, barS.set(fw, BAR_FILL_H, 1));
-      barFill.setMatrixAt(i, barM);
-      const kind = barTeams[i];
-      barC.set(
-        kind === 0
-          ? APAL.heal
-          : kind === 1
-            ? (TEAM_COLORS[selfTeam] ?? APAL.azure)
-            : APAL.danger,
-      );
-      barFill.setColorAt(i, barC);
-      // team shape marker floats just above the bar
-      barM.makeScale(1, 1, 1);
-      barM.setPosition(x, y + 0.22, z);
-      if (markTeams[i] === 0) {
-        markChevron.setMatrixAt(markCount0++, barM);
-      } else {
-        markPennant.setMatrixAt(markCount1++, barM);
+      mScratch.compose(vPos.set(x + xoff, y + nY, z + nZ), barQuat, vScale.set(fw, BAR_FILL_H, 1));
+      const fc = barFillClass[i] ?? FILL_ENEMY;
+      const fill = barFills[fc];
+      const fillN = barFillCounts[fc] ?? 0;
+      if (fill !== undefined) {
+        fill.setMatrixAt(fillN, mScratch);
+        barFillCounts[fc] = fillN + 1;
+      }
+
+      const mc = barMarkClass[i] ?? MARK_NEUTRAL;
+      const markMesh = markMeshes[mc];
+      const markN = markCounts[mc] ?? 0;
+      if (markMesh !== undefined) {
+        mScratch.compose(vPos.set(x, y + MARKER_LIFT, z), barQuat, vScale.set(1, 1, 1));
+        markMesh.setMatrixAt(markN, mScratch);
+        markCounts[mc] = markN + 1;
       }
     }
-    barBg.count = barCount;
-    barFill.count = barCount;
-    barBg.instanceMatrix.needsUpdate = true;
-    barFill.instanceMatrix.needsUpdate = true;
-    if (barFill.instanceColor) barFill.instanceColor.needsUpdate = true;
-    markChevron.count = markCount0;
-    markPennant.count = markCount1;
-    markChevron.instanceMatrix.needsUpdate = true;
-    markPennant.instanceMatrix.needsUpdate = true;
+    flushOne(barBg, barCount);
+    for (let c = 0; c < barFills.length; c++) {
+      const im = barFills[c];
+      if (im !== undefined) flushOne(im, barFillCounts[c] ?? 0);
+    }
+    for (let c = 0; c < markMeshes.length; c++) {
+      const im = markMeshes[c];
+      if (im !== undefined) flushOne(im, markCounts[c] ?? 0);
+    }
+  }
 
-    // ---- rings --------------------------------------------------------------------------
+  function syncGhosts(ghosts: readonly GhostEnt[]): void {
+    ghostSeen.clear();
+    for (let i = 0; i < archList.length; i++) {
+      const a = archList[i];
+      if (a !== undefined) a.ghostCount = 0;
+    }
+    for (let i = 0; i < ghosts.length; i++) {
+      const g = ghosts[i];
+      if (g === undefined) continue;
+      ghostSeen.add(g.id);
+      // A projectile leaves no memory marker: an arrow that reached its target
+      // has not "walked out of vision", and the old code substituted a wraith
+      // silhouette for it, which read as a summon dying where an arrow landed.
+      if (g.k === 'proj') continue;
+      const arch = ghostArchById.get(g.id);
+      if (arch === undefined) continue; // never seen alive: nothing to fade
+      const im = ghostMeshOf(arch);
+      if (im === null || arch.ghostCount >= GHOST_CAP) continue;
+
+      // death collapse: squash+splat toward the ground with a slight topple
+      // (keel direction seeded by id — deterministic, no rng), running the full
+      // 0.5 s fade so a death reads as a fall rather than a vanish.
+      const fade = Math.max(0, Math.min(1, g.fade));
+      const p = Math.min(1, (1 - fade) * 1.3);
+      eScratch.set(0, 0, (g.id % 2 === 0 ? 1 : -1) * 0.5 * p, 'XYZ');
+      qScratch.setFromEuler(eScratch);
+      mScratch.compose(
+        vPos.set(g.x, core.heightAt(g.x, g.z), g.z),
+        qScratch,
+        vScale.set(1 + 0.3 * p, Math.max(0.08, 1 - 0.92 * p), 1 + 0.3 * p),
+      );
+      const n = arch.ghostCount;
+      im.setMatrixAt(n, mScratch);
+      const v = GHOST_PEAK * fade;
+      cScratch.setRGB(v, v, v);
+      im.setColorAt(n, cScratch);
+      arch.ghostCount = n + 1;
+    }
+    for (let i = 0; i < archList.length; i++) {
+      const a = archList[i];
+      if (a === undefined || a.ghost === null) continue;
+      flushOne(a.ghost, a.ghostCount);
+      if (a.ghostCount > 0 && a.ghost.instanceColor !== null) {
+        a.ghost.instanceColor.needsUpdate = true;
+      }
+    }
+    // Forget silhouette memories no live entity and no ghost still needs.
+    // Reverse index loop + swap-remove: allocation-free, and safe to delete
+    // from while walking because everything above `i` has already been checked.
+    for (let i = ghostMemN - 1; i >= 0; i--) {
+      const id = ghostMemIds[i] ?? -1;
+      if (clock - (ghostMemAt[i] ?? 0) <= GHOST_MEMORY_S) continue;
+      if (active.has(id) || ghostSeen.has(id)) continue;
+      ghostArchById.delete(id);
+      ghostMemN -= 1;
+      ghostMemIds[i] = ghostMemIds[ghostMemN] ?? -1;
+      ghostMemAt[i] = ghostMemAt[ghostMemN] ?? 0;
+    }
+  }
+
+  function flushRings(selfId: number): void {
     const sel = selectedId >= 0 ? active.get(selectedId) : undefined;
-    if (sel && sel.mesh.visible) {
+    if (sel !== undefined) {
       selRing.visible = true;
-      selRing.position.set(sel.mesh.position.x, 0.05, sel.mesh.position.z);
+      selRing.position.set(sel.px, core.heightAt(sel.px, sel.pz) + 0.05, sel.pz);
     } else {
       selRing.visible = false;
     }
     const self = selfId >= 0 ? active.get(selfId) : undefined;
-    if (self && self.mesh.visible) {
+    if (self !== undefined) {
       selfRing.visible = true;
-      selfRing.position.set(self.mesh.position.x, 0.045, self.mesh.position.z);
+      selfRing.position.set(self.px, core.heightAt(self.px, self.pz) + 0.045, self.pz);
     } else {
       selfRing.visible = false;
     }
@@ -1241,11 +1542,11 @@ export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle {
       if (id < 0) selRing.visible = false;
     },
     orderMarker(x, z, attack) {
-      const hex = attack ? APAL.danger : APAL.gold;
-      markerRingMat.emissive.set(hex);
-      markerRing2Mat.emissive.set(hex);
-      markerDotMat.emissive.set(hex);
-      marker.position.set(x, 0.06, z);
+      const mat = attack ? markerAttackMat : markerMoveMat;
+      markerRing.material = mat;
+      markerRing2.material = mat;
+      markerDot.material = mat;
+      marker.position.set(x, core.heightAt(x, z) + 0.06, z);
       marker.visible = true;
       markerAge = 0;
     },

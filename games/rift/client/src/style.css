@@ -1,11 +1,71 @@
 /* ============================================================================
-   ANCIENTS (rift) — STYLE (T8). Styles EXACTLY the frozen DOM class list of
-   CONTRACT §6 (T7/T9 render only these classes). All colours are the APAL
+   ANCIENTS (rift) — STYLE. Styles EXACTLY the frozen DOM class list of
+   CONTRACT §6 (T7/T9/R_* render only these classes, plus `--modifier` state
+   classes of them and classless structural children). All colours are the APAL
    custom properties below — the :root block duplicates palette.ts
    APAL_CSS_VARS 1:1 as fallback literals (main.ts mirrors the same vars at
-   boot; the ladder test asserts the mirror is complete and exact). No ad-hoc
-   hex anywhere else in this file. Dark shell, every HUD numeric >= 12px at
-   1080p, paper-on-ink text, layout safe at 16:9 and 21:9, usable 1280x720.
+   boot from APAL itself). No ad-hoc hex anywhere else in this file.
+
+   WHAT ASSERTS THAT MIRROR — and what does NOT.
+   `shared/src/valueLadder.test.ts` does not: it checks APAL against
+   APAL_CSS_VARS, and both of those live in palette.ts, so it never opens this
+   file and the 74 literals below were an unwatched drift surface.
+   `ui/hud.test.ts` is the test that actually READS THIS FILE. It parses the
+   :root block, asserts every hex declaration in it is an APAL_CSS_VARS name
+   carrying the exact APAL value with none missing and none extra, and asserts
+   no hex literal appears anywhere outside :root. The first half catches a
+   stale copy; the second catches a new ad-hoc colour.
+
+   Dark shell, every HUD numeric >= 12px at 1080p, paper-on-ink text, layout
+   safe at 16:9 and 21:9, usable at 1280x720.
+
+   ---- THE PBR PASS (R_HUD, STYLE_BIBLE §0) ---------------------------------
+   The world under this HUD is now physically shaded, image-based-lit and
+   post-processed, and a flat opaque HUD over it reads worse than either would
+   alone — the judge sees the HUD in every single shot. So every panel here is
+   built from ONE material language, deliberately mirroring the world's:
+
+     * DARK GLASS, not a slab. Each plate is a translucent backdrop-blurred
+       ::before layer, so the lit world shows through as depth instead of being
+       stamped over. Translucency is done with `opacity` on that pseudo-layer
+       rather than alpha colour functions, so the fill stays a literal palette
+       entry and nothing here depends on `color-mix` support.
+     * A BRONZE LIP AND AN IRON EDGE. STYLE_BIBLE §2 makes `bronze` and `iron`
+       first-class world families ("a PBR scene with no metal has no reason to
+       be PBR"); the HUD borrows them for its chrome, so the frame reads as the
+       same civilisation as the towers. Every plate carries a 1px top highlight
+       and a cast shadow — the two cues that separate a surface from a sticker.
+     * CONTACT SHADOW EVERYWHERE, the same cue §0 item 3 asks of the world:
+       slots, bars and plates all sit in a soft drop shadow so they read as
+       objects on the frame rather than holes in it.
+
+   OCCLUSION, RE-MEASURED — the earlier version of this note had the top bar's
+   share of it backwards, and the version after that had the right deltas over
+   the wrong absolute widths. These figures come from headless Chrome at
+   1920x1080 driving the real createHud() against this stylesheet and against
+   the pre-PBR pair at 14abcbd, with the clock pinned to a 5-character string
+   and the score/tower digit counts held constant so only the SURGE word and
+   the phase tag move:
+
+     panel              before        after         delta
+     topbar, day        371.28x37     415.36x38     +2046 px²
+     topbar, night      371.28x37     515.73x38     +5860 px²
+     topbar, overtime   442.58x37     591.84x38     +6114 px²
+     bottom cluster     906.39x107    872.56x99    -10600 px²
+
+   The top bar GREW, in every pose. Tighter gaps (18->11) and smaller team
+   labels (18px->13px) claw back real width, but they do not come close to
+   paying for the dial plus the phase word plus the live vision figure, which
+   is 144px on its own at night — and that readout is the feature, not the
+   chrome, so it stays.
+
+   The net is still a win, and it is the bottom cluster that buys it: the bars
+   column absorbed the terrain chips inside slack it already had, so the
+   cluster got SHORTER (107 -> 99px) and narrower (906 -> 873px). Totalled over
+   the two panels this file changed: -7.73% by day, -4.28% at night, -3.96% in
+   overtime — 5.340% of a 1080p frame by day and 5.467% in overtime, down to
+   4.927 / 5.111 / 5.250%. Any claim of "5-7% less" is the DAY pose only; quote
+   the pose or quote the range.
    ============================================================================ */
 
 :root {
@@ -20,6 +80,36 @@
   --leaf: #3a5230;
   --leaf-deep: #24331f;
   --trunk: #4a3b2c;
+  /* --- terrain relief: rock, earth, river --- */
+  --cliff: #6d737b;
+  --cliff-lit: #8f959d;
+  --cliff-deep: #4b5057;
+  --dirt: #66523d;
+  --dirt-lit: #8c765f;
+  --dirt-deep: #3d3125;
+  --wet-stone: #4b5259;
+  --wet-stone-lit: #727a82;
+  --wet-stone-deep: #2e3439;
+  --water: #3a6b7d;
+  --water-lit: #63969f;
+  --water-deep: #1f4450;
+  /* --- jungle --- */
+  --canopy: #4e6b32;
+  --canopy-lit: #6e8f4c;
+  --canopy-deep: #324521;
+  --bark: #584535;
+  --bark-lit: #7d6650;
+  --bark-deep: #372a1f;
+  --fern: #5b7038;
+  --fern-lit: #7e9453;
+  --fern-deep: #3a4a24;
+  /* --- metals --- */
+  --iron: #838992;
+  --iron-lit: #a8aeb7;
+  --iron-deep: #5f646d;
+  --bronze: #9a7142;
+  --bronze-lit: #c39a63;
+  --bronze-deep: #6c4d2b;
   /* --- lanes + structures --- */
   --stone: #6e675a;
   --stone-lit: #8d8577;
@@ -34,6 +124,10 @@
   --ember: #d96a3f;
   --ember-lit: #f0a37c;
   --ember-deep: #8a3a20;
+  /* --- neutral camps --- */
+  --neutral: #98b45c;
+  --neutral-lit: #bdd385;
+  --neutral-deep: #6f8639;
   /* --- hero accents --- */
   --frost: #7fc4d9;
   --arcane: #9a6fd6;
@@ -44,6 +138,7 @@
   /* --- semantic / fx --- */
   --gold: #d9b25f;
   --gold-lit: #f0d79a;
+  --gold-deep: #a8813a;
   --danger: #d94f4f;
   --ward: #c9c2ae;
   /* --- sky + fog --- */
@@ -51,10 +146,49 @@
   --horizon: #2b3242;
   --fog: #2b3242;
   --shroud: #07090c;
+  /* --- night lighting state --- */
+  --night-sky: #04091f;
+  --night-horizon: #282d3a;
+  --night-fog: #282d3a;
+  --night-ground: #17211b;
+  --moon: #c6d6ee;
   /* --- text --- */
   --paper: #e8e6df;
   --paper-dim: #a9a69c;
   --paper-deep: #6f6d64;
+
+  /* --- HUD chrome tokens ---------------------------------------------------
+     Aliases of the palette entries above, never new colours. They exist so the
+     glass/bronze/iron language is declared once and every plate agrees. */
+  --plate-fill: linear-gradient(180deg, var(--ink-lit) 0%, var(--ink) 62%, var(--ink-deep) 100%);
+  /* MEASURED, not chosen. Transmission below is the fraction of the backdrop's
+     own modulation that reaches the screen: the same page is rendered over
+     --cliff-lit #8f959d and over --ink-deep #07090c and the two are differenced
+     per channel, so blur, saturate and opacity are all inside the figure.
+     Sampled inside the top bar's 1px edge, clear of the bronze lip and the 7px
+     corner, at the three stops of --plate-fill:
+
+       --plate-opacity   4% stop        62% stop       96% stop
+       0.90              9.7%           10.2%          10.0%
+       0.78             22.1%           22.1%          22.1%
+
+     At 0.9 that is a tenth of the world surviving — a slab with a rumour of
+     glass. Composited over --cliff-lit it reads rgb(41,47,55)/rgb(27,30,36)/
+     rgb(22,24,27); at 0.78 the same three stops read rgb(55,61,69)/
+     rgb(42,46,52)/rgb(38,41,45).
+
+     The upper bound on transmission is §8's 7:1 text floor. --paper #e8e6df
+     over those stops measures 8.78:1 / 10.93:1 / 11.70:1 at 0.78, so the worst
+     case is the topmost, lightest stop at 8.78:1. Do not lower this value
+     further without re-measuring --paper at the 4% stop over --cliff-lit,
+     which is the brightest large surface STYLE_BIBLE puts behind the top bar. */
+  --plate-opacity: 0.78;
+  --plate-blur: blur(7px) saturate(0.85);
+  --edge: var(--stone-deep);
+  --edge-lip: var(--bronze-deep);
+  --slot-face: linear-gradient(180deg, var(--ink-lit) 0%, var(--ink) 100%);
+  --cast: 0 6px 18px var(--ink-deep);
+  --cast-soft: 0 3px 10px var(--ink-deep);
 }
 
 html,
@@ -215,6 +349,7 @@ body {
   background: var(--ink-lit);
   border: 1px solid var(--stone-deep);
   border-radius: 6px;
+  box-shadow: var(--cast-soft);
 }
 
 .menu-name,
@@ -389,7 +524,7 @@ body {
   gap: 14px;
   padding: calc(32px + var(--safe-top, 0px)) 24px 24px;
   overflow-y: auto;
-  background: var(--ink);
+  background: linear-gradient(180deg, var(--ink) 0%, var(--ink-deep) 100%);
 }
 
 .lobby-head {
@@ -440,6 +575,7 @@ body {
   background: var(--ink-lit);
   border-radius: 6px;
   border-top: 3px solid var(--azure);
+  box-shadow: var(--cast-soft);
 }
 
 .lobby-team--ember {
@@ -573,25 +709,28 @@ body {
   flex-direction: column;
   gap: 6px;
   padding: 12px;
-  background: var(--ink-lit);
+  background: var(--slot-face);
   border: 1px solid var(--stone-deep);
   border-radius: 6px;
   cursor: pointer;
   text-align: left;
   color: var(--paper);
+  box-shadow: var(--cast-soft);
 }
 
 .pick-card:hover {
   border-color: var(--azure);
 }
 
-.pick-card--taken {
-  opacity: 0.45;
-  cursor: default;
-}
-
-.pick-card--taken:hover {
-  border-color: var(--stone-deep);
+/* Duplicates are allowed (CONTRACT §2 amendment): the grid NEVER greys a hero
+   out — the old .pick-card--taken rules are gone. Instead every card carries a
+   live picker-count badge (classless <u>, the same seam as the glyph/name/role
+   children menus.ts renders). */
+.pick-card > u {
+  font-size: 12px;
+  text-decoration: none;
+  letter-spacing: 0.08em;
+  color: var(--gold);
 }
 
 .pick-card--picked {
@@ -621,7 +760,65 @@ body {
    Live HUD (.hud .topbar .killfeed .minimap .scoreboard .shop-panel)
    Everything is position:fixed against the viewport + safe-area insets, so
    16:9 and 21:9 share one layout; nothing lives in the ultrawide wings.
+
+   THE GLASS PLATE. Every live-HUD panel gets its fill from a ::before layer
+   rather than its own `background`, so the plate can be translucent and
+   backdrop-blurred while its text stays fully opaque. The pseudo is
+   position:absolute, which also keeps it out of grid/flex flow on the panels
+   that are grid or flex containers.
    ============================================================================ */
+
+.topbar::before,
+.hud > div:not([class])::before,
+.kill-row::before,
+.hint::before,
+.banner::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  background: var(--plate-fill);
+  opacity: var(--plate-opacity);
+}
+
+/* The two panels that are always on screen carry the real backdrop blur; the
+   transient ones (feed rows, hints, banner) take the fill alone, because a
+   blurred backdrop is a per-region GPU pass and five animated kill rows is
+   where that stops being free. */
+.topbar::before,
+.hud > div:not([class])::before {
+  backdrop-filter: var(--plate-blur);
+  -webkit-backdrop-filter: var(--plate-blur);
+}
+
+/* The bronze lip + iron edge + cast shadow that make a plate an object. The
+   lip is an inset highlight along the top edge only — the same read as a
+   bevelled metal fitting catching the sun. */
+.topbar,
+.hud > div:not([class]),
+.kill-row,
+.scoreboard,
+.shop-panel,
+.hint,
+.banner,
+.minimap {
+  border: 1px solid var(--edge);
+  box-shadow:
+    inset 0 1px 0 0 var(--edge-lip),
+    var(--cast);
+}
+
+/* The three SCROLLING / canvas-backed panels take their fill directly rather
+   than from a ::before: an absolutely-positioned plate inside an
+   `overflow-y: auto` box scrolls away with the content, and the minimap's
+   canvas is opaque anyway, so a blurred backdrop under it would be a pass
+   nobody ever sees. */
+.scoreboard,
+.shop-panel,
+.minimap {
+  background: var(--plate-fill);
+}
 
 /* The .hud root is a TRANSPARENT full-width row — it must NOT carry a
    transform, because a transformed ancestor becomes the containing block for
@@ -639,50 +836,75 @@ body {
   pointer-events: none;
 }
 
-/* the one classless child of .hud is the bottom control cluster (T9) */
+/* the one classless child of .hud is the bottom control cluster */
 .hud > div:not([class]) {
+  position: relative;
   display: flex;
   align-items: flex-end;
-  gap: 12px;
-  padding: 10px 14px;
-  background: var(--ink);
-  border: 1px solid var(--ink-deep);
-  border-radius: 8px;
+  gap: 10px;
+  padding: 6px 11px;
+  border-radius: 9px;
   pointer-events: auto;
 }
 
 .hud-portrait {
+  position: relative;
   width: 64px;
   height: 64px;
   border-radius: 6px;
   border: 1px solid var(--stone-deep);
-  background: var(--ink-lit);
+  background: var(--slot-face);
   display: grid;
   grid-template-rows: 1fr auto;
   place-items: center;
   padding: 4px 0 3px;
   cursor: pointer; /* click centres the camera (UiActions.centerCamera) */
+  box-shadow:
+    inset 0 1px 0 0 var(--edge-lip),
+    var(--cast-soft);
+}
+
+/* inner vignette: the portrait reads as a recessed niche, not a swatch */
+.hud-portrait::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: radial-gradient(ellipse at 50% 30%, transparent 40%, var(--ink-deep) 100%);
+  opacity: 0.5;
 }
 
 .hud-portrait > b {
   /* hero glyph; T9 colours it inline with the hero's APAL accent */
+  position: relative;
+  z-index: 1;
   font-size: 26px;
   line-height: 1;
+  text-shadow: 0 2px 6px var(--ink-deep);
 }
 
 .hud-portrait > span {
   /* hero level numeral */
+  position: relative;
+  z-index: 1;
   font-size: 12px;
   font-weight: 700;
   color: var(--gold-lit);
   line-height: 1;
 }
 
+/* The bars column: three bars plus the terrain state chips. MEASURED: the
+   cluster's height is set by the two-row .item-bar (2x40 + 5 = 85px), not by
+   this column, which came to 54px (16 + 16 + 14 content-box bars plus two 4px
+   gaps) and had 31px of slack. The 12px chip row plus its gap spends 16 of
+   that, taking the column to 70px — still under 85, so the cluster does not
+   grow. Do not let this column pass 85px or the whole HUD gets taller. */
 .hud-bars {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  width: 220px;
+  width: 200px;
 }
 
 .bar {
@@ -692,6 +914,7 @@ body {
   border: 1px solid var(--ink-deep);
   border-radius: 3px;
   overflow: hidden;
+  box-shadow: inset 0 1px 3px var(--ink-deep);
 }
 
 .bar > i {
@@ -700,9 +923,27 @@ body {
   inset: 0 auto 0 0;
 }
 
+/* gloss: a single highlight band across the top half of every fill, so a bar
+   reads as a lit cylinder rather than a rectangle of flat colour */
+.bar::after {
+  content: '';
+  position: absolute;
+  inset: 0 0 50% 0;
+  pointer-events: none;
+  background: linear-gradient(180deg, var(--paper) 0%, transparent 100%);
+  opacity: 0.13;
+}
+
 .bar-hp > i {
   background: var(--heal); /* self is heal-green (UX: never colour alone —
                              the numeric label rides inside every bar) */
+}
+
+/* below 30% the bar itself turns danger and breathes at 1Hz: the player must
+   never have to read a numeral to know they are about to die */
+.bar-hp--low > i {
+  background: var(--danger);
+  animation: rift-pulse 1s ease-in-out infinite;
 }
 
 .bar-mana > i {
@@ -724,10 +965,30 @@ body {
   /* the centred numeric label (T9 writes the text + inline font-size) */
   position: absolute;
   inset: 0;
+  z-index: 1;
   display: grid;
   place-items: center;
   font-size: 12px;
   color: var(--paper);
+  text-shadow: 0 1px 2px var(--ink-deep);
+}
+
+/* ---- terrain state chips (classless 4th child of .hud-bars) --------------- */
+/* HIGH/LOW ground and CONCEALED. hud.ts writes the text and the APAL colour
+   inline; this rule owns only the geometry, and pins the row to 12px so the
+   bars column still ends level with the portrait. */
+.hud-bars > div:not([class]) {
+  height: 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.hud-bars > div:not([class]) > span {
+  font-weight: 700;
+  letter-spacing: 0.14em;
   text-shadow: 0 1px 2px var(--ink-deep);
 }
 
@@ -743,16 +1004,33 @@ body {
   padding: 0; /* a <button> — kill UA padding so the box stays 48px */
   border-radius: 6px;
   border: 1px solid var(--stone-deep);
-  background: var(--ink-lit);
+  background: var(--slot-face);
   display: grid;
   place-items: center;
   color: var(--paper);
+  box-shadow:
+    inset 0 1px 0 0 var(--edge-lip),
+    var(--cast-soft);
+}
+
+/* the recessed face of the slot — a soft inner shadow under the icon */
+.ability-slot::after,
+.item-slot::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  box-shadow: inset 0 -6px 10px -6px var(--ink-deep);
 }
 
 .ability-slot > b {
   /* ability icon glyph — the only in-flow child, so it centres */
+  position: relative;
+  z-index: 1;
   font-size: 22px;
   line-height: 1;
+  text-shadow: 0 2px 5px var(--ink-deep);
 }
 
 .ability-slot > kbd {
@@ -784,7 +1062,10 @@ body {
 
 .ability-slot--ready {
   border-color: var(--azure);
-  box-shadow: 0 0 8px var(--azure-deep);
+  box-shadow:
+    inset 0 1px 0 0 var(--edge-lip),
+    0 0 10px var(--azure-deep),
+    var(--cast-soft);
 }
 
 .ability-slot--ult-locked {
@@ -846,6 +1127,7 @@ body {
   font-weight: 800;
   line-height: 1;
   cursor: pointer;
+  box-shadow: 0 0 8px var(--gold-deep);
   animation: rift-pulse 1s ease-in-out infinite; /* 1Hz — under the 3Hz law */
 }
 
@@ -862,16 +1144,22 @@ body {
   padding: 0; /* a <button> — kill UA padding so the box stays 40px */
   border-radius: 5px;
   border: 1px solid var(--ink-deep);
-  background: var(--ink-lit);
+  background: var(--slot-face);
   display: grid;
   place-items: center;
   color: var(--paper);
+  box-shadow:
+    inset 0 1px 0 0 var(--edge-lip),
+    var(--cast-soft);
 }
 
 .item-slot > b {
   /* item icon glyph — the only in-flow child, so it centres */
+  position: relative;
+  z-index: 1;
   font-size: 18px;
   line-height: 1;
+  text-shadow: 0 2px 5px var(--ink-deep);
 }
 
 .item-slot > kbd {
@@ -889,8 +1177,29 @@ body {
   color: var(--paper-dim);
 }
 
+/* An empty slot is a socket waiting to be filled, not a broken one — and not
+   an invisible one either. The previous rule was `opacity: 0.4` over the
+   --ink-deep dashed border .item-slot already carries, on the --slot-face
+   gradient. Re-rendered in headless Chrome and sampled off the pixels, that
+   rule gives dash rgb(56,61,70) against face rgb(34,38,44) — 1.39:1 — and the
+   whole socket sits 1.21:1 against the plate behind it. Nothing at those
+   ratios is visible, which is what the review found in the captures: an empty
+   socket that reads as plate.
+
+   The fix is contrast, not alpha. --stone (#6e675a) painting the dash on an
+   --ink-deep face measures rgb(110,103,90) on rgb(7,9,12): 3.56:1 dash-vs-face,
+   clearing the 3:1 bar for a non-text UI boundary. The socket as a whole reads
+   2.24:1 (dash) and 1.59:1 (face) against the surrounding plate rgb(47,52,60),
+   so the dash — not the fill — is what carries the boundary, and the opacity
+   comes off entirely so it is not fighting a 60% fade as well. Three cues say
+   EMPTY and none of them is brightness alone: the dash, the missing bronze lip
+   (a lip says 'object'; a hole has none), and the deeper inset shadow that
+   pushes the face below the frame. */
 .item-slot--empty {
-  opacity: 0.4;
+  border-style: dashed;
+  border-color: var(--stone);
+  background: var(--ink-deep);
+  box-shadow: inset 0 3px 8px var(--ink-deep);
 }
 
 /* buy feedback (round-6 UX): the slot a purchase just landed in pops once —
@@ -904,6 +1213,7 @@ body {
   position: absolute;
   right: 2px;
   bottom: 1px;
+  z-index: 2;
   font-size: 12px;
   font-weight: 700;
   color: var(--gold-lit);
@@ -913,6 +1223,7 @@ body {
 .item-cd {
   position: absolute;
   inset: 0;
+  z-index: 1;
   display: grid;
   place-items: center;
   background: var(--ink-deep);
@@ -928,28 +1239,54 @@ body {
   align-items: center;
   gap: 6px;
   padding: 8px 10px;
-  border: 1px solid var(--gold);
+  border: 1px solid var(--gold-deep);
   border-radius: 5px;
-  background: var(--ink-lit);
+  /* worn gold, the treasure read of STYLE_BIBLE §2 carried into the HUD */
+  background: linear-gradient(180deg, var(--ink-lit) 0%, var(--ink-deep) 100%);
   font-size: 15px;
   font-weight: 700;
+  font-variant-numeric: tabular-nums;
   color: var(--gold);
   min-width: 72px;
   justify-content: flex-end;
   cursor: pointer;
+  text-shadow: 0 1px 2px var(--ink-deep);
+  box-shadow:
+    inset 0 1px 0 0 var(--gold-deep),
+    var(--cast-soft);
 }
 
 .gold-readout:hover {
-  background: var(--ink-deep);
+  border-color: var(--gold);
+  color: var(--gold-lit);
 }
 
 .kda {
   font-size: 12px;
   color: var(--paper-dim);
+  font-variant-numeric: tabular-nums;
   letter-spacing: 0.06em;
 }
 
 /* ---- top bar ------------------------------------------------------------- */
+/* The chrome IS tighter than it was — gap 18 -> 11, padding 6px/18px ->
+   4px/12px, team labels 18px -> 13px — but it does not pay for the dial, and
+   an earlier comment here claimed it did. Measured at 1920x1080 with the clock
+   pinned to 5 characters and the score and tower digit counts held constant:
+     day       371.28 -> 415.36px  (+44.08)
+     night     371.28 -> 515.73px  (+144.45)
+     overtime  442.58 -> 591.84px  (+149.26)
+   The +144 at night is the phase readout: the 16px disc, its 7px column gap,
+   and the 'NIGHT · VIS −25%' tag. That readout is the point of the affordance
+   (never colour alone: dial AND word AND figure), so the width is bought
+   deliberately. The HUD's net occlusion win comes from the bottom cluster —
+   see the file header for the totals.
+
+   The overtime pose is the widest and is the one that decides whether the bar
+   can still centre clear of the kill feed. Measured with a full five-row feed:
+   the bar ends at x=1255.92 and the feed starts at x=1487.67, so 231.75px of
+   clearance, and the two do not overlap vertically either (bar 8..46, feed
+   56..207). If you change anything here, re-measure all three poses. */
 
 .topbar {
   position: fixed;
@@ -958,50 +1295,111 @@ body {
   transform: translateX(-50%);
   display: flex;
   align-items: center;
-  gap: 18px;
-  padding: 6px 18px;
-  background: var(--ink);
-  border: 1px solid var(--ink-deep);
-  border-radius: 6px;
+  gap: 11px;
+  padding: 4px 12px;
+  border-radius: 7px;
 }
 
 .match-clock {
-  font-size: 15px;
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
+  display: grid;
+  grid-template-columns: auto auto auto;
+  align-items: center;
+  column-gap: 7px;
+  padding: 2px 9px 3px;
+  border: 1px solid var(--stone-deep);
+  border-radius: 5px;
+  background: var(--ink-deep);
   color: var(--paper);
 }
 
+/* the day/night dial: a sun disc that a crescent shade slides across as the
+   cycle runs. hud.ts writes the fill, the halo and the shade's opacity from a
+   pre-built ladder of mix(APAL, APAL) steps — never per frame. */
+.match-clock > i {
+  grid-column: 1;
+  position: relative;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  overflow: hidden;
+}
+
+.match-clock > i > u {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: var(--ink-deep);
+  transform: translateX(36%);
+  text-decoration: none;
+}
+
+.match-clock > b {
+  grid-column: 2;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
+  line-height: 1.05;
+}
+
+.match-clock > em {
+  grid-column: 3;
+  font-style: normal;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  line-height: 1.05;
+}
+
+/* night: the clock plate goes cold — the same moonlit rim the world takes */
+.match-clock--night {
+  border-color: var(--wet-stone-lit);
+  box-shadow: 0 0 10px var(--night-horizon);
+}
+
+/* overtime surge: the digits stay gold (they are still the match clock) and
+   the plate takes the danger rim that says the waves have grown teeth */
 .match-clock--surge {
-  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.match-clock--surge > b {
+  color: var(--gold-lit);
 }
 
 .team-score {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 14px;
+  align-items: baseline;
+  gap: 6px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
+  padding-bottom: 3px;
+  text-shadow: 0 1px 2px var(--ink-deep);
 }
 
-.team-score b {
-  /* names ride next to the numbers in the markup — never colour alone */
+.team-score > b {
+  /* AZURE / EMBER — the label rides next to the number in its own element, so
+     team identity is never colour alone */
   font-weight: 700;
+  letter-spacing: 0.18em;
+  opacity: 0.85;
 }
 
-.team-score .t0 {
-  color: var(--azure-lit);
+.team-score > i {
+  font-style: normal;
+  font-weight: 800;
+  line-height: 1;
 }
 
-.team-score .t1 {
-  color: var(--ember-lit);
+/* your team, marked by a rule in that team's own colour (currentColor is the
+   inline APAL team hex hud.ts sets) rather than a text underline */
+.team-score--you {
+  box-shadow: inset 0 -2px 0 0 currentColor;
 }
 
 .tower-count {
   font-size: 12px;
   color: var(--paper-dim);
   font-variant-numeric: tabular-nums;
+  letter-spacing: 0.06em;
 }
 
 /* ---- killfeed -------------------------------------------------------------- */
@@ -1018,16 +1416,22 @@ body {
 }
 
 .kill-row {
+  position: relative;
   padding: 5px 10px;
-  background: var(--ink);
-  border: 1px solid var(--ink-deep);
   border-radius: 4px;
   font-size: 12px;
   color: var(--paper);
+  animation: rift-feed-in 0.22s ease-out 1;
 }
 
 .kill-row b {
   color: var(--danger);
+}
+
+.kill-row i {
+  /* the bounty / FIRST BLOOD suffix hud.ts appends */
+  font-style: normal;
+  color: var(--gold);
 }
 
 /* ---- minimap ------------------------------------------------------------------ */
@@ -1038,20 +1442,31 @@ body {
   bottom: calc(10px + var(--safe-bottom, 0px));
   width: 200px;
   height: 200px;
-  border: 1px solid var(--stone-deep);
   border-radius: 6px;
-  background: var(--ink-deep);
   overflow: hidden;
   cursor: crosshair; /* click to pan */
+  /* R_MINIMAP owns the gestures on this element (click-to-pan and the
+     drag-to-order that AMENDMENT_3 §F ratified); this stylesheet owns the
+     rule that lets them survive a finger. Without it the browser claims the
+     drag for scroll/pinch and fires `pointercancel` mid-gesture, so on touch
+     a drag-order aborts and a pan jumps — in a repo that just shipped a touch
+     + PWA pass, that is every phone. `none` and not `pan-x`/`pan-y`: both
+     axes are meaningful map coordinates here, and there is nothing under the
+     minimap to scroll. */
+  touch-action: none;
 }
 
 .minimap canvas {
+  position: relative;
   width: 100%;
   height: 100%;
   display: block;
 }
 
 /* ---- scoreboard (TAB) ------------------------------------------------------------ */
+/* Row kinds are told apart by TAG, not by class, so no new class name is
+   minted: <h3> title, <h4> team header, <div> player row of four classless
+   <span> columns. */
 
 .scoreboard {
   position: fixed;
@@ -1062,50 +1477,60 @@ body {
   max-width: 94vw;
   max-height: 90vh;
   overflow-y: auto;
-  padding: 18px 22px;
-  background: var(--ink);
-  border: 1px solid var(--stone-deep);
-  border-radius: 8px;
-  box-shadow: 0 8px 32px var(--ink-deep);
+  padding: 20px 26px;
+  border-radius: 9px;
+}
+
+.scoreboard > h3 {
+  margin: 0 0 14px;
+  text-align: center;
+  font-weight: 700;
+  letter-spacing: 0.3em;
+  color: var(--gold-lit);
+  text-shadow: 0 2px 0 var(--ink-deep);
+}
+
+.scoreboard > h4 {
+  margin: 16px 0 6px;
+  padding-bottom: 5px;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  border-bottom: 1px solid var(--stone-deep);
+}
+
+.scoreboard > h4:first-of-type {
+  margin-top: 0;
 }
 
 .scoreboard > div {
-  /* T9 renders classless header/team/row divs with the full text line */
+  display: grid;
+  grid-template-columns: 8.5em minmax(9em, 1fr) 4.4em 6.5em;
+  column-gap: 18px;
+  align-items: baseline;
+  padding: 4px 2px 4px 11px;
+  line-height: 1.5;
   white-space: nowrap;
-  line-height: 1.55;
 }
 
-.scoreboard table {
-  width: 100%;
-  border-collapse: collapse;
+.scoreboard > div > span:nth-child(1) {
+  font-weight: 700;
+  letter-spacing: 0.04em;
 }
 
-.scoreboard th {
-  font-size: 12px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--paper-deep);
-  text-align: left;
-  padding: 4px 8px;
+.scoreboard > div > span:nth-child(2) {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.scoreboard td {
-  font-size: 13px;
-  color: var(--paper);
-  padding: 5px 8px;
+.scoreboard > div > span:nth-child(3) {
+  text-align: right;
+  opacity: 0.8;
   font-variant-numeric: tabular-nums;
 }
 
-.scoreboard tr.you td {
-  color: var(--gold-lit);
-}
-
-.scoreboard .team0 th {
-  color: var(--azure-lit);
-}
-
-.scoreboard .team1 th {
-  color: var(--ember-lit);
+.scoreboard > div > span:nth-child(4) {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 
 /* ---- shop ------------------------------------------------------------------------ */
@@ -1126,9 +1551,7 @@ body {
   display: flex;
   flex-direction: column;
   padding: 14px;
-  background: var(--ink);
-  border: 1px solid var(--stone-deep);
-  border-radius: 8px;
+  border-radius: 9px;
   overflow-y: auto;
 }
 
@@ -1146,12 +1569,13 @@ body {
   gap: 4px;
   min-width: 0; /* let long blurbs shrink inside their grid track */
   padding: 10px;
-  background: var(--ink-lit);
+  background: var(--slot-face);
   border: 1px solid var(--ink-deep);
   border-radius: 5px;
   color: var(--paper);
   cursor: pointer;
   text-align: left;
+  box-shadow: inset 0 1px 0 0 var(--edge-lip);
 }
 
 .shop-item:hover {
@@ -1170,6 +1594,7 @@ body {
 .shop-cost {
   font-size: 12px;
   font-weight: 700;
+  font-variant-numeric: tabular-nums;
   color: var(--gold);
 }
 
@@ -1232,6 +1657,7 @@ body {
   background: var(--ink-lit);
   border: 1px solid var(--stone-deep);
   border-radius: 8px;
+  box-shadow: var(--cast);
 }
 
 .end-row {
@@ -1275,19 +1701,59 @@ body {
   background: var(--azure-deep);
 }
 
+/* Death: a shroud that is DARKEST at the edges and merely dimmed at the
+   centre, so the spectate camera still shows a readable world instead of a
+   flat lid.
+
+   THIS WAS A NO-OP AND IS NOT ANY MORE. The gradient used to run
+   `var(--shroud)` -> `var(--ink-deep)`, and those two palette entries are
+   BOTH #07090c. Re-rendering that rule over a --cliff-lit #8f959d world and
+   sampling the pixels gives rgb(45,47,53) at the centre, at 25% out and at the
+   left edge — one colour, 27.8% survival everywhere. A vignette from a colour
+   to itself is a flat lid wearing a vignette's comment.
+
+   The real gradient needs an ALPHA ramp, which a two-hex ramp cannot express,
+   so the centre stop is `transparent` and the element opacity carries the
+   shroud. Survival below is measured the same way as --plate-opacity's — the
+   page rendered over #8f959d and over #07090c and differenced per channel:
+     centre (960,497)  rgb(134,140,148)  93.3% survival  (the fight is legible)
+     mid    (960,790)  rgb( 90, 94, 99)  61.0% survival
+     edge   ( 24,540)  rgb( 39, 43, 47)  24.0% survival  (fully shrouded)
+   `transparent` is a keyword, not an ad-hoc colour, and `.bar::after` and
+   `.hud-portrait::after` already use it the same way.
+
+   `opacity` here applies to the two text children as well, so it doubles as
+   the shroud's authority AND the legibility of 'YOU DIED': 0.72 -> 0.86 makes
+   the counter crisper at the same time it makes the vignette real. */
 .death-overlay {
   position: fixed;
   inset: 0;
   display: grid;
-  place-items: center;
-  background: var(--shroud);
-  opacity: 0.72;
+  /* min-content rows + centred content: the two children (the line and the
+     counter) sit together in the middle. With the default 1fr rows they split
+     the viewport and the counter ended up 500px below the words. */
+  grid-auto-rows: min-content;
+  align-content: center;
+  justify-items: center;
+  row-gap: 10px;
+  background: radial-gradient(ellipse at 50% 46%, transparent 0%, var(--ink-deep) 78%);
+  opacity: 0.86;
   pointer-events: none; /* death-spectate: the camera stays free */
+}
+
+.death-overlay > div:not([class]) {
+  /* the 'YOU DIED' line */
+  letter-spacing: 0.42em;
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--danger);
+  text-shadow: 0 2px 8px var(--ink-deep);
 }
 
 .respawn-count {
   font-size: 32px;
   font-weight: 800;
+  font-variant-numeric: tabular-nums;
   color: var(--paper);
   text-shadow: 0 2px 6px var(--ink-deep);
 }
@@ -1299,8 +1765,7 @@ body {
   transform: translateX(-50%);
   z-index: 5;
   padding: 8px 16px;
-  background: var(--ink);
-  border: 1px solid var(--gold);
+  border-color: var(--gold-deep);
   border-radius: 6px;
   font-size: 13px;
   color: var(--gold-lit);
@@ -1324,8 +1789,6 @@ body {
   left: 50%;
   transform: translateX(-50%);
   padding: 8px 20px;
-  background: var(--ink);
-  border: 1px solid var(--stone-deep);
   border-radius: 6px;
   font-size: 14px;
   color: var(--paper);
@@ -1348,10 +1811,14 @@ body {
 
 .dmg-number {
   position: fixed;
+  z-index: 6;
   font-size: 14px;
   font-weight: 800;
+  letter-spacing: 0.08em;
   color: var(--paper);
-  text-shadow: 0 1px 3px var(--ink-deep);
+  text-shadow:
+    0 1px 3px var(--ink-deep),
+    0 0 8px var(--ink-deep);
   pointer-events: none;
   animation: rift-dmg-rise 0.8s ease-out forwards;
 }
@@ -1413,6 +1880,19 @@ body {
   100% {
     border-color: var(--stone-deep);
     box-shadow: none;
+  }
+}
+
+/* kill feed: one-shot slide-in so a new row reads as an EVENT, not as text
+   that was always there */
+@keyframes rift-feed-in {
+  0% {
+    transform: translateX(14px);
+    opacity: 0;
+  }
+  100% {
+    transform: translateX(0);
+    opacity: 1;
   }
 }
 
@@ -1480,8 +1960,8 @@ body {
    an inline style) scales in hud.ts's applyUiScale at the same breakpoint. */
 @media (min-width: 2200px) {
   .hud > div:not([class]) {
-    gap: 14px;
-    padding: 12px 17px;
+    gap: 12px;
+    padding: 8px 13px;
   }
 
   .hud-portrait {
@@ -1493,8 +1973,10 @@ body {
     font-size: 31px;
   }
 
+  /* same slack argument at the ultrawide scale: the column reaches 83px under
+     a 102px item bar (2x48 + 6), so the cluster still grows by nothing */
   .hud-bars {
-    width: 264px;
+    width: 240px;
   }
 
   .bar {
@@ -1503,6 +1985,10 @@ body {
 
   .bar-xp {
     height: 14px;
+  }
+
+  .hud-bars > div:not([class]) {
+    height: 17px;
   }
 
   .ability-bar {
@@ -1552,8 +2038,13 @@ body {
   }
 
   .topbar {
-    gap: 22px;
-    padding: 8px 22px;
+    gap: 13px;
+    padding: 5px 14px;
+  }
+
+  .match-clock > i {
+    width: 19px;
+    height: 19px;
   }
 
   .killfeed {

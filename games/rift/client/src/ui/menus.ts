@@ -294,7 +294,7 @@ export function createMenus(parent: HTMLElement): UiHandle {
       title.textContent = room.label;
       const label = el('span', 'room-label', row);
       label.style.fontSize = `${FONT_MIN_PX}px`;
-      label.textContent = room.phase === 'lobby' ? 'IN LOBBY' : 'LIVE — join mid-match';
+      label.textContent = room.phase === 'warmup' ? 'IN LOBBY' : 'LIVE — join mid-match';
       const meta = el('span', 'room-meta', row);
       meta.style.fontSize = `${FONT_MIN_PX}px`;
       meta.textContent = `${room.players}/${room.maxPlayers} seated`;
@@ -365,7 +365,12 @@ export function createMenus(parent: HTMLElement): UiHandle {
         if (r.team !== t) continue;
         const seat = el('div', 'lobby-seat', col);
         seat.style.fontSize = '14px';
-        const hero = r.pick ? heroById(r.pick).name : 'choosing…';
+        // lobby.picks is FRESHER than the roster row: rift_lobby re-broadcasts
+        // on every accepted pick, rift_roster only on membership changes — a
+        // seat read from the roster showed 'choosing…' until someone joined or
+        // left (the pick-staleness half of the greying bug).
+        const seatPick = r.id in picks ? (picks[r.id] ?? null) : r.pick;
+        const hero = seatPick ? heroById(seatPick).name : 'choosing…';
         const tags = `${r.bot ? ' [BOT]' : ''}${r.connected || r.bot ? '' : ' [OFFLINE]'}`;
         seat.textContent = `${r.name}${tags} — ${hero}`;
         if (r.id === me) seat.style.textDecoration = 'underline';

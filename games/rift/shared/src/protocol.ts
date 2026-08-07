@@ -70,6 +70,16 @@ export type RiftS2C =
       readonly phase: Phase;
       readonly matchTick: number;
       readonly overtime: boolean;
+      /** Day/night cycle position: 0 = full day, 1 = full night, continuous and
+       *  WRAPPING — it ramps 0->1 across the first half of a cycle and 1->0 back
+       *  across the second, so it is a phase, not a monotonic clock. Derived on
+       *  the server purely from `matchTick` and `DAY_PERIOD_S` (TERRAIN_CONTRACT
+       *  §6), starting at full day. It is on the wire only so a RECONNECTING
+       *  client's lighting is correct immediately: the sim derives night for the
+       *  vision multiplier itself and never reads this field back. The client
+       *  feeds it straight to `SceneHandle.setTimeOfDay`. Always present, always
+       *  in [0,1] — never interpolate it across snapshots at a wrap. */
+      readonly dayPhase: number;
       readonly wardStock: number;
       /** Authoritative team kill totals, [team0, team1]. */
       readonly kills: readonly [number, number];
@@ -80,9 +90,9 @@ export type RiftS2C =
     };
 
 /** Events travel inside the platform envelope { t:'event', ev: RiftEvent }.
- *  Cast events are only sent to teams that can see the caster. Kill events
- *  carry PLAYER ids (killer null = executed by creeps/towers); clients map
- *  ids to names/heroes via the snap board. */
+ *  Cast and miss events are only sent to teams that can see the acting entity.
+ *  Kill events carry PLAYER ids (killer null = executed by creeps/towers);
+ *  clients map ids to names/heroes via the snap board. */
 export type RiftEvent =
   | { readonly t: 'rift_kill'; readonly killer: string | null; readonly victim: string; readonly gold: number; readonly firstBlood: boolean }
   | { readonly t: 'rift_structure'; readonly team: TeamId; readonly kind: 'tower' | 'guard' | 'ancient'; readonly lane: number | null }
@@ -90,6 +100,15 @@ export type RiftEvent =
   | { readonly t: 'rift_pick'; readonly id: string; readonly hero: HeroId | null }
   | { readonly t: 'rift_roster'; readonly roster: readonly RosterEntry[] }
   | { readonly t: 'rift_cast'; readonly id: number; readonly slot: number; readonly x: number; readonly z: number }
+  /** An uphill basic attack that missed (TERRAIN_CONTRACT §4). `attacker` and
+   *  `target` are ENTITY ids, as in rift_cast — not player ids. Emitted from
+   *  `fire()` on the tick the swing resolves, after the cooldown is stamped and
+   *  `atkTarget` is set, so the client still draws the tracer; the swing was
+   *  spent, it simply dealt no damage. Filtered by team vision exactly like
+   *  rift_cast. Abilities never miss, so this only ever accompanies a basic
+   *  attack. The HUD floats a `MISS` marker on it — a miss with no feedback
+   *  reads as a bug. */
+  | { readonly t: 'rift_miss'; readonly attacker: number; readonly target: number }
   | { readonly t: 'rift_end'; readonly winner: TeamId | null; readonly reason: EndReason; readonly stats: readonly PlayerStats[] };
 
 // --- Settings ---------------------------------------------------------------------

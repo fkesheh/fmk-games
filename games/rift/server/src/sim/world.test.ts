@@ -11,11 +11,17 @@ import { describe, expect, it } from 'vitest';
 import {
   BASE_INSET,
   buildMap,
+  CAMP_BRUTE,
+  CAMP_HIVE,
+  CAMP_PACK,
   HERO_VISION,
+  isPassable,
+  NEUTRAL_TEAM,
   STARTING_GOLD,
   STARTING_SKILL_POINTS,
   TICK_RATE,
 } from '@rift/shared';
+import type { CreepTuning, EntKind } from '@rift/shared';
 import { createWorld } from './world.js';
 import { NO_ENT } from './types.js';
 import type { AbilitiesEngine, Ent, QueuedCast, SeatDef, World } from './types.js';
@@ -62,6 +68,19 @@ function heroByPid(w: World, pid: string): Ent {
 function advance(w: World, n: number): void {
   for (let i = 0; i < n; i++) w.advance();
 }
+
+/** world.ts's private `ORDER_SNAP_CELLS`, restated. It is deliberately not
+ *  exported — it is an implementation budget, not contract — so the test
+ *  carries its own copy and the snap assertions below are written to hold for
+ *  any value at least this large. */
+const ORDER_SNAP_CELLS = 6;
+
+/** A pocket of the map with no structure, lane or camp clearing within reach:
+ *  a lone neutral parked here is left completely alone, so anything that
+ *  happens to its health bar came from the code under test. The tests using it
+ *  assert that isolation rather than assuming it. */
+const QUIET_SPOT = { x: 84.5, z: 8.5 };
+
 
 describe('world construction', () => {
   it('builds structure ents at their MapDef ids and hero mobiles from 1000', () => {
@@ -155,6 +174,57 @@ describe('order intake', () => {
     w.advance();
     expect(h.order).toBe('idle');
   });
+
+  it('snaps a destination inside a cliff to the NEAREST passable cell, and only then', () => {
+    // AMENDMENT_1 §C. Cliffs are solid and nothing but a hero is pathed, so an
+    // order onto one would otherwise steer the unit into the face and leave it
+    // pressed there for the rest of the match, having eaten the click.
+    const { w } = makeWorld();
+    const map = buildMap(1);
+    const g = map.terrain.grid;
+    const cell = map.side / g.dim;
+    const h = heroByPid(w, 'p0');
+
+    // (0.5, 0.5) is the centre of a cliff cell, and it is comfortably INSIDE
+    // the map — so nothing below can be produced by the bounds clamp.
+    const click = { x: 0.5, z: 0.5 };
+    expect(isPassable(map.terrain, click.x, click.z)).toBe(false);
+    w.order(h.id, { kind: 'move', x: click.x, z: click.z });
+    w.advance();
+    expect(isPassable(map.terrain, h.ox, h.oz)).toBe(true);
+
+    // NEAREST, not merely "some passable cell": nothing walkable within the
+    // snap budget lies closer to the click than the destination chosen.
+    const budget = ORDER_SNAP_CELLS * cell;
+    const chosen = Math.hypot(h.ox - click.x, h.oz - click.z);
+    expect(chosen).toBeLessThanOrEqual(budget);
+    let best = Infinity;
+    for (let cz = 0; cz < g.dim; cz++) {
+      for (let cx = 0; cx < g.dim; cx++) {
+        const px = (cx + 0.5) * cell;
+        const pz = (cz + 0.5) * cell;
+        const d = Math.hypot(px - click.x, pz - click.z);
+        if (d > budget) continue;
+        if (!isPassable(map.terrain, px, pz)) continue;
+        if (d < best) best = d;
+      }
+    }
+    expect(best).toBeLessThan(Infinity);
+    expect(chosen).toBeCloseTo(best, 9);
+    // and the hero can stand where it was sent
+    advance(w, 600);
+    expect(h.x).toBeCloseTo(h.ox, 6);
+    expect(h.z).toBeCloseTo(h.oz, 6);
+
+    // A LEGAL destination is untouched to the last bit — the snap must not
+    // quantise ordinary clicks onto cell centres. (48.25, 48.75) is walkable
+    // and is deliberately not the centre of its own cell.
+    expect(isPassable(map.terrain, 48.25, 48.75)).toBe(true);
+    w.order(h.id, { kind: 'move', x: 48.25, z: 48.75 });
+    w.advance();
+    expect(h.ox).toBe(48.25);
+    expect(h.oz).toBe(48.75);
+  });
 });
 
 describe('cast queue + injected engine', () => {
@@ -214,6 +284,7 @@ describe('mutation surface', () => {
 
   it('dash covers the distance in ~0.15s and clamps to map bounds', () => {
     const { w } = makeWorld();
+    const map = buildMap(1);
     const h = heroByPid(w, 'p0');
     h.x = 30;
     h.z = 30;
@@ -221,10 +292,29 @@ describe('mutation surface', () => {
     advance(w, 5);
     expect(h.x).toBeCloseTo(36, 6);
     expect(h.z).toBeCloseTo(30, 6);
+    // Out of bounds: `dash` CLAMPS its destination into the map and stops
+    // there. It does not snap — the nearest-passable-cell snap of
+    // AMENDMENT_1 §C belongs to `World.order`, because a click is a guess at
+    // where the player meant and a dash is a scripted vector that the ability
+    // already aimed. The clamp is what this test names, and the clamped
+    // destination is what it reads.
     w.dash(h.id, -50, -50);
     advance(w, 5);
-    expect(h.x).toBe(0);
-    expect(h.z).toBe(0);
+    expect(h.ox).toBe(0);
+    expect(h.oz).toBe(0);
+    // The corner (0, 0) is a CLIFF cell at 1, 2 and 3 lanes and cliffs are
+    // solid, so the arrival is the face in front of it, not the corner: the
+    // hero travels toward the clamped point, ends up inside the map on
+    // walkable ground, and then stops dead instead of grinding into the rock.
+    expect(isPassable(map.terrain, 0, 0)).toBe(false);
+    expect(h.x).toBeGreaterThanOrEqual(0);
+    expect(h.z).toBeGreaterThanOrEqual(0);
+    expect(Math.hypot(h.x, h.z)).toBeLessThan(Math.hypot(30, 30)); // it moved
+    expect(isPassable(map.terrain, h.x, h.z)).toBe(true);
+    const rest = { x: h.x, z: h.z };
+    advance(w, 40);
+    expect(h.x).toBe(rest.x);
+    expect(h.z).toBe(rest.z);
   });
 
   it('applyAura changes effective stats until it expires', () => {
@@ -325,11 +415,38 @@ describe('movement', () => {
 
   it('clamps orders to the map bounds', () => {
     const { w } = makeWorld();
+    const map = buildMap(1);
     const h = heroByPid(w, 'p0');
     w.order(h.id, { kind: 'move', x: -50, z: -50 });
+    w.advance();
+    // Two separate steps, both observable here. The CLAMP puts the
+    // destination back inside the map; without it the order would keep
+    // (-50, -50) and the snap, which searches a bounded neighbourhood, would
+    // have nothing near enough to find.
+    expect(h.ox).toBeGreaterThanOrEqual(0);
+    expect(h.oz).toBeGreaterThanOrEqual(0);
+    expect(h.ox).toBeLessThanOrEqual(map.side);
+    expect(h.oz).toBeLessThanOrEqual(map.side);
+    // The SNAP then moves it off the cliff the clamped corner sits in
+    // (AMENDMENT_1 §C), so the hero has somewhere it can actually stand.
+    expect(h.ox === 0 && h.oz === 0).toBe(false);
+    expect(isPassable(map.terrain, h.ox, h.oz)).toBe(true);
+    // The clamp is asserted a second time somewhere the snap CANNOT stand in
+    // for it. `nearestPassableCell` clamps into the grid on its own, so at the
+    // cliff corner above a missing bounds clamp is invisible — the snap drags
+    // the destination back inside anyway. (0, 95.5) is walkable, so the snap
+    // is a no-op there and the coordinate that survives is the clamp's alone.
+    expect(isPassable(map.terrain, 0, 95.5)).toBe(true);
+    w.order(h.id, { kind: 'move', x: -100, z: 95.5 });
+    w.advance();
+    expect(h.ox).toBe(0);
+    expect(h.oz).toBe(95.5);
+    // and it walks all the way there and stops, rather than stalling on rock
+    const dest = { x: h.ox, z: h.oz };
     advance(w, 600);
-    expect(h.x).toBe(0);
-    expect(h.z).toBe(0);
+    expect(h.x).toBeCloseTo(dest.x, 6);
+    expect(h.z).toBeCloseTo(dest.z, 6);
+    expect(h.order).toBe('idle');
   });
 
   it('creeps follow their lane waypoints toward the enemy base', () => {
@@ -360,6 +477,119 @@ describe('movement', () => {
     // in range already (reaver 1.8 + radii vs 4 m gap): swings begin
     advance(w, 25);
     expect(c.hp).toBeLessThan(c.maxHp);
+  });
+});
+
+describe('neutral camps (AMENDMENT_2 §D)', () => {
+  it('exposes one CampState per terrain clearing, in that exact order', () => {
+    // §D.4. camps.ts indexes straight into this table by clearing id, so the
+    // ordering is load-bearing, not incidental.
+    const { w } = makeWorld();
+    const defs = w.map.terrain.camps;
+    expect(defs.length).toBeGreaterThan(0);
+    expect(w.camps).toHaveLength(defs.length);
+    w.camps.forEach((c, i) => {
+      expect(c.id).toBe(i);
+      expect(c.def).toBe(defs[i]); // the world's own def object, not a copy
+    });
+  });
+
+  it('runs stepCamps inside advance(), after stepDeaths', () => {
+    // AMENDMENT_1 §F held S_WORLD back from wiring step (7) until S_JUNGLE
+    // landed, so nothing anywhere pinned that it eventually was: camps.test.ts
+    // drives stepCamps directly and stays green with the call deleted.
+    const { w } = makeWorld();
+    expect(w.camps.every((c) => c.aliveCount === 0)).toBe(true);
+    w.advance();
+    expect(w.camps.every((c) => c.aliveCount > 0)).toBe(true); // the jungle stood up
+    for (const c of w.camps) {
+      for (const id of c.memberIds) {
+        expect(must(w.get(id)).team).toBe(NEUTRAL_TEAM);
+      }
+    }
+    // ORDERING (AMENDMENT_1 §A): step (7) runs AFTER stepDeaths, so a camp
+    // emptied this tick stamps its respawn on the SAME tick. Run before it,
+    // the members would still read `alive` and the clock would start a tick
+    // late, every time, for every camp on the map.
+    const camp = must(w.camps[0]);
+    const h = heroByPid(w, 'p0');
+    for (const id of camp.memberIds) w.damage(h.id, id, 999999, 'physical');
+    const tickBefore = w.tick;
+    w.advance();
+    expect(camp.aliveCount).toBe(0);
+    expect(camp.respawnAtTick).toBeGreaterThan(tickBefore);
+  });
+
+  it('spawns each camp kind with its own tuned radius and health', () => {
+    // §D.2. `Ent.radius` is readonly and written once by makeEnt from the
+    // tuning, so applyCampStats cannot correct it afterwards: without these
+    // arms in mobileTuning() every member carries the 0.3 m fallback and a
+    // brute's combat reach, separation and structure push-out are all out by
+    // 0.4 m.
+    const { w } = makeWorld();
+    const cases: readonly [EntKind, CreepTuning][] = [
+      ['campPack', CAMP_PACK],
+      ['campBrute', CAMP_BRUTE],
+      ['campHive', CAMP_HIVE],
+    ];
+    for (const [kind, tuning] of cases) {
+      const e = must(w.get(w.spawnMobile(kind, NEUTRAL_TEAM, QUIET_SPOT.x, QUIET_SPOT.z, -1, 0, NO_ENT)));
+      expect(e.radius).toBe(tuning.radius);
+      expect(e.maxHp).toBe(tuning.hp);
+      expect(e.hp).toBe(tuning.hp);
+      expect(e.damage).toBe(tuning.damage);
+      expect(e.attackRange).toBe(tuning.attackRange);
+      expect(e.bounty).toBe(tuning.bounty);
+      expect(e.xpValue).toBe(tuning.xp);
+    }
+    expect(new Set(cases.map(([, t]) => t.radius)).size).toBe(3); // the arms are distinguishable
+  });
+
+  it('gives a camp member no hp regen, so a wounded one stays wounded', () => {
+    // §D.5 / AMENDMENT_1 §C. stepUnits' regen loop runs BEFORE its hero-only
+    // gate, so a non-zero hpRegen here would passively heal camp members
+    // mid-fight and quietly undo every poke a player lands on the jungle.
+    const { w } = makeWorld();
+    const e = must(
+      w.get(w.spawnMobile('campBrute', NEUTRAL_TEAM, QUIET_SPOT.x, QUIET_SPOT.z, -1, 0, NO_ENT)),
+    );
+    expect(e.hpRegen).toBe(0);
+    const wounded = e.maxHp / 2;
+    e.hp = wounded;
+    advance(w, 4 * TICK_RATE); // four seconds: any regen at all shows here
+    expect(e.alive).toBe(true);
+    expect(e.hpRegen).toBe(0);
+    expect(e.hp).toBe(wounded); // not a metre of it healed, and nothing hit it
+  });
+
+  it('never seeds a lane waypoint onto a neutral, even asked for one', () => {
+    // A lane polyline runs between the two PLAYER bases, so "the other end" is
+    // undefined for a third team; a camp member that picked one up would march
+    // down the lane. TERRAIN_CONTRACT §5 names this the most likely way the
+    // jungle breaks, so the guard does not rely on every caller passing -1.
+    const { w } = makeWorld();
+    const onLane = must(w.get(w.spawnMobile('melee', 1, QUIET_SPOT.x, QUIET_SPOT.z, 0, 0, NO_ENT)));
+    expect(onLane.waypoint).toBeGreaterThan(0); // team 1 walks the polyline reversed
+    const neutral = must(
+      w.get(w.spawnMobile('campPack', NEUTRAL_TEAM, QUIET_SPOT.x, QUIET_SPOT.z, 0, 0, NO_ENT)),
+    );
+    expect(neutral.waypoint).toBe(0);
+  });
+
+  it('gives every new mobile an initialised path, never undefined', () => {
+    // §D.1. The frozen shape is `path: readonly Vec2[] | null` and
+    // `pathIndex: number`; leaving them off made "not written yet" read as
+    // `undefined` and forced every consumer in movement.ts and camps.ts to
+    // coalesce.
+    const { w } = makeWorld();
+    const e = must(
+      w.get(w.spawnMobile('campPack', NEUTRAL_TEAM, QUIET_SPOT.x, QUIET_SPOT.z, -1, 0, NO_ENT)),
+    );
+    expect(e.path).toBeNull();
+    expect(e.pathIndex).toBe(0);
+    const h = heroByPid(w, 'p0');
+    expect(h.path === null || Array.isArray(h.path)).toBe(true);
+    expect(typeof h.pathIndex).toBe('number');
   });
 });
 

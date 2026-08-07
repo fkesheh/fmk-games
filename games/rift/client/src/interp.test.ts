@@ -5,15 +5,21 @@
 // performance.now()).
 // ============================================================================
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { EntKind, EntSnap, TeamId } from '@rift/shared';
+import { NEUTRAL_TEAM, isPlayerTeam } from '@rift/shared';
+import type { EntKind, EntSnap, EntTeam } from '@rift/shared';
 import type { SnapMsg } from './contract.js';
 import { createInterp } from './interp.js';
 
-function ent(id: number, x: number, z: number, k: EntKind = 'melee', team: TeamId = 0): EntSnap {
+function ent(id: number, x: number, z: number, k: EntKind = 'melee', team: EntTeam = 0): EntSnap {
   return { id, k, team, x, z, hp: 100, maxHp: 100 };
 }
 
-function snap(tick: number, ents: EntSnap[]): SnapMsg {
+/** A jungle camp member: neutral team, camp kind (shared/src/types.ts §5). */
+function camp(id: number, x: number, z: number, k: EntKind = 'campPack'): EntSnap {
+  return ent(id, x, z, k, NEUTRAL_TEAM);
+}
+
+function snap(tick: number, ents: EntSnap[], dayPhase = 0): SnapMsg {
   return {
     t: 'rift_snap',
     tick,
@@ -21,6 +27,7 @@ function snap(tick: number, ents: EntSnap[]): SnapMsg {
     phase: 'live',
     matchTick: tick,
     overtime: false,
+    dayPhase,
     wardStock: 0,
     kills: [0, 0],
     board: [],
@@ -151,5 +158,92 @@ describe('createInterp', () => {
     vi.advanceTimersByTime(50);
     itp.push(snap(3, [{ ...ent(5, 2, 0), hp: 55 }])); // no attack this snap
     expect(itp.sample()[0]?.atk).toBeUndefined();
+  });
+});
+
+// ---- neutrals (EntTeam widening) --------------------------------------------
+// `InterpEnt.team` and `GhostEnt.team` are `EntTeam` (`TeamId | 2`): jungle
+// camps ride the same snapshot path as players' units. Interp itself indexes
+// nothing per team, so its whole obligation is to carry the value through
+// UNCHANGED and to treat a camp as the ordinary mobile entity it is. Both
+// halves are load-bearing downstream: units.ts, minimap.ts and nameLabels.ts
+// all branch on `isPlayerTeam(e.team)`, and a neutral silently arriving as
+// team 0 renders in the AZURE family — a wrong answer that looks like a real
+// unit rather than like a bug.
+describe('createInterp — neutral (NEUTRAL_TEAM) entities', () => {
+  it('carries NEUTRAL_TEAM through interpolation without coercing it to a player team', () => {
+    const itp = createInterp();
+    itp.push(snap(1, [camp(40, 0, 0)]));
+    vi.advanceTimersByTime(50);
+    itp.push(snap(2, [camp(40, 10, 0)]));
+    vi.advanceTimersByTime(75); // render clock halfway between the two arrivals
+    const s = itp.sample();
+    expect(s).toHaveLength(1);
+    expect(s[0]?.team).toBe(NEUTRAL_TEAM);
+    expect(isPlayerTeam(s[0]?.team ?? 0)).toBe(false);
+    // and it interpolates exactly like any other mobile entity
+    expect(s[0]?.x).toBeCloseTo(5, 6);
+  });
+
+  it('keeps neutral and player teams apart in one snapshot (pooled slots do not bleed)', () => {
+    const itp = createInterp();
+    itp.push(
+      snap(1, [
+        ent(1, 1, 1, 'melee', 0),
+        camp(2, 2, 2, 'campBrute'),
+        ent(3, 3, 3, 'melee', 1),
+        camp(4, 4, 4, 'campHive'),
+      ]),
+    );
+    const byId = new Map(itp.sample().map((e) => [e.id, e.team]));
+    expect([...byId.entries()]).toEqual([
+      [1, 0],
+      [2, NEUTRAL_TEAM],
+      [3, 1],
+      [4, NEUTRAL_TEAM],
+    ]);
+  });
+
+  it('ghosts a neutral that walks out of vision, at its last seen position, still neutral', () => {
+    const itp = createInterp();
+    itp.push(snap(1, [camp(41, 12.5, 34.25, 'campBrute')]));
+    vi.advanceTimersByTime(50);
+    itp.push(snap(2, [])); // the camp leaves the visible set
+    const g = itp.ghosts();
+    expect(g).toHaveLength(1);
+    expect(g[0]?.id).toBe(41);
+    expect(g[0]?.k).toBe('campBrute');
+    expect(g[0]?.team).toBe(NEUTRAL_TEAM);
+    expect(g[0]?.x).toBeCloseTo(12.5, 6);
+    expect(g[0]?.z).toBeCloseTo(34.25, 6);
+    expect(itp.sample()).toHaveLength(0);
+  });
+
+  it('fades a neutral ghost over the same 0.5s and retires it (camps are not structures)', () => {
+    const itp = createInterp();
+    itp.push(snap(1, [camp(42, 20, 20, 'campHive')]));
+    vi.advanceTimersByTime(50);
+    itp.push(snap(2, []));
+    expect(itp.ghosts()[0]?.fade).toBeCloseTo(1, 6);
+    vi.advanceTimersByTime(250);
+    expect(itp.ghosts()[0]?.fade).toBeCloseTo(0.5, 6);
+    vi.advanceTimersByTime(300); // 550ms > GHOST_FADE_MS
+    expect(itp.ghosts()).toHaveLength(0);
+  });
+
+  it('a neutral that re-enters vision supersedes its ghost and starts fresh', () => {
+    const itp = createInterp();
+    itp.push(snap(1, [camp(43, 8, 8)]));
+    vi.advanceTimersByTime(50);
+    itp.push(snap(2, [])); // ghost at (8,8)
+    expect(itp.ghosts()).toHaveLength(1);
+    vi.advanceTimersByTime(100);
+    itp.push(snap(3, [camp(43, 30, 30)])); // re-acquired somewhere else
+    const s = itp.sample();
+    expect(s).toHaveLength(1);
+    expect(s[0]?.team).toBe(NEUTRAL_TEAM);
+    expect(s[0]?.x).toBeCloseTo(30, 6);
+    expect(s[0]?.z).toBeCloseTo(30, 6);
+    expect(itp.ghosts()).toHaveLength(0);
   });
 });

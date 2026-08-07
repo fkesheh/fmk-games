@@ -1,0 +1,132 @@
+{
+  "root": "/Users/fkesheh/projects/fps-rift",
+  "typecheck_cmd": "npm run typecheck",
+  "contract": [
+    "games/rift/GRAPHICS_CONTRACT.md",
+    "games/rift/STYLE_BIBLE.md",
+    "games/rift/DESIGN_DELTA.md",
+    "games/rift/TERRAIN_CONTRACT.md",
+    "games/rift/shared/src/palette.ts",
+    "games/rift/shared/src/surfaces.ts",
+    "games/rift/shared/src/terrain.ts",
+    "games/rift/shared/src/types.ts",
+    "games/rift/shared/src/config.ts",
+    "games/rift/shared/src/protocol.ts",
+    "games/rift/shared/src/map.ts",
+    "games/rift/shared/src/index.ts",
+    "games/rift/shared/src/valueLadder.test.ts",
+    "games/rift/server/src/sim/types.ts",
+    "games/rift/client/src/contract.ts",
+    "games/rift/client/src/render/core.ts",
+    "games/rift/client/src/render/kit.ts",
+    "games/rift/client/src/render/kit.test.ts"
+  ],
+  "modules": {
+    "S_VISION": [
+      "games/rift/server/src/sim/vision.ts",
+      "games/rift/server/src/sim/vision.test.ts"
+    ],
+    "S_COMBAT": [
+      "games/rift/server/src/sim/combat.ts",
+      "games/rift/server/src/sim/combat.test.ts"
+    ],
+    "S_MOVE": [
+      "games/rift/server/src/sim/movement.ts",
+      "games/rift/server/src/sim/pathing.ts",
+      "games/rift/server/src/sim/movement.test.ts"
+    ],
+    "S_WORLD": [
+      "games/rift/server/src/sim/world.ts",
+      "games/rift/server/src/sim/world.test.ts"
+    ],
+    "S_CAMPS": [
+      "games/rift/server/src/sim/camps.ts",
+      "games/rift/server/src/sim/camps.test.ts"
+    ],
+    "S_ABIL": [
+      "games/rift/server/src/sim/abilities.ts",
+      "games/rift/server/src/sim/abilities.test.ts"
+    ],
+    "S_UNITS": [
+      "games/rift/server/src/sim/units.ts",
+      "games/rift/server/src/sim/units.test.ts"
+    ],
+    "S_BOTS": [
+      "games/rift/server/src/bots.ts",
+      "games/rift/server/src/bots.test.ts"
+    ],
+    "S_ROOM": [
+      "games/rift/server/src/room.ts",
+      "games/rift/server/src/room.test.ts"
+    ],
+    "S_SHAREDTEST": [
+      "games/rift/shared/src/map.test.ts",
+      "games/rift/shared/src/protocol.test.ts"
+    ],
+    "S_BALANCE": [
+      "games/rift/server/src/balance.test.ts"
+    ],
+    "S_HARNESS": [
+      "scripts/verify-rift.mjs",
+      "scripts/capture-rift-art.mjs",
+      "scripts/e2e-rift.mjs",
+      "scripts/check-rift-palette.ts"
+    ],
+    "R_SCENE": [
+      "games/rift/client/src/render/scene.ts"
+    ],
+    "R_POST": [
+      "games/rift/client/src/render/post.ts"
+    ],
+    "R_TERRAIN": [
+      "games/rift/client/src/render/terrain.ts"
+    ],
+    "R_VEG": [
+      "games/rift/client/src/render/vegetation.ts"
+    ],
+    "R_MAPMESH": [
+      "games/rift/client/src/render/mapMesh.ts"
+    ],
+    "R_UNITS": [
+      "games/rift/client/src/render/units.ts"
+    ],
+    "R_MESH_HERO": [
+      "games/rift/client/src/render/meshes/heroes.ts",
+      "games/rift/client/src/render/meshes/heroes.test.ts"
+    ],
+    "R_MESH_CREEP": [
+      "games/rift/client/src/render/meshes/creeps.ts",
+      "games/rift/client/src/render/meshes/creeps.test.ts"
+    ],
+    "R_MESH_CAMP": [
+      "games/rift/client/src/render/meshes/camps.ts",
+      "games/rift/client/src/render/meshes/camps.test.ts"
+    ],
+    "R_MESH_STRUCT": [
+      "games/rift/client/src/render/meshes/structures.ts",
+      "games/rift/client/src/render/meshes/structures.test.ts"
+    ],
+    "R_FX": [
+      "games/rift/client/src/render/fx.ts"
+    ],
+    "R_FOG": [
+      "games/rift/client/src/render/fog.ts"
+    ],
+    "R_MINIMAP": [
+      "games/rift/client/src/ui/minimap.ts"
+    ],
+    "R_HUD": [
+      "games/rift/client/src/ui/hud.ts",
+      "games/rift/client/src/style.css"
+    ],
+    "R_WIRE": [
+      "games/rift/client/src/wire.ts",
+      "games/rift/client/src/game.ts",
+      "games/rift/client/src/net.ts",
+      "games/rift/client/src/interp.ts",
+      "games/rift/client/src/interp.test.ts",
+      "games/rift/client/src/ui/nameLabels.ts"
+    ]
+  },
+  "integrator": "R_WIRE"
+}

@@ -23,11 +23,22 @@
 // mirror image rule 2 demands. "Left of travel" uses the kart handedness
 // (track.ts closestOnTrack/gridSlot): left of unit tangent (tx,tz) is
 // (-tz, tx).
+//
+// TERRAIN (TERRAIN_CONTRACT §1-3): buildMap also compiles the terrain, by
+// calling buildTerrain(lanes) — the SAME pure function of the lane count the
+// client calls, because terrain is never sent on the wire and both sides must
+// agree bit-for-bit. buildMap therefore stays deterministic, rng-free and
+// clock-free. validateMap gains the six terrain rules of TERRAIN_CONTRACT §3
+// (numbered 6..11 here, after the five structure rules). Those rules read the
+// grid ONLY through the frozen O(1) queries kindAt/elevationAt/isPassable,
+// sampled at cell centres: the row/column order inside TerrainGrid is
+// terrain.ts's private business and is never assumed here.
 // ============================================================================
 import {
   ANCIENT,
   ANCIENT_GUARDS,
   BASE_INSET,
+  CAMP_LANE_CLEARANCE,
   GUARD_FLANK_DIST,
   GUARD_TOWER,
   HERO_RADIUS,
@@ -42,6 +53,8 @@ import {
   TOWER_LANE_OFFSET,
   TOWERS_PER_LANE,
 } from './config.js';
+import { ELEV_HIGH, buildTerrain, elevationAt, isPassable, kindAt } from './terrain.js';
+import type { CampDef, TerrainDef, TerrainKind } from './terrain.js';
 import type {
   MapDef,
   MapValidation,
@@ -56,6 +69,15 @@ const TOWER_PATH_MAX_DIST = 6;
 /** Mirror symmetry (rule 2) is asserted to this tolerance; the deterministic
  *  construction agrees to ~1e-13, so 1e-6 only trips on real breakage. */
 const MIRROR_TOL = 1e-6;
+/** Terrain rule 7 (lane pathability) marches the hero disc along each lane
+ *  polyline at this spacing, in metres. A quarter of a cell at the frozen
+ *  res = 1, so no cliff cell can slip between two consecutive samples. */
+const LANE_DISC_STEP = 0.25;
+/** The grid-wide terrain rules (6, 9, 11) name at most this many offending
+ *  cells before falling back to a count. One error string per bad cell would
+ *  emit thousands on a broken grid and bury the one a reviewer needs; a total
+ *  plus the first offenders still says WHICH rule broke and BY HOW MUCH. */
+const TERRAIN_ERROR_SAMPLES = 4;
 
 const KIND_RADIUS: Record<StructureKind, number> = {
   tower: TOWER.radius,
@@ -141,6 +163,160 @@ function polylineDistance(path: readonly Vec2[], px: number, pz: number): number
   return best;
 }
 
+// ---- terrain helpers (validateMap rules 6..11) ---------------------------------
+
+/** The four orthogonal neighbours of a grid cell, each with the label the trap
+ *  and elevation-coherence rules print. Everything these rules reason about —
+ *  unit movement, the cliff push-out's wall-slide, the connectivity flood fill
+ *  — is 4-connected: a diagonal touch is not a crossing a unit can walk. */
+const NEIGHBOURS: readonly {
+  readonly di: number;
+  readonly dj: number;
+  readonly label: string;
+}[] = [
+  { di: -1, dj: 0, label: '-x' },
+  { di: 1, dj: 0, label: '+x' },
+  { di: 0, dj: -1, label: '-z' },
+  { di: 0, dj: 1, label: '+z' },
+];
+
+/** One thing the connectivity flood fill (rule 8) must be able to walk to: a
+ *  structure or a camp clearing, resolved to the cell that contains it. */
+interface ReachTarget {
+  /** Human-readable identity, e.g. `structure #7 (team 0 tower)`. */
+  readonly label: string;
+  readonly x: number;
+  readonly z: number;
+  /** Linear index in the VALIDATOR's own row-major enumeration (j * dim + i).
+   *  Never the grid's internal index — that order is terrain.ts's business. */
+  readonly cell: number;
+  readonly kind: TerrainKind;
+  readonly passable: boolean;
+}
+
+/** Bounded error sink for the grid-wide terrain rules (6, 7, 9, 11). A broken
+ *  grid can offend in thousands of cells, and one string per cell would bury
+ *  the one line a reviewer needs. The first TERRAIN_ERROR_SAMPLES offenders are
+ *  reported in full — with measured values, like every other rule in this file
+ *  — and the remainder collapse into one count. `add` takes a THUNK so a
+ *  catastrophically broken grid never formats the messages it will not print. */
+interface CappedErrors {
+  add(detail: () => string): void;
+  flush(): void;
+}
+
+function capped(errors: string[], surplus: (n: number) => string): CappedErrors {
+  let found = 0;
+  return {
+    add(detail: () => string): void {
+      if (found < TERRAIN_ERROR_SAMPLES) errors.push(detail());
+      found++;
+    },
+    flush(): void {
+      if (found > TERRAIN_ERROR_SAMPLES) errors.push(surplus(found - TERRAIN_ERROR_SAMPLES));
+    },
+  };
+}
+
+/** Grid cell index containing world coordinate `v`, clamped into [0, dim-1] —
+ *  the same clamp the frozen terrain queries apply out of bounds. */
+function cellIndex(v: number, res: number, dim: number): number {
+  const i = Math.floor(v * res);
+  if (!(i > 0)) return 0; // also catches NaN
+  return i > dim - 1 ? dim - 1 : i;
+}
+
+/** World x (or z) of the CENTRE of cell `i`. Every terrain rule samples cell
+ *  centres: cells are addressed by world position through kindAt/elevationAt/
+ *  isPassable, never by index arithmetic into the grid's arrays. Note that the
+ *  mirror of a centre is exactly another centre — side - (i+0.5)/res is the
+ *  centre of cell dim-1-i — which is why rule 6 can compare kinds exactly. */
+function cellMid(i: number, res: number): number {
+  return (i + 0.5) / res;
+}
+
+/** The two kinds that are a MARKED level transition. Rule 11 lets a high region
+ *  border low ground only through one of these; rule 7 lets a lane cross
+ *  exactly a 'ramp' (a 'cliff' across a lane would strand every creep wave,
+ *  which have no pathfinding — TERRAIN_CONTRACT §4). */
+function isTransition(k: TerrainKind): boolean {
+  return k === 'cliff' || k === 'ramp';
+}
+
+/** Stable identity for a camp in error strings. */
+function campLabel(c: CampDef): string {
+  return `camp #${c.id} (${c.tier}, half ${c.half})`;
+}
+
+/** How many of cell (i,j)'s four orthogonal sides are impassable (rule 9).
+ *  **Off-map counts as impassable**: the movement clamp at the map frame
+ *  behaves exactly like a wall, so a one-cell pocket against the frame traps a
+ *  unit precisely as a pocket between cliffs does. */
+function blockedSideCount(
+  terrain: TerrainDef,
+  res: number,
+  dim: number,
+  i: number,
+  j: number,
+): number {
+  let blocked = 0;
+  for (const n of NEIGHBOURS) {
+    const ni = i + n.di;
+    const nj = j + n.dj;
+    if (ni < 0 || ni >= dim || nj < 0 || nj >= dim) {
+      blocked++;
+    } else if (!isPassable(terrain, cellMid(ni, res), cellMid(nj, res))) {
+      blocked++;
+    }
+  }
+  return blocked;
+}
+
+/** The labels of those sides, e.g. `-x, +z (map edge)`. Split from the count so
+ *  the every-cell scan allocates nothing and only a reported cell formats. */
+function blockedSideLabels(
+  terrain: TerrainDef,
+  res: number,
+  dim: number,
+  i: number,
+  j: number,
+): string {
+  const parts: string[] = [];
+  for (const n of NEIGHBOURS) {
+    const ni = i + n.di;
+    const nj = j + n.dj;
+    if (ni < 0 || ni >= dim || nj < 0 || nj >= dim) {
+      parts.push(`${n.label} (map edge)`);
+    } else if (!isPassable(terrain, cellMid(ni, res), cellMid(nj, res))) {
+      parts.push(`${n.label} ('${kindAt(terrain, cellMid(ni, res), cellMid(nj, res))}')`);
+    }
+  }
+  return parts.join(', ');
+}
+
+/** Resolve a structure or camp position to the cell the flood fill must reach. */
+function reachTarget(
+  terrain: TerrainDef,
+  res: number,
+  dim: number,
+  label: string,
+  x: number,
+  z: number,
+): ReachTarget {
+  const i = cellIndex(x, res, dim);
+  const j = cellIndex(z, res, dim);
+  const mx = cellMid(i, res);
+  const mz = cellMid(j, res);
+  return {
+    label,
+    x,
+    z,
+    cell: j * dim + i,
+    kind: kindAt(terrain, mx, mz),
+    passable: isPassable(terrain, mx, mz),
+  };
+}
+
 // ---- buildMap ----------------------------------------------------------------
 
 /**
@@ -152,6 +328,11 @@ function polylineDistance(path: readonly Vec2[], px: number, pz: number): number
  * (lane-major, near-to-far from team 0's Ancient), team 0 guards, team 0
  * ancient, then team 1 mirrored (lane-major, near-to-far from team 1's
  * Ancient, guards, ancient).
+ *
+ * `terrain` comes from `buildTerrain(lanes)` and is REQUIRED on every MapDef
+ * (TERRAIN_CONTRACT §2). It is a pure function of the same lane count, so a
+ * client that rebuilds the map from `rift_begin.lanes` gets a bit-identical
+ * grid without terrain ever touching the wire.
  */
 export function buildMap(lanes: number): MapDef {
   if (!Number.isInteger(lanes) || lanes < MIN_LANES || lanes > MAX_LANES) {
@@ -235,7 +416,7 @@ export function buildMap(lanes: number): MapDef {
     });
   }
 
-  return { lanes, side, paths, structures };
+  return { lanes, side, paths, structures, terrain: buildTerrain(lanes) };
 }
 
 // ---- validateMap ---------------------------------------------------------------
@@ -252,6 +433,28 @@ export function buildMap(lanes: number): MapDef {
  *     TOWER_PATH_MAX_DIST of its lane polyline;
  *  4. min pairwise structure edge-to-edge clearance >= STRUCTURE_MARGIN;
  *  5. identical structure counts per team per kind.
+ *
+ * And the six terrain rules (TERRAIN_CONTRACT §3), numbered on from those:
+ *  6. mirror exactness: every cell's kind AND elevation equal its reflection's
+ *     through the map centre, and every camp has an exact mirror counterpart
+ *     of the same tier in the other half;
+ *  7. lane pathability: a HERO_RADIUS disc walking every lane polyline never
+ *     touches a 'cliff' cell ('ramp' is permitted, and expected at base
+ *     mouths — lane creeps have no pathfinding, so a cliff strands the wave);
+ *  8. connectivity: a flood fill over passable cells from EACH ancient reaches
+ *     the other ancient, every structure and every camp clearing;
+ *  9. no concave traps: no passable cell has impassable neighbours on 3+ of
+ *     its 4 sides — this is what makes the wall-slide push-out sufficient and
+ *     is why creeps need no navmesh;
+ * 10. camp isolation: every camp centre is >= CAMP_LANE_CLEARANCE from every
+ *     lane polyline, so a passing wave can never aggro a camp;
+ * 11. elevation coherence: every high cell borders low ground only through a
+ *     'cliff' or a 'ramp' — an unmarked step would let units walk uphill and
+ *     make the uphill vision and miss rules read as a bug.
+ *
+ * Rules 6..11 read the grid ONLY through the frozen O(1) queries, sampled at
+ * cell centres, and are skipped as a body if the grid does not cover the map
+ * square (every sample would address the wrong cell).
  */
 export function validateMap(map: MapDef): MapValidation {
   const errors: string[] = [];
@@ -400,6 +603,301 @@ export function validateMap(map: MapDef): MapValidation {
           `identical structure counts per kind`,
       );
     }
+  }
+
+  // == TERRAIN (TERRAIN_CONTRACT §3), rules 6..11 ================================
+  // Precondition for all six: the grid must BE the map square. A grid that
+  // disagrees with map.side would make every sample below address the wrong
+  // cell, so it is reported once and the six rules are skipped rather than
+  // emitting thousands of meaningless offsets.
+  const terrain = map.terrain;
+  const dim = terrain.grid.dim;
+  const res = terrain.grid.res;
+  const gridOk =
+    sideOk &&
+    Number.isInteger(dim) &&
+    dim > 0 &&
+    Number.isFinite(res) &&
+    res > 0 &&
+    Math.abs(dim - map.side * res) < 1e-9;
+  if (!gridOk) {
+    errors.push(
+      `terrain grid does not cover the map square: grid.dim = ${String(dim)} at grid.res = ` +
+        `${String(res)} spans ${String(dim / res)} m, but the map side is ${String(map.side)} m — ` +
+        `terrain rules 6..11 were skipped because every cell sample would address the wrong cell`,
+    );
+  }
+
+  if (gridOk) {
+    // -- rule 6: mirror exactness (cells, then camps) ---------------------------
+    // The reflection of a cell centre is exactly another cell centre, so kinds
+    // and elevations compare exactly — no tolerance. Each mirrored PAIR is
+    // tested once (only cells whose own linear index is below their partner's),
+    // so one broken cell yields one error, not two.
+    const mirrorCells = capped(
+      errors,
+      (n) =>
+        `terrain mirror: ${n} further cell(s) differ from their reflection through the map centre`,
+    );
+    for (let j = 0; j < dim; j++) {
+      for (let i = 0; i < dim; i++) {
+        const p = j * dim + i;
+        const q = (dim - 1 - j) * dim + (dim - 1 - i);
+        if (p >= q) continue;
+        const x = cellMid(i, res);
+        const z = cellMid(j, res);
+        const mx = map.side - x;
+        const mz = map.side - z;
+        const ka = kindAt(terrain, x, z);
+        const kb = kindAt(terrain, mx, mz);
+        if (ka !== kb) {
+          mirrorCells.add(
+            () =>
+              `terrain mirror break at (${x.toFixed(1)}, ${z.toFixed(1)}): kind '${ka}', but its ` +
+              `reflection through the centre at (${mx.toFixed(1)}, ${mz.toFixed(1)}) is '${kb}' — ` +
+              `the halves must be identical under (x,z) -> (side-x, side-z)`,
+          );
+          continue; // one report per pair; a wrong kind usually drags elevation with it
+        }
+        const ea = elevationAt(terrain, x, z);
+        const eb = elevationAt(terrain, mx, mz);
+        if (ea !== eb) {
+          mirrorCells.add(
+            () =>
+              `terrain mirror break at (${x.toFixed(1)}, ${z.toFixed(1)}): elevation ${ea} on a ` +
+              `'${ka}' cell, but its reflection at (${mx.toFixed(1)}, ${mz.toFixed(1)}) is ` +
+              `elevation ${eb} — the halves must be identical under (x,z) -> (side-x, side-z)`,
+          );
+        }
+      }
+    }
+    mirrorCells.flush();
+    // §3: "Every terrain cell AND EVERY CAMP must satisfy it exactly." Iterating
+    // every camp asserts half 0 -> half 1 and half 1 -> half 0, exactly as rule
+    // 2 does for structures, and reports the measured miss the same way.
+    for (const c of terrain.camps) {
+      const mx = map.side - c.x;
+      const mz = map.side - c.z;
+      let best = Infinity;
+      for (const d of terrain.camps) {
+        if (d.half === c.half || d.tier !== c.tier) continue;
+        const gap = Math.hypot(d.x - mx, d.z - mz);
+        if (gap < best) best = gap;
+      }
+      if (!(best <= MIRROR_TOL)) {
+        errors.push(
+          `${campLabel(c)} at (${c.x.toFixed(2)}, ${c.z.toFixed(2)}) has no mirror counterpart: ` +
+            `its reflection through the centre lands at (${mx.toFixed(2)}, ${mz.toFixed(2)}), ` +
+            (best === Infinity
+              ? `and half ${1 - c.half} has no ${c.tier} camp at all`
+              : `and the nearest half ${1 - c.half} ${c.tier} camp is ${best.toFixed(4)} m away`),
+        );
+      }
+    }
+
+    // -- rule 7: lane pathability (the hero disc never touches a cliff) ---------
+    // Marched at LANE_DISC_STEP, a quarter of a cell, so no cliff cell can slip
+    // between two consecutive samples. Overlap is measured against the cell
+    // SQUARE, not its centre: a disc clipping the corner of a cliff cell is a
+    // collision. Each offending cell is named once per lane, however many
+    // samples touch it, and each lane gets its own budget of samples so a
+    // broken lane 0 never hides a broken lane 1.
+    for (const [pi, path] of map.paths.entries()) {
+      const len = pathLength(path);
+      const samples = Math.max(1, Math.ceil(len / LANE_DISC_STEP));
+      const reported = new Set<number>();
+      const laneErrors = capped(
+        errors,
+        (n) => `lane ${pi}: ${n} further 'cliff' cell(s) lie under the lane corridor`,
+      );
+      for (let s = 0; s <= samples; s++) {
+        const arc = Math.min(len, s * LANE_DISC_STEP);
+        const pose = walkPath(path, arc);
+        const i0 = cellIndex(pose.x - HERO_RADIUS, res, dim);
+        const i1 = cellIndex(pose.x + HERO_RADIUS, res, dim);
+        const j0 = cellIndex(pose.z - HERO_RADIUS, res, dim);
+        const j1 = cellIndex(pose.z + HERO_RADIUS, res, dim);
+        for (let j = j0; j <= j1; j++) {
+          for (let i = i0; i <= i1; i++) {
+            const key = j * dim + i;
+            if (reported.has(key)) continue;
+            const x = cellMid(i, res);
+            const z = cellMid(j, res);
+            if (kindAt(terrain, x, z) !== 'cliff') continue;
+            const qx = Math.min(Math.max(pose.x, i / res), (i + 1) / res);
+            const qz = Math.min(Math.max(pose.z, j / res), (j + 1) / res);
+            const d = Math.hypot(pose.x - qx, pose.z - qz);
+            if (d >= HERO_RADIUS) continue;
+            reported.add(key);
+            laneErrors.add(
+              () =>
+                `lane ${pi} is not pathable ${arc.toFixed(2)} m along its polyline: a ` +
+                `${HERO_RADIUS} m hero disc centred (${pose.x.toFixed(2)}, ${pose.z.toFixed(2)}) ` +
+                `overlaps the 'cliff' cell at (${x.toFixed(1)}, ${z.toFixed(1)}) — ${d.toFixed(2)} m ` +
+                `from the disc centre, needs >= ${HERO_RADIUS.toFixed(2)} m ('ramp' is permitted ` +
+                `across a lane, 'cliff' is not)`,
+            );
+          }
+        }
+      }
+      laneErrors.flush();
+    }
+
+    // -- rule 8: connectivity by flood fill over passable cells -----------------
+    // One fill per ancient, each asserting it reaches the other ancient, every
+    // structure and every camp clearing. A target's cell being impassable is a
+    // different defect from its being walled off, so it is reported once, up
+    // front, and excluded from the reachability pass rather than reported twice.
+    let passableTotal = 0;
+    for (let j = 0; j < dim; j++) {
+      for (let i = 0; i < dim; i++) {
+        if (isPassable(terrain, cellMid(i, res), cellMid(j, res))) passableTotal++;
+      }
+    }
+    const targets: ReachTarget[] = [];
+    for (const s of map.structures) {
+      if (!finite(s)) continue; // rule 1 already reports it
+      targets.push(
+        reachTarget(terrain, res, dim, `structure #${s.id} (team ${s.team} ${s.kind})`, s.x, s.z),
+      );
+    }
+    for (const c of terrain.camps) {
+      targets.push(reachTarget(terrain, res, dim, `${campLabel(c)} clearing`, c.x, c.z));
+    }
+    for (const target of targets) {
+      if (!target.passable) {
+        errors.push(
+          `terrain connectivity: ${target.label} at (${target.x.toFixed(2)}, ` +
+            `${target.z.toFixed(2)}) stands on an impassable '${target.kind}' cell — nothing can ` +
+            `walk to it`,
+        );
+      }
+    }
+    for (const anc of map.structures) {
+      if (anc.kind !== 'ancient' || !finite(anc)) continue;
+      const si = cellIndex(anc.x, res, dim);
+      const sj = cellIndex(anc.z, res, dim);
+      if (!isPassable(terrain, cellMid(si, res), cellMid(sj, res))) continue; // reported above
+      const seen = new Uint8Array(dim * dim);
+      const start = sj * dim + si;
+      seen[start] = 1;
+      const stack: number[] = [start];
+      let reached = 1;
+      while (stack.length > 0) {
+        const p = stack.pop();
+        if (p === undefined) break; // length > 0 guarantees a value; narrowing only
+        const pi = p % dim;
+        const pj = (p - pi) / dim;
+        for (const n of NEIGHBOURS) {
+          const ni = pi + n.di;
+          const nj = pj + n.dj;
+          if (ni < 0 || ni >= dim || nj < 0 || nj >= dim) continue;
+          const q = nj * dim + ni;
+          if (seen[q] === 1) continue;
+          if (!isPassable(terrain, cellMid(ni, res), cellMid(nj, res))) continue;
+          seen[q] = 1;
+          reached++;
+          stack.push(q);
+        }
+      }
+      for (const target of targets) {
+        if (!target.passable) continue; // already reported, and trivially unreachable
+        if (seen[target.cell] === 1) continue;
+        errors.push(
+          `terrain connectivity: ${target.label} at (${target.x.toFixed(2)}, ` +
+            `${target.z.toFixed(2)}) is unreachable from team ${anc.team}'s ancient at ` +
+            `(${anc.x.toFixed(2)}, ${anc.z.toFixed(2)}) — the passable flood fill from there ` +
+            `covers ${reached} of ${passableTotal} passable cells and never reaches it`,
+        );
+      }
+    }
+
+    // -- rule 9: no concave traps -----------------------------------------------
+    const traps = capped(
+      errors,
+      (n) =>
+        `terrain traps: ${n} further passable cell(s) have impassable neighbours on 3 or more of ` +
+        `their 4 sides`,
+    );
+    for (let j = 0; j < dim; j++) {
+      for (let i = 0; i < dim; i++) {
+        const x = cellMid(i, res);
+        const z = cellMid(j, res);
+        if (!isPassable(terrain, x, z)) continue;
+        const blocked = blockedSideCount(terrain, res, dim, i, j);
+        if (blocked < 3) continue;
+        traps.add(
+          () =>
+            `terrain trap at (${x.toFixed(1)}, ${z.toFixed(1)}): the passable ` +
+            `'${kindAt(terrain, x, z)}' cell is walled on ${blocked} of its 4 sides ` +
+            `(${blockedSideLabels(terrain, res, dim, i, j)}) — at most 2 may be impassable, or a ` +
+            `unit that walks in cannot wall-slide back out`,
+        );
+      }
+    }
+    traps.flush();
+
+    // -- rule 10: camp isolation from every lane ---------------------------------
+    for (const c of terrain.camps) {
+      let best = Infinity;
+      let bestLane = -1;
+      for (const [li, path] of map.paths.entries()) {
+        const d = polylineDistance(path, c.x, c.z);
+        if (d < best) {
+          best = d;
+          bestLane = li;
+        }
+      }
+      if (best < CAMP_LANE_CLEARANCE) {
+        errors.push(
+          `${campLabel(c)} at (${c.x.toFixed(2)}, ${c.z.toFixed(2)}) is ${best.toFixed(2)} m from ` +
+            `lane ${bestLane}'s polyline — a camp must sit at least ${CAMP_LANE_CLEARANCE} m from ` +
+            `every lane, or a passing wave will aggro it`,
+        );
+      }
+    }
+
+    // -- rule 11: elevation coherence ---------------------------------------------
+    // Subject: every non-transition cell at ELEV_HIGH — which is 'high', 'base'
+    // and any high camp clearing, NOT just the plateau kinds, because §3 lets a
+    // camp clearing be 'ground' at either elevation. 'cliff' and 'ramp' ARE the
+    // marked transition, so they are never the subject and are always a legal
+    // neighbour. The map frame is a wall and is skipped: there is no low ground
+    // outside it to step down to.
+    const stepErrors = capped(
+      errors,
+      (n) =>
+        `terrain elevation: ${n} further high cell(s) border low ground with no 'cliff' or 'ramp' ` +
+        `between them`,
+    );
+    for (let j = 0; j < dim; j++) {
+      for (let i = 0; i < dim; i++) {
+        const x = cellMid(i, res);
+        const z = cellMid(j, res);
+        const k = kindAt(terrain, x, z);
+        if (isTransition(k)) continue;
+        if (elevationAt(terrain, x, z) !== ELEV_HIGH) continue;
+        for (const n of NEIGHBOURS) {
+          const ni = i + n.di;
+          const nj = j + n.dj;
+          if (ni < 0 || ni >= dim || nj < 0 || nj >= dim) continue;
+          const nx = cellMid(ni, res);
+          const nz = cellMid(nj, res);
+          const nk = kindAt(terrain, nx, nz);
+          if (isTransition(nk)) continue;
+          if (elevationAt(terrain, nx, nz) === ELEV_HIGH) continue;
+          stepErrors.add(
+            () =>
+              `terrain elevation step at (${x.toFixed(1)}, ${z.toFixed(1)}): the high '${k}' cell ` +
+              `borders the low '${nk}' cell at (${nx.toFixed(1)}, ${nz.toFixed(1)}) on its ` +
+              `${n.label} side with no 'cliff' or 'ramp' between them — an unmarked step lets ` +
+              `units walk uphill and makes the uphill vision and miss rules read as a bug`,
+          );
+          break; // one report per offending high cell, however many sides step down
+        }
+      }
+    }
+    stepErrors.flush();
   }
 
   return { ok: errors.length === 0, errors };

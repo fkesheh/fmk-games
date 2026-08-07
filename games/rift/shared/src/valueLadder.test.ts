@@ -7,6 +7,13 @@
 // law (S1/S2/S4), HUD text contrast, hero-accent distinguishability, and the
 // APAL <-> APAL_CSS_VARS mirror.
 //
+// EXTENDED for the PBR + terrain pass (GRAPHICS_CONTRACT §3) with cases for the
+// new families: the tier law over cliff/dirt/wetStone/water/canopy/bark/fern/
+// iron/bronze/gold/neutral, the large-surface-vs-moss separation, the
+// neutral-camp identity against both teams and every hero accent, and the night
+// sky state under the same S1/S2/S4 laws that bind the day state. Cases were
+// ADDED; not one threshold moved.
+//
 // This file is the CONTRACT, not an opinion. NO IMPLEMENTER MAY WEAKEN A
 // THRESHOLD — retune the palette instead. Assertion style mirrors
 // games/kart/shared/src/valueLadder.test.ts: every failure message carries
@@ -30,6 +37,10 @@ const PAPER_ON_INK_MIN = 60; // HUD text contrast floor
 const ACCENT_HUE_MIN = 25; // hero accents pairwise: >= 25 deg …
 const ACCENT_L_MIN = 20; // … OR >= 20 L*
 const FOG_SHROUD_ALPHA = 0.55; // explored-not-visible ground composite
+const LARGE_VS_MOSS_L_MIN = 12; // new large surfaces vs open ground: >= 12 L* …
+const LARGE_VS_MOSS_HUE_MIN = 25; // … OR >= 25 deg of hue
+const NEUTRAL_HUE_MIN = 25; // neutral camps vs teams/accents: >= 25 deg …
+const NEUTRAL_L_MIN = 20; // … OR >= 20 L*
 
 function n(x: number): string {
   return x.toFixed(1);
@@ -50,6 +61,20 @@ const TIERS: readonly (readonly [string, string, string, string])[] = [
   ['azure', APAL.azure, APAL.azureLit, APAL.azureDeep],
   ['ember', APAL.ember, APAL.emberLit, APAL.emberDeep],
   ['ink', APAL.ink, APAL.inkLit, APAL.inkDeep],
+  // --- added by the PBR + terrain pass (GRAPHICS_CONTRACT §3). Each family's
+  //     {base, Lit, Deep} is also its seeded tint ladder (STYLE_BIBLE §8), so a
+  //     step that fails the 8 L* floor is a scatter whose variation is invisible.
+  ['cliff', APAL.cliff, APAL.cliffLit, APAL.cliffDeep],
+  ['dirt', APAL.dirt, APAL.dirtLit, APAL.dirtDeep],
+  ['wetStone', APAL.wetStone, APAL.wetStoneLit, APAL.wetStoneDeep],
+  ['water', APAL.water, APAL.waterLit, APAL.waterDeep],
+  ['canopy', APAL.canopy, APAL.canopyLit, APAL.canopyDeep],
+  ['bark', APAL.bark, APAL.barkLit, APAL.barkDeep],
+  ['fern', APAL.fern, APAL.fernLit, APAL.fernDeep],
+  ['iron', APAL.iron, APAL.ironLit, APAL.ironDeep],
+  ['bronze', APAL.bronze, APAL.bronzeLit, APAL.bronzeDeep],
+  ['gold', APAL.gold, APAL.goldLit, APAL.goldDeep],
+  ['neutral', APAL.neutral, APAL.neutralLit, APAL.neutralDeep],
 ];
 
 describe('ANCIENTS tier floors (Lit/Deep vs base >= 8 L*)', () => {
@@ -116,6 +141,34 @@ describe('ANCIENTS ground law (L5) and structure separation', () => {
         `L(moss ${APAL.moss})=${n(L(APAL.moss))} = ${n(d)} >= ${MONUMENT_VS_MOSS_MIN}`,
     ).toBeGreaterThanOrEqual(MONUMENT_VS_MOSS_MIN);
   });
+});
+
+// ============================================================================
+// LARGE-SURFACE SEPARATION (GRAPHICS_CONTRACT §3) — every new family that
+// covers a large fraction of the frame must be tellable from the open ground it
+// sits on or against: >= 12 L* OR >= 25 deg of hue from moss.
+//
+// The two branches are not interchangeable in intent. `cliff`, `dirt` and
+// `water` clear it on hue AND value; `canopy` deliberately shares moss's hue —
+// a forest IS the ground's colour family — and carries the whole separation on
+// value, which is why the OR is written as an OR and not an AND.
+// ============================================================================
+const LARGE_SURFACES = ['cliff', 'dirt', 'canopy', 'water'] as const;
+
+describe('ANCIENTS large-surface families vs open ground', () => {
+  for (const name of LARGE_SURFACES) {
+    it(`${name} vs moss: >= ${LARGE_VS_MOSS_L_MIN} L* or >= ${LARGE_VS_MOSS_HUE_MIN} deg hue`, () => {
+      const dL = Math.abs(L(APAL[name]) - L(APAL.moss));
+      const dH = hueDistance(APAL[name], APAL.moss);
+      expect(
+        dL >= LARGE_VS_MOSS_L_MIN || dH >= LARGE_VS_MOSS_HUE_MIN,
+        `terrain readability: ${name} ${APAL[name]} vs moss ${APAL.moss}: ` +
+          `dL=${n(dL)} (need >= ${LARGE_VS_MOSS_L_MIN}) AND dH=${n(dH)} ` +
+          `(need >= ${LARGE_VS_MOSS_HUE_MIN}) both fail — the ground would merge ` +
+          `with the terrain feature standing on it`,
+      ).toBe(true);
+    });
+  }
 });
 
 // ============================================================================
@@ -200,6 +253,50 @@ describe('ANCIENTS sky law (S1/S2/S4)', () => {
 });
 
 // ============================================================================
+// NIGHT SKY LAW — the SAME S1/S2/S4 that bind the day state bind at t=1.
+// `setTimeOfDay` interpolates day -> night, so a night state that breaks the
+// laws breaks them for every intermediate t as well; night is a second authored
+// lighting state (STYLE_BIBLE §4), never "day with the lights off".
+// ============================================================================
+describe('ANCIENTS night sky law (S1/S2/S4)', () => {
+  it('S1 — nightSky is cooler than nightHorizon', () => {
+    expect(
+      isCooler(APAL.nightSky, APAL.nightHorizon),
+      `S1 (night): zenith must be COOLER — expected blueBias(nightSky ` +
+        `${APAL.nightSky})=${n(blueBias(APAL.nightSky))} > blueBias(nightHorizon ` +
+        `${APAL.nightHorizon})=${n(blueBias(APAL.nightHorizon))}`,
+    ).toBe(true);
+  });
+
+  it(`S1 — nightSky is >= ${SKY_L_MIN} L* darker than nightHorizon`, () => {
+    const d = L(APAL.nightHorizon) - L(APAL.nightSky);
+    expect(
+      d,
+      `S1 (night): expected L(nightHorizon ${APAL.nightHorizon})=` +
+        `${n(L(APAL.nightHorizon))} - L(nightSky ${APAL.nightSky})=` +
+        `${n(L(APAL.nightSky))} = ${n(d)} >= ${SKY_L_MIN}`,
+    ).toBeGreaterThanOrEqual(SKY_L_MIN);
+  });
+
+  it('S2 — nightFog matches the night horizon stop exactly', () => {
+    expect(
+      APAL.nightFog,
+      `S2 (night): expected APAL.nightFog (${APAL.nightFog}) === APAL.nightHorizon ` +
+        `(${APAL.nightHorizon}) — the fog colour IS the horizon stop in both states`,
+    ).toBe(APAL.nightHorizon);
+  });
+
+  it('S4 — the night ground never matches the night horizon', () => {
+    expect(
+      APAL.nightGround,
+      `S4 (night): expected APAL.nightGround (${APAL.nightGround}) !== ` +
+        `APAL.nightHorizon (${APAL.nightHorizon}) — moonlit terrain blending into ` +
+        `the sky kills the horizon line exactly as it does by day`,
+    ).not.toBe(APAL.nightHorizon);
+  });
+});
+
+// ============================================================================
 // HUD TEXT
 // ============================================================================
 describe('ANCIENTS HUD text contrast', () => {
@@ -255,6 +352,61 @@ describe('ANCIENTS hero accents', () => {
           `a hero accent must never be mistaken for team identity`,
       ).not.toBe(APAL.ember);
     }
+  });
+});
+
+// ============================================================================
+// NEUTRAL-CAMP IDENTITY (GRAPHICS_CONTRACT §3) — NEUTRAL_TEAM = 2 is a third
+// visual identity, and the failure it exists to prevent is concrete: a player
+// blinks at a camp and reads it as an enemy wave, walks in, and dies. So it is
+// held to the same margin against BOTH team colours and EVERY hero accent.
+//
+// The list below is the six `visual.accent` keys the pairwise-accent suite uses
+// PLUS `arcane`: arcane is a palette hero-accent entry driven by ability FX
+// rather than by a hero body, and "every hero accent" in the contract means the
+// whole accent band, not just the six that appear on a chassis.
+// ============================================================================
+const NEUTRAL_RIVALS = [
+  'azure',
+  'ember',
+  'frost',
+  'arcane',
+  'heal',
+  'shade',
+  'pine',
+  'void',
+  'gold',
+] as const;
+
+describe('ANCIENTS neutral-camp identity', () => {
+  it(`neutral vs every team colour and hero accent: >= ${NEUTRAL_HUE_MIN} deg hue or >= ${NEUTRAL_L_MIN} L*`, () => {
+    const failures: string[] = [];
+    for (const name of NEUTRAL_RIVALS) {
+      const dH = hueDistance(APAL.neutral, APAL[name]);
+      const dL = Math.abs(L(APAL.neutral) - L(APAL[name]));
+      if (dH < NEUTRAL_HUE_MIN && dL < NEUTRAL_L_MIN) {
+        failures.push(
+          `neutral ${APAL.neutral} vs ${name} ${APAL[name]}: dH=${n(dH)} < ` +
+            `${NEUTRAL_HUE_MIN} AND dL=${n(dL)} < ${NEUTRAL_L_MIN}`,
+        );
+      }
+    }
+    expect(
+      failures,
+      `neutral identity collides — a neutral creep would be mistaken for an enemy ` +
+        `creep or a hero's ability colour:\n  ${failures.join('\n  ')}`,
+    ).toEqual([]);
+  });
+
+  it('neutral is not literally a team colour', () => {
+    expect(
+      APAL.neutral,
+      `neutral collision: neutral ${APAL.neutral} === azure ${APAL.azure}`,
+    ).not.toBe(APAL.azure);
+    expect(
+      APAL.neutral,
+      `neutral collision: neutral ${APAL.neutral} === ember ${APAL.ember}`,
+    ).not.toBe(APAL.ember);
   });
 });
 

@@ -9,30 +9,32 @@
 // SEAM (round-5): ClientState/UiActions do NOT carry the scene handle, so no
 // UiHandle module (hud.ts) can project world -> screen. This factory is
 // therefore driven one level up by game.ts (T8 owns modules.scene + interp).
-// The orchestrator applies the wiring (game.ts/contract.ts/wire.ts are NOT
-// T9 files — reported in the round-5 handoff, not applied here):
-//   contract.ts:  ClientModules += `nameLabels: NameLabelsHandle;`
-//   wire.ts:      modules literal += `nameLabels: createNameLabels(root),`
-//   game.ts step(), inside `if (inMatch)` after m.units.sync(...):
-//     m.nameLabels.update(
-//       this.interp.sample(),
-//       (x, z, out) => m.scene.groundToScreen(x, z, out),
-//       (pid) => this.helloView?.roster.find((r) => r.id === pid)?.name,
-//     );
+// The wiring the round-5 handoff asked the orchestrator for is IN PLACE:
+// `ClientModules.nameLabels` (contract.ts), `createNameLabels(root)` in the
+// wire.ts modules literal, and the per-frame `m.nameLabels.update(...)` call
+// in game.ts `step()`.
 //
 // Fog law: interp.sample() only contains server-visible ents, so fog-hidden
 // heroes simply never arrive here — no client-side fog check is needed (or
 // possible without leaking). Dead heroes (hp <= 0) get no label. The pool
 // caps at MAX_TEAM_SIZE * 2 — every seat in the match, no per-frame alloc.
 // ============================================================================
-import { APAL, MAX_TEAM_SIZE, heroById } from '@rift/shared';
+import { APAL, MAX_TEAM_SIZE, heroById, isPlayerTeam } from '@rift/shared';
 import type { TeamId } from '@rift/shared';
 import type { InterpEnt } from '../contract.js';
 
 const POOL_SIZE = MAX_TEAM_SIZE * 2;
 const FONT_PX = 12; // §8 floor
 /** Per-team SHAPE markers — team identity is shape AND colour, never colour
- *  alone (§8). ▲ = AZURE (team 0), ◆ = EMBER (team 1). */
+ *  alone (§8). ▲ = AZURE (team 0), ◆ = EMBER (team 1).
+ *
+ *  Both tuples are indexed by `TeamId`, NOT by `InterpEnt.team`, which is the
+ *  widened `EntTeam` (`TeamId | 2`) — a neutral jungle camp rides the same
+ *  snapshot path as a player's units. Index either with `NEUTRAL_TEAM` and the
+ *  read is out of bounds: the marker falls back to '' and the colour to
+ *  `APAL.paper`, i.e. a nameless label in the wrong family. `isPlayerTeam` is
+ *  the only sanctioned narrowing (types.ts) and `update` applies it before it
+ *  reaches either table. */
 const TEAM_MARKER: readonly string[] = ['▲', '◆'];
 const TEAM_COLOUR: readonly string[] = [APAL.azureLit, APAL.emberLit];
 
@@ -76,6 +78,13 @@ export function createNameLabels(parent: HTMLElement): NameLabelsHandle {
       for (const e of ents) {
         if (used >= pool.length) break; // cap at visible heroes
         if (e.k !== 'hero' || e.hp <= 0) continue;
+        // A neutral (NEUTRAL_TEAM) never gets a team-coloured name label: it
+        // belongs to no player team, has no roster name, and both tables below
+        // are TeamId-indexed. Skipped BEFORE a pool slot is taken, so a stray
+        // neutral cannot displace a real hero's label. Heroes are player-team
+        // by construction today; this is the narrowing the widened `EntTeam`
+        // requires, not a guess about who might appear here.
+        if (!isPlayerTeam(e.team)) continue;
         if (!project(e.x, e.z, pt)) continue; // behind the camera — stays hidden
         // anchor off the viewport = the hero is off-screen too (round-5:
         // groundToScreen's z-range check still passes just past the edges)
