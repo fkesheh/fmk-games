@@ -91,16 +91,20 @@
       "games/rift/client/src/render/units.ts"
     ],
     "R_MESH_HERO": [
-      "games/rift/client/src/render/meshes/heroes.ts"
+      "games/rift/client/src/render/meshes/heroes.ts",
+      "games/rift/client/src/render/meshes/heroes.test.ts"
     ],
     "R_MESH_CREEP": [
-      "games/rift/client/src/render/meshes/creeps.ts"
+      "games/rift/client/src/render/meshes/creeps.ts",
+      "games/rift/client/src/render/meshes/creeps.test.ts"
     ],
     "R_MESH_CAMP": [
-      "games/rift/client/src/render/meshes/camps.ts"
+      "games/rift/client/src/render/meshes/camps.ts",
+      "games/rift/client/src/render/meshes/camps.test.ts"
     ],
     "R_MESH_STRUCT": [
-      "games/rift/client/src/render/meshes/structures.ts"
+      "games/rift/client/src/render/meshes/structures.ts",
+      "games/rift/client/src/render/meshes/structures.test.ts"
     ],
     "R_FX": [
       "games/rift/client/src/render/fx.ts"

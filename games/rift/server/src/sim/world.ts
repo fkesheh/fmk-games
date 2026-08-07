@@ -17,6 +17,9 @@
 import {
   ANCIENT,
   ARMOR_K,
+  CAMP_BRUTE,
+  CAMP_HIVE,
+  CAMP_PACK,
   CREEP_MELEE,
   CREEP_RANGED,
   CREEP_SIEGE,
@@ -45,11 +48,13 @@ import {
   WARD_VISION,
   WAVE_FIRST_AT_S,
   heroById,
+  isPlayerTeam,
 } from '@rift/shared';
 import type {
   AuraStat,
   CreepTuning,
   EntKind,
+  EntTeam,
   ItemId,
   MapDef,
   TeamId,
@@ -58,6 +63,7 @@ import { NO_ENT } from './types.js';
 import type {
   AbilitiesEngine,
   AuraInstance,
+  CampState,
   Ent,
   EntId,
   Order,
@@ -68,7 +74,9 @@ import type {
 } from './types.js';
 import { stepMovement } from './movement.js';
 import { stepCombat, stepDeaths } from './combat.js';
+import { stepCamps } from './camps.js';
 import { stepUnits } from './units.js';
+import { cellIndexAt, cellMidX, cellMidZ, nearestPassableCell } from './pathing.js';
 
 interface QueuedOrder {
   readonly hero: EntId;
@@ -107,6 +115,17 @@ export interface PassiveAuraEntry {
 const DASH_TICKS = Math.round(0.15 * TICK_RATE); // dashes cross in ~0.15 s
 const MAX_AURA_INSTANCES = 16; // far above anything the roster can produce
 
+/** How far (in cells) an order destination inside a cliff may snap out to the
+ *  nearest walkable cell (AMENDMENT_1 §C).
+ *
+ *  Six cells, which is the same allowance A*'s goal snap uses in pathing.ts:
+ *  an order and the search that serves it must agree about which destinations
+ *  are reachable, or a hero would be sent to a point the planner then refuses
+ *  to route to. A click on a cliff FACE walks you to the foot of it; a click
+ *  six metres deep inside a mountain is not a destination at all, and the
+ *  order keeps its literal coordinate so movement stops the unit at the face. */
+const ORDER_SNAP_CELLS = 6;
+
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
@@ -114,7 +133,7 @@ function clamp(v: number, lo: number, hi: number): number {
 function makeEnt(
   id: EntId,
   kind: EntKind,
-  team: TeamId,
+  team: EntTeam,
   x: number,
   z: number,
   radius: number,
@@ -148,6 +167,12 @@ function makeEnt(
     ox: 0,
     oz: 0,
     orderTarget: NO_ENT,
+    // AMENDMENT_2 §D.1. The frozen shape says `path: readonly Vec2[] | null`
+    // and `pathIndex: number`, so "not written yet" is null/0 — never
+    // `undefined`. Leaving them off forced every reader in movement.ts and
+    // camps.ts to coalesce, and made the object literal itself a type error.
+    path: null,
+    pathIndex: 0,
     lane: -1,
     waypoint: 0,
     stunUntilTick: 0,
@@ -180,7 +205,14 @@ function makeEnt(
   };
 }
 
-/** Tuning for spawnMobile kinds that come from config's CreepTuning shape. */
+/** Tuning for spawnMobile kinds that come from config's CreepTuning shape.
+ *
+ *  The three camp kinds are here for one reason that cannot be fixed anywhere
+ *  else (AMENDMENT_2 §D.2): `Ent.radius` is `readonly` and is written once, by
+ *  `makeEnt`, from `t.radius`. `applyCampStats` runs afterwards and cannot
+ *  correct it — so without these arms every camp member carried the 0.3 m
+ *  fallback instead of its tier's 0.38 / 0.70 / 0.40, and combat reach,
+ *  separation and structure push-out were all wrong for a brute by 0.4 m. */
 function mobileTuning(kind: EntKind): CreepTuning | null {
   switch (kind) {
     case 'melee':
@@ -191,6 +223,12 @@ function mobileTuning(kind: EntKind): CreepTuning | null {
       return CREEP_SIEGE;
     case 'shade':
       return SUMMON_SHADE;
+    case 'campPack':
+      return CAMP_PACK;
+    case 'campBrute':
+      return CAMP_BRUTE;
+    case 'campHive':
+      return CAMP_HIVE;
     default:
       return null;
   }
