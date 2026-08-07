@@ -39,21 +39,55 @@
 //      when not in foliage, so it costs no width in the common case.
 //   4. MISS FLOAT on `rift_miss`. The event carries ENTITY ids, so the local
 //      hero's entity is resolved by `pid` out of `snap.ents` — only on a miss
-//      event, never per frame. Your whiffed swing floats danger-red, an
-//      enemy's whiff against you floats heal-green: an uphill miss with no
-//      feedback reads as a bug (protocol.ts, rift_miss).
+//      event, never per frame. The two directions are told apart by WORD,
+//      ANCHOR and COLOUR, never by colour alone (§8): your own whiffed swing
+//      floats the word MISS in danger-red off the PORTRAIT (the thing that
+//      swung), an enemy's whiff against you floats EVADED in heal-green off
+//      the HP BAR (the thing that was spared). An uphill miss with no feedback
+//      reads as a bug (protocol.ts, rift_miss).
 //
-// No new DOM class is minted for any of it. The day/night mark lives inside
-// `.match-clock` as classless children plus the `--night` state modifier; the
-// two chips are classless children of `.hud-bars`; the MISS float reuses
-// `.dmg-number`. That keeps the frozen DOM CLASS CONTRACT intact.
+//      *** THIS CANNOT FIRE YET — TWO LINKS OF THE CHAIN ARE MISSING. ***
+//      Traced end to end on the tree as it stands, and BOTH gaps are outside
+//      this module:
+//        1. `server/src/room.ts` `dispatchEvents` switches on `ev.k` over
+//           cast/kill/structure/surge/end and has NO `'miss'` arm, so the
+//           `SimEvent` that `AMENDMENT_1` §B.2 added — and that
+//           `sim/types.ts:281` documents room.ts as mapping — is drained and
+//           dropped. Nothing ever puts `rift_miss` on the wire. (S_ROOM.)
+//        2. `client/src/net.ts` `parseEvent` (net.ts:303) has no `rift_miss`
+//           case, so even once it is on the wire every miss event falls
+//           through `default: return null` and never reaches
+//           `ClientState.events`. (R_WIRE, recorded in AMENDMENT_3.)
+//      The float below is correct and is tested against a synthetic event, but
+//      it is UNREACHABLE in a real match until both land. Neither file is this
+//      module's to edit. Do NOT report this affordance as working; the tripwire
+//      in hud.test.ts fails if this note is removed while the gaps remain.
 //
-// PER-FRAME COST. `dayPhase` moves continuously, so the dial's gradient and
-// glow strings are PRE-BUILT at module load into a 25-step ladder and written
-// only when the quantised step changes — the render loop allocates no colour
-// string and touches no style property that did not change (GRAPHICS_CONTRACT
-// §5: no per-frame allocation). `buildMap` is called at most once per match
-// and its `MapDef` serves both the lane arrow and the terrain chips.
+// DOM CLASSES ADDED BY THIS PASS — three, not zero. An earlier report of this
+// work claimed "zero new DOM classes" while adding `.bar-hp--low`,
+// `.match-clock--night` and `.team-score--you`; AMENDMENT_3 §F ratified all
+// three on the merits (they are `--modifier` states of frozen classes, which
+// is the established extension form and mints no new element name) and
+// required that they be reported rather than elided. They are reported here.
+// Two further modifiers, `.match-clock--surge` and `.item-slot--empty`,
+// already existed in style.css but were never toggled from this file; this
+// pass drives them for the first time, which is a new binding but not a new
+// name. Everything else is genuinely classless: the day/night mark lives
+// inside `.match-clock` as classless children, the two chips are classless
+// children of `.hud-bars`, and the MISS float reuses `.dmg-number`.
+//
+// PER-FRAME COST, MEASURED. `dayPhase` moves continuously, so the dial's
+// gradient and glow strings are PRE-BUILT at module load into a 25-step ladder
+// and written only when the quantised step changes; `buildMap` is called at
+// most once per match and its `MapDef` serves both the lane arrow and the
+// terrain chips. Driven in headless Chrome for 6000 frames — a full 0 -> 1
+// dayPhase traverse at tick rate — `render()` costs mean 0.01 ms, p95 0.1 ms,
+// p99 0.1 ms, max 0.3 ms. A MutationObserver over the whole `.hud` subtree
+// plus an instrumented `textContent` setter report ZERO style mutations and
+// ZERO text writes on a settled frame, which is what GRAPHICS_CONTRACT §5
+// asks for. It was not zero until this pass: the level-gated ult's sweep
+// overlay was written twice per frame (see the ability loop), and that was the
+// only traffic left. `hud.test.ts` pins it, so it stays zero.
 //
 // DOM CLASS CONTRACT (§6): only classes from the frozen list are rendered:
 //   .hud .hud-portrait .hud-bars .bar .bar-hp .bar-mana .bar-xp
@@ -65,10 +99,13 @@
 // spans, key hints, the dial, the state chips, scoreboard columns) are
 // CLASSLESS elements — style.css styles them via descendant selectors (e.g.
 // `.bar > i`, `.ability-slot > b`, `.match-clock > i`, `.hud-bars > div`).
-// State MODIFIERS of a frozen class (`--ready`, `--night`, `--surge`, `--you`)
-// are the established extension form and mint no new element name. Every
-// numeric readout gets an inline font-size >= 12px so the §8 floor holds no
-// matter what CSS lands.
+// State MODIFIERS of a frozen class are the established extension form and
+// mint no new element name. The full set this file toggles is `--ready`,
+// `--ult-locked`, `--learned`, `--pop`, `--empty`, `--denied`, `--low`,
+// `--night`, `--surge` and `--you`; the last three plus `--low` are the ones
+// this pass introduced or first bound (see the note above). Every numeric
+// readout gets an inline font-size >= 12px so the §8 floor holds no matter
+// what CSS lands.
 //
 // Team identity is NEVER colour alone (§8): every team readout pairs the APAL
 // team colour with the AZURE/EMBER text label.
@@ -87,8 +124,10 @@ import {
   FOUNTAIN_RADIUS,
   ITEMS,
   LEVEL_CAP,
+  SURGE_WAVE_GROWTH,
   TICK_DT,
   ULT_LEVEL_REQ,
+  WAVE_GROWTH,
   XP_THRESHOLDS,
   buildMap,
   elevationAt,
@@ -140,9 +179,17 @@ const LANE_NAMES: readonly (readonly string[])[] = [
 // string every frame — a per-frame allocation in the render loop, which §5
 // bans outright. Instead the whole ramp is baked ONCE at module load into
 // PHASE_STEPS+1 pre-joined strings and the render loop writes one of them only
-// when the quantised step actually moves. 24 steps over a DAY_PERIOD_S = 600 s
-// cycle is a write every ~12.5 s of match time and a step under 1 L* wide, so
-// the crossfade still reads as continuous.
+// when the quantised step actually moves. `dayPhase` is a wrapping TRIANGLE
+// over DAY_PERIOD_S = 600 s (config.ts), so it crosses 0 -> 1 in 300 s and 24
+// steps is one write every 12.5 s of match time.
+//
+// The step size is small enough that the crossfade still reads as continuous,
+// but not uniformly: computing CIE L* of each rung's mix() and taking the
+// largest adjacent difference gives 0.318 L* on the disc core, 1.224 L* on its
+// rim, and 1.856 L* on the glow. Only the core is under 1 L*; the two others
+// are under the ~2.3 L* just-noticeable difference for adjacent large patches,
+// which is the bar that actually matters. Raising PHASE_STEPS is the lever if
+// the glow ever bands.
 //
 // Both endpoints of every mix() are APAL entries (STYLE_BIBLE §3): the sun is
 // the gold family, the moon is `moon` over the `wetStone` shaded side, and the
@@ -179,6 +226,19 @@ for (let i = 0; i <= PHASE_STEPS; i++) {
       : 'Full day — every unit has its full vision radius. The dial darkens as night comes on.',
   );
 }
+
+/** The overtime explanation. `renderDayNight` used to write `clock.title`
+ *  unconditionally, which meant the SURGE word on the clock — a state that
+ *  changes how every creep wave in the match behaves — had no explanation
+ *  anywhere in the HUD: whatever a surge tooltip said was overwritten by the
+ *  phase title on the very next dial rung. The two now COMPOSE (see
+ *  `writeClockTitle`), and the numbers are read out of `config.ts` rather
+ *  than typed here, so the tooltip cannot drift from the rule it describes. */
+const SURGE_TITLE =
+  `SURGE — overtime. Creep waves now compound at ` +
+  `+${String(Math.round(SURGE_WAVE_GROWTH * 100))}% hp and damage per wave instead of ` +
+  `+${String(Math.round(WAVE_GROWTH * 100))}%, and gain an extra melee creep for every ` +
+  `full period of overtime elapsed. Pushing gets harder the longer you wait.`;
 
 const CONCEAL_TITLE =
   `Concealed by foliage — enemies lose sight of you until one closes to ` +
@@ -397,8 +457,14 @@ export function createHud(parent: HTMLElement): UiHandle {
   fitText(barXpText, VALUE_FONT_PX);
   // terrain state chips — the classless 4th child of .hud-bars. Sized in CSS
   // to fit the slack the bars column already had under the taller item bar,
-  // which is what drives the cluster's height: the cluster does not grow, and
-  // measured end to end the HUD now occludes 5-7% LESS play area than before.
+  // which is what drives the cluster's height, so the cluster does not grow.
+  // RE-MEASURED at 1920x1080 (headless Chrome driving this file's real
+  // createHud against the pre-PBR pair at 14abcbd): the cluster went
+  // 906.39x107 -> 872.56x99, i.e. -10600 px², and the top bar went the OTHER
+  // way — +2046 px² by day, +5860 at night, +6114 in overtime. Net over the
+  // two panels: -7.73% day, -4.28% night, -3.96% overtime. The old "5-7% less"
+  // figure quoted here was the day pose only; style.css's header carries the
+  // full table.
   const stateRow = el('div', null, bars);
   const chipElev = el('span', null, stateRow);
   fitText(chipElev, CHIP_FONT_PX);
@@ -519,14 +585,19 @@ export function createHud(parent: HTMLElement): UiHandle {
   let laneTarget: { x: number; z: number } | null = null;
   let laneName = '';
   let killRows: KillRow[] = [];
+  /** key -> the live `.kill-row` element, so a rebuild can keep the elements
+   *  it is not changing. Kept in lockstep with `killfeed`'s children. */
+  const killRowEls = new Map<string, HTMLElement>();
   let eventsSeenLen = 0; // killfeed rebuild only when the events tail changes
   let eventsSeenLast: unknown = null;
   let scoreboardSig = '';
   let scoreboardWasOpen = false;
   let dialStep = -1; // last written rung of the day/night ladder
   let dialInit = false; // the dial + word have been written at least once
+  let clockSurge = false; // last written overtime state (feeds the clock title)
   let elevHighShown = false; // last written high/low chip state
   let elevChipInit = false;
+  let chipsShown = true; // last written visibility of the terrain-chip row
 
   // ---- action feedback (buy pop + gold float + skill flash) -------------------
   // Snap-diffed: baseline on the FIRST sight of `you` (a late joiner must not
@@ -547,8 +618,38 @@ export function createHud(parent: HTMLElement): UiHandle {
   // replaying six seconds of misses at once.
   let lastEventSeen: RiftEvent | null = null;
   let eventsBaselined = false;
-  let liveFloats = 0; // concurrent .dmg-number nodes this file owns
-  const MAX_LIVE_FLOATS = 5;
+
+  // FLOAT BUDGETS ARE PER CHANNEL, not global. A single shared cap meant an
+  // uphill brawl — which can produce several misses a second, and is exactly
+  // the situation the miss float exists for — filled every slot and starved
+  // the gold-spend pill, so a purchase made during a fight silently produced
+  // no feedback at all. Two independent budgets: the miss channel can flood
+  // and drop its own overflow without ever touching the gold channel. Gold
+  // needs only 2 because purchases are hand-paced and the pill lives 900 ms.
+  type FloatChannel = 'miss' | 'gold';
+  const FLOAT_CAP: Readonly<Record<FloatChannel, number>> = { miss: 4, gold: 2 };
+  const liveFloats: Record<FloatChannel, number> = { miss: 0, gold: 0 };
+
+  /** Show or hide the terrain-chip row as a unit.
+   *
+   *  The chips report where the hero is STANDING, so they are a lie the moment
+   *  there is no hero standing anywhere: with no `you` in the snapshot, and
+   *  while the hero is dead under the death overlay, a stale '▼ LOW' kept
+   *  rendering — a corpse does not hold low ground, and the overlay is
+   *  translucent so the player reads it right through the shroud.
+   *
+   *  `visibility`, not `display`. `.hud-bars` is a column inside a
+   *  `align-items: flex-end` row, so removing the 12px row from flow would
+   *  slide all three bars down 16px on death and back up on respawn. Hiding it
+   *  keeps the box and its geometry exactly where they were. `elevChipInit` is
+   *  cleared on hide so the next live frame writes fresh text rather than
+   *  trusting the pre-death cached state. */
+  function setChipsVisible(v: boolean): void {
+    if (v === chipsShown) return;
+    chipsShown = v;
+    stateRow.style.visibility = v ? '' : 'hidden';
+    if (!v) elevChipInit = false;
+  }
 
   function popItemSlot(i: number): void {
     if (poppingSlots.has(i)) return;
@@ -576,10 +677,17 @@ export function createHud(parent: HTMLElement): UiHandle {
 
   /** A `.dmg-number` pill launched off a HUD element — the same rising pill
    *  the world-space numbers use (fx sets the colour inline; so do we — APAL
-   *  only). Capped, because an uphill brawl can produce several misses a
-   *  second and a HUD that stacks 30 pills is worse than one that stacks none. */
-  function floatFrom(anchor: HTMLElement, text: string, color: string, dy: number): void {
-    if (liveFloats >= MAX_LIVE_FLOATS) return;
+   *  only). Capped per channel, because an uphill brawl can produce several
+   *  misses a second: a HUD that stacks 30 pills is worse than one that stacks
+   *  none, and a miss flood must never be able to eat the gold pill's slot. */
+  function floatFrom(
+    anchor: HTMLElement,
+    text: string,
+    color: string,
+    dy: number,
+    channel: FloatChannel,
+  ): void {
+    if (liveFloats[channel] >= FLOAT_CAP[channel]) return;
     const rect = anchor.getBoundingClientRect();
     if (rect.width === 0 && rect.height === 0) return; // anchor not laid out
     const n = document.createElement('div');
@@ -591,10 +699,10 @@ export function createHud(parent: HTMLElement): UiHandle {
     n.style.color = color;
     n.style.pointerEvents = 'none';
     root.appendChild(n);
-    liveFloats++;
+    liveFloats[channel]++;
     window.setTimeout(() => {
       n.remove();
-      liveFloats--;
+      liveFloats[channel]--;
     }, 900); // > the 0.8s rise animation
   }
 
@@ -711,9 +819,24 @@ export function createHud(parent: HTMLElement): UiHandle {
     return -1;
   }
 
-  /** Float a MISS marker for every uphill whiff the local hero was part of.
-   *  Yours reads danger (a wasted swing), theirs reads heal (the high ground
-   *  paid off) — colour AND the same word, so the pair is never colour alone. */
+  /** Float a marker for every uphill whiff the local hero was part of.
+   *
+   *  THREE DISCRIMINATORS, NEVER JUST HUE (§8). The two directions previously
+   *  floated the identical word at the identical anchor in two different
+   *  colours, which is a colour-alone signal and unreadable to ~8% of players:
+   *
+   *    you whiffed      -> 'MISS'   danger, off the PORTRAIT (you swung)
+   *    they whiffed you -> 'EVADED' heal,   off the HP BAR   (you were spared)
+   *
+   *  The words differ, the colours differ, and the two pills launch from
+   *  genuinely separate places: measured at 1920x1080 the portrait centre is
+   *  x=567.72 and the hp-bar centre x=709.72, so the pills spawn 142 px apart
+   *  horizontally (and 6 px apart vertically). Any one of the three cues
+   *  carries the meaning on its own.
+   *
+   *  NOTE — unreachable in a real match: room.ts never puts `rift_miss` on the
+   *  wire and net.ts:303 `parseEvent` would drop it if it did. Both gaps are
+   *  other modules'; see the file header for the trace. */
   function drainMisses(s: ClientState): void {
     const events = s.events;
     if (!eventsBaselined) {
@@ -734,8 +857,8 @@ export function createHud(parent: HTMLElement): UiHandle {
       if (!ev || ev.t !== 'rift_miss') continue;
       if (mine === -2) mine = ownEntityId(s);
       if (mine < 0) continue;
-      if (ev.attacker === mine) floatFrom(portrait, 'MISS', APAL.danger, 10);
-      else if (ev.target === mine) floatFrom(portrait, 'MISS', APAL.heal, 10);
+      if (ev.attacker === mine) floatFrom(portrait, 'MISS', APAL.danger, 10, 'miss');
+      else if (ev.target === mine) floatFrom(barHp, 'EVADED', APAL.heal, 10, 'miss');
     }
     lastEventSeen = events[events.length - 1] ?? lastEventSeen;
   }
@@ -758,7 +881,19 @@ export function createHud(parent: HTMLElement): UiHandle {
     clock.classList.toggle('match-clock--night', night);
     setText(phaseTag, PHASE_TAG[step] ?? 'DAY');
     setStyle(phaseTag, 'color', night ? APAL.moon : APAL.goldLit);
-    clock.title = PHASE_TITLE[step] ?? '';
+    writeClockTitle();
+  }
+
+  /** The clock plate reports TWO independent states — the day/night phase and
+   *  whether the match is in overtime — and one `title` has to carry both.
+   *  Composing rather than assigning is the whole point: `renderDayNight`
+   *  fires on every dial rung, so anything it wrote unconditionally would
+   *  erase the surge explanation within ~12 s of it appearing. Guarded on
+   *  change, because both callers run on frames where nothing moved. */
+  function writeClockTitle(): void {
+    const phase = PHASE_TITLE[dialStep] ?? '';
+    const next = clockSurge ? `${SURGE_TITLE}\n\n${phase}` : phase;
+    if (clock.title !== next) clock.title = next;
   }
 
   function rebuildKillfeed(s: ClientState, nowMs: number): void {
@@ -802,29 +937,49 @@ export function createHud(parent: HTMLElement): UiHandle {
     }
     // drop expired rows and rows no longer in the events window
     killRows = fresh.filter((r) => nowMs - r.at <= KILLFEED_ROW_MS && kept.has(r.key));
-    // DOM writes only when the visible row set actually changed
-    let dirty = killRows.length !== killfeed.childElementCount;
-    if (!dirty) {
-      for (let i = 0; i < killRows.length; i++) {
-        const rowEl = killfeed.children[i];
-        const row = killRows[i];
-        if (!rowEl || !row || (rowEl as HTMLElement).dataset.key !== row.key) {
-          dirty = true;
-          break;
-        }
+
+    // ---- INCREMENTAL DOM: a row element outlives the rebuild that keeps it --
+    // This used to be one `replaceChildren(...killRows.map(create))`, which
+    // destroys and recreates EVERY row on every change. `.kill-row` carries a
+    // one-shot `rift-feed-in` slide, and a freshly-created element always runs
+    // it — so a single new kill re-slid the entire stack, and five simultaneous
+    // kills produced five identical animations of five rows. The whole point of
+    // that animation is that a row reads as an EVENT; replaying it on rows that
+    // did not change destroys the signal it exists to carry.
+    //
+    // So: rows are matched by key against the elements already in the DOM.
+    // Departed rows are removed, new rows are inserted at their position, and
+    // a row that survives is never detached — which is what preserves both its
+    // running animation and its already-finished one. Kills arrive newest-first
+    // and surviving rows keep their relative order, so in practice the only
+    // operations are 'insert at the front' and 'remove from the end'; the
+    // `insertBefore` on an existing element below is the correctness backstop
+    // for a reorder, not the common path.
+    for (const [key, node] of killRowEls) {
+      if (!kept.has(key) || !killRows.some((r) => r.key === key)) {
+        node.remove();
+        killRowEls.delete(key);
       }
     }
-    if (!dirty) return;
-    killfeed.replaceChildren(
-      ...killRows.map((r) => {
+    let ref: ChildNode | null = killfeed.firstChild;
+    for (const r of killRows) {
+      const existing = killRowEls.get(r.key);
+      if (existing === undefined) {
         const row = document.createElement('div');
         row.className = 'kill-row';
         row.dataset.key = r.key;
         row.style.fontSize = scaledPx(FONT_MIN_PX);
         row.innerHTML = r.html;
-        return row;
-      }),
-    );
+        killRowEls.set(r.key, row);
+        killfeed.insertBefore(row, ref);
+        ref = row.nextSibling;
+      } else if (existing === ref) {
+        ref = existing.nextSibling; // already in place: touch nothing
+      } else {
+        killfeed.insertBefore(existing, ref);
+        ref = existing.nextSibling;
+      }
+    }
   }
 
   function rebuildScoreboard(s: ClientState): void {
@@ -951,7 +1106,11 @@ export function createHud(parent: HTMLElement): UiHandle {
       const overtime = snap?.overtime === true;
       setText(clockText, overtime ? `${fmtClock(gameS)} SURGE` : fmtClock(gameS));
       clock.classList.toggle('match-clock--surge', overtime);
+      clockSurge = overtime;
       renderDayNight(snap?.dayPhase ?? 0);
+      // renderDayNight early-returns on an unchanged dial rung, so the surge
+      // half of the tooltip needs its own write on the frame overtime flips
+      writeClockTitle();
 
       // ---- kill feed (rebuild only when the events tail changed) ---------------------
       const nowMs = performance.now();
@@ -1012,8 +1171,13 @@ export function createHud(parent: HTMLElement): UiHandle {
         // Elevation and concealment are read straight off the same shared
         // terrain the sim uses, at the hero's own position, so the HUD can
         // never disagree with the rules it is reporting.
+        // Dead heroes stand nowhere. `dead` is computed further down for the
+        // overlay; the chip row needs the same fact here, so it is derived
+        // once and reused rather than recomputed.
+        const heroDead = you.respawnAtTick > 0 && matchTick < you.respawnAtTick;
         const map = mapOf(s);
-        if (map) {
+        setChipsVisible(map !== null && !heroDead);
+        if (map && !heroDead) {
           const high = elevationAt(map.terrain, you.x, you.z) === ELEV_HIGH;
           if (high !== elevHighShown || !elevChipInit) {
             elevHighShown = high;
@@ -1038,12 +1202,20 @@ export function createHud(parent: HTMLElement): UiHandle {
           const remainingS = Math.max(0, (st.cdUntilTick - matchTick) * TICK_DT);
           const totalS = rank >= 1 ? rankVal(ab.cooldown, rank) : 0;
           const cdFrac = totalS > 0 ? Math.min(1, remainingS / totalS) : 0;
-          dom.cd.style.height = `${(cdFrac * 100).toFixed(1)}%`;
-          setText(dom.cd, remainingS > 0.05 ? fmtCooldown(remainingS) : '');
           const cost = rankVal(ab.manaCost, Math.max(rank, 1));
           setText(dom.cost, ab.isPassive ? '—' : cost > 0 ? String(cost) : '');
           // greyed: ult before its level gate, unranked actives, not enough mana
           const ultLocked = ab.ult && you.level < (ULT_LEVEL_REQ[rank] ?? Infinity);
+          // The sweep overlay has TWO jobs — the cooldown wipe and, on a
+          // level-gated ult, a full-height 'LV n' plate — and it is resolved to
+          // one value before it is written. It used to be written twice per
+          // frame: the cooldown pass first, then the ult branch overwriting it,
+          // which churned the ult slot's height 100% -> 0% -> 100% and its text
+          // '' -> 'LV 6' on EVERY frame for the whole first six levels of every
+          // match. Measured with a MutationObserver over the .hud subtree, that
+          // was the only DOM traffic a steady-state frame produced: 2 style
+          // mutations and 2 text writes, all of them on this element, against a
+          // §5 rule that says a frame writes nothing that did not change.
           const unusable =
             ultLocked || (!ab.isPassive && rank === 0) || (!ab.isPassive && you.mana < cost);
           dom.slot.style.opacity = unusable ? '0.35' : '';
@@ -1054,10 +1226,16 @@ export function createHud(parent: HTMLElement): UiHandle {
             !ab.isPassive && !unusable && rank >= 1 && remainingS <= 0.05;
           dom.slot.classList.toggle('ability-slot--ready', ready);
           dom.slot.classList.toggle('ability-slot--ult-locked', ultLocked);
-          if (ultLocked) {
-            dom.cd.style.height = '100%';
-            setText(dom.cd, `LV ${ULT_LEVEL_REQ[rank] ?? '?'}`);
-          }
+          const cdHeight = ultLocked ? '100%' : `${(cdFrac * 100).toFixed(1)}%`;
+          if (dom.cd.style.height !== cdHeight) dom.cd.style.height = cdHeight;
+          setText(
+            dom.cd,
+            ultLocked
+              ? `LV ${ULT_LEVEL_REQ[rank] ?? '?'}`
+              : remainingS > 0.05
+                ? fmtCooldown(remainingS)
+                : '',
+          );
           // '+' : a skill point is waiting and this rank is legal
           const canRank =
             you.skillPoints > 0 &&
@@ -1127,7 +1305,7 @@ export function createHud(parent: HTMLElement): UiHandle {
         }
         prevItems = you.items;
         if (prevGold !== null && you.gold < prevGold - 0.5) {
-          floatFrom(gold, `-${String(Math.round(prevGold - you.gold))}g`, APAL.gold, 8);
+          floatFrom(gold, `-${String(Math.round(prevGold - you.gold))}g`, APAL.gold, 8, 'gold');
         }
         prevGold = you.gold;
 
@@ -1139,9 +1317,10 @@ export function createHud(parent: HTMLElement): UiHandle {
         portrait.onclick = () => a.centerCamera();
 
         // ---- death overlay -------------------------------------------------------------
-        const dead = you.respawnAtTick > 0 && matchTick < you.respawnAtTick;
-        death.style.display = dead ? '' : 'none';
-        if (dead) {
+        // `heroDead` is the same fact the chip row was hidden on, computed once
+        // above; the overlay and the chips must never disagree about it.
+        death.style.display = heroDead ? '' : 'none';
+        if (heroDead) {
           setText(respawn, String(Math.max(1, Math.ceil((you.respawnAtTick - matchTick) * TICK_DT))));
         }
 
@@ -1236,6 +1415,9 @@ export function createHud(parent: HTMLElement): UiHandle {
         hintLane.style.display = 'none';
         hintLearn.style.display = 'none';
         hintShop.style.display = 'none';
+        // no `you` = no hero position = nothing for the terrain chips to
+        // report. They used to keep whatever they last said.
+        setChipsVisible(false);
       }
 
       // ---- scoreboard (TAB) ------------------------------------------------------------

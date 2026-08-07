@@ -4,10 +4,20 @@
    classes of them and classless structural children). All colours are the APAL
    custom properties below — the :root block duplicates palette.ts
    APAL_CSS_VARS 1:1 as fallback literals (main.ts mirrors the same vars at
-   boot from APAL itself; the ladder test asserts that mirror is complete and
-   exact). No ad-hoc hex anywhere else in this file. Dark shell, every HUD
-   numeric >= 12px at 1080p, paper-on-ink text, layout safe at 16:9 and 21:9,
-   usable at 1280x720.
+   boot from APAL itself). No ad-hoc hex anywhere else in this file.
+
+   WHAT ASSERTS THAT MIRROR — and what does NOT.
+   `shared/src/valueLadder.test.ts` does not: it checks APAL against
+   APAL_CSS_VARS, and both of those live in palette.ts, so it never opens this
+   file and the 74 literals below were an unwatched drift surface.
+   `ui/hud.test.ts` is the test that actually READS THIS FILE. It parses the
+   :root block, asserts every hex declaration in it is an APAL_CSS_VARS name
+   carrying the exact APAL value with none missing and none extra, and asserts
+   no hex literal appears anywhere outside :root. The first half catches a
+   stale copy; the second catches a new ad-hoc colour.
+
+   Dark shell, every HUD numeric >= 12px at 1080p, paper-on-ink text, layout
+   safe at 16:9 and 21:9, usable at 1280x720.
 
    ---- THE PBR PASS (R_HUD, STYLE_BIBLE §0) ---------------------------------
    The world under this HUD is now physically shaded, image-based-lit and
@@ -29,10 +39,33 @@
        slots, bars and plates all sit in a soft drop shadow so they read as
        objects on the frame rather than holes in it.
 
-   Nothing grew: the bottom cluster's height is still driven by the 64px
-   portrait (the bars column now ends level with it, terrain chips included),
-   and the top bar's tighter gaps and smaller team labels pay for the
-   day/night dial. The HUD occludes no more play area than before.
+   OCCLUSION, RE-MEASURED — the earlier version of this note had the top bar's
+   share of it backwards, and the version after that had the right deltas over
+   the wrong absolute widths. These figures come from headless Chrome at
+   1920x1080 driving the real createHud() against this stylesheet and against
+   the pre-PBR pair at 14abcbd, with the clock pinned to a 5-character string
+   and the score/tower digit counts held constant so only the SURGE word and
+   the phase tag move:
+
+     panel              before        after         delta
+     topbar, day        371.28x37     415.36x38     +2046 px²
+     topbar, night      371.28x37     515.73x38     +5860 px²
+     topbar, overtime   442.58x37     591.84x38     +6114 px²
+     bottom cluster     906.39x107    872.56x99    -10600 px²
+
+   The top bar GREW, in every pose. Tighter gaps (18->11) and smaller team
+   labels (18px->13px) claw back real width, but they do not come close to
+   paying for the dial plus the phase word plus the live vision figure, which
+   is 144px on its own at night — and that readout is the feature, not the
+   chrome, so it stays.
+
+   The net is still a win, and it is the bottom cluster that buys it: the bars
+   column absorbed the terrain chips inside slack it already had, so the
+   cluster got SHORTER (107 -> 99px) and narrower (906 -> 873px). Totalled over
+   the two panels this file changed: -7.73% by day, -4.28% at night, -3.96% in
+   overtime — 5.340% of a 1080p frame by day and 5.467% in overtime, down to
+   4.927 / 5.111 / 5.250%. Any claim of "5-7% less" is the DAY pose only; quote
+   the pose or quote the range.
    ============================================================================ */
 
 :root {
@@ -128,7 +161,28 @@
      Aliases of the palette entries above, never new colours. They exist so the
      glass/bronze/iron language is declared once and every plate agrees. */
   --plate-fill: linear-gradient(180deg, var(--ink-lit) 0%, var(--ink) 62%, var(--ink-deep) 100%);
-  --plate-opacity: 0.9;
+  /* MEASURED, not chosen. Transmission below is the fraction of the backdrop's
+     own modulation that reaches the screen: the same page is rendered over
+     --cliff-lit #8f959d and over --ink-deep #07090c and the two are differenced
+     per channel, so blur, saturate and opacity are all inside the figure.
+     Sampled inside the top bar's 1px edge, clear of the bronze lip and the 7px
+     corner, at the three stops of --plate-fill:
+
+       --plate-opacity   4% stop        62% stop       96% stop
+       0.90              9.7%           10.2%          10.0%
+       0.78             22.1%           22.1%          22.1%
+
+     At 0.9 that is a tenth of the world surviving — a slab with a rumour of
+     glass. Composited over --cliff-lit it reads rgb(41,47,55)/rgb(27,30,36)/
+     rgb(22,24,27); at 0.78 the same three stops read rgb(55,61,69)/
+     rgb(42,46,52)/rgb(38,41,45).
+
+     The upper bound on transmission is §8's 7:1 text floor. --paper #e8e6df
+     over those stops measures 8.78:1 / 10.93:1 / 11.70:1 at 0.78, so the worst
+     case is the topmost, lightest stop at 8.78:1. Do not lower this value
+     further without re-measuring --paper at the 4% stop over --cliff-lit,
+     which is the brightest large surface STYLE_BIBLE puts behind the top bar. */
+  --plate-opacity: 0.78;
   --plate-blur: blur(7px) saturate(0.85);
   --edge: var(--stone-deep);
   --edge-lip: var(--bronze-deep);
@@ -1123,11 +1177,29 @@ body {
   color: var(--paper-dim);
 }
 
-/* an empty slot is a socket waiting to be filled, not a broken one */
+/* An empty slot is a socket waiting to be filled, not a broken one — and not
+   an invisible one either. The previous rule was `opacity: 0.4` over the
+   --ink-deep dashed border .item-slot already carries, on the --slot-face
+   gradient. Re-rendered in headless Chrome and sampled off the pixels, that
+   rule gives dash rgb(56,61,70) against face rgb(34,38,44) — 1.39:1 — and the
+   whole socket sits 1.21:1 against the plate behind it. Nothing at those
+   ratios is visible, which is what the review found in the captures: an empty
+   socket that reads as plate.
+
+   The fix is contrast, not alpha. --stone (#6e675a) painting the dash on an
+   --ink-deep face measures rgb(110,103,90) on rgb(7,9,12): 3.56:1 dash-vs-face,
+   clearing the 3:1 bar for a non-text UI boundary. The socket as a whole reads
+   2.24:1 (dash) and 1.59:1 (face) against the surrounding plate rgb(47,52,60),
+   so the dash — not the fill — is what carries the boundary, and the opacity
+   comes off entirely so it is not fighting a 60% fade as well. Three cues say
+   EMPTY and none of them is brightness alone: the dash, the missing bronze lip
+   (a lip says 'object'; a hole has none), and the deeper inset shadow that
+   pushes the face below the frame. */
 .item-slot--empty {
-  opacity: 0.4;
   border-style: dashed;
-  box-shadow: none;
+  border-color: var(--stone);
+  background: var(--ink-deep);
+  box-shadow: inset 0 3px 8px var(--ink-deep);
 }
 
 /* buy feedback (round-6 UX): the slot a purchase just landed in pops once —
@@ -1197,9 +1269,24 @@ body {
 }
 
 /* ---- top bar ------------------------------------------------------------- */
-/* Tighter than it was (gap 18 -> 12, padding 18 -> 13, team labels 18px ->
-   13px) precisely so the day/night dial and its phase word cost the play area
-   nothing: the plate is narrower than the one it replaces. */
+/* The chrome IS tighter than it was — gap 18 -> 11, padding 6px/18px ->
+   4px/12px, team labels 18px -> 13px — but it does not pay for the dial, and
+   an earlier comment here claimed it did. Measured at 1920x1080 with the clock
+   pinned to 5 characters and the score and tower digit counts held constant:
+     day       371.28 -> 415.36px  (+44.08)
+     night     371.28 -> 515.73px  (+144.45)
+     overtime  442.58 -> 591.84px  (+149.26)
+   The +144 at night is the phase readout: the 16px disc, its 7px column gap,
+   and the 'NIGHT · VIS −25%' tag. That readout is the point of the affordance
+   (never colour alone: dial AND word AND figure), so the width is bought
+   deliberately. The HUD's net occlusion win comes from the bottom cluster —
+   see the file header for the totals.
+
+   The overtime pose is the widest and is the one that decides whether the bar
+   can still centre clear of the kill feed. Measured with a full five-row feed:
+   the bar ends at x=1255.92 and the feed starts at x=1487.67, so 231.75px of
+   clearance, and the two do not overlap vertically either (bar 8..46, feed
+   56..207). If you change anything here, re-measure all three poses. */
 
 .topbar {
   position: fixed;
@@ -1358,6 +1445,15 @@ body {
   border-radius: 6px;
   overflow: hidden;
   cursor: crosshair; /* click to pan */
+  /* R_MINIMAP owns the gestures on this element (click-to-pan and the
+     drag-to-order that AMENDMENT_3 §F ratified); this stylesheet owns the
+     rule that lets them survive a finger. Without it the browser claims the
+     drag for scroll/pinch and fires `pointercancel` mid-gesture, so on touch
+     a drag-order aborts and a pan jumps — in a repo that just shipped a touch
+     + PWA pass, that is every phone. `none` and not `pan-x`/`pan-y`: both
+     axes are meaningful map coordinates here, and there is nothing under the
+     minimap to scroll. */
+  touch-action: none;
 }
 
 .minimap canvas {
@@ -1607,7 +1703,28 @@ body {
 
 /* Death: a shroud that is DARKEST at the edges and merely dimmed at the
    centre, so the spectate camera still shows a readable world instead of a
-   flat lid. Same total authority, better read. */
+   flat lid.
+
+   THIS WAS A NO-OP AND IS NOT ANY MORE. The gradient used to run
+   `var(--shroud)` -> `var(--ink-deep)`, and those two palette entries are
+   BOTH #07090c. Re-rendering that rule over a --cliff-lit #8f959d world and
+   sampling the pixels gives rgb(45,47,53) at the centre, at 25% out and at the
+   left edge — one colour, 27.8% survival everywhere. A vignette from a colour
+   to itself is a flat lid wearing a vignette's comment.
+
+   The real gradient needs an ALPHA ramp, which a two-hex ramp cannot express,
+   so the centre stop is `transparent` and the element opacity carries the
+   shroud. Survival below is measured the same way as --plate-opacity's — the
+   page rendered over #8f959d and over #07090c and differenced per channel:
+     centre (960,497)  rgb(134,140,148)  93.3% survival  (the fight is legible)
+     mid    (960,790)  rgb( 90, 94, 99)  61.0% survival
+     edge   ( 24,540)  rgb( 39, 43, 47)  24.0% survival  (fully shrouded)
+   `transparent` is a keyword, not an ad-hoc colour, and `.bar::after` and
+   `.hud-portrait::after` already use it the same way.
+
+   `opacity` here applies to the two text children as well, so it doubles as
+   the shroud's authority AND the legibility of 'YOU DIED': 0.72 -> 0.86 makes
+   the counter crisper at the same time it makes the vignette real. */
 .death-overlay {
   position: fixed;
   inset: 0;
@@ -1619,8 +1736,8 @@ body {
   align-content: center;
   justify-items: center;
   row-gap: 10px;
-  background: radial-gradient(ellipse at 50% 46%, var(--shroud) 0%, var(--ink-deep) 78%);
-  opacity: 0.72;
+  background: radial-gradient(ellipse at 50% 46%, transparent 0%, var(--ink-deep) 78%);
+  opacity: 0.86;
   pointer-events: none; /* death-spectate: the camera stays free */
 }
 

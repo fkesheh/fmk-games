@@ -32,25 +32,38 @@
 // carries the key, with a 4096 shadow map whose frustum is fitted to the
 // CAMERA'S visible ground footprint and snapped to texel increments every frame.
 // Fitting to the map is what made a tower's shadow a shapeless smear
-// (STYLE_BIBLE §10a.2); fitting to the view buys ~3 cm shadow texels at
-// gameplay zoom, which is what resolves a cornice and a brazier as distinct
-// forms.
+// (STYLE_BIBLE §10a.2); fitting to the view buys 3.6 cm shadow texels at the
+// default camera height and 1.6 cm at full zoom-in (measured off the fitted
+// ortho extent: 74 m and 32 m of radius over a 4096 map), which is what
+// resolves a cornice and a brazier as distinct forms.
 //
 // TONE MAPPING is `NeutralToneMapping`, exposure 2.75 day -> 1.9 night, and it
 // belongs to this module alone (R_POST's `OutputPass` inherits both). ACES was
 // measured and rejected in an earlier round: it compresses mid-tones and shifts
 // hue, so sun-lit moss landed at L*~8 against a palette value of L*~22 at every
 // exposure. Do not re-litigate it.
+//
+// SHADOW POLICY (AMENDMENT_3 §D.2/§D.3, AMENDMENT_4 §C) is this module's, in
+// one place: {@link applyShadowPolicy} below is the whitelist, the shadow map
+// updates exactly once per frame, and the never-cast surface families are
+// stripped automatically off anything added to the scene.
+//
+// SURFACE PREWARM (AMENDMENT_3 §E.3). The first `surface()` call in the process
+// rasterises every generated normal/roughness/height map the family needs.
+// Measured cold, one fresh process per reading, a sweep of all 19 families
+// costs 107-169 ms (six readings, median 113) — which used to be billed to
+// whichever mesh module happened to build first. `createScene` now pays it,
+// once, before it builds anything of its own.
 // ============================================================================
 import * as THREE from 'three';
-import { APAL, TERRAIN_KINDS, ELEV_HIGH } from '@rift/shared';
-import type { TerrainDef } from '@rift/shared';
+import { APAL, SURFACES, SURFACE_IDS, TERRAIN_KINDS, ELEV_HIGH } from '@rift/shared';
+import type { SurfaceId, TerrainDef } from '@rift/shared';
 import { mix } from '@platform/shared';
 import type { SceneHandle } from '../contract.js';
 import type { SceneCore, SceneHandleInternal } from './core.js';
 import { whiteVertexColors } from './core.js';
 import type { LatheVec, Rng } from './kit.js';
-import { emissiveSurface, gradientTexture, lathe, rng, sphere, surface } from './kit.js';
+import { emissiveSurface, lathe, rng, sphere, surface } from './kit.js';
 
 // ---- camera rig (STYLE_BIBLE §5) --------------------------------------------
 /** Fixed-angle MOBA camera (CONTRACT §6 input.ts: pitch ~55deg, yaw fixed). */
@@ -106,9 +119,39 @@ const SHADOW_DIST = 220;
  *  plane along the light direction, receivers up to 140 m "below" it. */
 const SHADOW_NEAR = SHADOW_DIST - 70;
 const SHADOW_FAR = SHADOW_DIST + 140;
-/** Lateral margin round the visible footprint, in metres. A 14 m ancient just
- *  outside the frame still throws a ~26 m shadow into it, and a caster outside
- *  the ortho box is culled and casts nothing at all. */
+/**
+ * Lateral margin round the visible footprint, in metres.
+ *
+ * It is NOT the length of the longest shadow, and sizing it that way would cost
+ * shadow resolution for nothing. In the light's own orthographic basis a
+ * caster's silhouette and the shadow it throws share the same (right, up)
+ * coordinates — that is what an orthographic projection along the light
+ * direction means — so ANY caster whose shadow lands inside the fitted
+ * footprint already has the relevant part of itself inside the fitted box, at
+ * any shadow length.
+ *
+ * Verified on pixels rather than argued. A 14 m caster was walked backwards out
+ * of the frame along the light's own horizontal direction, at 2/5/8/12/16/20/26
+ * /34 m behind the near edge, and renderer.info was read each time:
+ *   - it is drawn into the shadow map at EVERY distance, including 34 m, at
+ *     camH 36 (fitted radius 74 m) and at camH 11 (fitted radius 32 m);
+ *   - its shadow is still in the frame at 20 m and gone by 26 m in both, and
+ *     still in the frame at 8 m and gone by 12 m at night.
+ * Those cut-offs are the geometry, not the box: 14 / tan(28 deg) = 26.3 m of
+ * shadow projects 18.6 m onto the frame edge by day, and 14 / tan(62 deg) =
+ * 7.4 m projects 7.2 m at night. Nothing is clipped.
+ *
+ * What the pad actually has to absorb is the error in the footprint FIT, since
+ * the four camera corner rays are intersected with one flat plane at the ground
+ * height under the camera target:
+ *   - a receiver a full level below that plane moves the shallowest corner ray
+ *     (pitch - fov/2 = 30 deg below horizontal) out by ELEV_STEP / tan(30 deg)
+ *     = 4.50 m;
+ *   - the widest caster on the map, the ancient at a 10.9 x 10.3 m envelope,
+ *     straddles the box edge with 5.45 m of silhouette half-width;
+ *   - `SHADOW_RADIUS_QUANT` rounds the radius UP, so it can only help, by 0-2 m.
+ * 4.50 + 5.45 = 9.95, rounded up to a whole quantisation step.
+ */
 const SHADOW_PAD = 12;
 /** The fitted radius is quantised to this step so it changes in discrete jumps.
  *  A continuously-varying extent defeats texel snapping — the texel grid itself
@@ -122,6 +165,23 @@ const SHADOW_RAY_CLAMP = 600;
  *  the near/far the generator is given. */
 const ENV_RADIUS = 40;
 const ENV_PMREM_SIZE = 256;
+/** Width of the degradation sky's equirectangular image. It is 2:1, and it is
+ *  256 because `PMREMGenerator` takes its cube size from `width / 4`: this asks
+ *  for a 64 cube, which is the same order as the 256 above once the equirect's
+ *  own 4x is accounted for, and it is the whole reason the kit's 4-px-wide
+ *  `gradientTexture` cannot be used here (it would ask for a 1x1 cube). */
+const FALLBACK_SKY_W = 256;
+/**
+ * Ambient intensity used ONLY when no environment map can be produced at all.
+ *
+ * three adds an AmbientLight straight into the diffuse irradiance, whereas the
+ * environment contributes `PI` times its mean radiance, so this is not
+ * ENV_HDR_GAIN and cannot be derived from it. It is measured: on the same frame
+ * at 1280x720, sun-lit moss reads L* 19.5 here against L* 19.1 with the full
+ * PMREM environment and L* 22.1 for the raw palette entry. At 0.55 it read
+ * L* 6.3 — lit, but a night frame in daylight.
+ */
+const EMERGENCY_FILL = 2.1;
 /**
  * Ambient intensity in the ENVIRONMENT SOURCE SCENE — never in the world scene,
  * where a second fill alongside `scene.environment` is a hard ban. It exists so
@@ -154,33 +214,90 @@ const ENV_DIM_NIGHT = 0.8;
  *  reason metal reads as metal (STYLE_BIBLE §4). Frozen values. */
 const SUN_DISC_INTENSITY = 6;
 const MOON_DISC_INTENSITY = 1.5;
+/** Radius the two discs are parked at inside the environment shell. */
+const DISC_ORBIT = ENV_RADIUS * 0.9;
 /** The discs are EMISSIVE-ONLY objects, so they are built on the family with
  *  the darkest albedo in the table: the ambient above lands on their albedo
  *  too, and `moss` keeps that contamination at ~10% of the emissive term
  *  instead of the ~200% `crystal`'s bright `ward` albedo would add. */
 const DISC_SURFACE = 'groundMoss';
 const SUN_DISC_R = 2.6;
-const MOON_DISC_R = 2.2;
-/** Angular offset between the two discs so they never z-fight while they
- *  cross-fade through dusk. */
-const DISC_SPLIT_DEG = 3.5;
-/** Quantisation of `setTimeOfDay` for PMREM rebuilds: 9 stops across the whole
- *  cycle. The residual between stops is carried continuously by
- *  `environmentIntensity`, so nothing pops; only the sky HUE steps, by ~11% of
- *  the day->night distance at a time. */
-const PHASE_STEPS = 8;
 /**
- * How much brighter than its palette value the sky renders ON SCREEN.
+ * Angular separation between the two discs, measured as a TRUE great-circle
+ * angle so it is the same at every phase.
+ *
+ * The floor is geometric, not aesthetic: the discs must not overlap while they
+ * cross-fade through dusk, or they z-fight. At the orbit radius they sit on,
+ * their angular radii are asin(2.6/36) = 4.14 deg and asin(2.2/36) = 3.51 deg,
+ * so anything at or below 7.65 deg overlaps. 9 leaves 1.35 deg of clear sky
+ * between the two limbs.
+ *
+ * The previous 3.5 was BOTH below that floor and not actually an angle: it
+ * added the offset to the azimuth inside x/z while adding it to the elevation
+ * in y, which is not a rotation of anything — the resulting vector was not even
+ * of length `DISC_ORBIT`, and the separation it produced varied with elevation.
+ */
+const DISC_SPLIT_DEG = 9;
+const MOON_DISC_R = 2.2;
+/**
+ * Quantisation of `setTimeOfDay` for PMREM rebuilds: 17 stops across the whole
+ * cycle. The residual between stops is carried continuously by
+ * `environmentIntensity`, so brightness never pops; only the sky HUE steps, by
+ * ~6% of the day->night distance at a time.
+ *
+ * It is also what bounds the ANGULAR disagreement between the environment and
+ * the key light. The `DirectionalLight` is continuous, the discs baked into the
+ * PMREM cannot be, so the specular anchor lags the shadow direction by at most
+ * half a step: +/-1.06 deg of elevation and +/-1.88 deg of azimuth. At the
+ * previous 8 steps that was +/-2.13 and +/-3.75.
+ *
+ * The cost of the finer quantisation is bounded and paid at construction: the
+ * shell and disc materials are a function of the integer step, so the whole
+ * cycle needs 6 * (PHASE_STEPS + 1) = 102 cached materials, all of them built
+ * by {@link prewarmSurfaces} before `createScene` returns. Nothing is minted
+ * mid-match, and they do not multiply shader programs either — three's program
+ * cache key (WebGLPrograms.getProgramCacheKey) is built from shader id,
+ * defines, map presence and boolean flags; `color`, `emissive` and
+ * `emissiveIntensity` are uniforms and never appear in it, so all 102 share the
+ * two programs their two families compile.
+ */
+const PHASE_STEPS = 16;
+/**
+ * How much brighter than its palette value the sky renders ON SCREEN, as a
+ * ratio against the fog it has to out-read.
  *
  * Sky law S2 puts the fog colour exactly on the horizon stop, and S4 forbids
  * terrain blending into the sky; both hold at once only because the sky is
- * authored in HDR while fog is the flat palette value. 2.2x is ~+14 L* of
- * separation at the horizon line — visible, without a dusk sky reading as
- * daylight. Divided back out of {@link ENV_HDR_GAIN} and the day exposure,
- * since `backgroundIntensity` is applied before both.
+ * authored in HDR while fog is the flat palette value.
+ *
+ * Worth knowing before retuning it: the camera is pitched 55 deg down with a
+ * 50 deg FOV, so the frame spans 30-80 deg BELOW the horizon and the sky bands
+ * are never in it. What this gain actually brightens on screen is the
+ * environment's GROUND hemisphere ({@link envMaterials}'s `ground` stop), seen
+ * past the edge of the map. The zenith and mid bands only ever reach the frame
+ * through the IBL.
  */
 const SKY_RENDER_GAIN = 2.2;
-const BACKGROUND_INTENSITY = SKY_RENDER_GAIN / (ENV_HDR_GAIN * EXPOSURE_DAY);
+/**
+ * `scene.backgroundIntensity`: undoes {@link ENV_HDR_GAIN} and applies the
+ * wanted gain, so the background leaves the sky-box shader at
+ * SKY_RENDER_GAIN x its palette value.
+ *
+ * `toneMappingExposure` is deliberately NOT in this division, and dividing it
+ * out was a category error worth naming: exposure is a COMMON FACTOR applied to
+ * the sky box and to every fogged fragment alike (the PMREM target is linear,
+ * so three sets `boxMesh.material.toneMapped = true` — WebGLBackground.js), and
+ * a common factor cancels out of a ratio. Dividing it out therefore did not
+ * hold the ratio steady, it multiplied it by 1/2.75: the sky left the shader at
+ * 0.8x its palette value instead of 2.2x, so it lost 8.8 L* of the separation
+ * S4 exists to guarantee.
+ *
+ * MEASURED on pixels, 1280x720, camera parked at the map edge so the sky is in
+ * frame, day phase 0: the background reads L* 25.56 against far terrain at
+ * L* 20.89 with the divisor in place, and L* 48.38 against the same L* 20.89
+ * without it — +4.67 of separation against +27.49.
+ */
+const BACKGROUND_INTENSITY = SKY_RENDER_GAIN / ENV_HDR_GAIN;
 /** Softens the three band boundaries into a gradient for the BACKGROUND only
  *  (the environment itself keeps its unblurred mip chain, so the disc stays a
  *  tight specular anchor). */
@@ -196,14 +313,37 @@ const BACKGROUND_BLUR = 0.15;
  *  1.9 m hero, so a cliff reads as a wall and not as a kerb. */
 const ELEV_STEP = 2.6;
 /**
- * Length of the earthen apron that carries a ramp down to low ground.
+ * Total run of the level transition at a ramp, in metres: the ramp cell itself
+ * plus the earthen apron in front of it.
  *
  * A ramp cell is one metre long — the terrain builder converts single cells of
  * the 1-cell cliff ring — so taking it at face value would make every ramp a
- * 69-degree wall indistinguishable from the cliff beside it. The apron spreads
- * the rise over 6 m of the low ground IN FRONT of the ramp mouth (never through
- * a cliff cell, so it cannot soften the wall it is cut through), giving a
- * constant ~23-degree grade that reads as walkable from the camera angle.
+ * 69-degree wall indistinguishable from the cliff beside it. The transition
+ * therefore spreads the rise over this run, propagated only through walkable
+ * low ground (never through a cliff cell, so it cannot soften the wall it is
+ * cut through), giving a constant ELEV_STEP / RAMP_APPROACH = 0.433 m/m grade —
+ * 23.4 degrees, which reads as walkable from the camera angle.
+ *
+ * THE RAMP CELL IS PART OF THE RUN (AMENDMENT_3 §F). It used to be excluded,
+ * sitting at the full plateau height with the whole 2.6 m spent on the low
+ * ground in front of it — so the one cell the player reads AS the ramp was a
+ * flat shelf at plateau height and the level change happened entirely off it.
+ * Sampled every 0.25 m across a 3-lane ramp, from the plateau cell centre to
+ * the first low cell centre, `heightAt` used to read
+ *   2.600 2.600 [2.600 2.600 2.600 2.492 2.383] 2.275 2.167
+ * and now reads
+ *   2.600 2.546 [2.492 2.438 2.383 2.275 2.167] 2.058 1.950
+ * where the bracket is the ramp cell itself. It was dead flat at plateau height
+ * for the whole metre up to the ramp centre; it now descends from the plateau
+ * EDGE, and the ramp cell carries 0.325 m of the 2.6 m step instead of 0.217 m.
+ * Checked at 1, 2 and 3 lanes; the level-gap invariant holds with zero
+ * violations over the full 8-neighbourhood in all three.
+ *
+ * There is a ceiling on the run, from the other side: the grade IS the drop
+ * between a ramp cell and its low neighbour, so a run longer than
+ * ELEV_STEP / MIN_LEVEL_GAP = 7.4 m would bring the two within
+ * {@link MIN_LEVEL_GAP} and the level-gap clamp would start eating the top of
+ * the apron. At 6 the drop is 0.433 against a 0.35 floor.
  */
 const RAMP_APPROACH = 6;
 /** The river runs in a shallow carved channel rather than being painted on flat
@@ -372,11 +512,19 @@ function buildHeightField(t: TerrainDef): Float32Array {
       let h = out[p] ?? 0;
       const d = dist[p] ?? INF;
       let shaped = false;
+      // The transition is sampled at CELL CENTRES, and a ramp cell's centre is
+      // half a metre down the run, not at its top — hence `d + 0.5`. That half
+      // metre is the whole of AMENDMENT_3 §F: with `d` alone a ramp cell landed
+      // on exactly ELEV_STEP and the ramp was a flat shelf at plateau height.
+      //
       // The channel is never filled in by a ramp apron: a river cell lifted a
-      // metre and a half would sit proud of its own water surface.
-      if (!high && code !== KIND_RIVER && d < RAMP_APPROACH) {
-        const lift = (1 - d / RAMP_APPROACH) * ELEV_STEP;
-        if (lift > h) {
+      // metre and a half would sit proud of its own water surface. A ramp cell
+      // takes the transition unconditionally (it IS the transition, and it
+      // starts at ELEV_STEP, so `lift > h` would never fire on it).
+      const ramp = code === KIND_RAMP;
+      if ((ramp || (!high && code !== KIND_RIVER)) && d + 0.5 < RAMP_APPROACH) {
+        const lift = (1 - (d + 0.5) / RAMP_APPROACH) * ELEV_STEP;
+        if (ramp || lift > h) {
           h = lift;
           shaped = true;
         }
@@ -399,16 +547,29 @@ function buildHeightField(t: TerrainDef): Float32Array {
   //     strictly higher than every ELEV_LOW neighbour. Only LOW cells are moved,
   //     so a plateau top stays flat. In practice this is a no-op — the apron
   //     tops out 0.43 m below the ramp — but it cannot silently stop being true.
+  //
+  //     The neighbourhood is all EIGHT cells, not the four orthogonals. That is
+  //     not thoroughness for its own sake: `heightAt` is bilinear over a 2x2 of
+  //     cell centres, so a LOW cell's sampled height is blended with its
+  //     DIAGONAL neighbours as much as with its orthogonal ones, and a diagonal
+  //     pair that the 4-neighbourhood never looked at could invert the two
+  //     levels inside the quad between them.
   for (let j = 0; j < dim; j++) {
     for (let i = 0; i < dim; i++) {
       const p = j * dim + i;
       if ((g.elev[p] ?? 0) === ELEV_HIGH) continue;
       let cap = Infinity;
-      if (i > 0 && (g.elev[p - 1] ?? 0) === ELEV_HIGH) cap = Math.min(cap, out[p - 1] ?? 0);
-      if (i < dim - 1 && (g.elev[p + 1] ?? 0) === ELEV_HIGH) cap = Math.min(cap, out[p + 1] ?? 0);
-      if (j > 0 && (g.elev[p - dim] ?? 0) === ELEV_HIGH) cap = Math.min(cap, out[p - dim] ?? 0);
-      if (j < dim - 1 && (g.elev[p + dim] ?? 0) === ELEV_HIGH) {
-        cap = Math.min(cap, out[p + dim] ?? 0);
+      for (let dj = -1; dj <= 1; dj++) {
+        const nj = j + dj;
+        if (nj < 0 || nj >= dim) continue;
+        for (let di = -1; di <= 1; di++) {
+          const ni = i + di;
+          if (ni < 0 || ni >= dim || (di === 0 && dj === 0)) continue;
+          const q = nj * dim + ni;
+          if ((g.elev[q] ?? 0) !== ELEV_HIGH) continue;
+          const hq = out[q] ?? 0;
+          if (hq < cap) cap = hq;
+        }
       }
       if (cap === Infinity) continue;
       const limit = cap - MIN_LEVEL_GAP;
@@ -416,6 +577,147 @@ function buildHeightField(t: TerrainDef): Float32Array {
     }
   }
   return out;
+}
+
+// ============================================================================
+// Shadow policy (AMENDMENT_3 §D.2, AMENDMENT_4 §C) — stated once, here
+// ============================================================================
+
+/**
+ * The four things that cast shadows. Everything else — creeps, camp neutrals,
+ * ferns, ground cover, decals, FX, motes, banners, health bars and every
+ * animated part — does not.
+ *
+ * This is a BUDGET rule before it is an art rule. `renderer.info` accumulates
+ * the shadow pass (GRAPHICS_CONTRACT §5 metering, and see `render` below), so
+ * every caster is a draw call spent twice, and the map's static geometry alone
+ * already puts the frame within reach of the 700 gate.
+ */
+export type ShadowCasterClass = 'cliff' | 'structure' | 'hero' | 'treeTrunk';
+
+/** Which surface family a kit material belongs to, recovered from the name the
+ *  kit stamps on it (`rift:<id>` / `rift:<id>:<colorKey>[:<tint>]`). Anything
+ *  else — a material this game did not build — reads as `null`. */
+function surfaceOfMaterial(m: THREE.Material): SurfaceId | null {
+  const parts = m.name.split(':');
+  if (parts[0] !== 'rift') return null;
+  const id = parts[1];
+  if (id === undefined || !Object.prototype.hasOwnProperty.call(SURFACES, id)) return null;
+  return id as SurfaceId;
+}
+
+/** False when EVERY material on the mesh comes from a family the frozen table
+ *  marks `castShadow: false` (AMENDMENT_4 §C: `fxAdditive`, `fxDecal`,
+ *  `shroud`). A material from outside the table is treated as able to cast, so
+ *  this can only ever remove a caster the table already forbade. */
+function familyMayCast(mesh: THREE.Mesh): boolean {
+  const mat = mesh.material;
+  const list = Array.isArray(mat) ? mat : [mat];
+  for (const m of list) {
+    const id = surfaceOfMaterial(m);
+    if (id === null || (SURFACES[id].castShadow ?? true)) return true;
+  }
+  return list.length === 0;
+}
+
+/**
+ * Apply the caster whitelist to a subtree. `cls` names which of the four
+ * casting classes the subtree is; `null` means it is not one of them and
+ * nothing under it casts.
+ *
+ * The subtree's `receiveShadow` is untouched — everything receives.
+ *
+ * Call it once, after building, on the group you are about to add to the scene.
+ * It is not a per-frame call and it is not idempotent-by-need: nothing else
+ * writes `castShadow` afterwards, because this is the only place shadow policy
+ * lives.
+ */
+export function applyShadowPolicy(root: THREE.Object3D, cls: ShadowCasterClass | null): void {
+  root.traverse((o) => {
+    const mesh = o as THREE.Mesh;
+    if (mesh.isMesh !== true) return;
+    mesh.castShadow = cls !== null && familyMayCast(mesh);
+  });
+}
+
+/** The half of the policy that is safe to apply unilaterally, and is applied to
+ *  everything added to the scene: a family the frozen table says must NEVER
+ *  cast never casts, whoever built the mesh and whether or not they went
+ *  through `bake()`. It only ever clears a flag the table already forbade, so
+ *  it cannot take a shadow off anything entitled to one. */
+function stripNeverCasters(root: THREE.Object3D): void {
+  root.traverse((o) => {
+    const mesh = o as THREE.Mesh;
+    if (mesh.isMesh !== true || mesh.castShadow === false) return;
+    if (!familyMayCast(mesh)) mesh.castShadow = false;
+  });
+}
+
+// ============================================================================
+// The environment source scene's materials, and the surface prewarm
+// ============================================================================
+
+/** The six materials the environment source scene wears at quantised phase `q`.
+ *  ONE place decides them, so the prewarm below and the rebuild in
+ *  `setTimeOfDay` cannot drift apart and mint two different sets. */
+interface EnvMaterials {
+  readonly zenith: THREE.MeshStandardMaterial;
+  readonly mid: THREE.MeshStandardMaterial;
+  readonly horizon: THREE.MeshStandardMaterial;
+  readonly ground: THREE.MeshStandardMaterial;
+  readonly sun: THREE.MeshStandardMaterial;
+  readonly moon: THREE.MeshStandardMaterial;
+}
+
+function envMaterials(q: number): EnvMaterials {
+  return {
+    zenith: surface('groundMoss', mix(APAL.skyHigh, APAL.nightSky, q)),
+    // The mid stop reads from `inkLit`/`ink`: the palette's only entries that
+    // sit between each state's zenith and horizon in BOTH value and hue, which
+    // is what the three-band falloff needs and what keeps this a single-level
+    // palette derivation rather than a mix of mixes.
+    mid: surface('groundMoss', mix(APAL.inkLit, APAL.ink, q)),
+    horizon: surface('groundMoss', mix(APAL.horizon, APAL.nightHorizon, q)),
+    ground: surface('groundMoss', mix(APAL.moss, APAL.nightGround, q)),
+    sun: emissiveSurface(DISC_SURFACE, 'goldLit', SUN_DISC_INTENSITY * (1 - q)),
+    moon: emissiveSurface(DISC_SURFACE, 'moon', MOON_DISC_INTENSITY * q),
+  };
+}
+
+let prewarmed = false;
+
+/**
+ * Build every material the game can ask for, once, here (AMENDMENT_3 §E.3).
+ *
+ * The first `surface()` call for a family rasterises its generated height,
+ * normal and wear maps on a 2D canvas; the kit caches them for the life of the
+ * process. Measured with one fresh process per reading, a sweep of all 19
+ * families costs 107-169 ms (six readings, median 113), and until now that bill
+ * landed on whichever mesh module happened to build first — which is why every
+ * mesh module's "cold" figure was really somebody else's texture generation.
+ * Paying it here makes it one line in one module's budget instead of a tax that
+ * moves with build order, and it also guarantees no material is constructed
+ * during a frame. After it, a full re-sweep of all 19 families measures 0.0-0.1
+ * ms, which is the check that it actually warmed what it claims to.
+ *
+ * The environment's per-step materials go in the same sweep: they are a
+ * function of the integer phase step, so the whole day cycle is a fixed
+ * 6 * (PHASE_STEPS + 1) set that can be built up front rather than minted at
+ * each rebuild.
+ *
+ * It never throws: a scene that cannot build a material has bigger problems
+ * than a cold cache, and they will surface at the shells below with a real
+ * stack rather than here with a misleading one.
+ */
+function prewarmSurfaces(): void {
+  if (prewarmed) return;
+  try {
+    for (const id of SURFACE_IDS) surface(id);
+    for (let s = 0; s <= PHASE_STEPS; s++) envMaterials(s / PHASE_STEPS);
+    prewarmed = true;
+  } catch (err) {
+    console.error('rift scene: surface prewarm failed — first use will pay for itself', err);
+  }
 }
 
 // ============================================================================
@@ -442,12 +744,25 @@ export function createScene(parent: HTMLElement): SceneHandle {
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  // ONE SHADOW MAP PER FRAME (AMENDMENT_3 §D.3). THREE re-renders every enabled
+  // shadow map on every `renderer.render()` call while `autoUpdate` is true, and
+  // the mandated post stack renders the scene TWICE: `RenderPass` draws it, then
+  // `GTAOPass` draws it again into its own depth+normal gbuffer
+  // (GTAOPass.js: `renderer.render( this.scene, this.camera )`). The 4096 map
+  // was therefore being rasterised twice per frame for one frame's worth of
+  // shadows. Measured through renderer.info on a 24-caster scene: 70 draws per
+  // frame with two scene renders, 46 with this flag and the once-per-frame
+  // `needsUpdate` in `render()` below — the whole shadow pass, saved.
+  renderer.shadowMap.autoUpdate = false;
   // DRAW-CALL METERING (GRAPHICS_CONTRACT §5). The composer resets renderer.info
   // on every pass, so the budget would silently collapse to ~1 the moment the
   // post stack landed. Ownership: this flag is set once here, `reset()` is
   // called exactly once per frame at the top of render(), and nothing else in
   // the tree may touch either.
   renderer.info.autoReset = false;
+
+  // ---- surface prewarm (AMENDMENT_3 §E.3) ------------------------------------
+  prewarmSurfaces();
 
   const canvas = renderer.domElement;
   canvas.style.position = 'absolute';
@@ -514,29 +829,60 @@ export function createScene(parent: HTMLElement): SceneHandle {
     return whiteVertexColors(lathe(pts, 28, { sx: -1 }));
   }
 
-  const skyZenith = new THREE.Mesh(envShell(0, 52), surface('groundMoss', APAL.skyHigh));
-  const skyMid = new THREE.Mesh(envShell(52, 80), surface('groundMoss', APAL.inkLit));
-  const skyHorizon = new THREE.Mesh(envShell(80, 95), surface('groundMoss', APAL.horizon));
-  const envGround = new THREE.Mesh(envShell(95, 180), surface('groundMoss', APAL.moss));
-  const sunDisc = new THREE.Mesh(
-    whiteVertexColors(sphere(SUN_DISC_R, 12)),
-    emissiveSurface(DISC_SURFACE, 'goldLit', SUN_DISC_INTENSITY),
-  );
-  const moonDisc = new THREE.Mesh(
-    whiteVertexColors(sphere(MOON_DISC_R, 12)),
-    emissiveSurface(DISC_SURFACE, 'moon', 0),
-  );
+  const envMat0 = envMaterials(0);
+  const skyZenith = new THREE.Mesh(envShell(0, 52), envMat0.zenith);
+  const skyMid = new THREE.Mesh(envShell(52, 80), envMat0.mid);
+  const skyHorizon = new THREE.Mesh(envShell(80, 95), envMat0.horizon);
+  const envGround = new THREE.Mesh(envShell(95, 180), envMat0.ground);
+  const sunDisc = new THREE.Mesh(whiteVertexColors(sphere(SUN_DISC_R, 12)), envMat0.sun);
+  const moonDisc = new THREE.Mesh(whiteVertexColors(sphere(MOON_DISC_R, 12)), envMat0.moon);
   envScene.add(skyZenith, skyMid, skyHorizon, envGround, sunDisc, moonDisc);
+
+  // The world scene's emergency fill: dark, and at intensity 0 it contributes
+  // nothing at all. It is raised ONLY when PMREM cannot produce an environment
+  // map by any route, which is the one case where §4's ban on a second fill
+  // does not apply — there is nothing to double-count and the alternative is an
+  // unlit frame. `applyEnvIntensity` is the only writer.
+  const emergencyFill = new THREE.AmbientLight(AMBIENT_COLOR, 0);
+  three.add(emergencyFill);
 
   const pmrem = new THREE.PMREMGenerator(renderer);
   let envTarget: THREE.WebGLRenderTarget | null = null;
+  let fallbackTex: THREE.Texture | null = null;
+  /** Which of the three sky routes is installed. It decides what
+   *  `environmentIntensity` has to MEAN, which is why it is state and not a
+   *  local: the two numbers are re-applied on every phase change. */
+  let envMode: 'pmrem' | 'ldr' | 'none' = 'pmrem';
   let envWarned = false;
+  let shadowPolicyWarned = false;
+
+  // AMENDMENT_3 §D.2 / AMENDMENT_4 §C, enforced rather than documented: three
+  // fires `childadded` on the scene for every group a render module hands it,
+  // so the never-cast families are stripped at the door. This is the only sweep
+  // that is safe to do without knowing what the subtree IS — the positive half
+  // of the whitelist needs that, and is `applyShadowPolicy`, which the module
+  // that built the group calls. Guarded: this runs inside somebody else's
+  // `add()` and must never be the reason their build throws.
+  three.addEventListener('childadded', (e) => {
+    try {
+      stripNeverCasters(e.child);
+    } catch (err) {
+      if (!shadowPolicyWarned) {
+        shadowPolicyWarned = true;
+        console.error('rift scene: shadow policy sweep failed', err);
+      }
+    }
+  });
 
   // ---- mutable scene state ---------------------------------------------------
   let mapSide = 128;
   let targetX = mapSide / 2;
   let targetZ = mapSide / 2;
-  let camHeight = 40;
+  // STYLE_BIBLE §5: default height 36, the same number `game.ts` holds in
+  // `CAM_DEFAULT_H`. It is only the value before `setCamera` first runs, but a
+  // scene that fits its shadow frustum to a taller camera than the game will
+  // ever use fits it to a footprint the player never sees.
+  let camHeight = 36;
   let shakeX = 0;
   let shakeZ = 0;
   let dayPhase = -1;
@@ -708,69 +1054,169 @@ export function createScene(parent: HTMLElement): SceneHandle {
    */
   function rebuildEnvironment(q: number): void {
     envAmbient.intensity = ENV_AMBIENT * envDim(q);
-    skyZenith.material = surface('groundMoss', mix(APAL.skyHigh, APAL.nightSky, q));
-    // The mid stop reads from `inkLit`/`ink`: the palette's only entries that
-    // sit between each state's zenith and horizon in BOTH value and hue, which
-    // is what the three-band falloff needs and what keeps this a single-level
-    // palette derivation rather than a mix of mixes.
-    skyMid.material = surface('groundMoss', mix(APAL.inkLit, APAL.ink, q));
-    skyHorizon.material = surface('groundMoss', mix(APAL.horizon, APAL.nightHorizon, q));
-    envGround.material = surface('groundMoss', mix(APAL.moss, APAL.nightGround, q));
-    sunDisc.material = emissiveSurface(DISC_SURFACE, 'goldLit', SUN_DISC_INTENSITY * (1 - q));
-    moonDisc.material = emissiveSurface(DISC_SURFACE, 'moon', MOON_DISC_INTENSITY * q);
+    const mats = envMaterials(q);
+    skyZenith.material = mats.zenith;
+    skyMid.material = mats.mid;
+    skyHorizon.material = mats.horizon;
+    envGround.material = mats.ground;
+    sunDisc.material = mats.sun;
+    moonDisc.material = mats.moon;
+
+    // Disc placement. Both discs ride the key light's own great circle, split by
+    // a TRUE angular offset, and the split is distributed across the cross-fade
+    // so that whichever disc is currently the key sits EXACTLY on the light
+    // direction: at q = 0 the sun is on it, at q = 1 the moon is. Their
+    // separation is `split` at every q, which is what stops them z-fighting
+    // through dusk when both are lit.
     const split = THREE.MathUtils.degToRad(DISC_SPLIT_DEG);
     const el = THREE.MathUtils.degToRad(lerp(SUN_ELEV_DAY_DEG, SUN_ELEV_NIGHT_DEG, q));
     const az = THREE.MathUtils.degToRad(lerp(SUN_AZIMUTH_DAY_DEG, SUN_AZIMUTH_NIGHT_DEG, q));
-    const dr = ENV_RADIUS * 0.9;
-    sunDisc.position.set(
-      Math.cos(el) * Math.cos(az) * dr,
-      Math.sin(el) * dr,
-      Math.cos(el) * Math.sin(az) * dr,
-    );
-    moonDisc.position.set(
-      Math.cos(el) * Math.cos(az + split) * dr,
-      Math.sin(el + split) * dr,
-      Math.cos(el) * Math.sin(az + split) * dr,
-    );
+    placeDisc(sunDisc, el - split * q, az);
+    placeDisc(moonDisc, el + split * (1 - q), az);
 
     try {
       const next = pmrem.fromScene(envScene, 0, 1, ENV_RADIUS * 2.5, { size: ENV_PMREM_SIZE });
       const previous = envTarget;
       envTarget = next;
+      envMode = 'pmrem';
       three.environment = next.texture;
       three.background = next.texture;
       if (previous !== null) previous.dispose();
     } catch (err) {
       if (!envWarned) {
         envWarned = true;
-        console.error('rift environment build failed; falling back to a flat sky', err);
+        console.error('rift environment build failed; falling back to a palette sky', err);
       }
-      if (three.environment === null) {
-        // Second path, not a stub: the same palette sky as an equirectangular
-        // ramp. three converts it to a CubeUV environment internally, so PBR
-        // still has an environment to sample and nothing renders as plastic.
-        const grad = gradientSky();
-        three.environment = grad;
-        three.background = new THREE.Color(APAL.fog);
-      }
+      installDegradedSky();
     }
+    applyEnvIntensity();
   }
 
-  /** Equirectangular fallback sky, cloned so setting `mapping` cannot mutate the
-   *  kit's cached texture. */
-  function gradientSky(): THREE.Texture {
-    const stops = [
-      { at: 0, color: APAL.skyHigh },
-      { at: 0.55, color: APAL.inkLit },
-      { at: 0.86, color: APAL.horizon },
-      { at: 1, color: APAL.moss },
-    ];
-    // Imported lazily from the kit's cache and cloned: the clone shares the
-    // canvas but owns its own mapping.
-    const tex = gradientTexture(stops).clone();
+  /**
+   * The degradation path, and it has to end in a PLAYABLE FRAME rather than a
+   * technically-non-null `scene.environment` (BUILD_SPECS R_SCENE, STYLE_BIBLE
+   * §4). Two rungs, in order, because they fail for different reasons:
+   *
+   * 1. PMREM the palette sky as an equirectangular ramp. This survives the
+   *    likely failure — something wrong with the SOURCE SCENE, a shader or a
+   *    material — and still gives PBR a real environment to sample. The sky is
+   *    LDR where the source scene is authored at {@link ENV_HDR_GAIN}, which is
+   *    what `envMode` tells {@link applyEnvIntensity} to make up; without that,
+   *    this rung renders the whole game ~15x too dim, which is a black screen
+   *    wearing a non-null environment.
+   * 2. If PMREM ITSELF is dead there can be no environment at all, so the frame
+   *    is lit directly instead. That is the one and only case where a second
+   *    fill may sit in the world scene — the ban in §4 is on double-counting an
+   *    environment that is, here, definitionally absent — and it is what stops
+   *    "no IBL" from meaning "black screen".
+   */
+  function installDegradedSky(): void {
+    // The old PMREM target is unreachable from here on, and holding it would
+    // leak a cube target through every subsequent phase step.
+    if (envTarget !== null) {
+      envTarget.dispose();
+      envTarget = null;
+    }
+    const sky = fallbackSky();
+    if (sky !== null) {
+      try {
+        const next = pmrem.fromEquirectangular(sky);
+        envTarget = next;
+        envMode = 'ldr';
+        three.environment = next.texture;
+        three.background = next.texture;
+        return;
+      } catch (err) {
+        console.error('rift environment: equirectangular fallback failed too', err);
+      }
+    }
+    envMode = 'none';
+    three.environment = null;
+    three.background = new THREE.Color(APAL.fog);
+  }
+
+  /** Put a disc on the environment shell at (elevation, azimuth). Spherical, so
+   *  it is always exactly {@link DISC_ORBIT} from the cube camera and an angular
+   *  offset is an angle rather than three unrelated additions. */
+  function placeDisc(disc: THREE.Mesh, elev: number, az: number): void {
+    disc.position.set(
+      Math.cos(elev) * Math.cos(az) * DISC_ORBIT,
+      Math.sin(elev) * DISC_ORBIT,
+      Math.cos(elev) * Math.sin(az) * DISC_ORBIT,
+    );
+  }
+
+  /**
+   * The degradation sky: the palette's own zenith->nadir ramp as a 2:1
+   * equirectangular image, built once and reused. `null` only if the browser
+   * refuses a 2D context, which is the same failure that takes every other
+   * generated texture in the game with it.
+   *
+   * It is drawn here rather than taken from the kit's `gradientTexture`, and
+   * that is a size constraint, not a preference: `gradientTexture` rasterises a
+   * 4-PIXEL-WIDE strip, because it is a 1-D ramp for UV-mapped surfaces, and
+   * `PMREMGenerator` sizes its cube from `image.width / 4`
+   * (PMREMGenerator.js `_setSizeFromTexture`). A 4 px equirect therefore asks
+   * for a 1x1 cube and produces an environment that samples to nothing.
+   * Measured with the kit texture in place: every sample point in the frame at
+   * L* 0.3 — the "playable frame" was a black one.
+   */
+  function fallbackSky(): THREE.Texture | null {
+    const cached = fallbackTex;
+    if (cached !== null) return cached;
+    const canvas = document.createElement('canvas');
+    canvas.width = FALLBACK_SKY_W;
+    canvas.height = FALLBACK_SKY_W / 2;
+    const ctx = canvas.getContext('2d');
+    if (ctx === null) return null;
+    const grad = ctx.createLinearGradient(0, 0, 0, canvas.height);
+    // Top of the image is the zenith: three's equirect sampling puts v = 1 at
+    // +Y and CanvasTexture's default `flipY` maps canvas row 0 to v = 1.
+    grad.addColorStop(0, APAL.skyHigh);
+    grad.addColorStop(0.42, APAL.inkLit);
+    grad.addColorStop(0.5, APAL.horizon);
+    grad.addColorStop(1, APAL.moss);
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    const tex = new THREE.CanvasTexture(canvas);
     tex.mapping = THREE.EquirectangularReflectionMapping;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.ClampToEdgeWrapping;
     tex.needsUpdate = true;
+    fallbackTex = tex;
     return tex;
+  }
+
+  /**
+   * The ONE writer of `environmentIntensity` and `backgroundIntensity`.
+   *
+   * Both numbers mean "lift what is installed to the level the frame was tuned
+   * at", and what is installed has two possible dynamic ranges, so they cannot
+   * be constants and they cannot be written in two places — the previous split
+   * between `rebuildEnvironment` and `setTimeOfDay` is exactly why the fallback
+   * path could be fixed in one and stomped in the other on the next frame.
+   *
+   *  - `pmrem`: the source scene already bakes ENV_HDR_GAIN and the day->night
+   *    dimming at the QUANTISED step, so all that is left is the residual
+   *    between steps, which is what keeps the fill continuous across a rebuild.
+   *  - `ldr`: a palette ramp with nothing baked in, so it needs the whole HDR
+   *    gain and the whole dimming curve applied here.
+   *  - `none`: there is no environment to scale, and the emergency fill is the
+   *    only thing standing between the player and an unlit frame.
+   */
+  function applyEnvIntensity(): void {
+    const t = dayPhase < 0 ? 0 : dayPhase;
+    const dim = envDim(t);
+    emergencyFill.intensity = envMode === 'none' ? EMERGENCY_FILL * dim : 0;
+    if (envMode !== 'pmrem') {
+      three.environmentIntensity = ENV_HDR_GAIN * dim;
+      three.backgroundIntensity = SKY_RENDER_GAIN * dim;
+      return;
+    }
+    const residual = dim / envDim(envStep / PHASE_STEPS);
+    three.environmentIntensity = residual;
+    three.backgroundIntensity = BACKGROUND_INTENSITY * residual;
   }
 
   function applyTimeOfDay(): void {
@@ -790,12 +1236,11 @@ export function createScene(parent: HTMLElement): SceneHandle {
       envStep = step;
       rebuildEnvironment(step / PHASE_STEPS);
     }
-    // The source scene carries the day->night ramp in discrete steps; this is
-    // the residual that makes it continuous, so the fill never pops between
-    // two PMREM rebuilds.
-    const residual = envDim(t) / envDim(envStep / PHASE_STEPS);
-    three.environmentIntensity = residual;
-    three.backgroundIntensity = BACKGROUND_INTENSITY * residual;
+    // The source scene carries the day->night ramp in discrete steps; the
+    // residual that makes it continuous is applied here, so the fill never pops
+    // between two PMREM rebuilds. It is one call, not two assignments, because
+    // what the two intensities have to mean depends on which sky is installed.
+    applyEnvIntensity();
   }
 
   // ---- the seam --------------------------------------------------------------
@@ -933,6 +1378,15 @@ export function createScene(parent: HTMLElement): SceneHandle {
         // 3. camera rig — shake offsets move every frame, and the shadow
         //    frustum is refitted from the same call.
         applyCamera();
+        // 3b. arm the shadow map for exactly ONE rasterisation this frame
+        //     (AMENDMENT_3 §D.3). `autoUpdate` is off, so the first
+        //     `renderer.render` inside step 4 renders the map and clears this
+        //     flag itself; every further scene render the post stack performs —
+        //     GTAOPass re-renders the whole scene into its gbuffer — reuses it.
+        //     It is set here rather than in createScene because the frustum has
+        //     just moved: a shadow map armed once would freeze the shadows to
+        //     the first frame's camera.
+        renderer.shadowMap.needsUpdate = true;
         // 4. either the installed frame pass or a direct render. NEVER both: a
         //    composer's own RenderPass already draws the scene, so a second
         //    direct render would double the frame and throw away the composited
