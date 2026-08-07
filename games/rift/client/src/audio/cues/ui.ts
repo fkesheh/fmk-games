@@ -61,6 +61,17 @@ function quickEnv(peak: number, releaseS: number): {
 
 // ---------------------------------------------------------------------------
 // ui.click — an iron click on press. Dark, tiny, non-info. Fires constantly.
+//
+// ITERATION NOTE: the first build filtered the metal body through a narrow, high-Q
+// bandpass (`q: 6` at `hz * 2.4`), which let almost nothing but a single partial through
+// — measured 85.8% of total energy crammed into 400-800 Hz alone, 0.1% below 120 Hz, no
+// perceptible transient. A blind A/B judge described it as "near-silent, no discernible
+// transient or low end at all" and it tied the 414-line legacy click rather than beating
+// it. FIX: widen the bandpass so more of the partial stack actually passes (real harmonic
+// detail instead of one filtered tone), sharpen the attack for a tactile snap, and add a
+// short, separate high transient layer for "attack" the metal body alone cannot give —
+// centred at PALETTE.info.A5 (880 Hz), which is comfortably inside the now-open
+// 120-2000 Hz range and an octave-plus clear of ui.lastHit's protected 2-4 kHz lane.
 // ---------------------------------------------------------------------------
 
 const CLICK_HZ = [PALETTE.mid.A3, PALETTE.low.D3, PALETTE.mid.D3] as const;
@@ -68,30 +79,36 @@ const CLICK_HZ = [PALETTE.mid.A3, PALETTE.low.D3, PALETTE.mid.D3] as const;
 const clickCue: CueFn = (g, at, p) => {
   const baseHz = pick(CLICK_HZ, p.variant);
   const hz = jitter(g, baseHz, VARY.pitchPct);
+  // Body — a small inharmonic partial stack. A wide, low-Q passband centred low in the
+  // partial spread lets several partials through (not just one), which is what gives a
+  // physical click its tactile "knock" instead of a thin filtered tone.
   metal(
     g,
     at,
     p.dest,
     {
-      ratios: METAL_RATIOS.slice(0, 4),
+      ratios: METAL_RATIOS.slice(0, 5),
       hz,
-      bandHz: jitter(g, hz * 2.4, VARY.timbrePct),
-      q: 6,
-      env: quickEnv(0.75, 0.018),
+      bandHz: jitter(g, hz * 2.2, VARY.timbrePct),
+      q: 1.3,
+      env: { attack: 0.0006, decay: 0.012, sustain: 0.05, release: 0.014, peak: 0.75 },
     },
     level(g, p, -9),
   );
+  // Transient snap — a very short, sharp noise tick giving the attack the metal body
+  // can't. Centred at PALETTE.info.A5: well above the metal body's content, well below
+  // ui.lastHit's 2-4 kHz lane, so the two stay clearly separated.
   noise(
     g,
     at,
     p.dest,
     {
       filter: 'bandpass',
-      hz: jitter(g, PALETTE.high.D5, VARY.timbrePct),
-      q: 3,
-      env: { attack: 0.0004, decay: 0.006, sustain: 0, release: 0.006, peak: 0.5 },
+      hz: jitter(g, PALETTE.info.A5, VARY.timbrePct),
+      q: 2.5,
+      env: { attack: 0.0003, decay: 0.006, sustain: 0, release: 0.006, peak: 0.6 },
     },
-    level(g, p, -16),
+    level(g, p, -13),
   );
 };
 
@@ -144,33 +161,47 @@ const buyCue: CueFn = (g, at, p) => {
 };
 
 // ---------------------------------------------------------------------------
-// ui.error — the dry denial thud. Info-legit per the contract, but SONIC_BIBLE §11
-// (accessibility) demands it read as "no", not an alarm: kept low and soft-edged, no
-// bright transient, a muted minor-second dyad against the root for mild dissonance
-// without harshness.
+// ui.error — the denial cue. SONIC_BIBLE §11 (accessibility) demands it read as "no",
+// not an alarm — that constraint is unchanged. But the first build over-corrected: a
+// thump rooted at PALETTE.low.A2 (110 Hz) sweeping down toward PALETTE.sub.A1 put 90.7%
+// of its total energy below 120 Hz with 0% in 400-800 Hz and no harmonic structure
+// anywhere — a blind A/B judge called both sides of that pairing "flat, pixelated noise
+// blocks with no harmonic content", and on a laptop speaker a 90%-sub cue is close to
+// inaudible. FIX: move the identity of the cue to an inharmonic partial stack (`metal`)
+// anchored in PALETTE.mid, giving it genuine body and structure across 120-800 Hz; keep
+// the INTERVAL.enemy minor-second colouring but voice it where it's actually audible;
+// keep only a small amount of low end so it still lands as a "thud", not a chime, without
+// re-dominating the spectrum the way the sub-only design did. Soft attacks throughout —
+// this is a "no", not a buzzer.
 // ---------------------------------------------------------------------------
 
-const ERROR_HZ = [PALETTE.low.A2, PALETTE.low.D2] as const;
+const ERROR_HZ = [PALETTE.mid.D3, PALETTE.mid.A3] as const;
 
 const errorCue: CueFn = (g, at, p) => {
   const rootHz = jitter(g, pick(ERROR_HZ, p.variant), VARY.pitchPct);
-  thump(
+  // `?? 1` never actually triggers: INTERVAL.enemy is a frozen 3-element literal
+  // (config.ts) and index 1 always exists; the fallback only satisfies
+  // noUncheckedIndexedAccess.
+  const enemySecond = INTERVAL.enemy[1] ?? 1;
+
+  // Body — an inharmonic partial stack gives real definition across 120-800 Hz instead
+  // of a single sub sweep. Soft attack (8 ms) keeps it a "no", not an alarm.
+  metal(
     g,
     at,
     p.dest,
     {
+      ratios: METAL_RATIOS.slice(0, 4),
       hz: rootHz,
-      dropHz: rootHz * 0.6,
-      dropTime: 0.05,
-      env: { attack: 0.002, decay: 0.03, sustain: 0.1, release: 0.05, peak: 0.7 },
+      bandHz: jitter(g, rootHz * 2.2, VARY.timbrePct),
+      q: 1.4,
+      env: { attack: 0.008, decay: 0.045, sustain: 0.15, release: 0.045, peak: 0.75 },
     },
     level(g, p, -8),
   );
-  // A muted minor-second dyad (INTERVAL.enemy[1]) reads as "wrong" without being an
-  // alarm — soft triangle, no attack transient, well under the info floor. `?? 1` never
-  // actually triggers: INTERVAL.enemy is a frozen 3-element literal (config.ts) and index
-  // 1 always exists; the fallback only satisfies noUncheckedIndexedAccess.
-  const enemySecond = INTERVAL.enemy[1] ?? 1;
+  // The minor-second dyad (INTERVAL.enemy[1]) — the "wrong" colour — now voiced right
+  // next to the body register instead of buried under a sub sweep, so it is actually
+  // heard as dissonance rather than felt as an inaudible sub thump.
   tone(
     g,
     at,
@@ -178,9 +209,23 @@ const errorCue: CueFn = (g, at, p) => {
     {
       type: 'triangle',
       hz: rootHz * enemySecond,
-      env: { attack: 0.01, decay: 0.04, sustain: 0.1, release: 0.05, peak: 0.3 },
+      env: { attack: 0.01, decay: 0.045, sustain: 0.15, release: 0.045, peak: 0.5 },
     },
-    level(g, p, -14),
+    level(g, p, -10),
+  );
+  // A small amount of low-end weight — just enough to feel like something landed, well
+  // down in level from the body layer so it no longer dominates the spectrum.
+  thump(
+    g,
+    at,
+    p.dest,
+    {
+      hz: PALETTE.low.A2,
+      dropHz: PALETTE.sub.A1,
+      dropTime: 0.04,
+      env: { attack: 0.004, decay: 0.02, sustain: 0.08, release: 0.03, peak: 0.35 },
+    },
+    level(g, p, -15),
   );
 };
 

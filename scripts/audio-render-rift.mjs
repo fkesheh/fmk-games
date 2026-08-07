@@ -86,13 +86,19 @@ const INFO_BAND_MAX_PCT = 8; // config.ts INFO_BAND_MAX_PCT
 
 // config.ts SCENES — name + total render length in seconds. `lastHitInFight`
 // additionally carries the mirrored onset of its `ui.lastHit` SceneStep
-// (atSec: 1.4), which is when the "chime cuts through" gate takes its window.
+// (atSec: 1.39 as of the retime below), which is when the "chime cuts
+// through" gate takes its window. RETIMED along with config.ts's
+// lastHitInFight.steps (audio-director ruling: the old 0.2s/1.4s cluster put
+// the chime 1.2s after the scene's only real 2-4kHz competitor had already
+// decayed to near-silence — see the comment on that SCENES entry for the
+// independently-measured evidence). If config.ts's lastHitInFight.steps ever
+// changes again, this value must be updated to match ui.lastHit's atSec.
 const SCENES = [
   { name: 'menuBed', seconds: 6 },
   { name: 'laning', seconds: 8 },
   { name: 'skirmish', seconds: 8 },
   { name: 'teamfight', seconds: 10 },
-  { name: 'lastHitInFight', seconds: 6, chimeOnsetS: 1.4 },
+  { name: 'lastHitInFight', seconds: 6, chimeOnsetS: 1.39 },
   { name: 'towerFallInFight', seconds: 10 },
   { name: 'ancientFall', seconds: 12 },
   { name: 'victory', seconds: 10 },
@@ -522,25 +528,82 @@ function installAudioHarness() {
     return 10 * Math.log10(power + 1e-12);
   }
 
-  async function truePeakDbtp(left, right, sampleRate) {
-    const factor = 4; // >=4x oversampling — inter-sample overshoot is the point of this gate.
-    const src = new AudioBuffer({ length: left.length, numberOfChannels: 2, sampleRate });
-    src.copyToChannel(Float32Array.from(left), 0);
-    src.copyToChannel(Float32Array.from(right), 1);
-    const octx = new OfflineAudioContext(2, left.length * factor, sampleRate * factor);
-    const node = octx.createBufferSource();
-    node.buffer = src;
-    node.connect(octx.destination);
-    node.start(0);
-    const rendered = await octx.startRendering();
-    let peak = 0;
-    for (let c = 0; c < rendered.numberOfChannels; c++) {
-      const d = rendered.getChannelData(c);
-      for (let i = 0; i < d.length; i++) {
-        const a = Math.abs(d[i]);
-        if (a > peak) peak = a;
-      }
+  /**
+   * Build a windowed-sinc polyphase FIR kernel for true-peak-style band-limited
+   * L-times oversampling. `K` is the kernel half-width in ORIGINAL-sample units
+   * (support spans +/-K original samples); total taps = 2*K*L+1.
+   *
+   * WHY THIS EXISTS (replaces an earlier, broken approach): the first version of
+   * this gate built an OfflineAudioContext at 4x the sample rate, assigned it an
+   * AudioBuffer nominally at the original rate, and trusted the browser to
+   * resample on playback. Verified against the standard ITU-R BS.1770-style
+   * inter-sample-peak test tone (four samples per cycle at +/-0.7071, whose
+   * continuous waveform peaks at 1.0 -- the textbook "0.71 sample peak / 1.0
+   * true peak" case) that this headless Chrome's buffer-rate-mismatch playback
+   * does NOT reveal ANY overshoot: it returns the raw sample peak bit-for-bit.
+   * Whatever that code path does internally, it is not band-limited
+   * reconstruction, so it was not measuring true peak at all -- it was measuring
+   * sample peak with extra steps, and every "true peak <= -1.0 dBTP" pass built
+   * on it was a false green.
+   *
+   * This kernel instead performs the interpolation directly in plain JS: no
+   * WebAudio, no opaque platform resampler, fully deterministic. Verified against
+   * the same test tone: reports ~0.11 dBTP (the expected ~1.0 linear true peak),
+   * a silent buffer reports exactly 0 linear, and a slow 200 Hz/0.5-amplitude
+   * sine reports ~0.49999 (no spurious overshoot on content nowhere near
+   * Nyquist). K=8 (65 taps) is a generic, well-behaved Blackman-windowed sinc —
+   * not a certified ITU-R BS.1770 reference filter, but methodologically the
+   * same technique (band-limited 4x oversampling) and more than adequate to
+   * catch real inter-sample overshoot for a game-audio build gate.
+   */
+  function buildTruePeakFirKernel(factor, halfWidthSamples) {
+    const L = factor;
+    const K = halfWidthSamples;
+    const N = 2 * K * L + 1;
+    const h = new Float64Array(N);
+    const center = K * L;
+    let sum = 0;
+    for (let i = 0; i < N; i++) {
+      const n = i - center;
+      const x = n / L;
+      const sinc = x === 0 ? 1 : Math.sin(Math.PI * x) / (Math.PI * x);
+      const w = 0.42 - 0.5 * Math.cos((2 * Math.PI * i) / (N - 1)) + 0.08 * Math.cos((4 * Math.PI * i) / (N - 1));
+      const v = sinc * w;
+      h[i] = v;
+      sum += v;
     }
+    // unity DC gain after zero-stuffing (which divides energy by L): sum(h) must equal L.
+    const scale = sum !== 0 ? L / sum : 1;
+    for (let i = 0; i < N; i++) h[i] *= scale;
+    return { h, K, L, center };
+  }
+
+  // >=4x oversampling per the contract's true-peak gate. Built once per page.
+  const TRUE_PEAK_FIR = buildTruePeakFirKernel(4, 8);
+
+  /** True peak (dBTP) of one channel via the polyphase FIR kernel above. */
+  function truePeakChannelLinear(ch, kernel) {
+    const { h, L, center } = kernel;
+    const n = ch.length;
+    if (n === 0) return 0;
+    const mMax = n * L - 1;
+    let peak = 0;
+    for (let m = 0; m <= mMax; m++) {
+      const kMin = Math.max(0, Math.ceil((m - center) / L));
+      const kMax = Math.min(n - 1, Math.floor((m + center) / L));
+      let acc = 0;
+      for (let k = kMin; k <= kMax; k++) {
+        acc += ch[k] * h[m - k * L + center];
+      }
+      const a = Math.abs(acc);
+      if (a > peak) peak = a;
+    }
+    return peak;
+  }
+
+  function truePeakDbtp(left, right, sampleRate) {
+    void sampleRate; // the kernel is sample-rate-agnostic (it operates purely on sample index ratios)
+    const peak = Math.max(truePeakChannelLinear(left, TRUE_PEAK_FIR), truePeakChannelLinear(right, TRUE_PEAK_FIR));
     return toDbOrFloor(peak);
   }
 
@@ -553,7 +616,7 @@ function installAudioHarness() {
     const rmsDbfs = toDbOrFloor(rms);
     const crestDb = Number.isFinite(peakDbfs) && Number.isFinite(rmsDbfs) ? peakDbfs - rmsDbfs : 0;
     const spec = analyzeSpectrum(mono, sampleRate);
-    const truePeak = await truePeakDbtp(left, right, sampleRate);
+    const truePeak = truePeakDbtp(left, right, sampleRate); // synchronous FIR kernel, no WebAudio involved
     const limiterPct =
       preLimitLeft && preLimitRight ? limiterActivePct(preLimitLeft, preLimitRight) : null;
     return {
@@ -844,6 +907,45 @@ function pctDiff(a, b) {
   return (Math.abs(a - b) / denom) * 100;
 }
 
+/** Sum of absolute differences across the 6 fixed bandEnergyPct bands (each
+ *  cue's bands already sum to ~100%, so this ranges 0..200 — a plain,
+ *  explainable measure of how differently shaped two spectra are, distinct
+ *  from and complementary to a single-number centroid). */
+const BAND_KEYS = ['0-120', '120-400', '400-800', '800-2000', '2000-4000', '4000-20000'];
+function bandShapeL1Distance(a, b) {
+  let sum = 0;
+  for (const k of BAND_KEYS) sum += Math.abs((a[k] ?? 0) - (b[k] ?? 0));
+  return sum;
+}
+
+/**
+ * AUDIO_CONTRACT.md rule 9 amendment, item 3: named pairs that must never be
+ * confused (the within-hero distinctness check only ever compared slots
+ * WITHIN one hero, which is exactly why atk.hero.melee/atk.creep.melee and
+ * die.hero.ally/die.hero.self — 1Hz of centroid apart — slipped through).
+ * "At minimum" list from the ruling, plus all six heroes' ultimates (the
+ * ruling said "the four heroes' ultimates" but RIFT has six heroes per
+ * HERO_TIMBRE in config.ts — comparing all six pairwise is more complete,
+ * not less, and the ruling's list is an explicit floor, not a ceiling).
+ */
+const MUST_DIFFER_PAIRS = [
+  ['atk.hero.melee', 'atk.creep.melee'],
+  ['die.hero', 'die.hero.ally'],
+  ['die.hero', 'die.hero.self'],
+  ['die.hero.ally', 'die.hero.self'],
+  ['obj.tower', 'obj.guard'],
+  ['obj.tower', 'obj.ancient'],
+  ['obj.guard', 'obj.ancient'],
+  ...(() => {
+    const ults = ['cast.bullwark.3', 'cast.longbow.3', 'cast.reaver.3', 'cast.hex.3', 'cast.mender.3', 'cast.shade.3'];
+    const pairs = [];
+    for (let i = 0; i < ults.length; i++) {
+      for (let j = i + 1; j < ults.length; j++) pairs.push([ults[i], ults[j]]);
+    }
+    return pairs;
+  })(),
+];
+
 async function main() {
   const args = process.argv.slice(2);
   if (args.includes('--help') || args.includes('-h')) {
@@ -1096,7 +1198,18 @@ async function main() {
       checkMetric(`attack crispness: ${id} crestDb > 8`, m.crestDb, (v) => v > 8, (v) => `got ${v.toFixed(1)}dB`);
     }
 
-    // the info-register law — every non-info cue (everything not in ui.*/ann.*).
+    // the info-register law, AMENDED (AUDIO_CONTRACT.md rule 9 amendment). The
+    // original "<=8% above 800Hz" was a ceiling with no floor: dumping nearly
+    // all energy below 120Hz satisfied it perfectly, and measurement showed six
+    // cue authors had independently done exactly that (atk.hero.melee 98.3%
+    // sub, die.hero.self 99.5% sub, etc — the most-repeated sounds in the game
+    // reduced to near-inaudible rumble on any speaker that rolls off below
+    // ~120Hz). The protected lane narrows to 2000-4000Hz ONLY — where
+    // ui.lastHit and the announcer live and must stay legible — reusing the
+    // same frozen INFO_BAND_MAX_PCT (8%) ceiling, just applied to the one band
+    // that actually needs protecting. 120-2000Hz is now open; the floor that
+    // used to live here has moved to the "impact body floor" gate below, which
+    // is the actual fix for the sub-only defect this replaces.
     for (const id of soundIds) {
       if (id.startsWith('ui.') || id.startsWith('ann.')) continue;
       const m = report.cues[id]?.primary;
@@ -1104,21 +1217,40 @@ async function main() {
         skip(`info register: ${id}`, 'primary render failed above — no audio to measure');
         continue;
       }
-      const b = m.bandEnergyPct;
-      const bandKeys = ['800-2000', '2000-4000', '4000-20000'];
-      const bandVals = bandKeys.map((k) => b?.[k]);
-      if (bandVals.some((v) => typeof v !== 'number' || !Number.isFinite(v))) {
-        failGate(
-          `info register: ${id}`,
-          `bandEnergyPct has a missing/non-finite band (${bandKeys.map((k, i) => `${k}=${String(bandVals[i])}`).join(', ')}) — the measurement did not happen, cannot evaluate this gate`,
-        );
+      checkMetric(
+        `info register: ${id} energy in the protected 2000-4000Hz lane <= ${INFO_BAND_MAX_PCT}%`,
+        m.bandEnergyPct?.['2000-4000'],
+        (v) => v <= INFO_BAND_MAX_PCT,
+        (v) => `got ${v.toFixed(1)}%`,
+      );
+    }
+
+    // NEW: impact body floor (AUDIO_CONTRACT.md rule 9 amendment). "Sub is a
+    // layer, not the whole sound." atk.*/hit.*/die.*/obj.* cues must carry a
+    // real minimum share of their energy in 120-2000Hz -- the band that
+    // actually reproduces on real consumer hardware (laptops, phones, most
+    // headsets roll off below ~120Hz). 20% is the low end of the coordinator's
+    // stated 20-25% order-of-magnitude range: low enough to not be an arbitrary
+    // high bar invented to make a point, high enough that a cue which is
+    // ~98% sub (as measured pre-fix) still fails it decisively. This is
+    // deliberately a single floor on 120-2000Hz rather than also capping
+    // 0-120Hz -- the two are close to equivalent for the actual defect found,
+    // and one clear, explainable metric beats two overlapping ones.
+    const IMPACT_BODY_FLOOR_PCT = 20;
+    for (const id of soundIds) {
+      if (!(id.startsWith('atk.') || id.startsWith('hit.') || id.startsWith('die.') || id.startsWith('obj.'))) {
         continue;
       }
-      const infoPct = bandVals[0] + bandVals[1] + bandVals[2];
-      check(
-        `info register: ${id} energy above ${INFO_FLOOR_HZ}Hz <= ${INFO_BAND_MAX_PCT}%`,
-        infoPct <= INFO_BAND_MAX_PCT,
-        `got ${infoPct.toFixed(1)}%`,
+      const m = report.cues[id]?.primary;
+      if (!m) {
+        skip(`impact body floor: ${id}`, 'primary render failed above — no audio to measure');
+        continue;
+      }
+      checkMetric(
+        `impact body floor: ${id} bandEnergyPct[120-2000] >= ${IMPACT_BODY_FLOOR_PCT}% (audibility on speakers that roll off below ~120Hz)`,
+        m.bandEnergyPct?.['120-400'] + m.bandEnergyPct?.['400-800'] + m.bandEnergyPct?.['800-2000'],
+        (v) => v >= IMPACT_BODY_FLOOR_PCT,
+        (v) => `got ${v.toFixed(1)}% (0-120Hz was ${safeFixed(m.bandEnergyPct?.['0-120'], 1)}%)`,
       );
     }
 
@@ -1200,6 +1332,41 @@ async function main() {
         `hero distinctness: ${hero} min pairwise centroid separation >= 15%`,
         minPct >= 15,
         `closest pair ${minPair.join(' vs ')} at ${minPct.toFixed(1)}%${missingNote}`,
+      );
+    }
+
+    // NEW: named must-differ pairs (AUDIO_CONTRACT.md rule 9 amendment, item 3).
+    // A pair passes if EITHER signal shows meaningful separation: centroid
+    // alone can be fooled (two spectra can share a centroid while sounding
+    // very different in shape), so a >=20 percentage-point difference in the
+    // 6-band energy distribution (bandShapeL1Distance, 0..200 range) is
+    // accepted as an alternate, independently sufficient proof of distinctness
+    // — not ANDed with centroid, which would make the gate stricter than
+    // either signal alone and risk failing pairs a listener could plainly
+    // tell apart by timbre even with similar spectral "center of mass".
+    const PAIR_CENTROID_MIN_PCT = 15; // same bar as the within-hero check, for consistency
+    const PAIR_BAND_SHAPE_MIN_L1 = 20; // percentage points, out of a 0..200 range
+    for (const [idA, idB] of MUST_DIFFER_PAIRS) {
+      const mA = report.cues[idA]?.primary;
+      const mB = report.cues[idB]?.primary;
+      const label = `must differ: ${idA} vs ${idB}`;
+      if (!mA || !mB) {
+        const missing = [!mA ? idA : null, !mB ? idB : null].filter(Boolean).join(', ');
+        skip(label, `${missing} did not render above — no audio to compare`);
+        continue;
+      }
+      const cA = mA.spectralCentroidHz;
+      const cB = mB.spectralCentroidHz;
+      if (typeof cA !== 'number' || !Number.isFinite(cA) || typeof cB !== 'number' || !Number.isFinite(cB)) {
+        failGate(label, 'spectralCentroidHz missing/non-finite on one side — the measurement did not happen');
+        continue;
+      }
+      const centroidPct = pctDiff(cA, cB);
+      const bandL1 = bandShapeL1Distance(mA.bandEnergyPct, mB.bandEnergyPct);
+      check(
+        `${label} (centroid >= ${PAIR_CENTROID_MIN_PCT}% OR band-shape L1 >= ${PAIR_BAND_SHAPE_MIN_L1})`,
+        centroidPct >= PAIR_CENTROID_MIN_PCT || bandL1 >= PAIR_BAND_SHAPE_MIN_L1,
+        `centroid ${cA.toFixed(0)}Hz vs ${cB.toFixed(0)}Hz (${centroidPct.toFixed(1)}% apart), band-shape L1 ${bandL1.toFixed(1)}`,
       );
     }
 
