@@ -216,6 +216,32 @@ export interface SurfaceDef {
   readonly blending?: SurfaceBlending;
   /** Depth bias, or omitted/`null` for none (`material.polygonOffset = false`). */
   readonly polygonOffset?: SurfacePolygonOffset | null;
+
+  // --- scene-integration controls (AMENDMENT_4 §B, §C) -----------------------
+  //
+  // Both are OPTIONAL and both default to the value the engine already used, so
+  // every family authored before amendment 4 renders and casts exactly as it
+  // did. They are here for the same reason the three above are: the property
+  // belongs to the FAMILY, and the alternative is every consumer remembering to
+  // set it — which is how FX, decals and shroud planes ended up in the shadow
+  // pass in the first place.
+
+  /** `material.fog`. Omitted (or true) means the family is affected by scene
+   *  fog. False for the overlay families that hang above the world and must not
+   *  be fogged by it: a fog-of-war sheet tinted by distance fog is a UI element
+   *  wearing the atmosphere's colour, and an additive burst dragged toward the
+   *  fog colour loses the one thing additive is for (AMENDMENT_4 §B). */
+  readonly fog?: boolean;
+  /** Whether meshes baked from this family cast shadows. Omitted (or true) is
+   *  the historical unconditional behaviour of `bakedMeshOf`.
+   *
+   *  False for `fxAdditive`, `fxDecal` and `shroud`: a transparent, depth-write-
+   *  free quad has no business in the shadow map, and the shadow pass is counted
+   *  by the draw meter against the 700-draw gate (AMENDMENT_3 §D.2, AMENDMENT_4
+   *  §C). This only stops families that must NEVER cast; R_SCENE still owns the
+   *  light rig and the overall caster whitelist, and per-instance opt-outs
+   *  (ferns, ground cover) remain the consumer's. */
+  readonly castShadow?: boolean;
 }
 
 // --- The frozen table --------------------------------------------------------
@@ -544,6 +570,11 @@ export const SURFACES: Record<SurfaceId, SurfaceDef> = {
     depthWrite: false,
     blending: 'additive',
     polygonOffset: null,
+    // Additive light added to the frame, then dragged toward the fog colour by
+    // scene fog, is no longer additive light — it greys out at exactly the
+    // distance the effect matters least and reads as a washed quad.
+    fog: false,
+    castShadow: false,
   },
 
   /** Ground scars, scorch marks, order markers — a FLAT QUAD LYING ON THE
@@ -578,6 +609,10 @@ export const SURFACES: Record<SurfaceId, SurfaceDef> = {
     depthWrite: false,
     blending: 'normal',
     polygonOffset: { factor: -1, units: -1 },
+    // A scar lies ON the ground and is fogged with it, so `fog` stays default.
+    // It must not cast: a flat quad's shadow is a second, offset copy of the
+    // scar, and it would double the decal's cost in the shadow pass.
+    castShadow: false,
   },
 
   /** The fog-of-war overlay planes, and nothing else.
@@ -605,5 +640,12 @@ export const SURFACES: Record<SurfaceId, SurfaceDef> = {
     depthWrite: false,
     blending: 'normal',
     polygonOffset: null,
+    // The overlay IS the atmosphere the fog system paints; scene-fogging it a
+    // second time tints the unexplored ink toward the horizon colour and the
+    // fog-of-war boundary stops reading as a boundary (AMENDMENT_4 §B).
+    fog: false,
+    // A sheet suspended over the whole map, casting a map-sized shadow, is the
+    // single worst caster the build could have.
+    castShadow: false,
   },
 };

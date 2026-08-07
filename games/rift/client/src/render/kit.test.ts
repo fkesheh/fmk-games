@@ -38,6 +38,7 @@ import {
   emissiveSurface,
   gradientTexture,
   ico,
+  instanceSurface,
   lathe,
   markBloom,
   noiseTexture,
@@ -321,6 +322,113 @@ describe('transparent surface families', () => {
   });
 });
 
+// ---- scene fog, from the table (AMENDMENT_4 §B) ------------------------------
+//
+// The overlay families hang above the world. Scene-fogging the shroud tints the
+// unexplored ink toward the horizon colour and the fog-of-war boundary stops
+// reading as a boundary; scene-fogging an additive burst drags it toward the fog
+// colour, which is precisely what additive is for not doing.
+
+describe('SurfaceDef.fog', () => {
+  it('takes material.fog from the table, defaulting to true', () => {
+    for (const id of SURFACE_IDS) {
+      expect(surface(id).fog, id).toBe(SURFACES[id].fog ?? true);
+    }
+  });
+
+  it('unfogs the shroud overlay and additive FX, and nothing else', () => {
+    expect(surface('shroud').fog).toBe(false);
+    expect(surface('fxAdditive').fog).toBe(false);
+    // A ground scar LIES on the terrain; it is fogged with the terrain it is
+    // painted on, or it floats free of the atmosphere at range.
+    expect(surface('fxDecal').fog).toBe(true);
+    expect(surface('groundMoss').fog).toBe(true);
+    expect(surface('cliffRock').fog).toBe(true);
+  });
+
+  it('reaches an emissive material too — the field is on buildMaterial', () => {
+    expect(emissiveSurface('fxAdditive', 'azure', 2).fog).toBe(false);
+    expect(emissiveSurface('crystal', 'azure', 2).fog).toBe(true);
+  });
+});
+
+// ---- the uncached escape hatch (AMENDMENT_4 §A) ------------------------------
+//
+// Two needs a shared cached material cannot meet: the fog overlay's low and high
+// sheets carry DIFFERENT `map`/`emissiveMap` textures, and `fxDecal` cannot fade
+// because under normal blending `opacity` is the only fade channel and the
+// vertex-colour attribute is itemSize 3 by law. One hatch, three channels.
+
+describe('instanceSurface() — the one legal uncached material', () => {
+  it('returns a DISTINCT instance every call, and never the cached one', () => {
+    const a = instanceSurface('shroud');
+    const b = instanceSurface('shroud');
+    expect(a).not.toBe(b);
+    expect(a).not.toBe(surface('shroud'));
+    expect(b).not.toBe(surface('shroud'));
+    // And it must not have poisoned the cache on the way past: `surface()` still
+    // hands out one shared instance, which is the whole draw-call story.
+    expect(surface('shroud')).toBe(surface('shroud'));
+  });
+
+  it('carries per-sheet map and emissiveMap — R_FOG has two sheets', () => {
+    const low = new THREE.Texture();
+    const high = new THREE.Texture();
+    const glow = new THREE.Texture();
+    const a = instanceSurface('shroud', { map: low, emissiveMap: glow });
+    const b = instanceSurface('shroud', { map: high });
+    expect(a.map).toBe(low);
+    expect(a.emissiveMap).toBe(glow);
+    expect(b.map).toBe(high);
+    // Neither leaked into the other, nor into the shared instance.
+    expect(b.emissiveMap).toBeNull();
+    expect(surface('shroud').map).toBeNull();
+    expect(surface('shroud').emissiveMap).toBeNull();
+  });
+
+  it('gives fxDecal the opacity fade it cannot get from a vertex colour', () => {
+    const m = instanceSurface('fxDecal', { opacity: 0.25 });
+    expect(m.opacity).toBeCloseTo(0.25, 10);
+    expect(m.transparent).toBe(true);
+    // The shared decal material is untouched at full opacity.
+    expect(surface('fxDecal').opacity).toBe(1);
+  });
+
+  it('omitting an override leaves the table value, not undefined', () => {
+    const m = instanceSurface('fxDecal', {});
+    expect(m.map).toBeNull();
+    expect(m.emissiveMap).toBeNull();
+    expect(m.opacity).toBe(SURFACES.fxDecal.opacity);
+  });
+
+  it('builds through the SAME path — vertex colours and the table blend state', () => {
+    for (const id of SURFACE_IDS) {
+      const def = SURFACES[id];
+      const m = instanceSurface(id);
+      const shared = surface(id);
+      expect(m.vertexColors, id).toBe(true);
+      expect(m.depthWrite, id).toBe(def.depthWrite ?? true);
+      expect(m.blending, id).toBe(
+        def.blending === 'additive' ? THREE.AdditiveBlending : THREE.NormalBlending,
+      );
+      expect(m.polygonOffset, id).toBe((def.polygonOffset ?? null) !== null);
+      expect(m.polygonOffsetFactor, id).toBe(def.polygonOffset?.factor ?? 0);
+      expect(m.polygonOffsetUnits, id).toBe(def.polygonOffset?.units ?? 0);
+      expect(m.fog, id).toBe(def.fog ?? true);
+      expect(m.transparent, id).toBe(def.transparent);
+      // Everything the shared material has, byte for byte, minus the identity.
+      expect(m.color.getHexString(), id).toBe(shared.color.getHexString());
+      expect(m.roughness, id).toBe(shared.roughness);
+      expect(m.metalness, id).toBe(shared.metalness);
+      expect(m.flatShading, id).toBe(shared.flatShading);
+      expect(m.emissive.getHexString(), id).toBe(shared.emissive.getHexString());
+      expect(m.emissiveIntensity, id).toBe(shared.emissiveIntensity);
+      expect(m.normalMap === null, id).toBe(shared.normalMap === null);
+      expect(m.roughnessMap === null, id).toBe(shared.roughnessMap === null);
+    }
+  });
+});
+
 // ---- generated textures -----------------------------------------------------
 
 describe('procedural textures — cached, tiling, never scaled by hand', () => {
@@ -503,6 +611,49 @@ describe('bake() — one geometry per surface id', () => {
       expect(child.receiveShadow).toBe(true);
     }
   });
+
+  // AMENDMENT_4 §C. `bakedMeshOf` used to set `castShadow = true`
+  // unconditionally, so every FX dome, ground scar and shroud plane baked
+  // through here entered the shadow pass — a pass the draw meter counts,
+  // against a 700 gate we are already at ~463 against.
+  it('keeps FX, decals and the shroud OUT of the shadow pass', () => {
+    for (const id of ['fxAdditive', 'fxDecal', 'shroud'] as const) {
+      const baked = bake([{ geo: box(1, 1, 1), surface: id }]);
+      expect(baked.group.children, id).toHaveLength(1);
+      for (const child of baked.group.children) {
+        expect(child.castShadow, id).toBe(false);
+        // Not casting is not the same as not receiving; only casting is ruled on.
+        expect(child.receiveShadow, id).toBe(true);
+      }
+    }
+  });
+
+  it('takes castShadow from the table for every family, defaulting to true', () => {
+    for (const id of SURFACE_IDS) {
+      const baked = bake([{ geo: box(1, 1, 1), surface: id }]);
+      const child = baked.group.children[0];
+      expect(child, id).toBeDefined();
+      expect(child?.castShadow, id).toBe(SURFACES[id].castShadow ?? true);
+    }
+  });
+
+  // The amendment's own requirement: the new fields are OPTIONAL, and omitting
+  // them must mean exactly the pre-amendment behaviour. The sixteen STYLE_BIBLE
+  // §2 families omit both, so every one of them renders and casts as it did.
+  it('leaves the sixteen pre-amendment families byte-identical', () => {
+    const pre = SURFACE_IDS.filter(
+      (id) => id !== 'fxAdditive' && id !== 'fxDecal' && id !== 'shroud',
+    );
+    expect(pre).toHaveLength(16);
+    for (const id of pre) {
+      const def = SURFACES[id];
+      expect(def.fog, id).toBeUndefined();
+      expect(def.castShadow, id).toBeUndefined();
+      expect(surface(id).fog, id).toBe(true);
+      const baked = bake([{ geo: box(1, 1, 1), surface: id }]);
+      expect(baked.group.children[0]?.castShadow, id).toBe(true);
+    }
+  });
 });
 
 describe('bakeVertexAO() — multiplies, never replaces', () => {
@@ -619,6 +770,19 @@ describe('bakeChunked() — the cold-load scheduler', () => {
     expect(job.mesh.parts.map((p) => p.material)).toEqual(
       bake(parts()).parts.map((p) => p.material),
     );
+  });
+
+  // The slow path builds its own meshes, so it can drift from bake() on exactly
+  // the field bake() just started reading from the table (AMENDMENT_4 §C).
+  it('honours castShadow exactly as bake() does', () => {
+    for (const id of SURFACE_IDS) {
+      const job = bakeChunked([{ geo: box(1, 1, 1), surface: id }], 1000);
+      while (job.step());
+      const child = job.mesh.group.children[0];
+      expect(child, id).toBeDefined();
+      expect(child?.castShadow, id).toBe(SURFACES[id].castShadow ?? true);
+      expect(child?.receiveShadow, id).toBe(true);
+    }
   });
 });
 

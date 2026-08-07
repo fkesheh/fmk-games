@@ -1041,6 +1041,12 @@ function buildMaterial(id: SurfaceId, def: SurfaceDef, albedo: string): THREE.Me
     polygonOffset: offset !== null,
     polygonOffsetFactor: offset?.factor ?? 0,
     polygonOffsetUnits: offset?.units ?? 0,
+    // SCENE FOG COMES FROM THE TABLE TOO (AMENDMENT_4 §B). The overlay families
+    // hang above the world and must not be tinted by the atmosphere they are
+    // painting; there was previously no way to say so through the table, which
+    // is what left the shroud unreachable. `true` is THREE's own default, so
+    // every family that omits it is untouched.
+    fog: def.fog ?? true,
     // VERTEX-COLOUR LAW: unconditional, on every material, forever. Baked AO
     // rides in the geometry's `color` attribute and would otherwise be
     // silently ignored. It holds on the transparent families too — an additive
@@ -1144,6 +1150,54 @@ export function partMaterial(
   return emissive === undefined
     ? surface(id, tint)
     : emissiveSurface(id, emissive.colorKey, emissive.intensity, tint);
+}
+
+/**
+ * The ONE legal uncached-material path (AMENDMENT_4 §A). Returns a fresh,
+ * UNCACHED `MeshStandardMaterial` built through the same `buildMaterial` as
+ * `surface()` — same surface definition, same unconditional `vertexColors`,
+ * same blending / depthWrite / polygonOffset / fog from the frozen table — with
+ * at most three channels overridden.
+ *
+ * It exists because exactly two needs cannot be met by a shared instance:
+ *  - the fog-of-war overlay carries a `map` and `emissiveMap` that DIFFER
+ *    between its low and high sheets, and one cached `shroud` material cannot
+ *    hold two different maps;
+ *  - `fxDecal` cannot fade, because under normal blending `opacity` is the only
+ *    fade channel and the vertex-colour attribute is `itemSize 3` by law, so a
+ *    scar could otherwise only vanish or shrink.
+ *
+ * Both are the same shape: a caller that legitimately needs a material of its
+ * own. The terms are narrow, and they are the whole point:
+ *
+ *  - **The caller OWNS DISPOSAL.** Nothing else holds a reference to it, so
+ *    nothing else will free it. `matCache` never sees this instance.
+ *  - **Never call it per frame, and never per entity.** Per SHEET or per POOL
+ *    only — a small, bounded number fixed at construction. A per-entity call is
+ *    a material leak and a draw call each, which is the failure `matCache`
+ *    exists to prevent.
+ *  - **This is not a licence to reintroduce call-site material mutation.**
+ *    Overriding anything outside `map`, `emissiveMap` and `opacity` remains
+ *    banned, and so does `.clone()`-and-override. Everything else — blend
+ *    state, depth state, roughness, the tint ladder — comes from the table, and
+ *    a family that needs different values needs a table entry, not this.
+ */
+export function instanceSurface(
+  id: SurfaceId,
+  overrides?: {
+    readonly map?: THREE.Texture | null;
+    readonly emissiveMap?: THREE.Texture | null;
+    readonly opacity?: number;
+  },
+): THREE.MeshStandardMaterial {
+  const def = SURFACES[id];
+  const m = buildMaterial(id, def, APAL[def.albedo]);
+  if (overrides !== undefined) {
+    if (overrides.map !== undefined) m.map = overrides.map;
+    if (overrides.emissiveMap !== undefined) m.emissiveMap = overrides.emissiveMap;
+    if (overrides.opacity !== undefined) m.opacity = overrides.opacity;
+  }
+  return m;
 }
 
 // ============================================================================
@@ -1495,8 +1549,12 @@ function normalizePart(part: Part): THREE.BufferGeometry {
   return g;
 }
 
-/** One merge bucket, keyed by material. */
+/** One merge bucket, keyed by material. `surface` is carried alongside because
+ *  the bucket key is a material identity and the mesh needs the FAMILY to read
+ *  its `castShadow` from the table — every part in a bucket shares one surface
+ *  id by construction, since the id is the first field of the key. */
 interface Bucket {
+  readonly surface: SurfaceId;
   readonly material: THREE.MeshStandardMaterial;
   readonly geos: THREE.BufferGeometry[];
 }
@@ -1518,9 +1576,19 @@ function mergeBucket(key: string, b: Bucket): THREE.BufferGeometry {
   return merged;
 }
 
-function bakedMeshOf(geo: THREE.BufferGeometry, material: THREE.MeshStandardMaterial): THREE.Mesh {
+/** `castShadow` comes from the FAMILY (AMENDMENT_4 §C). This used to be an
+ *  unconditional `true`, which put every FX dome, ground scar and shroud plane
+ *  baked through `bake()` into the shadow pass — a pass the draw meter counts,
+ *  against a 700-draw gate we are already at ~463 against. Default is `true`,
+ *  so the sixteen opaque families are untouched; `receiveShadow` is not part of
+ *  this ruling and stays unconditional. */
+function bakedMeshOf(
+  geo: THREE.BufferGeometry,
+  material: THREE.MeshStandardMaterial,
+  id: SurfaceId,
+): THREE.Mesh {
   const mesh = new THREE.Mesh(geo, material);
-  mesh.castShadow = true;
+  mesh.castShadow = SURFACES[id].castShadow ?? true;
   mesh.receiveShadow = true;
   return mesh;
 }
@@ -1545,7 +1613,11 @@ export function bake(parts: readonly Part[]): BakedMesh {
     const key = bucketKey(p);
     let b = buckets.get(key);
     if (b === undefined) {
-      b = { material: partMaterial(p.surface, p.tint, p.emissive), geos: [] };
+      b = {
+        surface: p.surface,
+        material: partMaterial(p.surface, p.tint, p.emissive),
+        geos: [],
+      };
       buckets.set(key, b);
     }
     b.geos.push(normalizePart(p));
@@ -1556,7 +1628,7 @@ export function bake(parts: readonly Part[]): BakedMesh {
   for (const [key, b] of buckets) {
     if (b.geos.length === 0) continue;
     const geo = mergeBucket(key, b);
-    group.add(bakedMeshOf(geo, b.material));
+    group.add(bakedMeshOf(geo, b.material, b.surface));
     out.push({ geo, material: b.material });
   }
   return { group, parts: out };
@@ -1733,7 +1805,11 @@ export function bakeChunked(parts: readonly Part[], budgetMs: number): ChunkedBa
         const key = bucketKey(p);
         let b = buckets.get(key);
         if (b === undefined) {
-          b = { material: partMaterial(p.surface, p.tint, p.emissive), geos: [] };
+          b = {
+            surface: p.surface,
+            material: partMaterial(p.surface, p.tint, p.emissive),
+            geos: [],
+          };
           buckets.set(key, b);
         }
         b.geos.push(normalizePart(p));
@@ -1750,7 +1826,7 @@ export function bakeChunked(parts: readonly Part[], budgetMs: number): ChunkedBa
       const b = key !== undefined ? buckets.get(key) : undefined;
       if (key !== undefined && b !== undefined && b.geos.length > 0) {
         const geo = mergeBucket(key, b);
-        group.add(bakedMeshOf(geo, b.material));
+        group.add(bakedMeshOf(geo, b.material, b.surface));
         out.push({ geo, material: b.material });
       }
       j++;
