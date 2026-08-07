@@ -14,8 +14,8 @@
 //   wide-mid / wide-base-own / wide-base-enemy   camH 55 (fully out)
 //   mid-lane                                     camH ~35, live creep clash
 //   close-hero / close-creeps / close-tower /
-//   close-ancient / close-deco / camp-brute      camH 18 (fully in)
-//   high-ground / jungle-wall                    camH ~25 (GRAPHICS_CONTRACT §5)
+//   close-ancient / close-deco / camp-brute      camH 11 (fully in, STYLE_BIBLE §5)
+//   high-ground / jungle-wall                    camH ~24 (GRAPHICS_CONTRACT §5)
 //   river-mid                                    camH ~35
 //   fx-cast / fx-combat / fog-edge               camH ~35
 //   hud-live / ui-shop / ui-scoreboard           camH ~35, HUD/overlay state
@@ -39,17 +39,32 @@
 //     the lane count, TERRAIN_CONTRACT §1) or a fixed fraction along the
 //     own->enemy diagonal — each mirrored through the map centre for team 1,
 //     so the same frames come back whichever side the human is seated on;
-//   * zoom is driven to a CLAMP (12 wheel notches at 1.12/notch overshoots the
-//     18..55 range) and then stepped back a fixed count — never relative to an
+//   * zoom is driven to a CLAMP (15 wheel notches at 1.12/notch overshoots the
+//     11..55 range) and then stepped back a fixed count — never relative to an
 //     unknown current height;
-//   * dayPhase is PINNED before every in-world shot through
+//   * the RENDERER's dayPhase is PINNED before every in-world shot through
 //     window.__rift.setDayPhase — 0 for the day matrix, 1 for the night trio.
 //     Without this the lighting depends on how long the match happened to have
 //     been running and no two judge rounds are comparable (GRAPHICS_CONTRACT
 //     §5). A missing setDayPhase fails the shot; it never captures anyway.
+//   * ...and the SERVER's dayPhase is a SEPARATE thing that the renderer pin
+//     does not touch: it scales every vision radius (config.ts
+//     `nightVisionScale`), and a hero's vision disc is the only thing lighting
+//     an off-lane frame. DAY_PERIOD_S 600 at speed 5 is a 120-second WALL
+//     cycle, so any vision-dependent shot waits for a fixed point in it
+//     (`waitDayPhaseBelow`) instead of taking whatever the clock offers;
 //   * shots that need a hero in frame POSE the hero first: order it to the
 //     fixed point and poll until it stands there, then aim the camera at the
 //     POINT, not at the hero;
+//   * and NOTHING above is trusted to have worked. Before every in-world
+//     shutter the camera's aim and height are MEASURED back out of the scene's
+//     own raycast (window.__rift.screenToGround) and compared against what the
+//     shot asked for, and the hero shots additionally require the hero to be
+//     inside that measured footprint. AMENDMENT_6: a harness that reports the
+//     arithmetic it intended instead of the state it produced is not a gate.
+//     This is not hypothetical — `panTo` ignored the minimap's 180° rotation
+//     and aimed every shot at the point-reflection of its target for an entire
+//     judge round, and `close-hero` shipped a frame with no hero in it;
 //   * every gameplay wait polls the real condition (opposing creeps in
 //     contact, units swinging, the cast event landing, neutrals visible in the
 //     camp clearing) with a timeout — the only fixed sleeps are the
@@ -87,7 +102,15 @@ import { mkdir, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
-import { CAMP_APPROACH_M, CAMP_VISIBLE_M, loadTerrain, terrainFacts } from './rift-terrain-facts.mjs';
+import {
+  assertCampBand,
+  CAMP_STAND_MAX_M,
+  CAMP_STAND_MIN_M,
+  CAMP_VISIBLE_M,
+  loadConfig,
+  loadTerrain,
+  terrainFacts,
+} from './rift-terrain-facts.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = Number(process.env.RIFT_ART_PORT ?? 8093); // 8080 dev / 8091 e2e / 8092 verify
@@ -192,17 +215,49 @@ const DRAW_CALL_BUDGET = 700;
 const TRIANGLE_BUDGET = 1_200_000;
 
 // ---- camera ------------------------------------------------------------------------
-// input.ts ZOOM_STEP = 1.12/notch, game.ts clamps camH to [18, 55] (default
-// 36). 12 notches move 3.9x — more than the 3.06x range — so 12 notches in
-// either direction always lands ON a clamp, which is what makes the framing
-// reproducible. 'default' = 4 notches in from 55 -> 34.96m.
-const ZOOM_CLAMP_STEPS = 12;
-const ZOOM_DEFAULT_STEPS = 4;
-// GRAPHICS_CONTRACT §5 asks for camH 24 on `high-ground`. The wheel is
-// multiplicative, so 24 is not exactly reachable; 3 notches OUT from the 18 m
-// clamp is 18 * 1.12^3 = 25.29 m, the nearest rung that is — and because it is
-// reached FROM a clamp it cannot drift between rounds.
-const ZOOM_CAM24_STEPS = 3;
+// input.ts ZOOM_STEP = 1.12/notch; game.ts clamps camH to [CAM_MIN_H 11,
+// CAM_MAX_H 55], default 36. STYLE_BIBLE §5 moved the lower clamp 18 -> 11
+// (a hero is ~40 px of a 1080p frame at camH 18, at which size §7's hero
+// silhouettes are unreadable), and that move invalidated the step counts here.
+//
+// The clamp-driving trick only works if the notch count OVERSHOOTS the whole
+// range: 55 / 11 = 5.0x, and 1.12^n must exceed it.
+//   12 notches = 3.896x  ->  55 / 3.896 = 14.12 m. NOT the clamp. Every "close"
+//                            shot in the matrix was sitting at 14.12 m — a
+//                            height nobody specified, neither the old 18 nor
+//                            the measured 11 — and `zoomTo('in')` was silently
+//                            a relative zoom, the one thing it exists to avoid.
+//   15 notches = 5.474x  ->  55 / 5.474 = 10.05 m, under 11, so it CLAMPS. ✓
+//                            and 11 * 5.474 = 60.2 m, over 55, so the outward
+//                            leg still clamps too. ✓
+const ZOOM_CLAMP_STEPS = 15;
+const ZOOM_DEFAULT_STEPS = 4; // 55 / 1.12^4 = 34.96 m ~= the 36 default
+// GRAPHICS_CONTRACT §5 asks for camH 24 on `high-ground` / `jungle-wall`. The
+// wheel is multiplicative, so 24 is not exactly reachable; the nearest rung
+// above the 11 m clamp is 11 * 1.12^7 = 24.32 m. (Against the old 18 m clamp
+// the same shot used 3 notches; carried over unchanged onto a 14.12 m base it
+// was producing 19.84 m, five metres under what §5 asked for.)
+const ZOOM_CAM24_STEPS = 7;
+/** What each rung is worth in metres, for the measured read-back below. */
+const ZOOM_RUNG_M = { out: 55, default: 34.96, cam24: 24.32, in: 11 };
+// The ABSOLUTE read-back tolerance. `camH` is derived from the ground footprint
+// the engine's own raycast reports (see `measureCamera`). That is exact on flat
+// ground, but `screenToGround` resolves against the real height field: ground
+// beside the target that sits Δ metres higher pulls the probe in by ~0.39Δ, and
+// RIFT's relief runs to 2.8 m. Measured, that reads up to 9% low — 9.99 m at
+// the 11 m clamp, taken beside the mid-lane tower.
+//
+// 12% therefore, and the number is honest about what it can and cannot catch:
+// it separates the rungs (the closest pair, 24.32 and 34.96, are 44% apart) and
+// it would have caught both of the defects that prompted it — 14.12 m reported
+// as 11 is +28%, and 19.84 m reported as 24.32 is -18%. What certifies the
+// clamp itself to the centimetre is `assertAtClamp`, which compares two probes
+// over the SAME ground and so has no relief term at all.
+const CAM_H_TOLERANCE = 0.12;
+/** How far the measured camera target may sit from the point we asked for. One
+ *  minimap pixel at 200 px covers side/200 = 0.64 m, and the click lands on a
+ *  pixel centre, so half a metre of quantisation is expected and 2 m is not. */
+const CAM_TARGET_TOLERANCE_M = 2.0;
 
 // ---- day / night pins ---------------------------------------------------------------
 // TERRAIN_CONTRACT §6 / contract.ts SceneHandle.setTimeOfDay: 0 = full day,
@@ -218,6 +273,21 @@ const NIGHT_PIN = 1;
 // mean 30.0-49.5 with stddev 22.3-35.8, so these floors sit at about half the
 // lowest observed mean and a quarter of the lowest observed stddev — under
 // every real frame, over every dimmed or blank one.
+//
+// THE FLOOR WAS NOT LOWERED, AND IT DID NOT NEED TO BE. `close-deco` (11.1) and
+// `camp-brute` (13.8) were failing the day floor and the two of them are the
+// only off-lane close-zoom shots, which made "18 is unreachable for an off-lane
+// framing, because the hero's own vision disc is the only lit ground" a very
+// plausible reading. It was the wrong one. Both were dark because `panTo`
+// aimed at the point-reflection of the pose (see `panTo`): the hero was
+// lighting one patch of jungle and the camera was photographing the unexplored
+// mirror of it. With the aim corrected and nothing else touched, the same two
+// shots measure 90.1 and 60.5 on the same build.
+//
+// This is why the floor stayed at 18. Re-deriving it downward would have made
+// the gate agree with the defect and closed the only signal that anything was
+// wrong — and 11.1 was never "an off-lane frame is dark", it was "this frame is
+// of the wrong place".
 const MIN_FRAME_STDDEV = 6; // 0..255
 const MIN_FRAME_MEAN_DAY = 18;
 const MIN_FRAME_MEAN_NIGHT = 6;
@@ -226,11 +296,30 @@ const MIN_FRAME_MEAN_NIGHT = 6;
 const FULLSCREEN_OVERLAYS = ['.hud .death-overlay', '.death-overlay', '.end-screen', '.lobby-start', '.modal'];
 
 // ---- terrain-derived framing ------------------------------------------------------------
-// CAMP_APPROACH_M / CAMP_VISIBLE_M come from ./rift-terrain-facts.mjs — one
-// definition for all three harnesses (they had drifted apart, and all three
-// were standing inside camp aggro).
+// The camp stand-off band and CAMP_VISIBLE_M come from ./rift-terrain-facts.mjs
+// — one definition for all three harnesses (they had drifted apart, and all
+// three were standing inside camp aggro).
 const CAMP_VISIBLE_TIMEOUT_MS = 30000;
 const WORLD_READY_TIMEOUT_MS = 60000;
+/** The SERVER day phase the camp shot is taken at. Not the renderer pin: that
+ *  one fixes the lighting, this one fixes VISION, and vision is what draws the
+ *  fog disc that lights an off-lane frame at all.
+ *
+ *  0.15 leaves hero vision at 10.59-11.00 m (`nightVisionScale`), a 4% spread
+ *  round to round, and comfortably over the ~9.4 m the furthest-possible
+ *  nearest member can sit at from the far end of the stand-off band. It is
+ *  reached for 15% of every cycle, and DAY_PERIOD_S 600 at speed 5 makes the
+ *  cycle 120 s of wall clock, so the wait below is bounded by about that. */
+const CAMP_SHOT_MAX_DAY_PHASE = 0.15;
+/** ...and the phase must still be under THIS when the shutter opens; the march
+ *  and the visibility poll cost a few seconds of a moving cycle. 0.35 is hero
+ *  vision 10.04 m, still over the 9.4 m worst case. */
+const CAMP_SHOT_MAX_DAY_PHASE_AT_SHOT = 0.35;
+const DAY_PHASE_WAIT_MS = 150000; // > one full 120 s wall cycle
+/** The camp pose is held tighter than the general POSE_TOLERANCE_M: the whole
+ *  stand-off band is 0.85 m wide, so a 2 m slop would put the hero either
+ *  inside camp aggro or outside the vision that reveals it. */
+const CAMP_POSE_TOLERANCE_M = 0.6;
 
 // ---- deterministic waits --------------------------------------------------------------
 const LIVE_TIMEOUT_MS = 60000;
@@ -242,7 +331,7 @@ const COMBAT_ATTACKERS = 2; // ents with a fresh .atk target in frame
 const COMBAT_RADIUS_M = 20;
 const CREEPS_TIMEOUT_MS = 90000;
 const CREEPS_MIN = 3;
-const CREEPS_RADIUS_M = 12; // camH 18 frames ~16m either side — keep them ON screen
+const CREEPS_RADIUS_M = 8; // camH 11 frames ~11m either side — keep them ON screen
 const SCOUT_TIMEOUT_MS = 90000; // reveal the enemy base for wide-base-enemy
 const FRESH_TICK_MS = 400; // liveness probe window (20 sim ticks at speed 5)
 const RESPAWN_TIMEOUT_MS = 90000; // RESPAWN_BASE_S 3 + 3.5/level, /5 for speed
@@ -276,6 +365,9 @@ const RETREAT_SAFE_M = 12; // "home" for retreatHome: inside the fountain's guar
 // harness exited with NO manifest, which its consumers treat as "never run".
 // ============================================================================
 let FACTS = null;
+/** shared/src/config.ts, loaded the same way — every balance constant the
+ *  camp checks reason about is read from it rather than copied. */
+let CONFIG = null;
 
 // ---- state -----------------------------------------------------------------------------
 const shots = [];
@@ -535,8 +627,137 @@ const neutralsNear = (page, cx, cz, radius) =>
     radius,
   );
 
-/** Pan the camera by clicking the minimap canvas (world [0,side]^2 maps
- *  linearly onto it — ui/minimap.ts pointerdown -> actions.panCameraTo). */
+/** Live camp members (team 2) near a clearing centre, with their positions —
+ *  used to CHECK the ring radius this harness's stand-off band is derived
+ *  against, rather than trusting the copied constant. */
+const campMembers = (page, cx, cz, radius) =>
+  page.evaluate(
+    (x, z, r) => {
+      const ring = window.__rift?.snaps() ?? [];
+      const s = ring.length > 0 ? ring[ring.length - 1] : null;
+      if (s === null || s === undefined) return [];
+      return s.ents
+        .filter((e) => e.team === 2 && e.hp > 0 && Math.hypot(e.x - x, e.z - z) <= r)
+        .map((e) => ({ x: e.x, z: e.z }));
+    },
+    cx,
+    cz,
+    radius,
+  );
+
+/**
+ * The two properties the stand-off band exists to produce, checked against the
+ * live snapshot at the moment of the shot:
+ *
+ *   1. the CLEARING CENTRE is inside the hero's own vision — so the ground this
+ *      shot frames is lit by this hero, not by a bot that happened to be
+ *      standing somewhere useful, which is a reveal that will not repeat;
+ *   2. no member has reached the hero, so the camp has not pulled.
+ *
+ * (1) is asked of the CLEARING, not of the nearest member, and the difference
+ * matters. Members are not furniture: they chase lane creeps, get pushed by
+ * separation and walk home again, and the first version of this check —
+ * "nearest member inside hero vision" — failed a good frame because a member
+ * had drifted to the far side of the clearing and read 11.04 m against an
+ * 11.00 m radius. The camp was in shot and lit; the check was measuring
+ * something the shot does not depend on. What it does depend on is the
+ * clearing being inside the vision disc, and that is a property of the
+ * stand-off point and the day phase — both of which this harness controls.
+ *
+ * Every number here comes from shared `config.ts` through `loadConfig()`,
+ * `nightVisionScale` included — the night ramp is the sim's own function rather
+ * than a harness re-derivation of it. That is the whole point: a stale local
+ * copy of exactly this vision figure is what broke this shot, and AMENDMENT_1
+ * §B.1 had to hoist a re-derived copy of exactly this ramp out of two modules
+ * for the same reason.
+ *
+ * What this deliberately does NOT assert is where members sit relative to their
+ * POSTS. The first version did, and failed a perfectly good shot because a lane
+ * creep had legitimately pulled the camp 3.6 m off its 1.6 m ring — members may
+ * range out to CAMP_LEASH_RADIUS and the shot does not care, provided (1) and
+ * (2) hold.
+ */
+async function assertCampStandOff(page, cx, cz) {
+  const members = await campMembers(page, cx, cz, CAMP_VISIBLE_M);
+  if (members.length === 0) throw new Error('no camp members in the snapshot at the moment of the shot');
+  const you = await latestYou(page);
+  if (you === null) throw new Error('no local hero in the snapshot');
+  const phase = await serverDayPhase(page);
+  if (phase === null) throw new Error('rift_snap.dayPhase is missing — the hero vision radius cannot be computed');
+  const vision = CONFIG.HERO_VISION * CONFIG.nightVisionScale(phase);
+  const toClearing = Math.hypot(cx - you.x, cz - you.z);
+  if (toClearing > vision) {
+    throw new Error(
+      `the hero stands ${toClearing.toFixed(2)}m from the clearing centre but its vision at dayPhase ` +
+        `${phase.toFixed(3)} is only ${vision.toFixed(2)}m — the camp is on the wire through somebody else's vision, ` +
+        'so this framing will not reproduce',
+    );
+  }
+  let nearest = Infinity;
+  for (const m of members) nearest = Math.min(nearest, Math.hypot(m.x - you.x, m.z - you.z));
+  if (nearest <= CONFIG.AGGRO_RADIUS) {
+    throw new Error(
+      `a camp member is ${nearest.toFixed(2)}m from the hero, inside AGGRO_RADIUS ${CONFIG.AGGRO_RADIUS} — ` +
+        'the stand-off failed and the camp is about to pull',
+    );
+  }
+  log(
+    `camp-brute: ${members.length} member(s), clearing ${toClearing.toFixed(2)}m and nearest member ` +
+      `${nearest.toFixed(2)}m from the hero, vision ${vision.toFixed(2)}m at dayPhase ${phase.toFixed(3)}`,
+  );
+}
+
+/** The SERVER's day phase, straight off the newest snapshot
+ *  (`rift_snap.dayPhase`, the single definition AMENDMENT_1 §B.1 hoisted into
+ *  config.ts). This is the one that scales VISION; `setDayPhase` pins only the
+ *  renderer, and confusing the two is what made `camp-brute` intermittent. */
+const serverDayPhase = (page) =>
+  page.evaluate(() => {
+    const ring = window.__rift?.snaps() ?? [];
+    const s = ring.length > 0 ? ring[ring.length - 1] : null;
+    if (s === null || s === undefined) return null;
+    const d = s.dayPhase;
+    return typeof d === 'number' && Number.isFinite(d) ? d : null;
+  });
+
+/** Block until the server's day phase drops to `max`, so a vision-dependent
+ *  shot is always taken at the same point of the cycle. */
+async function waitDayPhaseBelow(page, max) {
+  const t0 = Date.now();
+  for (;;) {
+    const p = await serverDayPhase(page);
+    if (p === null) {
+      throw new Error(
+        'rift_snap.dayPhase is missing — a vision-dependent shot cannot be pinned to a point in the day/night ' +
+          'cycle, so it would not be reproducible (protocol.ts freezes dayPhase on the snapshot)',
+      );
+    }
+    if (p <= max) {
+      log(`server dayPhase ${p.toFixed(3)} <= ${max} — hero vision is at its day value`);
+      return p;
+    }
+    if (Date.now() - t0 > DAY_PHASE_WAIT_MS) {
+      throw new Error(`the server day phase never fell to ${max} within ${DAY_PHASE_WAIT_MS}ms (last ${p.toFixed(3)})`);
+    }
+    await assertConnectedLive(page);
+    await sleep(1000);
+  }
+}
+
+/** ...and the same phase, re-checked at the moment of the shot. */
+async function assertDayPhaseBelow(page, max, name) {
+  const p = await serverDayPhase(page);
+  if (p === null || p > max) {
+    throw new Error(
+      `${name}: the server day phase is ${p === null ? 'unreadable' : p.toFixed(3)}, over the ${max} this shot is ` +
+        'pinned to — hero vision has shrunk and the frame would not match the other rounds',
+    );
+  }
+}
+
+/** Click the minimap canvas at normalised CANVAS coordinates (u,v), where
+ *  (0,0) is its top-left pixel. This is a canvas-space helper — callers that
+ *  mean a WORLD point must go through `panTo`, which owns the mapping. */
 async function minimapPan(page, u, v) {
   const rect = await page.$eval('.minimap canvas', (el) => {
     const r = el.getBoundingClientRect();
@@ -545,8 +766,34 @@ async function minimapPan(page, u, v) {
   await page.mouse.click(rect.x + u * rect.w, rect.y + v * rect.h);
 }
 
-/** Aim the camera at a WORLD point. */
-const panTo = (page, x, z) => minimapPan(page, x / MAP_SIDE, z / MAP_SIDE);
+/**
+ * Aim the camera at a WORLD point.
+ *
+ * THE MINIMAP IS DRAWN ROTATED 180°, AND SO IS ITS HIT TEST. `ui/minimap.ts`
+ * states it in its header — "world x -> canvas LEFT, world z -> canvas UP",
+ * measured by scripts/repro-pan.mjs against the fixed camera rig — and
+ * `toWorld()` implements it: `world = (1 - u) * side`, not `u * side`.
+ *
+ * This harness used to send `u = x / side`, so EVERY pan in it landed on the
+ * point-reflection of its target, `(side - x, side - z)`. It survived review
+ * for as long as it did because the map is point-symmetric about its centre
+ * (TERRAIN_CONTRACT §3): the mirror of the map centre is the map centre, the
+ * mirror of a tower is the opposing tower, the mirror of a cliff cell is
+ * another cliff cell — so most of the matrix photographed a plausible-looking
+ * wrong place and only the two shot families that frame something UNIQUE gave
+ * it away:
+ *   * the hero shots (close-hero, night-close-hero, fx-cast) framed the empty
+ *     mirror of the pose point, which is why `close-hero` came back as a
+ *     near-black frame with no hero in it at all;
+ *   * the off-lane terrain shots (close-deco, camp-brute) framed the mirror of
+ *     the cell the hero was lighting, which is unexplored shroud — hence day
+ *     frames at mean luminance 11-14 against an 18 floor, and hence the
+ *     flakiness, since whether the mirror had been explored by somebody else
+ *     varied from round to round.
+ * `panTo` is now the ONLY place that knows the mapping, and `assertCamera`
+ * below proves it landed rather than assuming it did.
+ */
+const panTo = (page, x, z) => minimapPan(page, 1 - x / MAP_SIDE, 1 - z / MAP_SIDE);
 
 /** Wheel-zoom `steps` notches; dir -1 zooms in (lower camH), +1 out. */
 async function zoom(page, steps, dir) {
@@ -557,20 +804,184 @@ async function zoom(page, steps, dir) {
   }
 }
 
+/**
+ * PROVE the wheel is sitting on a clamp, by taking one more notch in the same
+ * direction and requiring the framing not to move.
+ *
+ * This is the exact test for the defect that was reported, and it is immune to
+ * terrain: both measurements are taken at the same camera target over the same
+ * ground, so whatever the relief does to the estimator it does identically to
+ * each, and the RATIO between them is exact. An absolute height check cannot be
+ * that clean — `screenToGround` resolves against the real height field, so a
+ * plateau beside the target pulls the probe in and reads several percent low
+ * (measured: 9.99 m at the 11 m clamp beside the mid-lane tower).
+ *
+ * A notch that is a no-op means the clamp absorbed it, which is the entire
+ * premise of driving the zoom from a clamp. If it is NOT a no-op, the notch
+ * count no longer overshoots the range and every rung derived from this one
+ * sits at an unspecified height — precisely what 12 notches had been doing ever
+ * since CAM_MIN_H moved 18 -> 11.
+ */
+const CLAMP_PROOF_TOLERANCE = 0.03; // 3%, against the 12% a single free notch moves
+async function assertAtClamp(page, dir, name) {
+  const before = await measureCamera(page);
+  await zoom(page, 1, dir);
+  const after = await measureCamera(page);
+  const moved = Math.abs(after.camH - before.camH) / before.camH;
+  if (moved > CLAMP_PROOF_TOLERANCE) {
+    throw new Error(
+      `${ZOOM_CLAMP_STEPS} notches did not reach the ${name} clamp: one more moved the framing by ` +
+        `${(moved * 100).toFixed(1)}% (${before.camH.toFixed(2)}m -> ${after.camH.toFixed(2)}m), so the wheel is still ` +
+        'free to travel and every rung driven from here is at an unspecified height',
+    );
+  }
+}
+
 let zoomLevel = null; // 'out' | 'default' | 'cam24' | 'in'
-/** Drive camH to a reproducible height: always via a clamp, never relative. */
+/** Drive camH to a reproducible height: always via a clamp, never relative.
+ *  Each clamp is PROVED before anything is stepped off it, and every shot then
+ *  re-measures the absolute height in `assertCamera`. The arithmetic in the
+ *  constants above says where a rung should land; the measurements are what
+ *  decide whether it did. */
 async function zoomTo(page, level) {
   if (zoomLevel === level) return;
-  await zoom(page, ZOOM_CLAMP_STEPS, +1); // -> clamp 55
-  if (level === 'in') {
-    await zoom(page, ZOOM_CLAMP_STEPS, -1); // -> clamp 18
-  } else if (level === 'cam24') {
-    await zoom(page, ZOOM_CLAMP_STEPS, -1); // -> clamp 18
-    await zoom(page, ZOOM_CAM24_STEPS, +1); // -> 25.29, the rung nearest camH 24
+  await zoom(page, ZOOM_CLAMP_STEPS, +1); // -> the CAM_MAX_H clamp
+  await assertAtClamp(page, +1, 'CAM_MAX_H');
+  if (level === 'in' || level === 'cam24') {
+    await zoom(page, ZOOM_CLAMP_STEPS, -1); // -> the CAM_MIN_H clamp
+    await assertAtClamp(page, -1, 'CAM_MIN_H');
+    if (level === 'cam24') await zoom(page, ZOOM_CAM24_STEPS, +1); // -> 24.32, the rung nearest camH 24
   } else if (level === 'default') {
     await zoom(page, ZOOM_DEFAULT_STEPS, -1); // -> 34.96
   }
   zoomLevel = level;
+}
+
+// ---- camera read-back (the framing gate) -----------------------------------------------
+// AMENDMENT_6: a harness gates on BEHAVIOUR, never on the arithmetic that was
+// supposed to produce it. Both halves of the framing — where the camera is
+// aimed and how high it is — are therefore MEASURED through
+// `window.__rift.screenToGround`, the scene's own raycast against its own
+// camera, and a shot whose framing did not land is failed rather than saved.
+//
+// The rig is fixed (render/scene.ts `applyCamera`): the eye sits at
+// `heightAt(target) + camH`, pulled back `camH / tan(55°)` along -z, looking at
+// the target, through a perspective camera of vertical FOV 50 at 16:9. Yaw and
+// roll are zero, so the camera's right vector is horizontal and:
+//
+//   * the ray through the CANVAS CENTRE hits the ground AT the camera target
+//     (contract.ts says so in as many words), giving (x, z) exactly;
+//   * along the centre ROW the ray's y-component does not vary with the
+//     horizontal pixel, so every hit on that row shares one depth and the
+//     ground offset is exactly linear in NDC u:
+//         hit.x - target.x = camH * u * tan(FOV/2) * aspect / sin(55°)
+//     which inverts to camH with no free parameters.
+const CAM_PITCH_RAD = (55 * Math.PI) / 180;
+const CAM_FOV_RAD = (50 * Math.PI) / 180;
+const CAM_ASPECT = SHOT_VIEWPORT.width / SHOT_VIEWPORT.height; // 16:9, both viewports
+/** Ground half-width at the centre row, per metre of camH. */
+const CAM_HALF_W_PER_M = (Math.tan(CAM_FOV_RAD / 2) * CAM_ASPECT) / Math.sin(CAM_PITCH_RAD);
+/** Ground distance from the target to the BOTTOM edge, per metre of camH:
+ *  1/tan(55°) - 1/tan(55° + 25°). The near edge, not the far one — the far ray
+ *  leaves at 30° and multiplies any height error by 1.73, the near ray at 80°
+ *  divides it by 5.7. */
+const CAM_NEAR_Z_PER_M = 1 / Math.tan(CAM_PITCH_RAD) - 1 / Math.tan(CAM_PITCH_RAD + CAM_FOV_RAD / 2);
+/** How much of the measured footprint counts as "in frame, and large". 0.7
+ *  keeps the subject inside the middle 70% of the frame in both axes, which is
+ *  the framing STYLE_BIBLE §5 asks for — not merely "somewhere on screen". */
+const HERO_FRAME_FRAC = 0.7;
+/** Signed fractions of the half-width to probe along the centre row, widest
+ *  first. `screenToGround` reports null once a ray leaves the map, and at the
+ *  widest rung over a base corner one whole side of the row does — so the
+ *  probe tries both sides and steps inward until one lands. The offset is
+ *  exactly linear in this fraction, so every rung that lands gives the same
+ *  camH; a narrower one only carries more of the raycast's own rounding. */
+const CAM_PROBE_US = [0.8, -0.8, 0.5, -0.5, 0.25, -0.25];
+
+/** The camera target and height, measured through the scene's raycast. Throws
+ *  rather than returning a guess — an unmeasurable camera is a failed shot. */
+async function measureCamera(page) {
+  const m = await page.evaluate((us) => {
+    const api = window.__rift;
+    if (api === undefined || typeof api.screenToGround !== 'function') return { err: 'missing' };
+    const canvas = document.querySelector('canvas');
+    if (canvas === null) return { err: 'no canvas' };
+    const r = canvas.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return { err: 'canvas has no box' };
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    const centre = api.screenToGround(cx, cy);
+    let side = null;
+    let u = 0;
+    for (const f of us) {
+      const hit = api.screenToGround(cx + (r.width / 2) * f, cy);
+      if (hit !== null) {
+        side = hit;
+        u = f;
+        break;
+      }
+    }
+    return { centre, side, u, aspect: r.width / r.height };
+  }, CAM_PROBE_US);
+  if (m.err !== undefined) {
+    throw new Error(
+      `window.__rift.screenToGround is unusable (${m.err}) — it is the frozen camera probe (CONTRACT §6) and ` +
+        'without it no shot can prove what it framed',
+    );
+  }
+  if (Math.abs(m.aspect - CAM_ASPECT) > 0.01) {
+    throw new Error(`the canvas is ${m.aspect.toFixed(3)}:1, not ${CAM_ASPECT.toFixed(3)}:1 — the camH derivation assumes 16:9`);
+  }
+  if (m.centre === null || m.side === null) {
+    throw new Error('every camera probe ray left the map — the camera is aimed off the world');
+  }
+  const camH = Math.abs(m.side.x - m.centre.x) / (Math.abs(m.u) * CAM_HALF_W_PER_M);
+  return { x: m.centre.x, z: m.centre.z, camH };
+}
+
+/** The framing gate for one shot: the camera is where we aimed it and at the
+ *  height the rung claims. `level` may be null to check only the aim. */
+async function assertCamera(page, name, wantX, wantZ, level) {
+  const cam = await measureCamera(page);
+  const off = Math.hypot(cam.x - wantX, cam.z - wantZ);
+  if (off > CAM_TARGET_TOLERANCE_M) {
+    throw new Error(
+      `the camera is aimed at (${cam.x.toFixed(1)}, ${cam.z.toFixed(1)}), ${off.toFixed(1)}m from the requested ` +
+        `(${wantX.toFixed(1)}, ${wantZ.toFixed(1)}) — ${name} would photograph the wrong place`,
+    );
+  }
+  if (level !== null) {
+    const want = ZOOM_RUNG_M[level];
+    if (want === undefined) throw new Error(`unknown zoom rung '${String(level)}'`);
+    if (Math.abs(cam.camH - want) > want * CAM_H_TOLERANCE) {
+      throw new Error(
+        `camera height measured ${cam.camH.toFixed(2)}m, but the '${level}' rung is ${want}m — the wheel notch ` +
+          'count no longer reaches the clamp it is driven from (game.ts CAM_MIN_H / CAM_MAX_H moved)',
+      );
+    }
+  }
+  return cam;
+}
+
+/** ...and, for the shots whose entire subject is the player's hero, that the
+ *  hero is actually inside the measured footprint. `close-hero` shipped a
+ *  near-black frame containing no hero at all for a whole judge round because
+ *  nothing checked this: the PNG was the right size, the luminance floors
+ *  passed, and the manifest said `ok`. */
+async function assertHeroFramed(page, name, cam) {
+  const you = await latestYou(page);
+  if (you === null) throw new Error(`${name}: no local hero in the snapshot`);
+  const dx = Math.abs(you.x - cam.x);
+  const dz = Math.abs(you.z - cam.z);
+  const maxX = HERO_FRAME_FRAC * CAM_HALF_W_PER_M * cam.camH;
+  const maxZ = HERO_FRAME_FRAC * CAM_NEAR_Z_PER_M * cam.camH;
+  if (dx > maxX || dz > maxZ) {
+    throw new Error(
+      `the hero stands at (${you.x.toFixed(1)}, ${you.z.toFixed(1)}), ${Math.hypot(you.x - cam.x, you.z - cam.z).toFixed(1)}m ` +
+        `from the camera target (${cam.x.toFixed(1)}, ${cam.z.toFixed(1)}) — outside the ${maxX.toFixed(1)}x${maxZ.toFixed(1)}m ` +
+        `frame ${name} exists to fill with it`,
+    );
+  }
 }
 
 // ---- world queries (all reductions run IN PAGE — never ship a whole snap over) ------------
@@ -886,7 +1297,17 @@ function assertFrameLive(name, res) {
   }
 }
 
-async function capture(page, name, settleOpts) {
+/**
+ * Take one shot.
+ *
+ * `frames`/`ms` drive the pre-shot settle. `at` is the world point the camera
+ * was aimed at and `level` the zoom rung it was driven to: supplying them turns
+ * on the MEASURED framing gate (`assertCamera`), and every in-world shot
+ * supplies them. `hero: true` additionally requires the player's hero to be
+ * inside the measured footprint — for the shots whose whole subject it is.
+ */
+async function capture(page, name, opts = {}) {
+  const { at = null, level = null, hero = false, ...settleOpts } = opts;
   await settle(page, settleOpts);
   // Re-check at the LAST possible moment: the per-shot gate ran before the
   // zoom and the pan, and a hero can die inside those couple of seconds —
@@ -895,6 +1316,10 @@ async function capture(page, name, settleOpts) {
     log(`[warn] ${name}: the hero died during framing — waiting out the respawn dim`);
     await waitAlive(page, RESPAWN_TIMEOUT_MS);
     await settle(page, settleOpts);
+  }
+  if (at !== null) {
+    const cam = await assertCamera(page, name, at.x, at.z, level);
+    if (hero) await assertHeroFramed(page, name, cam);
   }
   const res = await captureRaw(page, name);
   if (res.bytes < MIN_PNG_BYTES) {
@@ -927,12 +1352,16 @@ async function step(name, fn) {
 /** March the hero to (x,z) and wait until it STANDS there, re-issuing the
  *  order so a stun, a death + respawn or a bumped path never strands it.
  *  The camera is then aimed at the POINT, so the framing is identical every
- *  round regardless of where the hero stopped within the tolerance. */
-async function poseHero(page, x, z, timeoutMs) {
+ *  round regardless of where the hero stopped within the tolerance.
+ *
+ *  `tolerance` defaults to POSE_TOLERANCE_M. The camp shot passes a tighter
+ *  one: its stand-off band is under a metre wide, so the general slop would
+ *  swallow it whole. */
+async function poseHero(page, x, z, timeoutMs, tolerance = POSE_TOLERANCE_M) {
   const t0 = Date.now();
   for (;;) {
     const you = await latestYou(page).catch(() => null);
-    if (you !== null && Math.hypot(you.x - x, you.z - z) <= POSE_TOLERANCE_M) {
+    if (you !== null && you.respawnAtTick === 0 && Math.hypot(you.x - x, you.z - z) <= tolerance) {
       await page.evaluate(() => window.__rift.order('stop')).catch(() => {});
       await sleep(400);
       return true;
@@ -1107,7 +1536,7 @@ async function run() {
       await assertLive(page);
       await zoomTo(page, 'default');
       await panTo(page, tower.x, tower.z);
-      await capture(page, 'hud-live', { ms: 800 });
+      await capture(page, 'hud-live', { ms: 800, at: tower, level: 'default' });
     });
 
     // -- ui-shop ---------------------------------------------------------------------------------
@@ -1123,7 +1552,7 @@ async function run() {
         8000,
         'shop panel open (.shop-panel visible)',
       );
-      await capture(page, 'ui-shop', { ms: 400 });
+      await capture(page, 'ui-shop', { ms: 400, at: tower, level: 'default' });
     });
     await page.evaluate(() => {
       const el = document.querySelector('.shop-panel');
@@ -1135,7 +1564,7 @@ async function run() {
       await assertLive(page);
       await page.keyboard.down('Tab');
       try {
-        await capture(page, 'ui-scoreboard', { ms: 300 });
+        await capture(page, 'ui-scoreboard', { ms: 300, at: tower, level: 'default' });
       } finally {
         await page.keyboard.up('Tab');
       }
@@ -1151,7 +1580,7 @@ async function run() {
         CLASH_TIMEOUT_MS,
         `opposing creeps within ${CLASH_CONTACT_M}m of each other near the map centre`,
       );
-      await capture(page, 'mid-lane', { ms: 500 });
+      await capture(page, 'mid-lane', { ms: 500, at: mid, level: 'default' });
     });
 
     // -- close-creeps: closest zoom on a wave ---------------------------------------------------------
@@ -1164,7 +1593,7 @@ async function run() {
         CREEPS_TIMEOUT_MS,
         `${CREEPS_MIN} creeps within ${CREEPS_RADIUS_M}m of the map centre`,
       );
-      await capture(page, 'close-creeps', { ms: 500 });
+      await capture(page, 'close-creeps', { ms: 500, at: mid, level: 'in' });
     });
 
     // -- fx-combat: tracers / bursts / damage numbers on screen -------------------------------------
@@ -1177,7 +1606,7 @@ async function run() {
         COMBAT_TIMEOUT_MS,
         `${COMBAT_ATTACKERS} units swinging within ${COMBAT_RADIUS_M}m of the map centre`,
       );
-      await capture(page, 'fx-combat', { frames: 1, ms: 0 });
+      await capture(page, 'fx-combat', { frames: 1, ms: 0, at: mid, level: 'default' });
     });
 
     // -- fog-edge: BEFORE the off-lane poses, which would explore this corner ---------------------------
@@ -1185,7 +1614,7 @@ async function run() {
       await assertLive(page);
       await zoomTo(page, 'default');
       await panTo(page, fogP.x, fogP.z);
-      await capture(page, 'fog-edge', { ms: 900 }); // the fog mask refreshes at ~5Hz
+      await capture(page, 'fog-edge', { ms: 900, at: fogP, level: 'default' }); // the fog mask refreshes at ~5Hz
     });
 
     // -- close-tower / close-ancient: pure map facts, no waiting ------------------------------------------
@@ -1193,24 +1622,54 @@ async function run() {
       await assertLive(page);
       await zoomTo(page, 'in');
       await panTo(page, tower.x, tower.z);
-      await capture(page, 'close-tower', { ms: 600 });
+      await capture(page, 'close-tower', { ms: 600, at: tower, level: 'in' });
     });
     await step('close-ancient', async () => {
       await assertLive(page);
       await zoomTo(page, 'in');
       await panTo(page, ownAncient.x, ownAncient.z);
-      await capture(page, 'close-ancient', { ms: 600 });
+      await capture(page, 'close-ancient', { ms: 600, at: ownAncient, level: 'in' });
     });
 
-    // -- close-hero: pose the hero on the mid lane, then frame the POINT ------------------------------------
+    // ==========================================================================
+    // THE HERO SHOTS. Pose the hero on the mid lane, then frame the POINT — and
+    // be willing to do it again.
+    //
+    // There is a live match running between the pose and the shutter: the
+    // camera has to be driven to a clamp and back (a couple of seconds of wheel
+    // events), the frame has to settle, and a level-1 hero standing 30% of the
+    // way down the mid lane at night, among sixteen bots, dies in that window
+    // often enough to matter. `capture` already waits out the respawn dim, but
+    // the hero respawns AT ITS FOUNTAIN, 41 m away — measured — so waiting is
+    // not enough on its own: the shot has to be re-posed.
+    //
+    // Before the framing gate existed this simply produced a hero-less frame
+    // that passed every check the harness had, which is how the shipped
+    // `night-close-hero.png` came to be a photograph of the "YOU DIED" screen.
+    // ==========================================================================
+    const HERO_SHOT_TRIES = 3;
     let posed = false;
+    const heroShot = async (name, point, settleMs, dayT) => {
+      let lastErr = null;
+      for (let attempt = 1; attempt <= HERO_SHOT_TRIES; attempt++) {
+        try {
+          await assertLive(page, dayT);
+          await poseHero(page, point.x, point.z, POSE_TIMEOUT_MS);
+          posed = true;
+          await zoomTo(page, 'in');
+          await panTo(page, point.x, point.z);
+          await capture(page, name, { ms: settleMs, at: point, level: 'in', hero: true });
+          return;
+        } catch (err) {
+          lastErr = err;
+          if (attempt < HERO_SHOT_TRIES) log(`[warn] ${name}: attempt ${attempt} lost the hero (${errText(err)}) — re-posing`);
+        }
+      }
+      throw lastErr;
+    };
+
     await step('close-hero', async () => {
-      await assertLive(page);
-      await poseHero(page, poseP.x, poseP.z, POSE_TIMEOUT_MS);
-      posed = true;
-      await zoomTo(page, 'in');
-      await panTo(page, poseP.x, poseP.z);
-      await capture(page, 'close-hero', { ms: 600 });
+      await heroShot('close-hero', poseP, 600, DAY_PIN);
     });
 
     // -- fx-cast: level Q, fire it up the lane, shoot the effect --------------------------------------------
@@ -1228,6 +1687,12 @@ async function run() {
       const id = await selfEntId(page);
       if (id < 0) throw new Error('own hero entity not found in the snapshot');
       await settle(page, { frames: 2, ms: 200 });
+      // Same measured framing gate the other shots get. The camera check is
+      // hoisted out of the loop below because the camera does not move once the
+      // loop starts; the HERO check cannot be, because the hero can die inside
+      // it — so each attempt re-checks that it still has a hero to photograph
+      // and re-poses when it does not.
+      await assertCamera(page, 'fx-cast', poseP.x, poseP.z, 'default');
 
       let last = null;
       let lastErr = 'the cast never fired';
@@ -1236,6 +1701,13 @@ async function run() {
         if (you === null || you.respawnAtTick > 0) {
           lastErr = 'the hero was dead at every cast attempt';
           await sleep(CAST_RETRY_MS);
+          continue;
+        }
+        if (Math.hypot(you.x - poseP.x, you.z - poseP.z) > POSE_TOLERANCE_M) {
+          // Died and respawned at the fountain, or got displaced: this frame
+          // would have no hero in it, and the FX would be off screen with it.
+          lastErr = 'the hero left the framed point';
+          await poseHero(page, poseP.x, poseP.z, POSE_TIMEOUT_MS);
           continue;
         }
         if (you.cd0 > you.matchTick) {
@@ -1280,7 +1752,7 @@ async function run() {
       await poseHero(page, decoP.x, decoP.z, POSE_TIMEOUT_MS);
       await zoomTo(page, 'in');
       await panTo(page, decoCam.x, decoCam.z);
-      await capture(page, 'close-deco', { ms: 900 });
+      await capture(page, 'close-deco', { ms: 900, at: decoCam, level: 'in' });
     });
 
     // ==========================================================================
@@ -1305,28 +1777,44 @@ async function run() {
         await assertLive(page);
         await zoomTo(page, level);
         await panTo(page, target.x, target.z);
-        await capture(page, name, { ms: settleMs });
+        await capture(page, name, { ms: settleMs, at: target, level });
       });
     };
 
     await terrainShot('river-mid', riverP, 'default', 700);
     await terrainShot('camp-brute', campP, 'in', 600, async (p) => {
-      // Stand off the clearing centre, on the map-centre side, at
-      // CAMP_APPROACH_M: outside the camp's acquisition reach measured from the
-      // centre (AGGRO_RADIUS 7 plus a resting member's ~2 m offset ≈ 9 m) and
-      // inside HERO_VISION (11) so the camp is revealed. See
-      // ./rift-terrain-facts.mjs for the full derivation — the leash radius,
-      // which this used to quote, governs a different thing entirely.
-      const dx = mid.x - p.x;
-      const dz = mid.z - p.z;
-      const dl = Math.hypot(dx, dz) || 1;
-      const stand = FACTS.nearestPassable(p.x + (dx / dl) * CAMP_APPROACH_M, p.z + (dz / dl) * CAMP_APPROACH_M);
-      await poseHero(page, stand.x, stand.z, POSE_TIMEOUT_MS);
+      // Stand off the clearing centre on the map-centre side, inside the band
+      // ./rift-terrain-facts.mjs derives: far enough out that the camp does not
+      // acquire a loitering hero (AGGRO_RADIUS 7 measured from a member resting
+      // 1.6 m off centre), close enough in that a member is still inside hero
+      // vision AFTER `nightVisionScale` has taken it down to 8.25 m. The old
+      // 10.5 m was derived against day vision alone and put the nearest member
+      // ~8.9 m out, so this shot simply stopped working past dayPhase ≈ 0.79.
+      const stand = FACTS.campStand(p.x, p.z, mid.x, mid.z);
+      if (stand === null) {
+        throw new Error(
+          `no passable cell ${CAMP_STAND_MIN_M}-${CAMP_STAND_MAX_M}m from the brute clearing ` +
+            `(${p.x.toFixed(1)}, ${p.z.toFixed(1)}) — the hero cannot be posed where the camp is both safe and visible`,
+        );
+      }
+      log(`camp-brute: stand-off cell (${stand.x.toFixed(1)}, ${stand.z.toFixed(1)}), ${stand.d.toFixed(2)}m from the clearing centre`);
+      // Wait for the SERVER's day phase BEFORE marching. The renderer pin
+      // (assertLive -> setDayPhase) fixes the lighting and nothing else: vision
+      // radii are the server's, driven by the real matchTick, and
+      // DAY_PERIOD_S 600 at speed 5 is a 120-second WALL cycle. Unpinned, this
+      // shot was taken at whatever phase the match happened to be in and the
+      // fog disc around the hero — the only thing lighting an off-lane frame —
+      // changed size from round to round. That is not a threshold to relax; it
+      // is the shot not being reproducible.
+      await waitDayPhaseBelow(page, CAMP_SHOT_MAX_DAY_PHASE);
+      await poseHero(page, stand.x, stand.z, POSE_TIMEOUT_MS, CAMP_POSE_TOLERANCE_M);
       await waitFor(
         async () => (await neutralsNear(page, p.x, p.z, CAMP_VISIBLE_M)) > 0,
         CAMP_VISIBLE_TIMEOUT_MS,
         `neutral camp creeps within ${CAMP_VISIBLE_M}m of the brute clearing (${p.x.toFixed(1)}, ${p.z.toFixed(1)})`,
       );
+      await assertCampStandOff(page, p.x, p.z);
+      await assertDayPhaseBelow(page, CAMP_SHOT_MAX_DAY_PHASE_AT_SHOT, 'camp-brute');
     });
     await terrainShot('high-ground', cliffP, 'cam24', 700);
     await terrainShot('jungle-wall', wallP, 'cam24', 700);
@@ -1351,19 +1839,19 @@ async function run() {
       await assertLive(page);
       await zoomTo(page, 'out');
       await panTo(page, mid.x, mid.z);
-      await capture(page, 'wide-mid', { ms: 900 });
+      await capture(page, 'wide-mid', { ms: 900, at: mid, level: 'out' });
     });
     await step('wide-base-own', async () => {
       await assertLive(page);
       await zoomTo(page, 'out');
       await panTo(page, ownAncient.x, ownAncient.z);
-      await capture(page, 'wide-base-own', { ms: 900 });
+      await capture(page, 'wide-base-own', { ms: 900, at: ownAncient, level: 'out' });
     });
     await step('wide-base-enemy', async () => {
       await assertLive(page);
       await zoomTo(page, 'out');
       await panTo(page, enemyAncient.x, enemyAncient.z);
-      await capture(page, 'wide-base-enemy', { ms: 900 });
+      await capture(page, 'wide-base-enemy', { ms: 900, at: enemyAncient, level: 'out' });
     });
 
     // ==========================================================================
@@ -1376,21 +1864,16 @@ async function run() {
       await assertLive(page, NIGHT_PIN);
       await zoomTo(page, 'default');
       await panTo(page, mid.x, mid.z);
-      await capture(page, 'night-mid-lane', { ms: 700 });
+      await capture(page, 'night-mid-lane', { ms: 700, at: mid, level: 'default' });
     });
     await step('night-close-hero', async () => {
-      await assertLive(page, NIGHT_PIN);
-      await poseHero(page, poseP.x, poseP.z, POSE_TIMEOUT_MS);
-      await assertLive(page, NIGHT_PIN);
-      await zoomTo(page, 'in');
-      await panTo(page, poseP.x, poseP.z);
-      await capture(page, 'night-close-hero', { ms: 700 });
+      await heroShot('night-close-hero', poseP, 700, NIGHT_PIN);
     });
     await step('night-wide-mid', async () => {
       await assertLive(page, NIGHT_PIN);
       await zoomTo(page, 'out');
       await panTo(page, mid.x, mid.z);
-      await capture(page, 'night-wide-mid', { ms: 900 });
+      await capture(page, 'night-wide-mid', { ms: 900, at: mid, level: 'out' });
     });
 
     // Hand the renderer back to the snapshot clock — a pinned scene would
@@ -1431,6 +1914,10 @@ for (const name of WANTED) await rm(path.join(OUT_DIR, `${name}.png`), { force: 
 let fatal = null;
 try {
   FACTS = terrainFacts(await loadTerrain(), WANT_LANES);
+  CONFIG = await loadConfig();
+  // Fail here, before a server is even started, if a balance edit has moved the
+  // camp stand-off band out from under the constants it was derived from.
+  assertCampBand(CONFIG);
   await startServer();
   await waitForServer();
   await assertProductionMount();

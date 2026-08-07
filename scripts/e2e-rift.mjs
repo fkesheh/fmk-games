@@ -54,7 +54,7 @@ import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
-import { CAMP_APPROACH_M, CAMP_VISIBLE_M, loadTerrain, terrainFacts } from './rift-terrain-facts.mjs';
+import { CAMP_STAND_MAX_M, CAMP_STAND_MIN_M, CAMP_VISIBLE_M, loadTerrain, terrainFacts } from './rift-terrain-facts.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = Number(process.env.E2E_PORT ?? 8091);
@@ -77,9 +77,11 @@ const END_TIMEOUT_MS = Number(process.env.E2E_END_TIMEOUT ?? 360000); // 6 min
 // check and the type-stripped import of terrain.ts can both throw, and at
 // module scope that killed the suite before its handler existed — no checks
 // recorded, no summary, indistinguishable from a suite that never ran.
-// CAMP_APPROACH_M / CAMP_VISIBLE_M come from the same shared module as the two
-// capture harnesses; all three used to carry their own copy.
+// The camp stand-off derivation and CAMP_VISIBLE_M come from the same shared
+// module as the two capture harnesses; all three used to carry their own copy.
 let MAP_SIDE = 0; // 96 at 1 lane — read, never assumed
+/** buildTerrain(EXPECT_LANES) facts, for `campStand`. */
+let FACTS = null;
 /** Camp clearings ordered nearest-first to the map centre, so the hero walks
  *  to the one it can reach soonest from either fountain. */
 let CAMPS = [];
@@ -368,7 +370,8 @@ async function main() {
   await mkdir(SHOTS_DIR, { recursive: true });
   const t0 = Date.now();
 
-  const facts = terrainFacts(await loadTerrain(), EXPECT_LANES);
+  FACTS = terrainFacts(await loadTerrain(), EXPECT_LANES);
+  const facts = FACTS;
   MAP_SIDE = facts.side;
   CAMPS = [...facts.camps].sort(
     (a, b) =>
@@ -687,13 +690,14 @@ async function main() {
   // coordinates are NOT hard-coded: they come from buildTerrain(1) in this
   // process, which is the same pure function the server used (TERRAIN_CONTRACT
   // §1), so this check follows the generator instead of rotting behind it.
-  // The stand-off point is on the map-centre side of the clearing, at
-  // CAMP_APPROACH_M: outside the camp's acquisition reach measured from the
-  // clearing centre (AGGRO_RADIUS 7 plus a resting member's ~2 m offset ≈ 9 m)
-  // and inside HERO_VISION (11) so the camp is revealed. See
-  // ./rift-terrain-facts.mjs — CAMP_LEASH_RADIUS, which this used to quote,
-  // caps how far an already-aggroed member may be dragged and says nothing
-  // about whether a loitering hero is pulled.
+  // The stand-off point is a PASSABLE cell on the map-centre side of the
+  // clearing, inside the band ./rift-terrain-facts.mjs derives: outside the
+  // camp's acquisition reach measured from the clearing centre (AGGRO_RADIUS 7
+  // plus the 1.6 m ring camps.ts rests members on) and close enough that a
+  // member stays inside hero vision even after nightVisionScale has taken it
+  // from 11 m down to 8.25 m. CAMP_LEASH_RADIUS, which this used to quote, caps
+  // how far an already-aggroed member may be dragged and says nothing about
+  // whether a loitering hero is pulled.
   // ==========================================================================
   const aTeam = (await riftState(A))?.team ?? 0;
   const camp = campsForTeam(aTeam)[0] ?? CAMPS[0];
@@ -702,11 +706,14 @@ async function main() {
   if (camp === undefined) {
     check('(15) neutral jungle camps are on the wire (team 2 entities at a camp clearing)', false,
       `buildTerrain(${EXPECT_LANES}) produced no camps at all — TERRAIN_CONTRACT §3 requires 2 per half at 1 lane`);
+  } else if (FACTS.campStand(camp.x, camp.z, MAP_SIDE / 2, MAP_SIDE / 2) === null) {
+    // A bail-out, never an early `return`: this runs inside main(), and
+    // returning here would take every check after it down with this one.
+    check('(15) neutral jungle camps are on the wire (team 2 entities at a camp clearing)', false,
+      `no passable cell ${CAMP_STAND_MIN_M}-${CAMP_STAND_MAX_M}m from the ${camp.tier} clearing at ` +
+        `(${camp.x.toFixed(1)}, ${camp.z.toFixed(1)}) — the hero cannot stand anywhere the camp is both safe and visible`);
   } else {
-    const dxc = MAP_SIDE / 2 - camp.x;
-    const dzc = MAP_SIDE / 2 - camp.z;
-    const dlc = Math.hypot(dxc, dzc) || 1;
-    const stand = { x: camp.x + (dxc / dlc) * CAMP_APPROACH_M, z: camp.z + (dzc / dlc) * CAMP_APPROACH_M };
+    const stand = FACTS.campStand(camp.x, camp.z, MAP_SIDE / 2, MAP_SIDE / 2);
     const campDeadline = Date.now() + CAMP_WALK_TIMEOUT_MS;
     for (;;) {
       // The match ending under us is a different failure from "no camps on the
