@@ -284,6 +284,25 @@ export const CAMP_HIVE_RESPAWN_S = 95;
  *  fully-extended camp is still 4 m clear of any lane polyline — DESIGN_DELTA
  *  §2's "a camp that can be dragged into a lane is a bug". */
 export const CAMP_LEASH_RADIUS = 10;
+/** Hysteresis band on camp acquisition: a camp ACQUIRES a target within
+ *  (CAMP_LEASH_RADIUS - CAMP_ACQUIRE_MARGIN) of the clearing centre but RETAINS
+ *  it out to the full radius. AMENDMENT_2 §C promoted this out of camps.ts,
+ *  where it was a module-local constant, because it is balance-visible.
+ *
+ *  Without the band, `lastHitBy` re-pulls a member the instant it steps back
+ *  inside the disc and the leash releases it the instant it steps out: a camp
+ *  poked from exactly the boundary ping-pongs forever. 1 m is the smallest gap
+ *  that survives one tick of travel at camp move speed. */
+export const CAMP_ACQUIRE_MARGIN = 1;
+/** A camp that has taken no damage for this long, with every living member
+ *  idle, restores all members to full hp and clears recentDamagers.
+ *
+ *  AMENDMENT_2 §B. Camps have hpRegen 0 and otherwise heal only on leash-break
+ *  ARRIVAL, so a camp poked from outside its own reach never resets and can be
+ *  whittled down for free across several visits. This closes that without
+ *  touching the leash rule. The arrival restore stays as well — it is immediate,
+ *  which is what makes a broken chase read as clean rather than laggy. */
+export const CAMP_RESET_S = 5;
 
 /** Camps per team half, indexed by LANE COUNT (index 0 unused; MAX_LANES = 3).
  *  DESIGN_DELTA §2 fixes 2/3/4 — camp count scales with the map exactly as

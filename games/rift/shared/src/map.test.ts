@@ -13,6 +13,16 @@
 // with itself. These walk the grid independently and would catch a validator
 // that silently stopped checking — and the detection block at the bottom then
 // proves the validator still fires on a deliberately broken grid.
+//
+// DETECTION COVERAGE. The terrain detection block covers all six terrain rules
+// — 6 mirror, 7 lane pathability, 8 connectivity, 9 concave traps, 10 camp
+// isolation, 11 elevation coherence — plus the grid-covers-the-square
+// precondition that gates them. Every one of those tests asserts on the string
+// that rule ALONE emits, so deleting any single rule from validateMap turns
+// exactly one test red rather than being absorbed by a sibling rule that
+// happens to also fire on the same fixture. Each fixture below is minimal: it
+// breaks the fewest cells or structures that can express the defect, so the
+// error it names is the error it caused.
 // ============================================================================
 import { describe, expect, it } from 'vitest';
 import {
@@ -265,8 +275,9 @@ describe.each([1, 2, 3])('buildMap(%i lanes)', (lanes) => {
     }
     if (lanes % 2 === 1) {
       // the mid lane is its own mirror: it passes through the map centre
-      const mid = map.paths[lanes - 1]!;
-      expect(mid[1]).toMatchObject({ x: map.side / 2, z: map.side / 2 });
+      // (named midLane, not mid: `mid(i, res)` is the cell-centre helper below)
+      const midLane = map.paths[lanes - 1]!;
+      expect(midLane[1]).toMatchObject({ x: map.side / 2, z: map.side / 2 });
     }
   });
 
@@ -353,10 +364,12 @@ describe('validateMap detection (broken maps must fail)', () => {
 
   it('detects insufficient edge-to-edge clearance, with the measured gap', () => {
     const map = buildMap(1);
-    // drag one team-0 guard 2 m toward its ancient: 7.51 -> 5.51 centre gap,
-    // 2.01 m edge-to-edge < STRUCTURE_MARGIN
+    // Minimal fixture: drag EXACTLY ONE team-0 guard 2 m toward its ancient.
+    // 7.51 -> 5.51 m centre gap, 2.01 m edge-to-edge < STRUCTURE_MARGIN.
+    let dragged = false;
     const structures = map.structures.map((s) => {
-      if (s.team === 0 && s.kind === 'guard') {
+      if (!dragged && s.team === 0 && s.kind === 'guard') {
+        dragged = true;
         const dx = BASE_INSET - s.x;
         const dz = BASE_INSET - s.z;
         const l = Math.hypot(dx, dz) || 1;
@@ -364,6 +377,7 @@ describe('validateMap detection (broken maps must fail)', () => {
       }
       return s;
     });
+    expect(dragged, 'the fixture moved no guard at all').toBe(true);
     const v = validateMap(withStructures(map, structures));
     expect(v.ok).toBe(false);
     const clearance = v.errors.filter((e) => e.includes('edge-to-edge clearance'));
@@ -373,9 +387,10 @@ describe('validateMap detection (broken maps must fail)', () => {
 
   it('detects unequal structure counts per team', () => {
     const map = buildMap(2);
-    const structures = map.structures.filter(
-      (s) => !(s.team === 1 && s.kind === 'tower' && s.lane === 0),
-    );
+    // Minimal fixture: delete exactly one team-1 tower.
+    const doomed = map.structures.find((s) => s.team === 1 && s.kind === 'tower')!;
+    const structures = map.structures.filter((s) => s.id !== doomed.id);
+    expect(structures).toHaveLength(map.structures.length - 1);
     const v = validateMap(withStructures(map, structures));
     expect(v.ok).toBe(false);
     expect(v.errors.some((e) => e.includes('identical structure counts'))).toBe(true);
@@ -383,8 +398,10 @@ describe('validateMap detection (broken maps must fail)', () => {
 
   it('detects non-finite geometry without throwing', () => {
     const map = buildMap(1);
+    // Minimal fixture: exactly one coordinate of exactly one structure is NaN.
+    const doomed = map.structures.find((s) => s.team === 0 && s.kind === 'guard')!;
     const structures = map.structures.map((s) =>
-      s.team === 0 && s.kind === 'guard' ? { ...s, x: Number.NaN } : s,
+      s.id === doomed.id ? { ...s, x: Number.NaN } : s,
     );
     const v = validateMap(withStructures(map, structures));
     expect(v.ok).toBe(false);
@@ -474,6 +491,42 @@ describe.each([1, 2, 3])('buildTerrain(%i lanes) — grid shape', (lanes) => {
     }
     expect(offenders, offenders.join('; ')).toEqual([]);
   });
+
+  it('actually contains every kind, and the impassable set IS the cliff set', () => {
+    // The law table above derives its expectation from the same query it
+    // checks, so by itself it pins what a kind MEANS, not what the grid holds:
+    // it would stay green over a grid painted entirely 'ground'. This is the
+    // half that reads the content — a census taken from the raw kind bytes,
+    // every contract kind present, and the impassable cells counted two
+    // independent ways (isPassable, and the stored 'cliff' code).
+    const { dim, res } = t.grid;
+    const census = new Map<TerrainKind, number>();
+    for (const k of TERRAIN_KINDS) census.set(k, 0);
+    for (let p = 0; p < t.grid.kind.length; p++) {
+      const k = TERRAIN_KINDS[t.grid.kind[p]!];
+      if (k !== undefined) census.set(k, (census.get(k) ?? 0) + 1);
+    }
+    const report = [...census].map(([k, n]) => `${k}=${String(n)}`).join(' ');
+    const missing = [...census].filter(([, n]) => n === 0).map(([k]) => k);
+    expect(
+      missing,
+      `the ${lanes}-lane grid never paints ${missing.join(', ')} — census: ${report}`,
+    ).toEqual([]);
+
+    let impassable = 0;
+    for (let j = 0; j < dim; j++) {
+      for (let i = 0; i < dim; i++) {
+        if (!isPassable(t, mid(i, res), mid(j, res))) impassable++;
+      }
+    }
+    expect(
+      impassable,
+      `isPassable rejects ${impassable} cell(s) but the grid stores ` +
+        `${String(census.get('cliff'))} 'cliff' cell(s) — 'cliff' is the only impassable kind, ` +
+        `so those two counts are the same number (census: ${report})`,
+    ).toBe(census.get('cliff'));
+    expect(impassable, 'a map with no impassable cell has no cliffs at all').toBeGreaterThan(0);
+  });
 });
 
 describe.each([1, 2, 3])('buildTerrain(%i lanes) — mirror exactness (§3.1)', (lanes) => {
@@ -509,22 +562,34 @@ describe.each([1, 2, 3])('buildTerrain(%i lanes) — mirror exactness (§3.1)', 
     expect(breaks, `${breaks} mirrored cell pair(s) differ; first: ${first}`).toBe(0);
   });
 
-  it('the frozen queries agree with the raw bytes at every reflected pair', () => {
-    // kindAt/elevationAt are what the sim actually reads. If the arrays mirror
-    // but the queries do not, the cell addressing is wrong, not the paint.
+  it('the frozen queries read exactly the raw bytes, at every cell', () => {
+    // The test above compares BYTES; the sim reads through kindAt/elevationAt.
+    // This is the only place the two representations are joined, and it is what
+    // makes the byte comparison mean anything: if the queries did not address
+    // the arrays the way this suite indexes them, the mirror could be perfect in
+    // the bytes and broken in play. Every cell is visited, so every reflected
+    // partner is visited too.
     const { dim, res } = t.grid;
-    let breaks = 0;
-    for (let j = 0; j < dim; j++) {
-      for (let i = 0; i < dim; i++) {
-        const x = mid(i, res);
-        const z = mid(j, res);
-        const mx = map.side - x;
-        const mz = map.side - z;
-        if (kindAt(t, x, z) !== kindAt(t, mx, mz)) breaks++;
-        else if (elevationAt(t, x, z) !== elevationAt(t, mx, mz)) breaks++;
+    let mismatch = '';
+    for (let j = 0; j < dim && mismatch === ''; j++) {
+      for (let i = 0; i < dim && mismatch === ''; i++) {
+        const p = j * dim + i;
+        const wantKind = TERRAIN_KINDS[t.grid.kind[p]!];
+        const gotKind = kindAt(t, mid(i, res), mid(j, res));
+        const wantElev = t.grid.elev[p]!;
+        const gotElev = elevationAt(t, mid(i, res), mid(j, res));
+        if (gotKind !== wantKind) {
+          mismatch =
+            `kindAt(${mid(i, res)}, ${mid(j, res)}) reads '${gotKind}', but byte ${p} — ` +
+            `cell (${i}, ${j}) — holds '${String(wantKind)}'`;
+        } else if (gotElev !== wantElev) {
+          mismatch =
+            `elevationAt(${mid(i, res)}, ${mid(j, res)}) reads ${gotElev}, but byte ${p} — ` +
+            `cell (${i}, ${j}) — holds ${wantElev}`;
+        }
       }
     }
-    expect(breaks).toBe(0);
+    expect(mismatch, mismatch).toBe('');
   });
 });
 
@@ -922,6 +987,81 @@ describe('validateMap terrain detection (broken grids must fail)', () => {
     const v = validateMap(withTerrain(map, broken.def));
     expect(v.ok).toBe(false);
     expect(v.errors.some((e) => e.includes('is not pathable'))).toBe(true);
+  });
+
+  it('detects a camp clearing walled off from the ancients (rule 8)', () => {
+    const map = buildMap(1);
+    const broken = cloneTerrain(map.terrain);
+    const { dim, res } = broken.def.grid;
+    const camp = map.terrain.camps[0]!;
+    const ci = cellIndex(camp.x, res, dim);
+    const cj = cellIndex(camp.z, res, dim);
+    // Minimal island: the flood fill is 4-connected, so four 'cliff' cells are
+    // the entire wall. The clearing itself stays PASSABLE on purpose — a target
+    // standing on a cliff is a different rule-8 error, reported separately, and
+    // this fixture must exercise the fill, not that shortcut. (The sealed cell
+    // is also a rule-9 trap by construction — any island is — which is why the
+    // assertion below is on the rule-8 sentence alone.)
+    for (const [di, dj] of NBRS) broken.kind[(cj + dj) * dim + (ci + di)] = codeOf('cliff');
+    expect(
+      isPassable(broken.def, mid(ci, res), mid(cj, res)),
+      'the fixture sealed the clearing cell itself, which is the other rule-8 error',
+    ).toBe(true);
+    const v = validateMap(withTerrain(map, broken.def));
+    expect(v.ok).toBe(false);
+    const unreachable = v.errors.filter(
+      (e) => e.includes('terrain connectivity:') && e.includes('is unreachable from team'),
+    );
+    // One report per ancient: both fills must fail to find it.
+    expect(unreachable, v.errors.join('; ')).toHaveLength(2);
+    expect(
+      unreachable.every((e) => e.includes(`camp #${camp.id}`)),
+      unreachable.join('; '),
+    ).toBe(true);
+  });
+
+  it('detects a one-mouth pocket a unit cannot steer out of (rule 9)', () => {
+    const map = buildMap(1);
+    const broken = cloneTerrain(map.terrain);
+    const { dim, res } = broken.def.grid;
+    // Carve the pocket into a 5x5 of plain low 'ground' so the three new cliffs
+    // touch nothing else: the pocket keeps one mouth, so it stays reachable and
+    // rule 8 has nothing to say about it — this fixture is a trap and only a
+    // trap.
+    let ti = -1;
+    let tj = -1;
+    for (let j = 2; j < dim - 2 && ti < 0; j++) {
+      for (let i = 2; i < dim - 2 && ti < 0; i++) {
+        let plain = true;
+        for (let dj = -2; dj <= 2 && plain; dj++) {
+          for (let di = -2; di <= 2 && plain; di++) {
+            const p = (j + dj) * dim + (i + di);
+            if (broken.kind[p] !== codeOf('ground') || broken.elev[p] !== ELEV_LOW) plain = false;
+          }
+        }
+        if (plain) {
+          ti = i;
+          tj = j;
+        }
+      }
+    }
+    expect(ti, 'no 5x5 of plain low ground to carve a pocket in — the fixture is broken').toBeGreaterThan(-1);
+    for (const [di, dj] of [
+      [-1, 0],
+      [1, 0],
+      [0, -1],
+    ] as const) {
+      broken.kind[(tj + dj) * dim + (ti + di)] = codeOf('cliff');
+    }
+    const v = validateMap(withTerrain(map, broken.def));
+    expect(v.ok).toBe(false);
+    const traps = v.errors.filter((e) => e.includes('terrain trap at'));
+    expect(traps, v.errors.join('; ')).toHaveLength(1);
+    expect(
+      traps[0],
+      `the trap report must name the pocket at cell (${ti}, ${tj}) and its three walls`,
+    ).toContain(`(${mid(ti, res).toFixed(1)}, ${mid(tj, res).toFixed(1)})`);
+    expect(traps[0]).toContain('walled on 3 of its 4 sides');
   });
 
   it('detects a camp parked on a lane, with the measured distance', () => {

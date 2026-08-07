@@ -8,9 +8,9 @@
 // Item actives reach the engine as { kind: 'item' } queue entries: units.ts
 // validates + spends (charges/cooldown/ward stock) inside World.useItem and
 // enqueues dash/aura actives here for execution; wardstone placement never
-// leaves units.ts. Projectile/summon despawn uses Ent.expireAtTick = tick —
-// the frozen surface has no despawnMobile, and expiry reaping is the world's
-// own advance() step (7).
+// leaves units.ts. Projectile/summon despawn stamps Ent.expireAtTick via
+// despawnTick() — the frozen surface has no despawnMobile, and expiry reaping
+// is the world's own advance() step (7).
 //
 // NEUTRALS (TERRAIN_CONTRACT §5, DESIGN_DELTA §2). Entity teams are `EntTeam`,
 // so a jungle camp is a third team that is hostile to BOTH player teams and
@@ -109,12 +109,25 @@ function targetTeamOk(rule: TargetTeam, casterTeam: EntTeam, targetTeam: EntTeam
 }
 
 /** Expiry test for summons, wards and projectiles. `expireAtTick <= 0` means
- *  "never expires": 0 is the frozen sentinel for permanent entities and camp
- *  creeps are spawned with -1 (TERRAIN_CONTRACT §5), so a bare `!== 0` test
- *  would read every neutral in the jungle as already expired and skip it in
- *  every effect loop. */
+ *  "never expires" — the sentinel is frozen at `<= 0`, not `=== 0`, by
+ *  AMENDMENT_1 §B.3 and documented on `Ent.expireAtTick` in `sim/types.ts`.
+ *  Camp creeps are spawned with -1 (BUILD_SPECS §S_UNITS, `stepExpiry`), so a
+ *  bare `!== 0` test would read every neutral in the jungle as already expired
+ *  and skip it in every effect loop. */
 function expired(e: Ent, tick: number): boolean {
   return e.expireAtTick > 0 && e.expireAtTick <= tick;
+}
+
+/** The stamp that means "despawn NOW". Expiry at the current tick is the only
+ *  despawn signal the frozen World surface offers, but `expireAtTick <= 0`
+ *  means *never* (AMENDMENT_1 §B.3), so match tick 0 cannot express it: a
+ *  projectile that resolves — or a summon pushed over the cap — on the first
+ *  tick of the match would be stamped permanent, drop out of the engine's own
+ *  tables, and then never be reaped, leaking for the whole match. Tick 0
+ *  therefore stamps 1: the entity is reaped one tick later instead of never.
+ *  Every other tick is its own stamp, reaped by advance() step (7) same-tick. */
+function despawnTick(tick: number): number {
+  return tick > 0 ? tick : 1;
 }
 
 export function createAbilitiesEngine(): AbilitiesEngine {
@@ -123,9 +136,35 @@ export function createAbilitiesEngine(): AbilitiesEngine {
 
 class AbilitiesEngineImpl implements AbilitiesEngine {
   private readonly projs: ProjState[] = [];
-  /** Reused inRadius scratch buffer (World fills it by index, never
-   *  allocates); grown once to the widest query, then stable. */
-  private readonly radiusBuf: Ent[] = [];
+  /** `inRadius` scratch buffers, leased by NESTING DEPTH (index == depth).
+   *
+   *  A radius query is issued while an earlier query's results are still being
+   *  walked: `firstHit` applies each pierce hit's effects from inside its own
+   *  scan loop, and an AoE effect runs `eachAffected`, which queries again. One
+   *  shared array would be refilled under the outer loop, which keeps stepping
+   *  against its own now-stale element count — reading entities the collision
+   *  query never returned (pierce hits on units outside the projectile's hit
+   *  radius) and skipping ones it did. Each depth owns a distinct array,
+   *  created the first time that depth is reached and reused for the rest of
+   *  the match, so this still allocates nothing per tick. */
+  private readonly radiusBufs: Ent[][] = [];
+  private radiusDepth = 0;
+
+  /** Lease the scratch array for the current query depth; every lease is
+   *  paired with `releaseBuf()` in a `finally`, so a throw out of an effect
+   *  cannot strand the depth counter and starve every later query. */
+  private leaseBuf(): Ent[] {
+    const d = this.radiusDepth++;
+    const existing = this.radiusBufs[d];
+    if (existing !== undefined) return existing;
+    const fresh: Ent[] = [];
+    this.radiusBufs[d] = fresh;
+    return fresh;
+  }
+
+  private releaseBuf(): void {
+    this.radiusDepth--;
+  }
 
   step(world: World): void {
     for (const c of world.drainCasts()) {
@@ -311,12 +350,17 @@ class AbilitiesEngineImpl implements AbilitiesEngine {
       if (primary && primary.alive && targetTeamOk(side, team, primary.team)) fn(primary.id);
       return;
     }
-    const n = world.inRadius(x, z, radius, this.radiusBuf);
-    for (let i = 0; i < n; i++) {
-      const e = this.radiusBuf[i];
-      if (!e || !e.alive || expired(e, world.tick) || !isUnitTargetable(e)) continue;
-      if (!targetTeamOk(side, team, e.team)) continue;
-      fn(e.id);
+    const buf = this.leaseBuf();
+    try {
+      const n = world.inRadius(x, z, radius, buf);
+      for (let i = 0; i < n; i++) {
+        const e = buf[i];
+        if (!e || !e.alive || expired(e, world.tick) || !isUnitTargetable(e)) continue;
+        if (!targetTeamOk(side, team, e.team)) continue;
+        fn(e.id);
+      }
+    } finally {
+      this.releaseBuf();
     }
   }
 
@@ -346,7 +390,7 @@ class AbilitiesEngineImpl implements AbilitiesEngine {
       mine.sort((a, b) => a.expireAtTick - b.expireAtTick); // oldest first
       for (let i = 0; i < overflow && i < mine.length; i++) {
         const m = mine[i];
-        if (m) m.expireAtTick = world.tick;
+        if (m) m.expireAtTick = despawnTick(world.tick);
       }
     }
     const until = world.tick + Math.round(durationS * TICK_RATE);
@@ -484,28 +528,35 @@ class AbilitiesEngineImpl implements AbilitiesEngine {
   }
 
   /** Straight-flight collision: enemies within hit radius at the new
-   *  position. Non-pierce returns the nearest; pierce returns every unit it
-   *  hasn't hit yet (effects apply once per unit along the whole flight). */
+   *  position. Non-pierce returns the nearest; pierce applies effects to every
+   *  unit it hasn't hit yet (once per unit along the whole flight) and returns
+   *  null. The pierce impacts run INSIDE this scan and can query `inRadius`
+   *  again — hence the leased buffer, which the nested query cannot touch. */
   private firstHit(world: World, p: ProjState, ent: Ent): Ent | null {
-    const n = world.inRadius(ent.x, ent.z, p.radius, this.radiusBuf);
-    let best: Ent | null = null;
-    let bestD = Infinity;
-    for (let i = 0; i < n; i++) {
-      const e = this.radiusBuf[i];
-      if (!e || !e.alive || expired(e, world.tick) || !isUnitTargetable(e)) continue;
-      if (!targetTeamOk('enemy', p.team, e.team) || p.hit.has(e.id)) continue;
-      if (p.pierce) {
-        p.hit.add(e.id);
-        this.impact(world, p, e.x, e.z, e);
-        continue;
+    const buf = this.leaseBuf();
+    try {
+      const n = world.inRadius(ent.x, ent.z, p.radius, buf);
+      let best: Ent | null = null;
+      let bestD = Infinity;
+      for (let i = 0; i < n; i++) {
+        const e = buf[i];
+        if (!e || !e.alive || expired(e, world.tick) || !isUnitTargetable(e)) continue;
+        if (!targetTeamOk('enemy', p.team, e.team) || p.hit.has(e.id)) continue;
+        if (p.pierce) {
+          p.hit.add(e.id);
+          this.impact(world, p, e.x, e.z, e);
+          continue;
+        }
+        const d = Math.hypot(e.x - ent.x, e.z - ent.z);
+        if (d < bestD) {
+          bestD = d;
+          best = e;
+        }
       }
-      const d = Math.hypot(e.x - ent.x, e.z - ent.z);
-      if (d < bestD) {
-        bestD = d;
-        best = e;
-      }
+      return best;
+    } finally {
+      this.releaseBuf();
     }
-    return best;
   }
 
   /** Projectile impact: effects land where the projectile arrived, sourced
@@ -516,9 +567,10 @@ class AbilitiesEngineImpl implements AbilitiesEngine {
   }
 
   /** The frozen surface has no despawnMobile: expiry at the current tick is
-   *  the despawn signal — the world reaps the ent in advance() step (7). */
+   *  the despawn signal — the world reaps the ent in advance() step (7), and
+   *  `despawnTick` keeps tick 0 from stamping the "never" sentinel. */
   private despawnProj(world: World, ent: Ent, index: number): void {
-    ent.expireAtTick = world.tick;
+    ent.expireAtTick = despawnTick(world.tick);
     this.dropProj(index);
   }
 

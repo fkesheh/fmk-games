@@ -30,6 +30,11 @@
 //      viewers farther than CONCEAL_REVEAL_RADIUS, unless the viewer is itself
 //      concealed or is looking DOWN from high ground (config.ts's three
 //      exceptions), and unless the target swung last tick — attacking reveals.
+//      The look-down exception excludes a viewer standing on a RAMP
+//      (AMENDMENT_1 §C): `elevationAt` reads a ramp as ELEV_HIGH, so without
+//      that narrowing anyone on any ramp would see through every bush on the
+//      map. A ramp still counts as high ground for the uphill veto — only the
+//      foliage exemption is narrowed.
 //
 // A veto is absolute: it is not a range penalty, and no combination of vetoes
 // ever ADDS visibility. Structures and enemy wards never reach the concealment
@@ -46,27 +51,31 @@ import {
   CREEP_MELEE,
   CREEP_RANGED,
   CREEP_SIEGE,
-  DAY_PERIOD_S,
   GUARD_TOWER,
   HERO_VISION,
-  NIGHT_VISION_MULT,
   SUMMON_SHADE,
-  TICK_RATE,
   TOWER,
   WARD_VISION,
+  dayPhase,
   elevationAt,
   isConcealing,
+  kindAt,
+  nightVisionScale,
 } from '@rift/shared';
 import type { EntKind, TeamId, TerrainDef } from '@rift/shared';
 import { NO_ENT } from './types.js';
 import type { Ent, EntId, World } from './types.js';
 
-/** Vision radius of a source entity, from config by kind. Callers only ever
- *  ask about kinds that are legal sources; 'proj' is never a source, and the
- *  camp kinds are NEUTRAL_TEAM so they are never a source for a player team
- *  either — both are listed because the switch is exhaustive over EntKind and
- *  a silently missing arm would return undefined at some future kind. */
-function visionRadius(e: Ent): number {
+/** Vision radius of a source entity, from config by kind.
+ *
+ *  Exported for the suite only, and deliberately: `computeTeamVisible` takes a
+ *  `TeamId`, so a NEUTRAL_TEAM camp creep can never be collected as a viewer
+ *  and the three camp arms below are unreachable through the frozen seam. They
+ *  are not dead code — the switch is exhaustive over `EntKind` with no default,
+ *  so dropping an arm makes the return type `number | undefined` and fails the
+ *  build — but the only way to pin what they return is to call this directly.
+ *  Nothing in `server/` imports it; `computeTeamVisible` stays the seam. */
+export function visionRadius(e: Pick<Ent, 'kind'>): number {
   switch (e.kind) {
     case 'hero':
       return HERO_VISION;
@@ -100,8 +109,9 @@ function visionRadius(e: Ent): number {
 /** Does night shrink this kind's radius? DESIGN_DELTA §5 names the exceptions
  *  positively — "structures and wards are unaffected, they are lit" — so the
  *  false arm is the closed list (ward, tower, guard, ancient) and everything
- *  with living eyes scales. 'proj' is never a source; its arm is a formality. */
-function scalesAtNight(kind: EntKind): boolean {
+ *  with living eyes scales. 'proj' is never a source; its arm is a formality.
+ *  Exported for the suite for the same reason as `visionRadius` above. */
+export function scalesAtNight(kind: EntKind): boolean {
   switch (kind) {
     case 'hero':
     case 'melee':
@@ -119,33 +129,6 @@ function scalesAtNight(kind: EntKind): boolean {
     case 'proj':
       return false;
   }
-}
-
-/**
- * Day/night cycle position at a match tick: 0 = full day, 1 = full night,
- * continuous and WRAPPING — it ramps 0->1 across the first half of a cycle and
- * back across the second, exactly as `rift_snap.dayPhase` is specified in
- * `protocol.ts`, so the sim's night and the client's lighting are the same
- * function of the same clock and cannot drift.
- *
- * The sim derives this itself and never reads the wire field back (the field
- * exists only so a RECONNECTING client lights correctly). It is a pure
- * function of the tick — divide, multiply, compare, no trigonometry — so it is
- * bit-identical on every engine and replay-safe.
- */
-function dayPhaseAtTick(tick: number): number {
-  const cycle = (tick / TICK_RATE / DAY_PERIOD_S) % 1;
-  return cycle < 0.5 ? cycle * 2 : 2 - cycle * 2;
-}
-
-/** Multiplier on a living source's vision radius at a given day phase: 1 at
- *  full day, NIGHT_VISION_MULT at full night, linear between. It RAMPS rather
- *  than snapping — `dayPhase` is continuous by construction, and a step would
- *  put a hard vision cliff in the middle of a dusk the renderer is drawing as
- *  a gradient (DESIGN_DELTA §5: "a visible swing in initiative, not a
- *  blackout"). */
-function nightVisionScale(dayPhase: number): number {
-  return 1 - (1 - NIGHT_VISION_MULT) * dayPhase;
 }
 
 /** Is `e` a living vision source for its team? Dead heroes/creeps/wards and
@@ -170,6 +153,11 @@ interface Viewer {
   elev: number;
   /** Viewer stands in foliage itself, so foliage does not hide from it. */
   concealed: boolean;
+  /** Viewer stands on a ramp. Its `elev` is ELEV_HIGH (a ramp reads as high
+   *  ground, one value — terrain.ts §3), which is right for the uphill veto but
+   *  wrong for the look-down foliage exemption: a ramp is a slope up out of the
+   *  low ground, not a vantage over it. AMENDMENT_1 §C. */
+  onRamp: boolean;
 }
 
 /** Pool of Viewer records, grown once to the largest source count ever seen
@@ -189,7 +177,7 @@ function pushViewer(): Viewer {
     viewers.push(pooled);
     return pooled;
   }
-  const fresh: Viewer = { x: 0, z: 0, r2: 0, elev: 0, concealed: false };
+  const fresh: Viewer = { x: 0, z: 0, r2: 0, elev: 0, concealed: false, onRamp: false };
   viewerPool.push(fresh);
   viewers.push(fresh);
   return fresh;
@@ -201,10 +189,15 @@ function pushViewer(): Viewer {
 export function computeTeamVisible(world: World, team: TeamId, out: Set<EntId>): void {
   out.clear();
   const terrain: TerrainDef = world.map.terrain;
-  const night = nightVisionScale(dayPhaseAtTick(world.tick));
+  // AMENDMENT_1 §B.1: the cycle has exactly one definition, in config.ts, and
+  // room.ts puts that same value on the wire — the sim's night and the client's
+  // lighting can no longer drift.
+  const night = nightVisionScale(dayPhase(world.tick));
 
   // Pass 1 — collect this team's living sources, with their radius (night
-  // applied), their own elevation and their own concealment resolved once.
+  // applied), their own elevation, concealment and ramp-ness resolved once.
+  // Camp creeps carry NEUTRAL_TEAM and `team` is a TeamId, so the jungle is
+  // never a viewer for either player team; it is only ever a target below.
   viewers.length = 0;
   for (const e of world.all()) {
     if (e.team !== team || !isSource(e)) continue;
@@ -215,6 +208,7 @@ export function computeTeamVisible(world: World, team: TeamId, out: Set<EntId>):
     v.r2 = r * r;
     v.elev = elevationAt(terrain, e.x, e.z);
     v.concealed = isConcealing(terrain, e.x, e.z);
+    v.onRamp = kindAt(terrain, e.x, e.z) === 'ramp';
   }
 
   // Pass 2 — one test per (enemy mobile, viewer) pair.
@@ -241,8 +235,11 @@ export function computeTeamVisible(world: World, team: TeamId, out: Set<EntId>):
       if (v.elev < mElev) continue;
       // Concealment veto: the viewer is at or below the target's level here
       // (the uphill veto already returned on the rest), so `v.elev <= mElev`
-      // is exactly "not looking down into the bush".
-      if (hidden && d2 > CONCEAL_REVEAL_R2 && !v.concealed && v.elev <= mElev) continue;
+      // is exactly "not looking down into the bush". A viewer on a ramp reads
+      // as high but is not looking down, so it never earns the exemption.
+      if (hidden && d2 > CONCEAL_REVEAL_R2 && !v.concealed && (v.elev <= mElev || v.onRamp)) {
+        continue;
+      }
       out.add(m.id);
       break;
     }

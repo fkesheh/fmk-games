@@ -1,15 +1,22 @@
 // ============================================================================
-// T3 — SIM CORE: movement.ts + pathing.ts tests (TERRAIN_CONTRACT §4, S_MOVE).
-// Cliffs are solid and elevation changes need a ramp; heroes — and only heroes
-// — get grid A*; lane creeps keep their polyline; camps hold their clearing;
-// dashes stop at the rock instead of through it.
+// T3 — SIM CORE: movement.ts + pathing.ts tests (TERRAIN_CONTRACT §4,
+// AMENDMENT_1 §A/§D). Cliffs are solid and elevation changes need a ramp;
+// heroes — and only heroes — get grid A*, at most two searches a tick; lane
+// creeps keep their polyline; camps EXECUTE the orders sim/camps.ts writes and
+// decide nothing; dashes stop at the rock instead of through it.
 //
 // Terrain is hand-painted per scenario rather than sampled from buildMap: the
-// interesting cases (a one-cell-thick wall, a single ramp, a sealed pocket) are
-// exactly the ones a generated map is contractually forbidden to contain, and a
-// test that has to hunt the real map for a cliff asserts on whatever it found
-// rather than on what the rule says. The real map is used where the real map IS
-// the subject: lane corridors, camps, and cross-build determinism.
+// interesting cases (a one-cell-thick wall, a single ramp, a sealed pocket, a
+// lone pillar) are exactly the ones a generated map is contractually forbidden
+// to contain, and a test that has to hunt the real map for a cliff asserts on
+// whatever it found rather than on what the rule says. The real map is used
+// where the real map IS the subject: lane corridors, the passability
+// equivalence, and cross-build determinism.
+//
+// Camp members are stood up by the REAL `spawnCamp` from sim/camps.ts rather
+// than hand-stamped here. movement.ts owns only the executing half of the camps
+// seam (AMENDMENT_1 §A), so a fixture that invented a camp's statline or its
+// orders would be testing the fixture.
 //
 // `stepMovement` is driven directly rather than through `advance()` so that a
 // failure here is a movement failure and not combat, waves or upkeep leaking in.
@@ -19,25 +26,31 @@ import {
   AGGRO_RADIUS,
   buildMap,
   CAMP_BRUTE,
-  CAMP_HIVE,
   CAMP_LEASH_RADIUS,
-  CAMP_PACK,
   ELEV_HIGH,
   ELEV_LOW,
   isPassable,
-  isPlayerTeam,
   kindAt,
   LANE_CORRIDOR_HALF_W,
   NEUTRAL_TEAM,
   TERRAIN_KINDS,
   TICK_RATE,
 } from '@rift/shared';
-import type { CampDef, CreepTuning, EntKind, EntTeam, MapDef, TerrainDef, TerrainKind, Vec2 } from '@rift/shared';
+import type { CampDef, EntKind, MapDef, TerrainDef, TerrainKind, Vec2 } from '@rift/shared';
 import { SimWorld } from './world.js';
 import { stepMovement } from './movement.js';
-import { findPath, PATH_NODE_BUDGET, segmentWalkable, walkableFraction } from './pathing.js';
+import { spawnCamp } from './camps.js';
+import {
+  cellPassable,
+  findPath,
+  PATH_NODE_BUDGET,
+  PATH_SEARCHES_PER_TICK,
+  pathSearchesUsed,
+  segmentWalkable,
+  walkableFraction,
+} from './pathing.js';
 import { NO_ENT } from './types.js';
-import type { AbilitiesEngine, Ent, EntId, SeatDef, World } from './types.js';
+import type { AbilitiesEngine, CampState, Ent, EntId, SeatDef, World } from './types.js';
 
 class EngineDouble implements AbilitiesEngine {
   step(world: World): void {
@@ -50,23 +63,40 @@ const SEATS: SeatDef[] = [
   { pid: 'p1', team: 1, hero: 'longbow', bot: false, lane: 0 },
 ];
 
+/** Eight seats, for the per-tick search budget: a full lobby can order on the
+ *  same tick, which is the case AMENDMENT_1 §D exists for. */
+const EIGHT_SEATS: SeatDef[] = Array.from({ length: 8 }, (_, i) => ({
+  pid: `p${i}`,
+  team: (i % 2) as 0 | 1,
+  hero: i % 2 === 0 ? ('reaver' as const) : ('longbow' as const),
+  bot: false,
+  lane: 0,
+}));
+
 const HIGH_KINDS: readonly TerrainKind[] = ['high', 'base', 'ramp'];
 
 /** Paint a square terrain grid cell by cell from a function of the cell CENTRE.
  *  Elevation is derived from the kind exactly as TERRAIN_CONTRACT §3 defines it
- *  (`'ramp'` reads ELEV_HIGH), so a scenario only ever states kinds. */
-function terrainOf(side: number, paint: (x: number, z: number) => TerrainKind, camps: CampDef[] = []): TerrainDef {
-  const dim = side;
+ *  (`'ramp'` reads ELEV_HIGH), so a scenario only ever states kinds. `res` is a
+ *  parameter because the sweep sampler must be a fraction of a CELL, not a
+ *  fixed number of metres — see the resolution case below. */
+function terrainOf(
+  side: number,
+  paint: (x: number, z: number) => TerrainKind,
+  camps: CampDef[] = [],
+  res = 1,
+): TerrainDef {
+  const dim = side * res;
   const kind = new Uint8Array(dim * dim);
   const elev = new Uint8Array(dim * dim);
   for (let z = 0; z < dim; z++) {
     for (let x = 0; x < dim; x++) {
-      const k = paint(x + 0.5, z + 0.5);
+      const k = paint((x + 0.5) / res, (z + 0.5) / res);
       kind[z * dim + x] = TERRAIN_KINDS.indexOf(k);
       elev[z * dim + x] = HIGH_KINDS.includes(k) ? ELEV_HIGH : ELEV_LOW;
     }
   }
-  return { grid: { side, res: 1, dim, kind, elev }, camps, landmarks: [] };
+  return { grid: { side, res, dim, kind, elev }, camps, landmarks: [] };
 }
 
 function mapOf(terrain: TerrainDef, paths: readonly (readonly Vec2[])[] = []): MapDef {
@@ -89,28 +119,28 @@ function must(e: Ent | undefined): Ent {
   return e;
 }
 
-/** Spawn a mobile, including a neutral one. `World.spawnMobile` is frozen with
- *  `team: EntTeam` (TERRAIN_CONTRACT §5), but the implementation still narrows
- *  to `TeamId` until S_WORLD widens it, so a neutral goes in as team 0 and has
- *  its team re-stamped — `Ent.team` is what movement actually reads. */
-function spawn(w: SimWorld, kind: EntKind, team: EntTeam, x: number, z: number, lane: number): EntId {
-  const id = w.spawnMobile(kind, isPlayerTeam(team) ? team : 0, x, z, lane, -1, NO_ENT);
-  const e = must(w.get(id));
-  if (!isPlayerTeam(team)) Object.assign(e, { team: NEUTRAL_TEAM });
-  return id;
+function spawn(w: SimWorld, kind: EntKind, team: 0 | 1, x: number, z: number, lane: number): EntId {
+  return w.spawnMobile(kind, team, x, z, lane, -1, NO_ENT);
 }
 
-/** Spawn a camp member with its frozen tuning applied by hand.
- *  `spawnMobile`'s tuning table has no camp entries until S_CAMPS/S_WORLD add
- *  them, and a camp with `moveSpeed = 0` would make every leash assertion below
- *  pass for the wrong reason. Numbers come from config, never invented. */
-function spawnCampMember(w: SimWorld, kind: EntKind, tuning: CreepTuning, x: number, z: number): Ent {
-  const e = must(w.get(spawn(w, kind, NEUTRAL_TEAM, x, z, -1)));
-  e.moveSpeed = tuning.moveSpeed;
-  e.attackRange = tuning.attackRange;
-  e.maxHp = tuning.hp;
-  e.hp = tuning.hp;
-  return e;
+/**
+ * Stand up a REAL camp at (x, z) through sim/camps.ts, and return its members.
+ *
+ * This is the only way a neutral enters these tests. `spawnCamp` owns the
+ * spawn recipe (NEUTRAL_TEAM, lane -1, no owner, no expiry) and the tier
+ * statline; movement.ts owns none of that and must not be handed a
+ * hand-assembled camp whose numbers agree with nothing.
+ */
+function standCamp(w: SimWorld, tier: CampDef['tier'], x: number, z: number): Ent[] {
+  const state: CampState = {
+    id: 0,
+    def: { id: 0, tier, x, z, half: 0 },
+    memberIds: [],
+    aliveCount: 0,
+    respawnAtTick: -1,
+  };
+  spawnCamp(w, state);
+  return state.memberIds.map((id) => must(w.get(id)));
 }
 
 function orderMove(e: Ent, x: number, z: number): void {
@@ -175,6 +205,35 @@ describe('terrain primitives', () => {
     expect(stepped.grid.elev[3]).toBe(ELEV_HIGH);
     expect(stepped.grid.elev[4]).toBe(ELEV_LOW);
   });
+
+  it('is the frozen isPassable, cell-indexed — the pathfinder derives nothing', () => {
+    // `cellPassable` exists so A* can ask about a cell index it already holds
+    // without converting to metres and back. That makes it a SECOND spelling of
+    // `isPassable`, and a second spelling can drift; this is what stops it.
+    const t3 = buildMap(3).terrain;
+    const g = t3.grid;
+    let solid = 0;
+    for (let cz = 0; cz < g.dim; cz++) {
+      for (let cx = 0; cx < g.dim; cx++) {
+        const idx = cz * g.dim + cx;
+        const p = cellPassable(g, idx);
+        expect(p).toBe(isPassable(t3, (cx + 0.5) / g.res, (cz + 0.5) / g.res));
+        if (!p) solid += 1;
+      }
+    }
+    expect(solid).toBeGreaterThan(0); // the map really does contain rock
+  });
+
+  it('samples the sweep per CELL, so a finer grid cannot be tunnelled either', () => {
+    // res 8 = 12.5 cm cells. A sampler fixed at 0.25 m steps over whole cells
+    // here: it would land on 12.0625 and 12.3125 and never see the wall at
+    // 12.125..12.25 between them. Derived from `res`, it cannot miss.
+    const fine = terrainOf(32, (x) => (x > 12.125 && x < 12.25 ? 'cliff' : 'ground'), [], 8);
+    expect(kindAt(fine, 12.1875, 5)).toBe('cliff');
+    expect(kindAt(fine, 12.0625, 5)).toBe('ground');
+    expect(kindAt(fine, 12.3125, 5)).toBe('ground');
+    expect(segmentWalkable(fine, 11.0, 5, 13.0, 5)).toBe(false);
+  });
 });
 
 describe('hero pathing over cliffs', () => {
@@ -218,7 +277,7 @@ describe('hero pathing over cliffs', () => {
     expect(crossed).toBe(true);
   });
 
-  it('plans once per destination and never re-searches per tick', () => {
+  it('plans once per destination cell and never re-searches per tick', () => {
     const w = worldOf(mapOf(wallWithRamp));
     const h = hero(w, 'p0');
     h.x = 6;
@@ -231,9 +290,62 @@ describe('hero pathing over cliffs', () => {
     tick(w, 60);
     expect(h.path).toBe(planned); // same array object: no re-plan happened
 
-    orderMove(h, 8, 40); // a new destination DOES re-plan
+    // Nudging the destination inside the metre it already occupies is not a new
+    // destination: AMENDMENT_1 §D says re-plan on a destination CELL change, and
+    // the follower walks the exact point in its tail leg regardless.
+    orderMove(h, 40.3, 6.2);
+    tick(w);
+    expect(h.path).toBe(planned);
+
+    orderMove(h, 8, 40); // a different CELL does re-plan
     tick(w);
     expect(h.path).not.toBe(planned);
+  });
+
+  it('re-plans a route it has been displaced off, to the very same destination', () => {
+    // Ent.path's frozen invariant is "every new order resets this to null and
+    // pathIndex to 0", and nothing in the sim implemented it. Memoising on the
+    // destination alone kept a pathIndex that pointed at a waypoint the hero
+    // could no longer reach, and `travel()` then returned -1 for ever.
+    const blob = terrainOf(48, (x, z) => (x > 20 && x < 26 && z > 20 && z < 26 ? 'cliff' : 'ground'));
+    const w = worldOf(mapOf(blob));
+    const h = hero(w, 'p0');
+    h.x = 10;
+    h.z = 23;
+    h.moveSpeed = 12; // cover ground fast enough to actually consume a waypoint
+    orderMove(h, 36, 23);
+    let walked = 0;
+    // `?? 0`: world.ts's makeEnt does not yet initialise `pathIndex`, so it
+    // reads undefined until movement writes it (see the S_WORLD note).
+    while ((h.pathIndex ?? 0) === 0 && walked < 600) {
+      tick(w);
+      walked += 1;
+    }
+    const stale = h.path;
+    expect(stale?.length ?? 0).toBeGreaterThan(1);
+    expect(h.pathIndex).toBeGreaterThan(0);
+
+    // Carried to the far side of the rock — as a dash, a push-out or a chase
+    // could — and handed the IDENTICAL order again. The waypoint it was walking
+    // to is now behind the rock, which is the precondition being tested.
+    const wp = (stale ?? [])[h.pathIndex];
+    if (!wp) throw new Error('expected a live waypoint');
+    // Reflected through the rock's centre, so whichever way round the route
+    // went, the waypoint it is holding is now on the far side of the rock.
+    const tx = 46 - wp.x;
+    const tz = 46 - wp.z;
+    expect(segmentWalkable(blob, tx, tz, wp.x, wp.z)).toBe(false);
+    h.x = tx;
+    h.z = tz;
+    orderMove(h, 36, 23);
+    tick(w);
+    expect(h.path).not.toBe(stale);
+    expect(h.pathIndex).toBe(0);
+
+    const spent = runUntil(w, h, 1200, () => h.order === 'idle');
+    expect(spent).toBeLessThan(1200);
+    expect(h.x).toBeCloseTo(36, 3);
+    expect(h.z).toBeCloseTo(23, 3);
   });
 
   it('string-pulls the route instead of emitting a cell-by-cell staircase', () => {
@@ -319,6 +431,68 @@ describe('hero pathing over cliffs', () => {
   });
 });
 
+describe('the per-tick search budget (AMENDMENT_1 §D)', () => {
+  /** The same wall-and-ramp map: every order below has a blocked straight line
+   *  and therefore genuinely needs A*. */
+  const wallWithRamp = terrainOf(48, (x, z) => {
+    if (x > 24 && x < 25) return z > 30 && z < 34 ? 'ramp' : 'cliff';
+    return x > 25 ? 'high' : 'ground';
+  });
+
+  function eightOrdered(dest: readonly [number, number]): { w: SimWorld; heroes: Ent[] } {
+    const w = worldOf(mapOf(wallWithRamp), EIGHT_SEATS);
+    const heroes: Ent[] = [];
+    for (let i = 0; i < 8; i++) {
+      const h = hero(w, `p${i}`);
+      h.x = 6;
+      h.z = 3 + i * 3; // 3 m apart: no separation, no accidental re-plans
+      orderMove(h, dest[0], dest[1]);
+      heroes.push(h);
+    }
+    return { w, heroes };
+  }
+
+  function routed(heroes: readonly Ent[]): number {
+    return heroes.filter((h) => (h.path?.length ?? 0) > 1).length;
+  }
+
+  it('runs at most two searches a tick and defers the rest to the next one', () => {
+    const { w, heroes } = eightOrdered([40, 6]);
+    tick(w);
+    // A full lobby ordered on one tick: two are served, six wait.
+    expect(pathSearchesUsed()).toBe(PATH_SEARCHES_PER_TICK);
+    expect(routed(heroes)).toBe(PATH_SEARCHES_PER_TICK);
+
+    for (let i = 0; i < 30; i++) {
+      tick(w);
+      expect(pathSearchesUsed()).toBeLessThanOrEqual(PATH_SEARCHES_PER_TICK);
+    }
+    expect(routed(heroes)).toBe(8); // the queue drains; nobody is starved
+  });
+
+  it('a deferred hero still moves that tick, and never memoises the deferral', () => {
+    const { w, heroes } = eightOrdered([40, 6]);
+    const before = heroes.map((h) => ({ x: h.x, z: h.z }));
+    tick(w);
+    heroes.forEach((h, i) => {
+      const b = before[i];
+      if (!b) throw new Error('missing snapshot');
+      expect(Math.hypot(h.x - b.x, h.z - b.z)).toBeGreaterThan(0); // everyone moved
+      // A deferred request leaves no route behind to be mistaken for an answer.
+      if ((h.path?.length ?? 0) <= 1) expect(h.path ?? null).toBeNull();
+    });
+  });
+
+  it('a clear straight line costs no search at all', () => {
+    // Eight orders across open ground on the west side: the common case must
+    // not consume the allowance, or genuine A* orders would starve behind it.
+    const { w, heroes } = eightOrdered([20, 20]);
+    tick(w);
+    expect(pathSearchesUsed()).toBe(0);
+    for (const h of heroes) expect(h.path?.length).toBe(1);
+  });
+});
+
 describe('cliff collision', () => {
   /** A one-cell-thick wall at x in [24,25) spanning the whole map, with LOW
    *  ground on both sides: the only thing stopping anyone is the cliff itself. */
@@ -370,6 +544,30 @@ describe('cliff collision', () => {
       prevZ = h.z;
     }
     expect(h.z).toBeGreaterThan(30); // it really did travel along the wall
+  });
+
+  it('spends a blocked step on the tangent it was actually travelling', () => {
+    // One isolated cliff cell. Standing diagonally off its corner and driving
+    // into it is the one shape where BOTH axis remainders are legal — anywhere
+    // else the motion is stopped at the blocking cell boundary and exactly one
+    // axis is left — so it is the only case where the choice of axis is
+    // observable. Taking X first regardless drifted every such unit east,
+    // whatever direction it was heading.
+    const pillar = terrainOf(48, (x, z) =>
+      x > 24 && x < 25 && z > 24 && z < 25 ? 'cliff' : 'ground',
+    );
+    const w = worldOf(mapOf(pillar));
+    const members = standCamp(w, 'pack', 6, 6); // a straight-line steerer, not a pather
+    const e = must(members[0]);
+    e.moveSpeed = 20; // 1 m in a tick, so the remainder is big enough to see
+    e.x = 23.9;
+    e.z = 23.95;
+    orderMove(e, 23.9 + 6, 23.95 + 8); // 0.6 east / 0.8 north: mostly NORTH
+    const x0 = e.x;
+    const z0 = e.z;
+    tick(w);
+    expect(e.z - z0).toBeGreaterThan(0.5); // it kept going north
+    expect(e.x).toBe(x0); // and spent nothing sideways
   });
 
   it('lets two units press head-on into the same face without deadlocking', () => {
@@ -460,7 +658,8 @@ describe('lane creeps and summons', () => {
     const at = poly[1] ?? { x: 20, z: 20 };
     const creepId = spawn(w, 'melee', 0, at.x, at.z, 0);
     const creep = must(w.get(creepId));
-    spawn(w, 'campPack', NEUTRAL_TEAM, at.x + 2, at.z, -1);
+    const camp = must(standCamp(w, 'pack', at.x + 2, at.z)[0]);
+    expect(camp.team).toBe(NEUTRAL_TEAM);
     tick(w, 3);
     expect(creep.orderTarget).toBe(NO_ENT);
   });
@@ -473,7 +672,7 @@ describe('lane creeps and summons', () => {
     const shadeId = spawn(w, 'shade', 0, 40, 40, -1);
     const shade = must(w.get(shadeId));
     Object.assign(shade, { owner: h.id });
-    spawn(w, 'campPack', NEUTRAL_TEAM, 42, 40, -1);
+    standCamp(w, 'pack', 42, 40);
     tick(w, 3);
     expect(shade.orderTarget).toBe(NO_ENT);
   });
@@ -497,60 +696,106 @@ describe('lane creeps and summons', () => {
     h.ox = 60;
     h.oz = 60;
     h.orderTarget = NO_ENT;
-    const campId = spawn(w, 'campBrute', NEUTRAL_TEAM, 40 + AGGRO_RADIUS - 1, 40, -1);
+    const camp = standCamp(w, 'brute', 40 + AGGRO_RADIUS - 1, 40);
     tick(w);
-    expect(h.orderTarget).toBe(campId);
+    // Whichever member of the camp is nearest — the point is that a neutral is
+    // a legal attack-move target at all.
+    expect(camp.map((e) => e.id)).toContain(h.orderTarget);
+  });
+
+  it('never acquires a STRUCTURE as a mobile — the id partition is not the test', () => {
+    // `nearestEnemyMobile` used to reject structures with `t.id < 1000`, which
+    // is world.ts's private numbering. A lane creep beside an enemy tower must
+    // pick the creep in front of it, not the building.
+    const w = worldOf(map);
+    const tower = must(w.structures.find((s) => s.kind === 'tower' && s.team === 1));
+    const mine = must(w.get(spawn(w, 'melee', 0, tower.x, tower.z + 3, -1)));
+    tick(w);
+    expect(mine.orderTarget).not.toBe(tower.id);
   });
 });
 
-describe('neutral camps', () => {
-  const map = buildMap(2);
-  const camp = map.terrain.camps[0];
+describe('neutral camps — the EXECUTING half of the seam (AMENDMENT_1 §A)', () => {
+  const flat = terrainOf(48, () => 'ground');
 
-  it('holds its clearing when nothing comes near', () => {
-    const w = worldOf(map);
-    const c = camp ?? { x: 50.5, z: 43.5 };
-    const e = spawnCampMember(w, 'campHive', CAMP_HIVE, c.x, c.z);
-    tick(w, 200);
-    expect(Math.hypot(e.x - c.x, e.z - c.z)).toBeLessThan(0.2);
-    expect(e.lane).toBe(-1);
-    expect(e.waypoint).toBe(0); // it never entered lane-following code
-    expect(e.path ?? null).toBeNull();
+  it('walks exactly where the order says, and stops being told to', () => {
+    const w = worldOf(mapOf(flat));
+    const e = must(standCamp(w, 'brute', 20, 20)[0]);
+    orderMove(e, 26, 20);
+    const need = Math.ceil(Math.hypot(26 - e.x, 20 - e.z) / (CAMP_BRUTE.moveSpeed / TICK_RATE)) + 2;
+    tick(w, need);
+    expect(e.x).toBeCloseTo(26, 6);
+    expect(e.z).toBeCloseTo(20, 6);
+    // movement.ts writes no order field for a camp: only sim/camps.ts does, and
+    // it has not run. The member sits on its destination still "moving".
+    expect(e.order).toBe('move');
   });
 
-  it('chases inside the leash and returns home when the target breaks away', () => {
-    const w = worldOf(map);
-    const c = camp ?? { x: 50.5, z: 43.5 };
-    const e = spawnCampMember(w, 'campBrute', CAMP_BRUTE, c.x, c.z);
-    const h = hero(w, 'p0');
-    h.order = 'idle';
-    h.x = c.x + 5;
-    h.z = c.z;
+  it('holds still on an idle order, even with an enemy on top of it', () => {
+    const w = worldOf(mapOf(flat));
+    const e = must(standCamp(w, 'brute', 20, 20)[0]);
+    e.order = 'idle';
+    e.ox = 40; // a destination it must NOT walk to
+    e.oz = 40;
+    spawn(w, 'melee', 0, e.x + 1.5, e.z, -1);
+    const x0 = e.x;
+    const z0 = e.z;
     tick(w, 20);
-    expect(e.orderTarget).toBe(h.id);
-    expect(e.x).toBeGreaterThan(c.x); // it moved toward the intruder
-
-    h.x = c.x + CAMP_LEASH_RADIUS + 6; // the hero leaves the leash disc
-    tick(w, 200);
-    expect(e.orderTarget).toBe(NO_ENT);
-    expect(Math.hypot(e.x - c.x, e.z - c.z)).toBeLessThan(0.2);
+    expect(e.x).toBe(x0);
+    expect(e.z).toBe(z0);
+    expect(e.orderTarget).toBe(NO_ENT); // and it acquired nothing on its own
+    expect(e.order).toBe('idle');
   });
 
-  it('never leaves its leash radius, whatever the bait does', () => {
-    const w = worldOf(map);
-    const c = camp ?? { x: 50.5, z: 43.5 };
-    const e = spawnCampMember(w, 'campPack', CAMP_PACK, c.x, c.z);
+  it('never plans a path and never touches a lane polyline', () => {
+    const lane: Vec2[] = [
+      { x: 2, z: 2 },
+      { x: 44, z: 44 },
+    ];
+    const w = worldOf(mapOf(flat, [lane]));
+    const e = must(standCamp(w, 'pack', 20, 20)[0]);
+    e.lane = 0; // the exact state the fall-through bug produces
+    orderMove(e, 24, 20);
+    tick(w, 60);
+    expect(e.path ?? null).toBeNull(); // A* is heroes only
+    expect(e.pathIndex ?? 0).toBe(0);
+    expect(e.waypoint).toBe(0); // it never entered lane-following code
+    expect(e.x).toBeCloseTo(24, 6);
+    expect(e.z).toBeCloseTo(20, 6);
+  });
+
+  it('chases the LIVE position of its ordered target, not a recorded one', () => {
+    const w = worldOf(mapOf(flat));
+    const e = must(standCamp(w, 'brute', 20, 20)[0]);
     const h = hero(w, 'p0');
     h.order = 'idle';
-    h.x = c.x + 4;
-    h.z = c.z;
-    let worst = 0;
-    for (let i = 0; i < 400; i++) {
-      h.x = c.x + 4 + (i % 40) * 0.5; // walked slowly out of the clearing, repeatedly
-      tick(w);
-      worst = Math.max(worst, Math.hypot(e.x - c.x, e.z - c.z));
-    }
-    expect(worst).toBeLessThanOrEqual(CAMP_LEASH_RADIUS);
+    h.x = 20;
+    h.z = 26;
+    // camps.ts records the target's position in ox/oz when it issues the order;
+    // by the time movement runs, the target has moved. The order names the
+    // ENTITY, so the entity is what gets chased.
+    e.order = 'attack';
+    e.orderTarget = h.id;
+    e.ox = 20;
+    e.oz = 26;
+    h.x = 20;
+    h.z = 14; // the far side, past the stale destination
+    tick(w, 40);
+    expect(Math.hypot(e.x - h.x, e.z - h.z)).toBeLessThan(Math.hypot(e.x - 20, e.z - 26));
+    expect(e.z).toBeLessThan(20);
+  });
+
+  it('leaves the leash entirely to camps.ts — it is not enforced here', () => {
+    // Proof that the halves cannot silently both implement it: with camps.ts
+    // never running, a move order 30 m from the clearing is carried out in full.
+    // (`camps.test.ts` owns the composed behaviour, where the order is never
+    // issued in the first place.)
+    const w = worldOf(mapOf(flat));
+    const e = must(standCamp(w, 'pack', 6, 20)[0]);
+    const far = 6 + CAMP_LEASH_RADIUS + 20; // 36 m out, well inside the map square
+    orderMove(e, far, 20);
+    tick(w, 400);
+    expect(e.x).toBeCloseTo(far, 6);
   });
 });
 

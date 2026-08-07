@@ -37,6 +37,9 @@
 // a player-team death, the KILLER's team for a neutral one — and a neutral
 // death is a creep death in every other respect: no first blood, no 'kill'
 // SimEvent (it carries a victimPid and a camp has none), no hero deaths.
+// Because Ent.lastHitBy is only an id, the killer's TEAM is captured every tick
+// while the killer is still readable (see captureKillerTeams): a neutral that
+// outlives its last hitter must still pay that hitter's team, not nobody.
 // ============================================================================
 import {
   ASSIST_GOLD,
@@ -60,37 +63,10 @@ import {
 } from '@rift/shared';
 import type { TeamId } from '@rift/shared';
 import { NO_ENT } from './types.js';
-import type { Ent, EntId, SimEvent } from './types.js';
+import type { Ent, EntId } from './types.js';
 import { inAttackRange } from './movement.js';
 import { grantXp } from './units.js';
 import type { SimWorld } from './world.js';
-
-/** The uphill miss on the wire. `shared/src/protocol.ts` (frozen) declares
- *  `rift_miss` and TERRAIN_CONTRACT §4 requires fire() to emit it, but the
- *  frozen `SimEvent` union in `sim/types.ts` has no `'miss'` member to carry it
- *  across the room's event drain — reported as a CONTRACT_GAP. Until the union
- *  gains the variant, this file describes the one event it needs locally and
- *  reaches the world's sink through the widened view below. Nothing frozen is
- *  edited, no cast is written, and the room's `dispatchEvents` switch has no
- *  `default` branch, so an unmapped event is simply ignored there.
- *
- *  `attacker` and `target` are ENTITY ids, matching `rift_miss` and `rift_cast`
- *  — never player ids. */
-interface MissEvent {
-  readonly k: 'miss';
-  readonly attacker: EntId;
-  readonly target: EntId;
-}
-
-/** Structural view of `SimWorld.pushEvent` widened by exactly one event, in the
- *  spirit of abilities.ts's `WorldSeamGaps`. */
-interface MissEventSink {
-  pushEvent(ev: SimEvent | MissEvent): void;
-}
-
-function missSink(w: SimWorld): MissEventSink {
-  return w;
-}
 
 function isWaveCreepOrSummon(e: Ent): boolean {
   return e.kind === 'melee' || e.kind === 'ranged' || e.kind === 'siege' || e.kind === 'shade';
@@ -115,7 +91,9 @@ function fire(w: SimWorld, a: Ent, t: Ent): void {
   a.nextAttackTick = w.tick + Math.max(1, Math.round(a.attackPeriod * TICK_RATE));
   a.atkTarget = t.id;
   if (uphillMiss(w, a, t)) {
-    missSink(w).pushEvent({ k: 'miss', attacker: a.id, target: t.id });
+    // AMENDMENT_1 §B.2: 'miss' is a real SimEvent member; attacker and target
+    // are ENTITY ids, matching `rift_miss` on the wire — never player ids.
+    w.pushEvent({ k: 'miss', attacker: a.id, target: t.id });
     return;
   }
   const dealt = w.dealDamage(a.id, t.id, a.damage, 'physical');
@@ -194,6 +172,51 @@ export function stepCombat(w: SimWorld): void {
 
 // --- deaths + loot (step 6) ------------------------------------------------------
 
+/** Killing teams that must outlive the killer, keyed by world so nothing is
+ *  shared between matches and nothing survives one.
+ *
+ *  `Ent.lastHitBy` is an id, not a team, and the ent behind it is not permanent:
+ *  units.ts reaps expired projectiles and summons at step (7), and this file
+ *  reaps creep corpses at step (6), while a neutral can die much later from a
+ *  source that writes no `lastHitBy` at all — `camps.ts` culls orphaned members
+ *  by writing `hp = 0` directly. Resolving the killer through `w.get` then
+ *  answers undefined, and the neutral would pay NOBODY: strictly worse than the
+ *  double payment this task set out to remove. So the killing team is captured
+ *  while the killer is still readable, and read back after it is gone. */
+const killerTeams = new WeakMap<SimWorld, Map<EntId, TeamId>>();
+
+/** Record the team of every living neutral's current last hitter, and forget
+ *  ids no living neutral names any more. Runs once per tick at the top of
+ *  stepDeaths, which is before this tick's corpse reaping and before units.ts'
+ *  expiry reaping, so a killer alive when it landed the blow is always recorded
+ *  at least once. The table therefore holds at most one entry per living
+ *  neutral — it cannot grow with match length. */
+function captureKillerTeams(w: SimWorld): void {
+  let table = killerTeams.get(w);
+  for (const e of w.mobileMap.values()) {
+    if (!e.alive || isPlayerTeam(e.team) || e.lastHitBy === NO_ENT) continue;
+    if (table !== undefined && table.has(e.lastHitBy)) continue;
+    const killer = w.get(e.lastHitBy);
+    if (killer === undefined || !isPlayerTeam(killer.team)) continue;
+    if (table === undefined) {
+      table = new Map<EntId, TeamId>();
+      killerTeams.set(w, table);
+    }
+    table.set(e.lastHitBy, killer.team);
+  }
+  if (table === undefined) return;
+  for (const id of table.keys()) {
+    let named = false;
+    for (const e of w.mobileMap.values()) {
+      if (e.alive && !isPlayerTeam(e.team) && e.lastHitBy === id) {
+        named = true;
+        break;
+      }
+    }
+    if (!named) table.delete(id);
+  }
+}
+
 /** The ONE team whose heroes are paid for `d`'s death, or null when nobody is.
  *
  *  For a player-team victim this is the other player team — identical to the
@@ -202,25 +225,22 @@ export function stepCombat(w: SimWorld): void {
  *  For a NEUTRAL victim (TERRAIN_CONTRACT §5) that filter admitted heroes from
  *  BOTH teams and paid the camp's xp twice. A camp is an enemy to everyone, so
  *  "the enemy team" is not a team at all: the payer is the team of whoever
- *  landed the killing blow. A camp with no last-hitter, or one finished off by
- *  another neutral, pays nobody — there is no third team to pay. */
+ *  landed the killing blow, whether or not that killer is still in the store —
+ *  {@link captureKillerTeams} recorded its team while it was. A camp with no
+ *  last-hitter, or one finished off by another neutral, pays nobody: there is no
+ *  third team to pay. */
 function lootTeam(w: SimWorld, d: Ent): TeamId | null {
   if (isPlayerTeam(d.team)) return d.team === 0 ? 1 : 0;
-  const killer = d.lastHitBy !== NO_ENT ? w.get(d.lastHitBy) : undefined;
-  if (killer === undefined) return null;
-  return isPlayerTeam(killer.team) ? killer.team : null;
+  if (d.lastHitBy === NO_ENT) return null;
+  const killer = w.get(d.lastHitBy);
+  if (killer !== undefined) return isPlayerTeam(killer.team) ? killer.team : null;
+  return killerTeams.get(w)?.get(d.lastHitBy) ?? null;
 }
 
 function killStructure(w: SimWorld, d: Ent): void {
-  // A structure is never neutral: StructureDef.team is TeamId and the world
-  // builds every structure ent straight from it. The guard is that proof, and
-  // it is mandatory — `SimEvent.structure.team` is a TeamId that the client
-  // uses to index two-element colour/marker tuples, and writing NEUTRAL_TEAM
-  // into it is the out-of-bounds read TERRAIN_CONTRACT §5 forbids. A structure
-  // that somehow was not on a player team falls silently rather than paying a
-  // bounty and announcing a team that does not exist.
-  if (!isPlayerTeam(d.team)) return;
-  // Tower bounty (towers AND guard towers) to every living enemy hero.
+  // Tower bounty (towers AND guard towers) to every living enemy hero. This
+  // needs no team guard: `e.team === d.team` excludes the owner whatever the
+  // owner is, so the payout is correct for any value `d.team` can hold.
   if (d.bounty > 0) {
     for (const e of w.mobileMap.values()) {
       if (e.kind !== 'hero' || !e.alive || e.team === d.team) continue;
@@ -228,6 +248,13 @@ function killStructure(w: SimWorld, d: Ent): void {
       e.goldEarned += d.bounty;
     }
   }
+  // The EVENT, and only the event, needs a player team: `SimEvent.structure`
+  // carries a TeamId that the client uses to index two-element colour/marker
+  // tuples, and writing NEUTRAL_TEAM into it is the out-of-bounds read
+  // TERRAIN_CONTRACT §5 forbids. A structure is never neutral — StructureDef.team
+  // is a TeamId and the world builds every structure ent straight from it — so
+  // this narrow guard is that proof, and it must not swallow the bounty with it.
+  if (!isPlayerTeam(d.team)) return;
   const kind = d.kind === 'ancient' ? 'ancient' : d.kind === 'guard' ? 'guard' : 'tower';
   w.pushEvent({ k: 'structure', team: d.team, kind, lane: d.lane >= 0 ? d.lane : null });
 }
@@ -322,6 +349,8 @@ function killHero(w: SimWorld, v: Ent): void {
 }
 
 export function stepDeaths(w: SimWorld): void {
+  // Before anything is reaped: remember who is currently killing each neutral.
+  captureKillerTeams(w);
   w.deadBuf.length = 0;
   for (const s of w.structures) {
     if (s.alive && s.hp <= 0) w.deadBuf.push(s);
@@ -336,12 +365,12 @@ export function stepDeaths(w: SimWorld): void {
     d.orderTarget = NO_ENT;
     d.order = 'idle';
     // Hero loot is the only path that touches first blood, the 'kill' event
-    // (whose victimPid a neutral has not got) and a deaths counter, so it is
-    // gated on the victim being a hero ON A PLAYER TEAM. Heroes are always
-    // seated and therefore always 0 or 1; the guard states that rather than
-    // assuming it, and routes anything neutral to the creep path where the
-    // paying team is decided by the killer.
-    if (d.kind === 'hero' && isPlayerTeam(d.team)) killHero(w, d);
+    // (whose victimPid a neutral has not got) and a deaths counter. The branch
+    // keys on kind ALONE: a hero is the victim or it is not. Adding
+    // `&& isPlayerTeam(d.team)` would route a hero to killCreep, which never
+    // writes respawnAtTick, while the corpse loop below never removes a hero —
+    // a permanent soft-lock wearing the costume of a safety check.
+    if (d.kind === 'hero') killHero(w, d);
     else if (d.id < 1000) killStructure(w, d);
     else killCreep(w, d);
   }

@@ -14,6 +14,12 @@
 // own recipe (team = NEUTRAL_TEAM, lane = -1, expireAtTick = -1,
 // owner = NO_ENT) rather than through sim/camps.ts, so this file tests the
 // unit under test and stays independent of the camp engine.
+//
+// The last describe block pins units.ts' four neutral-safety guards ONE AT A
+// TIME. Every test in it is built so that reverting exactly one guard — and no
+// other — turns exactly that test red; in particular no test relies on two
+// guards masking each other, which is how the first version of this suite came
+// to pass against an implementation with the guards removed.
 // ============================================================================
 import { describe, expect, it } from 'vitest';
 import {
@@ -580,7 +586,16 @@ const CAMP_COUNT: Readonly<Record<CampDef['tier'], number>> = {
  *  team, lane -1 (a camp creep with lane >= 0 walks a lane polyline — the way
  *  this feature breaks), expireAtTick -1 (the "alive" sentinel, deliberately
  *  NOT 0), owner NO_ENT. Members are fanned inside the clearing, which §3.5
- *  guarantees is CAMP_LANE_CLEARANCE away from every lane corridor. */
+ *  guarantees is CAMP_LANE_CLEARANCE away from every lane corridor.
+ *
+ *  WHAT THESE FIXTURES ARE, EXACTLY. `spawnMobile`'s tuning lookup has no arm
+ *  for the camp kinds, so a member stood up this way is an INERT PROP: 1 hp,
+ *  0 damage, 0 move speed, 0 vision, no attack. It occupies the mobile map and
+ *  nothing more. That is the right fixture for this file — units.ts' claim is
+ *  that the mere PRESENCE of neutral entities changes nothing it computes —
+ *  but it means no test here says anything about camps that fight, move, die to
+ *  a lane push or get chased. Camp behaviour is sim/camps.ts' subject, and
+ *  stepCamps is not wired into advance() yet (AMENDMENT_1 §F). */
 function spawnCamps(w: World, map: MapDef): Ent[] {
   const out: Ent[] = [];
   for (const c of map.terrain.camps) {
@@ -630,7 +645,11 @@ function waveSignatures(w: World, upto: number): string[] {
 }
 
 describe('neutral camps are invisible to units.ts', () => {
-  it('spawns identical waves with and without a full jungle on the map', () => {
+  it('spawns identical waves whether or not neutral entities populate the map', () => {
+    // The claim this test can support, stated exactly: wave composition,
+    // growth, timing and spawn geometry do not depend on how many entities are
+    // in the mobile map. The jungle here is inert props (see spawnCamps), so
+    // this does NOT claim waves are unaffected by camps that fight or die.
     // Same terrain both sides: buildMap is a pure function of the lane count.
     const map = buildMap(1);
     expect(map.terrain.camps.length).toBeGreaterThan(0);
@@ -642,7 +661,14 @@ describe('neutral camps are invisible to units.ts', () => {
     // period, and one compounding growth step.
     const bareSigs = waveSignatures(bare.w, 2);
     const jungleSigs = waveSignatures(jungle.w, 2);
-    expect(bareSigs[0]).not.toBe(''); // the signature actually saw creeps
+    // Every one of the three signatures must describe real creeps: three empty
+    // strings compare equal to three empty strings and would prove nothing.
+    expect(bareSigs).toHaveLength(3);
+    for (const [k, sig] of bareSigs.entries()) {
+      expect(sig, `wave ${k} produced no creeps`).not.toBe('');
+      // WAVE_MELEE + WAVE_RANGED creeps per team per lane, 2 teams, 1 lane
+      expect(sig.split('|'), `wave ${k} roster`).toHaveLength(2 * (WAVE_MELEE + WAVE_RANGED));
+    }
     expect(jungleSigs).toEqual(bareSigs);
     // and the neutrals really were there the whole time, never wave-counted
     for (const m of members) {
@@ -695,10 +721,18 @@ describe('neutral camps are invisible to units.ts', () => {
     expect(p0.alive).toBe(true);
   });
 
-  it('restocks wards on the same cadence whether or not neutrals are dying', () => {
+  it('restocks wards on the documented cadence with the jungle alive, and a mass neutral death neither pays stock nor shifts the schedule', () => {
+    // The previous version of this test wiped the jungle BEFORE the first
+    // cadence assertion, so an implementation that suppressed restock whenever
+    // a neutral existed stayed green. Here the FIRST restock is asserted with
+    // every camp member alive, and survivors are still alive at the last
+    // assertion — so "restock is disabled while neutrals exist" fails on the
+    // first boundary, and "a neutral death touches lastRestockTick / stock"
+    // fails on the second.
     const map = buildMap(1);
     const { w } = makeWorldOn(map);
     const members = spawnCamps(w, map);
+    expect(members.length).toBeGreaterThanOrEqual(4);
     const p0 = hero(w, 'p0');
     w.buy(p0.id, 'wardstone');
     const slot = p0.items.indexOf('wardstone');
@@ -706,21 +740,44 @@ describe('neutral camps are invisible to units.ts', () => {
     w.useItem(p0.id, slot, p0.x + 2, p0.z);
     expect(w.wardStock(0)).toBe(0);
     expect(w.wardStock(1)).toBe(WARD_TEAM_STOCK);
-    // Wipe the whole jungle. Neutral deaths pay no team stock and cost none.
-    for (const m of members) w.damage(NO_ENT, m.id, 1e9, 'physical');
+    const period = Math.round(WARD_RESTOCK_S * TICK_RATE);
+    // Restock is on an absolute schedule (multiples of the period), not a
+    // timer started by the spend — derive the boundaries from the clock.
+    const first = (Math.floor(w.tick / period) + 1) * period;
+    const alive = (m: Ent): boolean => w.get(m.id)?.alive === true;
+
+    // (1) FIRST boundary, whole jungle alive on both sides of it.
+    advance(w, first - 1 - w.tick);
+    expect(members.every(alive)).toBe(true);
+    expect(w.wardStock(0)).toBe(0); // one tick early: nothing yet
     w.advance();
-    for (const m of members) expect(w.get(m.id)).toBeUndefined();
-    expect(w.wardStock(0)).toBe(0);
+    expect(w.tick).toBe(first);
+    expect(members.every(alive)).toBe(true);
+    expect(w.wardStock(0)).toBe(1); // restocked WITH a full jungle present
+
+    // (2) kill half the jungle mid-period: no stock paid, no schedule shift.
+    const killed = members.slice(0, 2);
+    const survivors = members.slice(2);
+    expect(survivors.length).toBeGreaterThan(0);
+    for (const m of killed) w.damage(NO_ENT, m.id, 1e9, 'physical');
+    w.advance();
+    for (const m of killed) expect(w.get(m.id)).toBeUndefined();
+    expect(w.wardStock(0)).toBe(1); // a neutral death is not a ward
     expect(w.wardStock(1)).toBe(WARD_TEAM_STOCK);
-    // Exactly the documented cadence, unshifted by the mass death above.
-    advance(w, Math.round(WARD_RESTOCK_S * TICK_RATE) - 1);
-    expect(w.wardStock(0)).toBe(1);
-    advance(w, Math.round(WARD_RESTOCK_S * TICK_RATE));
+
+    // (3) SECOND boundary lands on the unshifted schedule, survivors alive.
+    advance(w, first + period - 1 - w.tick);
+    expect(w.wardStock(0)).toBe(1); // one tick early
+    w.advance();
     expect(w.wardStock(0)).toBe(WARD_TEAM_STOCK);
-    advance(w, Math.round(WARD_RESTOCK_S * TICK_RATE));
-    expect(w.wardStock(0)).toBe(WARD_TEAM_STOCK); // capped
+    expect(survivors.every(alive)).toBe(true);
+
+    // (4) capped, and team 1 was never touched by any of it.
+    advance(w, period);
+    expect(w.wardStock(0)).toBe(WARD_TEAM_STOCK);
     expect(w.wardStock(1)).toBe(WARD_TEAM_STOCK);
-  });
+    expect(survivors.every(alive)).toBe(true);
+  }, 30000);
 
   it('pays no passive gold and grants no xp to a neutral', () => {
     const map = buildMap(1);
@@ -734,5 +791,94 @@ describe('neutral camps are invisible to units.ts', () => {
     expect(m.xp).toBe(xp);
     expect(m.level).toBe(level);
     expect(m.goldEarned).toBe(0);
+  });
+});
+
+// ============================================================================
+// GUARD PINS. units.ts carries four neutral-safety guards with deliberately
+// DISJOINT coverage. The scenario tests above exercise the production case (a
+// camp member: neutral team, camp kind, expireAtTick -1), which every guard
+// catches — so they stay green if any single guard is removed, and cannot tell
+// the guards apart. Each test below is built around the one case that exactly
+// one guard covers, so reverting that guard alone turns exactly that test red.
+// ============================================================================
+describe('each neutral-safety guard, pinned on its own', () => {
+  // GUARD: `e.kind !== 'hero'` in stepRespawns.
+  // Case only it covers: a NON-hero on a PLAYER team carrying a respawn stamp.
+  // The isPlayerTeam narrow lets this one straight through.
+  it('the hero respawner never revives a non-hero mobile on a player team', () => {
+    const { w } = makeWorld();
+    const creep = must(w.get(w.spawnMobile('melee', 0, 30, 60, -1, -1, NO_ENT)));
+    const [cx, cz] = [creep.x, creep.z];
+    creep.alive = false; // hp untouched, so stepDeaths does not sweep the corpse
+    const stamp = w.tick + 2;
+    creep.respawnAtTick = stamp;
+    advance(w, 20);
+    expect(creep.alive).toBe(false); // stays down: creeps do not respawn
+    expect(creep.respawnAtTick).toBe(stamp); // the stamp is not consumed
+    expect(creep.x).toBeCloseTo(cx, 9); // never teleported to a fountain
+    expect(creep.z).toBeCloseTo(cz, 9);
+    // control: the guard has not simply disabled the loop — heroes still return
+    const p0 = hero(w, 'p0');
+    w.damage(NO_ENT, p0.id, 999999, 'physical');
+    w.advance();
+    expect(p0.alive).toBe(false);
+    advance(w, Math.round((RESPAWN_BASE_S + RESPAWN_PER_LEVEL_S * 1) * TICK_RATE));
+    expect(p0.alive).toBe(true);
+  });
+
+  // GUARD: `isPlayerTeam(team)` in stepRespawns.
+  // Case only it covers: a HERO-KIND entity on NEUTRAL_TEAM. The kind test
+  // waves this through, and `fountainSpot` takes a TeamId, so without the
+  // narrow this both revives a neutral and indexes a two-team tuple with 2.
+  it('the hero respawner never revives a hero-kind entity on the neutral team', () => {
+    const { w } = makeWorld();
+    const ghost = must(w.get(w.spawnMobile('hero', NEUTRAL_TEAM, 30, 60, -1, -1, NO_ENT)));
+    expect(ghost.kind).toBe('hero');
+    expect(ghost.team).toBe(NEUTRAL_TEAM);
+    const [gx, gz] = [ghost.x, ghost.z];
+    ghost.alive = false;
+    const stamp = w.tick + 2;
+    ghost.respawnAtTick = stamp;
+    advance(w, 20);
+    expect(ghost.alive).toBe(false);
+    expect(ghost.respawnAtTick).toBe(stamp);
+    expect(ghost.x).toBeCloseTo(gx, 9); // a neutral has no fountain to return to
+    expect(ghost.z).toBeCloseTo(gz, 9);
+  });
+
+  // GUARD: `e.expireAtTick <= 0` in stepExpiry (AMENDMENT_1 §B.3).
+  // Case only it covers: a NON-camp kind stamped with a negative sentinel. The
+  // isCampKind test does not apply, so `=== 0` would reap this on tick 1.
+  it('treats a negative expiry stamp as "never" even for a non-camp kind', () => {
+    const { w } = makeWorld();
+    const forever = w.spawnMobile('ward', 0, 30, 60, -1, -1, NO_ENT);
+    const zero = w.spawnMobile('ward', 0, 31, 60, -1, 0, NO_ENT);
+    // control: the reaper is live in this world and still kills a real stamp
+    const timed = w.spawnMobile('ward', 0, 32, 60, -1, w.tick + 2, NO_ENT);
+    advance(w, 2);
+    expect(w.get(timed)).toBeUndefined();
+    advance(w, TICK_RATE * 5);
+    expect(w.get(forever), '-1 was read as a tick in the past').toBeDefined();
+    expect(w.get(zero)).toBeDefined();
+  });
+
+  // GUARD: `isCampKind(e.kind)` in stepExpiry.
+  // Case only it covers: a camp member carrying a POSITIVE, already-elapsed
+  // stamp. The `<= 0` sentinel does not apply, so only the kind test saves it.
+  it('never reaps a camp member, even one carrying a positive expiry stamp', () => {
+    const map = buildMap(1);
+    const { w } = makeWorldOn(map);
+    const members = spawnCamps(w, map);
+    expect(members.length).toBeGreaterThan(0);
+    for (const m of members) m.expireAtTick = w.tick + 1;
+    // control: a non-camp mobile with the same stamp is reaped on schedule
+    const shade = w.spawnMobile('shade', 0, 30, 60, -1, w.tick + 1, NO_ENT);
+    advance(w, 5);
+    expect(w.get(shade)).toBeUndefined();
+    for (const m of members) {
+      expect(w.get(m.id), 'a camp member was reaped by the expiry step').toBeDefined();
+      expect(m.alive).toBe(true);
+    }
   });
 });

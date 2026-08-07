@@ -7,11 +7,12 @@
 // creep targeting, siege multiplier, lifesteal, stun. Gold assertions account
 // for passive income (PASSIVE_GOLD_PER_S * TICK_DT per tick per hero).
 //
-// Plus TERRAIN_CONTRACT §4/§5: the uphill miss (rate, determinism, spent
-// swing, wire event, and that only LOW->HIGH misses) and neutral-safe kill
-// attribution (one paying team per neutral death, no first blood, no kill
-// event, no deaths counter, and the isPlayerTeam guards holding when a camp
-// lands the killing blow on a hero).
+// Plus TERRAIN_CONTRACT §4/§5: the uphill miss (rate — measured both on the
+// raw hash and on real swings through fire() — determinism, spent swing, wire
+// event, and that only LOW->HIGH misses) and neutral-safe kill attribution (one
+// paying team per neutral death, including when the last hitter has already
+// been reaped; no first blood, no kill event, no deaths counter, and the
+// isPlayerTeam guards holding when a camp lands the killing blow on a hero).
 //
 // Terrain positions are SEARCHED, never hard-coded: buildMap() is a pure
 // function of the lane count, so the search is deterministic, and it cannot
@@ -48,7 +49,7 @@ import {
 import type { Elevation, MapDef, Vec2 } from '@rift/shared';
 import { createWorld } from './world.js';
 import { NO_ENT } from './types.js';
-import type { AbilitiesEngine, Ent, SeatDef, World } from './types.js';
+import type { AbilitiesEngine, Ent, SeatDef, SimEvent, World } from './types.js';
 
 class EngineDouble implements AbilitiesEngine {
   step(world: World): void {
@@ -197,19 +198,13 @@ function swings(w: World, a: Ent, d: Ent, ticks: number): Swing[] {
   return out;
 }
 
-/** The uphill-miss wire event. `SimEvent` (frozen) has no 'miss' member yet —
- *  see the CONTRACT_GAP note in combat.ts — so the drained event is inspected
- *  structurally rather than by union narrowing. */
-interface MissWire {
-  readonly k: 'miss';
-  readonly attacker: number;
-  readonly target: number;
-}
-
-function isMissEvent(ev: unknown): ev is MissWire {
-  if (typeof ev !== 'object' || ev === null) return false;
-  if (!('k' in ev) || !('attacker' in ev) || !('target' in ev)) return false;
-  return ev.k === 'miss' && typeof ev.attacker === 'number' && typeof ev.target === 'number';
+/** Write the one impossible state combat.ts guards against. `Ent.team` is
+ *  readonly and every structure is built from `StructureDef.team`, which is a
+ *  TeamId — so a structure off the player teams cannot be produced by any
+ *  supported call, and the guard protecting `SimEvent.structure.team` would
+ *  otherwise be unreachable and untestable. */
+function forceNeutral(e: Ent): void {
+  Object.assign(e, { team: NEUTRAL_TEAM });
 }
 
 /** A neutral jungle creep. camps.ts owns real camp tuning; this fixture only
@@ -304,7 +299,7 @@ describe('creep loot', () => {
     const p3 = hero(w, 'p3');
     p0.x = ARENA.x;
     p0.z = ARENA.z;
-    p2.x = ARENA.x + 5; // within XP_SHARE_RADIUS (12), does NOT attack
+    p2.x = ARENA.x + 5; // within XP_SHARE_RADIUS (20), does NOT attack
     p2.z = ARENA.z;
     // p3 stays at its fountain, far away: same team, out of radius
     const creep = must(w.get(w.spawnMobile('melee', 1, ARENA.x + 1, ARENA.z, -1, 0, NO_ENT)));
@@ -458,6 +453,28 @@ describe('structures', () => {
       expect(ev.kind).toBe('tower');
       expect(ev.lane).toBe(0);
     }
+  });
+
+  it('pays a structure bounty even when the team guard blocks the announcement', () => {
+    // The isPlayerTeam guard exists for ONE thing: SimEvent.structure.team is a
+    // TeamId the client uses to index two-element tuples. It must gate the
+    // event and nothing else — sitting above the payout would forfeit the
+    // bounty of any structure that ever left the two player teams.
+    const w = makeWorld();
+    const p0 = hero(w, 'p0');
+    const p2 = hero(w, 'p2');
+    const tower = structure(w, 'tower', 1);
+    forceNeutral(tower);
+    expect(tower.team).toBe(NEUTRAL_TEAM);
+    w.drainEvents();
+    const g0 = p0.gold;
+    const g2 = p2.gold;
+    w.damage(p0.id, tower.id, 99999, 'physical');
+    w.advance();
+    expect(tower.alive).toBe(false);
+    expect(p0.gold - g0).toBeCloseTo(TOWER.bounty + PASSIVE_PER_TICK, 4);
+    expect(p2.gold - g2).toBeCloseTo(TOWER.bounty + PASSIVE_PER_TICK, 4);
+    expect(w.drainEvents().some((e) => e.k === 'structure')).toBe(false);
   });
 
   it('Fortify reduces hero damage to structures with no enemy creep nearby', () => {
@@ -640,27 +657,52 @@ describe('uphill miss', () => {
   it('emits a miss event carrying ENTITY ids, and only on a miss', () => {
     const slope = findPair(MAP, ELEV_LOW, ELEV_HIGH, GAP, CLEAR);
     const { w, a, d } = duel(slope.a, slope.b);
-    let seen: MissWire | undefined;
-    let hitTicksWithMissEvent = 0;
+    let seen: Extract<SimEvent, { k: 'miss' }> | undefined;
+    let hitTicksWithMiss = 0;
     for (let i = 0; i < 1200 && seen === undefined; i++) {
       d.hp = d.maxHp;
       w.advance();
-      // MissWire is not a SimEvent member yet (CONTRACT_GAP), so the drained
-      // batch is inspected as unknowns and narrowed by the structural guard.
-      const drained: readonly unknown[] = w.drainEvents();
-      const miss = drained.find(isMissEvent);
+      // AMENDMENT_1 §B.2 put 'miss' in the SimEvent union, so the drained batch
+      // narrows by discriminant: if combat.ts pushed anything else, or pushed
+      // through a widened seam, this file would not compile.
+      const drained: SimEvent[] = w.drainEvents();
+      const miss = drained.find((ev) => ev.k === 'miss');
       if (a.atkTarget !== d.id) continue;
       if (d.hp < d.maxHp) {
-        if (miss !== undefined) hitTicksWithMissEvent += 1;
+        if (miss !== undefined) hitTicksWithMiss += 1;
         continue;
       }
       seen = miss;
     }
-    expect(hitTicksWithMissEvent).toBe(0);
+    expect(hitTicksWithMiss).toBe(0);
     expect(seen).toBeDefined();
     expect(seen?.attacker).toBe(a.id);
     expect(seen?.target).toBe(d.id);
     expect(seen?.attacker).toBeGreaterThanOrEqual(1000); // entity id, not a pid
+  });
+
+  it('the miss rate of REAL swings through fire() matches HIGH_GROUND_MISS', () => {
+    // The missRoll suite above measures the hash with synthetic ids. This one
+    // measures what the sim actually does: every sample is a swing that went
+    // through stepCombat -> fire(), on the real terrain, at the real ids.
+    const slope = findPair(MAP, ELEV_LOW, ELEV_HIGH, GAP, CLEAR);
+    const { w, a, d } = duel(slope.a, slope.b);
+    let swung = 0;
+    let missed = 0;
+    for (let i = 0; i < 10000; i++) {
+      d.hp = d.maxHp;
+      a.nextAttackTick = 0; // cadence is measured elsewhere; sample every tick
+      w.advance();
+      if (a.atkTarget !== d.id) continue;
+      swung += 1;
+      if (d.hp === d.maxHp) missed += 1;
+    }
+    expect(swung).toBeGreaterThanOrEqual(9900);
+    expect(missed).toBeGreaterThan(0);
+    expect(missed).toBeLessThan(swung);
+    expect(Math.abs(missed / swung - HIGH_GROUND_MISS)).toBeLessThanOrEqual(0.02);
+    expect(elevationAt(w.map.terrain, a.x, a.z)).toBe(ELEV_LOW);
+    expect(elevationAt(w.map.terrain, d.x, d.z)).toBe(ELEV_HIGH);
   });
 
   it('replays bit-for-bit: two identical worlds diverge nowhere', () => {
@@ -728,6 +770,48 @@ describe('neutral deaths', () => {
     expect(p1.xp - x1).toBeCloseTo(0, 9);
   });
 
+  it('still pays the last hitter team after the last hitter has been reaped', () => {
+    // The undefined branch of the killer lookup. A wave creep lands the blow
+    // that stays `lastHitBy`, dies, and leaves the store; the camp is finished
+    // off later by a source that writes no lastHitBy at all — exactly how
+    // camps.ts culls an orphaned member. The camp must still pay the creep's
+    // team, not nobody.
+    const w = makeWorld();
+    const p0 = hero(w, 'p0'); // team 0 — the creep's team, the payee
+    const p1 = hero(w, 'p1'); // team 1 — in radius, must be paid nothing
+    p0.x = ARENA.x;
+    p0.z = ARENA.z;
+    p1.x = ARENA.x + 3;
+    p1.z = ARENA.z;
+    const camp = neutral(w, ARENA.x + 1, ARENA.z, 60, 120);
+    expect(Math.hypot(p1.x - camp.x, p1.z - camp.z)).toBeLessThan(XP_SHARE_RADIUS);
+    const creep = must(w.get(w.spawnMobile('melee', 0, ARENA.x + 40, ARENA.z, -1, 0, NO_ENT)));
+    // a real blow, small enough that the camp outlives the creep that dealt it
+    w.damage(creep.id, camp.id, 0.25, 'physical');
+    expect(camp.lastHitBy).toBe(creep.id);
+    expect(camp.alive).toBe(true);
+    camp.hp = camp.maxHp;
+    w.advance(); // the tick that can still read the creep's team
+    // now kill the creep and let stepDeaths reap its corpse
+    w.damage(p1.id, creep.id, 999999, 'physical');
+    w.advance();
+    expect(w.get(creep.id)).toBeUndefined();
+    expect(camp.alive).toBe(true);
+    expect(camp.lastHitBy).toBe(creep.id); // a dangling id: no ent behind it
+    advance(w, 5); // several ticks later, so this is not a same-tick fluke
+    expect(camp.alive).toBe(true);
+    expect(camp.lastHitBy).toBe(creep.id);
+    const g0 = p0.gold;
+    const x0 = p0.xp;
+    const x1 = p1.xp;
+    camp.hp = 0; // an orphan cull: no damage event, no fresh lastHitBy
+    w.advance();
+    expect(camp.alive).toBe(false);
+    expect(p0.xp - x0).toBeCloseTo(120, 6); // the reaped creep's team is paid
+    expect(p1.xp - x1).toBeCloseTo(0, 9); // and the other team still is not
+    expect(p0.gold - g0).toBeCloseTo(PASSIVE_PER_TICK, 4); // bounty needs a hero
+  });
+
   it('pays nobody when a neutral dies with no player killer', () => {
     const w = makeWorld();
     const p0 = hero(w, 'p0');
@@ -775,6 +859,22 @@ describe('neutral deaths', () => {
       expect(kill.firstBlood).toBe(true);
       expect(kill.gold).toBe(KILL_GOLD_BASE + KILL_GOLD_PER_LEVEL * 1 + FIRST_BLOOD_BONUS);
     }
+  });
+
+  it('routes a hero victim to hero loot on ANY team, and never soft-locks it', () => {
+    // The death router keys on kind alone. Gating it on isPlayerTeam too would
+    // send this ent to killCreep — no respawnAtTick — while the corpse loop
+    // never removes a hero: dead forever, in the store, unrespawnable.
+    const w = makeWorld();
+    const p0 = hero(w, 'p0');
+    const stray = must(w.get(w.spawnMobile('hero', NEUTRAL_TEAM, ARENA.x, ARENA.z, -1, 0, NO_ENT)));
+    expect(stray.kind).toBe('hero');
+    expect(stray.team).toBe(NEUTRAL_TEAM);
+    w.damage(p0.id, stray.id, 999999, 'physical');
+    w.advance();
+    expect(stray.alive).toBe(false);
+    expect(w.get(stray.id)).toBeDefined(); // heroes are kept for the respawn
+    expect(stray.respawnAtTick).toBeGreaterThan(w.tick); // and one is scheduled
   });
 
   it('survives a camp landing the killing blow on a hero', () => {

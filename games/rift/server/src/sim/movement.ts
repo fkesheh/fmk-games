@@ -10,7 +10,7 @@
 // Speed = effective moveSpeed (base + items + haste, from recomputeEnt) *
 // (1 - strongest active slow).
 //
-// AMENDED for TERRAIN_CONTRACT §4 — three things, and nothing else changed:
+// AMENDED for TERRAIN_CONTRACT §4 and AMENDMENT_1 §A/§D:
 //
 //  1. CLIFFS ARE SOLID, AND ELEVATION NEEDS A RAMP. Every metre of motion in
 //     this file goes through `travel()`, which sweeps the step against the
@@ -24,21 +24,30 @@
 //     straight-line steering with `path = null` forever — their corridor is
 //     contractually validated cliff-free (§3.2), which is the simplification
 //     the whole design rests on. Camp creeps never leave their clearing.
-//     A hero's path is computed when its DESTINATION changes, never per tick.
-//  3. NEUTRAL CAMPS. `stepMovement`'s kind switch gains a camp branch that must
-//     not fall through to `creepMotion` (a camp creep in lane-following code
-//     walks down a lane, which is the single most likely way the jungle
-//     breaks). Camps leash to their clearing; lane creeps and summons refuse
-//     to acquire them, while hero attack-move (`nearestEnemyAny`) still does —
-//     get that backwards and either the jungle is inert or every creep wave
-//     suicides into it.
+//     A hero's path is planned when its destination CELL changes or when the
+//     route it is holding is no longer walkable from where it stands — never
+//     per tick — and at most `PATH_SEARCHES_PER_TICK` searches run in one tick
+//     (AMENDMENT_1 §D); a hero whose request is deferred steers straight for
+//     that tick and asks again on the next one.
+//  3. NEUTRAL CAMPS ARE EXECUTED HERE, NOT DECIDED HERE (AMENDMENT_1 §A).
+//     `campMotion` reads `order` / `ox` / `oz` / `orderTarget` and does exactly
+//     what they say. It performs NO acquisition, NO leash test, NO home search
+//     and NO hp change, it writes no order field, and it must not fall through
+//     to `creepMotion` (a camp creep in lane-following code walks down a lane,
+//     which is the single most likely way the jungle breaks). Every one of
+//     those decisions belongs to sim/camps.ts, which runs after this step, so
+//     an order it writes takes effect on the NEXT tick — that latency is
+//     accepted and is not to be "fixed" by moving ents from camps.ts.
+//     Lane creeps and summons still refuse to acquire camps, while hero
+//     attack-move (`nearestEnemyAny`) still does — get that backwards and
+//     either the jungle is inert or every creep wave suicides into it.
 //
 // Terrain collision is POINT-vs-cell, deliberately: unit radii resolve against
 // other units and structures, as they always have, and a 1 m cell grid with
 // per-cell corner rules already keeps a HERO_RADIUS disc off the rock.
 // ============================================================================
-import { AGGRO_RADIUS, CAMP_LEASH_RADIUS, isPlayerTeam, NEUTRAL_TEAM, TICK_DT } from '@rift/shared';
-import type { CampDef, TerrainDef } from '@rift/shared';
+import { AGGRO_RADIUS, isCampKind, isPlayerTeam, NEUTRAL_TEAM, TICK_DT } from '@rift/shared';
+import type { TerrainDef } from '@rift/shared';
 import { NO_ENT } from './types.js';
 import type { Ent } from './types.js';
 import {
@@ -46,8 +55,9 @@ import {
   cellMidX,
   cellMidZ,
   cellPassable,
-  findPath,
   nearestPassableCell,
+  requestPath,
+  resetPathBudget,
   segmentWalkable,
   walkableFraction,
 } from './pathing.js';
@@ -79,12 +89,21 @@ const SUMMON_FOLLOW_DIST = 3;
 /** How far (in cells) the cliff push-out will look for standable ground. Cliff
  *  rings are one to three cells thick, so four always finds the outside. */
 const PUSHOUT_SEARCH_CELLS = 4;
-/** A camp member closer than this to its clearing centre counts as home and
- *  stops walking — below one tick of camp movement, so it cannot oscillate. */
-const CAMP_HOME_EPS = 0.1;
 
 function clampNum(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
+}
+
+/** Is `t` a MOBILE (as opposed to one of the map's structures)?
+ *
+ *  Asked of the world's own store rather than of the entity id. Structure ids
+ *  and mobile ids are partitioned at 1000, but that partition is world.ts's
+ *  private numbering with no type-level link to anything here: a module that
+ *  spells `t.id < 1000` has hard-coded another file's invariant and will keep
+ *  compiling on the day it changes. `mobileMap` IS the set of mobiles, so this
+ *  is the definition rather than a proxy for it. */
+function isMobile(w: SimWorld, t: Ent): boolean {
+  return w.mobileMap.has(t.id);
 }
 
 /** Is t a legal thing for e to swing at (alive enemy, not a ward/projectile)?
@@ -100,15 +119,15 @@ function attackable(e: Ent, t: Ent): boolean {
  *
  *  `skipNeutral` is the auto-aggro carve-out of TERRAIN_CONTRACT §5: lane
  *  creeps and summons must never acquire a jungle camp, or a wave that clips a
- *  clearing walks out of its lane and dies in the jungle. Camps themselves pass
- *  false — they acquire whatever walks into them. */
+ *  clearing walks out of its lane and dies in the jungle. Camps themselves
+ *  never call this at all — acquisition for a camp lives in sim/camps.ts. */
 function nearestEnemyMobile(w: SimWorld, e: Ent, r: number, skipNeutral: boolean): Ent | undefined {
   const n = w.inRadius(e.x, e.z, r, w.scratchA);
   let best: Ent | undefined;
   let bestD = Infinity;
   for (let i = 0; i < n; i++) {
     const t = w.scratchA[i];
-    if (!t || t.id < 1000 || !attackable(e, t)) continue;
+    if (!t || !isMobile(w, t) || !attackable(e, t)) continue;
     if (skipNeutral && t.team === NEUTRAL_TEAM) continue;
     const d = entDist(e, t);
     if (d < bestD) {
@@ -165,6 +184,17 @@ function structureInReach(w: SimWorld, e: Ent): Ent | undefined {
 
 // --- terrain-aware motion primitives ------------------------------------------
 
+/** Spend a single-axis remainder if any of it is legal. Returns whether the
+ *  unit moved at all. */
+function slideAxis(t: TerrainDef, e: Ent, rx: number, rz: number): boolean {
+  if (rx === 0 && rz === 0) return false;
+  const f = walkableFraction(t, e.x, e.z, e.x + rx, e.z + rz);
+  if (!(f > 0)) return false;
+  e.x += rx * f;
+  e.z += rz * f;
+  return true;
+}
+
 /** Apply a motion vector with the cliff veto, in two stages: travel as far
  *  along it as the terrain allows (so a dash stops AT the face rather than
  *  refusing to start), then spend what is left of the step sliding.
@@ -175,7 +205,14 @@ function structureInReach(w: SimWorld, e: Ent): Ent | undefined {
  *  Exactly one axis may take the remainder, so wall-hugging never travels
  *  further in a tick than open ground would. Head-on into a face both
  *  components vanish and the unit stops dead — there is nothing to oscillate
- *  between, which is why this needs no anti-jitter term. */
+ *  between, which is why this needs no anti-jitter term.
+ *
+ *  WHICH axis is offered first is the motion's own dominant tangent, not a
+ *  fixed X-then-Z order. A fixed order is a bias in world space: two units
+ *  meeting the same wall from opposite sides both drifted +X, which reads as
+ *  the terrain pushing everything one way. Comparing the two remainders is a
+ *  property of the step, so the drift follows where the unit was going. An
+ *  exact tie resolves to X, which keeps it deterministic. */
 function slideStep(t: TerrainDef, e: Ent, mx: number, mz: number): void {
   const f = walkableFraction(t, e.x, e.z, e.x + mx, e.z + mz);
   if (f >= 1) {
@@ -189,17 +226,15 @@ function slideStep(t: TerrainDef, e: Ent, mx: number, mz: number): void {
   }
   const rx = mx * (1 - f);
   const rz = mz * (1 - f);
-  if (rx !== 0) {
-    const fx = walkableFraction(t, e.x, e.z, e.x + rx, e.z);
-    if (fx > 0) {
-      e.x += rx * fx;
-      return;
-    }
+  const ax = rx < 0 ? -rx : rx;
+  const az = rz < 0 ? -rz : rz;
+  if (ax >= az) {
+    if (slideAxis(t, e, rx, 0)) return;
+    slideAxis(t, e, 0, rz);
+    return;
   }
-  if (rz !== 0) {
-    const fz = walkableFraction(t, e.x, e.z, e.x, e.z + rz);
-    if (fz > 0) e.z += rz * fz;
-  }
+  if (slideAxis(t, e, 0, rz)) return;
+  slideAxis(t, e, rx, 0);
 }
 
 /**
@@ -244,40 +279,76 @@ function steer(w: SimWorld, e: Ent, tx: number, tz: number): boolean {
   return travel(w, e, tx, tz, speed * TICK_DT) >= 0;
 }
 
-/** Forget the current route. Called whenever a hero stops travelling to its
- *  order destination — chasing a target is straight-line by design — so that
- *  resuming the trip re-plans from wherever the fight left the hero. */
+/** Forget the current route. `Ent.path`'s frozen invariant is "every new order
+ *  resets this to null and pathIndex to 0"; this is that reset, and it is
+ *  called at every point where THIS file issues or completes an order. It is
+ *  deliberately NOT called while chasing: a chase is straight-line steering
+ *  that does not read the route, and clearing it every chase tick is what
+ *  forced a fresh A* the moment the chase ended (AMENDMENT_1 §D). */
 function clearPath(e: Ent): void {
   e.path = null;
   e.pathIndex = 0;
 }
 
-/** Guarantee `e.path` describes a route to the CURRENT order destination.
+/**
+ * May `e` keep walking the route it is holding?
  *
- *  The memo is the path's own last waypoint: it always equals (ox, oz) exactly,
- *  including in the two degenerate cases (no route found → a single waypoint at
- *  the destination, i.e. steer straight; destination inside a cliff → the
- *  reachable cell at the foot of it, then the destination itself). So a hero
- *  ordered somewhere unreachable searches ONCE and then walks into the wall
- *  exactly as it has always walked into a structure — it never re-searches per
- *  tick, which is the only way this could threaten the 2.5 ms tick. */
-function ensurePath(t: TerrainDef, e: Ent): void {
-  const cur = e.path;
-  if (cur && cur.length > 0) {
-    const last = cur[cur.length - 1];
-    if (last && last.x === e.ox && last.z === e.oz) return;
-  }
-  const found = findPath(t, e.x, e.z, e.ox, e.oz);
-  e.path = found ?? [{ x: e.ox, z: e.oz }];
+ * Three conditions, and the second is the one that was missing:
+ *
+ *  1. the route must lead to the CURRENT order destination — compared by CELL,
+ *     per AMENDMENT_1 §D, so nudging a destination inside the metre it already
+ *     occupies does not buy a search. The follower walks the exact (ox, oz) in
+ *     its tail leg anyway, so cell equality loses no precision;
+ *  2. the leg the unit is actually on must be walkable FROM WHERE IT STANDS.
+ *     A route is planned from a position; a dash, a push-out or a chase can
+ *     move the unit off it while the destination is unchanged, and the old code
+ *     — which memoised on the destination alone — then kept a `pathIndex` that
+ *     pointed at a waypoint the unit could no longer reach, so `travel()`
+ *     returned -1 for ever and the hero never arrived;
+ *  3. a route of ONE point is always terminal: it is what the follower writes
+ *     when the search reported "no route, steer straight". Re-planning it would
+ *     re-run that failed search every tick, which is the exact per-tick cost
+ *     §4 forbids. The same applies to a leg blocked only because the DESTINATION
+ *     is inside rock: pressing against the face is the intended behaviour there,
+ *     not evidence of a stale route.
+ */
+function pathUsable(t: TerrainDef, e: Ent): boolean {
+  const path = e.path;
+  if (!path || path.length === 0) return false;
+  const last = path[path.length - 1];
+  if (!last) return false;
+  const g = t.grid;
+  const destCell = cellIndexAt(g, e.ox, e.oz);
+  if (cellIndexAt(g, last.x, last.z) !== destCell) return false;
+  if (path.length === 1) return true;
+  if (e.pathIndex >= path.length) return true;
+  const wp = path[e.pathIndex];
+  if (!wp) return false;
+  if (segmentWalkable(t, e.x, e.z, wp.x, wp.z)) return true;
+  return !cellPassable(g, destCell);
+}
+
+/** Guarantee `e.path` describes a route the unit can walk to its CURRENT order
+ *  destination. Returns false when the tick's search allowance is spent: the
+ *  caller steers straight this tick and this runs again next tick, leaving the
+ *  stale route untouched rather than memoising a guess. */
+function ensurePath(t: TerrainDef, e: Ent): boolean {
+  if (pathUsable(t, e)) return true;
+  const plan = requestPath(t, e.x, e.z, e.ox, e.oz);
+  if (plan.deferred) return false;
+  // A null plan is the final answer "there is no route worth walking" — record
+  // it as the one-point route so condition (3) above stops it being re-asked.
+  e.path = plan.path ?? [{ x: e.ox, z: e.oz }];
   e.pathIndex = 0;
+  return true;
 }
 
 /** Walk the hero along its A* route toward (ox, oz) for one tick. Returns true
  *  on arrival at the final waypoint, which is what ends a move order. */
 function followPath(w: SimWorld, e: Ent): boolean {
-  ensurePath(w.map.terrain, e);
-  const path = e.path;
   let budget = e.moveSpeed * (1 - e.slowPct) * TICK_DT;
+  if (!ensurePath(w.map.terrain, e)) return travel(w, e, e.ox, e.oz, budget) >= 0;
+  const path = e.path;
   if (!path || path.length === 0) return travel(w, e, e.ox, e.oz, budget) >= 0;
   // Bounded by the waypoint count: each iteration consumes one waypoint, and
   // running out of budget or hitting rock returns immediately.
@@ -314,7 +385,8 @@ function heroMotion(w: SimWorld, e: Ent): void {
       const t = e.orderTarget !== NO_ENT ? w.get(e.orderTarget) : undefined;
       if (!t || !attackable(e, t)) {
         // Target gone: degrade to an attack-move to its last known position
-        // (dead heroes keep their position), else drop to idle.
+        // (dead heroes keep their position), else drop to idle. Both are NEW
+        // orders, so both reset the route.
         if (t) {
           e.order = 'attackmove';
           e.ox = t.x;
@@ -326,7 +398,9 @@ function heroMotion(w: SimWorld, e: Ent): void {
         clearPath(e);
         return;
       }
-      clearPath(e);
+      // Chasing is straight-line by design: the target moves, and re-planning a
+      // route at it every tick is the per-tick search the contract forbids. The
+      // route it is carrying is simply not read while this branch runs.
       if (!inAttackRange(e, t)) steer(w, e, t.x, t.z);
       return;
     }
@@ -341,12 +415,11 @@ function heroMotion(w: SimWorld, e: Ent): void {
         if (t) e.orderTarget = t.id;
       }
       if (t) {
-        // Chasing is straight-line: the target moves, and re-planning a route
-        // at it every tick is exactly the per-tick search the contract forbids.
-        clearPath(e);
         if (!inAttackRange(e, t)) steer(w, e, t.x, t.z);
         return;
       }
+      // Back to travelling: `pathUsable` re-checks the route the chase left
+      // behind and re-plans only if the hero has come off it.
       if (followPath(w, e)) {
         e.order = 'idle';
         clearPath(e);
@@ -422,62 +495,34 @@ function summonMotion(w: SimWorld, e: Ent): void {
   }
 }
 
-/** The clearing a camp member belongs to: the nearest camp centre on the map.
- *  Exact rather than heuristic, because CAMP_LEASH_RADIUS (10) is a hard cap on
- *  how far a member may ever be from its own centre and no two clearings sit
- *  within twice that of each other. Read from `map.terrain.camps` — the same
- *  immutable placement record `World.camps` is built from — so movement needs
- *  no camp bookkeeping of its own and cannot disagree with sim/camps.ts. */
-function campHome(w: SimWorld, e: Ent): CampDef | undefined {
-  let best: CampDef | undefined;
-  let bestD = Infinity;
-  for (const c of w.map.terrain.camps) {
-    const dx = c.x - e.x;
-    const dz = c.z - e.z;
-    const d2 = dx * dx + dz * dz;
-    if (d2 < bestD) {
-      bestD = d2;
-      best = c;
-    }
-  }
-  return best;
-}
-
-/** Neutral camp motion (TERRAIN_CONTRACT §5). Camps hold their clearing: they
- *  chase what comes to them and go home the moment the fight leaves the leash
- *  disc. They never walk a lane polyline, never acquire a structure, and never
- *  path — a camp that can be dragged into a lane is a defect, and the clearance
- *  validation (§3.5) only holds because this function keeps them inside
- *  CAMP_LEASH_RADIUS of the clearing centre. The hp restore and the damager
- *  reset that go with a leash break belong to sim/camps.ts; this is the
- *  kinematics half of the same rule. */
+/**
+ * Neutral camp motion — the EXECUTOR half of the camps seam (AMENDMENT_1 §A).
+ *
+ * sim/camps.ts decides; this carries the decision out and nothing else. It
+ * reads only `order`, `ox`, `oz` and `orderTarget`, and it writes only `x` and
+ * `z` (through `steer`, so the cliff veto still applies). In particular it does
+ * NOT acquire a target, does NOT measure a leash, does NOT know where the
+ * member's clearing is, does NOT touch hp, and does NOT write an order field
+ * back — every one of those was the half of the old design that never met the
+ * other half. An `idle` member does not move at all: its post is where camps.ts
+ * put it, and stepping toward anything from there would fight pass-2
+ * separation for ever.
+ *
+ * An `attack` order follows the target's LIVE position, which is what "attack"
+ * means for every other kind in this file. If that target has left the world
+ * the member walks at `(ox, oz)` — the last position camps.ts recorded — for
+ * exactly one tick, until camps.ts re-decides.
+ */
 function campMotion(w: SimWorld, e: Ent): void {
-  const home = campHome(w, e);
-  if (!home) return; // a map with no camps: nothing to guard, nothing to do
-  let t = e.orderTarget !== NO_ENT ? w.get(e.orderTarget) : undefined;
-  if (t && !attackable(e, t)) {
-    t = undefined;
-    e.orderTarget = NO_ENT;
-  }
-  if (!t) {
-    t = nearestEnemyMobile(w, e, AGGRO_RADIUS, false);
-    if (t) e.orderTarget = t.id;
-  }
-  if (t) {
-    // The leash is measured against the TARGET, not against this member's own
-    // position: it is a clean gate with no boundary to oscillate across, and it
-    // means a hero who steps out of the clearing has genuinely broken away.
-    const tdx = t.x - home.x;
-    const tdz = t.z - home.z;
-    if (tdx * tdx + tdz * tdz <= CAMP_LEASH_RADIUS * CAMP_LEASH_RADIUS) {
+  if (e.order === 'idle') return;
+  if (e.order === 'attack' && e.orderTarget !== NO_ENT) {
+    const t = w.get(e.orderTarget);
+    if (t) {
       if (!inAttackRange(e, t)) steer(w, e, t.x, t.z);
       return;
     }
-    e.orderTarget = NO_ENT;
   }
-  const dx = home.x - e.x;
-  const dz = home.z - e.z;
-  if (dx * dx + dz * dz > CAMP_HOME_EPS * CAMP_HOME_EPS) steer(w, e, home.x, home.z);
+  steer(w, e, e.ox, e.oz);
 }
 
 /** Scripted dash: cover the remaining distance evenly over the remaining
@@ -508,6 +553,11 @@ function dashMotion(w: SimWorld, e: Ent): void {
 // --- the step --------------------------------------------------------------------
 
 export function stepMovement(w: SimWorld): void {
+  // A fresh A* allowance for this tick (AMENDMENT_1 §D). This is the only
+  // caller: pathing's counter is per sim tick, and movement is the only thing
+  // in the sim that searches.
+  resetPathBudget();
+
   // 1. individual motion (steering / dash / waypoint following)
   for (const e of w.mobileMap.values()) {
     if (!e.alive || e.kind === 'proj' || e.kind === 'ward') continue;
@@ -517,22 +567,13 @@ export function stepMovement(w: SimWorld): void {
       continue;
     }
     if (e.dashUntilTick !== 0) e.dashUntilTick = 0;
-    switch (e.kind) {
-      case 'hero':
-        heroMotion(w, e);
-        break;
-      case 'shade':
-        summonMotion(w, e);
-        break;
-      case 'campPack':
-      case 'campBrute':
-      case 'campHive':
-        campMotion(w, e);
-        break;
-      default:
-        creepMotion(w, e); // melee / ranged / siege
-        break;
-    }
+    // Dispatch by kind. The camp arm tests `isCampKind` (AMENDMENT_1 §B.4)
+    // rather than restating the three camp kinds, so a fourth tier cannot
+    // silently fall through into lane-following code.
+    if (e.kind === 'hero') heroMotion(w, e);
+    else if (e.kind === 'shade') summonMotion(w, e);
+    else if (isCampKind(e.kind)) campMotion(w, e);
+    else creepMotion(w, e); // melee / ranged / siege
   }
 
   // 2. soft separation between overlapping mobiles (heroes take half weight

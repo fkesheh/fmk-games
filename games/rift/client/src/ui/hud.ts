@@ -1,30 +1,74 @@
 // ============================================================================
-// ANCIENTS (rift) client — HUD (CONTRACT §6 ui/hud.ts + §8 UX bible, T9).
-// Bottom-centre portrait/hp/mana/ability/item cluster, top-centre match clock
-// + team score + towers standing, top-right kill feed, gold/shop button, K/D/A,
-// level + XP bar, TAB scoreboard, death overlay, first-60-seconds onboarding
-// (ONE text hint at a time — RMB-move > learn-to-cast > shop — dismissed on
-// use, plus the lane
-// arrow, a SEPARATE directional indicator that must read AT SPAWN (§8) and so
-// never queues behind the move hint; it is dismissed on arrival at the lane
-// midpoint; everything is suppressed while the scoreboard is open), and the
-// disconnect banner. Action feedback (round-6 UX): a successful BUY pops the
-// item slot it landed in (one-shot scale) and floats a '-Ng' gold number off
-// the gold readout; a spent skill point flashes the ability slot green
-// (one-shot). Pure DOM — T8's style.css owns layout and static look;
-// this file owns structure, text, dynamic widths/opacities, and the ONLY
-// colours it sets inline are APAL entries (team identity + hero accents).
+// ANCIENTS (rift) client — HUD (CONTRACT §6 ui/hud.ts + §8 UX bible, T9;
+// re-dressed for the PBR pass by R_HUD, GRAPHICS_CONTRACT §6 + STYLE_BIBLE §0).
+// Bottom-centre portrait/hp/mana/XP/state-chip cluster, ability and item bars
+// with cooldowns, gold, K/D/A, top-centre match clock + day/night dial + team
+// score + towers standing, top-right kill feed, TAB scoreboard, death overlay,
+// first-60-seconds onboarding (ONE text hint at a time — RMB-move >
+// learn-to-cast > shop — dismissed on use, plus the lane arrow, a SEPARATE
+// directional indicator that must read AT SPAWN (§8) and so never queues
+// behind the move hint; it is dismissed on arrival at the lane midpoint;
+// everything is suppressed while the scoreboard is open), and the disconnect
+// banner. Action feedback (round-6 UX): a successful BUY pops the item slot it
+// landed in (one-shot scale) and floats a '-Ng' gold number off the gold
+// readout; a spent skill point flashes the ability slot green (one-shot).
+// Pure DOM — style.css owns layout and static look; this file owns structure,
+// text, dynamic widths/opacities, and the ONLY colours it sets inline are APAL
+// entries (team identity, hero accents, terrain-state chips) or `mix()` of two
+// APAL entries.
+//
+// ---- WHAT THE PBR PASS ADDED (GRAPHICS_CONTRACT §6 "HUD and minimap") -------
+// Four terrain/time affordances, because the world now HAS terrain and time
+// and a HUD that does not report them leaves the player guessing at three
+// mechanics they cannot see:
+//
+//   1. DAY/NIGHT DIAL on the match clock. `snap.dayPhase` (0 = full day,
+//      1 = full night, continuous, wrapping) drives a sun->moon disc that
+//      crossfades continuously — that continuity IS the anticipation cue, the
+//      player watches night coming — plus a DAY/NIGHT word at the phase
+//      midpoint and the LIVE vision penalty beside it, read out of the frozen
+//      `nightVisionScale(dayPhase)` that `sim/vision.ts` itself applies. The
+//      penalty ramps, so the readout ramps; quoting NIGHT_VISION_MULT's -25%
+//      from the midpoint on would have doubled the figure the sim was using.
+//      Never colour alone: dial AND word AND figure.
+//   2. HIGH/LOW GROUND CHIP on the self readout. `elevationAt` at the hero's
+//      own position. Bright on HIGH (the advantaged state: attackers below you
+//      miss at HIGH_GROUND_MISS), dim on LOW — a MOBA HUD signals the
+//      exception, not the default.
+//   3. CONCEALED CHIP. `isConcealing` at the hero's position; hidden entirely
+//      when not in foliage, so it costs no width in the common case.
+//   4. MISS FLOAT on `rift_miss`. The event carries ENTITY ids, so the local
+//      hero's entity is resolved by `pid` out of `snap.ents` — only on a miss
+//      event, never per frame. Your whiffed swing floats danger-red, an
+//      enemy's whiff against you floats heal-green: an uphill miss with no
+//      feedback reads as a bug (protocol.ts, rift_miss).
+//
+// No new DOM class is minted for any of it. The day/night mark lives inside
+// `.match-clock` as classless children plus the `--night` state modifier; the
+// two chips are classless children of `.hud-bars`; the MISS float reuses
+// `.dmg-number`. That keeps the frozen DOM CLASS CONTRACT intact.
+//
+// PER-FRAME COST. `dayPhase` moves continuously, so the dial's gradient and
+// glow strings are PRE-BUILT at module load into a 25-step ladder and written
+// only when the quantised step changes — the render loop allocates no colour
+// string and touches no style property that did not change (GRAPHICS_CONTRACT
+// §5: no per-frame allocation). `buildMap` is called at most once per match
+// and its `MapDef` serves both the lane arrow and the terrain chips.
 //
 // DOM CLASS CONTRACT (§6): only classes from the frozen list are rendered:
 //   .hud .hud-portrait .hud-bars .bar .bar-hp .bar-mana .bar-xp
 //   .ability-bar .ability-slot .ability-cd .ability-rank .ability-plus
 //   .item-bar .item-slot .item-charges .item-cd .gold-readout .kda
 //   .topbar .match-clock .team-score .tower-count .killfeed .kill-row
-//   .scoreboard .death-overlay .respawn-count .hint .banner
+//   .scoreboard .death-overlay .respawn-count .hint .banner .dmg-number
 // Structural children that have no class in the contract (bar fills, glyph
-// spans, key hints) are CLASSLESS elements — T8 styles them via descendant
-// selectors (e.g. `.bar > i`, `.ability-slot > b`). Every numeric readout gets
-// an inline font-size >= 12px so the §8 floor holds no matter what CSS lands.
+// spans, key hints, the dial, the state chips, scoreboard columns) are
+// CLASSLESS elements — style.css styles them via descendant selectors (e.g.
+// `.bar > i`, `.ability-slot > b`, `.match-clock > i`, `.hud-bars > div`).
+// State MODIFIERS of a frozen class (`--ready`, `--night`, `--surge`, `--you`)
+// are the established extension form and mint no new element name. Every
+// numeric readout gets an inline font-size >= 12px so the §8 floor holds no
+// matter what CSS lands.
 //
 // Team identity is NEVER colour alone (§8): every team readout pairs the APAL
 // team colour with the AZURE/EMBER text label.
@@ -35,8 +79,11 @@
 // (mid (48,48) renders up-left of the team-0 fountain (11,11)). If T7's scene
 // ever changes that yaw, update laneArrowAngle() (one function, flagged there).
 // ============================================================================
+import { mix } from '@platform/shared';
 import {
   APAL,
+  CONCEAL_REVEAL_RADIUS,
+  ELEV_HIGH,
   FOUNTAIN_RADIUS,
   ITEMS,
   LEVEL_CAP,
@@ -44,13 +91,18 @@ import {
   ULT_LEVEL_REQ,
   XP_THRESHOLDS,
   buildMap,
+  elevationAt,
   heroById,
+  isConcealing,
+  nightVisionScale,
 } from '@rift/shared';
 import type {
   AbilityDef,
   BoardEntry,
   HeroId,
   ItemId,
+  MapDef,
+  RiftEvent,
   RosterEntry,
   TeamId,
 } from '@rift/shared';
@@ -64,6 +116,7 @@ const MOVE_HINT_DISMISS_M = 2; // hero moved this far from spawn = hint used
 const SHOP_HINT_GOLD = 400; // §8: shop hint first appears at 400+ gold
 const FONT_MIN_PX = 12; // §8: smallest HUD text at 1080p
 const VALUE_FONT_PX = 13; // bar values + mana costs: above the 12px floor (round-2 UX)
+const CHIP_FONT_PX = 12; // terrain state chips: exactly on the §8 floor
 const LANE_ARROW_ARRIVE_M = 10; // hero this close to the lane midpoint = arrow used
 const LANE_ARROW_OFFSET_PX = 200; // screen-space orbit radius (round-5 UX: 150 sat ON the hero)
 const LANE_LABEL_MAX_S = 20; // hard fallback: the lane TEXT retires after 20s live (round-5 UX)
@@ -82,6 +135,59 @@ const LANE_NAMES: readonly (readonly string[])[] = [
   ['TOP', 'BOT', 'MID'],
 ];
 
+// ---- day / night dial ladder --------------------------------------------------
+// `dayPhase` is continuous, so a naive implementation rebuilds a gradient
+// string every frame — a per-frame allocation in the render loop, which §5
+// bans outright. Instead the whole ramp is baked ONCE at module load into
+// PHASE_STEPS+1 pre-joined strings and the render loop writes one of them only
+// when the quantised step actually moves. 24 steps over a DAY_PERIOD_S = 600 s
+// cycle is a write every ~12.5 s of match time and a step under 1 L* wide, so
+// the crossfade still reads as continuous.
+//
+// Both endpoints of every mix() are APAL entries (STYLE_BIBLE §3): the sun is
+// the gold family, the moon is `moon` over the `wetStone` shaded side, and the
+// glow runs from goldDeep to nightHorizon so the dial's halo cools with the
+// sky it reports.
+const PHASE_STEPS = 24;
+const DIAL_FILL: string[] = [];
+const DIAL_GLOW: string[] = [];
+const DIAL_SHADE: string[] = [];
+const PHASE_TAG: string[] = [];
+const PHASE_TITLE: string[] = [];
+for (let i = 0; i <= PHASE_STEPS; i++) {
+  const t = i / PHASE_STEPS;
+  const core = mix(APAL.goldLit, APAL.moon, t);
+  const rim = mix(APAL.gold, APAL.wetStoneLit, t);
+  const glow = mix(APAL.goldDeep, APAL.nightHorizon, t);
+  DIAL_FILL.push(`radial-gradient(circle at 34% 30%, ${core} 0%, ${rim} 74%)`);
+  DIAL_GLOW.push(`0 0 ${(3 + 5 * t).toFixed(1)}px ${glow}`);
+  DIAL_SHADE.push(t.toFixed(3));
+  // THE PENALTY IS A RAMP, NOT A SWITCH — and getting this wrong is how a HUD
+  // starts lying. `config.ts`'s `nightVisionScale` is a SMOOTH 1 ->
+  // NIGHT_VISION_MULT ramp over the phase (AMENDMENT_1 §C, which amended
+  // TERRAIN_CONTRACT §4.3's boolean snap), and `sim/vision.ts` scales every
+  // hero and creep radius by exactly this call. Printing NIGHT_VISION_MULT's
+  // full -25% from the halfway point onward would have stated twice the
+  // penalty the sim was applying. What is baked below is the frozen function
+  // evaluated at the same phase, so the readout cannot drift from the rule.
+  const pct = Math.round((1 - nightVisionScale(t)) * 100);
+  const word = t >= 0.5 ? 'NIGHT' : 'DAY';
+  PHASE_TAG.push(pct >= 1 ? `${word} · VIS −${String(pct)}%` : word);
+  PHASE_TITLE.push(
+    pct >= 1
+      ? `${word} — heroes and creeps see ${String(pct)}% less far. Wards, towers and ancients keep full sight.`
+      : 'Full day — every unit has its full vision radius. The dial darkens as night comes on.',
+  );
+}
+
+const CONCEAL_TITLE =
+  `Concealed by foliage — enemies lose sight of you until one closes to ` +
+  `${String(CONCEAL_REVEAL_RADIUS)} m`;
+const HIGH_GROUND_TITLE =
+  'HIGH GROUND — you see over the low ground and attacks fired up at you can miss';
+const LOW_GROUND_TITLE =
+  'LOW GROUND — you cannot see onto the plateau, and your attacks up at it can miss';
+
 // ---- small helpers ------------------------------------------------------------
 
 function el<K extends keyof HTMLElementTagNameMap>(
@@ -98,6 +204,12 @@ function el<K extends keyof HTMLElementTagNameMap>(
 /** Write text only when it changed — per-frame DOM churn is the enemy. */
 function setText(e: HTMLElement, s: string): void {
   if (e.textContent !== s) e.textContent = s;
+}
+
+/** Write a style property only when it changed. Same motive as setText: a
+ *  redundant style write dirties layout even when the value is identical. */
+function setStyle(e: HTMLElement, prop: 'background' | 'boxShadow' | 'opacity' | 'color', v: string): void {
+  if (e.style[prop] !== v) e.style[prop] = v;
 }
 
 function fmtClock(gameSeconds: number): string {
@@ -120,6 +232,15 @@ function accentColor(accent: string): string {
 function rankVal(arr: readonly number[], rank: number): number {
   const idx = Math.min(Math.max(rank, 1), arr.length) - 1;
   return arr[idx] ?? 0;
+}
+
+/** Quantise `dayPhase` onto the pre-built dial ladder. Out-of-range input
+ *  clamps rather than indexing past the end — the field is contractually
+ *  [0,1] but a HUD must never throw on a bad number off the wire. */
+function phaseStep(t: number): number {
+  if (!Number.isFinite(t)) return 0;
+  const c = t <= 0 ? 0 : t >= 1 ? 1 : t;
+  return Math.round(c * PHASE_STEPS);
 }
 
 /** Arc-length midpoint of a lane polyline (the arrow target). */
@@ -213,17 +334,36 @@ export function createHud(parent: HTMLElement): UiHandle {
   }
 
   // -- top bar -------------------------------------------------------------------
+  // Each score plate is `<b>NAME</b><i>n</i>` (team 1 mirrored) so the team
+  // label is a real element instead of a colour — §8's never-colour-alone law
+  // — and so the number can carry tabular figures without dragging the label.
   const topbar = el('div', 'topbar', root);
   const scoreA = el('span', 'team-score', topbar);
-  fitText(scoreA, 18);
+  const scoreAName = el('b', null, scoreA);
+  scoreAName.textContent = TEAM_LABEL[0] ?? '';
+  fitText(scoreAName, 13);
+  const scoreAVal = el('i', null, scoreA);
+  fitText(scoreAVal, 18);
   const towersA = el('span', 'tower-count', topbar);
   fitText(towersA, 14);
+
   const clock = el('span', 'match-clock', topbar);
-  fitText(clock, 20);
+  // the dial: a sun/moon disc whose crescent shade rides in as night falls
+  const dial = el('i', null, clock);
+  const dialShade = el('u', null, dial);
+  const clockText = el('b', null, clock);
+  fitText(clockText, 20);
+  const phaseTag = el('em', null, clock);
+  fitText(phaseTag, FONT_MIN_PX);
+
   const towersB = el('span', 'tower-count', topbar);
   fitText(towersB, 14);
   const scoreB = el('span', 'team-score', topbar);
-  fitText(scoreB, 18);
+  const scoreBVal = el('i', null, scoreB);
+  fitText(scoreBVal, 18);
+  const scoreBName = el('b', null, scoreB);
+  scoreBName.textContent = TEAM_LABEL[1] ?? '';
+  fitText(scoreBName, 13);
 
   // -- kill feed (top right) -------------------------------------------------------
   const killfeed = el('div', 'killfeed', root);
@@ -235,7 +375,7 @@ export function createHud(parent: HTMLElement): UiHandle {
   banner.textContent = 'CONNECTION LOST — reconnecting…';
 
   // -- bottom-centre cluster ---------------------------------------------------------
-  const bottom = el('div', null, root); // classless row wrapper (T8: `.hud > div`)
+  const bottom = el('div', null, root); // classless row wrapper (`.hud > div`)
 
   const portrait = el('button', 'hud-portrait', bottom);
   const portraitGlyph = el('b', null, portrait);
@@ -255,6 +395,19 @@ export function createHud(parent: HTMLElement): UiHandle {
   const barXpFill = el('i', null, barXp);
   const barXpText = el('span', null, barXp);
   fitText(barXpText, VALUE_FONT_PX);
+  // terrain state chips — the classless 4th child of .hud-bars. Sized in CSS
+  // to fit the slack the bars column already had under the taller item bar,
+  // which is what drives the cluster's height: the cluster does not grow, and
+  // measured end to end the HUD now occludes 5-7% LESS play area than before.
+  const stateRow = el('div', null, bars);
+  const chipElev = el('span', null, stateRow);
+  fitText(chipElev, CHIP_FONT_PX);
+  const chipHide = el('span', null, stateRow);
+  fitText(chipHide, CHIP_FONT_PX);
+  chipHide.style.display = 'none';
+  chipHide.textContent = '❋ HIDDEN';
+  chipHide.title = CONCEAL_TITLE;
+  chipHide.style.color = APAL.fernLit;
 
   const abilityBar = el('div', 'ability-bar', bottom);
   const abilityDoms: AbilitySlotDom[] = [];
@@ -265,7 +418,7 @@ export function createHud(parent: HTMLElement): UiHandle {
     key.textContent = SLOT_KEYS[i] ?? '';
     fitText(key, FONT_MIN_PX);
     const cd = el('div', 'ability-cd', slot);
-    const cost = el('span', null, slot); // T8: `.ability-slot > span` (mana cost)
+    const cost = el('span', null, slot); // `.ability-slot > span` (mana cost)
     fitText(cost, VALUE_FONT_PX);
     const rank = el('div', 'ability-rank', slot);
     fitText(rank, FONT_MIN_PX);
@@ -316,8 +469,8 @@ export function createHud(parent: HTMLElement): UiHandle {
   hintMove.textContent = 'RIGHT-CLICK the ground to move';
   // lane arrow: a SEPARATE directional indicator (§8), not one of the queued
   // text hints — it must read at spawn, so it never waits behind hintMove.
-  // T9 positions it inline (screen-space orbit toward the lane midpoint);
-  // T8's .hint rule supplies the pill look; the inline left/top/bottom/
+  // It is positioned inline (screen-space orbit toward the lane midpoint);
+  // the .hint rule supplies the pill look; the inline left/top/bottom/
   // transform override the pill's default bottom-centre anchor.
   const hintLane = el('div', 'hint', root);
   hintLane.style.display = 'none';
@@ -355,6 +508,8 @@ export function createHud(parent: HTMLElement): UiHandle {
   let heroId: HeroId | null = null; // hero of the current match (slot glyphs are static per match)
   let heroDefs: readonly AbilityDef[] = [];
   let beginRef: ClientState['begin'] = null; // identity watch: a new begin = a new match
+  let matchMap: MapDef | null = null; // built once per match: lane arrow + terrain chips
+  let matchMapFailed = false; // buildMap threw (impossible lane count) — never retry
   let spawnX = 0;
   let spawnZ = 0;
   let spawnKnown = false;
@@ -368,6 +523,10 @@ export function createHud(parent: HTMLElement): UiHandle {
   let eventsSeenLast: unknown = null;
   let scoreboardSig = '';
   let scoreboardWasOpen = false;
+  let dialStep = -1; // last written rung of the day/night ladder
+  let dialInit = false; // the dial + word have been written at least once
+  let elevHighShown = false; // last written high/low chip state
+  let elevChipInit = false;
 
   // ---- action feedback (buy pop + gold float + skill flash) -------------------
   // Snap-diffed: baseline on the FIRST sight of `you` (a late joiner must not
@@ -380,6 +539,16 @@ export function createHud(parent: HTMLElement): UiHandle {
   let ranksBaselined = false;
   const poppingSlots = new Set<number>(); // item slots mid-pop
   const flashingSlots = new Set<number>(); // ability slots mid-flash
+
+  // ---- rift_miss feed ---------------------------------------------------------
+  // The events window is a rolling tail of stable objects, so "what is new" is
+  // "everything after the last object I saw". A window whose tail I no longer
+  // recognise (a reconnect, a >32-event burst) RESYNCS silently rather than
+  // replaying six seconds of misses at once.
+  let lastEventSeen: RiftEvent | null = null;
+  let eventsBaselined = false;
+  let liveFloats = 0; // concurrent .dmg-number nodes this file owns
+  const MAX_LIVE_FLOATS = 5;
 
   function popItemSlot(i: number): void {
     if (poppingSlots.has(i)) return;
@@ -405,20 +574,28 @@ export function createHud(parent: HTMLElement): UiHandle {
     }, 700); // > the 0.6s learn flash
   }
 
-  /** '-Ng' off the gold readout — same .dmg-number pill as the world-space
-   *  numbers (fx sets the colour inline; so do we — APAL only). */
-  function floatGoldSpent(amount: number): void {
-    const rect = gold.getBoundingClientRect();
+  /** A `.dmg-number` pill launched off a HUD element — the same rising pill
+   *  the world-space numbers use (fx sets the colour inline; so do we — APAL
+   *  only). Capped, because an uphill brawl can produce several misses a
+   *  second and a HUD that stacks 30 pills is worse than one that stacks none. */
+  function floatFrom(anchor: HTMLElement, text: string, color: string, dy: number): void {
+    if (liveFloats >= MAX_LIVE_FLOATS) return;
+    const rect = anchor.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) return; // anchor not laid out
     const n = document.createElement('div');
     n.className = 'dmg-number';
-    n.textContent = `-${String(Math.round(amount))}g`;
+    n.textContent = text;
     n.style.position = 'fixed';
     n.style.left = `${(rect.left + rect.width / 2).toFixed(0)}px`;
-    n.style.top = `${(rect.top - 8).toFixed(0)}px`;
-    n.style.color = APAL.gold;
+    n.style.top = `${(rect.top - dy).toFixed(0)}px`;
+    n.style.color = color;
     n.style.pointerEvents = 'none';
     root.appendChild(n);
-    window.setTimeout(() => n.remove(), 900); // > the 0.8s rise animation
+    liveFloats++;
+    window.setTimeout(() => {
+      n.remove();
+      liveFloats--;
+    }, 900); // > the 0.8s rise animation
   }
 
   function resetMatchHints(): void {
@@ -428,17 +605,38 @@ export function createHud(parent: HTMLElement): UiHandle {
     shopOpenedOnce = false;
     laneTarget = null;
     laneName = '';
+    matchMap = null;
+    matchMapFailed = false;
     prevItems = null; // re-baseline: a new match must not float the old gold delta
     prevGold = null;
     ranksBaselined = false;
+    eventsBaselined = false;
+    lastEventSeen = null;
+  }
+
+  /** The match's `MapDef`, built at most once and shared by the lane arrow and
+   *  the terrain chips. `buildMap` throws on an impossible lane count, and a
+   *  HUD that throws takes the frame with it (§10 robustness), so a failure is
+   *  latched and the terrain affordances simply stay quiet. */
+  function mapOf(s: ClientState): MapDef | null {
+    if (matchMap !== null || matchMapFailed) return matchMap;
+    const begin = s.begin;
+    if (!begin) return null;
+    try {
+      matchMap = buildMap(begin.lanes);
+    } catch {
+      matchMapFailed = true;
+      matchMap = null;
+    }
+    return matchMap;
   }
 
   // First move ORDER detection (round-5 UX: the 'your lane: MID' text and the
-  // RMB hint were both still up at 0:59). input.ts (T8) sends orders straight
-  // to the net — unreachable through the frozen ClientState/UiActions seams —
-  // so hud listens to the SAME raw verbs input.ts maps onto rift_order: RMB
-  // down (move/attack), A (attack-move arm), S (stop). Capture phase, inert
-  // in the unit harness, reset per match; the snap-observed position fallback
+  // RMB hint were both still up at 0:59). input.ts sends orders straight to
+  // the net — unreachable through the frozen ClientState/UiActions seams — so
+  // hud listens to the SAME raw verbs input.ts maps onto rift_order: RMB down
+  // (move/attack), A (attack-move arm), S (stop). Capture phase, inert in the
+  // unit harness, reset per match; the snap-observed position fallback
   // (movedEnough) and the hard 20s clock (LANE_LABEL_MAX_S) back it up.
   window.addEventListener(
     'pointerdown',
@@ -497,6 +695,70 @@ export function createHud(parent: HTMLElement): UiHandle {
   function playerTeam(s: ClientState, id: string | null): TeamId | null {
     if (id === null) return null;
     return boardEntry(s, id)?.team ?? null;
+  }
+
+  /** The local hero's ENTITY id, or -1. `rift_miss` carries entity ids while
+   *  `hello.you` is a player id, and `YouSnap` has no entity id — the join is
+   *  `EntSnap.pid`. Only called when a miss event actually lands, so this scan
+   *  costs nothing per frame. */
+  function ownEntityId(s: ClientState): number {
+    const snap = s.snap;
+    const me = s.hello?.you;
+    if (!snap || me === undefined) return -1;
+    for (const e of snap.ents) {
+      if (e.k === 'hero' && e.pid === me) return e.id;
+    }
+    return -1;
+  }
+
+  /** Float a MISS marker for every uphill whiff the local hero was part of.
+   *  Yours reads danger (a wasted swing), theirs reads heal (the high ground
+   *  paid off) — colour AND the same word, so the pair is never colour alone. */
+  function drainMisses(s: ClientState): void {
+    const events = s.events;
+    if (!eventsBaselined) {
+      eventsBaselined = true;
+      lastEventSeen = events.length > 0 ? events[events.length - 1] ?? null : null;
+      return;
+    }
+    let start = 0;
+    if (lastEventSeen !== null) {
+      const idx = events.lastIndexOf(lastEventSeen);
+      // tail no longer in the window: resync, do not replay the whole buffer
+      start = idx >= 0 ? idx + 1 : events.length;
+    }
+    if (start >= events.length) return;
+    let mine = -2; // -2 = not resolved yet this drain
+    for (let i = start; i < events.length; i++) {
+      const ev = events[i];
+      if (!ev || ev.t !== 'rift_miss') continue;
+      if (mine === -2) mine = ownEntityId(s);
+      if (mine < 0) continue;
+      if (ev.attacker === mine) floatFrom(portrait, 'MISS', APAL.danger, 10);
+      else if (ev.target === mine) floatFrom(portrait, 'MISS', APAL.heal, 10);
+    }
+    lastEventSeen = events[events.length - 1] ?? lastEventSeen;
+  }
+
+  /** Day/night dial + word + vision tag. Everything written here is either a
+   *  pre-built string off the ladder or a two-state constant, and every write
+   *  is guarded on change, so a continuously moving `dayPhase` costs at most
+   *  three property writes every ~12 s of match time. */
+  function renderDayNight(t: number): void {
+    const step = phaseStep(t);
+    if (step === dialStep && dialInit) return;
+    dialStep = step;
+    dialInit = true;
+    setStyle(dial, 'background', DIAL_FILL[step] ?? DIAL_FILL[0] ?? '');
+    setStyle(dial, 'boxShadow', DIAL_GLOW[step] ?? DIAL_GLOW[0] ?? '');
+    setStyle(dialShade, 'opacity', DIAL_SHADE[step] ?? '0');
+    // the word flips at the phase midpoint; the figure beside it moves with
+    // every rung, because the penalty itself does
+    const night = step * 2 >= PHASE_STEPS;
+    clock.classList.toggle('match-clock--night', night);
+    setText(phaseTag, PHASE_TAG[step] ?? 'DAY');
+    setStyle(phaseTag, 'color', night ? APAL.moon : APAL.goldLit);
+    clock.title = PHASE_TITLE[step] ?? '';
   }
 
   function rebuildKillfeed(s: ClientState, nowMs: number): void {
@@ -569,6 +831,7 @@ export function createHud(parent: HTMLElement): UiHandle {
     const snap = s.snap;
     if (!snap) return;
     buildNameMap(s, nameMap);
+    const you = s.hello?.you ?? null;
     const sigParts: string[] = [];
     for (const b of snap.board) {
       sigParts.push(
@@ -579,13 +842,16 @@ export function createHud(parent: HTMLElement): UiHandle {
     if (sig === scoreboardSig && scoreboardWasOpen) return;
     scoreboardSig = sig;
 
-    // build into a detached host, then swap in one replaceChildren
+    // Build into a detached host, then swap in one replaceChildren. The three
+    // row kinds are told apart by TAG, not by class, so the frozen class list
+    // is untouched: <h3> title, <h4> team header, <div> player row (four
+    // classless <span> columns that style.css grids into alignment).
     const host = document.createElement('div');
-    const head = el('div', null, host);
+    const head = el('h3', null, host);
     head.style.fontSize = scaledPx(14);
     head.textContent = 'SCOREBOARD';
     for (const team of [0, 1] as const) {
-      const label = el('div', null, host);
+      const label = el('h4', null, host);
       label.style.fontSize = scaledPx(14);
       label.style.color = TEAM_APAL[team] ?? APAL.paper;
       label.textContent = `${TEAM_LABEL[team] ?? ''} — ${snap.kills[team] ?? 0} kills`;
@@ -595,13 +861,21 @@ export function createHud(parent: HTMLElement): UiHandle {
       for (const b of rows) {
         const row = el('div', null, host);
         row.style.fontSize = scaledPx(FONT_MIN_PX);
+        if (you !== null && b.id === you) row.style.color = APAL.goldLit;
         const hero = heroById(b.hero);
         const name = nameMap.get(b.id) ?? (b.bot ? 'Bot' : 'Player');
         // [OFFLINE] marks a disconnected HUMAN seat only — a bot is never
         // 'offline', it just plays (round-5 UX: bots read '[BOT] [OFFLINE]')
         const tags = `${b.bot ? ' [BOT]' : ''}${!b.bot && !b.connected ? ' [OFFLINE]' : ''}`;
-        row.textContent =
-          `${hero.name} — ${name}${tags} — LV ${b.level} — ${b.kills}/${b.deaths}/${b.assists}`;
+        // hero identity rides as a colour BAR down the row's leading edge, not
+        // as coloured text: the darkest accents (pine, shade) are barely
+        // legible at 12px on the ink plate, and a rule beside paper-white text
+        // carries the same identity at full contrast
+        row.style.boxShadow = `inset 3px 0 0 0 ${accentColor(hero.visual.accent)}`;
+        el('span', null, row).textContent = hero.name;
+        el('span', null, row).textContent = `${name}${tags}`;
+        el('span', null, row).textContent = `LV ${b.level}`;
+        el('span', null, row).textContent = `${b.kills} / ${b.deaths} / ${b.assists}`;
       }
     }
     scoreboard.replaceChildren(...Array.from(host.childNodes));
@@ -639,14 +913,12 @@ export function createHud(parent: HTMLElement): UiHandle {
 
       // ---- top bar ---------------------------------------------------------------
       const myTeam: TeamId = s.hello?.team ?? 0;
-      setText(scoreA, `${TEAM_LABEL[0] ?? ''} ${snap?.kills[0] ?? 0}`);
+      setText(scoreAVal, String(snap?.kills[0] ?? 0));
       scoreA.style.color = TEAM_APAL[0] ?? APAL.paper;
-      if (myTeam === 0) scoreA.style.textDecoration = 'underline';
-      else scoreA.style.textDecoration = '';
-      setText(scoreB, `${snap?.kills[1] ?? 0} ${TEAM_LABEL[1] ?? ''}`);
+      scoreA.classList.toggle('team-score--you', myTeam === 0);
+      setText(scoreBVal, String(snap?.kills[1] ?? 0));
       scoreB.style.color = TEAM_APAL[1] ?? APAL.paper;
-      if (myTeam === 1) scoreB.style.textDecoration = 'underline';
-      else scoreB.style.textDecoration = '';
+      scoreB.classList.toggle('team-score--you', myTeam === 1);
 
       let towers0 = 0;
       let towers1 = 0;
@@ -656,9 +928,11 @@ export function createHud(parent: HTMLElement): UiHandle {
       if (snap) {
         for (const e of snap.ents) {
           if (e.k === 'tower' || e.k === 'guard') {
+            // structures are never neutral, but count explicitly rather than
+            // treating "not team 0" as team 1 (EntTeam narrowing discipline)
             if (e.hp > 0) {
               if (e.team === 0) towers0++;
-              else towers1++;
+              else if (e.team === 1) towers1++;
             }
           } else if (e.k === 'ancient' && e.team === myTeam) {
             ownAncientX = e.x;
@@ -674,10 +948,10 @@ export function createHud(parent: HTMLElement): UiHandle {
       towersB.style.color = TEAM_APAL[1] ?? APAL.paper;
       towersB.title = `${TEAM_LABEL[1] ?? ''} towers standing`;
 
-      const clockText = snap?.overtime === true ? `${fmtClock(gameS)} SURGE` : fmtClock(gameS);
-      setText(clock, clockText);
-      clock.style.color = snap?.overtime === true ? APAL.gold : APAL.paper;
-      clock.title = snap?.overtime === true ? 'Overtime surge — waves grow stronger' : 'Match time';
+      const overtime = snap?.overtime === true;
+      setText(clockText, overtime ? `${fmtClock(gameS)} SURGE` : fmtClock(gameS));
+      clock.classList.toggle('match-clock--surge', overtime);
+      renderDayNight(snap?.dayPhase ?? 0);
 
       // ---- kill feed (rebuild only when the events tail changed) ---------------------
       const nowMs = performance.now();
@@ -688,6 +962,7 @@ export function createHud(parent: HTMLElement): UiHandle {
         buildNameMap(s, nameMap);
       }
       rebuildKillfeed(s, nowMs);
+      drainMisses(s);
 
       // ---- personal cluster -----------------------------------------------------------
       const boardOpen = s.scoreboardOpen && snap !== null; // hints + scoreboard never coexist
@@ -712,6 +987,9 @@ export function createHud(parent: HTMLElement): UiHandle {
         const hpFrac = you.maxHp > 0 ? Math.max(0, Math.min(1, you.hp / you.maxHp)) : 0;
         barHpFill.style.width = `${(hpFrac * 100).toFixed(1)}%`;
         setText(barHpText, `${Math.ceil(you.hp)} / ${Math.ceil(you.maxHp)}`);
+        // low-hp state: the bar itself reads danger, so the player never has to
+        // read a numeral to know they are about to die
+        barHp.classList.toggle('bar-hp--low', hpFrac <= 0.3);
         const manaFrac = you.maxMana > 0 ? Math.max(0, Math.min(1, you.mana / you.maxMana)) : 0;
         barManaFill.style.width = `${(manaFrac * 100).toFixed(1)}%`;
         setText(barManaText, `${Math.ceil(you.mana)} / ${Math.ceil(you.maxMana)}`);
@@ -729,6 +1007,25 @@ export function createHud(parent: HTMLElement): UiHandle {
           hi === undefined ? 'MAX LEVEL' : `${Math.max(0, Math.floor(you.xp - lo))} / ${hi - lo} XP`,
         );
         barXp.title = `${Math.floor(you.xp)} xp total — level ${lvl}`;
+
+        // ---- terrain state chips (GRAPHICS_CONTRACT §6) -------------------------
+        // Elevation and concealment are read straight off the same shared
+        // terrain the sim uses, at the hero's own position, so the HUD can
+        // never disagree with the rules it is reporting.
+        const map = mapOf(s);
+        if (map) {
+          const high = elevationAt(map.terrain, you.x, you.z) === ELEV_HIGH;
+          if (high !== elevHighShown || !elevChipInit) {
+            elevHighShown = high;
+            elevChipInit = true;
+            setText(chipElev, high ? '▲ HIGH' : '▼ LOW');
+            setStyle(chipElev, 'color', high ? APAL.cliffLit : APAL.paperDeep);
+            chipElev.title = high ? HIGH_GROUND_TITLE : LOW_GROUND_TITLE;
+          }
+          const hidden = isConcealing(map.terrain, you.x, you.z);
+          const wantHide = hidden ? '' : 'none';
+          if (chipHide.style.display !== wantHide) chipHide.style.display = wantHide;
+        }
 
         // abilities
         for (let i = 0; i < abilityDoms.length; i++) {
@@ -791,14 +1088,14 @@ export function createHud(parent: HTMLElement): UiHandle {
             setText(dom.charges, '');
             dom.cd.style.height = '0%';
             setText(dom.cd, '');
-            dom.slot.style.opacity = '0.3';
+            dom.slot.classList.add('item-slot--empty');
             dom.slot.title = 'Empty item slot';
             dom.slot.onclick = null;
             continue;
           }
           const def = heroItem(id);
           setText(dom.glyph, def.icon);
-          dom.slot.style.opacity = '';
+          dom.slot.classList.remove('item-slot--empty');
           dom.slot.title = `${def.name} — ${def.blurb}`;
           const charges = you.itemCharges[i] ?? 0;
           setText(dom.charges, def.active?.kind === 'ward' ? String(charges) : '');
@@ -830,7 +1127,7 @@ export function createHud(parent: HTMLElement): UiHandle {
         }
         prevItems = you.items;
         if (prevGold !== null && you.gold < prevGold - 0.5) {
-          floatGoldSpent(prevGold - you.gold);
+          floatFrom(gold, `-${String(Math.round(prevGold - you.gold))}g`, APAL.gold, 8);
         }
         prevGold = you.gold;
 
@@ -862,12 +1159,12 @@ export function createHud(parent: HTMLElement): UiHandle {
 
         // ONE text hint at a time (§8): stacking popups occluded the ability
         // bar. Priority: RMB-move > learn-to-cast > shop. The lane arrow is
-        // NOT part of this
-        // queue — it is a directional indicator that must read AT SPAWN, so
-        // it shows alongside whichever text hint is up, positioned on a
-        // screen-space orbit around the hero, and is dismissed on arrival at
-        // the lane midpoint (or at the end of the onboarding window). All are
-        // suppressed while the scoreboard is open so overlays never fight.
+        // NOT part of this queue — it is a directional indicator that must
+        // read AT SPAWN, so it shows alongside whichever text hint is up,
+        // positioned on a screen-space orbit around the hero, and is dismissed
+        // on arrival at the lane midpoint (or at the end of the onboarding
+        // window). All are suppressed while the scoreboard is open so overlays
+        // never fight.
         const showMove = inWindow && !movedEnough && !orderIssued && !boardOpen;
         hintMove.style.display = showMove ? '' : 'none';
 
@@ -886,9 +1183,9 @@ export function createHud(parent: HTMLElement): UiHandle {
         // lane arrow toward the assigned lane's midpoint (begin.laneAssignment)
         if (inWindow && laneTarget === null && laneName === '' && s.begin && s.hello) {
           const lane = s.begin.laneAssignment[s.hello.you];
-          if (lane !== undefined) {
-            const map = buildMap(s.begin.lanes);
-            const path = map.paths[lane];
+          const laneMap = map;
+          if (lane !== undefined && laneMap) {
+            const path = laneMap.paths[lane];
             if (path) {
               laneTarget = laneMidpoint(path);
               laneName = LANE_NAMES[s.begin.lanes]?.[lane] ?? `LANE ${lane + 1}`;

@@ -1,6 +1,6 @@
 // ============================================================================
-// ANCIENTS (rift) — PATHING (TERRAIN_CONTRACT §4, DESIGN_DELTA §1). Two things
-// live here and nothing else:
+// ANCIENTS (rift) — PATHING (TERRAIN_CONTRACT §4, DESIGN_DELTA §1, AMENDMENT_1
+// §D). Three things live here and nothing else:
 //
 //  1. The CELL PRIMITIVES the movement veto is built from — `segmentWalkable`
 //     (may a mobile sweep from A to B this tick?) and the cell accessors the
@@ -11,6 +11,10 @@
 //  2. Hero-only grid A* over `TerrainDef.grid`, 8-connected, octile heuristic,
 //     returning a SIMPLIFIED polyline (collinear runs collapsed, then string-
 //     pulled through open space so a hero does not visibly staircase).
+//  3. The PER-TICK SEARCH BUDGET (AMENDMENT_1 §D). `PATH_NODE_BUDGET` bounds
+//     one search; `PATH_SEARCHES_PER_TICK` bounds how many searches a tick may
+//     run at all. `requestPath` is the door movement uses; `findPath` stays the
+//     raw, unbudgeted search for callers that are not on the tick path.
 //
 // What "walkable" means, once, here:
 //  - a `'cliff'` cell may never be entered (`isPassable`, TERRAIN_CONTRACT §2);
@@ -22,18 +26,13 @@
 //    diagonally between two cliff corners that a straight walk cannot pass.
 //
 // DETERMINISM (§4). The open set is ordered by `(f, h, cellIndex)` — never by
-// insertion order into a Map, never by object identity — so two worlds built
-// from the same map produce byte-identical paths. No `Math.random`, no clock,
-// no world state. The scratch buffers below are module-level for allocation
-// reasons only: every search fills `state` before it reads it, so a search's
-// result never depends on the search that preceded it.
-//
-// BUDGET (§0, 2.5 ms sim tick). At most 16 heroes exist and a path is computed
-// only when an order arrives, but eight bots can order on the same tick, so:
-// the straight-line case never searches at all (it is the common case), and a
-// search that exceeds PATH_NODE_BUDGET expansions gives up and returns null —
-// the hero then steers straight, which is exactly what every unit did before
-// this pass. A stalled tick is a worse failure than a hero walking into a wall.
+// insertion order into a Map, never by object identity — and the `f` half of
+// that key is SNAPSHOT at push time rather than re-read from the live cost
+// array (see `heapF`). No `Math.random`, no clock, no world state. The scratch
+// buffers below are module-level for allocation reasons only: every search
+// fills `state` before it reads it, so a search's result never depends on the
+// search that preceded it. The per-tick counter is the one piece of state that
+// deliberately outlives a call, and `resetPathBudget()` is what clears it.
 // ============================================================================
 import { TERRAIN_KINDS } from '@rift/shared';
 import type { TerrainDef, TerrainGrid, Vec2 } from '@rift/shared';
@@ -52,12 +51,15 @@ import type { TerrainDef, TerrainGrid, Vec2 } from '@rift/shared';
 const K_CLIFF = TERRAIN_KINDS.indexOf('cliff');
 const K_RAMP = TERRAIN_KINDS.indexOf('ramp');
 
-/** Sweep sample spacing, in metres, for {@link segmentWalkable}. Must be < the
- *  cell size (1 m at the frozen res = 1) so consecutive samples land in cells
+/** Sweep sample spacing for {@link walkableFraction}, as a FRACTION OF A CELL
+ *  rather than a distance in metres. Consecutive samples must land in cells
  *  that differ by at most one on each axis — that is what makes the per-sample
  *  adjacency test exhaustive, and it is why a dash or a hasted hero cannot
- *  tunnel through a one-cell-thick cliff in a single tick. */
-const SAMPLE_STEP = 0.25;
+ *  tunnel through a one-cell-thick cliff in a single tick. A metre constant
+ *  only satisfies that at `res === 1`; a fraction satisfies it at every
+ *  resolution the grid could ever be built at, so the sampler is derived from
+ *  `g.res` at every call site below and never assumes the frozen value. */
+const SAMPLE_CELL_FRACTION = 0.25;
 
 /** Diagonal step cost. Octile metric: orthogonal 1, diagonal sqrt(2). */
 const DIAG = Math.SQRT2;
@@ -80,6 +82,23 @@ const DIAG = Math.SQRT2;
  *  terrain existed — a hero pressing against a plateau is a visible, local,
  *  recoverable fault; a sim tick that misses its deadline is not. */
 export const PATH_NODE_BUDGET = 1600;
+
+/**
+ * How many A* searches a single sim tick may run (AMENDMENT_1 §D).
+ *
+ * `PATH_NODE_BUDGET` bounds ONE search; nothing bounded how many searches a
+ * tick could start, and the reviewer measured A* at p99.9 = 2.017 ms and max
+ * 25.7 ms against a 2.5 ms tick — one search can already eat the tick, and
+ * eight bots can order on the same tick. Two searches is the ruling: it keeps
+ * the worst measured tick inside ~2x a single search while still clearing a
+ * full 8v8 lobby's simultaneous orders within four ticks (0.2 s), which is
+ * below the reaction time of anything watching.
+ *
+ * Overflow does NOT drop the request: {@link requestPath} reports `deferred`,
+ * the caller steers straight for that tick exactly as it would with no route at
+ * all, and asks again next tick.
+ */
+export const PATH_SEARCHES_PER_TICK = 2;
 
 /** How far (in cells) a destination inside a cliff is allowed to snap to the
  *  nearest walkable cell. A click on a cliff face should walk you to the foot
@@ -112,10 +131,23 @@ export function cellMidZ(g: TerrainGrid, idx: number): number {
   return (Math.floor(idx / g.dim) + 0.5) / g.res;
 }
 
-/** Is cell `idx` standable at all? Everything except `'cliff'` is. An
- *  out-of-range index reads as solid: for movement, "off the grid" and "wall"
- *  are the same answer, and it is the only default that cannot let a unit
- *  escape the map. */
+/**
+ * Is cell `idx` standable at all? Everything except `'cliff'` is.
+ *
+ * This is the CELL-INDEXED form of the frozen `isPassable(t, x, z)` and must
+ * stay exactly equivalent to it for every in-grid coordinate. It is not written
+ * as a call to `isPassable` for one measured reason: `isPassable` takes world
+ * metres, so A* would have to convert an index it already has into a coordinate
+ * and back again inside its inner loop. The equivalence is therefore pinned by
+ * a test instead of by construction — `movement.test.ts`'s "cellPassable agrees
+ * with the frozen isPassable" case sweeps a real map and compares the two — and
+ * neither predicate names a literal terrain index: both resolve `'cliff'`
+ * through `TERRAIN_KINDS`.
+ *
+ * An out-of-range index reads as solid: for movement, "off the grid" and "wall"
+ * are the same answer, and it is the only default that cannot let a unit escape
+ * the map. (`isPassable` cannot reach that case: it clamps into the grid first.)
+ */
 export function cellPassable(g: TerrainGrid, idx: number): boolean {
   const c = g.kind[idx];
   return c !== undefined && c !== K_CLIFF;
@@ -156,11 +188,11 @@ function gridStep(g: TerrainGrid, cx0: number, cz0: number, cx1: number, cz1: nu
  * travel, as a fraction in [0,1]. 1 means the whole segment is legal; 0 means
  * it cannot leave where it stands.
  *
- * SWEPT, not an endpoint test: the segment is walked in {@link SAMPLE_STEP}
- * increments and every cell transition along it is checked, so no amount of
- * `moveSpeed`, and no dash, can step over a wall between two legal-looking
- * endpoints. The fraction — rather than a bare yes/no — is what lets a dash
- * stop AT the cliff face instead of refusing to move at all.
+ * SWEPT, not an endpoint test: the segment is walked in {@link
+ * SAMPLE_CELL_FRACTION}-of-a-cell increments and every cell transition along it
+ * is checked, so no amount of `moveSpeed`, and no dash, can step over a wall
+ * between two legal-looking endpoints. The fraction — rather than a bare yes/no
+ * — is what lets a dash stop AT the cliff face instead of refusing to move.
  *
  * Returns 0 if the START cell is itself impassable: a unit that has been shoved
  * inside a cliff by separation or structure push-out may not use that illegal
@@ -175,7 +207,8 @@ export function walkableFraction(t: TerrainDef, x0: number, z0: number, x1: numb
   const dx = x1 - x0;
   const dz = z1 - z0;
   const d = Math.sqrt(dx * dx + dz * dz);
-  const steps = Math.ceil(d / SAMPLE_STEP);
+  const sample = SAMPLE_CELL_FRACTION / g.res;
+  const steps = Math.ceil(d / sample);
   for (let s = 1; s <= steps; s++) {
     const f = s / steps;
     const nx = axisCell(x0 + dx * f, g.res, g.dim);
@@ -231,6 +264,60 @@ export function nearestPassableCell(g: TerrainGrid, x: number, z: number, maxCel
   return best;
 }
 
+// --- the per-tick search budget (AMENDMENT_1 §D) ------------------------------
+
+let searchesThisTick = 0;
+
+/** Start a new tick's search allowance. `stepMovement` calls this once, first
+ *  thing, and it is the ONLY writer besides `requestPath`. */
+export function resetPathBudget(): void {
+  searchesThisTick = 0;
+}
+
+/** How many A* searches have run since the last {@link resetPathBudget}. The
+ *  budget's observable: the suite asserts the cap directly on this rather than
+ *  inferring it from which hero happened to be served first. */
+export function pathSearchesUsed(): number {
+  return searchesThisTick;
+}
+
+/** The answer to one route request. */
+export interface PathPlan {
+  /** The route, or `null` when the caller should steer straight at the goal —
+   *  either because the straight line is already clear, or because there is no
+   *  route at all. Both of those are FINAL answers and may be memoized. */
+  readonly path: Vec2[] | null;
+  /** True when the tick's search allowance was already spent, so NOTHING was
+   *  searched. The caller steers straight for this tick exactly as it would
+   *  with no route, and asks again next tick. A deferred plan must never be
+   *  memoized — that would turn a one-tick delay into a permanent one. */
+  readonly deferred: boolean;
+}
+
+const PLAN_STRAIGHT: PathPlan = { path: null, deferred: false };
+const PLAN_DEFERRED: PathPlan = { path: null, deferred: true };
+
+/**
+ * The budgeted door onto {@link findPath}, and the only one anything on the
+ * tick path may use (AMENDMENT_1 §D).
+ *
+ * The straight-line case is answered without touching the budget: it is a
+ * single swept segment test, not a search, and it is the common case — charging
+ * it against the allowance would starve the orders that genuinely need A*.
+ */
+export function requestPath(
+  t: TerrainDef,
+  fromX: number,
+  fromZ: number,
+  toX: number,
+  toZ: number,
+): PathPlan {
+  if (segmentWalkable(t, fromX, fromZ, toX, toZ)) return PLAN_STRAIGHT;
+  if (searchesThisTick >= PATH_SEARCHES_PER_TICK) return PLAN_DEFERRED;
+  searchesThisTick += 1;
+  return { path: searchPath(t, fromX, fromZ, toX, toZ), deferred: false };
+}
+
 // --- A* scratch --------------------------------------------------------------
 // Module-level and reused: a 128x128 grid needs ~0.5 MB of node arrays and a
 // search must not allocate them per order. Every search fills `state` first, so
@@ -245,6 +332,20 @@ let parent = new Int32Array(0);
 /** 0 = unseen, 1 = open, 2 = closed. */
 let state = new Uint8Array(0);
 let heap = new Int32Array(0);
+/** The `f` of `heap[i]` AS IT WAS WHEN THAT ENTRY WAS PUSHED.
+ *
+ *  Lazy deletion means a cell can sit in the heap while a better route to it is
+ *  found and pushed a second time, which lowers `fCost[cell]` under the older
+ *  entry. A comparator that re-read `fCost` would therefore see the key of an
+ *  entry already placed in the tree change beneath it — the heap property is
+ *  stated over the keys at insertion, and silently mutating them makes every
+ *  ordering argument about this structure void. Snapshotting costs one write
+ *  per push and makes stale entries strictly worse than the fresh one that
+ *  replaced them, which is exactly what lazy deletion assumes.
+ *
+ *  `h` needs no snapshot: it is a pure function of (cell, goal) and the goal is
+ *  fixed for the whole search, so `hCost[cell]` is immutable once written. */
+let heapF = new Float64Array(0);
 let heapLen = 0;
 
 function ensureScratch(cells: number): void {
@@ -260,34 +361,44 @@ function ensureScratch(cells: number): void {
   // true upper bound on total pushes, not an estimate, and the heap can never
   // overflow and silently drop a node. Sized once, never grown.
   heap = new Int32Array(cells * 8 + 1);
+  heapF = new Float64Array(cells * 8 + 1);
 }
 
-/** Total order on open nodes: lower f first, then lower h (prefer the node
- *  closer to the goal — it breaks the plateau of equal-f nodes toward the
+/** Total order on heap SLOTS: lower snapshot f first, then lower h (prefer the
+ *  node closer to the goal — it breaks the plateau of equal-f nodes toward the
  *  goal), then lower cell index. The third key is what makes the search
  *  reproducible: it never falls back on insertion order. */
-function better(a: number, b: number): boolean {
-  const fa = fCost[a] ?? 0;
-  const fb = fCost[b] ?? 0;
-  if (fa !== fb) return fa < fb;
+function betterSlot(i: number, j: number): boolean {
+  const fi = heapF[i] ?? 0;
+  const fj = heapF[j] ?? 0;
+  if (fi !== fj) return fi < fj;
+  const a = heap[i] ?? 0;
+  const b = heap[j] ?? 0;
   const ha = hCost[a] ?? 0;
   const hb = hCost[b] ?? 0;
   if (ha !== hb) return ha < hb;
   return a < b;
 }
 
-function heapPush(cell: number): void {
+function heapSwap(i: number, j: number): void {
+  const c = heap[i] ?? 0;
+  const f = heapF[i] ?? 0;
+  heap[i] = heap[j] ?? 0;
+  heapF[i] = heapF[j] ?? 0;
+  heap[j] = c;
+  heapF[j] = f;
+}
+
+function heapPush(cell: number, f: number): void {
   if (heapLen >= heap.length) return; // bounded by construction; never hit
   let i = heapLen;
   heap[i] = cell;
+  heapF[i] = f;
   heapLen += 1;
   while (i > 0) {
     const p = (i - 1) >> 1;
-    const vi = heap[i] ?? 0;
-    const vp = heap[p] ?? 0;
-    if (!better(vi, vp)) break;
-    heap[i] = vp;
-    heap[p] = vi;
+    if (!betterSlot(i, p)) break;
+    heapSwap(i, p);
     i = p;
   }
 }
@@ -297,17 +408,16 @@ function heapPop(): number {
   heapLen -= 1;
   if (heapLen > 0) {
     heap[0] = heap[heapLen] ?? 0;
+    heapF[0] = heapF[heapLen] ?? 0;
     let i = 0;
     for (;;) {
       const l = 2 * i + 1;
       const r = l + 1;
       let m = i;
-      if (l < heapLen && better(heap[l] ?? 0, heap[m] ?? 0)) m = l;
-      if (r < heapLen && better(heap[r] ?? 0, heap[m] ?? 0)) m = r;
+      if (l < heapLen && betterSlot(l, m)) m = l;
+      if (r < heapLen && betterSlot(r, m)) m = r;
       if (m === i) break;
-      const vi = heap[i] ?? 0;
-      heap[i] = heap[m] ?? 0;
-      heap[m] = vi;
+      heapSwap(i, m);
       i = m;
     }
   }
@@ -356,7 +466,10 @@ function collapseCollinear(pts: Vec2[]): Vec2[] {
  *  still in line of sight, then repeat from there. Turns the cell-centre
  *  staircase A* produces into the two or three corners a player would have
  *  clicked, and every kept segment is `segmentWalkable`, so the follower's own
- *  cliff veto never disagrees with the route it was handed. */
+ *  cliff veto never disagrees with the route it was handed — in particular the
+ *  FIRST kept point is always reachable in a straight line from where the unit
+ *  stands, which is what lets the follower treat "no waypoint is visible" as
+ *  proof that its route is stale rather than as a reason to search again. */
 function stringPull(t: TerrainDef, fromX: number, fromZ: number, pts: Vec2[]): Vec2[] {
   const out: Vec2[] = [];
   let ax = fromX;
@@ -382,26 +495,12 @@ function stringPull(t: TerrainDef, fromX: number, fromZ: number, pts: Vec2[]): V
 // --- the search ---------------------------------------------------------------
 
 /**
- * Grid A* from (fromX,fromZ) to (toX,toZ) over the terrain grid — HEROES ONLY
- * (TERRAIN_CONTRACT §4). Returns a simplified polyline whose LAST point is the
- * destination (or the reachable cell nearest to it, when the destination is
- * inside a cliff), or `null` when there is no route, the search would exceed
- * PATH_NODE_BUDGET, or the straight line is already clear — in every null case
- * the caller steers straight, which is the pre-terrain behaviour of every unit
- * in the sim and is never a stall.
- *
- * The straight-line early-out is not an optimisation detail: most orders are
- * across open ground, and a hero that walks a cell-centre polyline across an
- * empty field instead of a straight line looks broken.
+ * The raw grid A*, with NO straight-line early-out and NO budget accounting.
+ * Split out so {@link findPath} and {@link requestPath} can each apply their own
+ * preconditions without either of them paying for the other's swept segment
+ * test twice.
  */
-export function findPath(
-  t: TerrainDef,
-  fromX: number,
-  fromZ: number,
-  toX: number,
-  toZ: number,
-): Vec2[] | null {
-  if (segmentWalkable(t, fromX, fromZ, toX, toZ)) return null;
+function searchPath(t: TerrainDef, fromX: number, fromZ: number, toX: number, toZ: number): Vec2[] | null {
   const g = t.grid;
   const cells = g.dim * g.dim;
   ensureScratch(cells);
@@ -426,11 +525,12 @@ export function findPath(
   state.fill(0);
   heapLen = 0;
   gCost[start] = 0;
-  hCost[start] = octile(startCx, startCz, goalCx, goalCz);
-  fCost[start] = hCost[start] ?? 0;
+  const h0 = octile(startCx, startCz, goalCx, goalCz);
+  hCost[start] = h0;
+  fCost[start] = h0;
   parent[start] = -1;
   state[start] = 1;
-  heapPush(start);
+  heapPush(start, h0);
 
   let expanded = 0;
   let found = false;
@@ -460,10 +560,11 @@ export function findPath(
       gCost[nb] = ng;
       const h = octile(nx, nz, goalCx, goalCz);
       hCost[nb] = h;
-      fCost[nb] = ng + h;
+      const f = ng + h;
+      fCost[nb] = f;
       parent[nb] = cur;
       state[nb] = 1;
-      heapPush(nb);
+      heapPush(nb, f);
     }
   }
   if (!found) return null;
@@ -482,12 +583,40 @@ export function findPath(
   const route = stringPull(t, fromX, fromZ, collapseCollinear(raw));
   // A route ALWAYS ends on the requested point, even when that point is inside
   // rock. Two reasons, both load-bearing: the follower recognises a route as
-  // current by comparing its last waypoint against the order destination, so a
-  // route that stopped at the snapped cell would be re-planned every tick —
-  // exactly the per-tick search §4 forbids — and the final unreachable leg is
-  // what makes the hero press against the cliff face instead of halting a
-  // metre short, which is how it has always treated a structure it was ordered
-  // into.
+  // current by comparing its last waypoint's CELL against the order
+  // destination's cell, so a route that stopped at the snapped cell would be
+  // re-planned every tick — exactly the per-tick search §4 forbids — and the
+  // final unreachable leg is what makes the hero press against the cliff face
+  // instead of halting a metre short, which is how it has always treated a
+  // structure it was ordered into.
   if (!exact) route.push({ x: toX, z: toZ });
   return route;
+}
+
+/**
+ * Grid A* from (fromX,fromZ) to (toX,toZ) over the terrain grid — HEROES ONLY
+ * (TERRAIN_CONTRACT §4). Returns a simplified polyline whose LAST point is the
+ * destination (or the reachable cell nearest to it, when the destination is
+ * inside a cliff), or `null` when there is no route, the search would exceed
+ * PATH_NODE_BUDGET, or the straight line is already clear — in every null case
+ * the caller steers straight, which is the pre-terrain behaviour of every unit
+ * in the sim and is never a stall.
+ *
+ * The straight-line early-out is not an optimisation detail: most orders are
+ * across open ground, and a hero that walks a cell-centre polyline across an
+ * empty field instead of a straight line looks broken.
+ *
+ * UNBUDGETED. Anything running inside a sim tick calls {@link requestPath}
+ * instead; this entry point exists for offline callers (tooling and the suite),
+ * which must not perturb the tick's allowance.
+ */
+export function findPath(
+  t: TerrainDef,
+  fromX: number,
+  fromZ: number,
+  toX: number,
+  toZ: number,
+): Vec2[] | null {
+  if (segmentWalkable(t, fromX, fromZ, toX, toZ)) return null;
+  return searchPath(t, fromX, fromZ, toX, toZ);
 }

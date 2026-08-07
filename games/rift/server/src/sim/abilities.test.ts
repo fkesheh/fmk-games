@@ -11,7 +11,7 @@
 // ============================================================================
 import { describe, expect, it } from 'vitest';
 import type { AuraStat, CampDef, EntTeam, HeroId, MapDef, TeamId, TerrainDef } from '@rift/shared';
-import { isPlayerTeam, NEUTRAL_TEAM, TICK_RATE } from '@rift/shared';
+import { heroById, isPlayerTeam, NEUTRAL_TEAM, TICK_RATE } from '@rift/shared';
 import type { CampState, Ent, EntId, Order, QueuedCast, SimEvent, World } from './types.js';
 import { NO_ENT } from './types.js';
 import { createAbilitiesEngine, ITEM_EVENT_SLOT_BASE } from './abilities.js';
@@ -286,10 +286,11 @@ function mkCreep(w: FakeWorld, id: EntId, team: TeamId, x: number, z: number, ov
 
 type CampKind = 'campPack' | 'campBrute' | 'campHive';
 
-/** One neutral camp creep, spawned exactly the way sim/camps.ts will spawn it
- *  (TERRAIN_CONTRACT §5): NEUTRAL_TEAM, lane -1, owner NO_ENT — and
- *  `expireAtTick = -1`, the encoding that means "never expires" for a camp and
- *  that a naive `expireAtTick !== 0` reaper reads as "already expired". */
+/** One neutral camp creep, spawned exactly the way sim/camps.ts will spawn it:
+ *  NEUTRAL_TEAM, lane -1, owner NO_ENT (TERRAIN_CONTRACT §5) — and
+ *  `expireAtTick = -1` (BUILD_SPECS §S_UNITS, `stepExpiry`), which means "never
+ *  expires" under the `<= 0` sentinel frozen by AMENDMENT_1 §B.3 and which a
+ *  naive `expireAtTick !== 0` reaper reads as "already expired". */
 function mkCampCreep(
   w: FakeWorld,
   id: EntId,
@@ -341,6 +342,37 @@ function stepN(engine: { step(w: World): void }, world: FakeWorld, n: number): v
   for (let i = 0; i < n; i++) {
     engine.step(world);
     world.tick++;
+  }
+}
+
+/** The world's expiry reaper, in the exact form units.ts `stepExpiry` uses:
+ *  `if (e.expireAtTick <= 0 || w.tick < e.expireAtTick) continue`. Anything the
+ *  engine despawns must satisfy this at SOME tick — a stamp of 0 never does,
+ *  because `expireAtTick <= 0` means "never expires" (AMENDMENT_1 §B.3). */
+function reapedBy(e: Ent | undefined, tick: number): boolean {
+  return e !== undefined && e.expireAtTick > 0 && tick >= e.expireAtTick;
+}
+
+/** Compose a PIERCING projectile with an AoE payload — the one ability shape
+ *  that makes the engine issue an `inRadius` query from inside a live
+ *  `inRadius` scan (pierce applies each hit's effects mid-scan; an AoE effect
+ *  queries again). No shipped ability has both fields today: longbow_q pierces
+ *  with a single-target payload, and every AoE ability is instant or homing.
+ *  Abilities are DATA (ability.ts), so adding one is a roster edit and not a
+ *  code change — the engine may not depend on that gap. The case is therefore
+ *  synthesised by lending Piercing Arrow an `aoeRadius` for the duration of
+ *  one test, restored afterwards even if the body throws. */
+function withAoeOnPiercingArrow<T>(radius: number, body: () => T): T {
+  const def = heroById('longbow').abilities[0];
+  if (!def) throw new Error('longbow_q is missing from the roster');
+  const patch = def as { aoeRadius?: readonly number[] };
+  const saved = patch.aoeRadius;
+  patch.aoeRadius = [radius, radius, radius, radius];
+  try {
+    return body();
+  } finally {
+    if (saved === undefined) delete patch.aoeRadius;
+    else patch.aoeRadius = saved;
   }
 }
 
@@ -629,6 +661,7 @@ describe('effect primitives', () => {
 
   it('summon cap: over-cap casts expire the OLDEST shades first', () => {
     const { world, engine } = setup();
+    world.tick = 50; // mid-match: the tick-0 sentinel case is its own test below
     const h = mkHero(world, 1, 0, 'shade', 10, 10, { abilityRanks: [0, 0, 0, 1] });
     // Six shades already active (the cap), with staggered expiry = age order.
     for (let i = 0; i < 6; i++) {
@@ -639,12 +672,36 @@ describe('effect primitives', () => {
     engine.step(world);
     const shades = [...world.mobiles()].filter((e) => e.kind === 'shade');
     expect(shades).toHaveLength(8); // 6 old + 2 new spawned
-    const active = shades.filter((s) => s.expireAtTick > world.tick);
+    const active = shades.filter((s) => !reapedBy(s, world.tick));
     expect(active).toHaveLength(6); // ...but only 6 remain active
     // The two oldest (expireAtTick 100, 110) were expired this tick.
-    const expiredOld = shades.filter((s) => s.expireAtTick === world.tick);
-    expect(expiredOld).toHaveLength(2);
+    const killed = shades.filter((s) => reapedBy(s, world.tick));
+    expect(killed).toHaveLength(2);
     expect(active.every((s) => s.expireAtTick >= 120)).toBe(true);
+    expect(h.mana).toBe(860); // 1000 - 140: the cast itself committed
+  });
+
+  it('summon cap on match tick 0: the over-cap shades are reaped, not made permanent', () => {
+    // expireAtTick <= 0 means NEVER (AMENDMENT_1 §B.3), so stamping the raw
+    // tick on tick 0 hands the two oldest shades immortality: over the cap,
+    // out of the engine's reach, and invisible to the world's reaper forever.
+    const { world, engine } = setup();
+    expect(world.tick).toBe(0);
+    mkHero(world, 1, 0, 'shade', 10, 10, { abilityRanks: [0, 0, 0, 1] });
+    for (let i = 0; i < 6; i++) {
+      world.spawnMobile('shade', 0, 12 + i, 20, -1, 100 + i * 10, 1);
+    }
+    world.cast(1, 3, null, null, NO_ENT);
+    engine.step(world);
+    const shades = [...world.mobiles()].filter((e) => e.kind === 'shade');
+    const oldest = shades.filter((s) => s.expireAtTick < 100); // the two stamped for despawn
+    expect(oldest).toHaveLength(2);
+    for (const s of oldest) {
+      expect(s.expireAtTick).toBeGreaterThan(0); // never the "never" sentinel
+      expect(reapedBy(s, 1)).toBe(true); // gone by the very next tick
+    }
+    // ...and the cap really is restored once the reaper runs.
+    expect(shades.filter((s) => !reapedBy(s, 1))).toHaveLength(6);
   });
 });
 
@@ -726,6 +783,71 @@ describe('projectiles', () => {
     expect(proj?.expireAtTick).not.toBe(0);
     expect(proj?.x).toBeCloseTo(24); // died exactly at range end (10 + 14)
     expect(world.log.filter((l) => l.startsWith('damage:'))).toEqual([]);
+  });
+
+  it('a projectile that resolves on match tick 0 is reaped, not made permanent', () => {
+    // The despawn signal is `expireAtTick = tick`, but `expireAtTick <= 0`
+    // means NEVER (AMENDMENT_1 §B.3) — so on tick 0 the raw stamp turns the
+    // despawn into immortality. The engine drops the proj from its own table
+    // the same tick, so nothing would ever move, resolve or expire it again:
+    // a permanent ghost entity, in every snapshot, for the rest of the match.
+    const { world, engine } = setup();
+    expect(world.tick).toBe(0);
+    mkHero(world, 1, 0, 'hex', 10, 10, { abilityRanks: [1, 0, 0, 0] });
+    // 0.5 m away: inside stepLen (0.9) + both radii, so the bolt homes, hits
+    // and despawns inside the very first step, while tick is still 0.
+    const t = mkCreep(world, 2, 1, 10.5, 10, { hp: 300, maxHp: 300 });
+    world.cast(1, 0, null, null, 2);
+    engine.step(world);
+    expect(t.hp).toBe(210); // 300 - 90: it really did resolve on tick 0
+    const proj = [...world.mobiles()].find((e) => e.kind === 'proj');
+    expect(proj).toBeDefined();
+    expect(proj?.expireAtTick).toBeGreaterThan(0); // not the "never" sentinel
+    expect(reapedBy(proj, 1)).toBe(true); // gone by the next tick at the latest
+    // And it is inert in the meantime: dropped from the engine's table.
+    const px = proj?.x;
+    stepN(engine, world, 3);
+    expect(proj?.x).toBe(px);
+    expect(world.log.filter((l) => l.startsWith('damage:'))).toHaveLength(1);
+  });
+
+  it('a pierce impact cannot corrupt the collision scan that is still running', () => {
+    // Pierce applies each hit's effects from inside the collision scan, and an
+    // AoE payload issues its own inRadius. Sharing one scratch buffer refills
+    // it under the live scan, which keeps walking against its stale count and
+    // reads whatever the INNER query happened to leave at those indices —
+    // registering pierce hits on units that were never within the arrow's
+    // 1.2 m hit radius, and skipping ones that were.
+    withAoeOnPiercingArrow(1.5, () => {
+      const { world, engine } = setup();
+      const q = heroById('longbow').abilities[0];
+      expect(q?.projectile?.pierce).toBe(true);
+      expect(q?.projectile?.radius).toBe(1.2);
+      mkHero(world, 1, 0, 'longbow', 10, 10, { abilityRanks: [1, 0, 0, 0] });
+      // The arrow flies down z = 10 from x = 10. Insertion order matters: the
+      // off-line unit sits BETWEEN the two real hits in world iteration order,
+      // so a stale index lands on it.
+      const near = mkCreep(world, 2, 1, 15, 9.2); // 0.8 off-line: a real hit
+      const offLine = mkCreep(world, 3, 1, 15, 7.9); // 2.1 off-line: never a hit
+      const far = mkCreep(world, 4, 1, 15, 10.8); // 0.8 off-line: a real hit
+      // Geometry: |near-far| = 1.6 > aoe 1.5, so neither splashes the other;
+      // |near-offLine| = 1.3 < 1.5, so offLine IS in near's splash — exactly
+      // how it gets written into the buffer mid-scan.
+      world.cast(1, 0, 24, 10, NO_ENT); // point cast at castRange 14
+      stepN(engine, world, 20);
+
+      const hits = (id: EntId): number =>
+        world.log.filter((l) => l.startsWith(`damage:1>${id}:`)).length;
+      // Each real hit takes its own impact and nothing else.
+      expect(hits(2)).toBe(1);
+      expect(hits(4)).toBe(1);
+      // The off-line unit is splashed by near's impact — once. It is never
+      // itself a pierce hit, so it never becomes the centre of an impact.
+      expect(hits(3)).toBe(1);
+      expect(near.hp).toBe(370); // 450 - 80
+      expect(far.hp).toBe(370);
+      expect(offLine.hp).toBe(370);
+    });
   });
 
   it('a non-pierce straight-line hit lands on the first enemy only and despawns', () => {

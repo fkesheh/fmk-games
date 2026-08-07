@@ -6,24 +6,45 @@
 // parseRiftSettings is the opposite: it THROWS Error(message) on bad input
 // so the platform can convert it to {t:'error',code:'bad_settings'}.
 //
-// The S2C direction has no parser by design — the server authors it — so its
-// gate is different in kind: the shapes must survive the wire byte for byte
-// (JSON round-trip), the fields the terrain build added must be present and
-// unlossy, and nothing on the S2C side may be reachable through parseRiftC2S.
-// That covers `rift_snap.dayPhase` (TERRAIN_CONTRACT §6), the neutral camp
-// EntKinds and `EntSnap.team === NEUTRAL_TEAM` (§5), and `rift_miss` (§4).
+// The S2C direction has no parser by design — the server authors it. Two
+// consequences this file states out loud rather than papering over:
+//
+//  1. NOTHING IN shared/ CAN ENFORCE THE [0,1] RANGE OF `rift_snap.dayPhase`.
+//     Nothing here ever reads an inbound snapshot, so there is no door at which
+//     to reject one. AMENDMENT_1 §B.1 makes the range the PRODUCER's
+//     obligation: `server/src/room.ts` fills the field from the frozen
+//     `dayPhase(matchTick)` in config.ts and from nowhere else. That gap is
+//     deliberate and it lives in room.ts, not here. What this file can gate,
+//     and does, is the frozen producer itself — it never leaves [0,1], never
+//     steps discontinuously, and never emits a value JSON cannot carry.
+//  2. A JSON round-trip of an object literal written two lines above it is not
+//     a test: no production code is on that path, so it cannot fail for any
+//     implementation of this game. Every S2C case below therefore either
+//     drives frozen code (`dayPhase`, `nightVisionScale`, `isCampKind`,
+//     `isPlayerTeam`, `parseRiftC2S`) or is an explicit COMPILE-TIME pin whose
+//     failure mode is a red `tsc` — and says which of the two it is.
+//
+// That covers `rift_snap.dayPhase` (TERRAIN_CONTRACT §6, AMENDMENT_1 §B.1/§C),
+// the neutral camp EntKinds and `EntSnap.team === NEUTRAL_TEAM` (§5), and
+// `rift_miss` (§4).
 //
 // Frozen code under test (Layer-1, IMMUTABLE): protocol.ts, config.ts,
-// hero.ts, item.ts, types.ts.
+// hero.ts, item.ts, types.ts, terrain.ts.
 // ============================================================================
 import { describe, expect, it } from 'vitest';
 import {
+  DAY_PERIOD_S,
   INVENTORY_SLOTS,
   MAP_COORD_MAX,
   MAX_TEAM_SIZE,
   MIN_TEAM_SIZE,
   NEUTRAL_TEAM,
+  NIGHT_VISION_MULT,
+  TICK_RATE,
+  dayPhase,
+  isCampKind,
   isPlayerTeam,
+  nightVisionScale,
   parseRiftC2S,
   parseRiftSettings,
 } from '@rift/shared';
@@ -356,14 +377,17 @@ describe('parseRiftSettings', () => {
 // S2C — the server-authored direction (TERRAIN_CONTRACT §4, §5, §6).
 // ============================================================================
 
-/** One trip through the wire: exactly what a WebSocket does to a message. */
+/** One trip through the wire: exactly what a WebSocket does to a message.
+ *  Used ONLY on a value a frozen producer computed — a round-trip of a literal
+ *  written two lines above it asserts something about JSON, not about rift. */
 function overWire<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
 /** Every EntKind, as a Record so the compiler rejects this list the moment a
  *  kind is added to or removed from the union — a new kind that nobody
- *  round-trips is a kind the client silently fails to draw. */
+ *  classifies is a kind the client silently fails to draw. This one is a
+ *  COMPILE-TIME pin: its failure mode is a red `tsc`, not a red vitest. */
 const ALL_ENT_KINDS: Readonly<Record<EntKind, true>> = {
   hero: true,
   melee: true,
@@ -381,22 +405,25 @@ const ALL_ENT_KINDS: Readonly<Record<EntKind, true>> = {
 };
 const ENT_KINDS = Object.keys(ALL_ENT_KINDS) as readonly EntKind[];
 
-/** The three neutral jungle tiers (TERRAIN_CONTRACT §5). */
+/** The three neutral jungle tiers (TERRAIN_CONTRACT §5), spelled out here so
+ *  the expectation is independent of the `isCampKind` it is used to check. */
 const CAMP_KINDS: readonly EntKind[] = ['campPack', 'campBrute', 'campHive'];
 
 function entSnap(over: Partial<EntSnap> & Pick<EntSnap, 'k' | 'team'>): EntSnap {
   return { id: 1, x: 10, z: 20, hp: 400, maxHp: 400, ...over };
 }
 
-function snap(dayPhase: number, ents: readonly EntSnap[] = []): RiftS2C {
+/** A snapshot built the way room.ts must build one: `dayPhase` is not a free
+ *  parameter, it is `dayPhase(matchTick)` and nothing else (AMENDMENT_1 §B.1). */
+function snapAtTick(matchTick: number, ents: readonly EntSnap[] = []): RiftS2C {
   return {
     t: 'rift_snap',
-    tick: 900,
+    tick: matchTick + TICK_RATE,
     serverTime: 1_700_000_000_000,
     phase: 'live',
-    matchTick: 880,
+    matchTick,
     overtime: false,
-    dayPhase,
+    dayPhase: dayPhase(matchTick),
     wardStock: 2,
     kills: [3, 5],
     board: [],
@@ -405,47 +432,137 @@ function snap(dayPhase: number, ents: readonly EntSnap[] = []): RiftS2C {
   };
 }
 
-describe('rift_snap.dayPhase (TERRAIN_CONTRACT §6)', () => {
-  it('survives the wire exactly, at both ends of the cycle and in between', () => {
-    // 0 = full day, 1 = full night, continuous and WRAPPING. The client feeds
-    // it straight to SceneHandle.setTimeOfDay, so any lossy step here is a
-    // reconnecting client lit for the wrong half of the cycle.
-    for (const dayPhase of [0, 0.001, 0.25, 0.5, 0.75, 0.999, 1]) {
-      const wire = overWire(snap(dayPhase));
-      if (wire.t !== 'rift_snap') throw new Error(`expected rift_snap, got ${wire.t}`);
-      expect(wire.dayPhase, `dayPhase ${dayPhase} did not survive the wire`).toBe(dayPhase);
+/** One full day -> night -> day cycle, in ticks, and its midpoint (full night). */
+const CYCLE_TICKS = DAY_PERIOD_S * TICK_RATE;
+const HALF_CYCLE = CYCLE_TICKS / 2;
+
+describe('dayPhase — the frozen day/night cycle (config.ts, AMENDMENT_1 §B.1)', () => {
+  it('never leaves [0,1], and sweeps all of it, over two cycles and before tick 0', () => {
+    // This producer IS the [0,1] enforcement: there is no S2C parser to reject
+    // an out-of-range phase (see the file header), so the invariant is checked
+    // here over the whole domain room.ts can hand it — negative matchTicks
+    // included, because the cycle runs during the pre-match phase too.
+    let offender = '';
+    let lo = Number.POSITIVE_INFINITY;
+    let hi = Number.NEGATIVE_INFINITY;
+    for (let t = -CYCLE_TICKS; t < 2 * CYCLE_TICKS && offender === ''; t++) {
+      const p = dayPhase(t);
+      if (p < lo) lo = p;
+      if (p > hi) hi = p;
+      if (!Number.isFinite(p) || p < 0 || p > 1) offender = `dayPhase(${t}) = ${String(p)}`;
+    }
+    expect(offender, `outside [0,1]: ${offender}`).toBe('');
+    // ...and it is not a constant: a stuck 0.5 would satisfy the bound above
+    // while leaving the map in permanent dusk.
+    expect(lo, 'the cycle never reaches full day').toBe(0);
+    expect(hi, 'the cycle never reaches full night').toBe(1);
+  });
+
+  it('is a wrapping triangle: 0 at the start, 1 at the half period, 0 at the wrap', () => {
+    expect(dayPhase(0), 'a match starts at full day').toBe(0);
+    expect(dayPhase(HALF_CYCLE), 'full night is the peak of the triangle').toBe(1);
+    expect(dayPhase(CYCLE_TICKS), 'the cycle wraps back to full day').toBe(0);
+    for (const t of [1, 137, HALF_CYCLE - 1, HALF_CYCLE + 1, CYCLE_TICKS - 1]) {
+      expect(
+        dayPhase(t + CYCLE_TICKS),
+        `tick ${t} and tick ${t + CYCLE_TICKS} are one cycle apart and must be the same phase`,
+      ).toBe(dayPhase(t));
+      expect(dayPhase(t - CYCLE_TICKS), `tick ${t - CYCLE_TICKS} is one cycle back`).toBe(
+        dayPhase(t),
+      );
     }
   });
 
-  it('is a REQUIRED key — full day (0) is not dropped as falsy', () => {
-    const wire = overWire(snap(0));
-    expect(
-      Object.hasOwn(wire, 'dayPhase'),
-      `dayPhase 0 (full day) must travel as a present key, not be elided — got ` +
-        `${JSON.stringify(wire)}`,
-    ).toBe(true);
-    if (wire.t !== 'rift_snap') throw new Error(`expected rift_snap, got ${wire.t}`);
-    expect(wire.dayPhase).toBe(0);
-    expect(typeof wire.dayPhase).toBe('number');
+  it('falls exactly as it rose — a triangle, not a sawtooth', () => {
+    // The divergence AMENDMENT_1 §B.1 closed: a sawtooth ((t / cycle) % 1)
+    // agrees with the triangle at t = 0 and nowhere else, which put client
+    // lighting at 0.99 where the server's night read 0.02 near every boundary.
+    for (const d of [1, 60, 600, HALF_CYCLE - 1, HALF_CYCLE]) {
+      expect(
+        dayPhase(HALF_CYCLE + d),
+        `the ramp down ${d} ticks after full night must mirror the ramp up ${d} ticks before it`,
+      ).toBeCloseTo(dayPhase(HALF_CYCLE - d), 12);
+    }
   });
 
-  it('is never interpolated into existence: two snaps carry two independent phases', () => {
-    const a = overWire(snap(0.98));
-    const b = overWire(snap(0.02));
-    if (a.t !== 'rift_snap' || b.t !== 'rift_snap') throw new Error('expected rift_snap');
-    // A wrap looks like a huge jump; the contract forbids interpolating across
-    // it, so both endpoints must arrive intact for the client to detect one.
-    expect(a.dayPhase).toBe(0.98);
-    expect(b.dayPhase).toBe(0.02);
+  it('is continuous: no tick moves the phase by more than one tick is worth', () => {
+    // AMENDMENT_1 §C: the phase drives a ramp, so a discontinuity anywhere pops
+    // every unit's vision radius in a single tick. A sawtooth or a boolean snap
+    // jumps a whole 1.0 at its boundary and dies here.
+    const step = 1 / HALF_CYCLE;
+    let worst = 0;
+    let at = 0;
+    for (let t = -1; t < 2 * CYCLE_TICKS; t++) {
+      const d = Math.abs(dayPhase(t + 1) - dayPhase(t));
+      if (d > worst) {
+        worst = d;
+        at = t;
+      }
+    }
+    expect(
+      worst,
+      `the phase jumps ${worst} between tick ${at} and tick ${at + 1}; one tick is worth ${step}`,
+    ).toBeLessThanOrEqual(step + 1e-12);
+  });
+
+  it('every phase it produces survives the wire as a finite number', () => {
+    // The one JSON assertion worth making here: the VALUE is computed by the
+    // frozen producer, and JSON.stringify turns a NaN or an Infinity into null
+    // — a reconnecting client lit by `null` is a black screen. matchTick 0 also
+    // pins that a full-day 0 travels as a present key rather than being elided.
+    for (const matchTick of [
+      0,
+      1,
+      HALF_CYCLE - 1,
+      HALF_CYCLE,
+      HALF_CYCLE + 1,
+      CYCLE_TICKS - 1,
+      CYCLE_TICKS,
+      5 * CYCLE_TICKS + 4321,
+    ]) {
+      const wire = overWire(snapAtTick(matchTick));
+      if (wire.t !== 'rift_snap') throw new Error(`expected rift_snap, got ${wire.t}`);
+      expect(
+        typeof wire.dayPhase,
+        `the phase at matchTick ${matchTick} arrived as ${JSON.stringify(wire.dayPhase)}`,
+      ).toBe('number');
+      expect(wire.dayPhase).toBe(dayPhase(matchTick));
+      expect(
+        Object.hasOwn(wire, 'dayPhase'),
+        `dayPhase ${dayPhase(matchTick)} must travel as a present key, not be elided as falsy`,
+      ).toBe(true);
+    }
+  });
+
+  it('is a REQUIRED key on rift_snap — a COMPILE-TIME pin, not a runtime one', () => {
+    // Nothing can reject an inbound snapshot that omits the field, so the pin
+    // is tsc: the @ts-expect-error below itself fails the build the moment the
+    // omission becomes legal — dayPhase made optional, or dropped from RiftS2C.
+    // @ts-expect-error — RiftS2C requires dayPhase; omitting it must not compile
+    const missing: RiftS2C = {
+      t: 'rift_snap',
+      tick: 20,
+      serverTime: 1_700_000_000_000,
+      phase: 'live',
+      matchTick: 0,
+      overtime: false,
+      wardStock: 2,
+      kills: [3, 5],
+      board: [],
+      you: null,
+      ents: [],
+    };
+    expect(missing.t).toBe('rift_snap');
   });
 
   it('cannot be injected by a client — protocol.ts exposes no S2C parser at all', () => {
     // parseRiftC2S is the ONLY door into the sim and has no 'rift_snap' case,
     // so a hostile client cannot post a dayPhase — in range or wildly out of
     // it — into the simulation. That is precisely why protocol.ts performs no
-    // range check on the field: it is server-authored, derived from matchTick
-    // and DAY_PERIOD_S, and the [0,1] invariant is the PRODUCER's obligation
-    // (TERRAIN_CONTRACT §6), pinned by the capture harness's setDayPhase.
+    // range check on the field, and why shared/ has no place to enforce [0,1]
+    // on an inbound value: the field is server-authored, derived from matchTick
+    // by the frozen `dayPhase` above, and the invariant is the PRODUCER's
+    // obligation, discharged in server/src/room.ts (AMENDMENT_1 §B.1).
     // If an S2C parser is ever added, it must reject out-of-range values and
     // this test must be replaced by that rejection case.
     const outOfRange: readonly number[] = [
@@ -469,27 +586,83 @@ describe('rift_snap.dayPhase (TERRAIN_CONTRACT §6)', () => {
   });
 });
 
-describe('EntSnap — neutral jungle camps on the wire (TERRAIN_CONTRACT §5)', () => {
-  it('every EntKind round-trips, including the three camp tiers', () => {
+describe('nightVisionScale — the ramp the phase drives (AMENDMENT_1 §C)', () => {
+  it('is 1 at full day and NIGHT_VISION_MULT at full night', () => {
+    expect(nightVisionScale(0), 'full day must not shrink anything').toBe(1);
+    expect(nightVisionScale(1)).toBeCloseTo(NIGHT_VISION_MULT, 12);
+  });
+
+  it('is a RAMP, not a boolean snap: it decreases strictly across the phase', () => {
+    // TERRAIN_CONTRACT §4.3 had written this as a snap; §C ratified the ramp.
+    // A snap returns one of two values, so at least one of these strict
+    // inequalities collapses into an equality and this test goes red.
+    const samples = [0, 0.25, 0.5, 0.75, 1].map((p) => nightVisionScale(p));
+    for (let i = 1; i < samples.length; i++) {
+      expect(
+        samples[i]!,
+        `vision scale at phase ${0.25 * i} (${samples[i]!}) is not strictly below the scale at ` +
+          `phase ${0.25 * (i - 1)} (${samples[i - 1]!}) — that is a snap, not a ramp`,
+      ).toBeLessThan(samples[i - 1]!);
+    }
+  });
+
+  it('clamps a phase outside [0,1] instead of extrapolating', () => {
+    // shared/ cannot police the wire, but this function is total: it is the
+    // last line of defence if a producer ever hands it a bad phase.
+    expect(nightVisionScale(-0.5), 'a negative phase must read as full day').toBe(1);
+    expect(nightVisionScale(2), 'a phase past 1 must read as full night').toBeCloseTo(
+      NIGHT_VISION_MULT,
+      12,
+    );
+    expect(nightVisionScale(2)).toBeGreaterThan(0);
+  });
+
+  it('composed with dayPhase, vision never pops between two consecutive ticks', () => {
+    // The composition is what the sim actually evaluates every tick. One tick
+    // of the cycle may move vision by at most one tick's worth of the ramp.
+    const perTick = (1 - NIGHT_VISION_MULT) / HALF_CYCLE;
+    let worst = 0;
+    let at = 0;
+    for (let t = 0; t < 2 * CYCLE_TICKS; t++) {
+      const d = Math.abs(nightVisionScale(dayPhase(t + 1)) - nightVisionScale(dayPhase(t)));
+      if (d > worst) {
+        worst = d;
+        at = t;
+      }
+    }
+    expect(
+      worst,
+      `vision scale moves ${worst} between tick ${at} and tick ${at + 1}; one tick of the ramp ` +
+        `is worth ${perTick} — anything larger pops every unit's radius in a single tick`,
+    ).toBeLessThanOrEqual(perTick + 1e-12);
+  });
+});
+
+describe('EntSnap — neutral jungle camps (TERRAIN_CONTRACT §5, AMENDMENT_1 §B.4)', () => {
+  it('isCampKind classifies exactly the three camp tiers, across the whole union', () => {
+    // ENT_KINDS is derived from a Record<EntKind, true>, so the LIST is pinned
+    // at compile time; isCampKind is the frozen classifier every consumer must
+    // call instead of re-listing the tiers inline. Add a fourth camp tier and
+    // forget to classify it, and this goes red at runtime while the Record goes
+    // red at compile time.
     for (const k of ENT_KINDS) {
-      const wire = overWire(entSnap({ k, team: CAMP_KINDS.includes(k) ? NEUTRAL_TEAM : 0 }));
-      expect(wire.k, `EntKind '${k}' did not survive the wire`).toBe(k);
+      expect(
+        isCampKind(k),
+        `isCampKind('${k}') disagrees with TERRAIN_CONTRACT §5's camp census`,
+      ).toBe(CAMP_KINDS.includes(k));
     }
-    for (const k of CAMP_KINDS) {
-      expect(ENT_KINDS, `camp kind '${k}' is missing from EntKind`).toContain(k);
-    }
+    expect(ENT_KINDS.filter((k) => isCampKind(k))).toEqual(CAMP_KINDS);
   });
 
-  it('team === NEUTRAL_TEAM (2) round-trips and is not coerced to a player team', () => {
-    for (const k of CAMP_KINDS) {
-      const wire = overWire(entSnap({ id: 77, k, team: NEUTRAL_TEAM }));
-      expect(wire.team, `'${k}' arrived on team ${wire.team}, not NEUTRAL_TEAM`).toBe(2);
-      expect(wire.team).not.toBe(0);
-      expect(wire.team).not.toBe(1);
-    }
+  it('EntSnap.team admits exactly 0, 1 and NEUTRAL_TEAM — a COMPILE-TIME pin', () => {
+    const neutral: EntSnap = entSnap({ id: 77, k: 'campPack', team: NEUTRAL_TEAM });
+    // @ts-expect-error — 3 is not an EntTeam; if this compiles, kills[] indexing is unsound
+    const alien: EntSnap = entSnap({ id: 78, k: 'campPack', team: 3 });
+    expect(neutral.team).toBe(NEUTRAL_TEAM);
+    expect(alien.k).toBe('campPack');
   });
 
-  it('a whole snapshot of mixed teams keeps every entity on its own team', () => {
+  it('in a mixed snapshot, camp kinds are neutral and only players index kills[]', () => {
     const ents: readonly EntSnap[] = [
       entSnap({ id: 1, k: 'hero', team: 0, lvl: 6, hero: 'reaver', pid: 'p1' }),
       entSnap({ id: 2, k: 'melee', team: 1 }),
@@ -497,26 +670,29 @@ describe('EntSnap — neutral jungle camps on the wire (TERRAIN_CONTRACT §5)', 
       entSnap({ id: 4, k: 'campBrute', team: NEUTRAL_TEAM }),
       entSnap({ id: 5, k: 'campHive', team: NEUTRAL_TEAM }),
     ];
-    const wire = overWire(snap(0.4, ents));
+    const wire = snapAtTick(8_000, ents);
     if (wire.t !== 'rift_snap') throw new Error(`expected rift_snap, got ${wire.t}`);
-    expect(wire.ents.map((e) => [e.id, e.k, e.team])).toEqual([
-      [1, 'hero', 0],
-      [2, 'melee', 1],
-      [3, 'campPack', 2],
-      [4, 'campBrute', 2],
-      [5, 'campHive', 2],
-    ]);
-    // The tuple hazard: kills is [team0, team1] and a neutral team would index
-    // off the end of it. isPlayerTeam is the only sanctioned narrowing.
+    // The tuple hazard: kills is [team0, team1] and a neutral team indexes off
+    // the end of it. isPlayerTeam is the only sanctioned narrowing, and
+    // isCampKind is the only sanctioned camp test — the two must agree on every
+    // entity in a snapshot.
     for (const e of wire.ents) {
       const team: EntTeam = e.team;
       if (isPlayerTeam(team)) {
-        expect(wire.kills[team], `kills[${team}] must exist`).toBeTypeOf('number');
+        expect(isCampKind(e.k), `'${e.k}' is on player team ${team} but classifies as a camp`).toBe(
+          false,
+        );
+        expect(wire.kills[team], `kills[${team}] must exist for a player team`).toBeTypeOf('number');
       } else {
-        expect(team).toBe(NEUTRAL_TEAM);
-        expect(CAMP_KINDS).toContain(e.k);
+        expect(team, `entity #${e.id} is on no player team, so it must be NEUTRAL_TEAM`).toBe(
+          NEUTRAL_TEAM,
+        );
+        expect(isCampKind(e.k), `'${e.k}' is neutral but is not classified as a camp kind`).toBe(
+          true,
+        );
       }
     }
+    expect(wire.ents.filter((e) => isCampKind(e.k)), 'the three camp tiers').toHaveLength(3);
   });
 
   it('isPlayerTeam narrows exactly the two player teams', () => {
@@ -527,13 +703,13 @@ describe('EntSnap — neutral jungle camps on the wire (TERRAIN_CONTRACT §5)', 
   });
 });
 
-describe('rift_miss (TERRAIN_CONTRACT §4)', () => {
-  it('round-trips with ENTITY ids, like rift_cast', () => {
+describe('rift_miss (TERRAIN_CONTRACT §4, AMENDMENT_1 §B.2)', () => {
+  it('is server-authored: the only parser refuses a client-fabricated miss', () => {
+    // The typed literal is the COMPILE-TIME pin on the event's shape — attacker
+    // and target are ENTITY ids, like rift_cast's target, not player ids. The
+    // runtime assertion is that parseRiftC2S refuses it: rift_miss has no C2S
+    // case, and if one is ever added a client can fake every miss in the match.
     const ev: RiftEvent = { t: 'rift_miss', attacker: 1042, target: 1043 };
-    expect(overWire(ev)).toEqual({ t: 'rift_miss', attacker: 1042, target: 1043 });
-  });
-
-  it('is not a client command: a client cannot fabricate a miss', () => {
-    expect(parseRiftC2S({ t: 'rift_miss', attacker: 1, target: 2 })).toBeNull();
+    expect(parseRiftC2S(ev), `parseRiftC2S accepted ${JSON.stringify(ev)}`).toBeNull();
   });
 });

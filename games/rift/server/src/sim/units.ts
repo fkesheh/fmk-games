@@ -14,21 +14,32 @@
 //
 // NEUTRAL SAFETY (TERRAIN_CONTRACT §5). Jungle camps are a third team and their
 // creeps live in this world's mobile map like everything else, so every rule in
-// this file is deliberately blind to them:
-//   - wave composition, growth and the overtime surge are derived from the wave
-//     counter and the match clock alone — never from a population count — so a
-//     jungle full of neutrals cannot perturb wave sizing;
-//   - hero respawn narrows with isPlayerTeam before it touches a per-team tuple,
-//     and camp respawn belongs to stepCamps (sim/camps.ts) alone;
-//   - the expiry reaper treats any non-positive expireAtTick as "never" and
-//     skips camp kinds outright — camp members are spawned with -1;
-//   - the per-team ward stock is indexed by literal team ids only, so a neutral
-//     death can never reach it.
+// this file is deliberately blind to them. There are exactly five guards, and
+// each one covers a case no other guard covers — they are not belt-and-braces
+// restatements of one another, and units.test.ts pins each one with a test that
+// goes red when that guard alone is reverted:
+//   1. wave composition, growth and the overtime surge are derived from the
+//      wave counter and the match clock alone — never from a population count —
+//      so a jungle full of neutrals cannot perturb wave sizing;
+//   2. the respawn loop takes heroes only, which is what excludes the camp
+//      kinds (no camp kind is 'hero') AND every other player-team mobile that
+//      might carry a respawn stamp;
+//   3. the respawn loop then narrows with isPlayerTeam, which is a strictly
+//      different case: a hero-KIND entity sitting on NEUTRAL_TEAM. That narrow
+//      is also what makes `fountainSpot` — which takes a TeamId — legal to call;
+//   4. the expiry reaper treats any non-positive expireAtTick as "never", so
+//      the -1 camp members are spawned with is not read as a tick in the past;
+//   5. the expiry reaper also skips camp kinds outright, which covers the case
+//      the sentinel does not: a camp member carrying a positive stamp.
+// Two further properties fall out of the code shape rather than a guard: the
+// per-team ward stock is indexed by the literal team ids 0 and 1 only, so no
+// neutral event can reach it; and the fountain tick asks `w.atOwnFountain(e)`
+// instead of indexing a per-team tuple here, so there is no team index in this
+// file to get wrong.
 // ============================================================================
 import {
   FOUNTAIN_HEAL_PCT,
   FOUNTAIN_MANA_PCT,
-  FOUNTAIN_RADIUS,
   LEVEL_CAP,
   OVERTIME_AT_S,
   PASSIVE_GOLD_PER_S,
@@ -46,18 +57,12 @@ import {
   WAVE_RANGED,
   XP_THRESHOLDS,
   heroById,
+  isCampKind,
   isPlayerTeam,
 } from '@rift/shared';
 import type { TeamId } from '@rift/shared';
 import type { Ent } from './types.js';
 import type { SimWorld } from './world.js';
-
-/** True for the three neutral jungle kinds (TERRAIN_CONTRACT §5). Their whole
- *  lifecycle — spawn, leash, respawn — is stepCamps' business; every loop in
- *  this file that could otherwise claim one consults this first. */
-function isCampMember(e: Ent): boolean {
-  return e.kind === 'campPack' || e.kind === 'campBrute' || e.kind === 'campHive';
-}
 
 /** Grant xp to a hero and process any level-ups: thresholds from
  *  XP_THRESHOLDS (cumulative, index = level), +SKILL_POINTS_PER_LEVEL per
@@ -155,12 +160,15 @@ function stepWaves(w: SimWorld): void {
 
 /** HERO respawn only. A neutral camp creep also carries a `respawnAtTick`-shaped
  *  timer on its CampState, but camps respawn whole through stepCamps — nothing
- *  here may pick one up. Two independent guards enforce that: the kind test
- *  (no camp kind is 'hero') and the isPlayerTeam narrowing, which is also what
- *  makes `fountainSpot` — a two-element per-team lookup — legal to call. */
+ *  here may pick one up. Two guards with DISJOINT coverage do that work: the
+ *  kind test excludes every non-hero mobile (which is what the camp kinds are),
+ *  and the isPlayerTeam narrowing excludes the case the kind test cannot see —
+ *  a hero-kind entity on NEUTRAL_TEAM — while also being what makes
+ *  `fountainSpot`, which takes a TeamId, legal to call. Neither is redundant
+ *  with the other; reverting either one alone turns a test in units.test.ts red. */
 function stepRespawns(w: SimWorld): void {
   for (const e of w.mobileMap.values()) {
-    if (e.kind !== 'hero' || isCampMember(e)) continue;
+    if (e.kind !== 'hero') continue;
     if (e.alive || e.respawnAtTick <= 0) continue;
     if (w.tick < e.respawnAtTick) continue;
     const team = e.team;
@@ -197,17 +205,19 @@ function stepRespawns(w: SimWorld): void {
  *  summons by stamping expireAtTick = world.tick, so this reaps ALL expired
  *  mobiles — projs included. No loot on expiry; heroes are exempt.
  *
- *  Camp members are exempt too, and doubly so. They are spawned with
- *  expireAtTick = -1 (TERRAIN_CONTRACT §5), so the sentinel test is widened
- *  from `=== 0` to `<= 0`: any non-positive stamp means "never expires", and
- *  the old strict test would have read -1 as a tick already in the past and
- *  reaped the entire jungle on its first tick. The kind test then makes the
- *  exemption independent of how camps.ts happens to stamp its spawns. */
+ *  Camp members are exempt too, by two guards that cover different cases.
+ *  The sentinel test is `<= 0`, not `=== 0` (sim/types.ts, AMENDMENT_1 §B.3):
+ *  any non-positive stamp means "never expires", which matters because camps
+ *  spawn with -1 (TERRAIN_CONTRACT §5) and a strict `=== 0` would read -1 as a
+ *  tick already in the past and reap the entire jungle on its first tick. That
+ *  sentinel protects every kind, not just camps. The isCampKind test then
+ *  covers what the sentinel cannot: a camp member carrying a POSITIVE stamp,
+ *  which keeps the exemption independent of how camps.ts stamps its spawns. */
 function stepExpiry(w: SimWorld): void {
   w.deadBuf.length = 0;
   for (const e of w.mobileMap.values()) {
     if (e.expireAtTick <= 0 || w.tick < e.expireAtTick) continue;
-    if (e.kind === 'hero' || isCampMember(e)) continue;
+    if (e.kind === 'hero' || isCampKind(e.kind)) continue;
     w.deadBuf.push(e);
   }
   for (const e of w.deadBuf) {
@@ -236,17 +246,13 @@ export function stepUnits(w: SimWorld): void {
     if (e.manaRegen > 0 && e.mana < e.maxMana) {
       e.mana = Math.min(e.maxMana, e.mana + e.manaRegen * TICK_DT);
     }
-    // ancientX/ancientZ are two-element per-team tuples: narrow before indexing.
-    // A neutral has no fountain, so the else branch is simply "no fountain tick".
-    const team = e.team;
-    if (!isPlayerTeam(team)) continue;
-    const ax = w.ancientX[team];
-    const az = w.ancientZ[team];
-    if (ax === undefined || az === undefined) continue;
-    if (Math.hypot(e.x - ax, e.z - az) <= FOUNTAIN_RADIUS) {
-      e.hp = Math.min(e.maxHp, e.hp + e.maxHp * FOUNTAIN_HEAL_PCT * TICK_DT);
-      e.mana = Math.min(e.maxMana, e.mana + e.maxMana * FOUNTAIN_MANA_PCT * TICK_DT);
-    }
+    // The fountain test goes through w.atOwnFountain, the same predicate the
+    // shop gates on, so this file never indexes a per-team tuple by an entity's
+    // team at all. An entity with no fountain of its own — anything neutral —
+    // simply gets no fountain tick.
+    if (!w.atOwnFountain(e)) continue;
+    e.hp = Math.min(e.maxHp, e.hp + e.maxHp * FOUNTAIN_HEAL_PCT * TICK_DT);
+    e.mana = Math.min(e.maxMana, e.mana + e.maxMana * FOUNTAIN_MANA_PCT * TICK_DT);
   }
   // Team ward stock restock: +1 per WARD_RESTOCK_S up to WARD_TEAM_STOCK.
   // wardStockArr is a two-element per-team tuple and is indexed here by the

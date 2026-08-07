@@ -1,139 +1,219 @@
 // ============================================================================
-// ANCIENTS (rift) — FOG OF WAR (CONTRACT §6 render/fog.ts + §7 fog look).
-// The client owns the PIXELS of fog: a generated CanvasTexture visibility
-// mask (the §0 amendment permits CanvasTexture for fog + minimap ONLY),
-// rebuilt from each snapshot (game.ts throttles to ~5Hz).
+// ANCIENTS (rift) — FOG OF WAR (GRAPHICS_CONTRACT §1/§6, STYLE_BIBLE §10).
 //
-// Canvases (all generated — no image assets):
-//   visNow    — this update's visible discs (white, soft radial falloff)
-//   explored  — persistent BINARY accumulation of every ent's vision blob
-//   blurBuf   — explored after a wide gaussian blur at HALF res (the soft
-//               edge; one blur per update, upscaled into both planes)
-//   mask      — THE shared maskCanvas (the minimap reads this one): opaque
-//               `shroud` unexplored, DIM_ALPHA explored (terrain composites
-//               toward shroud), clear where visible
-//   hard      — unexplored-only shroud, for the high plane that hides props
-//   shroudNoise / featherErase / featherDim — boot-baked, see below
+// The client owns the PIXELS of fog; the SERVER owns the truth. This module
+// presents `snap`, it does not re-derive it — but it mirrors the sim's vision
+// rules (sim/vision.ts) closely enough that the mask it paints and the units
+// the server sent agree on screen:
 //
-// World overlay = two transparent Lambert planes (the material law holds —
-// emissive-locked so the shroud hex renders exactly): a LOW one at y=0.55
-// using `mask` (darkens terrain; unit bodies poke through and stay readable
-// on fog-darkened ground — the ladder law) and a HIGH one at y=7.5 using
-// `hard` (unexplored is a full shroud over everything below the sky).
+//   * sources are THIS PLAYER'S team only (own mobiles, own wards, own living
+//     structures). The old build lit a disc around every ent IN the snapshot,
+//     including visible enemies, which revealed ground the server considers
+//     hidden and made `isVisible` return true beside an enemy hero;
+//   * night shrinks the radius of everything with living eyes — heroes, creeps,
+//     summons, camps — by `NIGHT_VISION_MULT`, ramped by `snap.dayPhase` with
+//     the SAME formula the sim uses (`1 - (1-mult)*phase`). Wards, towers,
+//     guards and ancients are lit and unaffected (DESIGN_DELTA §5);
+//   * vision does not travel uphill (DESIGN_DELTA §1: "a unit on low ground
+//     cannot see units OR TERRAIN on high ground"). A low viewer's disc is
+//     punched by a boot-baked ELEV_HIGH stencil, in BOTH the live pass and the
+//     explored accumulation, so a plateau you have never climbed stays dark.
+//     This is a per-position rule, so `isVisible` applies it too.
+//   Concealment (foliage) is deliberately NOT mirrored: it hides an ENTITY from
+//   a distant enemy, not the ground, and `isVisible(x,z)` has no viewer to test
+//   it against — applying it would hide things the server says are visible.
 //
-// COMPOSITING LAW (round-5 UX-judge amendment): the planes are MUCH larger
-// than the map square and the mask texture is ClampToEdge-wrapped onto their
-// centre, so the planes cover the whole visible ground disc. The map's border
-// texels (which ClampToEdge stretches over everything out-of-bounds) are
-// FEATHERED on every compose over a wobbling band: `mask` border fades to
-// DIM_ALPHA (out-of-bounds ground reads as dim dusk outskirts — never
-// transparent, or raw lit ground and the LIGHTER mottle decals ghost
-// through, the round-3 "decal ghosts in the void" bug; never opaque, or the
-// world ends as a pitch void island), `hard` border fades to clear (the high
-// shroud dissolves at the map edge instead of ending on a straight line).
-// The feather is baked ONCE into two overlay canvases (featherErase punches
-// the border band down with destination-out, featherDim lays DIM_ALPHA back
-// underneath with destination-over) so no per-update getImageData readback
-// ever forces a raster flush (round-6 perf: the round-5 per-pixel pass was
-// the bulk of the 5Hz update cost at 512²).
+// THE OVERLAY IS TERRAIN-CONFORMAL, not a plane. Two sheets whose every vertex
+// is `SceneCore.heightAt` plus a lift, so fog sits ON the ground instead of
+// floating over valleys and cutting into ridges (the immediate tell §10 names).
+// Each vertex takes the MAX of five height taps over ±0.6 m, which makes the
+// sheet step UP at a cliff line one quad early rather than slicing the face.
+//   * LOW  (+0.55 m): the `mask` texture — darkens explored-not-visible ground
+//     toward `shroud` at DIM_ALPHA, clears where visible. Unit bodies poke
+//     through and stay readable on fog-darkened ground (the ladder law:
+//     valueLadder.test.ts asserts team colours against composite(moss, shroud,
+//     0.55), so DIM_ALPHA is contract data, not a tuning dial).
+//   * HIGH (+7.5 m, above the 6 m Ancient): the `hard` texture — opaque only
+//     where never explored, so trees, towers and camps in unexplored jungle are
+//     occluded by the shroud instead of poking out of it.
 //
-// ROUND-6 EDGE REBUILD (art-judge refutation of the round-5 fix on pixels —
-// the explored/shroud boundary measured a near-straight HARD vertical edge
-// with stepped banding over a single-texel cliff, shroud stdev L* 0.45):
-//  (a) ROOT CAUSE — the 'lighten' accumulation ratcheted alpha: separable
-//      blend modes composite ALPHA as source-over (αr = αs + αb(1-αs)), so
-//      every 5Hz re-stamp of the same gradient discs pushed the falloff
-//      band's alpha asymptotically to 1 — the soft radial edge eroded to a
-//      BINARY explored mask within seconds. `explored` now stamps SOLID
-//      blobs (alpha 1, no gradient to erode, no blend-mode alpha trap);
-//  (b) the soft edge is applied ONCE at compose time: blurBuf = gaussian
-//      blur of the binary explored mask (canvas blur(Npx) ≈ gaussian σ N/2,
-//      so the 10-90% ramp is ~1.28*N texels ≈ 4.5m — several metres, not
-//      texels). destination-out of blurBuf ramps mask alpha 1 -> DIM_ALPHA
-//      and hard alpha 1 -> 0 across the whole band, never a texel cliff;
-//  (c) the straight-run seam: each explored blob's rim wobbles ±9% with the
-//      noise field, so a corridor of overlapping blobs never unions into a
-//      ruler-straight boundary (the "wobbling feather" the judge missed);
-//  (d) mask RES 256 -> 512 (5.3 texels/m at side 96): the blurred ramp spans
-//      ~25 texels, so 8-bit alpha quantization steps stay far below the
-//      perceptual banding threshold (no dither pass needed — bilinear
-//      interpolation across a 25-texel gaussian ramp is smooth);
-//  (e) shroud grain AMPLITUDE ~doubled (emissive multiplier 0.08..1.0, was
-//      0.5..1.0) so the interior reads as living darkness at frame scale
-//      (stdev L* ~0.6+, was 0.45 — perceptible-but-subtle). The emissive
-//      lift is COMPUTED from the palette so the multiplier's mean
-//      reproduces the round-5 shroud level the scene exposure was
-//      calibrated against (a palette-exact mean measured too dark and
-//      shrank the absolute grain amplitude — stdev went DOWN).
+// MATERIAL (GRAPHICS_CONTRACT §1a, STYLE_BIBLE §11). No Lambert anywhere: both
+// sheets take `surface('cloth', APAL.shroud)` — the shroud IS a veil, and cloth
+// is the roughest, most matte, metal-free family in the frozen table — CLONED
+// so the overlay's own state (its alpha mask, its drifting grain, transparency)
+// never touches the kit's cached instance that every banner in the game shares.
+// The clone sets only what an overlay must own and the surface table does not
+// speak to: `map`, `emissiveMap`, `transparent`, `depthWrite`, `fog`,
+// `envMapIntensity` (0 — a 4% Fresnel sheen off the IBL across a map-sized
+// sheet would grey the shroud out of "fully occluding"), and `normalMap = null`
+// (a weave relief on atmosphere is the UI-lid read §10a.5 files as a defect;
+// the drifting grain carries all of the structure). Roughness, metalness and
+// albedo are the table's and are untouched.
 //
-// PERF (<= ~2ms at 5Hz): zero per-update getImageData (isVisible is a JS
-// distance check against the disc list — same >40-alpha semantics at
-// 0.945r); ONE half-res gaussian blur; every other op is a deferred canvas
-// draw rasterized once at texture upload.
+// SHROUD LEVEL IS SOLVED, NOT TUNED. `map`'s shroud RGB crushes the lit term to
+// ~0, exactly as before, so the emissive carries the whole read. Emissive is
+// `APAL.shroud` at `1 / (exposure * GRAIN_MEAN)`: the grain map's mean is
+// GRAIN_MEAN and the renderer multiplies by `toneMappingExposure`, so the two
+// cancel and the unexplored shroud renders at PALETTE-EXACT `APAL.shroud` —
+// in both lighting states, since a frame hook re-solves it whenever R_SCENE
+// ramps exposure (2.75 day -> 1.9 night). This replaces the previous round's
+// hand-fitted lift/trim constants, which were calibrated against ACES and stop
+// meaning anything under NeutralToneMapping. NeutralToneMapping is effectively
+// identity this far below its compression knee, so the solve is exact.
+//
+// ATMOSPHERE, NOT A UI LID (§10, §10a.5). Four things do this work and none of
+// them costs a per-frame allocation:
+//   (a) the sheets follow the ground;
+//   (b) the shroud's RGB is a seamless three-octave grain tile carried on a
+//       SECOND UV set in metres — the two sheets tile it at different scales
+//       and DRIFT it in different directions, so the mist visibly moves and the
+//       repeat never lines up (a still frame of a MOBA should never look still);
+//   (c) the explored/shroud boundary is a wide gaussian ramp (several metres,
+//       not texels) over blobs whose rims wobble with the noise field, so a
+//       corridor never unions into a ruler-straight edge, and the live vision
+//       edge is a 3.9 m alpha falloff rather than a step;
+//   (d) the DIM layer's shroud is warmed 10% toward the palette's warm neutral
+//       while the unexplored layer above it stays exactly `APAL.shroud` — §10's
+//       "slightly warm visibility falloff", carried on the emissive because the
+//       albedo is crushed (see below) and a warm mask texel would be invisible.
+//
+// PERF. Everything above is snapshot work at ~5 Hz (game.ts throttles). Zero
+// getImageData outside boot; every per-source stamp is a pre-baked sprite
+// blitted with drawImage (no CanvasGradient churn); ONE half-res gaussian per
+// update; `isVisible` is a JS distance test over a POOLED disc list plus one
+// O(1) terrain lookup. The frame hook writes two texture offsets and, only when
+// exposure actually moves, two floats. Two draw calls total.
 // ============================================================================
 import * as THREE from 'three';
 import {
   ANCIENT,
   APAL,
+  CAMP_BRUTE,
+  CAMP_HIVE,
+  CAMP_PACK,
   CREEP_MELEE,
   CREEP_RANGED,
   CREEP_SIEGE,
+  ELEV_HIGH,
   GUARD_TOWER,
   HERO_VISION,
+  NIGHT_VISION_MULT,
   SUMMON_SHADE,
   TOWER,
   WARD_VISION,
+  elevationAt,
+  isPlayerTeam,
 } from '@rift/shared';
-import type { EntKind, MapDef } from '@rift/shared';
+import type { EntKind, MapDef, TeamId, TerrainDef } from '@rift/shared';
 import { mix } from '@platform/shared';
 import type { FogHandle, SceneHandle, SnapMsg } from '../contract.js';
-import { sceneCore } from './scene.js';
+import { sceneCore, whiteVertexColors } from './core.js';
+import { surface } from './kit.js';
 
+// ---- mask rasters -----------------------------------------------------------
+/** Mask/explored/scratch resolution. At side 96 that is 5.3 texels/m, so the
+ *  blurred explored ramp below spans ~25 texels and 8-bit alpha quantisation
+ *  stays far under the perceptual banding threshold. */
 const RES = 512;
-/** blurBuf resolution — the gaussian runs at half res (same world-space
- *  sigma, quarter of the pixels) and drawImage upscales it into the planes. */
+/** The gaussian runs at half res — same world-space sigma, a quarter of the
+ *  pixels — and `drawImage` upscales it into both composites. */
 const BLUR_RES = RES / 2;
-/** World height of the low (terrain-dimming) fog plane. */
-const LOW_Y = 0.55;
-/** World height of the hard-shroud plane (above the 6 m Ancient + heart). */
-const HIGH_Y = 7.5;
-/** Explored-not-visible terrain darkens toward shroud by this alpha (CONTRACT
- *  §6/§7: composites toward `shroud` 0.55). The scene exposure is tuned so
- *  explored ground at 0.55 still reads plainly lighter than the opaque shroud. */
-const DIM_ALPHA = 0.55;
-/** Overlay plane size as a multiple of the map side. The ground disc reaches
- *  side*1.6 from the centre, so the plane must span >= side*3.2 to cover it;
- *  3.4 leaves margin. The mask texture maps the map square onto the plane's
- *  centre (ClampToEdge): out-of-bounds world samples the feathered border
- *  texels — dim outskirts on `mask`, clear on `hard` (see feather). */
-const PLANE_SPAN = 3.4;
-/** Gaussian blur (canvas filter px = BLUR_RES texels, σ ≈ N/2) of the binary
- *  explored mask — the explored/shroud transition ramp (~1.28*N half-res
- *  texels ≈ 6.8m at side 96 — several metres, not texels; measured ~45px
- *  10-90% on the 1080p fog-edge capture). */
+/** Canvas `filter: blur(Npx)` is a gaussian of sigma ~N/2, so the 10-90% ramp
+ *  is ~1.28*N half-res texels — about 6.8 m at side 96. Metres, not texels:
+ *  that is the difference between atmosphere and a UI lid. */
 const EDGE_BLUR = 14;
-/** Explored blob rim wobble: radius modulation ±9% from the noise field —
- *  long corridors never union into a ruler-straight boundary. */
+/** Explored blob rim wobble (fraction of radius), sampled from the noise field
+ *  so a corridor of overlapping blobs never unions into a straight seam. */
 const RIM_WOBBLE = 0.09;
-/** Segments per explored blob rim (enough that the wobble reads organic). */
 const RIM_SEGMENTS = 28;
-/** Width (RES texels) of the map-edge feather band + its noise wobble.
- *  20 texels ≈ 3.75m at side 96. */
+/** Map-edge feather band width in RES texels, plus its noise wobble. */
 const FEATHER = 20;
 const FEATHER_WOBBLE = 8;
-/** Shroud emissive-grain multiplier range (round-6: was 0.5..1.0, measured
- *  sub-perceptual stdev L* 0.45 at frame scale). Near-full range so the
- *  absolute amplitude is large enough to read at 1080p — valleys bottom at
- *  0.08 (near-black, never a dead #000 patch), peaks at 1.0 (no clamp
- *  clipping). The mean stays at the exposure-calibrated round-5 shroud
- *  level (see emissiveLift). */
+/** Per-source stamp resolution. Vision radii are 6-11 m, i.e. 32-59 texels at
+ *  RES/side, so 128 is a downscale at every real size. */
+const SPRITE_RES = 128;
+/** Extra softening on the ELEV_HIGH stencil, in RES texels. The stencil is
+ *  rasterised at the TERRAIN's own 1 cell/m grid and upscaled, so bilinear
+ *  filtering already spreads its edge over ~RES/dim texels; this only takes the
+ *  last of the stair-step off. A vision boundary that follows a cliff should
+ *  read as a hard rule with a soft pixel edge, never as aliasing. */
+const STENCIL_BLUR = 1;
+
+// ---- overlay geometry -------------------------------------------------------
+/** Overlay span as a multiple of the map side. The visible ground disc reaches
+ *  side*1.6 from the centre, so the sheet must span >= side*3.2 to cover it. */
+const PLANE_SPAN = 3.4;
+/** Inner sample spacing in metres, per sheet. The terrain grid is frozen at
+ *  1 cell/metre (TerrainGrid.res), so the LOW sheet samples the height field at
+ *  its own resolution and cannot miss a step — it is the one the player reads
+ *  against the ground. The HIGH sheet is a lid 7.5 m up whose only job is to
+ *  occlude, so it follows gross elevation at 3 m and costs a sixth as many
+ *  triangles (§5: the triangle budget is a gate, not an aspiration). */
+const LOW_CELL_M = 1;
+const HIGH_CELL_M = 3;
+/** Rings of skirt quads outside the map square, spaced quadratically so they
+ *  densify toward the map edge where the height still varies. */
+const SKIRT_RINGS = 6;
+/** Half-width of the ridge-safe height filter, in metres. Five taps, MAX: the
+ *  sheet steps up one quad BEFORE a cliff instead of slicing through its face. */
+const H_TAP = 0.6;
+/** Lift of each sheet above the local ground, in metres. HIGH clears the 6 m
+ *  Ancient and its heart. */
+const LOW_LIFT = 0.55;
+const HIGH_LIFT = 7.5;
+const LOW_ORDER = 60;
+const HIGH_ORDER = 61;
+
+// ---- shroud look ------------------------------------------------------------
+/** Explored-not-visible ground composites toward `shroud` by this alpha.
+ *  CONTRACT DATA, not a dial: valueLadder.test.ts asserts team readability
+ *  against `composite(moss, shroud, 0.55)`. */
+const DIM_ALPHA = 0.55;
+/** Grain multiplier range written into the shroud tile. Near-full range so the
+ *  absolute amplitude reads as living darkness at 1080p; the valley floor is
+ *  0.08 rather than 0 so no patch is ever a dead #000. */
 const GRAIN_LO = 0.08;
 const GRAIN_SPAN = 0.92;
+/** Mean of the multiplier. The value-noise field averages 0.5, so this is the
+ *  map's mean, and the emissive solve divides it back out. */
 const GRAIN_MEAN = GRAIN_LO + GRAIN_SPAN / 2;
-/** isVisible radius threshold: the round-5 alpha>40 cutoff on the disc
- *  gradient (full alpha to 0.65r, linear to 0 at r) lands at 0.945r. */
+/** Noise tile resolution. Seamless (the octave grids wrap), so it repeats. */
+const NOISE_RES = 256;
+/** Metres per grain tile on each sheet, and the drift of each in m/s. Two
+ *  different scales moving in two different directions: the mist layers, and
+ *  the repeat of a 256² tile never lines up with itself on screen. */
+const LOW_TILE_M = 34;
+const HIGH_TILE_M = 53;
+const LOW_DRIFT_X = 0.34;
+const LOW_DRIFT_Z = 0.13;
+const HIGH_DRIFT_X = -0.19;
+const HIGH_DRIFT_Z = 0.22;
+/** How far the DIM layer's shroud is warmed toward the palette's warm neutral.
+ *  This is §10's "soft, slightly warm visibility falloff at the edge of
+ *  vision", and it is carried by the emissive rather than by the mask's RGB:
+ *  the mask multiplies an albedo that is already crushed to ~0, so a warm tint
+ *  painted into the canvas would be mathematically invisible.
+ *
+ *  It applies to the LOW sheet only. Explored-but-not-visible ground therefore
+ *  carries a faint warm cast that fades out exactly as the vision falloff ramps
+ *  its alpha away, while the never-explored mass above it stays cold and dead —
+ *  warm toward what you have seen, cold toward what you have not. The
+ *  unexplored shroud, which is the surface valueLadder.test.ts names, stays
+ *  PALETTE-EXACT `APAL.shroud`: the HIGH sheet draws after the LOW one
+ *  (renderOrder) and is opaque wherever nothing has ever been explored, so it
+ *  covers the warm layer completely there. Both endpoints are APAL entries, so
+ *  `mix` stays legal (STYLE_BIBLE §3). */
+const WARM_DIM = 0.1;
+/** `isVisible` radius threshold: the disc stamp holds full alpha to 0.65r and
+ *  ramps to 0 at r, so the >40/255 alpha cutoff lands at 0.945r. */
 const VIS_R_FRACTION = 0.945;
+/** Tolerance matching `snap.you` against its own hero entity, in metres. Both
+ *  come from the same `Ent` on the same tick, so this only absorbs a JSON
+ *  round-trip. */
+const SELF_EPS = 0.01;
 
+/** Vision radius by kind — the client mirror of sim/vision.ts's `visionRadius`.
+ *  Exhaustive over `EntKind` by type, so a new kind cannot be forgotten here. */
 const VISION: Record<EntKind, number> = {
   hero: HERO_VISION,
   melee: CREEP_MELEE.vision,
@@ -144,11 +224,49 @@ const VISION: Record<EntKind, number> = {
   guard: GUARD_TOWER.vision,
   ancient: ANCIENT.vision,
   ward: WARD_VISION,
+  campPack: CAMP_PACK.vision,
+  campBrute: CAMP_BRUTE.vision,
+  campHive: CAMP_HIVE.vision,
   proj: 0,
 };
 
-/** rgba() string from an APAL hex (the visibility mask's RGB is irrelevant —
- *  only its alpha is read — but every colour literal stays palette-traceable). */
+/** Does night shrink this kind's radius? Transcribed from sim/vision.ts's
+ *  `scalesAtNight`: the FALSE arm is the closed list (ward, tower, guard,
+ *  ancient — "structures and wards are lit", DESIGN_DELTA §5) and everything
+ *  with living eyes scales. Diverging from the sim here is exactly how a client
+ *  starts drawing a unit the server has already hidden. */
+function scalesAtNight(kind: EntKind): boolean {
+  switch (kind) {
+    case 'hero':
+    case 'melee':
+    case 'ranged':
+    case 'siege':
+    case 'shade':
+    case 'campPack':
+    case 'campBrute':
+    case 'campHive':
+      return true;
+    case 'ward':
+    case 'tower':
+    case 'guard':
+    case 'ancient':
+    case 'proj':
+      return false;
+  }
+}
+
+/** Multiplier on a living source's radius: 1 at full day, NIGHT_VISION_MULT at
+ *  full night, LINEAR between — the sim ramps rather than snapping, and a step
+ *  here would put a vision cliff in the middle of a dusk the renderer is
+ *  drawing as a gradient. `dayPhase` is contractually [0,1]; it is clamped
+ *  anyway so a malformed frame cannot grow anybody's vision. */
+function nightVisionScale(dayPhase: number): number {
+  const p = dayPhase > 0 ? (dayPhase < 1 ? dayPhase : 1) : 0;
+  return 1 - (1 - NIGHT_VISION_MULT) * p;
+}
+
+/** rgba() string from an APAL hex. Every colour literal in this file stays
+ *  palette-traceable even where only the alpha channel is ever read. */
 function rgbaOf(hex: string, alpha: number): string {
   const r = parseInt(hex.slice(1, 3), 16);
   const g = parseInt(hex.slice(3, 5), 16);
@@ -165,9 +283,11 @@ function makeCanvas(res: number): [HTMLCanvasElement, CanvasRenderingContext2D] 
   return [cv, ctx];
 }
 
-// ---- procedural value noise (deterministic — mulberry32, never Math.random) ----
-/** RES² field in [0,1]: three octaves (large soft drift + mid blotches + fine
- *  grain) so shroud/dim modulation reads as organic darkness, not static. */
+// ---- procedural value noise (deterministic — mulberry32, never Math.random) --
+/** NOISE_RES² field in [0,1]: three octaves (large soft drift + mid blotches +
+ *  fine grain) so the shroud reads as organic darkness rather than static. The
+ *  octave grids index with `% n`, so the field TILES seamlessly and can be
+ *  repeat-wrapped across the whole overlay. */
 const noiseField = ((): Float32Array => {
   let seed = 0x9e3779b9;
   const rnd: () => number = () => {
@@ -204,45 +324,65 @@ const noiseField = ((): Float32Array => {
   const g4 = grid(4);
   const g16 = grid(16);
   const g64 = grid(64);
-  const field = new Float32Array(RES * RES);
-  for (let y = 0; y < RES; y++) {
-    for (let x = 0; x < RES; x++) {
-      const u = x / RES;
-      const v = y / RES;
-      field[y * RES + x] =
+  const field = new Float32Array(NOISE_RES * NOISE_RES);
+  for (let y = 0; y < NOISE_RES; y++) {
+    for (let x = 0; x < NOISE_RES; x++) {
+      const u = x / NOISE_RES;
+      const v = y / NOISE_RES;
+      field[y * NOISE_RES + x] =
         0.35 * sample(g4, 4, u, v) + 0.35 * sample(g16, 16, u, v) + 0.3 * sample(g64, 64, u, v);
     }
   }
   return field;
 })();
 
-/** Noise-field sample at fractional canvas coords, clamped (used by the
- *  explored-rim wobble, whose samples sit between texels). */
-function noiseAt(x: number, y: number): number {
-  const xi = Math.max(0, Math.min(RES - 1, Math.round(x)));
-  const yi = Math.max(0, Math.min(RES - 1, Math.round(y)));
-  return noiseField[yi * RES + xi] ?? 0.5;
+/** Noise sample at RES-space canvas coordinates, wrapped (the field tiles).
+ *  Used by the explored-rim wobble and the map-edge feather, whose samples sit
+ *  between texels. */
+function noiseAtRes(x: number, y: number): number {
+  const xi = (((Math.round(x * (NOISE_RES / RES)) % NOISE_RES) + NOISE_RES) % NOISE_RES) | 0;
+  const yi = (((Math.round(y * (NOISE_RES / RES)) % NOISE_RES) + NOISE_RES) % NOISE_RES) | 0;
+  return noiseField[yi * NOISE_RES + xi] ?? 0.5;
+}
+
+/** One live vision source, flattened to numbers and POOLED: `update` refills
+ *  the window every snapshot and `isVisible` reads it on the audio and FX hot
+ *  paths, so neither may allocate. */
+interface Disc {
+  x: number;
+  z: number;
+  /** Full vision radius in metres, night scale already applied. */
+  r: number;
+  /** `(r * VIS_R_FRACTION)²`, the `isVisible` test. */
+  r2: number;
+  /** Viewer stands on ELEV_LOW, so it sees no ELEV_HIGH ground. */
+  low: boolean;
 }
 
 export function createFog(scene: SceneHandle, map: MapDef): FogHandle {
   const core = sceneCore(scene);
-  const scale = RES / map.side;
+  const terrain: TerrainDef = map.terrain;
+  const side = map.side;
+  /** RES texels per world metre. */
+  const scale = RES / side;
 
   const [visNow, vctx] = makeCanvas(RES);
   const [explored, ectx] = makeCanvas(RES);
+  const [scratch, sctx] = makeCanvas(RES);
   const [blurBuf, bctx] = makeCanvas(BLUR_RES);
   const [mask, mctx] = makeCanvas(RES);
   const [hard, hctx] = makeCanvas(RES);
 
-  /** Grayscale emissive-modulation canvas for the shroud (multiplier
-   *  GRAIN_LO..GRAIN_LO+GRAIN_SPAN) — painted ONCE from the noise field,
-   *  drawn under every hard compose so the shroud's RGB is living grain
-   *  while its alpha stays the unexplored mask. Procedural, no textures
-   *  (§0 CanvasTexture amendment). */
-  const [shroudNoise, nctx] = makeCanvas(RES);
+  // ---- the shroud grain tile ------------------------------------------------
+  // Greyscale multiplier GRAIN_LO..GRAIN_LO+GRAIN_SPAN, painted once from the
+  // noise field. It rides the sheets' SECOND uv set in metres, so it repeats
+  // across the whole overlay at a fixed world density and drifts (see the frame
+  // hook) — the mask's own ClampToEdge border can never do that, which is why
+  // the previous build's outskirts measured a dead flat fill.
+  const [grainTile, gctx] = makeCanvas(NOISE_RES);
   {
-    const img = nctx.createImageData(RES, RES);
-    for (let i = 0; i < RES * RES; i++) {
+    const img = gctx.createImageData(NOISE_RES, NOISE_RES);
+    for (let i = 0; i < NOISE_RES * NOISE_RES; i++) {
       const m = GRAIN_LO + (noiseField[i] ?? 0.5) * GRAIN_SPAN;
       const g = Math.max(0, Math.min(255, Math.round(m * 255)));
       img.data[i * 4] = g;
@@ -250,31 +390,73 @@ export function createFog(scene: SceneHandle, map: MapDef): FogHandle {
       img.data[i * 4 + 2] = g;
       img.data[i * 4 + 3] = 255;
     }
-    nctx.putImageData(img, 0, 0);
+    gctx.putImageData(img, 0, 0);
   }
 
-  // ---- boot-baked map-edge feather overlays --------------------------------------
-  // featherErase: alpha 1 at the outermost texel -> 0 at the inner edge of a
-  // wobbling ~FEATHER-texel band (smoothstep, wobble from the noise field so
-  // the seam is never ruler-straight). destination-out with it punches the
-  // border band down on both planes.
-  // featherDim: same band profile scaled to DIM_ALPHA over the shroud hex.
-  // destination-over lays it UNDER the punched mask border: alpha ends
-  // EXACTLY at DIM_ALPHA on the outermost texel (dim dusk outskirts, never
-  // transparent, never opaque), while on `hard` the erase alone leaves the
-  // border clear (the high shroud dissolves at the map edge). Baked ONCE —
-  // no per-update ImageData pass (the round-5 full-canvas readback was the
-  // bulk of the 5Hz update cost at 512²).
+  // ---- per-source stamps ----------------------------------------------------
+  // Baked once and blitted with drawImage. A CanvasGradient built per source
+  // per update was the previous build's only allocating path in `update`.
+  const [discSprite, dpctx] = makeCanvas(SPRITE_RES);
+  {
+    // live vision: full alpha to 0.65r, soft to nothing at r — 3.9 m of falloff
+    // on a hero's 11 m radius, which is the "soft edge of vision" of §10 and
+    // the reason VIS_R_FRACTION below is 0.945 rather than 1.
+    const c = SPRITE_RES / 2;
+    const g = dpctx.createRadialGradient(c, c, 0, c, c, c);
+    g.addColorStop(0, rgbaOf(APAL.paper, 1));
+    g.addColorStop(0.65, rgbaOf(APAL.paper, 1));
+    g.addColorStop(1, rgbaOf(APAL.paper, 0));
+    dpctx.fillStyle = g;
+    dpctx.fillRect(0, 0, SPRITE_RES, SPRITE_RES);
+  }
+
+  // ---- the ELEV_HIGH stencil ------------------------------------------------
+  // Alpha 1 over every cell a low viewer may not see into — the uphill veto,
+  // baked once. Rasterised at the terrain grid's OWN resolution (one texel per
+  // cell, so the loop is dim² frozen-query lookups rather than RES² and carries
+  // exactly the same information), then upscaled and blurred into the full-res
+  // stencil so the punched boundary is a soft pixel edge, never a stair-step.
+  // `scratch` is free at boot, so neither step costs an extra canvas.
+  const [highStencil, hsctx] = makeCanvas(RES);
+  {
+    const dim = terrain.grid.dim;
+    const [cells, cctx] = makeCanvas(dim);
+    const img = cctx.createImageData(dim, dim);
+    for (let cz = 0; cz < dim; cz++) {
+      const wz = (cz + 0.5) * (side / dim);
+      for (let cx = 0; cx < dim; cx++) {
+        if (elevationAt(terrain, (cx + 0.5) * (side / dim), wz) !== ELEV_HIGH) continue;
+        img.data[(cz * dim + cx) * 4 + 3] = 255;
+      }
+    }
+    cctx.putImageData(img, 0, 0);
+    sctx.clearRect(0, 0, RES, RES);
+    sctx.filter = `blur(${String(STENCIL_BLUR)}px)`;
+    sctx.drawImage(cells, 0, 0, RES, RES);
+    sctx.filter = 'none';
+    hsctx.clearRect(0, 0, RES, RES);
+    hsctx.drawImage(scratch, 0, 0);
+  }
+
+  // ---- boot-baked map-edge feather -----------------------------------------
+  // The sheets are far larger than the map square and the mask is ClampToEdge,
+  // so the border texels stretch over every out-of-bounds metre of ground.
+  // featherErase ramps alpha 1 at the outermost texel to 0 across a wobbling
+  // ~FEATHER band; featherDim lays DIM_ALPHA back underneath it. Result: `mask`
+  // ends at exactly DIM_ALPHA (dim dusk outskirts — never transparent, or lit
+  // ground ghosts through; never opaque, or the world ends as a pitch island)
+  // and `hard` dissolves to clear instead of stopping on a straight line.
+  // Baked ONCE: a per-update ImageData pass at 512² dominated the 5 Hz cost.
   const [featherErase, fectx] = makeCanvas(RES);
   const [featherDim, fdctx] = makeCanvas(RES);
   {
-    const band = FEATHER + FEATHER_WOBBLE + 1; // widest possible wobbled band
+    const band = FEATHER + FEATHER_WOBBLE + 1;
     const eraseImg = fectx.createImageData(RES, RES);
     const dimImg = fdctx.createImageData(RES, RES);
     const sr = parseInt(APAL.shroud.slice(1, 3), 16);
     const sg = parseInt(APAL.shroud.slice(3, 5), 16);
     const sb = parseInt(APAL.shroud.slice(5, 7), 16);
-    const strips: Array<[number, number, number, number]> = [
+    const strips: readonly (readonly [number, number, number, number])[] = [
       [0, 0, RES, band],
       [0, RES - band, RES, band],
       [0, band, band, RES - 2 * band],
@@ -286,17 +468,16 @@ export function createFog(scene: SceneHandle, map: MapDef): FogHandle {
           const x = sx + xx;
           const y = sy + yy;
           const edge = Math.min(x, RES - 1 - x, y, RES - 1 - y);
-          const b = FEATHER + ((noiseField[y * RES + x] ?? 0.5) - 0.5) * 2 * FEATHER_WOBBLE;
+          const b = FEATHER + (noiseAtRes(x, y) - 0.5) * 2 * FEATHER_WOBBLE;
           if (edge >= b) continue;
           const s = 1 - edge / b;
-          const p = s * s * (3 - 2 * s); // 1 at the outermost texel -> 0 inward
-          const ei = (y * RES + x) * 4;
-          eraseImg.data[ei + 3] = Math.round(p * 255);
-          const di = ei;
-          dimImg.data[di] = sr;
-          dimImg.data[di + 1] = sg;
-          dimImg.data[di + 2] = sb;
-          dimImg.data[di + 3] = Math.round(p * DIM_ALPHA * 255);
+          const p = s * s * (3 - 2 * s);
+          const i = (y * RES + x) * 4;
+          eraseImg.data[i + 3] = Math.round(p * 255);
+          dimImg.data[i] = sr;
+          dimImg.data[i + 1] = sg;
+          dimImg.data[i + 2] = sb;
+          dimImg.data[i + 3] = Math.round(p * DIM_ALPHA * 255);
         }
       }
     }
@@ -304,8 +485,8 @@ export function createFog(scene: SceneHandle, map: MapDef): FogHandle {
     fdctx.putImageData(dimImg, 0, 0);
   }
 
-  /** Apply the baked feather to a fog canvas (LAST compose step).
-   *  withDim: mask (border -> DIM_ALPHA outskirts) vs hard (border -> clear). */
+  /** Apply the baked feather — always the LAST compose step on a canvas.
+   *  `withDim`: `mask` (border -> DIM_ALPHA) vs `hard` (border -> clear). */
   function feather(ctx: CanvasRenderingContext2D, withDim: boolean): void {
     ctx.globalCompositeOperation = 'destination-out';
     ctx.globalAlpha = 1;
@@ -317,166 +498,392 @@ export function createFog(scene: SceneHandle, map: MapDef): FogHandle {
     ctx.globalCompositeOperation = 'source-over';
   }
 
-  // boot state: everything unexplored (outskirts dim per the feather law)
+  // boot state: nothing explored anywhere (outskirts dim per the feather law)
   mctx.fillStyle = APAL.shroud;
   mctx.fillRect(0, 0, RES, RES);
   feather(mctx, true);
-  hctx.drawImage(shroudNoise, 0, 0);
+  hctx.fillStyle = APAL.shroud;
+  hctx.fillRect(0, 0, RES, RES);
   feather(hctx, false);
 
-  /** Vision discs of the last update (world coords) — isVisible's data, no
-   *  canvas readback. */
-  let discs: Array<{ x: number; z: number; r: number }> = [];
+  // ---- terrain-conformal overlay sheets -------------------------------------
+  /** Height the sheet must clear at (x,z): the MAX of five taps over ±H_TAP.
+   *  A plain sample interpolates straight through a cliff face; the max makes
+   *  the sheet take the step one quad early and ride the ridge instead. */
+  function ridgeSafeHeight(x: number, z: number): number {
+    let h = core.heightAt(x, z);
+    const a = core.heightAt(x - H_TAP, z);
+    if (a > h) h = a;
+    const b = core.heightAt(x + H_TAP, z);
+    if (b > h) h = b;
+    const c = core.heightAt(x, z - H_TAP);
+    if (c > h) h = c;
+    const d = core.heightAt(x, z + H_TAP);
+    if (d > h) h = d;
+    return h;
+  }
 
-  // ---- world overlay planes ----------------------------------------------------
-  // Plane spans PLANE_SPAN * map.side (covers the whole ground disc); the mask
-  // texture maps the map square onto the plane's centre, clamped at the edges
-  // so the border texels' shroud extends over every out-of-bounds pixel of
-  // ground. uv' = uv*repeat + offset with repeat = span/side: the map square
-  // (the plane's central 1/PLANE_SPAN) samples exactly [0,1] of the mask —
-  // repeat > 1, offset negative (getting this backwards silently samples the
-  // map CENTRE everywhere — measured on the fog-edge capture).
-  const span = map.side * PLANE_SPAN;
-  const uvScale = PLANE_SPAN;
-  const uvOffset = -(PLANE_SPAN - 1) / 2;
+  /**
+   * One overlay sheet in WORLD coordinates: the map square sampled every
+   * `cellM` metres, plus SKIRT_RINGS of quadratically expanding quads out to
+   * PLANE_SPAN so the sheet covers the entire visible ground disc. The skirt
+   * densifies toward the map edge, where the height still varies, and its
+   * vertices sample `heightAt` too — out of bounds that clamps to the nearest
+   * in-bounds cell, so the sheet leaves the map at the height the map ends at
+   * instead of dropping to y=0 and tearing away from the ground.
+   *
+   * `uv` maps the map square onto [0,1] of the mask — computed in GEOMETRY
+   * SPACE, which is why no texture in this module sets `repeat` (the UV law).
+   * v is flipped because a CanvasTexture uploads with flipY, so v=1 is canvas
+   * row 0, which is world z=0. `uv1` carries the grain tile, in metres/tile.
+   */
+  function buildSheet(lift: number, tileM: number, cellM: number): THREE.BufferGeometry {
+    const inner = Math.max(8, Math.round(side / cellM));
+    const margin = (side * (PLANE_SPAN - 1)) / 2;
+    const n = SKIRT_RINGS * 2 + inner + 1;
+    const axis = new Float64Array(n);
+    for (let k = 0; k < SKIRT_RINGS; k++) {
+      const t = (SKIRT_RINGS - k) / SKIRT_RINGS;
+      const d = margin * t * t;
+      axis[k] = -d;
+      axis[n - 1 - k] = side + d;
+    }
+    for (let i = 0; i <= inner; i++) axis[SKIRT_RINGS + i] = (i * side) / inner;
+
+    const vertCount = n * n;
+    const pos = new Float32Array(vertCount * 3);
+    const uv = new Float32Array(vertCount * 2);
+    const uv1 = new Float32Array(vertCount * 2);
+    let p = 0;
+    let q = 0;
+    for (let r = 0; r < n; r++) {
+      const z = axis[r] ?? 0;
+      for (let c = 0; c < n; c++) {
+        const x = axis[c] ?? 0;
+        pos[p] = x;
+        pos[p + 1] = ridgeSafeHeight(x, z) + lift;
+        pos[p + 2] = z;
+        p += 3;
+        uv[q] = x / side;
+        uv[q + 1] = 1 - z / side;
+        uv1[q] = x / tileM;
+        uv1[q + 1] = z / tileM;
+        q += 2;
+      }
+    }
+
+    const quads = (n - 1) * (n - 1);
+    const idx = new Uint32Array(quads * 6);
+    let t = 0;
+    for (let r = 0; r < n - 1; r++) {
+      for (let c = 0; c < n - 1; c++) {
+        const a = r * n + c;
+        const b = a + 1;
+        const d = a + n;
+        const e = d + 1;
+        // winding chosen so computeVertexNormals yields +Y (checked by hand:
+        // cross(pC-pB, pA-pB) = (0, dx*dz, 0) for both triangles)
+        idx[t] = a;
+        idx[t + 1] = d;
+        idx[t + 2] = b;
+        idx[t + 3] = b;
+        idx[t + 4] = d;
+        idx[t + 5] = e;
+        t += 6;
+      }
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    geo.setAttribute('uv1', new THREE.BufferAttribute(uv1, 2));
+    geo.setIndex(new THREE.BufferAttribute(idx, 1));
+    geo.computeVertexNormals();
+    // VERTEX-COLOUR LAW (GRAPHICS_CONTRACT §2): this geometry never passes
+    // through the kit's bake(), and every kit material is vertexColors:true —
+    // without the neutral white attribute both sheets render black.
+    whiteVertexColors(geo);
+    geo.computeBoundingSphere();
+    return geo;
+  }
+
+  // ---- textures -------------------------------------------------------------
   const maskTex = new THREE.CanvasTexture(mask);
   maskTex.colorSpace = THREE.SRGBColorSpace;
-  maskTex.repeat.set(uvScale, uvScale);
-  maskTex.offset.set(uvOffset, uvOffset);
   const hardTex = new THREE.CanvasTexture(hard);
-  // hardTex doubles as the shroud's emissiveMap: leave it in LINEAR space so
-  // the painted grayscale noise acts as a raw GRAIN_LO..1.05 multiplier on
-  // the emissive (an sRGB decode would skew the grain dark and kill the mean).
-  hardTex.repeat.set(uvScale, uvScale);
-  hardTex.offset.set(uvOffset, uvOffset);
-  // Independent REPEAT-wrapped noise texture for the LOW plane's emissiveMap:
-  // the mask's own ClampToEdge border can never vary inside the diagonal
-  // outskirt quadrants (both uv coords clamp to ONE corner texel — the
-  // residual stdev-0.00 fill), so the dim grain rides this second texture
-  // whose wrap keeps the noise alive over the whole overlay span. Linear
-  // space, same density as the mask.
-  const dimNoiseTex = new THREE.CanvasTexture(shroudNoise);
-  dimNoiseTex.wrapS = THREE.RepeatWrapping;
-  dimNoiseTex.wrapT = THREE.RepeatWrapping;
-  dimNoiseTex.repeat.set(uvScale, uvScale);
-  dimNoiseTex.offset.set(uvOffset, uvOffset);
+  hardTex.colorSpace = THREE.SRGBColorSpace;
+  /** Two independent textures over the ONE grain canvas, so each sheet can
+   *  drift its own offset. LINEAR (`NoColorSpace`): the painted greyscale is a
+   *  raw multiplier on the emissive, and an sRGB decode would skew it dark and
+   *  break the mean the emissive solve divides out. Channel 1 = the `uv1`
+   *  attribute built above; the UV law is satisfied in geometry space, so
+   *  neither texture touches `repeat`. */
+  function grainTexture(): THREE.CanvasTexture {
+    const tex = new THREE.CanvasTexture(grainTile);
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.colorSpace = THREE.NoColorSpace;
+    tex.channel = 1;
+    return tex;
+  }
+  const lowGrain = grainTexture();
+  const highGrain = grainTexture();
 
-  /** Emissive lift toward inkLit, COMPUTED from the palette: the grain
-   *  multiplier's mean must reproduce the round-5 shroud level the scene
-   *  exposure was calibrated against (scene.ts: the 0.55 dim clears 8 L*
-   *  over the shroud — measured when the shroud rendered at
-   *  (shroud + 0.28*(inkLit-shroud)) * 0.75 per channel). With the wider
-   *  GRAIN_MEAN=0.54 multiplier the lift rises to hold that same observed
-   *  mean: lifted * 0.5 ≈ (shroud + 0.28*(inkLit-shroud)) * 0.75. The
-   *  GRAIN_MEAN_TRIM pulls the solved lift back 18% — the linear solve
-   *  overshoots through the ACES curve + the realized noise-field mean
-   *  (measured +25% mean L* on the fog-edge capture, which narrowed the
-   *  dim/shroud ladder clearance; trimmed back to the calibrated level). */
-  const GRAIN_MEAN_TRIM = 0.82;
-  const emissiveLift = ((): number => {
-    const chan = (hex: string): number[] => [
-      parseInt(hex.slice(1, 3), 16) / 255,
-      parseInt(hex.slice(3, 5), 16) / 255,
-      parseInt(hex.slice(5, 7), 16) / 255,
-    ];
-    const s = chan(APAL.shroud);
-    const l = chan(APAL.inkLit);
-    let sum = 0;
-    let n = 0;
-    for (let c = 0; c < 3; c++) {
-      const sv = s[c] ?? 0;
-      const lv = l[c] ?? 0;
-      const denom = lv - sv;
-      if (denom <= 1e-6) continue;
-      // solve lifted = shroud + lift*(inkLit-shroud) for the calibrated mean
-      sum += ((0.75 * (sv + 0.28 * denom)) / GRAIN_MEAN - sv) / denom;
-      n++;
-    }
-    return n > 0 ? (sum / n) * GRAIN_MEAN_TRIM : 0.46;
-  })();
-  const shroudEmissive = mix(APAL.shroud, APAL.inkLit, emissiveLift);
+  // ---- materials ------------------------------------------------------------
+  /** The overlay material: a CLONE of the kit's cloth-in-shroud surface. Cloned
+   *  because `surface()` caches per (id, tint) and every banner and tabard in
+   *  the game shares that instance — mutating it here would drag them all into
+   *  transparency. The clone sets only overlay state the surface table does not
+   *  describe; roughness, metalness and albedo remain the table's.
+   *
+   *  `normalMap = null` is not a preference, it is forced: the kit caches its
+   *  generated maps, so the weave texture on this material is the SAME object
+   *  every banner samples, and the only way to give it a sane world density
+   *  here would be to move it onto channel 1 — mutating shared state. A weave
+   *  relief on atmosphere is the UI-lid read anyway; the drifting grain carries
+   *  all of this surface's structure. */
+  function overlayMaterial(
+    mapTex: THREE.CanvasTexture,
+    grain: THREE.CanvasTexture,
+    shroudHex: string,
+  ): THREE.MeshStandardMaterial {
+    const m = surface('cloth', APAL.shroud).clone();
+    m.name = 'rift:fogOverlay';
+    m.map = mapTex;
+    m.normalMap = null;
+    m.envMapIntensity = 0;
+    m.emissive.set(shroudHex);
+    m.emissiveMap = grain;
+    m.emissiveIntensity = 1 / GRAIN_MEAN; // re-solved against exposure below
+    m.transparent = true;
+    m.depthWrite = false;
+    m.fog = false;
+    m.needsUpdate = true;
+    return m;
+  }
+  const lowMat = overlayMaterial(maskTex, lowGrain, mix(APAL.shroud, APAL.dirtLit, WARM_DIM));
+  const highMat = overlayMaterial(hardTex, highGrain, APAL.shroud);
 
-  const mkPlane = (
-    tex: THREE.CanvasTexture,
-    y: number,
+  function addSheet(
+    geo: THREE.BufferGeometry,
+    mat: THREE.MeshStandardMaterial,
     order: number,
-    emissiveHex: string,
-    emissiveTex: THREE.CanvasTexture | null,
-  ): THREE.Mesh => {
-    const m = new THREE.MeshLambertMaterial({
-      color: APAL.inkDeep, // lit contribution ≈ black; emissive carries it
-      emissive: emissiveHex,
-      map: tex,
-      emissiveMap: emissiveTex,
-      transparent: true,
-      depthWrite: false,
-      fog: false,
-      flatShading: true,
-    });
-    const plane = new THREE.Mesh(new THREE.PlaneGeometry(span, span), m);
-    plane.geometry.rotateX(-Math.PI / 2);
-    plane.position.set(map.side / 2, y, map.side / 2);
-    plane.renderOrder = order;
-    return plane;
-  };
-  // both planes: shroud emissive lifted toward inkLit by exactly the amount
-  // the grain multiplier's mean pulls back down — the MEAN renders ≈
-  // `shroud`, the grain around it is the "intentional darkness"/dim-fill
-  // modulation, now strong enough to read at frame scale
-  core.three.add(mkPlane(maskTex, LOW_Y, 60, shroudEmissive, dimNoiseTex));
-  core.three.add(mkPlane(hardTex, HIGH_Y, 61, shroudEmissive, hardTex));
+  ): void {
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.renderOrder = order;
+    mesh.castShadow = false;
+    mesh.receiveShadow = false;
+    // Emissive, and deliberately NOT markBloom()'d: the shroud is darkness, not
+    // a light source, and hazing the frame with it is the amateur bloom tell
+    // STYLE_BIBLE §6 bans.
+    mesh.matrixAutoUpdate = false;
+    mesh.updateMatrix();
+    core.three.add(mesh);
+  }
+  addSheet(buildSheet(LOW_LIFT, LOW_TILE_M, LOW_CELL_M), lowMat, LOW_ORDER);
+  addSheet(buildSheet(HIGH_LIFT, HIGH_TILE_M, HIGH_CELL_M), highMat, HIGH_ORDER);
+
+  // ---- frame hook: mist drift + the exposure solve --------------------------
+  // Allocation-free by construction: four float adds, two texture offsets, and
+  // two writes that only happen on the frames where R_SCENE actually moves the
+  // exposure ramp (setTimeOfDay, 2.75 day -> 1.9 night).
+  let lastExposure = -1;
+  core.addFrameHook((dtMs: number) => {
+    const exposure = core.renderer.toneMappingExposure;
+    if (exposure > 0 && exposure !== lastExposure) {
+      lastExposure = exposure;
+      // emissive * intensity * grainMean * exposure == linear(APAL.shroud)
+      const k = 1 / (exposure * GRAIN_MEAN);
+      lowMat.emissiveIntensity = k;
+      highMat.emissiveIntensity = k;
+    }
+    const dt = dtMs * 0.001;
+    let lu = lowGrain.offset.x + (dt * LOW_DRIFT_X) / LOW_TILE_M;
+    let lv = lowGrain.offset.y + (dt * LOW_DRIFT_Z) / LOW_TILE_M;
+    let hu = highGrain.offset.x + (dt * HIGH_DRIFT_X) / HIGH_TILE_M;
+    let hv = highGrain.offset.y + (dt * HIGH_DRIFT_Z) / HIGH_TILE_M;
+    // keep the offsets inside one tile forever — an unbounded accumulator loses
+    // float precision over a 30-minute match and the mist starts stepping
+    if (lu > 1) lu -= 1;
+    else if (lu < 0) lu += 1;
+    if (lv > 1) lv -= 1;
+    else if (lv < 0) lv += 1;
+    if (hu > 1) hu -= 1;
+    else if (hu < 0) hu += 1;
+    if (hv > 1) hv -= 1;
+    else if (hv < 0) hv += 1;
+    lowGrain.offset.set(lu, lv);
+    highGrain.offset.set(hu, hv);
+  });
+
+  // ---- live vision ----------------------------------------------------------
+  const discPool: Disc[] = [];
+  let discCount = 0;
+
+  /** Next pooled Disc, growing the pool at most once per peak source count. */
+  function pushDisc(): Disc {
+    const held = discPool[discCount];
+    discCount++;
+    if (held !== undefined) return held;
+    const fresh: Disc = { x: 0, z: 0, r: 0, r2: 0, low: false };
+    discPool.push(fresh);
+    return fresh;
+  }
+
+  /** Which team's eyes we are drawing. Resolved once and then fixed for the
+   *  match. `YouSnap` carries no team, so it is recovered from the snapshot by
+   *  three independent tells, cheapest and most certain first:
+   *    1. a `ward` in the snapshot is ALWAYS ours — the sim drops enemy wards
+   *       unconditionally, at any range;
+   *    2. the hero entity standing exactly where `snap.you` says we are;
+   *    3. a DEAD mobile — the sim sends its own team's mobiles alive or dead
+   *       and drops dead enemies, so a corpse on the wire is one of ours.
+   *  Until one fires, every source in the snapshot counts, which is the
+   *  behaviour of the previous build: over-generous for one frame, never a
+   *  crash, and never a black screen. */
+  let selfTeam: TeamId | null = null;
+  function resolveSelfTeam(snap: SnapMsg): void {
+    if (selfTeam !== null) return;
+    for (const e of snap.ents) {
+      if (e.k === 'ward' && isPlayerTeam(e.team)) {
+        selfTeam = e.team;
+        return;
+      }
+    }
+    const you = snap.you;
+    if (you !== null) {
+      for (const e of snap.ents) {
+        if (e.k !== 'hero' || e.hero !== you.hero || !isPlayerTeam(e.team)) continue;
+        if (Math.abs(e.x - you.x) > SELF_EPS || Math.abs(e.z - you.z) > SELF_EPS) continue;
+        selfTeam = e.team;
+        return;
+      }
+    }
+    for (const e of snap.ents) {
+      if (e.hp > 0 || !isPlayerTeam(e.team)) continue;
+      if (e.k === 'tower' || e.k === 'guard' || e.k === 'ancient' || e.k === 'proj') continue;
+      selfTeam = e.team;
+      return;
+    }
+  }
+
+  /** Stamp `sprite` centred on a world point at a world radius. */
+  function blit(
+    ctx: CanvasRenderingContext2D,
+    sprite: HTMLCanvasElement,
+    x: number,
+    z: number,
+    r: number,
+  ): void {
+    const pr = r * scale;
+    ctx.drawImage(sprite, x * scale - pr, z * scale - pr, pr * 2, pr * 2);
+  }
+
+  /** Solid explored blob with a noise-wobbled rim, so overlapping blobs along a
+   *  lane never union into a ruler-straight boundary. Solid (alpha 1) on
+   *  purpose: a gradient re-stamped at 5 Hz has its falloff band ratcheted to
+   *  binary by source-over alpha within seconds. The soft edge is applied once,
+   *  at compose time, by the gaussian below. */
+  function blob(ctx: CanvasRenderingContext2D, x: number, z: number, r: number): void {
+    const px = x * scale;
+    const py = z * scale;
+    const pr = r * scale;
+    ctx.beginPath();
+    for (let s = 0; s <= RIM_SEGMENTS; s++) {
+      const ang = (s / RIM_SEGMENTS) * Math.PI * 2;
+      const cs = Math.cos(ang);
+      const sn = Math.sin(ang);
+      const rr = pr * (1 + RIM_WOBBLE * 2 * (noiseAtRes(px + cs * pr, py + sn * pr) - 0.5));
+      const bx = px + cs * rr;
+      const by = py + sn * rr;
+      if (s === 0) ctx.moveTo(bx, by);
+      else ctx.lineTo(bx, by);
+    }
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  /** Punch every ELEV_HIGH cell out of `scratch`, then merge it into `dst`.
+   *  This is the uphill veto: a low viewer's disc is drawn into `scratch`, and
+   *  what survives is only the low ground it can actually see. */
+  function mergeLowLayer(dst: CanvasRenderingContext2D): void {
+    sctx.globalCompositeOperation = 'destination-out';
+    sctx.globalAlpha = 1;
+    sctx.drawImage(highStencil, 0, 0);
+    sctx.globalCompositeOperation = 'source-over';
+    dst.globalCompositeOperation = 'source-over';
+    dst.globalAlpha = 1;
+    dst.drawImage(scratch, 0, 0);
+  }
 
   function update(snap: SnapMsg): void {
-    // this update's visible discs, soft radial edges (CONTRACT §6 falloff)
-    vctx.clearRect(0, 0, RES, RES);
-    discs = [];
-    for (const e of snap.ents) {
-      const r = VISION[e.k];
-      if (r <= 0 || e.hp <= 0) continue;
-      discs.push({ x: e.x, z: e.z, r: r * VIS_R_FRACTION });
-      const px = e.x * scale;
-      const py = e.z * scale;
-      const pr = r * scale;
-      const grad = vctx.createRadialGradient(px, py, 0, px, py, pr);
-      grad.addColorStop(0, rgbaOf(APAL.paper, 1));
-      grad.addColorStop(0.65, rgbaOf(APAL.paper, 1));
-      grad.addColorStop(1, rgbaOf(APAL.paper, 0));
-      vctx.fillStyle = grad;
-      vctx.beginPath();
-      vctx.arc(px, py, pr, 0, Math.PI * 2);
-      vctx.fill();
+    resolveSelfTeam(snap);
+    const night = nightVisionScale(snap.dayPhase);
 
-      // persistent explored memory: a SOLID blob per ent (alpha 1 — nothing
-      // to erode; the round-5 'lighten' gradient accumulation ratcheted the
-      // falloff band to binary). The rim wobbles ±9% with the noise field so
-      // corridors of overlapping blobs never union into a straight seam.
-      ectx.fillStyle = rgbaOf(APAL.paper, 1);
-      ectx.beginPath();
-      for (let sgm = 0; sgm <= RIM_SEGMENTS; sgm++) {
-        const ang = (sgm / RIM_SEGMENTS) * Math.PI * 2;
-        const rx = px + Math.cos(ang) * pr;
-        const ry = py + Math.sin(ang) * pr;
-        const rr = pr * (1 + RIM_WOBBLE * 2 * (noiseAt(rx, ry) - 0.5));
-        const bx = px + Math.cos(ang) * rr;
-        const by = py + Math.sin(ang) * rr;
-        if (sgm === 0) ectx.moveTo(bx, by);
-        else ectx.lineTo(bx, by);
-      }
-      ectx.closePath();
-      ectx.fill();
+    // --- this team's living eyes, night-scaled, elevation resolved once ------
+    discCount = 0;
+    for (const e of snap.ents) {
+      if (e.hp <= 0) continue;
+      if (selfTeam !== null && e.team !== selfTeam) continue;
+      const base = VISION[e.k];
+      if (base <= 0) continue;
+      const r = scalesAtNight(e.k) ? base * night : base;
+      const d = pushDisc();
+      d.x = e.x;
+      d.z = e.z;
+      d.r = r;
+      const vr = r * VIS_R_FRACTION;
+      d.r2 = vr * vr;
+      d.low = elevationAt(terrain, e.x, e.z) !== ELEV_HIGH;
     }
 
-    // the soft edge, paid ONCE: gaussian-blur the binary explored mask into
-    // the half-res blurBuf (same world-space sigma, quarter of the pixels);
-    // drawImage upscales it smoothly into both plane composites below
+    // --- pass A: what is visible RIGHT NOW -----------------------------------
+    vctx.globalCompositeOperation = 'source-over';
+    vctx.globalAlpha = 1;
+    vctx.clearRect(0, 0, RES, RES);
+    sctx.clearRect(0, 0, RES, RES);
+    for (let i = 0; i < discCount; i++) {
+      const d = discPool[i];
+      if (d === undefined) continue;
+      blit(d.low ? sctx : vctx, discSprite, d.x, d.z, d.r);
+    }
+    mergeLowLayer(vctx);
+
+    // --- pass B: persistent explored memory ----------------------------------
+    // Skipped entirely while the team is still unresolved. `explored` never
+    // forgets, so burning one frame of every-source-counts into it would leave
+    // the enemy jungle permanently revealed for the rest of the match, whereas
+    // skipping costs at most one snapshot of memory the very next update
+    // re-covers. The LIVE pass above deliberately does NOT skip: a player who
+    // can see nothing is a worse failure than a player who explored 200 ms late.
+    if (selfTeam !== null) {
+      ectx.globalCompositeOperation = 'source-over';
+      ectx.globalAlpha = 1;
+      ectx.fillStyle = rgbaOf(APAL.paper, 1);
+      sctx.clearRect(0, 0, RES, RES);
+      sctx.fillStyle = rgbaOf(APAL.paper, 1);
+      for (let i = 0; i < discCount; i++) {
+        const d = discPool[i];
+        if (d === undefined) continue;
+        blob(d.low ? sctx : ectx, d.x, d.z, d.r);
+      }
+      mergeLowLayer(ectx);
+    }
+
+    // --- the soft edge, paid ONCE -------------------------------------------
+    // gaussian-blur the binary explored mask into the half-res buffer (same
+    // world-space sigma, a quarter of the pixels); drawImage upscales it
+    // smoothly into both composites below.
     bctx.globalCompositeOperation = 'source-over';
+    bctx.globalAlpha = 1;
     bctx.clearRect(0, 0, BLUR_RES, BLUR_RES);
     bctx.filter = `blur(${String(EDGE_BLUR)}px)`;
     bctx.drawImage(explored, 0, 0, BLUR_RES, BLUR_RES);
     bctx.filter = 'none';
 
-    // shared mask: shroud, punched to DIM_ALPHA by the blurred explored, to 0
-    // by the visible discs — both ramps span many texels, never a cliff
+    // --- the shared mask (the minimap reads this canvas) ---------------------
+    // shroud everywhere, punched to DIM_ALPHA by the blurred explored memory
+    // and to 0 by live vision — both ramps span many texels, never a cliff.
     mctx.globalCompositeOperation = 'source-over';
     mctx.globalAlpha = 1;
     mctx.fillStyle = APAL.shroud;
@@ -488,15 +895,16 @@ export function createFog(scene: SceneHandle, map: MapDef): FogHandle {
     mctx.drawImage(visNow, 0, 0);
     mctx.globalCompositeOperation = 'source-over';
 
-    // hard shroud: noise-grain RGB, opaque alpha only where never explored
+    // --- the high shroud: opaque only where never explored -------------------
     hctx.globalCompositeOperation = 'source-over';
     hctx.globalAlpha = 1;
-    hctx.drawImage(shroudNoise, 0, 0);
+    hctx.fillStyle = APAL.shroud;
+    hctx.fillRect(0, 0, RES, RES);
     hctx.globalCompositeOperation = 'destination-out';
     hctx.drawImage(blurBuf, 0, 0, RES, RES);
     hctx.globalCompositeOperation = 'source-over';
-    // finishing pass LAST: baked wobbling map-edge feather (mask border ->
-    // DIM_ALPHA outskirts, hard border -> clear)
+
+    // finishing pass, LAST on both: the baked wobbling map-edge feather
     feather(mctx, true);
     feather(hctx, false);
 
@@ -504,11 +912,23 @@ export function createFog(scene: SceneHandle, map: MapDef): FogHandle {
     hardTex.needsUpdate = true;
   }
 
+  /** Is this world point inside the team's live vision? Radius plus the uphill
+   *  veto, which is the only one of the sim's three rules that is a function of
+   *  POSITION alone. Concealment is not applied: it hides an entity from a
+   *  distant enemy, and answering `false` here for an ally standing in a bush
+   *  would hide something the server considers visible. Allocation-free — this
+   *  runs on the FX and audio paths. */
   function isVisible(x: number, z: number): boolean {
-    for (const d of discs) {
+    let high = -1;
+    for (let i = 0; i < discCount; i++) {
+      const d = discPool[i];
+      if (d === undefined) continue;
       const dx = x - d.x;
       const dz = z - d.z;
-      if (dx * dx + dz * dz <= d.r * d.r) return true;
+      if (dx * dx + dz * dz > d.r2) continue;
+      if (!d.low) return true;
+      if (high < 0) high = elevationAt(terrain, x, z) === ELEV_HIGH ? 1 : 0;
+      if (high === 0) return true;
     }
     return false;
   }
