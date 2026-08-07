@@ -238,6 +238,62 @@ const CAMP_WEAR_REACH = 3.4;
  *  the vertex-colour mask and nothing else, exactly as the spec requires. */
 const WEAR_SWITCH = 0.5;
 const WEAR_BLEND = 0.22;
+/** Sub-quads per axis on a passable cell that a family boundary can cross.
+ *
+ *  A cell is two triangles, so without this the finest a material boundary can
+ *  be is a half-cell — and since every family test used to key off the cell's
+ *  own kind or a per-cell distance field, it was a WHOLE cell: a hard,
+ *  axis-aligned 1 m staircase down every lane, bank and scour edge in the
+ *  frame. Three sub-quads per axis puts the switch on a 0.33 m lattice, and
+ *  `EDGE_WOBBLE` then moves it off any lattice at all.
+ *
+ *  Only boundary cells pay it (see `subOf`); the open jungle stays two
+ *  triangles, because subdividing ground with one family on it buys vertices
+ *  and nothing else. */
+const GROUND_SUB = 3;
+/** The same, for a boundary that was ALREADY ragged before this pass and only
+ *  needs the grid taken out from under it: the plateau's scour line and the
+ *  wear fringe are both noise-driven isolines, and they are also the two
+ *  largest sets of cells on the map.
+ *
+ *  MEASURED, cold, on the 3-lane map: at GROUND_SUB for everything the module
+ *  builds 184,320 triangles in 118 ms, which is 51,512 / 48 ms before this pass
+ *  and 120 ms of budget (AMENDMENT_3 §E.4). Splitting the soft boundaries out
+ *  to 2 is what pays for the hard ones. The two tiers meet at T-junctions,
+ *  which this mesh already contains by construction — a 3x3 rock face meets a
+ *  single ground quad along every ring edge — and both sides of every such edge
+ *  interpolate the SAME two corner values along the same straight segment, so a
+ *  T-junction here is collinear and cannot open. */
+const GROUND_SUB_SOFT = 2;
+/** Sub-quads per axis on a river cell's water sheet. The sheet's outline is the
+ *  waterline, and a staircase waterline is the loudest of all of them. */
+const WATER_SUB = 3;
+/** Peak displacement of a family boundary, in metres, and the noise scale that
+ *  drives it. The switch is an isoline of `signed distance + wobble`, so the
+ *  boundary is a ragged organic curve rather than a chamfered grid: at 0.55 m
+ *  against a 1 m cell it breaks the grid read outright, and the noise scale is
+ *  pinned at 2.4 m by the period argument on `NOISE_DIM` — see there. */
+const EDGE_WOBBLE = 0.55;
+const EDGE_NOISE_M = 2.4;
+/** Metres over which a family's albedo is blended into the darker family beside
+ *  it, by the same one-way multiplicative mask `MOSS_OVER_DIRT` uses. */
+const EDGE_BLEND = 0.75;
+/** Metres of wet, washed bank outside the water's own channel. */
+const WET_MARGIN = 1;
+/** A mid-scale value mottle and its noise scale: a zero-mean multiplicative
+ *  break-up filling the gap between `VALUE_VAR`'s 9 m broad shape and the
+ *  family texture's own 1 m tile, so the ground varies at every scale the eye
+ *  reads rather than at two.
+ *
+ *  IT IS NOT A MOIRE FIX, and it was tried as one. MEASURED, on `close-hero`
+ *  before and after at 4x: the paving's chain-link is unchanged. That lattice
+ *  is the `slabSeam` normal map — every 1 m tile is bit-identical and carries
+ *  four courses of brick, so it repeats perfectly — and an 11% swing in the
+ *  DIFFUSE vertex colour at 1.7 m does not disturb a normal-map lattice at
+ *  0.25 m. What it does do it does honestly; it makes no claim on the moire.
+ *  The moire is `kit.ts`'s, on both paving and water (see `emitWater`). */
+const MOTTLE_VAR = 0.11;
+const MOTTLE_M = 1.7;
 /** Metres from the nearest rock over which the ground darkens into the contact
  *  band, and the metres within which a plateau top is treated as bare rim. */
 const ROCK_CONTACT_REACH = 2.5;
@@ -259,13 +315,19 @@ const D_BANK_M = 4;
  *    fValue  at 9    m -> 1152 m, second octave 483.8 m
  *    fScour  at 6    m ->  768 m, second octave 322.6 m
  *    fWear   at 4.5  m ->  576 m, second octave 242.0 m
- *    fWear   at 3.2  m ->  409.6 m, second octave 172.0 m   <- the shortest
+ *    fWear   at 3.2  m ->  409.6 m, second octave 172.0 m
+ *    fMottle at 1.7  m ->  217.6 m, ONE octave (see `mottleAt`)
+ *    fEdge*  at 2.4  m ->  307.2 m, second octave 129.0 m   <- the shortest
  *    direct lattice reads (fCell, fCellB, fJx/fJy/fJz)      -> 128 cells
- *  The shortest sampled period is 172.0 m and the direct reads wrap at 128
+ *  The shortest sampled period is 129.0 m and the direct reads wrap at 128
  *  cells, both >= the 128 m map side, so no field and no hash repeats inside the
- *  map on either axis. At the previous NOISE_DIM of 64 the shortest period was
- *  86.0 m and the hashes wrapped at 64 cells, which the header comment claimed
- *  was ">= 280 m" and was not. */
+ *  map on either axis. That 129.0 m is what fixes `EDGE_NOISE_M` at 2.4 and not
+ *  at the 2.1 the boundary wobble would otherwise prefer: 2.1 m puts the second
+ *  octave at 112.9 m, which repeats INSIDE the map, and a repeating wobble is a
+ *  regular pattern — the exact thing the wobble exists to destroy. At the
+ *  previous NOISE_DIM of 64 the shortest period was 86.0 m and the hashes
+ *  wrapped at 64 cells, which the header comment claimed was ">= 280 m" and was
+ *  not. */
 const NOISE_DIM = 128;
 /** A material bucket smaller than this, in triangles, is not worth a draw call.
  *  Below the threshold the triangles are folded into a neighbouring family that
@@ -386,15 +448,36 @@ function linearRgb(hex: string): readonly [number, number, number] {
  * pale: (0.206, 0.469, 0.435). Computed from APAL rather than written down, so
  * a palette move cannot leave this stale.
  */
-const MOSS_OVER_DIRT: readonly [number, number, number] = (() => {
-  const m = linearRgb(APAL.moss);
-  const d = linearRgb(APAL.dirt);
+function overRatio(dark: string, bright: string): readonly [number, number, number] {
+  const m = linearRgb(dark);
+  const d = linearRgb(bright);
   return [
     clamp01(d[0] > 0 ? m[0] / d[0] : 1),
     clamp01(d[1] > 0 ? m[1] / d[1] : 1),
     clamp01(d[2] > 0 ? m[2] / d[2] : 1),
   ];
-})();
+}
+
+const MOSS_OVER_DIRT = overRatio(APAL.moss, APAL.dirt);
+/**
+ * The other two links of the same chain, so the ground's albedo is continuous
+ * across every boundary in the frame and not only across the wear fringe.
+ *
+ * The chain is paving -> dirt -> moss, and it runs one way for a reason: the
+ * mask can only DARKEN, so a family can only be blended into one that is darker
+ * on all three channels. It is, on every link — `stone` (#6e675a) over `dirt`
+ * (#66523d) over `moss` (#2e3827), and `wetStone` (#4b5259) over `moss` — so
+ * every pair that actually meets on this map is expressible.
+ *
+ * MEASURED in linear space, from APAL rather than written down:
+ *   DIRT_OVER_PAVING (0.852, 0.622, 0.456)   MOSS_OVER_WET (0.388, 0.469, 0.203)
+ * A lane's outer band therefore arrives at the verge already the colour of the
+ * earth beside it, and the wet bank arrives at the moss already the colour of
+ * the moss — which is the whole of what a two-material boundary can be blended
+ * with, and the half of the staircase that geometry cannot fix.
+ */
+const DIRT_OVER_PAVING = overRatio(APAL.dirt, APAL.stone);
+const MOSS_OVER_WET = overRatio(APAL.moss, APAL.wetStone);
 
 // ---- deterministic fields ---------------------------------------------------
 // `rng(seed)` is the only randomness source in the game, and it is a STREAM —
@@ -1048,6 +1131,98 @@ export function createTerrain(scene: SceneHandle, map: MapDef): TerrainHandle {
     }
   }
 
+  // ---- 3b. the masks, lifted off the cell grid ------------------------------
+  // EVERY field above is per CELL, and a per-cell field read as a per-cell
+  // answer is a 1 m staircase in whatever it drives. That is the whole of the
+  // boundary defect: the lane's paving stopped exactly on a cell edge, the wet
+  // bank started exactly on a cell edge, the rim rock ended exactly on a cell
+  // edge, and the wear fringe's PROXIMITY term stepped on one even though its
+  // noise term did not. Below, each of those is lifted onto the corner lattice
+  // and read by bilinear interpolation, so a boundary becomes an ISOLINE of a
+  // continuous field — which can then be displaced by noise (`EDGE_WOBBLE`) and
+  // resolved at `GROUND_SUB` per axis instead of one.
+
+  /** A per-cell field averaged onto the corner lattice. Corners on the map
+   *  frame average only the cells that exist, which is the right answer: there
+   *  is no ground out there to have a value. */
+  const cornerAvg = (cell: (p: number) => number): Float32Array => {
+    const out = new Float32Array(corners);
+    for (let cj = 0; cj < cw; cj++) {
+      for (let ci = 0; ci < cw; ci++) {
+        let s = 0;
+        let n = 0;
+        for (let j = cj - 1; j <= cj; j++) {
+          for (let i = ci - 1; i <= ci; i++) {
+            if (i < 0 || j < 0 || i >= dim || j >= dim) continue;
+            s += cell(j * dim + i);
+            n++;
+          }
+        }
+        out[cj * cw + ci] = n > 0 ? s / n : 0;
+      }
+    }
+    return out;
+  };
+
+  /** Bilinear read of a corner lattice at WORLD METRES, clamped to the grid. */
+  const latAt = (f: Float32Array, x: number, z: number): number => {
+    const fx = x / CELL_M;
+    const fz = z / CELL_M;
+    let ci = Math.floor(fx);
+    let cj = Math.floor(fz);
+    if (ci < 0) ci = 0;
+    else if (ci > cw - 2) ci = cw - 2;
+    if (cj < 0) cj = 0;
+    else if (cj > cw - 2) cj = cw - 2;
+    const c = cj * cw + ci;
+    return bilerp(
+      f[c] ?? 0,
+      f[c + 1] ?? 0,
+      f[c + cw] ?? 0,
+      f[c + cw + 1] ?? 0,
+      clamp01(fx - ci),
+      clamp01(fz - cj),
+    );
+  };
+
+  /** Signed distance to a family's own edge, in METRES, positive INSIDE it.
+   *  Built from the pair of BFS fields the family already has: the one measured
+   *  through it (how deep in) and the one measured to it (how far out). Both
+   *  count whole cells from a cell CENTRE, so the half-cell offset is what puts
+   *  the zero on the cell boundary the two fields share. */
+  const signedOf = (
+    isIn: (p: number) => boolean,
+    inD: Uint8Array,
+    outD: Uint8Array,
+    inCap: number,
+    outCap: number,
+  ): Float32Array =>
+    cornerAvg((p) =>
+      isIn(p) ? ((inD[p] ?? inCap) - 0.5) * CELL_M : -(((outD[p] ?? outCap) - 0.5) * CELL_M),
+    );
+
+  const laneSD = signedOf(
+    (p) => isKind(p, K_LANE),
+    distLaneEdge,
+    distLane,
+    cellsOf(D_LANE_EDGE_M),
+    cellsOf(D_LANE_M),
+  );
+  const riverSD = signedOf(
+    (p) => isKind(p, K_RIVER),
+    distBank,
+    distRiver,
+    cellsOf(D_BANK_M),
+    cellsOf(D_RIVER_M),
+  );
+  const cliffD = cornerAvg((p) => (distCliff[p] ?? cellsOf(D_CLIFF_M)) * CELL_M);
+  const wearD = cornerAvg((p) => (distWear[p] ?? cellsOf(D_WEAR_M)) * CELL_M);
+  /** Capped before averaging: `campDist` is 64 everywhere outside each camp's
+   *  own 14 m window, and averaging 64 against 7 across that window's edge
+   *  would invent a fringe that is nothing but the window. The cap is well past
+   *  `CAMP_WEAR_REACH`, so nothing a consumer reads is clipped. */
+  const campD = cornerAvg((p) => Math.min(campDist[p] ?? 64, 12));
+
   // ---- 4. deterministic fields --------------------------------------------
   const seedTag = `rift:terrain:${String(map.lanes)}`;
   const fWear = noiseLattice(`${seedTag}:wear`);
@@ -1058,6 +1233,32 @@ export function createTerrain(scene: SceneHandle, map: MapDef): TerrainHandle {
   const fJx = noiseLattice(`${seedTag}:jx`);
   const fJy = noiseLattice(`${seedTag}:jy`);
   const fJz = noiseLattice(`${seedTag}:jz`);
+  /** One lattice per boundary. Sharing one would wobble the bank and the lane
+   *  edge in lockstep, which is a different regular pattern and not an absence
+   *  of one. */
+  const fEdgeWet = noiseLattice(`${seedTag}:edgeWet`);
+  const fEdgeLane = noiseLattice(`${seedTag}:edgeLane`);
+  const fEdgeRim = noiseLattice(`${seedTag}:edgeRim`);
+  const fMottle = noiseLattice(`${seedTag}:mottle`);
+
+  /** The boundary displacement at a point, in metres. Zero-mean, so a wobbled
+   *  isoline encloses the same area the cell-grid boundary did. */
+  const wobbleAt = (f: Float32Array, x: number, z: number): number =>
+    (field2At(f, x, z, EDGE_NOISE_M) - 0.5) * 2 * EDGE_WOBBLE;
+
+  /** Zero-mean sub-metre value break-up. Applied at EVERY ground vertex, not
+   *  only the subdivided ones: it is evaluated at the vertex's own position, so
+   *  a cell's corners agree with its neighbour's and the field is continuous
+   *  across the subdivision boundary. A term applied only where the mesh is
+   *  fine would put a visible patchwork on exactly that boundary instead.
+   *
+   *  ONE octave, unlike every other field here. It is the single most-sampled
+   *  thing in the build — every vertex of every ground cell asks for it, which
+   *  is over a hundred thousand samples cold — and its job is to be smoothly
+   *  irregular at 1.7 m, which a second octave at 0.71 m does not help with
+   *  because the vertex lattice under it is 0.33 m at its finest. */
+  const mottleAt = (x: number, z: number): number =>
+    1 + (fieldAt(fMottle, x, z, MOTTLE_M) - 0.5) * MOTTLE_VAR;
 
   // ---- 5. per-corner shading ----------------------------------------------
   // Computed on the corner lattice, not per cell, so the ground's shading is
@@ -1149,55 +1350,168 @@ export function createTerrain(scene: SceneHandle, map: MapDef): TerrainHandle {
   /** Wear in [0,1] at a point: how far the built world has trodden the moss
    *  down into earth. Proximity sets the reach, noise sets the edge, so the
    *  fringe is ragged rather than an offset outline of the lane. `x`/`z` are
-   *  world metres. */
-  const wearAt = (p: number, x: number, z: number): number => {
-    const dw = (distWear[p] ?? cellsOf(D_WEAR_M)) * CELL_M;
-    const dc = campDist[p] ?? 64;
-    const prox = Math.max(clamp01(1 - dw / WEAR_REACH), clamp01(1 - dc / CAMP_WEAR_REACH));
+   *  world metres, and BOTH proximity terms are now read off the corner lattice
+   *  — read per cell, the proximity term stepped 1/3.2 of the way to full wear
+   *  at every cell boundary and no amount of noise on top of it hid that. */
+  const wearAt = (x: number, z: number): number => {
+    const prox = Math.max(
+      clamp01(1 - latAt(wearD, x, z) / WEAR_REACH),
+      clamp01(1 - latAt(campD, x, z) / CAMP_WEAR_REACH),
+    );
     if (prox <= 0) return 0;
     return prox * (0.5 + 0.85 * field2At(fWear, x, z, 4.5));
   };
 
-  /** Whether a cell can wear at all. `prox` is per CELL, and the noise factor is
-   *  strictly positive, so this is EXACTLY `wearAt(p, ...) > 0` at every point
-   *  of the cell — and it costs no noise sample, which matters because the
-   *  blend below would otherwise pay one per ground cell just to find out it
-   *  had nothing to blend. */
-  const canWear = (p: number): boolean =>
-    (distWear[p] ?? cellsOf(D_WEAR_M)) * CELL_M < WEAR_REACH ||
-    (campDist[p] ?? 64) < CAMP_WEAR_REACH;
+  /** The two continuous boundary metrics, in metres and positive INSIDE:
+   *  signed distance to the family's edge, displaced by its own noise. Every
+   *  family test and every blend mask reads these two numbers and `wearAt`, so
+   *  the switch and the blend can never disagree about where the boundary is. */
+  const wetAt = (x: number, z: number): number =>
+    latAt(riverSD, x, z) + wobbleAt(fEdgeWet, x, z);
+  const laneAt = (x: number, z: number): number =>
+    latAt(laneSD, x, z) + wobbleAt(fEdgeLane, x, z);
 
-  /** Surface family for one point of a passable cell. Sampled per TRIANGLE, not
-   *  per cell, and paired with the hash-flipped quad diagonal above. `x`/`z`
-   *  are world metres. */
-  const surfaceAt = (i: number, j: number, k: number, x: number, z: number): SurfaceId => {
-    const p = j * dim + i;
+  /** Whether the moss/earth switch can fall inside this cell at all.
+   *
+   *  `wear = prox * (0.5 + 0.85 n)` with `n` in [0,1), so wear cannot reach
+   *  `WEAR_SWITCH` unless `prox >= WEAR_SWITCH / 1.35 = 0.370`. `prox` falls
+   *  with distance and both distance fields are bilinear over the cell, and a
+   *  bilinear field attains its extrema at a CORNER — so the largest `prox`
+   *  anywhere in the cell is at the corner with the smallest distance, and
+   *  testing four corners is exact rather than conservative. It costs no noise
+   *  sample, which is the point: most of the map asks this question and has
+   *  nothing to blend. */
+  const PROX_FOR_SWITCH = WEAR_SWITCH / 1.35;
+  const WEAR_D_MAX = WEAR_REACH * (1 - PROX_FOR_SWITCH);
+  const CAMP_D_MAX = CAMP_WEAR_REACH * (1 - PROX_FOR_SWITCH);
+  const cellWears = (i: number, j: number): boolean => {
+    for (let cj = j; cj <= j + 1; cj++) {
+      for (let ci = i; ci <= i + 1; ci++) {
+        const c = cj * cw + ci;
+        if ((wearD[c] ?? 99) <= WEAR_D_MAX || (campD[c] ?? 99) <= CAMP_D_MAX) return true;
+      }
+    }
+    return false;
+  };
+
+  /** The smallest and largest value a corner lattice takes over one cell.
+   *  Bilinear, so both extrema are at corners. Returned through two scalars
+   *  rather than a tuple: this runs per cell and a tuple per cell is 16k
+   *  objects on the frame the map appears. */
+  let spanLo = 0;
+  let spanHi = 0;
+  const cellSpan = (f: Float32Array, i: number, j: number): void => {
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let cj = j; cj <= j + 1; cj++) {
+      for (let ci = i; ci <= i + 1; ci++) {
+        const v = f[cj * cw + ci] ?? 0;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      }
+    }
+    spanLo = lo;
+    spanHi = hi;
+  };
+
+  /**
+   * Surface family for one point of a passable cell.
+   *
+   * Sampled per SUB-TRIANGLE, and — the change that kills the staircase — every
+   * test that used to read a per-cell distance field now reads the CONTINUOUS
+   * signed field plus a noise displacement. `k === K_RIVER` was a cell test and
+   * drew a cell-shaped bank; `riverSD + wobble > 0` is an isoline and draws a
+   * bank. The cell kind survives only where it decides something that is not a
+   * boundary the camera can see: the base platform (whose edge is R_MAPMESH's
+   * kerb, and must not disagree with it), the ramp (whose edges are rock), and
+   * the plateau top (which is separated from every low cell by a ring cell, so
+   * its cell boundary is never a visible material boundary).
+   *
+   * PRECEDENCE IS PRESERVED. The channel wins over the lane, the lane wins over
+   * the ramp and the plateau, and the wet MARGIN is tested after them — so a
+   * lane that fords the river still reads as a lane and not as a bank.
+   */
+  const surfaceAt = (
+    i: number,
+    j: number,
+    k: number,
+    x: number,
+    z: number,
+    wet: number,
+    lane: number,
+    wear: number,
+  ): SurfaceId => {
     if (k === K_BASE) return 'monumentStone';
-    if (k === K_RIVER) return 'wetRock';
-    if (k === K_LANE) {
+    if (wet > 0) return 'wetRock';
+    if (lane > 0) {
       // Worn margins where traffic spills off the paving onto the verge: only
       // the shoulder course is eligible, and only where the noise says the
       // paving has broken, so a lane keeps a continuous built spine.
-      const shoulder = (distLaneEdge[p] ?? cellsOf(D_LANE_EDGE_M)) * CELL_M <= 1;
-      return shoulder && field2At(fWear, x, z, 3.2) > 0.58 ? 'groundDirt' : 'lanePaving';
+      return lane <= 1 && field2At(fWear, x, z, 3.2) > 0.58 ? 'groundDirt' : 'lanePaving';
     }
     if (k === K_RAMP) {
       // A base mouth is the lane climbing onto the platform and stays paved;
-      // a jungle plateau access is a worn track cut through the rock.
-      return (distLane[p] ?? cellsOf(D_LANE_M)) * CELL_M <= 1 ? 'lanePaving' : 'groundDirt';
+      // a jungle plateau access is a worn track cut through the rock. Kept per
+      // CELL deliberately: a ramp is one discrete crossing of the ring, its
+      // edges are rock on both sides, and half a ramp paved would read as a
+      // defect rather than as wear.
+      return (distLane[j * dim + i] ?? cellsOf(D_LANE_M)) * CELL_M <= 1
+        ? 'lanePaving'
+        : 'groundDirt';
     }
     if (k === K_HIGH) {
       // Bare and wind-scoured (STYLE_BIBLE §8): rock at the rim, where the
       // camera reads the plateau's edge, and rock through the scoured middle.
       // The contrast between bare high ground and dense low jungle is what
       // makes the elevation read from above.
-      if ((distCliff[p] ?? cellsOf(D_CLIFF_M)) * CELL_M <= ROCK_RIM_REACH) return 'cliffRock';
+      if (latAt(cliffD, x, z) + wobbleAt(fEdgeRim, x, z) <= ROCK_RIM_REACH) return 'cliffRock';
       return field2At(fScour, x, z, 6) > 0.45 ? 'cliffRock' : 'groundMoss';
     }
-    // the wet margin of the bank
-    if ((distRiver[p] ?? cellsOf(D_RIVER_M)) * CELL_M <= 1) return 'wetRock';
+    if (wet > -WET_MARGIN) return 'wetRock'; // the wet margin of the bank
     if (k === K_FOLIAGE) return 'groundMoss';
-    return wearAt(p, x, z) > WEAR_SWITCH ? 'groundDirt' : 'groundMoss';
+    return wear > WEAR_SWITCH ? 'groundDirt' : 'groundMoss';
+  };
+
+  /**
+   * The one-way multiplicative mask that fades a family into the darker family
+   * beside it, written into `out` as three linear channels.
+   *
+   * This is `MOSS_OVER_DIRT` generalised to every boundary the frame contains.
+   * A triangle holds one material, so the ONLY thing that can make a material
+   * boundary continuous in albedo is the vertex-colour attribute — the law
+   * reserves it for exactly this. Each family arrives at its boundary already
+   * rendering the colour of what is on the other side, and is released to its
+   * own albedo over `EDGE_BLEND`; what still changes at the line is roughness
+   * and normal detail, which is the material change and is supposed to show.
+   */
+  const edgeMask = (
+    id: SurfaceId,
+    wet: number,
+    lane: number,
+    wear: number,
+    out: Float32Array,
+  ): void => {
+    let w = 1;
+    let ratio: readonly [number, number, number] | null = null;
+    if (id === 'groundDirt') {
+      ratio = MOSS_OVER_DIRT;
+      w = clamp01((wear - WEAR_SWITCH) / WEAR_BLEND);
+    } else if (id === 'lanePaving') {
+      ratio = DIRT_OVER_PAVING;
+      w = clamp01(lane / EDGE_BLEND);
+    } else if (id === 'wetRock') {
+      ratio = MOSS_OVER_WET;
+      w = clamp01((wet + WET_MARGIN) / EDGE_BLEND);
+    }
+    if (ratio === null) {
+      out[0] = 1;
+      out[1] = 1;
+      out[2] = 1;
+      return;
+    }
+    out[0] = lerp(ratio[0], 1, w);
+    out[1] = lerp(ratio[1], 1, w);
+    out[2] = lerp(ratio[2], 1, w);
   };
 
   /** Rock shares one accumulator wherever it comes from — a plateau's scoured
@@ -1214,17 +1528,99 @@ export function createTerrain(scene: SceneHandle, map: MapDef): TerrainHandle {
   const cornerYs = new Float32Array(4);
   const cornerNs = new Float32Array(12);
   const cornerSs = new Float32Array(4);
-  const cornerWs = new Float32Array(4);
   const patchXYZ = new Float32Array((CLIFF_SUB + 1) * (CLIFF_SUB + 1) * 3);
   const patchS = new Float32Array((CLIFF_SUB + 1) * (CLIFF_SUB + 1));
+  /** The sub-lattice of one passable cell: position, normal, shade, the three
+   *  boundary metrics and the value mottle, each evaluated ONCE per sub-corner
+   *  and read by both the family switch and the blend mask. Sized for the
+   *  finest subdivision and used from index 0 at every coarser one. */
+  const GS1 = GROUND_SUB + 1;
+  const subXYZ = new Float32Array(GS1 * GS1 * 3);
+  const subNrm = new Float32Array(GS1 * GS1 * 3);
+  const subSh = new Float32Array(GS1 * GS1);
+  const subWet = new Float32Array(GS1 * GS1);
+  const subLane = new Float32Array(GS1 * GS1);
+  const subWear = new Float32Array(GS1 * GS1);
+  const subMot = new Float32Array(GS1 * GS1);
+  const maskRgb = new Float32Array(3);
+
+  /**
+   * The cell `yAtUV` is currently answering for. Scratch and not a closure: a
+   * closure per cell is 16k function objects for the GC to walk on the frame
+   * the map appears, which is the same argument `pushTriFlat` already makes
+   * about temporary arrays.
+   *
+   * THE SUB-VERTEX HEIGHT IS EXACT. It is evaluated on the plane of whichever
+   * of the cell's own two triangles contains it — the same hash-picked
+   * diagonal, the same corner heights — so a subdivided cell emits, to the bit,
+   * the surface the two triangles already emitted. Subdivision here is a
+   * MATERIAL-RESOLUTION change and nothing else: it must not move the ground a
+   * unit stands on by a single millimetre, and a bilinear patch (the obvious
+   * alternative) would have moved it on every ramp and every sloped cell.
+   */
+  let cellY0 = 0;
+  let cellY1 = 0;
+  let cellY2 = 0;
+  let cellY3 = 0;
+  let cellFlip = false;
+  const yAtUV = (u: number, v: number): number =>
+    cellFlip
+      ? u + v <= 1
+        ? cellY0 + (cellY1 - cellY0) * u + (cellY2 - cellY0) * v
+        : cellY1 + cellY2 - cellY3 + (cellY3 - cellY2) * u + (cellY3 - cellY1) * v
+      : v >= u
+        ? cellY0 + (cellY3 - cellY2) * u + (cellY2 - cellY0) * v
+        : cellY0 + (cellY1 - cellY0) * u + (cellY3 - cellY1) * v;
 
   // ---- 8. emitters ---------------------------------------------------------
 
+  /**
+   * How finely a passable cell is divided.
+   *
+   * GROUND_SUB where a family boundary — or the blend band on either side of
+   * one — can fall inside the cell, and 1 where it cannot. The predicate is
+   * exact, not a guess: every metric it tests is bilinear over the cell, so its
+   * extrema are at the four corners, and the widest the noise can move a
+   * boundary is EDGE_WOBBLE. A cell this returns 1 for therefore carries ONE
+   * family at a mask of exactly 1 across its whole area, and two triangles say
+   * everything there is to say about it.
+   */
+  const subOf = (i: number, j: number, k: number): number => {
+    // TIER 3 — the two long continuous LINES the camera traces: the waterline
+    // (channel isoline 0, wet-margin isoline -WET_MARGIN) and the paving's
+    // verge (lane isoline 0). A staircase reads as a staircase along a line;
+    // this is where the finest resolution is worth its triangles.
+    cellSpan(riverSD, i, j);
+    const wetLo = spanLo - EDGE_WOBBLE;
+    const wetHi = spanHi + EDGE_WOBBLE;
+    if ((wetLo <= 0 && wetHi >= 0) || (wetLo <= -WET_MARGIN && wetHi >= -WET_MARGIN)) {
+      return GROUND_SUB;
+    }
+    cellSpan(laneSD, i, j);
+    const laneLo = spanLo - EDGE_WOBBLE;
+    const laneHi = spanHi + EDGE_WOBBLE;
+    if (laneLo <= 0 && laneHi >= 0) return GROUND_SUB;
+    // TIER 2 — every boundary that is a noise-driven PATCH rather than a line
+    // (the shoulder's broken paving, the plateau's scour, the wear fringe), and
+    // every blend BAND. A band is a smooth gradient and is continuous across
+    // cells at any resolution, so it never needed the finest one; a patch is
+    // already ragged and only needed the grid taken out from under it.
+    if (laneLo <= Math.max(1, EDGE_BLEND) && laneHi >= 0) return GROUND_SUB_SOFT;
+    if (wetLo <= EDGE_BLEND - WET_MARGIN && wetHi >= -WET_MARGIN) return GROUND_SUB_SOFT;
+    if (k === K_HIGH) return GROUND_SUB_SOFT; // scoured rock / moss, all over it
+    if (k === K_GROUND && cellWears(i, j)) return GROUND_SUB_SOFT;
+    return 1;
+  };
+
   const emitPassableCell = (acc: Map<string, Accum>, i: number, j: number, k: number): void => {
-    cornerYs[0] = cellCornerY(i, j, i, j);
-    cornerYs[1] = cellCornerY(i, j, i + 1, j);
-    cornerYs[2] = cellCornerY(i, j, i, j + 1);
-    cornerYs[3] = cellCornerY(i, j, i + 1, j + 1);
+    const y0 = cellCornerY(i, j, i, j);
+    const y1 = cellCornerY(i, j, i + 1, j);
+    const y2 = cellCornerY(i, j, i, j + 1);
+    const y3 = cellCornerY(i, j, i + 1, j + 1);
+    cornerYs[0] = y0;
+    cornerYs[1] = y1;
+    cornerYs[2] = y2;
+    cornerYs[3] = y3;
     cornerNormalInto(i, j, i, j, cornerNs, 0);
     cornerNormalInto(i, j, i + 1, j, cornerNs, 3);
     cornerNormalInto(i, j, i, j + 1, cornerNs, 6);
@@ -1234,50 +1630,118 @@ export function createTerrain(scene: SceneHandle, map: MapDef): TerrainHandle {
     cornerSs[2] = shadeC[(j + 1) * cw + i] ?? 1;
     cornerSs[3] = shadeC[(j + 1) * cw + i + 1] ?? 1;
 
-    // The moss/dirt blend weight, per CORNER (the vertices are the corners) and
-    // only on the ground path, which is the only place the two families meet.
-    // Four field samples for a cell that can wear, none for one that cannot.
-    const p = j * dim + i;
-    const blends = k === K_GROUND && canWear(p);
-    if (blends) {
-      for (let c = 0; c < 4; c++) {
-        const cx = (i + (c === 1 || c === 3 ? 1 : 0)) * CELL_M;
-        const cz = (j + (c === 2 || c === 3 ? 1 : 0)) * CELL_M;
-        cornerWs[c] = clamp01((wearAt(p, cx, cz) - WEAR_SWITCH) / WEAR_BLEND);
+    const flip = latticeAt(fCell, i, j) < 0.5;
+    cellY0 = y0;
+    cellY1 = y1;
+    cellY2 = y2;
+    cellY3 = y3;
+    cellFlip = flip;
+
+    // Which metrics this cell actually needs. Where a metric is saturated over
+    // the whole cell its constant stands in, and the noise sample is not paid —
+    // which matters because most of the map is open jungle asking three
+    // questions it already knows the answer to.
+    cellSpan(riverSD, i, j);
+    const wetConst =
+      spanHi + EDGE_WOBBLE < -WET_MARGIN
+        ? -99
+        : spanLo - EDGE_WOBBLE > Math.max(0, EDGE_BLEND - WET_MARGIN)
+          ? 99
+          : Number.NaN;
+    cellSpan(laneSD, i, j);
+    const laneConst =
+      spanHi + EDGE_WOBBLE < 0
+        ? -99
+        : spanLo - EDGE_WOBBLE > Math.max(1, EDGE_BLEND)
+          ? 99
+          : Number.NaN;
+    const wearReal = k === K_GROUND && cellWears(i, j);
+
+    const sub = subOf(i, j, k);
+    const inv = 1 / sub;
+    const gs1 = sub + 1;
+    for (let sj = 0; sj < gs1; sj++) {
+      const v = sj * inv;
+      const z = (j + v) * CELL_M;
+      for (let si = 0; si < gs1; si++) {
+        const u = si * inv;
+        const x = (i + u) * CELL_M;
+        const c = sj * gs1 + si;
+        subXYZ[c * 3] = x;
+        subXYZ[c * 3 + 1] = yAtUV(u, v);
+        subXYZ[c * 3 + 2] = z;
+        let nx = bilerp(cornerNs[0] ?? 0, cornerNs[3] ?? 0, cornerNs[6] ?? 0, cornerNs[9] ?? 0, u, v);
+        let ny = bilerp(cornerNs[1] ?? 1, cornerNs[4] ?? 1, cornerNs[7] ?? 1, cornerNs[10] ?? 1, u, v);
+        let nz = bilerp(cornerNs[2] ?? 0, cornerNs[5] ?? 0, cornerNs[8] ?? 0, cornerNs[11] ?? 0, u, v);
+        const nl = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+        nx /= nl;
+        ny /= nl;
+        nz /= nl;
+        subNrm[c * 3] = nx;
+        subNrm[c * 3 + 1] = ny;
+        subNrm[c * 3 + 2] = nz;
+        subSh[c] = bilerp(cornerSs[0] ?? 1, cornerSs[1] ?? 1, cornerSs[2] ?? 1, cornerSs[3] ?? 1, u, v);
+        subMot[c] = mottleAt(x, z);
+        subWet[c] = Number.isNaN(wetConst) ? wetAt(x, z) : wetConst;
+        subLane[c] = Number.isNaN(laneConst) ? laneAt(x, z) : laneConst;
+        subWear[c] = wearReal ? wearAt(x, z) : 0;
       }
     }
 
-    const tris = QUAD_TRIS[latticeAt(fCell, i, j) < 0.5 ? 1 : 0];
+    const tris = QUAD_TRIS[flip ? 1 : 0];
     if (tris === undefined) return;
-    for (const tri of tris) {
-      const c0 = tri[0] ?? 0;
-      const c1 = tri[1] ?? 0;
-      const c2 = tri[2] ?? 0;
-      const cx = (c0 === 1 || c0 === 3 ? 1 : 0) + (c1 === 1 || c1 === 3 ? 1 : 0) + (c2 === 1 || c2 === 3 ? 1 : 0);
-      const cz = (c0 === 2 || c0 === 3 ? 1 : 0) + (c1 === 2 || c1 === 3 ? 1 : 0) + (c2 === 2 || c2 === 3 ? 1 : 0);
-      const id = surfaceAt(i, j, k, (i + cx / 3) * CELL_M, (j + cz / 3) * CELL_M);
-      const a = surfaceAccum(acc, id);
-      const blend = blends && id === 'groundDirt';
-      for (const c of tri) {
-        const s = cornerSs[c] ?? 1;
-        // The blend rides ON the shade, both multiplicative, both in the one
-        // attribute the law reserves for exactly this.
-        const w = blend ? cornerWs[c] ?? 1 : 1;
-        const mr = blend ? lerp(MOSS_OVER_DIRT[0], 1, w) : 1;
-        const mg = blend ? lerp(MOSS_OVER_DIRT[1], 1, w) : 1;
-        const mb = blend ? lerp(MOSS_OVER_DIRT[2], 1, w) : 1;
-        pushVert(
-          a,
-          (i + (c === 1 || c === 3 ? 1 : 0)) * CELL_M,
-          cornerYs[c] ?? 0,
-          (j + (c === 2 || c === 3 ? 1 : 0)) * CELL_M,
-          cornerNs[c * 3] ?? 0,
-          cornerNs[c * 3 + 1] ?? 1,
-          cornerNs[c * 3 + 2] ?? 0,
-          s * mr,
-          s * mg,
-          s * mb,
-        );
+    for (let sj = 0; sj < sub; sj++) {
+      for (let si = 0; si < sub; si++) {
+        // Sub-corner indices in the same 0..3 order the quad triangulation uses:
+        // 0=(0,0) 1=(1,0) 2=(0,1) 3=(1,1).
+        const q0 = sj * gs1 + si;
+        const q1 = q0 + 1;
+        const q2 = q0 + gs1;
+        const q3 = q2 + 1;
+        // THE FAMILY IS SAMPLED PER SUB-QUAD, from the mean of the four cached
+        // corner metrics — which is exactly the bilinear value at the quad's
+        // own centre.
+        //
+        // Sampling it per sub-TRIANGLE instead was built and MEASURED. It
+        // halves the smallest step the boundary can take (a diagonal cut rather
+        // than a square one), it costs 107.2 ms cold against this version's
+        // 92.4 ms on the same machine under the same load — 16% of the whole
+        // 120 ms budget — and on a `close-hero` A/B it produced no boundary a
+        // reader can point at. The two builds differ by SIX triangles map-wide,
+        // because the change moves triangles between buckets and adds none. The
+        // finer step is already well below what EDGE_WOBBLE displaces the line
+        // by, which is why it does not show. It is not in this file.
+        const cx = (si + 0.5) * inv;
+        const cz = (sj + 0.5) * inv;
+        const mWet =
+          ((subWet[q0] ?? 0) + (subWet[q1] ?? 0) + (subWet[q2] ?? 0) + (subWet[q3] ?? 0)) * 0.25;
+        const mLane =
+          ((subLane[q0] ?? 0) + (subLane[q1] ?? 0) + (subLane[q2] ?? 0) + (subLane[q3] ?? 0)) * 0.25;
+        const mWear =
+          ((subWear[q0] ?? 0) + (subWear[q1] ?? 0) + (subWear[q2] ?? 0) + (subWear[q3] ?? 0)) * 0.25;
+        const id = surfaceAt(i, j, k, (i + cx) * CELL_M, (j + cz) * CELL_M, mWet, mLane, mWear);
+        const a = surfaceAccum(acc, id);
+        for (const tri of tris) {
+          for (const corner of tri) {
+            const q = corner === 0 ? q0 : corner === 1 ? q1 : corner === 2 ? q2 : q3;
+            // The blend and the mottle ride ON the shade — all multiplicative,
+            // all in the one attribute the law reserves for exactly this.
+            edgeMask(id, subWet[q] ?? 0, subLane[q] ?? 0, subWear[q] ?? 0, maskRgb);
+            const s = (subSh[q] ?? 1) * (subMot[q] ?? 1);
+            pushVert(
+              a,
+              subXYZ[q * 3] ?? 0,
+              subXYZ[q * 3 + 1] ?? 0,
+              subXYZ[q * 3 + 2] ?? 0,
+              subNrm[q * 3] ?? 0,
+              subNrm[q * 3 + 1] ?? 1,
+              subNrm[q * 3 + 2] ?? 0,
+              s * (maskRgb[0] ?? 1),
+              s * (maskRgb[1] ?? 1),
+              s * (maskRgb[2] ?? 1),
+            );
+          }
+        }
       }
     }
   };
@@ -1542,21 +2006,84 @@ export function createTerrain(scene: SceneHandle, map: MapDef): TerrainHandle {
     return WATER_DEPTH * clamp01((d * CELL_M) / WATER_TAPER);
   };
 
-  /** The transparent sheet over a river cell. Visual only — nothing in the sim
-   *  reads it, and nothing here slows, damages or reveals a unit standing in it
-   *  (DESIGN_DELTA §4). */
+  /**
+   * The transparent sheet over a river cell. Visual only — nothing in the sim
+   * reads it, and nothing here slows, damages or reveals a unit standing in it
+   * (DESIGN_DELTA §4).
+   *
+   * THE WATERLINE IS THE SHEET'S OUTLINE, and one quad per river cell drew that
+   * outline as the cell grid — the loudest staircase in the frame, because the
+   * sheet is a bright transparent band against dark moss and its edge is the
+   * only thing marking it. The sheet is subdivided WATER_SUB ways and a
+   * sub-quad is DROPPED where the same wobbled channel isoline the wet bank
+   * uses says it is dry. The isoline is shared with `surfaceAt`, so the sheet
+   * can only ever RETRACT to inside the wet rock beneath it: the worst this can
+   * do is show a little more bank, never a strip of water standing on moss.
+   *
+   * THE CHAIN-LINK ON THE WATER IS NOT THIS, AND IT IS NOT REACHABLE FROM HERE.
+   * MEASURED, on `river-mid`, by suppressing this emitter and re-capturing: the
+   * lattice vanishes completely and the bed under it is clean. Every pixel of
+   * it therefore belongs to the `riverWater` MATERIAL and none to the sheet's
+   * geometry. It is the `ripple` normal map — a periodic array of crests tiled
+   * at exactly 1 m by the UV law — on a roughness-0.08 surface that turns every
+   * crest into a specular sun glint. Three ways out were tried from inside this
+   * module and all three are dead ends:
+   *   - the vertex colour multiplies DIFFUSE albedo, and a specular lattice is
+   *     indifferent to what colour the diffuse under it is;
+   *   - subdividing the sheet does nothing, because the lattice is world-
+   *     aligned at ~0.5 m and is not a function of the quad size;
+   *   - a swell displacing the sheet by 0.09 m over 1.6 m — a ~6 deg tilt —
+   *     left it visually unchanged, because the ripple map's own slopes are far
+   *     steeper than anything a sheet 0.22 m deep may be bent by. It was
+   *     measured, it showed nothing on pixels, and it is not in this file.
+   * The three dials that would fix it — the `ripple` generator in `kit.ts`, and
+   * `riverWater`'s roughness 0.08 and normal strength 0.45 in the frozen
+   * `surfaces.ts` table — are all outside R_TERRAIN's ownership.
+   */
   const emitWater = (acc: Map<string, Accum>, i: number, j: number): void => {
     const water = surfaceAccum(acc, 'riverWater');
-    const sh = shadeC[j * cw + i] ?? 1;
-    pushQuadFlat(
-      water,
-      i * CELL_M, (loH[j * cw + i] ?? 0) + waterDepthAt(i, j), j * CELL_M,
-      (i + 1) * CELL_M, (loH[j * cw + i + 1] ?? 0) + waterDepthAt(i + 1, j), j * CELL_M,
-      (i + 1) * CELL_M, (loH[(j + 1) * cw + i + 1] ?? 0) + waterDepthAt(i + 1, j + 1), (j + 1) * CELL_M,
-      i * CELL_M, (loH[(j + 1) * cw + i] ?? 0) + waterDepthAt(i, j + 1), (j + 1) * CELL_M,
-      sh, sh, sh, sh,
-      0, 1, 0,
-    );
+    // The sheet's four corner heights, each the bed plus its own taper.
+    const w00 = (loH[j * cw + i] ?? 0) + waterDepthAt(i, j);
+    const w10 = (loH[j * cw + i + 1] ?? 0) + waterDepthAt(i + 1, j);
+    const w01 = (loH[(j + 1) * cw + i] ?? 0) + waterDepthAt(i, j + 1);
+    const w11 = (loH[(j + 1) * cw + i + 1] ?? 0) + waterDepthAt(i + 1, j + 1);
+    const s00 = shadeC[j * cw + i] ?? 1;
+    const s10 = shadeC[j * cw + i + 1] ?? 1;
+    const s01 = shadeC[(j + 1) * cw + i] ?? 1;
+    const s11 = shadeC[(j + 1) * cw + i + 1] ?? 1;
+    const inv = 1 / WATER_SUB;
+    const gs1 = WATER_SUB + 1;
+    for (let sj = 0; sj < gs1; sj++) {
+      const v = sj * inv;
+      for (let si = 0; si < gs1; si++) {
+        const u = si * inv;
+        const c = sj * gs1 + si;
+        subXYZ[c * 3] = (i + u) * CELL_M;
+        subXYZ[c * 3 + 1] = bilerp(w00, w10, w01, w11, u, v);
+        subXYZ[c * 3 + 2] = (j + v) * CELL_M;
+        subSh[c] = bilerp(s00, s10, s01, s11, u, v) * mottleAt((i + u) * CELL_M, (j + v) * CELL_M);
+      }
+    }
+    for (let sj = 0; sj < WATER_SUB; sj++) {
+      for (let si = 0; si < WATER_SUB; si++) {
+        const mx = (i + (si + 0.5) * inv) * CELL_M;
+        const mz = (j + (sj + 0.5) * inv) * CELL_M;
+        if (wetAt(mx, mz) <= 0) continue;
+        const q0 = sj * gs1 + si;
+        const q1 = q0 + 1;
+        const q2 = q0 + gs1;
+        const q3 = q2 + 1;
+        pushQuadFlat(
+          water,
+          subXYZ[q0 * 3] ?? 0, subXYZ[q0 * 3 + 1] ?? 0, subXYZ[q0 * 3 + 2] ?? 0,
+          subXYZ[q1 * 3] ?? 0, subXYZ[q1 * 3 + 1] ?? 0, subXYZ[q1 * 3 + 2] ?? 0,
+          subXYZ[q3 * 3] ?? 0, subXYZ[q3 * 3 + 1] ?? 0, subXYZ[q3 * 3 + 2] ?? 0,
+          subXYZ[q2 * 3] ?? 0, subXYZ[q2 * 3 + 1] ?? 0, subXYZ[q2 * 3 + 2] ?? 0,
+          subSh[q0] ?? 1, subSh[q1] ?? 1, subSh[q3] ?? 1, subSh[q2] ?? 1,
+          0, 1, 0,
+        );
+      }
+    }
   };
 
   /** The map frame, dropped into bare rock. Without it the camera sees under
