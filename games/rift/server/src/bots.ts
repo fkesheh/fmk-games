@@ -10,15 +10,32 @@
 // ============================================================================
 import { rng } from '@platform/shared';
 import {
+  ELEV_HIGH,
+  ELEV_LOW,
   FORTIFY_RADIUS,
   ITEMS,
+  MAX_LANES,
+  MIN_LANES,
+  TICK_RATE,
   TOWER,
   ULT_LEVEL_REQ,
   WARD_PLACE_RANGE,
+  buildTerrain,
+  elevationAt,
   heroById,
+  isPlayerTeam,
 } from '@rift/shared';
-import type { AbilityDef, HeroDef, HeroId, HeroRole, ItemId, TeamId, Vec2 } from '@rift/shared';
-import type { BotBrain, BotCommand, BotPercept, Ent } from './sim/types.js';
+import type {
+  AbilityDef,
+  HeroDef,
+  HeroId,
+  HeroRole,
+  ItemId,
+  TeamId,
+  TerrainDef,
+  Vec2,
+} from '@rift/shared';
+import type { BotBrain, BotCommand, BotPercept, CampPercept, Ent } from './sim/types.js';
 
 // --- Behaviour knobs (bot policy, not game balance — those live in config) ---
 const RETREAT_HP = 0.32; // fall back to fountain below this hp fraction
@@ -37,6 +54,57 @@ const WARD_REFRESH_TICKS = 600; // 30s between ward attempts at the same spot
 const SKILL_RETRY_TICKS = 100; // re-try a silently-refused skill slot after 5s
 const WAYPOINT_SLACK = 0.75; // aim at the next waypoint past this travel distance
 const LASTHIT_RANGE_EPS = 0.1; // slack on the in-attack-range check
+
+// --- Jungle knobs (DESIGN_DELTA §2) ---
+/** Hp fraction a bot must hold to leave lane for a camp. Well above RETREAT_HP
+ *  (0.32) on purpose: between the two the bot keeps laning but will not walk
+ *  into a camp it cannot finish, which is the difference between a tempo
+ *  choice and a donation. */
+const JUNGLE_MIN_HP = 0.6;
+/** Farthest camp a bot will detour to, from its own position. ~1/3 of the
+ *  96 m base map side, so the detour is always to a camp beside the bot's own
+ *  lane and never a cross-map trip: DESIGN_DELTA §2's "terrain should create
+ *  decisions, not chores". */
+const JUNGLE_MAX_DIST = 30;
+/** An enemy lane creep this close to the bot counts as lane pressure. Sits
+ *  above AGGRO_RADIUS (7) so the wave the bot is already fighting always
+ *  registers, and above the 10.5 m tower range so a dive in progress does. */
+const LANE_PRESSURE_RADIUS = 14;
+/** Minimum time back in lane between camps, in seconds. A detour is at most
+ *  ~6 s each way at hero speed plus the clear, so requiring at least this long
+ *  in lane keeps lane time >= jungle time — DESIGN_DELTA §2's "contesting lanes
+ *  stays the primary game and the jungle stays the supplement". */
+const JUNGLE_RELANE_S = 20;
+const JUNGLE_RELANE_TICKS = JUNGLE_RELANE_S * TICK_RATE;
+/** Hero level at which each tier stops being a donation.
+ *  - `pack` at 2: config's CAMP_PACK is "clearable from level 2-3, which is what
+ *    stops the jungle from being a level-6 gate".
+ *  - `hive` at 6: DESIGN_DELTA §2's large camp — "genuinely dangerous solo
+ *    before level 6, attemptable by most heroes at 6". Five ranged bodies at
+ *    7.5 m deal their damage whether or not the hero is in contact, which is
+ *    what makes it the tier a level-1 bot must never walk into.
+ *  - `brute` at 4: between the two. It has the most hp per body and 4 armour,
+ *    but it is melee-only (attackRange 1.9) and slow (2.9 m/s), so it is the
+ *    one tier a mid-level hero can take chip-free by walking. */
+const CAMP_MIN_LEVEL: Readonly<Record<CampPercept['tier'], number>> = {
+  pack: 2,
+  brute: 4,
+  hive: 6,
+};
+/** Preference order among camps the bot's level allows: richest first. Camp
+ *  totals are pack 76 g, hive 115 g, brute 132 g, so tier rank IS gold rank. */
+const CAMP_TIER_RANK: Readonly<Record<CampPercept['tier'], number>> = {
+  pack: 0,
+  hive: 1,
+  brute: 2,
+};
+/** Enemy-hero-equivalents added to the local headcount when the bot stands on
+ *  low ground and any nearby enemy hero stands on high ground. DESIGN_DELTA §1:
+ *  "holding high ground should be worth roughly one hero level of effective
+ *  strength in a fight" — in a headcount scorer one extra body is the closest
+ *  available proxy, and it is the side of the trade that matters: uphill, 25%
+ *  of the bot's basic attacks miss and none of theirs do. */
+const HIGH_GROUND_FOE_BIAS = 1;
 
 /** Per-role build orders, declared as data (CONTRACT §5). Bought in order at
  *  the fountain; wardstone re-enters the support rotation because its slot
@@ -167,6 +235,88 @@ function fountainPoint(p: BotPercept, out: { x: number; z: number }): boolean {
   return true;
 }
 
+/** Terrain is NOT on the percept and never goes on the wire — it is a pure
+ *  function of the lane count (§0), and `BotPercept.paths` carries exactly one
+ *  polyline per lane, so the bot rebuilds the same grid the room built. Memoised
+ *  per lane count at module scope: `buildTerrain` is pure, so the cache changes
+ *  no result, and there are at most MAX_LANES entries of at most 128x128 cells
+ *  for the life of the process. Returns null rather than throwing on a percept
+ *  with no paths — a bot must never be the thing that kills a room. */
+const terrainByLanes = new Map<number, TerrainDef>();
+function terrainFor(p: BotPercept): TerrainDef | null {
+  const lanes = p.paths.length;
+  if (!Number.isInteger(lanes) || lanes < MIN_LANES || lanes > MAX_LANES) return null;
+  const cached = terrainByLanes.get(lanes);
+  if (cached) return cached;
+  const built = buildTerrain(lanes);
+  terrainByLanes.set(lanes, built);
+  return built;
+}
+
+/** True while the bot's own lane still needs it: any enemy hero inside the
+ *  engagement radius, or any enemy creep of this lane inside
+ *  LANE_PRESSURE_RADIUS. Neutral camp creeps are neither (their kind is not a
+ *  lane-creep kind and their lane is -1), so standing in a camp does not itself
+ *  read as lane pressure and cancel the trip that got the bot there. */
+function lanePressure(p: BotPercept): boolean {
+  const self = p.self;
+  const engage2 = ENGAGE_RANGE * ENGAGE_RANGE;
+  const creep2 = LANE_PRESSURE_RADIUS * LANE_PRESSURE_RADIUS;
+  for (let i = 0; i < p.visible.length; i++) {
+    const e = p.visible[i];
+    if (!e || !e.alive || e.team === self.team) continue;
+    const d2 = distSq(self.x, self.z, e.x, e.z);
+    if (e.kind === 'hero') {
+      if (d2 <= engage2) return true;
+      continue;
+    }
+    if (!isCreepKind(e.kind) || e.lane !== p.lane) continue;
+    if (d2 <= creep2) return true;
+  }
+  return false;
+}
+
+/** Which half of the map a point sits in. `CampPercept` deliberately carries no
+ *  `half` (it is coarse camp-timer knowledge and nothing else), but every lane
+ *  polyline runs base-to-base with team 0's Ancient at index 0, so the halves
+ *  fall straight out of the two endpoints — no new contract surface. */
+function inOwnHalf(p: BotPercept, team: TeamId, x: number, z: number): boolean {
+  const path = p.paths[p.lane];
+  if (!path || path.length === 0) return false;
+  const a = path[0];
+  const b = path[path.length - 1];
+  if (!a || !b) return false;
+  const own = team === 0 ? a : b;
+  const foe = team === 0 ? b : a;
+  return distSq(x, z, own.x, own.z) < distSq(x, z, foe.x, foe.z);
+}
+
+/** The best camp for this bot right now, or -1. Richest tier the level allows
+ *  wins; ties break on distance, then on the lower id — no rng, so two bots on
+ *  identical percepts route identically. */
+function pickCamp(p: BotPercept, team: TeamId): number {
+  const self = p.self;
+  const maxD2 = JUNGLE_MAX_DIST * JUNGLE_MAX_DIST;
+  let bestId = -1;
+  let bestRank = -1;
+  let bestD2 = 0;
+  for (let i = 0; i < p.camps.length; i++) {
+    const c = p.camps[i];
+    if (!c || !c.up) continue;
+    if (self.level < CAMP_MIN_LEVEL[c.tier]) continue;
+    const d2 = distSq(self.x, self.z, c.x, c.z);
+    if (d2 > maxD2) continue;
+    if (!inOwnHalf(p, team, c.x, c.z)) continue;
+    const rank = CAMP_TIER_RANK[c.tier];
+    if (bestId < 0 || rank > bestRank || (rank === bestRank && d2 < bestD2)) {
+      bestId = c.id;
+      bestRank = rank;
+      bestD2 = d2;
+    }
+  }
+  return bestId;
+}
+
 export function createBotBrain(seed: number, hero: HeroId): BotBrain {
   const rand = rng(seed);
   const def: HeroDef = heroById(hero);
@@ -183,6 +333,11 @@ export function createBotBrain(seed: number, hero: HeroId): BotBrain {
   let skillAttemptTick = -1;
   let skillAttemptPoints = -1;
   let skillAttemptRank = -1;
+  // Jungle commitment: the CampPercept.id the bot is currently walking to, or
+  // -1. Only the id is retained — the percept table is a reused buffer whose
+  // `up` the room refreshes in place, so it is re-read by index every tick.
+  let campCommit = -1;
+  let campReleaseTick = -JUNGLE_RELANE_TICKS; // last tick a commitment ended
   const wp = { x: 0, z: 0 }; // scratch waypoint / hold point
 
   function castReady(self: Ent, tick: number, slot: number): AbilityDef | null {
@@ -459,10 +614,41 @@ export function createBotBrain(seed: number, hero: HeroId): BotBrain {
     return best;
   }
 
+  /** The camp the bot should be walking to this tick, or null to stay in lane.
+   *  Holding a commitment across ticks is what stops the bot oscillating
+   *  between the clearing and the lane every tick; the commitment ends the
+   *  moment the camp is cleared, the lane needs the bot, or its hp drops — and
+   *  ending it starts the relane window, so "clear it, then return to lane" is
+   *  a round trip rather than a permanent move into the jungle. */
+  function jungleTarget(p: BotPercept, team: TeamId, frac: number): CampPercept | null {
+    if (campCommit >= 0) {
+      const held = campCommit < p.camps.length ? p.camps[campCommit] : undefined;
+      if (held && held.up && frac >= JUNGLE_MIN_HP && !lanePressure(p)) return held;
+      campCommit = -1;
+      campReleaseTick = p.tick;
+      return null;
+    }
+    if (frac < JUNGLE_MIN_HP) return null;
+    if (p.tick - campReleaseTick < JUNGLE_RELANE_TICKS) return null;
+    if (lanePressure(p)) return null;
+    const id = pickCamp(p, team);
+    if (id < 0) return null;
+    campCommit = id;
+    return p.camps[id] ?? null;
+  }
+
   function tick(p: BotPercept): BotCommand[] {
     const out: BotCommand[] = [];
     const self = p.self;
     if (p.phase !== 'live' || !self.alive) return out;
+    // `Ent.team` is EntTeam because neutral camp creeps exist; a BRAIN only
+    // ever drives a hero, and a hero is never NEUTRAL_TEAM. This is the
+    // narrowing obligation in sim/types.ts, discharged once at the door: every
+    // per-team decision below (own fountain endpoint, lane travel direction,
+    // own half, the next lane waypoint) is undefined for a neutral entity, so
+    // the honest answer for one is "no commands", not a guessed team.
+    const team = self.team;
+    if (!isPlayerTeam(team)) return out;
     const now = p.tick;
     const frac = hpFrac(self);
 
@@ -529,16 +715,31 @@ export function createBotBrain(seed: number, hero: HeroId): BotBrain {
     //  mode; a committed cast this tick rides, otherwise fall back toward
     //  the fountain until the local numbers even out. ---
     if (!out.some((c) => c.c === 'cast')) {
+      // High-ground awareness (DESIGN_DELTA §1): an attacker on lower ground
+      // than its target misses 25% of its basic attacks. Standing low against
+      // a hero standing high is therefore a fight the bot enters a body down,
+      // so the headcount it scores counts one extra enemy. Weighting only the
+      // BAD side is deliberate: the reverse case (bot high, enemy low) is
+      // already a fight it wins on the same rule, and biasing it would make
+      // the bot hold ground it should have left.
+      const terr = terrainFor(p);
+      const selfLow = terr !== null && elevationAt(terr, self.x, self.z) === ELEV_LOW;
       let foes = 0;
       let allies = 0;
+      let uphill = false;
       for (let i = 0; i < p.visible.length; i++) {
         const e = p.visible[i];
         if (!e || e.kind !== 'hero' || !e.alive || e.id === self.id) continue;
         if (distSq(self.x, self.z, e.x, e.z) > ENGAGE_RANGE * ENGAGE_RANGE) continue;
-        if (e.team === self.team) allies += 1;
-        else foes += 1;
+        if (e.team === self.team) {
+          allies += 1;
+          continue;
+        }
+        foes += 1;
+        if (selfLow && terr !== null && elevationAt(terr, e.x, e.z) === ELEV_HIGH) uphill = true;
       }
-      if (foes > allies + OUTNUMBERED_MARGIN && fountainPoint(p, wp)) {
+      const scored = foes + (uphill ? HIGH_GROUND_FOE_BIAS : 0);
+      if (scored > allies + OUTNUMBERED_MARGIN && fountainPoint(p, wp)) {
         out.push({ c: 'order', kind: 'move', x: wp.x, z: wp.z });
         return out;
       }
@@ -575,6 +776,19 @@ export function createBotBrain(seed: number, hero: HeroId): BotBrain {
       return out;
     }
 
+    // --- jungle: clear a nearby own-half camp while the lane can spare it ---
+    const camp = jungleTarget(p, team, frac);
+    if (camp) {
+      // Re-issued only when the destination actually changes. AMENDMENT_1 §D:
+      // every new order resets `path`/`pathIndex`, and A* is capped at two
+      // searches per tick — a bot re-ordering the same clearing every tick
+      // would repath forever and never arrive.
+      if (self.order !== 'attackmove' || self.ox !== camp.x || self.oz !== camp.z) {
+        out.push({ c: 'order', kind: 'attackmove', x: camp.x, z: camp.z });
+      }
+      return out;
+    }
+
     // --- lane discipline: shadow the own wave, else attack-move forward ---
     const path = p.paths[p.lane];
     if (!path || path.length === 0) {
@@ -589,7 +803,7 @@ export function createBotBrain(seed: number, hero: HeroId): BotBrain {
       if (!e || !isCreepKind(e.kind) || e.team !== self.team || !e.alive) continue;
       if (e.lane !== p.lane) continue;
       const prog = pathProgress(path, e.x, e.z);
-      const travel = self.team === 0 ? prog : total - prog;
+      const travel = team === 0 ? prog : total - prog;
       if (travel > waveProg) {
         waveProg = travel;
         wave = e;
@@ -599,7 +813,7 @@ export function createBotBrain(seed: number, hero: HeroId): BotBrain {
       out.push({ c: 'order', kind: 'attackmove', x: wave.x, z: wave.z });
       return out;
     }
-    nextWaypoint(path, self.x, self.z, self.team, wp);
+    nextWaypoint(path, self.x, self.z, team, wp);
     out.push({ c: 'order', kind: 'attackmove', x: wp.x, z: wp.z });
     return out;
   }

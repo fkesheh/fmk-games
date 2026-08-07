@@ -5,9 +5,10 @@
 // side 96, team-0 ancient at (BASE_INSET, BASE_INSET), mid at (48, 48).
 // ============================================================================
 import { describe, expect, it } from 'vitest';
-import type { EntKind, HeroId, TeamId } from '@rift/shared';
+import { ELEV_HIGH, ELEV_LOW, NEUTRAL_TEAM, buildTerrain, elevationAt } from '@rift/shared';
+import type { EntKind, EntTeam, HeroId, TeamId, Vec2 } from '@rift/shared';
 import { NO_ENT } from './sim/types.js';
-import type { BotCommand, BotPercept, Ent } from './sim/types.js';
+import type { BotCommand, BotPercept, CampPercept, Ent } from './sim/types.js';
 import { createBotBrain } from './bots.js';
 
 // 1-lane map geometry: [(11,11) -> (48,48) -> (85,85)], team 1 walks it reversed.
@@ -17,7 +18,11 @@ const PATH = [
   { x: 85, z: 85 },
 ] as const;
 
-function makeEnt(over: Partial<Ent> & { id: number; kind: EntKind; team: TeamId }): Ent {
+// `team` is EntTeam, not TeamId: camp creeps carry NEUTRAL_TEAM (sim/types.ts
+// §Ent.team), and a factory that could not build one would leave the brain's
+// neutral guard untestable. `makeHero` below keeps TeamId — a hero is never
+// neutral.
+function makeEnt(over: Partial<Ent> & { id: number; kind: EntKind; team: EntTeam }): Ent {
   return {
     x: 0,
     z: 0,
@@ -44,6 +49,10 @@ function makeEnt(over: Partial<Ent> & { id: number; kind: EntKind; team: TeamId 
     ox: 0,
     oz: 0,
     orderTarget: NO_ENT,
+    // AMENDMENT_2 §D.1: makeEnt in world.ts initialises these at construction,
+    // so nothing downstream has to coalesce them. Mirrored here.
+    path: null,
+    pathIndex: 0,
     lane: -1,
     waypoint: 0,
     stunUntilTick: 0,
@@ -85,6 +94,7 @@ function makePercept(self: Ent, over?: Partial<BotPercept>): BotPercept {
     visible: [],
     lane: 0,
     paths: [PATH],
+    camps: [],
     wardStock: 0,
     atFountain: false,
     overtime: false,
@@ -94,6 +104,53 @@ function makePercept(self: Ent, over?: Partial<BotPercept>): BotPercept {
 
 function makeHero(id: number, team: TeamId, hero: HeroId, over?: Partial<Ent>): Ent {
   return makeEnt({ id, kind: 'hero', team, hero, ...over });
+}
+
+/** `CampPercept.id` MUST equal its index in `BotPercept.camps` (sim/types.ts):
+ *  the brain re-reads its committed camp by index every tick, because the room
+ *  owns one mutable percept per camp and refreshes `up` in place. */
+function makeCamps(
+  ...specs: readonly { tier: CampPercept['tier']; x: number; z: number; up?: boolean }[]
+): CampPercept[] {
+  return specs.map((s, id) => ({ id, tier: s.tier, x: s.x, z: s.z, up: s.up ?? true }));
+}
+
+/** True when some order in `cmds` targets (x, z). */
+function ordersToward(cmds: readonly BotCommand[], x: number, z: number): boolean {
+  return orders(cmds).some((o) => o.kind !== 'attack' && o.kind !== 'stop' && o.x === x && o.z === z);
+}
+
+const T1 = buildTerrain(1);
+/** A DIFFERENT lane count's grid, used only to prove the brain reads the one
+ *  its percept implies. Terrain never goes on the wire (§0) — it is rebuilt
+ *  from the lane count, and `paths.length` is the only lane count a percept
+ *  carries. */
+const T3 = buildTerrain(3);
+
+/** Two real 1-lane-map points within ENGAGE_RANGE (12 m) of each other at the
+ *  given elevations. Searched rather than hard-coded: the plateau layout is
+ *  terrain.ts's to decide, and a hard-coded pair would silently stop testing
+ *  elevation the first time the layout moved. */
+function findPair(
+  fromElev: number,
+  toElev: number,
+  okB: (b: Vec2) => boolean = (): boolean => true,
+): { a: Vec2; b: Vec2 } {
+  for (let x = 1; x < 95; x++) {
+    for (let z = 1; z < 95; z++) {
+      const a = { x: x + 0.5, z: z + 0.5 };
+      if (elevationAt(T1, a.x, a.z) !== fromElev) continue;
+      for (let dx = -8; dx <= 8; dx++) {
+        for (let dz = -8; dz <= 8; dz++) {
+          if (dx * dx + dz * dz > 100 || (dx === 0 && dz === 0)) continue;
+          const b = { x: a.x + dx, z: a.z + dz };
+          if (b.x < 1 || b.z < 1 || b.x > 94 || b.z > 94) continue;
+          if (elevationAt(T1, b.x, b.z) === toElev && okB(b)) return { a, b };
+        }
+      }
+    }
+  }
+  throw new Error(`no ${String(fromElev)} -> ${String(toElev)} pair within range on the 1-lane map`);
 }
 
 function orders(cmds: readonly BotCommand[]): Extract<BotCommand, { c: 'order' }>[] {
@@ -490,5 +547,419 @@ describe('archetype casting', () => {
     const enemy = makeHero(2001, 1, 'reaver', { x: 46, z: 40, hp: 640, maxHp: 640 });
     const cmds = brain.tick(makePercept(self, { visible: [enemy] }));
     expect(cmds.some((c) => c.c === 'cast')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Jungle (DESIGN_DELTA §2). All coordinates are on the 1-lane map: the
+// anti-diagonal x + z = 96 is the half boundary, team 0's base is (11, 11).
+// The bot carries no ability ranks in these cases, so nothing casts and the
+// order under test is the only order emitted.
+// ---------------------------------------------------------------------------
+describe('jungle behaviour', () => {
+  /** Healthy, level 6, mid-lane, own half, nothing contesting. */
+  const jungler = (over?: Partial<Ent>): Ent =>
+    makeHero(1000, 0, 'reaver', { x: 40, z: 40, hp: 640, maxHp: 640, level: 6, ...over });
+
+  it('walks a healthy bot with a safe lane to an up camp in its own half', () => {
+    const brain = createBotBrain(21, 'reaver');
+    const cmds = brain.tick(
+      makePercept(jungler(), { camps: makeCamps({ tier: 'pack', x: 30, z: 46 }) }),
+    );
+    expect(cmds).toContainEqual({ c: 'order', kind: 'attackmove', x: 30, z: 46 });
+  });
+
+  it('stays in lane when an enemy wave is pushing it', () => {
+    const brain = createBotBrain(21, 'reaver');
+    // 5.7 m away, inside LANE_PRESSURE_RADIUS, and far too healthy to last-hit.
+    const wave = makeEnt({ id: 1001, kind: 'melee', team: 1, lane: 0, x: 44, z: 44, hp: 400, maxHp: 450, radius: 0.42 });
+    const cmds = brain.tick(
+      makePercept(jungler(), {
+        visible: [wave],
+        camps: makeCamps({ tier: 'pack', x: 30, z: 46 }),
+      }),
+    );
+    expect(ordersToward(cmds, 30, 46)).toBe(false);
+    expect(orders(cmds).some((o) => o.kind === 'attackmove')).toBe(true);
+  });
+
+  it('stays in lane when an enemy hero is inside the engagement radius', () => {
+    const brain = createBotBrain(21, 'reaver');
+    const foe = makeHero(2001, 1, 'longbow', { x: 48, z: 44, hp: 540, maxHp: 540 });
+    const cmds = brain.tick(
+      makePercept(jungler(), { visible: [foe], camps: makeCamps({ tier: 'pack', x: 30, z: 46 }) }),
+    );
+    expect(ordersToward(cmds, 30, 46)).toBe(false);
+  });
+
+  it('does not leave lane below the jungle hp bar, even above the retreat bar', () => {
+    const brain = createBotBrain(21, 'reaver');
+    // 50%: past RETREAT_HP (32%) so it is not retreating, under JUNGLE_MIN_HP.
+    const cmds = brain.tick(
+      makePercept(jungler({ hp: 320 }), { camps: makeCamps({ tier: 'pack', x: 30, z: 46 }) }),
+    );
+    expect(ordersToward(cmds, 30, 46)).toBe(false);
+    expect(orders(cmds).some((o) => o.kind === 'attackmove')).toBe(true);
+  });
+
+  it('ignores a camp in the enemy half', () => {
+    const brain = createBotBrain(21, 'reaver');
+    // 28.3 m away — inside JUNGLE_MAX_DIST, so only the half rule can reject it.
+    const cmds = brain.tick(
+      makePercept(jungler(), { camps: makeCamps({ tier: 'pack', x: 60, z: 60 }) }),
+    );
+    expect(ordersToward(cmds, 60, 60)).toBe(false);
+  });
+
+  it('mirrors the half rule for team 1', () => {
+    const brain = createBotBrain(21, 'reaver');
+    const self = makeHero(1000, 1, 'reaver', { x: 56, z: 56, hp: 640, maxHp: 640, level: 6 });
+    const own = brain.tick(makePercept(self, { camps: makeCamps({ tier: 'pack', x: 66, z: 50 }) }));
+    expect(own).toContainEqual({ c: 'order', kind: 'attackmove', x: 66, z: 50 });
+    const other = createBotBrain(21, 'reaver');
+    const across = other.tick(
+      makePercept(self, { camps: makeCamps({ tier: 'pack', x: 30, z: 46 }) }),
+    );
+    expect(ordersToward(across, 30, 46)).toBe(false);
+  });
+
+  it('ignores a camp beyond the detour distance', () => {
+    const brain = createBotBrain(21, 'reaver');
+    // (14, 20) is own-half but 32.8 m from (40, 40).
+    const cmds = brain.tick(
+      makePercept(jungler(), { camps: makeCamps({ tier: 'pack', x: 14, z: 20 }) }),
+    );
+    expect(ordersToward(cmds, 14, 20)).toBe(false);
+  });
+
+  it('ignores a camp that is already cleared', () => {
+    const brain = createBotBrain(21, 'reaver');
+    const cmds = brain.tick(
+      makePercept(jungler(), { camps: makeCamps({ tier: 'pack', x: 30, z: 46, up: false }) }),
+    );
+    expect(ordersToward(cmds, 30, 46)).toBe(false);
+  });
+
+  it('never sends a level-1 bot into a hive, and sends a level-6 one', () => {
+    const camps = makeCamps({ tier: 'hive', x: 30, z: 46 });
+    const rookie = createBotBrain(21, 'reaver');
+    expect(
+      ordersToward(rookie.tick(makePercept(jungler({ level: 1 }), { camps })), 30, 46),
+    ).toBe(false);
+    const veteran = createBotBrain(21, 'reaver');
+    expect(
+      ordersToward(veteran.tick(makePercept(jungler({ level: 6 }), { camps })), 30, 46),
+    ).toBe(true);
+  });
+
+  it('gates each tier on its own level: pack at 2, brute at 4, hive at 6', () => {
+    const at = (level: number, tier: CampPercept['tier']): boolean =>
+      ordersToward(
+        createBotBrain(21, 'reaver').tick(
+          makePercept(jungler({ level }), { camps: makeCamps({ tier, x: 30, z: 46 }) }),
+        ),
+        30,
+        46,
+      );
+    expect([at(1, 'pack'), at(2, 'pack')]).toEqual([false, true]);
+    expect([at(3, 'brute'), at(4, 'brute')]).toEqual([false, true]);
+    expect([at(5, 'hive'), at(6, 'hive')]).toEqual([false, true]);
+  });
+
+  it('prefers the richest tier its level allows over the nearest camp', () => {
+    const brain = createBotBrain(21, 'reaver');
+    // brute is FARTHEST (14.4 m vs 8.9 and 11.7) and still wins: camp gold is
+    // brute 132 > hive 115 > pack 76, so tier rank beats proximity.
+    const camps = makeCamps(
+      { tier: 'hive', x: 32, z: 44 },
+      { tier: 'pack', x: 30, z: 46 },
+      { tier: 'brute', x: 28, z: 48 },
+    );
+    const cmds = brain.tick(makePercept(jungler(), { camps }));
+    expect(cmds).toContainEqual({ c: 'order', kind: 'attackmove', x: 28, z: 48 });
+  });
+
+  it('drops to the best tier the level allows when the richest is out of reach', () => {
+    const brain = createBotBrain(21, 'reaver');
+    const camps = makeCamps(
+      { tier: 'hive', x: 32, z: 44 },
+      { tier: 'pack', x: 30, z: 46 },
+      { tier: 'brute', x: 28, z: 48 },
+    );
+    // Level 5: brute (4) and pack (2) are legal, hive (6) is not.
+    const cmds = brain.tick(makePercept(jungler({ level: 5 }), { camps }));
+    expect(cmds).toContainEqual({ c: 'order', kind: 'attackmove', x: 28, z: 48 });
+    const rookie = createBotBrain(21, 'reaver');
+    // Level 3: only the pack is legal.
+    const low = rookie.tick(makePercept(jungler({ level: 3 }), { camps }));
+    expect(low).toContainEqual({ c: 'order', kind: 'attackmove', x: 30, z: 46 });
+  });
+
+  it('does not re-issue the camp order once the bot is already walking there', () => {
+    const brain = createBotBrain(21, 'reaver');
+    const camps = makeCamps({ tier: 'pack', x: 30, z: 46 });
+    expect(brain.tick(makePercept(jungler(), { camps, tick: 100 }))).toContainEqual({
+      c: 'order',
+      kind: 'attackmove',
+      x: 30,
+      z: 46,
+    });
+    // Second tick: the sim has taken the order, so the bot must not repath.
+    const enRoute = jungler({ x: 36, z: 42, order: 'attackmove', ox: 30, oz: 46 });
+    const again = brain.tick(makePercept(enRoute, { camps, tick: 101 }));
+    expect(orders(again)).toHaveLength(0);
+  });
+
+  it('re-issues the camp order when the standing order points somewhere else', () => {
+    const brain = createBotBrain(21, 'reaver');
+    const camps = makeCamps({ tier: 'pack', x: 30, z: 46 });
+    brain.tick(makePercept(jungler(), { camps, tick: 100 }));
+    // Still an attackmove, but at the lane destination it had before — the
+    // destination, not the order kind, is what decides a repath.
+    const stale = jungler({ x: 36, z: 42, order: 'attackmove', ox: 48, oz: 48 });
+    expect(brain.tick(makePercept(stale, { camps, tick: 101 }))).toContainEqual({
+      c: 'order',
+      kind: 'attackmove',
+      x: 30,
+      z: 46,
+    });
+  });
+
+  it('sticks to the camp it committed to when a richer one comes up', () => {
+    const brain = createBotBrain(21, 'reaver');
+    const camps = makeCamps(
+      { tier: 'pack', x: 30, z: 46 },
+      { tier: 'brute', x: 28, z: 48, up: false },
+    );
+    expect(brain.tick(makePercept(jungler(), { camps, tick: 100 }))).toContainEqual({
+      c: 'order',
+      kind: 'attackmove',
+      x: 30,
+      z: 46,
+    });
+    const richer = camps[1];
+    if (!richer) expect.unreachable('camp table lost its entry');
+    else richer.up = true;
+    // Without the commitment the bot would turn around mid-walk every time a
+    // better camp respawned and clear nothing.
+    const enRoute = jungler({ x: 34, z: 44, order: 'attackmove', ox: 30, oz: 46 });
+    const next = brain.tick(makePercept(enRoute, { camps, tick: 101 }));
+    expect(ordersToward(next, 28, 48)).toBe(false);
+  });
+
+  it('re-issues the camp order if the sim dropped it', () => {
+    const brain = createBotBrain(21, 'reaver');
+    const camps = makeCamps({ tier: 'pack', x: 30, z: 46 });
+    brain.tick(makePercept(jungler(), { camps, tick: 100 }));
+    const stunned = jungler({ x: 36, z: 42, order: 'idle', ox: 0, oz: 0 });
+    expect(brain.tick(makePercept(stunned, { camps, tick: 101 }))).toContainEqual({
+      c: 'order',
+      kind: 'attackmove',
+      x: 30,
+      z: 46,
+    });
+  });
+
+  it('returns to lane the moment the camp is cleared', () => {
+    const brain = createBotBrain(21, 'reaver');
+    const camps = makeCamps({ tier: 'pack', x: 30, z: 46 });
+    const atCamp = jungler({ x: 30, z: 46, order: 'attackmove', ox: 30, oz: 46 });
+    brain.tick(makePercept(atCamp, { camps, tick: 100 }));
+    // The room flips `up` in place on the SAME object it handed out.
+    const held = camps[0];
+    if (!held) expect.unreachable('camp table lost its entry');
+    else held.up = false;
+    const back = brain.tick(makePercept(atCamp, { camps, tick: 101 }));
+    expect(ordersToward(back, 30, 46)).toBe(false);
+    expect(orders(back).some((o) => o.kind === 'attackmove')).toBe(true);
+  });
+
+  it('holds the lane for the relane window before taking the next camp', () => {
+    const brain = createBotBrain(21, 'reaver');
+    const camps = makeCamps(
+      { tier: 'pack', x: 30, z: 46 },
+      { tier: 'pack', x: 34, z: 50 },
+    );
+    const atCamp = jungler({ x: 30, z: 46, order: 'attackmove', ox: 30, oz: 46 });
+    brain.tick(makePercept(atCamp, { camps, tick: 100 }));
+    const cleared = camps[0];
+    if (!cleared) expect.unreachable('camp table lost its entry');
+    else cleared.up = false;
+    brain.tick(makePercept(atCamp, { camps, tick: 101 })); // commitment released
+    // 399 ticks later (< JUNGLE_RELANE_TICKS = 400): still laning.
+    expect(ordersToward(brain.tick(makePercept(atCamp, { camps, tick: 500 })), 34, 50)).toBe(false);
+    // 400 ticks later: free to take the second camp.
+    expect(ordersToward(brain.tick(makePercept(atCamp, { camps, tick: 501 })), 34, 50)).toBe(true);
+  });
+
+  it('routes to a real camp from the real 1-lane terrain table', () => {
+    // The synthetic coordinates above pin the rules; this pins that the rules
+    // fire at all against the camps terrain.ts actually places.
+    const own = T1.camps.filter((c) => c.half === 0);
+    expect(own.length).toBeGreaterThan(0);
+    const target = own[0];
+    if (!target) return expect.unreachable('no team-0 camp on the 1-lane map');
+    const brain = createBotBrain(21, 'reaver');
+    const self = makeHero(1000, 0, 'reaver', {
+      x: target.x,
+      z: target.z - 6,
+      hp: 640,
+      maxHp: 640,
+      level: 6,
+    });
+    const camps = T1.camps.map((c) => ({ id: c.id, tier: c.tier, x: c.x, z: c.z, up: true }));
+    const cmds = brain.tick(makePercept(self, { camps }));
+    // The order must land on a team-0 CLEARING, not on the lane. Camps sit at
+    // least CAMP_LANE_CLEARANCE (14 m) off every polyline, so no lane order can
+    // satisfy this by accident — which is the whole point of asserting it here
+    // rather than asserting "some attackmove".
+    expect(
+      orders(cmds).some(
+        (o) =>
+          o.kind === 'attackmove' && own.some((c) => c.x === o.x && c.z === o.z),
+      ),
+    ).toBe(true);
+  });
+
+  it('is deterministic across a camp-bearing percept stream', () => {
+    const build = (): BotPercept[] => {
+      const camps = makeCamps(
+        { tier: 'pack', x: 30, z: 46 },
+        { tier: 'brute', x: 28, z: 48 },
+      );
+      const out: BotPercept[] = [];
+      for (let t = 0; t < 250; t++) {
+        const first = camps[0];
+        const second = camps[1];
+        if (!first || !second) throw new Error('camp table lost an entry');
+        first.up = t % 60 < 35;
+        second.up = t % 90 < 40;
+        out.push(
+          makePercept(
+            makeHero(1000, 0, 'reaver', {
+              x: 38 + (t % 7),
+              z: 40 + (t % 5),
+              hp: 640 - (t % 30) * 8,
+              maxHp: 640,
+              level: 1 + (t % 8),
+            }),
+            // The room hands out ONE table per match, mutated in place; the
+            // brain must snapshot nothing from it.
+            { tick: t, camps: camps.map((c) => ({ ...c })) },
+          ),
+        );
+      }
+      return out;
+    };
+    const a = createBotBrain(77, 'reaver');
+    const b = createBotBrain(77, 'reaver');
+    const streamA = build();
+    const streamB = build();
+    const outA = streamA.map((p) => a.tick(p));
+    const outB = streamB.map((p) => b.tick(p));
+    expect(outA).toEqual(outB);
+    expect(outA.some((cmds) => ordersToward(cmds, 28, 48) || ordersToward(cmds, 30, 46))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// High ground (DESIGN_DELTA §1). Terrain never goes on the wire: the brain
+// rebuilds it from the lane count, which is `paths.length`.
+// ---------------------------------------------------------------------------
+describe('high-ground awareness', () => {
+  it('disengages from low ground against a hero on high ground', () => {
+    const { a: low, b: high } = findPair(ELEV_LOW, ELEV_HIGH);
+    const brain = createBotBrain(31, 'reaver');
+    const self = makeHero(1000, 0, 'reaver', { x: low.x, z: low.z, hp: 640, maxHp: 640 });
+    const foe = makeHero(2001, 1, 'longbow', { x: high.x, z: high.z, hp: 540, maxHp: 540 });
+    const cmds = brain.tick(makePercept(self, { visible: [foe] }));
+    expect(orders(cmds)).toContainEqual({ c: 'order', kind: 'move', x: 11, z: 11 });
+  });
+
+  it('contests the same one-on-one on level ground', () => {
+    const { a: low, b: alsoLow } = findPair(ELEV_LOW, ELEV_LOW);
+    const brain = createBotBrain(31, 'reaver');
+    const self = makeHero(1000, 0, 'reaver', { x: low.x, z: low.z, hp: 640, maxHp: 640 });
+    const foe = makeHero(2001, 1, 'longbow', { x: alsoLow.x, z: alsoLow.z, hp: 540, maxHp: 540 });
+    const cmds = brain.tick(makePercept(self, { visible: [foe] }));
+    expect(orders(cmds).some((o) => o.kind === 'move')).toBe(false);
+  });
+
+  it('does not disengage when it is the one holding the high ground', () => {
+    const { a: high, b: low } = findPair(ELEV_HIGH, ELEV_LOW);
+    const brain = createBotBrain(31, 'reaver');
+    const self = makeHero(1000, 0, 'reaver', { x: high.x, z: high.z, hp: 640, maxHp: 640 });
+    const foe = makeHero(2001, 1, 'longbow', { x: low.x, z: low.z, hp: 540, maxHp: 540 });
+    const cmds = brain.tick(makePercept(self, { visible: [foe] }));
+    expect(orders(cmds).some((o) => o.kind === 'move')).toBe(false);
+  });
+
+  it('does not disengage when both sides are on the high ground', () => {
+    // The rule is a HEIGHT DIFFERENCE, not "an enemy stands somewhere high":
+    // level high ground carries no miss penalty either way.
+    const { a: high, b: alsoHigh } = findPair(ELEV_HIGH, ELEV_HIGH);
+    const brain = createBotBrain(31, 'reaver');
+    const self = makeHero(1000, 0, 'reaver', { x: high.x, z: high.z, hp: 640, maxHp: 640 });
+    const foe = makeHero(2001, 1, 'longbow', {
+      x: alsoHigh.x,
+      z: alsoHigh.z,
+      hp: 540,
+      maxHp: 540,
+    });
+    const cmds = brain.tick(makePercept(self, { visible: [foe] }));
+    expect(orders(cmds).some((o) => o.kind === 'move')).toBe(false);
+  });
+
+  it('reads elevation from the lane count its own percept carries', () => {
+    // A point that is HIGH on the 1-lane map and LOW on the 3-lane map. A brain
+    // that rebuilt terrain from a fixed lane count would read this enemy as
+    // level ground and stand its ground on a hill it is under.
+    const { a: low, b: high } = findPair(
+      ELEV_LOW,
+      ELEV_HIGH,
+      (b) => elevationAt(T3, b.x, b.z) === ELEV_LOW,
+    );
+    const brain = createBotBrain(31, 'reaver');
+    const self = makeHero(1000, 0, 'reaver', { x: low.x, z: low.z, hp: 640, maxHp: 640 });
+    const foe = makeHero(2001, 1, 'longbow', { x: high.x, z: high.z, hp: 540, maxHp: 540 });
+    const cmds = brain.tick(makePercept(self, { visible: [foe] }));
+    expect(orders(cmds)).toContainEqual({ c: 'order', kind: 'move', x: 11, z: 11 });
+  });
+
+  it('an ally on the spot pays for the uphill body', () => {
+    const { a: low, b: high } = findPair(ELEV_LOW, ELEV_HIGH);
+    const brain = createBotBrain(31, 'reaver');
+    const self = makeHero(1000, 0, 'reaver', { x: low.x, z: low.z, hp: 640, maxHp: 640 });
+    const foe = makeHero(2001, 1, 'longbow', { x: high.x, z: high.z, hp: 540, maxHp: 540 });
+    const ally = makeHero(1002, 0, 'bullwark', { x: low.x + 1, z: low.z, hp: 720, maxHp: 720 });
+    const cmds = brain.tick(makePercept(self, { visible: [foe, ally] }));
+    expect(orders(cmds).some((o) => o.kind === 'move')).toBe(false);
+  });
+
+  it('skips the uphill weighting entirely when there are no enemy heroes near', () => {
+    const { a: low } = findPair(ELEV_LOW, ELEV_HIGH);
+    const brain = createBotBrain(31, 'reaver');
+    const self = makeHero(1000, 0, 'reaver', { x: low.x, z: low.z, hp: 640, maxHp: 640 });
+    const cmds = brain.tick(makePercept(self));
+    expect(orders(cmds).some((o) => o.kind === 'move')).toBe(false);
+  });
+});
+
+describe('neutral-team guard', () => {
+  it('emits nothing for a self that is not on a player team', () => {
+    const brain = createBotBrain(41, 'reaver');
+    const neutral = makeEnt({
+      id: 1500,
+      kind: 'campBrute',
+      team: NEUTRAL_TEAM,
+      x: 30,
+      z: 46,
+      hp: 470,
+      maxHp: 470,
+      skillPoints: 1,
+      gold: 5000,
+      level: 6,
+    });
+    expect(brain.tick(makePercept(neutral, { atFountain: true }))).toEqual([]);
   });
 });
