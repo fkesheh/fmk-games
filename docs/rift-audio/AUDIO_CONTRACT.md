@@ -51,6 +51,31 @@ Where a rule looks oddly specific, that is why — do not "simplify" it.*
    The one hard constraint that survives regardless: a sustained band centre in a non-`ui`/`ann` cue
    must sit below `INFO_FLOOR_HZ`. Timbre freedom does not license squatting in the reserved
    information register.
+
+   **AMENDMENT — the info-register rule as originally written was actively harmful, and I am
+   replacing it.** Measured after the first full render: `atk.hero.melee` 98.3% of its energy below
+   120 Hz, `atk.creep.melee` 98.0%, `die.hero.ally` 99.2%, `die.hero.self` 99.5%, `obj.ancient` 97.5%.
+   The most-repeated sounds in the game are nearly inaudible on any speaker that rolls off below
+   ~120 Hz — laptops, phones, most headsets. `atk.hero.melee` and `atk.creep.melee` differ by 1 Hz of
+   spectral centroid; so do `die.hero.ally` and `die.hero.self`.
+
+   The cause is this rule. "≤ 8% above 800 Hz" is a CEILING WITH NO FLOOR, so dumping everything
+   below 120 Hz satisfies it perfectly. Six authors independently complied and the gate rewarded them
+   for it. `ui.lastHit` is the only spectrally healthy cue in the bank precisely because it is exempt.
+
+   The replacement, which protects what the original was actually trying to protect:
+
+   - **The protected lane is 2000–4000 Hz, not everything above 800 Hz.** That is where `ui.lastHit`
+     and the announcer live and where they must stay legible. Non-`ui`/`ann` cues keep a tight cap
+     there.
+   - **120–2000 Hz is open.** Body, material and articulation belong there. This is the band that
+     carries a sound on real consumer hardware.
+   - **A FLOOR now applies to impact cues** (`atk.*`, `hit.*`, `die.*`, `obj.*`): a meaningful share
+     of energy must sit in 120–2000 Hz. A cue that is 98% sub is not weighty, it is absent.
+   - **Sub is a layer, not the whole sound.** Weight comes from a sub layer UNDER a body and a
+     transient, which is how the Dota benchmark actually achieves it — not from sub alone.
+
+   A gate that can be satisfied by removing content is a badly designed gate. This one was.
 10. **Only `info`-register cues may put meaningful energy above `INFO_FLOOR_HZ` (800 Hz).** That
     register is reserved for information: last-hit, level-up, skill point, cooldown ready, purchase,
     error, announcer. "Meaningful" is `INFO_BAND_MAX_PCT` (8 % of total energy above 800 Hz) and the

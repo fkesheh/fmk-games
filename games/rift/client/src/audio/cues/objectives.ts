@@ -7,13 +7,23 @@
  * ancient's death "the biggest sound in the game", and §9's Dota-2 benchmark is measured
  * mechanically on the structure-death cues: real, dominant sub-bass, not midrange crunch.
  *
- * Collapse anatomy for `obj.tower`/`obj.guard`/`obj.ancient` (SONIC_BIBLE §4-5):
- *   sub drop (thump) -> low swell underneath -> metal stress layer -> collapsing noise
- *   sweep -> debris tail (repeated seeded grains) -> a quiet allegiance-identity chord.
- * The sub layers (thump + swell) carry the design weight; the metal/noise/debris layers
- * are deliberately lower-gain and get filtered toward the sub band as they decay, so the
- * required "≥35% / ≥45% of energy below 120 Hz" (AUDIO_CONTRACT.md T6) is a property of
- * the mix, not a coincidence.
+ * Collapse anatomy for `obj.tower`/`obj.guard`/`obj.ancient` (SONIC_BIBLE §4-5), REVISED
+ * after a rendered-audio review: a first pass built purely to the (now-superseded) "<=8%
+ * above 800Hz" ceiling put ~97-98% of every structure's energy below 120Hz with a 94-320ms
+ * rise time — a swell, not an impact, and nearly inaudible on any speaker that rolls off
+ * below ~120Hz. AUDIO_CONTRACT.md rule 9 now protects only 2000-4000Hz (ui.lastHit/
+ * announcer territory); 120-2000Hz is open and is exactly the band that carries weight on
+ * real hardware. The anatomy is now:
+ *   broadband impact crack (4-8kHz, 2-10ms, quiet) -> sub drop (thump) -> low "weight" body
+ *   swell in the 60-180Hz reproducible band -> low swell underneath -> metal stress layer
+ *   -> collapsing noise sweep -> debris tail (repeated seeded grains) -> a quiet
+ *   allegiance-identity chord. The crack gives the first 10ms a genuine broadband onset;
+ *   the sub layers now decay over `cfg.subDecayS` (1.5-2.5s, starting AT the impact instead
+ *   of peaking early and vacating before the debris tail's "crash" moment); the new weight
+ *   layer keeps real energy resident in 60-180Hz through the tail. The structure-death sub-
+ *   energy FLOOR (AUDIO_CONTRACT.md T6: "≥35% / ≥45% of energy below 120 Hz") is unchanged
+ *   and still comfortably met — measured pre-revision energy was 97-98% below 120Hz against
+ *   a 35-45% floor, so there was (and remains) enormous room to open up 120-2000Hz.
  *
  * Allegiance colour (SONIC_BIBLE §3 + §11): `CuePlay.intensity` is repurposed by this
  * module, for the three structure cues only, as the friendly/enemy flag — see
@@ -26,7 +36,7 @@
  */
 
 import type { CueFn, CueGraph, CuePlay, CueRegistry } from '../contract.js';
-import { degree, jitter, jitterDb, metal, noise, shimmer, swell, thump, tone } from '../dsp.js';
+import { db, degree, jitter, jitterDb, metal, noise, shimmer, swell, thump, tone } from '../dsp.js';
 import { INTERVAL, METAL_RATIOS, PALETTE, VARY } from '../config.js';
 
 // ---------------------------------------------------------------------------
@@ -78,7 +88,19 @@ interface CollapseCfg {
   readonly subHz: number;
   readonly subDropHz: number;
   readonly subDropTime: number;
+  /** How long the primary sub carries weight, starting AT the impact (1.5-2.5s target —
+   *  finding 2 of the rendered-audio review: the previous envelope peaked in the first
+   *  ~150ms and was 20-30dB down by the time the debris/crash content actually landed). */
+  readonly subDecayS: number;
   readonly extraSub?: { readonly hz: number; readonly dropHz: number; readonly dropTime: number };
+  /** Low "weight" body layer, 60-180Hz (PALETTE.low) — reproduces on hardware that cannot
+   *  reproduce the sub fundamental. Finding 3 (ancient) / finding 1 (all three): a cue that
+   *  is ~98% sub with nothing in the reproducible band is nearly inaudible on real speakers. */
+  readonly weightHz: number;
+  readonly weightGain: number;
+  /** The broadband impact crack's level, in dB relative to the sub body (finding 1 target:
+   *  roughly -6 to -10dB). Ancient reads louder here for the "outweighs tower/guard" gap. */
+  readonly impactDb: number;
   readonly swellHz: number;
   readonly metalHz: number;
   readonly metalBandHz: number;
@@ -95,7 +117,38 @@ function structureCollapse(g: CueGraph, at: number, p: CuePlay, cfg: CollapseCfg
   const dest = p.dest;
   const level = p.gain * cfg.duckLevel;
 
-  // 1) The sub drop — the weight archetype, dominant low-end, fires right on the beat.
+  // 0) The impact crack — a 4-8kHz broadband transient FIRST, before the swell, so a
+  // structure falling CRACKS and then rumbles instead of only swelling. Deliberately
+  // above ui.lastHit's 2-4kHz lane (rule 9, amended: only 2000-4000Hz is protected).
+  noise(
+    g,
+    jitteredAt(g, at),
+    dest,
+    {
+      filter: 'highpass',
+      hz: jitter(g, 5200, VARY.timbrePct),
+      q: 0.7,
+      // NOTE: sustain is a FRACTION of peak the decay ramp targets (dsp.ts's applyEnv),
+      // not a hold duration. An earlier draft used sustain:0.04, which collapsed the
+      // envelope to 4% of peak by 5ms and left almost no integrated energy — measured
+      // 2000-8000Hz energy in the first 30ms was ~3-5 orders of magnitude below the
+      // 20-800Hz energy in the same window, i.e. no audible crack at all despite the
+      // layer existing. sustain:0.35 keeps real energy through the ~15ms core.
+      env: { attack: 0.001, decay: 0.006, sustain: 0.35, release: 0.015, peak: 1.0 },
+    },
+    level * db(cfg.impactDb) * jitterDb(g, VARY.levelDb),
+  );
+
+  // 1) The sub drop — the weight archetype. Fast punch (attack) then a HIGH sustain and a
+  // long release (`subDecayS`) so the sub is still substantial when the debris/crash
+  // content plays later in the tail, instead of vacating in the first ~150ms.
+  // Rebalanced after the "impact body floor" measurement: pre-rebalance, every structure
+  // cue measured 93-98% of its energy below 120Hz against only a 35%/45% FLOOR (huge
+  // margin), and 3-6% in 120-2000Hz against a NEW 20% floor (AUDIO_CONTRACT.md rule 9
+  // amendment — "sub is a layer, not the whole sound"). The sub floor has enormous room to
+  // give, so peaks below are trimmed on the pure-sub layers (thump/extraSub/low swell) and
+  // raised on every layer that already lives partly or wholly in 120-2000Hz (metal, the
+  // weight body, the noise sweep, debris), rather than inventing new layers.
   thump(
     g,
     at,
@@ -104,13 +157,7 @@ function structureCollapse(g: CueGraph, at: number, p: CuePlay, cfg: CollapseCfg
       hz: jitter(g, cfg.subHz, VARY.pitchPct),
       dropHz: cfg.subDropHz,
       dropTime: cfg.subDropTime,
-      env: {
-        attack: 0.006,
-        decay: cfg.subDropTime * 0.6,
-        sustain: 0.55,
-        release: cfg.tailS * 0.55,
-        peak: 1.0,
-      },
+      env: { attack: 0.008, decay: 0.04, sustain: 0.88, release: cfg.subDecayS, peak: 0.75 },
     },
     level * jitterDb(g, VARY.levelDb),
   );
@@ -126,37 +173,58 @@ function structureCollapse(g: CueGraph, at: number, p: CuePlay, cfg: CollapseCfg
         hz: jitter(g, cfg.extraSub.hz, VARY.pitchPct),
         dropHz: cfg.extraSub.dropHz,
         dropTime: cfg.extraSub.dropTime,
-        env: {
-          attack: 0.01,
-          decay: cfg.extraSub.dropTime * 0.7,
-          sustain: 0.6,
-          release: cfg.tailS * 0.6,
-          peak: 0.85,
-        },
+        env: { attack: 0.01, decay: 0.05, sustain: 0.85, release: cfg.subDecayS, peak: 0.6 },
       },
       level * jitterDb(g, VARY.levelDb),
     );
   }
 
-  // 2) Low swell underneath — sustains the sub energy through the whole tail.
+  // 2) Low swell underneath — sustains the sub energy through the whole tail, decaying in
+  // step with the primary thump (`subDecayS`). Sawtooth (not sine) so it has real harmonic
+  // content for the lowpass to open into as it decays, instead of a bare fundamental that
+  // no filter sweep can add energy to.
   swell(
     g,
     at + 0.02,
     dest,
     {
-      type: 'sine',
+      type: 'sawtooth',
       hz: jitter(g, cfg.swellHz, VARY.pitchPct),
       voices: 3,
       spreadCents: jitter(g, 6, VARY.timbrePct),
-      openHz: 220,
-      sweepHz: 55,
-      sweepTime: cfg.tailS,
-      env: { attack: 0.12, decay: 0.3, sustain: 0.7, release: cfg.tailS * 0.75, peak: 0.85 },
+      openHz: 260,
+      sweepHz: 60,
+      sweepTime: cfg.subDecayS,
+      env: { attack: 0.08, decay: 0.2, sustain: 0.8, release: cfg.subDecayS, peak: 0.45 },
     },
     level * jitterDb(g, VARY.levelDb),
   );
 
-  // 3) Metal stress layer — the structure groaning before it gives, then settling.
+  // 2b) The "weight" body: a low/low-mid swell (60-260Hz, PALETTE.low/mid — see per-cue
+  // `weightHz`) that is genuinely reproducible on small speakers/headsets, sustained
+  // through most of the tail. This is the direct fix for a cue that measured ~98% sub and
+  // was therefore nearly silent on hardware that rolls off below ~120Hz. Sawtooth for real
+  // harmonic content; `weightGain` now rivals or exceeds the primary thump (per-cue).
+  swell(
+    g,
+    jitteredAt(g, at, 0.03),
+    dest,
+    {
+      type: 'sawtooth',
+      hz: jitter(g, cfg.weightHz, VARY.pitchPct),
+      voices: 3,
+      spreadCents: jitter(g, 8, VARY.timbrePct),
+      openHz: 900,
+      sweepHz: 220,
+      sweepTime: cfg.subDecayS * 0.7,
+      env: { attack: 0.03, decay: 0.15, sustain: 0.75, release: cfg.subDecayS * 0.85, peak: 0.9 },
+    },
+    level * cfg.weightGain * jitterDb(g, VARY.levelDb),
+  );
+
+  // 3) Metal stress layer — the structure groaning before it gives, then settling. Already
+  // lives in 120-2000Hz (`cfg.metalBandHz`); turned up from a background texture to a real
+  // contributor.
   metal(
     g,
     jitteredAt(g, at),
@@ -165,18 +233,19 @@ function structureCollapse(g: CueGraph, at: number, p: CuePlay, cfg: CollapseCfg
       ratios: METAL_RATIOS.slice(0, 5),
       hz: jitter(g, cfg.metalHz, VARY.timbrePct),
       bandHz: cfg.metalBandHz,
-      q: 3.2,
+      q: 2.4,
       filterHz: cfg.metalBandHz * 2,
       sweepHz: cfg.metalBandHz * 0.35,
       sweepTime: cfg.tailS * 0.6,
-      env: { attack: 0.01, decay: 0.18, sustain: 0.25, release: cfg.tailS * 0.4, peak: 0.5 },
+      env: { attack: 0.01, decay: 0.18, sustain: 0.35, release: cfg.tailS * 0.45, peak: 0.9 },
     },
-    level * 0.6 * jitterDb(g, VARY.levelDb),
+    level * 1.1 * jitterDb(g, VARY.levelDb),
   );
 
-  // 4) Collapsing noise sweep — masonry giving way, filtered down into the sub band by
-  // the time it decays, so its tail reinforces the low-end energy target rather than
-  // fighting it.
+  // 4) Collapsing noise sweep — masonry giving way. A LOWPASS sweeping from
+  // `noiseStartHz` down to `noiseEndHz` passes its ENTIRE sub-cutoff spectrum, and for
+  // white noise (flat power density) the 120-2000Hz span is ~15x wider than 0-120Hz, so
+  // this layer was already energy-efficient for the floor — it just needed more level.
   noise(
     g,
     jitteredAt(g, at, 0.03),
@@ -187,14 +256,15 @@ function structureCollapse(g: CueGraph, at: number, p: CuePlay, cfg: CollapseCfg
       sweepHz: cfg.noiseEndHz,
       sweepTime: cfg.tailS * 0.85,
       q: 0.9,
-      env: { attack: 0.02, decay: cfg.tailS * 0.3, sustain: 0.4, release: cfg.tailS * 0.6, peak: 0.55 },
+      env: { attack: 0.02, decay: cfg.tailS * 0.3, sustain: 0.4, release: cfg.tailS * 0.6, peak: 0.85 },
     },
     level * jitterDb(g, VARY.levelDb),
   );
 
   // 5) Debris tail — repeated short seeded grains over the back half of the collapse.
   // T0's noise() loops the shared 1s buffer, so this is bounded only by each grain's own
-  // envelope, never the buffer length.
+  // envelope, never the buffer length. Bandpassed around `cfg.metalBandHz`'s neighbourhood
+  // (120-400Hz), so louder grains directly help the impact-body floor too.
   const debrisSpan = cfg.tailS * 0.55;
   for (let i = 0; i < cfg.debrisCount; i++) {
     const frac = cfg.debrisCount > 1 ? i / (cfg.debrisCount - 1) : 0;
@@ -206,10 +276,10 @@ function structureCollapse(g: CueGraph, at: number, p: CuePlay, cfg: CollapseCfg
       {
         filter: 'bandpass',
         hz: jitter(g, cfg.metalBandHz * (0.35 + frac * 0.25), VARY.timbrePct),
-        q: 1.4,
-        env: { attack: 0.002, decay: 0.05, sustain: 0.05, release: 0.09, peak: 0.35 },
+        q: 1.2,
+        env: { attack: 0.002, decay: 0.05, sustain: 0.05, release: 0.09, peak: 0.5 },
       },
-      level * 0.4 * jitterDb(g, VARY.levelDb),
+      level * 0.65 * jitterDb(g, VARY.levelDb),
     );
   }
 
@@ -239,6 +309,10 @@ const OBJ_TOWER: CueFn = (g, at, p) => {
     subHz: PALETTE.low.D2,
     subDropHz: PALETTE.sub.D1,
     subDropTime: 0.45,
+    subDecayS: 1.6,
+    weightHz: PALETTE.low.A2,
+    weightGain: 1.0,
+    impactDb: -9,
     swellHz: PALETTE.sub.A1,
     metalHz: PALETTE.mid.D3,
     metalBandHz: 420,
@@ -256,6 +330,13 @@ const OBJ_GUARD: CueFn = (g, at, p) => {
     subHz: PALETTE.low.F2,
     subDropHz: PALETTE.sub.A1,
     subDropTime: 0.4,
+    subDecayS: 1.6,
+    // A full octave+ above tower's weightHz (PALETTE.low.A2, 110Hz) — MUST_DIFFER_PAIRS
+    // gates obj.tower vs obj.guard on centroid/band-shape; sharing near-identical registers
+    // here previously collapsed the two into a 7% centroid difference (needs >=15%).
+    weightHz: PALETTE.mid.A3,
+    weightGain: 0.9,
+    impactDb: -10,
     swellHz: PALETTE.sub.D2,
     metalHz: PALETTE.mid.F3,
     metalBandHz: 520,
@@ -264,7 +345,10 @@ const OBJ_GUARD: CueFn = (g, at, p) => {
     debrisCount: 4,
     identityHz: PALETTE.low.A2,
     duckLevel: 0.85,
-    tailS: 1.7,
+    // Bumped 1.7 -> 2.0: shares tower's subDecayS budget so both get an honest 1.5-2.5s
+    // sub decay; still clearly the smaller/brighter of the two via pitch, duckLevel and
+    // a lighter debris count, not via a shorter tail.
+    tailS: 2.0,
   });
 };
 
@@ -273,7 +357,11 @@ const OBJ_ANCIENT: CueFn = (g, at, p) => {
     subHz: PALETTE.sub.A1,
     subDropHz: PALETTE.sub.D1,
     subDropTime: 0.6,
+    subDecayS: 2.4,
     extraSub: { hz: PALETTE.sub.D1, dropHz: degree(PALETTE.rootHz, 0, -2), dropTime: 0.9 },
+    weightHz: PALETTE.low.F2,
+    weightGain: 1.35,
+    impactDb: -6,
     swellHz: PALETTE.sub.D1,
     metalHz: PALETTE.mid.D3,
     metalBandHz: 340,
@@ -281,7 +369,11 @@ const OBJ_ANCIENT: CueFn = (g, at, p) => {
     noiseEndHz: 70,
     debrisCount: 7,
     identityHz: PALETTE.low.D2,
-    duckLevel: 1.0,
+    // Bumped 1.0 -> 1.12 (finding 3: the ancient must clearly outweigh tower/guard, not
+    // sit ~1dB above them). Combined with the louder crack (-6dB vs -9/-10dB) and the
+    // heavier weightGain above, separation now comes from added content, not just a
+    // louder linear multiplier riding the same limiter ceiling.
+    duckLevel: 1.12,
     tailS: 2.8,
   });
 };
@@ -336,6 +428,10 @@ const OBJ_SURGE: CueFn = (g, at, p) => {
   const dest = p.dest;
   const level = p.gain;
 
+  // Rebalanced for the "impact body floor" (120-2000Hz >= 20%): pre-rebalance measured
+  // 14.4% against the 20% floor, with the deep thump dominating. Trimmed here; the
+  // sawtooth swell (already rising through 300-2200Hz) and the mid-register flourish
+  // below are turned up instead, since both already live partly/wholly in the target band.
   thump(
     g,
     at,
@@ -344,7 +440,7 @@ const OBJ_SURGE: CueFn = (g, at, p) => {
       hz: jitter(g, PALETTE.low.A2, VARY.pitchPct),
       dropHz: PALETTE.sub.A1,
       dropTime: 0.24,
-      env: { attack: 0.006, decay: 0.14, sustain: 0.4, release: 0.5, peak: 0.8 },
+      env: { attack: 0.006, decay: 0.14, sustain: 0.4, release: 0.5, peak: 0.55 },
     },
     level * jitterDb(g, VARY.levelDb),
   );
@@ -361,7 +457,7 @@ const OBJ_SURGE: CueFn = (g, at, p) => {
       openHz: 300,
       sweepHz: 2200,
       sweepTime: 1.0,
-      env: { attack: 0.5, decay: 0.25, sustain: 0.6, release: 0.55, peak: 0.75 },
+      env: { attack: 0.5, decay: 0.25, sustain: 0.6, release: 0.55, peak: 0.95 },
     },
     level * jitterDb(g, VARY.levelDb),
   );
@@ -374,12 +470,12 @@ const OBJ_SURGE: CueFn = (g, at, p) => {
       {
         type: 'triangle',
         hz: PALETTE.mid.A3 * r,
-        env: { attack: 0.015, decay: 0.2, sustain: 0.3, release: 0.4, peak: 0.3 },
+        env: { attack: 0.015, decay: 0.2, sustain: 0.3, release: 0.4, peak: 0.55 },
         filterHz: 2400,
         sweepHz: 1000,
         sweepTime: 0.5,
       },
-      level * 0.6 * jitterDb(g, VARY.levelDb),
+      level * 1.3 * jitterDb(g, VARY.levelDb),
     );
   }
 };
@@ -389,46 +485,61 @@ const OBJ_RESPAWN: CueFn = (g, at, p) => {
   const dest = p.dest;
   const level = p.gain;
 
+  // Rebalanced for the "impact body floor": pre-rebalance measured 0.6% in 120-2000Hz
+  // (96.3% below 120Hz). `type: 'sawtooth'` (was 'triangle') gives real harmonics, and
+  // `openHz` starts already-open at 400 (was 150) — the filter previously only widened
+  // toward `sweepHz` well after the envelope's attack/decay had already spent most of its
+  // amplitude, so harmonics arrived too late to matter. Trimmed peak since the fundamental
+  // alone still dominated 0-120Hz even with the harmonics unlocked.
   swell(
     g,
     at,
     dest,
     {
-      type: 'triangle',
+      type: 'sawtooth',
       hz: jitter(g, PALETTE.sub.A1, VARY.pitchPct),
       voices: 2,
       spreadCents: 5,
-      openHz: 150,
+      openHz: 400,
       sweepHz: 1600,
       sweepTime: 0.9,
-      env: { attack: 0.35, decay: 0.2, sustain: 0.55, release: 0.5, peak: 0.7 },
+      env: { attack: 0.35, decay: 0.2, sustain: 0.55, release: 0.5, peak: 0.3 },
     },
     level * jitterDb(g, VARY.levelDb),
   );
 
+  // A HIGHPASS's passband runs from its cutoff all the way to Nyquist, so turning this up
+  // while it was `filter: 'highpass'` mostly added 4000-20000Hz energy (measured 15%, not
+  // the 120-2000Hz the impact-body floor needs) rather than the intended "rising whoosh"
+  // body. `bandpass`, contained within the target band and centred clear of the 0-120Hz
+  // sub bucket, is the fix — the primary carrier of this cue's 120-2000Hz content now.
   noise(
     g,
     at + 0.05,
     dest,
     {
-      filter: 'highpass',
-      hz: 200,
-      sweepHz: 1400,
+      filter: 'bandpass',
+      hz: 300,
+      sweepHz: 900,
       sweepTime: 0.6,
-      q: 0.7,
-      env: { attack: 0.05, decay: 0.25, sustain: 0.2, release: 0.4, peak: 0.3 },
+      q: 1.1,
+      env: { attack: 0.05, decay: 0.25, sustain: 0.25, release: 0.4, peak: 1.0 },
     },
-    level * jitterDb(g, VARY.levelDb),
+    level * 2.0 * jitterDb(g, VARY.levelDb),
   );
 
+  // A bare sine has ZERO harmonics — 100% of its energy sits in 0-120Hz by construction,
+  // so this "fountain hum" flavour layer was the single biggest drag on the impact-body
+  // floor despite its modest-looking gain. Trimmed to a genuinely minor decorative touch
+  // (peak/duration both cut) rather than removed outright.
   tone(
     g,
     at + 0.1,
     dest,
     {
-      type: 'sine',
+      type: 'triangle',
       hz: jitter(g, PALETTE.sub.A1, VARY.pitchPct),
-      env: { attack: 0.4, decay: 0.3, sustain: 0.7, release: 0.6, peak: 0.5 },
+      env: { attack: 0.3, decay: 0.2, sustain: 0.6, release: 0.25, peak: 0.2 },
     },
     level * 0.6 * jitterDb(g, VARY.levelDb),
   );
@@ -776,10 +887,14 @@ const ANN_DRAW: CueFn = (g, at, p) => {
 // ---------------------------------------------------------------------------
 
 export const OBJECTIVE_CUES = {
+  // Real max end (low swell, item 2): ~1.90 s (0.02 + 0.08 + 0.2 + subDecayS 1.6). Declared
+  // 2.0 s for an honest ~100 ms cushion.
   'obj.tower': { fn: OBJ_TOWER, bus: 'sfx', priority: 1, tail: 2.0, variants: 1, dry: false },
-  // Real tail (swell layer): 1.715 s. Declared 1.8 s for an honest ~85 ms cushion —
-  // 1.7 undershot it by 15 ms and would have truncated the swell's release.
-  'obj.guard': { fn: OBJ_GUARD, bus: 'sfx', priority: 1, tail: 1.8, variants: 1, dry: false },
+  // Guard now shares tower's tailS/subDecayS budget (see OBJ_GUARD) so its sub genuinely
+  // decays over 1.5-2.5 s too; real max end is the same ~1.90 s as tower's. Declared 2.0 s.
+  'obj.guard': { fn: OBJ_GUARD, bus: 'sfx', priority: 1, tail: 2.0, variants: 1, dry: false },
+  // Real max end (low swell, item 2): ~2.70 s (0.02 + 0.08 + 0.2 + subDecayS 2.4). Declared
+  // 2.8 s for an honest ~100 ms cushion.
   'obj.ancient': { fn: OBJ_ANCIENT, bus: 'sfx', priority: 1, tail: 2.8, variants: 1, dry: false },
   'obj.surge': { fn: OBJ_SURGE, bus: 'sfx', priority: 1, tail: 1.6, variants: 1, dry: false },
   'obj.klaxon': { fn: OBJ_KLAXON, bus: 'sfx', priority: 1, tail: 1.7, variants: 1, dry: false },

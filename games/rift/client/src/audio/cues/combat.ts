@@ -4,23 +4,44 @@
  * `atk.*` (the swing), `hit.*` (the impact, including the low-HP heartbeat) and `die.*`
  * (creep/ward/hero deaths, including the team-interval hero-death family). These are the
  * highest-repetition cues in the whole build — thousands of plays per match — so every
- * cue here stays small (SONIC_BIBLE §5: auto-attacks/small hits are 2 layers, <=200ms)
+ * cue here stays small (SONIC_BIBLE §5: auto-attacks/small hits are 2-3 layers, <=200ms)
  * and every repeatable cue genuinely varies per SONIC_BIBLE §7 / AUDIO_CONTRACT rule 11:
  * round-robin picks a structurally different base (register note, filter centre) per
  * `p.variant`, and `jitter()` adds a fresh pitch/timbre nudge on every single play on top
  * of that, so the same variant never sounds identical twice in a row either.
  *
- * Damage-school colour (SONIC_BIBLE §3): physical is noise-forward, band-passed inside
- * 300-2000 Hz; magic is tonal-forward via detuned/ring-modulated `shimmer` with a filtered
- * tail. Every noise/shimmer centre and sideband in this file is kept at or below ~780 Hz
- * (comfortably under `INFO_FLOOR_HZ` = 800) except `hit.crit`'s deliberate <25 ms bright
- * accent — the one place SONIC_BIBLE explicitly allows a brief transient into that band.
- * The `info` register itself (`PALETTE.info`) is never touched here; it belongs to `ui.*`.
+ * BAND POLICY (amended): the protected lane is 2000-4000 Hz ONLY — that is where
+ * `ui.lastHit` and the announcer live, and it stays clear. 120-2000 Hz is OPEN and
+ * EXPECTED here: a rendered-audio review found the previous "everything under ~780 Hz"
+ * reading of the old rule dumped 98-99% of every impact cue's energy below 120 Hz, where
+ * most speakers roll off — the most-fired sounds in the game were reading as silent on a
+ * laptop, and two death cues that must never be confused (ally vs self) were a 1 Hz
+ * centroid apart because their only audible content was a sub-bass thump. Every impact cue
+ * below is now a genuine THREE-layer sound:
+ *   - SUB   (`thump`, low/sub register) — weight underneath, capped to a MINORITY of the
+ *     cue's total energy. It is a layer under the sound, not the sound.
+ *   - BODY  (`noise` band-passed 300-750 Hz, or `metal` for a steel/structural material) —
+ *     the DOMINANT layer. This is what makes the cue audible on a phone speaker and what
+ *     tells the player WHAT was hit; material (tonal/metallic via `metal` vs broadband/dull
+ *     via `noise`) is the primary differentiator between e.g. a hero's weapon and a
+ *     creep's, not loudness.
+ *   - TRANSIENT (`noise`, brief, high-passed/band-passed) — real edge for impact percept,
+ *     placed at 4-6 kHz specifically to sit clear of `ui.lastHit`'s 2-4 kHz lane.
+ * Damage-school colour (SONIC_BIBLE §3) still holds for `hit.physical`/`hit.magic`:
+ * physical stays noise/broadband-forward, magic stays tonal via `shimmer`. `hit.self` is a
+ * deliberate exception to the "bright transient" rule — it is described as a duller,
+ * muffled thud ("that was me"), so it carries no 4-6 kHz edge on purpose (its body layer is
+ * a low-Q bandpass, not a lowpass, so it still excludes the deep sub rather than diluting
+ * into it). `hit.heartbeat` is sub/body only, no transient — it is an interoceptive
+ * body-pulse cue, not a positioned impact, so brightness would read as alarm rather than
+ * dread — but it DOES carry a soft 150-400 Hz body under the sub (amended spec: the
+ * original "no content above 300 Hz" line made the cue inaudible on speakers that roll off
+ * below ~120 Hz, which is most laptops/phones/headsets).
  */
 
 import type { CueFn, CueGraph, CuePlay, CueRegistry, Env } from '../contract.js';
-import { jitter, noise, shimmer, thump, tone } from '../dsp.js';
-import { INTERVAL, PALETTE, VARY } from '../config.js';
+import { jitter, metal, noise, shimmer, thump, tone } from '../dsp.js';
+import { INTERVAL, METAL_RATIOS, PALETTE, VARY } from '../config.js';
 
 const SUB = PALETTE.sub;
 const LOW = PALETTE.low;
@@ -56,48 +77,77 @@ function layerOffset(g: CueGraph): number {
 }
 
 // ---------------------------------------------------------------------------
-// atk.* — the swing. Attacks are the most-fired cues in the game: 2 layers, attack
-// < 8 ms, total < 200 ms, crest > 8 dB (the render harness measures all three and fails
-// the build on them). Physical/noise-forward throughout — nothing here is a damage school
-// choice, it is the mechanical sound of the weapon leaving.
+// atk.* — the swing. Attacks are the most-fired cues in the game: attack < 8 ms (measured
+// on the summed signal), total < 200 ms, crest > 8 dB. No layer here uses `layerOffset` —
+// even a few ms of stagger on a second layer pushes the measured onset out; every layer
+// starts at exactly `at`. Material, not loudness, tells hero apart from creep: `metal`
+// (tonal, ringing partials) reads as steel; `noise` at a low Q reads as dull wood/leather.
 // ---------------------------------------------------------------------------
 
 const atkHeroMelee: CueFn = (g, at, p) => {
-  const bandHz = jitter(g, rr4(p.variant, 560, 640, 720, 780), VARY.timbrePct);
+  // SUB — weight underneath, capped low.
+  const subHz = jitter(g, rr4(p.variant, SUB.A1, SUB.D1, SUB.D2, SUB.A1), VARY.attackPitchPct);
+  thump(
+    g,
+    at,
+    p.dest,
+    {
+      hz: subHz,
+      dropHz: subHz * 0.5,
+      dropTime: 0.05,
+      env: { attack: 0.003, decay: 0.03, sustain: 0.06, release: 0.05, peak: 1 },
+    },
+    0.28 * p.gain,
+  );
+  // BODY — metallic clang: the hero's material identity, dominant layer.
+  const bodyHz = jitter(g, rr4(p.variant, MID.D3, MID.F3, MID.A3, MID.D4), VARY.timbrePct);
+  metal(
+    g,
+    at,
+    p.dest,
+    {
+      ratios: METAL_RATIOS,
+      hz: bodyHz,
+      bandHz: bodyHz * 2.1,
+      q: 1.8,
+      env: { attack: 0.003, decay: 0.05, sustain: 0.12, release: 0.08, peak: 1 },
+    },
+    1.0 * p.gain,
+  );
+  // TRANSIENT — bright metallic edge, 4-6 kHz, clear of ui.lastHit's 2-4 kHz lane.
+  const edgeHz = jitter(g, rr4(p.variant, 4200, 4600, 4900, 5200), VARY.timbrePct);
   noise(
     g,
     at,
     p.dest,
     {
       filter: 'bandpass',
-      hz: bandHz,
-      sweepHz: bandHz * 0.6,
-      sweepTime: 0.045,
-      q: 1.4,
-      env: { attack: 0.0025, decay: 0.022, sustain: 0.04, release: 0.032, peak: 1 },
+      hz: edgeHz,
+      q: 3,
+      env: { attack: 0.001, decay: 0.006, sustain: 0, release: 0.01, peak: 1 },
     },
-    0.85 * p.gain,
-  );
-  const hz = jitter(g, rr4(p.variant, LOW.D2, LOW.F2, LOW.A2, LOW.D3), VARY.attackPitchPct);
-  // No layerOffset here: the attack-crispness gate (< 8ms to 90% of peak, measured on the
-  // summed signal) leaves no room for a staggered second layer — see the note atop the
-  // atk.* section.
-  thump(
-    g,
-    at,
-    p.dest,
-    {
-      hz,
-      dropHz: hz * 0.5,
-      dropTime: 0.045,
-      env: { attack: 0.0025, decay: 0.028, sustain: 0.08, release: 0.045, peak: 1 },
-    },
-    0.55 * p.gain,
+    0.45 * p.gain,
   );
 };
 
 const atkHeroRanged: CueFn = (g, at, p) => {
-  const bandHz = jitter(g, rr4(p.variant, 600, 660, 720, 780), VARY.timbrePct);
+  const subHz = jitter(g, rr4(p.variant, SUB.D1, SUB.A1, SUB.D2, SUB.A1), VARY.attackPitchPct);
+  thump(
+    g,
+    at,
+    p.dest,
+    {
+      hz: subHz,
+      dropHz: subHz * 0.55,
+      dropTime: 0.035,
+      env: { attack: 0.0025, decay: 0.02, sustain: 0.05, release: 0.035, peak: 1 },
+    },
+    0.1 * p.gain,
+  );
+  // BODY — the launch/air "whoosh", broadband (not tonal) but still brighter-leaning than
+  // a creep's bow, matching the hero-family's edge. Tighter Q than the creep bow to
+  // concentrate more of its energy in-band against the sub thump.
+  const bandHz = jitter(g, rr4(p.variant, 550, 610, 660, 710), VARY.timbrePct);
   noise(
     g,
     at,
@@ -105,30 +155,92 @@ const atkHeroRanged: CueFn = (g, at, p) => {
     {
       filter: 'bandpass',
       hz: bandHz,
-      sweepHz: bandHz * 0.45,
+      sweepHz: bandHz * 0.75,
       sweepTime: 0.05,
-      q: 2.0,
-      env: { attack: 0.0025, decay: 0.02, sustain: 0.03, release: 0.03, peak: 1 },
+      q: 1.9,
+      env: { attack: 0.0025, decay: 0.03, sustain: 0.08, release: 0.06, peak: 1 },
     },
-    0.8 * p.gain,
+    1.3 * p.gain,
   );
-  const hz = jitter(g, rr4(p.variant, LOW.A2, LOW.D2, LOW.F2, LOW.D3), VARY.attackPitchPct);
+  // TRANSIENT — thin bowstring snap, higher/thinner than melee's clang.
+  const edgeHz = jitter(g, rr4(p.variant, 5000, 5400, 5700, 6000), VARY.timbrePct);
+  noise(
+    g,
+    at,
+    p.dest,
+    {
+      filter: 'bandpass',
+      hz: edgeHz,
+      q: 3.5,
+      env: { attack: 0.001, decay: 0.005, sustain: 0, release: 0.008, peak: 1 },
+    },
+    0.4 * p.gain,
+  );
+};
+
+const atkCreepMelee: CueFn = (g, at, p) => {
+  const subHz = jitter(g, rr4(p.variant, SUB.D1, SUB.A1, SUB.D2, SUB.A1), VARY.attackPitchPct);
   thump(
     g,
     at,
     p.dest,
     {
-      hz,
-      dropHz: hz * 0.55,
-      dropTime: 0.035,
-      env: { attack: 0.003, decay: 0.02, sustain: 0.05, release: 0.03, peak: 1 },
+      hz: subHz,
+      dropHz: subHz * 0.5,
+      dropTime: 0.04,
+      env: { attack: 0.003, decay: 0.022, sustain: 0.05, release: 0.035, peak: 1 },
     },
-    0.35 * p.gain,
+    0.13 * p.gain,
+  );
+  // BODY — dull wood/leather club: broadband noise, low-ish Q so it still reads as
+  // flat/aperiodic (never ringing the way the hero's `metal` layer does), but tight enough
+  // to concentrate its energy against the sub thump.
+  const bandHz = jitter(g, rr4(p.variant, 420, 480, 540, 600), VARY.timbrePct);
+  noise(
+    g,
+    at,
+    p.dest,
+    {
+      filter: 'bandpass',
+      hz: bandHz,
+      sweepHz: bandHz * 0.65,
+      sweepTime: 0.045,
+      q: 1.15,
+      env: { attack: 0.003, decay: 0.03, sustain: 0.07, release: 0.055, peak: 1 },
+    },
+    1.35 * p.gain,
+  );
+  // TRANSIENT — present but subdued and lower than the hero's bright edge: duller.
+  const edgeHz = jitter(g, rr4(p.variant, 3200, 3400, 3600, 3800), VARY.timbrePct);
+  noise(
+    g,
+    at,
+    p.dest,
+    {
+      filter: 'bandpass',
+      hz: edgeHz,
+      q: 2.2,
+      env: { attack: 0.001, decay: 0.005, sustain: 0, release: 0.008, peak: 1 },
+    },
+    0.15 * p.gain,
   );
 };
 
-const atkCreepMelee: CueFn = (g, at, p) => {
-  const bandHz = jitter(g, rr4(p.variant, 420, 480, 540, 600), VARY.timbrePct);
+const atkCreepRanged: CueFn = (g, at, p) => {
+  const subHz = jitter(g, rr4(p.variant, SUB.A1, SUB.D1, SUB.D2, SUB.A1), VARY.attackPitchPct);
+  thump(
+    g,
+    at,
+    p.dest,
+    {
+      hz: subHz,
+      dropHz: subHz * 0.55,
+      dropTime: 0.03,
+      env: { attack: 0.0025, decay: 0.018, sustain: 0.04, release: 0.028, peak: 1 },
+    },
+    0.11 * p.gain,
+  );
+  const bandHz = jitter(g, rr4(p.variant, 460, 520, 580, 640), VARY.timbrePct);
   noise(
     g,
     at,
@@ -138,59 +250,42 @@ const atkCreepMelee: CueFn = (g, at, p) => {
       hz: bandHz,
       sweepHz: bandHz * 0.6,
       sweepTime: 0.04,
-      q: 1.3,
-      env: { attack: 0.003, decay: 0.02, sustain: 0.04, release: 0.03, peak: 1 },
+      q: 1.2,
+      env: { attack: 0.0025, decay: 0.025, sustain: 0.06, release: 0.045, peak: 1 },
     },
-    0.5 * p.gain,
+    1.2 * p.gain,
   );
-  const hz = jitter(g, rr4(p.variant, LOW.D2, LOW.F2, LOW.A2, LOW.D3), VARY.attackPitchPct);
-  thump(
-    g,
-    at,
-    p.dest,
-    {
-      hz,
-      dropHz: hz * 0.5,
-      dropTime: 0.04,
-      env: { attack: 0.003, decay: 0.025, sustain: 0.07, release: 0.035, peak: 1 },
-    },
-    0.32 * p.gain,
-  );
-};
-
-const atkCreepRanged: CueFn = (g, at, p) => {
-  const bandHz = jitter(g, rr4(p.variant, 460, 520, 580, 640), VARY.timbrePct);
+  const edgeHz = jitter(g, rr4(p.variant, 3000, 3200, 3400, 3600), VARY.timbrePct);
   noise(
     g,
     at,
     p.dest,
     {
       filter: 'bandpass',
-      hz: bandHz,
-      sweepHz: bandHz * 0.5,
-      sweepTime: 0.045,
-      q: 1.8,
-      env: { attack: 0.003, decay: 0.018, sustain: 0.03, release: 0.028, peak: 1 },
+      hz: edgeHz,
+      q: 2.2,
+      env: { attack: 0.001, decay: 0.004, sustain: 0, release: 0.007, peak: 1 },
     },
-    0.46 * p.gain,
-  );
-  const hz = jitter(g, rr4(p.variant, LOW.A2, LOW.D2, LOW.F2, LOW.D3), VARY.attackPitchPct);
-  thump(
-    g,
-    at,
-    p.dest,
-    {
-      hz,
-      dropHz: hz * 0.55,
-      dropTime: 0.03,
-      env: { attack: 0.003, decay: 0.018, sustain: 0.05, release: 0.028, peak: 1 },
-    },
-    0.22 * p.gain,
+    0.12 * p.gain,
   );
 };
 
 const atkSiege: CueFn = (g, at, p) => {
-  const bandHz = jitter(g, rr4(p.variant, 380, 440, 500, 560), VARY.timbrePct);
+  const subHz = jitter(g, rr4(p.variant, SUB.D2, SUB.A1, SUB.D2, SUB.D1), VARY.attackPitchPct);
+  thump(
+    g,
+    at,
+    p.dest,
+    {
+      hz: subHz,
+      dropHz: subHz * 0.48,
+      dropTime: 0.05,
+      env: { attack: 0.003, decay: 0.03, sustain: 0.07, release: 0.05, peak: 1 },
+    },
+    0.15 * p.gain,
+  );
+  // BODY — heavier and lower than a hand creep weapon: a war machine's timber/iron frame.
+  const bandHz = jitter(g, rr4(p.variant, 340, 400, 460, 520), VARY.timbrePct);
   noise(
     g,
     at,
@@ -198,45 +293,32 @@ const atkSiege: CueFn = (g, at, p) => {
     {
       filter: 'bandpass',
       hz: bandHz,
-      sweepHz: bandHz * 0.55,
+      sweepHz: bandHz * 0.6,
       sweepTime: 0.05,
-      q: 1.1,
-      env: { attack: 0.003, decay: 0.028, sustain: 0.06, release: 0.04, peak: 1 },
+      q: 1.2,
+      env: { attack: 0.003, decay: 0.04, sustain: 0.09, release: 0.07, peak: 1 },
     },
-    0.7 * p.gain,
+    1.4 * p.gain,
   );
-  const hz = jitter(g, rr4(p.variant, LOW.F2, LOW.A2, LOW.D2, LOW.D3), VARY.attackPitchPct);
-  thump(
-    g,
-    at,
-    p.dest,
-    {
-      hz,
-      dropHz: hz * 0.48,
-      dropTime: 0.05,
-      env: { attack: 0.003, decay: 0.032, sustain: 0.09, release: 0.05, peak: 1 },
-    },
-    0.6 * p.gain,
-  );
-};
-
-/** Heaviest attack: a mid-register launch with a sub component (AUDIO_CONTRACT T5). */
-const atkTower: CueFn = (g, at, p) => {
-  const launchHz = jitter(g, rr4(p.variant, MID.D3, MID.F3, MID.A3, MID.D4), VARY.timbrePct);
+  // TRANSIENT — a mechanical crunch, duller than the hero's clang, more present than a
+  // hand-creep's tap.
+  const edgeHz = jitter(g, rr4(p.variant, 3400, 3600, 3800, 4000), VARY.timbrePct);
   noise(
     g,
     at,
     p.dest,
     {
       filter: 'bandpass',
-      hz: launchHz,
-      sweepHz: launchHz * 1.3,
-      sweepTime: 0.05,
-      q: 1.6,
-      env: { attack: 0.003, decay: 0.03, sustain: 0.06, release: 0.05, peak: 1 },
+      hz: edgeHz,
+      q: 2.5,
+      env: { attack: 0.001, decay: 0.006, sustain: 0, release: 0.01, peak: 1 },
     },
-    0.75 * p.gain,
+    0.25 * p.gain,
   );
+};
+
+/** Heaviest attack: a structural steel body over a sub component (AUDIO_CONTRACT T5). */
+const atkTower: CueFn = (g, at, p) => {
   const subHz = jitter(g, rr4(p.variant, SUB.D1, SUB.A1, SUB.D2, SUB.A1), VARY.attackPitchPct);
   thump(
     g,
@@ -246,20 +328,57 @@ const atkTower: CueFn = (g, at, p) => {
       hz: subHz,
       dropHz: subHz * 0.55,
       dropTime: 0.06,
-      env: { attack: 0.003, decay: 0.035, sustain: 0.1, release: 0.06, peak: 1 },
+      env: { attack: 0.0022, decay: 0.03, sustain: 0.08, release: 0.05, peak: 1 },
     },
-    0.75 * p.gain,
+    0.2 * p.gain,
+  );
+  // BODY — structural steel via `metal` (SONIC_BIBLE §4: metal = "steel, armour,
+  // STRUCTURES"), the heaviest, lowest-centred body in the atk.* family. This is the
+  // loudest cue in the atk.* family (heaviest design intent) and it pushes hardest into
+  // the shared bus compressor, which measurably softens onset — total level trimmed here
+  // (not just the sub/body ratio) to bring its peak in line with the rest of the family,
+  // which is what actually recovers the sub-8ms onset.
+  const bodyHz = jitter(g, rr4(p.variant, MID.D3, MID.F3, MID.A3, MID.D3), VARY.timbrePct);
+  metal(
+    g,
+    at,
+    p.dest,
+    {
+      ratios: METAL_RATIOS,
+      hz: bodyHz,
+      bandHz: bodyHz * 2.0,
+      q: 1.9,
+      env: { attack: 0.0022, decay: 0.042, sustain: 0.11, release: 0.075, peak: 1 },
+    },
+    0.85 * p.gain,
+  );
+  // TRANSIENT — the mechanical release clank.
+  const edgeHz = jitter(g, rr4(p.variant, 4600, 4900, 5200, 5500), VARY.timbrePct);
+  noise(
+    g,
+    at,
+    p.dest,
+    {
+      filter: 'bandpass',
+      hz: edgeHz,
+      q: 3,
+      env: { attack: 0.001, decay: 0.007, sustain: 0, release: 0.012, peak: 1 },
+    },
+    0.3 * p.gain,
   );
 };
 
 // ---------------------------------------------------------------------------
 // hit.* — the impact. Fired at the victim's position whenever any unit loses HP.
-// hit.physical / hit.magic / hit.crit are the three "what landed" cues; hit.self is what
-// the local player hears taking damage; hit.heartbeat is the low-HP dread pulse.
+// hit.physical / hit.magic / hit.crit are the three "what landed" cues, now the same
+// three-layer sub/body/transient shape as atk.*; hit.self is the deliberate muffled
+// exception (no bright transient — it is written to sound duller, not sharper);
+// hit.heartbeat is sub+soft-body only, no transient (its own spec: no bright content —
+// dread, not alarm — but a 150-400 Hz body layer keeps it audible on small speakers).
 // ---------------------------------------------------------------------------
 
 const hitPhysical: CueFn = (g, at, p) => {
-  const bandHz = jitter(g, rr4(p.variant, 480, 560, 620, 700), VARY.timbrePct);
+  const bandHz = jitter(g, rr4(p.variant, 400, 480, 560, 640), VARY.timbrePct);
   noise(
     g,
     at,
@@ -267,12 +386,12 @@ const hitPhysical: CueFn = (g, at, p) => {
     {
       filter: 'bandpass',
       hz: bandHz,
-      sweepHz: bandHz * 0.55,
+      sweepHz: bandHz * 0.6,
       sweepTime: 0.07,
-      q: 1.3,
-      env: { attack: 0.003, decay: 0.04, sustain: 0.07, release: 0.075, peak: 1 },
+      q: 1.2,
+      env: { attack: 0.003, decay: 0.045, sustain: 0.08, release: 0.075, peak: 1 },
     },
-    0.75 * p.gain,
+    1.4 * p.gain,
   );
   const hz = jitter(g, rr4(p.variant, LOW.D2, LOW.F2, LOW.A2, LOW.D3), VARY.pitchPct);
   thump(
@@ -282,14 +401,27 @@ const hitPhysical: CueFn = (g, at, p) => {
     {
       hz,
       dropHz: hz * 0.45,
-      dropTime: 0.08,
-      env: { attack: 0.004, decay: 0.05, sustain: 0.1, release: 0.08, peak: 1 },
+      dropTime: 0.07,
+      env: { attack: 0.004, decay: 0.05, sustain: 0.09, release: 0.07, peak: 1 },
     },
-    0.6 * p.gain,
+    0.13 * p.gain,
+  );
+  const edgeHz = jitter(g, rr4(p.variant, 4000, 4300, 4600, 4900), VARY.timbrePct);
+  noise(
+    g,
+    at,
+    p.dest,
+    {
+      filter: 'bandpass',
+      hz: edgeHz,
+      q: 3,
+      env: { attack: 0.001, decay: 0.006, sustain: 0, release: 0.012, peak: 1 },
+    },
+    0.35 * p.gain,
   );
 };
 
-/** Magic school: tonal-forward ring-mod shimmer + a body thump. No noise layer. */
+/** Magic school: tonal-forward ring-mod shimmer (body + identity) + a sub thump + a spark. */
 const hitMagic: CueFn = (g, at, p) => {
   const hz = jitter(g, rr4(p.variant, HIGH.F4, HIGH.A4, HIGH.D5, HIGH.F5), VARY.pitchPct);
   const tailHz = jitter(g, rr4(p.variant, 600, 640, 680, 650), VARY.timbrePct);
@@ -302,9 +434,9 @@ const hitMagic: CueFn = (g, at, p) => {
       modHz: rr4(p.variant, 42, 58, 66, 74),
       index: 0.55,
       tailHz,
-      env: { attack: 0.004, decay: 0.05, sustain: 0.12, release: 0.09, peak: 1 },
+      env: { attack: 0.004, decay: 0.05, sustain: 0.14, release: 0.1, peak: 1 },
     },
-    0.55 * p.gain,
+    0.75 * p.gain,
   );
   const bodyHz = jitter(g, rr4(p.variant, LOW.D2, LOW.F2, LOW.A2, LOW.D3), VARY.pitchPct);
   thump(
@@ -314,20 +446,33 @@ const hitMagic: CueFn = (g, at, p) => {
     {
       hz: bodyHz,
       dropHz: bodyHz * 0.45,
-      dropTime: 0.09,
-      env: { attack: 0.004, decay: 0.05, sustain: 0.1, release: 0.08, peak: 1 },
+      dropTime: 0.06,
+      env: { attack: 0.004, decay: 0.04, sustain: 0.08, release: 0.065, peak: 1 },
     },
-    0.6 * p.gain,
+    0.3 * p.gain,
+  );
+  const sparkHz = jitter(g, rr4(p.variant, 4500, 4800, 5100, 5500), VARY.timbrePct);
+  noise(
+    g,
+    at,
+    p.dest,
+    {
+      filter: 'bandpass',
+      hz: sparkHz,
+      q: 3.2,
+      env: { attack: 0.001, decay: 0.007, sustain: 0, release: 0.012, peak: 1 },
+    },
+    0.3 * p.gain,
   );
 };
 
 /**
- * A bigger version of hit.physical plus a <25 ms bright accent. The accent is the one
- * deliberate exception to "stay under INFO_FLOOR_HZ" (SONIC_BIBLE: "the info register is
- * not yours") — kept brief and quiet enough that it stays inside `INFO_BAND_MAX_PCT`.
+ * A bigger version of hit.physical plus a brighter accent. The accent now lives at 4-6 kHz
+ * (clear of ui.lastHit's 2-4 kHz lane, and free to be bigger now that the protected lane is
+ * 2-4 kHz only, not "everything above 800 Hz").
  */
 const hitCrit: CueFn = (g, at, p) => {
-  const bandHz = jitter(g, rr4(p.variant, 520, 600, 680, 760), VARY.timbrePct);
+  const bandHz = jitter(g, rr4(p.variant, 420, 500, 580, 660), VARY.timbrePct);
   noise(
     g,
     at,
@@ -335,12 +480,12 @@ const hitCrit: CueFn = (g, at, p) => {
     {
       filter: 'bandpass',
       hz: bandHz,
-      sweepHz: bandHz * 0.5,
+      sweepHz: bandHz * 0.55,
       sweepTime: 0.07,
-      q: 1.5,
-      env: { attack: 0.003, decay: 0.045, sustain: 0.09, release: 0.08, peak: 1 },
+      q: 1.25,
+      env: { attack: 0.003, decay: 0.05, sustain: 0.1, release: 0.08, peak: 1 },
     },
-    0.85 * p.gain,
+    1.4 * p.gain,
   );
   const hz = jitter(g, rr4(p.variant, LOW.F2, LOW.A2, LOW.D3, LOW.D2), VARY.pitchPct);
   thump(
@@ -350,12 +495,12 @@ const hitCrit: CueFn = (g, at, p) => {
     {
       hz,
       dropHz: hz * 0.4,
-      dropTime: 0.09,
-      env: { attack: 0.004, decay: 0.055, sustain: 0.14, release: 0.09, peak: 1 },
+      dropTime: 0.08,
+      env: { attack: 0.004, decay: 0.05, sustain: 0.1, release: 0.075, peak: 1 },
     },
-    0.85 * p.gain,
+    0.14 * p.gain,
   );
-  const accentHz = jitter(g, rr4(p.variant, 1600, 1750, 1850, 1950), VARY.timbrePct);
+  const accentHz = jitter(g, rr4(p.variant, 4500, 4900, 5300, 5700), VARY.timbrePct);
   noise(
     g,
     at,
@@ -364,13 +509,17 @@ const hitCrit: CueFn = (g, at, p) => {
       filter: 'bandpass',
       hz: accentHz,
       q: 3.5,
-      env: { attack: 0.001, decay: 0.008, sustain: 0, release: 0.01, peak: 1 },
+      env: { attack: 0.001, decay: 0.008, sustain: 0, release: 0.014, peak: 1 },
     },
-    0.25 * p.gain,
+    0.45 * p.gain,
   );
 };
 
-/** What the local player hears taking damage: a duller, lower, filtered thud. */
+/**
+ * What the local player hears taking damage: a duller, lower, filtered thud. Deliberately
+ * carries NO bright transient — "duller/muffled" is the whole point ("that was me", not a
+ * clean readable clang), so it stays a sub+body pair by design, not an oversight.
+ */
 const hitSelf: CueFn = (g, at, p) => {
   const hz = jitter(g, rr4(p.variant, LOW.D2, SUB.A1, LOW.F2, SUB.D2), VARY.pitchPct);
   thump(
@@ -381,33 +530,46 @@ const hitSelf: CueFn = (g, at, p) => {
       hz,
       dropHz: hz * 0.4,
       dropTime: 0.1,
-      env: { attack: 0.005, decay: 0.06, sustain: 0.14, release: 0.11, peak: 1 },
+      env: { attack: 0.005, decay: 0.05, sustain: 0.1, release: 0.09, peak: 1 },
     },
-    0.85 * p.gain,
+    0.16 * p.gain,
   );
-  const cutoff = jitter(g, rr4(p.variant, 340, 300, 380, 260), VARY.timbrePct);
+  // BODY — bandpass, not lowpass: a lowpass still passes everything below its cutoff,
+  // which dilutes straight back into the 0-120Hz bin alongside the sub thump. A bandpass
+  // centred just below hit.physical's (duller, lower) excludes the deep sub explicitly
+  // while staying muffled — no highpass skirt, no bright transient, still "that was me".
+  const cutoff = jitter(g, rr4(p.variant, 340, 380, 420, 460), VARY.timbrePct);
   noise(
     g,
     at + layerOffset(g),
     p.dest,
     {
-      filter: 'lowpass',
+      filter: 'bandpass',
       hz: cutoff,
       sweepHz: cutoff * 0.6,
       sweepTime: 0.1,
-      q: 0.8,
-      env: { attack: 0.006, decay: 0.07, sustain: 0.1, release: 0.1, peak: 1 },
+      q: 1.1,
+      env: { attack: 0.006, decay: 0.06, sustain: 0.09, release: 0.09, peak: 1 },
     },
-    0.5 * p.gain,
+    1.4 * p.gain,
   );
 };
 
 /**
- * The low-HP dread pulse: a sub-register double-thump ("lub-dub"), always < 300 Hz, always
- * inside a 400 ms budget. `p.intensity` carries the band from `index.ts`'s heartbeat timer
- * (0 = 30% HP, 1 = 15% HP); band 1 is tighter, louder and more urgent. Every firing draws a
- * fresh `jitter()` value, so a heartbeat repeated every 0.62-1.1 s all match never locks
- * into a mechanically identical tick — it stays dread, not a metronome.
+ * The low-HP dread pulse: a sub-register double-thump ("lub-dub") plus a soft, non-
+ * percussive low-mid body (150-400 Hz) so the pulse is audible — not just felt — on a
+ * speaker that rolls off below ~120 Hz. Amended spec (was "no content above 300 Hz", which
+ * made the cue read as silence on exactly the hardware most players use): still `dry: true`
+ * and still exempt from the stereo-decorrelation gate (non-positional is correct — this is
+ * the player's own pulse, not a world event) — only audibility changed. The body layer uses
+ * a SOFT attack (14 ms, not the crisp <3 ms transients used elsewhere in this file) and a
+ * low Q so it reads as a dull thud riding under the sub, never a click or a bright ping —
+ * dread, not alarm — which matters doubly here because this cue repeats every
+ * `DERIVE.lowHpPulseS` while the player is near death and fatigue is the real risk.
+ * `p.intensity` carries the band from `index.ts`'s heartbeat timer (0 = 30% HP, 1 = 15%
+ * HP); band 1 is tighter, louder and more urgent. Every firing draws a fresh `jitter()`
+ * value, so a heartbeat repeated every 0.62-1.1 s all match never locks into a mechanically
+ * identical tick.
  */
 const hitHeartbeat: CueFn = (g, at, p) => {
   const urgent = p.intensity >= 1;
@@ -415,6 +577,10 @@ const hitHeartbeat: CueFn = (g, at, p) => {
   const level = (urgent ? 1.15 : 1.0) * p.gain;
   const hz1 = jitter(g, SUB.A1, VARY.pitchPct);
   const hz2 = jitter(g, SUB.D1, VARY.pitchPct);
+  // SUB — the felt weight. A sine's energy concentrates almost entirely into one narrow
+  // bin, so even a "modest" gain here out-competes a much louder broadband body layer for
+  // share of energy (the same lesson from the atk.*/die.* rebuild) — trimmed hard (0.9/0.65
+  // -> 0.2/0.15) so the new body layer, not this, sets the cue's spectral centre of mass.
   thump(
     g,
     at,
@@ -425,7 +591,7 @@ const hitHeartbeat: CueFn = (g, at, p) => {
       dropTime: 0.09,
       env: { attack: 0.006, decay: 0.05, sustain: 0.15, release: 0.09, peak: 1 },
     },
-    0.9 * level,
+    0.2 * level,
   );
   thump(
     g,
@@ -437,15 +603,47 @@ const hitHeartbeat: CueFn = (g, at, p) => {
       dropTime: 0.08,
       env: { attack: 0.006, decay: 0.045, sustain: 0.1, release: 0.08, peak: 1 },
     },
-    0.65 * level,
+    0.15 * level,
+  );
+  // BODY — a soft low-mid thud under each beat, never bright, never sharp. Gain set well
+  // above the sub layer's (the pattern that actually moves the balance, per the same
+  // lesson) and Q tightened (1.1 -> 2.2) to concentrate its energy competitively.
+  const bodyHz1 = jitter(g, 230, VARY.pitchPct);
+  noise(
+    g,
+    at,
+    p.dest,
+    {
+      filter: 'bandpass',
+      hz: bodyHz1,
+      q: 2.2,
+      env: { attack: 0.014, decay: 0.06, sustain: 0.16, release: 0.1, peak: 1 },
+    },
+    1.5 * level,
+  );
+  const bodyHz2 = jitter(g, 190, VARY.pitchPct);
+  noise(
+    g,
+    at + gap,
+    p.dest,
+    {
+      filter: 'bandpass',
+      hz: bodyHz2,
+      q: 2.2,
+      env: { attack: 0.014, decay: 0.055, sustain: 0.13, release: 0.09, peak: 1 },
+    },
+    1.15 * level,
   );
 };
 
 // ---------------------------------------------------------------------------
-// die.* — deaths. The three hero-death cues share one body-fall shape and differ only in
-// the SONIC_BIBLE §3 team-interval colour: `die.hero` resolves consonant (good news, an
-// enemy fell), `die.hero.ally` and `die.hero.self` colour dissonant (bad news), and
-// `die.hero.self` additionally carries extra low-end weight for the real loss.
+// die.* — deaths. The three hero-death cues share one shape and differ only in the
+// SONIC_BIBLE §3 team-interval colour: `die.hero` resolves consonant (good news, an enemy
+// fell), `die.hero.ally` and `die.hero.self` colour dissonant (bad news). The interval
+// chord's root now sits in the audible MID register (was LOW.D2, ~73 Hz — inaudible on
+// small speakers and the reason die.hero.ally/die.hero.self were a 1 Hz centroid apart);
+// the SUB thump stays underneath as weight, not as the whole sound. `die.hero.self` gets
+// the hardest onset of the three plus extra low-end weight for the real loss.
 // ---------------------------------------------------------------------------
 
 function heroDeathChord(
@@ -454,6 +652,7 @@ function heroDeathChord(
   p: CuePlay,
   interval: readonly number[],
   weight: number,
+  hardOnset: boolean,
 ): void {
   // INTERVAL.ally / INTERVAL.enemy are both frozen 3-entry arrays (config.ts) widened to
   // `readonly number[]`, so indexing is `number | undefined` under noUncheckedIndexedAccess
@@ -462,19 +661,30 @@ function heroDeathChord(
   const i0 = interval[0] ?? 1;
   const i1 = interval[1] ?? 1;
   const i2 = interval[2] ?? 1;
-  const root = jitter(g, LOW.D2, VARY.pitchPct);
+  // Chord root moved to the audible MID register — this is the fix. At the old LOW.D2 root
+  // (~73 Hz) the whole ally/enemy interval colouring rode under 120 Hz alongside the sub
+  // thump; nobody could hear which interval was even playing.
+  const root = jitter(g, MID.A3, VARY.pitchPct);
 
+  // SUB — body-fall weight, underneath, capped.
+  const subRoot = jitter(g, LOW.D2, VARY.pitchPct);
   thump(
     g,
     at,
     p.dest,
     {
-      hz: root,
-      dropHz: root * 0.42,
-      dropTime: 0.2 * weight,
-      env: { attack: 0.004, decay: 0.12, sustain: 0.22, release: 0.4 * weight, peak: 1 },
+      hz: subRoot,
+      dropHz: subRoot * 0.42,
+      dropTime: 0.18 * weight,
+      env: {
+        attack: hardOnset ? 0.0025 : 0.004,
+        decay: 0.1,
+        sustain: 0.18,
+        release: 0.3 * weight,
+        peak: 1,
+      },
     },
-    0.95 * weight * p.gain,
+    0.4 * weight * p.gain,
   );
 
   if (weight > 1) {
@@ -487,91 +697,99 @@ function heroDeathChord(
       {
         hz: subHz,
         dropHz: subHz * 0.5,
-        dropTime: 0.32,
-        env: { attack: 0.006, decay: 0.16, sustain: 0.3, release: 0.55, peak: 1 },
+        dropTime: 0.3,
+        env: { attack: 0.003, decay: 0.14, sustain: 0.28, release: 0.5, peak: 1 },
       },
-      0.7 * p.gain,
+      0.42 * p.gain,
     );
   }
 
+  // BODY/CHORD — the team-interval colour, now dominant and audible.
   const chordEnv: Env = {
-    attack: 0.02,
-    decay: 0.16,
-    sustain: 0.3,
-    release: 0.5 * weight,
+    attack: hardOnset ? 0.006 : 0.015,
+    decay: 0.14,
+    sustain: 0.35,
+    release: 0.45 * weight,
     peak: 1,
   };
-  const cutoff = jitter(g, 1400, VARY.timbrePct);
+  const cutoff = jitter(g, 1800, VARY.timbrePct);
   tone(
     g,
     at + layerOffset(g),
     p.dest,
     { type: 'triangle', hz: root * i0, filterHz: cutoff, env: chordEnv },
-    0.4 * p.gain,
+    0.65 * p.gain,
   );
   tone(
     g,
     at + layerOffset(g),
     p.dest,
     { type: 'triangle', hz: root * i1, filterHz: cutoff, env: chordEnv },
-    0.32 * p.gain,
+    0.55 * p.gain,
   );
   tone(
     g,
     at + layerOffset(g),
     p.dest,
     { type: 'triangle', hz: root * i2, filterHz: cutoff, env: chordEnv },
-    0.28 * p.gain,
+    0.48 * p.gain,
   );
-}
 
-/** An enemy fell — good news, resolved with INTERVAL.ally (fifth + octave). */
-const dieHero: CueFn = (g, at, p) => heroDeathChord(g, at, p, INTERVAL.ally, 1);
-
-/** A teammate fell — bad news, coloured with INTERVAL.enemy (minor 2nd + tritone). */
-const dieHeroAlly: CueFn = (g, at, p) => heroDeathChord(g, at, p, INTERVAL.enemy, 1);
-
-/** You fell — INTERVAL.enemy plus extra low-end weight for the real loss. */
-const dieHeroSelf: CueFn = (g, at, p) => heroDeathChord(g, at, p, INTERVAL.enemy, 1.4);
-
-/**
- * Fires constantly — must sit below the last-hit chime it accompanies and never mask it:
- * nothing above `INFO_FLOOR_HZ`.
- */
-const dieCreep: CueFn = (g, at, p) => {
-  const bandHz = jitter(g, rr4(p.variant, 420, 480, 540, 600), VARY.timbrePct);
+  // TRANSIENT — the fall's impact edge. die.hero.self gets a harsher, higher, louder crack
+  // for the hardest onset of the three; the other two get a modest, softer one.
+  const edgeHz = hardOnset
+    ? jitter(g, 5200, VARY.timbrePct)
+    : jitter(g, 4200, VARY.timbrePct);
   noise(
     g,
     at,
     p.dest,
     {
-      filter: 'lowpass',
-      hz: bandHz,
-      sweepHz: bandHz * 0.5,
-      sweepTime: 0.09,
-      q: 0.9,
-      env: { attack: 0.004, decay: 0.05, sustain: 0.08, release: 0.09, peak: 1 },
+      filter: 'bandpass',
+      hz: edgeHz,
+      q: hardOnset ? 3.4 : 2.6,
+      env: {
+        attack: 0.001,
+        decay: hardOnset ? 0.01 : 0.008,
+        sustain: 0,
+        release: hardOnset ? 0.016 : 0.013,
+        peak: 1,
+      },
     },
-    0.55 * p.gain,
+    (hardOnset ? 0.4 : 0.25) * p.gain,
   );
-  const hz = jitter(g, rr4(p.variant, LOW.D2, LOW.F2, LOW.A2, SUB.A1), VARY.pitchPct);
+}
+
+/** An enemy fell — good news, resolved with INTERVAL.ally (fifth + octave). */
+const dieHero: CueFn = (g, at, p) => heroDeathChord(g, at, p, INTERVAL.ally, 1, false);
+
+/** A teammate fell — bad news, coloured with INTERVAL.enemy (minor 2nd + tritone). */
+const dieHeroAlly: CueFn = (g, at, p) => heroDeathChord(g, at, p, INTERVAL.enemy, 1, false);
+
+/** You fell — INTERVAL.enemy, extra low-end weight, and the hardest onset of the three. */
+const dieHeroSelf: CueFn = (g, at, p) => heroDeathChord(g, at, p, INTERVAL.enemy, 1.4, true);
+
+/**
+ * Fires constantly — must sit below the last-hit chime it accompanies and never mask it:
+ * nothing in the 2-4 kHz protected lane.
+ */
+const dieCreep: CueFn = (g, at, p) => {
+  const subHz = jitter(g, rr4(p.variant, SUB.D1, SUB.A1, SUB.D2, SUB.A1), VARY.pitchPct);
   thump(
     g,
-    at + layerOffset(g),
+    at,
     p.dest,
     {
-      hz,
-      dropHz: hz * 0.45,
-      dropTime: 0.1,
-      env: { attack: 0.005, decay: 0.06, sustain: 0.12, release: 0.1, peak: 1 },
+      hz: subHz,
+      dropHz: subHz * 0.45,
+      dropTime: 0.04,
+      env: { attack: 0.004, decay: 0.04, sustain: 0.08, release: 0.06, peak: 1 },
     },
-    0.65 * p.gain,
+    0.13 * p.gain,
   );
-};
-
-/** A ward breaking: a brittle crack rather than a body-fall, kept well under 800 Hz. */
-const dieWard: CueFn = (g, at, p) => {
-  const bandHz = jitter(g, rr4(p.variant, 560, 640, 700, 760), VARY.timbrePct);
+  // BODY — organic thud/squelch: broadband, low-ish Q, dull but concentrated enough to
+  // dominate the sub thump.
+  const bandHz = jitter(g, rr4(p.variant, 380, 440, 500, 560), VARY.timbrePct);
   noise(
     g,
     at,
@@ -580,22 +798,69 @@ const dieWard: CueFn = (g, at, p) => {
       filter: 'bandpass',
       hz: bandHz,
       sweepHz: bandHz * 0.55,
-      sweepTime: 0.05,
-      q: 2.2,
-      env: { attack: 0.002, decay: 0.02, sustain: 0.03, release: 0.05, peak: 1 },
+      sweepTime: 0.09,
+      q: 1.15,
+      env: { attack: 0.005, decay: 0.05, sustain: 0.09, release: 0.08, peak: 1 },
     },
-    0.6 * p.gain,
+    1.35 * p.gain,
   );
-  const hz = jitter(g, rr4(p.variant, LOW.D2, LOW.F2, LOW.A2, SUB.A1), VARY.pitchPct);
+  const edgeHz = jitter(g, rr4(p.variant, 3200, 3400, 3600, 3800), VARY.timbrePct);
+  noise(
+    g,
+    at,
+    p.dest,
+    {
+      filter: 'bandpass',
+      hz: edgeHz,
+      q: 2.2,
+      env: { attack: 0.001, decay: 0.005, sustain: 0, release: 0.009, peak: 1 },
+    },
+    0.15 * p.gain,
+  );
+};
+
+/** A ward breaking: a brittle crystalline crack rather than a body-fall. */
+const dieWard: CueFn = (g, at, p) => {
+  const subHz = jitter(g, rr4(p.variant, SUB.A1, SUB.D1, SUB.D2, SUB.A1), VARY.pitchPct);
   thump(
     g,
     at + layerOffset(g),
     p.dest,
     {
-      hz,
-      dropHz: hz * 0.5,
-      dropTime: 0.06,
-      env: { attack: 0.003, decay: 0.03, sustain: 0.05, release: 0.06, peak: 1 },
+      hz: subHz,
+      dropHz: subHz * 0.5,
+      dropTime: 0.05,
+      env: { attack: 0.003, decay: 0.028, sustain: 0.045, release: 0.045, peak: 1 },
+    },
+    0.08 * p.gain,
+  );
+  // BODY — the crack itself, with enough Q to ring like brittle material.
+  const bandHz = jitter(g, rr4(p.variant, 520, 580, 650, 720), VARY.timbrePct);
+  noise(
+    g,
+    at,
+    p.dest,
+    {
+      filter: 'bandpass',
+      hz: bandHz,
+      sweepHz: bandHz * 0.6,
+      sweepTime: 0.045,
+      q: 2.0,
+      env: { attack: 0.002, decay: 0.024, sustain: 0.04, release: 0.055, peak: 1 },
+    },
+    1.3 * p.gain,
+  );
+  // TRANSIENT — a thin glassy snap, higher/thinner than an organic death's edge.
+  const edgeHz = jitter(g, rr4(p.variant, 5200, 5600, 5900, 6200), VARY.timbrePct);
+  noise(
+    g,
+    at,
+    p.dest,
+    {
+      filter: 'bandpass',
+      hz: edgeHz,
+      q: 3.6,
+      env: { attack: 0.001, decay: 0.006, sustain: 0, release: 0.011, peak: 1 },
     },
     0.35 * p.gain,
   );
@@ -605,6 +870,10 @@ const dieWard: CueFn = (g, at, p) => {
 // Registry — `satisfies`, never a type annotation (AUDIO_CONTRACT rule 14). Annotating
 // with `CueRegistry` would erase the literal SoundId keys and break `index.ts`'s total
 // `Record<SoundId, CueSpec>` merge no matter how complete this registry actually is.
+//
+// `tail` is the real synthesis end time (max layer end, including any `layerOffset`
+// worst case), not a round number — see the hit.self lesson: an under-declared tail gets
+// the cue's own release clipped by the harness's duck-release/truncation bookkeeping.
 // ---------------------------------------------------------------------------
 
 export const COMBAT_CUES = {
@@ -612,7 +881,7 @@ export const COMBAT_CUES = {
     fn: atkHeroMelee,
     bus: 'sfx',
     priority: 4,
-    tail: 0.1,
+    tail: 0.14,
     variants: VARY.roundRobin,
     dry: false,
   },
@@ -620,7 +889,7 @@ export const COMBAT_CUES = {
     fn: atkHeroRanged,
     bus: 'sfx',
     priority: 4,
-    tail: 0.09,
+    tail: 0.1,
     variants: VARY.roundRobin,
     dry: false,
   },
@@ -628,7 +897,7 @@ export const COMBAT_CUES = {
     fn: atkCreepMelee,
     bus: 'sfx',
     priority: 5,
-    tail: 0.08,
+    tail: 0.1,
     variants: VARY.roundRobin,
     dry: false,
   },
@@ -636,7 +905,7 @@ export const COMBAT_CUES = {
     fn: atkCreepRanged,
     bus: 'sfx',
     priority: 5,
-    tail: 0.07,
+    tail: 0.08,
     variants: VARY.roundRobin,
     dry: false,
   },
@@ -644,7 +913,7 @@ export const COMBAT_CUES = {
     fn: atkSiege,
     bus: 'sfx',
     priority: 5,
-    tail: 0.11,
+    tail: 0.12,
     variants: VARY.roundRobin,
     dry: false,
   },
@@ -652,7 +921,7 @@ export const COMBAT_CUES = {
     fn: atkTower,
     bus: 'sfx',
     priority: 5,
-    tail: 0.12,
+    tail: 0.15,
     variants: VARY.roundRobin,
     dry: false,
   },
@@ -660,7 +929,7 @@ export const COMBAT_CUES = {
     fn: hitPhysical,
     bus: 'sfx',
     priority: 4,
-    tail: 0.15,
+    tail: 0.19,
     variants: VARY.roundRobin,
     dry: false,
   },
@@ -668,7 +937,7 @@ export const COMBAT_CUES = {
     fn: hitMagic,
     bus: 'sfx',
     priority: 4,
-    tail: 0.15,
+    tail: 0.17,
     variants: VARY.roundRobin,
     dry: false,
   },
@@ -676,9 +945,9 @@ export const COMBAT_CUES = {
     fn: hitSelf,
     bus: 'sfx',
     priority: 3,
-    // Real synthesis end: thump 0.005+0.06+0.11=0.175s; noise layer (offset <=0.008s late)
-    // 0.008+0.006+0.07+0.1=0.184s. Declare the honest worst case with a small margin.
-    tail: 0.19,
+    // Real synthesis end: thump 0.005+0.05+0.09=0.145s; noise layer (offset <=0.008s late)
+    // 0.008+0.006+0.06+0.09=0.164s. Declared with a small margin.
+    tail: 0.18,
     variants: VARY.roundRobin,
     dry: false,
   },
@@ -686,7 +955,7 @@ export const COMBAT_CUES = {
     fn: hitCrit,
     bus: 'sfx',
     priority: 4,
-    tail: 0.17,
+    tail: 0.15,
     variants: VARY.roundRobin,
     dry: false,
   },
@@ -702,7 +971,7 @@ export const COMBAT_CUES = {
     fn: dieHero,
     bus: 'sfx',
     priority: 4,
-    tail: 0.75,
+    tail: 0.65,
     variants: 1,
     dry: false,
   },
@@ -710,7 +979,7 @@ export const COMBAT_CUES = {
     fn: dieHeroAlly,
     bus: 'sfx',
     priority: 4,
-    tail: 0.75,
+    tail: 0.65,
     variants: 1,
     dry: false,
   },
@@ -718,7 +987,7 @@ export const COMBAT_CUES = {
     fn: dieHeroSelf,
     bus: 'sfx',
     priority: 2,
-    tail: 1.0,
+    tail: 0.85,
     variants: 1,
     dry: false,
   },
@@ -726,7 +995,7 @@ export const COMBAT_CUES = {
     fn: dieCreep,
     bus: 'sfx',
     priority: 5,
-    tail: 0.2,
+    tail: 0.17,
     variants: VARY.roundRobin,
     dry: false,
   },
@@ -734,7 +1003,7 @@ export const COMBAT_CUES = {
     fn: dieWard,
     bus: 'sfx',
     priority: 5,
-    tail: 0.15,
+    tail: 0.14,
     variants: VARY.roundRobin,
     dry: false,
   },
