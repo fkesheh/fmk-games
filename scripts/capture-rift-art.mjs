@@ -94,10 +94,14 @@
 // Flags: --out <dir> (default judge/captures), --only <name-prefix>,
 //        --keep-server. Env: RIFT_ART_PORT (default 8093),
 //        E2E_PROTOCOL_TIMEOUT (default 300000).
-// The client dist must already exist — this harness NEVER builds.
+// The client dist must already exist — this harness NEVER builds. It does,
+// however, refuse to run against a dist that is OLDER than its own sources
+// (`assertBundleFresh`) and against a server bundle that does not contain the
+// protocol vocabulary this matrix depends on (`assertServerBundleCarries`).
+// See the STALE DIST section below for why existence was never enough.
 // ============================================================================
 import { spawn } from 'node:child_process';
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { mkdir, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -372,6 +376,11 @@ let CONFIG = null;
 // ---- state -----------------------------------------------------------------------------
 const shots = [];
 const pageErrors = [];
+/** Every console.warn the page emitted, verbatim. Reported, not fatal — the fatal subset is
+ *  promoted into `pageErrors` by FATAL_WARN_RE. */
+const pageWarnings = [];
+/** Raw `rift_snap` frame texts off the socket, newest last (see `tapWire`). */
+const wireSnaps = [];
 const browsers = [];
 let serverChild = null;
 let serverExit = null;
@@ -391,11 +400,149 @@ const errText = (err) => (err instanceof Error ? err.message : String(err));
  *  `--only ui-menu` does not sit through a whole match. */
 const EARLY_DONE = Symbol('early-done');
 
+// ---- STALE DIST: freshness, not existence ---------------------------------------------------
+//
+// This guard used to be `if (!existsSync(SERVER_ENTRY) || !existsSync(CLIENT_ENTRY))`, and a
+// six-hour-stale `platform/server/dist/server.js` walked straight through it: the file existed,
+// it was simply the WRONG file. It predated the commit that put `rift_snap.dayPhase` and
+// `rift_miss` on the wire, so `dayPhase` was absent from the wire entirely — and `net.ts`
+// substitutes 0 for an absent `dayPhase` behind a one-shot console.warn, so a missing feature
+// read as a plausible "full day" forever. Every consequence was silent:
+//   * the three night shots are renderer-pinned (NIGHT_PIN), so they LOOKED like night while the
+//     server underneath was in full day and the night vision penalty was never applied;
+//   * `waitDayPhaseBelow(page, 0.15)` returned instantly against a constant 0 instead of gating
+//     on the cycle it was written to gate on;
+//   * and it was the THIRD such round: an earlier bundle contained zero occurrences of
+//     `campBrute`, so no camp had ever reached the wire in any test that claimed to check one.
+//
+// So: EXISTENCE IS NOT FRESHNESS. Each bundle is compared against the newest mtime among the
+// sources that compile into it, and a bundle that lost that race fails the run with both
+// timestamps and the file that beat it. It is a hard failure and not a warning, and this harness
+// still NEVER builds — a harness that silently rebuilds hides exactly the defect above, and the
+// operator must know their tree was not the tree they measured.
+const FRESHNESS_EXTS = new Set(['.ts', '.tsx', '.js', '.mjs', '.cjs', '.json', '.css', '.html', '.glsl', '.frag', '.vert']);
+
+/** Everything esbuild pulls into `platform/server/dist/server.js` THAT CAN CHANGE RIFT'S WIRE.
+ *  Deliberately NOT the whole bundle: `platform/server/src/index.ts` also links @bank/@fps/@kart/
+ *  @wordbomb servers, and none of them can alter a rift snapshot. Including them would red this
+ *  harness every time an unrelated agent edited another game — a gate that cries wolf gets an
+ *  escape hatch bolted onto it, and then it is not a gate. Widen this list only for code that
+ *  rift's server actually executes. */
+const SERVER_SOURCES = [
+  'platform/server/src',
+  'platform/shared/src',
+  'games/rift/server/src',
+  'games/rift/shared/src',
+].map((p) => path.join(ROOT, p));
+
+/** ...and everything vite pulls into `games/rift/client/dist/`. */
+const CLIENT_SOURCES = [
+  'games/rift/client/src',
+  'games/rift/client/index.html',
+  'games/rift/client/vite.config.ts',
+  'games/rift/shared/src',
+  'platform/shared/src',
+].map((p) => path.join(ROOT, p));
+
+/** Newest `{file, mtimeMs}` under `roots` (each a directory or a single file). `*.test.ts` is
+ *  skipped because no bundler ever imports one — a test edit must not demand a rebuild. */
+function newestSource(roots) {
+  let newest = null;
+  const consider = (p) => {
+    const mtimeMs = statSync(p).mtimeMs;
+    if (newest === null || mtimeMs > newest.mtimeMs) newest = { file: p, mtimeMs };
+  };
+  const walk = (dir) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      if (e.name === 'node_modules' || e.name === 'dist') continue;
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        walk(p);
+        continue;
+      }
+      if (!e.isFile() || e.name.endsWith('.test.ts') || e.name.endsWith('.test.tsx')) continue;
+      if (!FRESHNESS_EXTS.has(path.extname(e.name))) continue;
+      consider(p);
+    }
+  };
+  for (const r of roots) {
+    // A root that has moved is a SILENTLY WEAKENED gate, so it is a failure, not a skip.
+    if (!existsSync(r)) throw new Error(`freshness gate: source root ${path.relative(ROOT, r)} does not exist`);
+    if (statSync(r).isDirectory()) walk(r);
+    else consider(r);
+  }
+  return newest;
+}
+
+const fmtGap = (ms) => {
+  const s = Math.round(ms / 1000);
+  if (s < 90) return `${s}s`;
+  const m = Math.round(s / 60);
+  return m < 90 ? `${m}m` : `${(m / 60).toFixed(1)}h`;
+};
+
+function assertBundleFresh(label, bundle, roots) {
+  if (!existsSync(bundle)) {
+    throw new Error(
+      `${label}: ${path.relative(ROOT, bundle)} does not exist — run "npm run build" first (this harness NEVER builds)`,
+    );
+  }
+  const bundleMs = statSync(bundle).mtimeMs;
+  const newest = newestSource(roots);
+  if (newest === null) {
+    throw new Error(
+      `${label}: no source files found under ${roots.map((r) => path.relative(ROOT, r)).join(', ')} — the ` +
+        'freshness gate cannot run, and a gate that cannot run is not a gate',
+    );
+  }
+  if (bundleMs >= newest.mtimeMs) {
+    log(
+      `${label} fresh: built ${new Date(bundleMs).toISOString()}, newest source ` +
+        `${path.relative(ROOT, newest.file)} ${new Date(newest.mtimeMs).toISOString()}`,
+    );
+    return;
+  }
+  throw new Error(
+    `${label} IS STALE — this run would measure code that is not in the bundle.\n` +
+      `    bundle  ${path.relative(ROOT, bundle)}\n` +
+      `            built ${new Date(bundleMs).toISOString()}\n` +
+      `    source  ${path.relative(ROOT, newest.file)}\n` +
+      `            saved ${new Date(newest.mtimeMs).toISOString()} — ${fmtGap(newest.mtimeMs - bundleMs)} NEWER than the bundle\n` +
+      '    Run "npm run build" and re-run. This harness NEVER builds: a six-hour-stale server.js is what\n' +
+      '    made three "night" captures grade a full-day server, silently, for a whole judge round.',
+  );
+}
+
+/** Literal strings the SERVER bundle must contain. Each is a protocol feature that has already
+ *  shipped once as "present in the source, absent from the running binary" — the failure mode a
+ *  freshness check catches only when the mtimes happen to tell the truth (a `git checkout` or a
+ *  restored dist can produce a NEW file built from OLD source). Cheap, and it reads the artifact
+ *  itself rather than a timestamp about it. The build is not minified, so these survive verbatim. */
+const REQUIRED_SERVER_SYMBOLS = [
+  ['dayPhase', 'rift_snap.dayPhase — absent from the wire, net.ts substitutes 0 and night never happens'],
+  ['rift_miss', 'the uphill-miss event (TERRAIN_CONTRACT §4)'],
+  ['campBrute', 'the neutral camp EntKinds — a bundle with zero occurrences shipped, and no camp ever reached the wire'],
+  ['campPack', 'the neutral camp EntKinds (tier 1)'],
+  ['campHive', 'the neutral camp EntKinds (tier 3)'],
+];
+
+function assertServerBundleCarries() {
+  const bundle = readFileSync(SERVER_ENTRY, 'utf8');
+  const missing = REQUIRED_SERVER_SYMBOLS.filter(([sym]) => !bundle.includes(sym));
+  if (missing.length === 0) return;
+  throw new Error(
+    `${path.relative(ROOT, SERVER_ENTRY)} does not contain ${missing.map(([s]) => `\`${s}\``).join(', ')} — the ` +
+      'bundle was built from sources that predate these features:\n' +
+      missing.map(([s, why]) => `    ${s}: ${why}`).join('\n') +
+      '\n    Run "npm run build".',
+  );
+}
+
 // ---- server -------------------------------------------------------------------------------
 async function startServer() {
-  if (!existsSync(SERVER_ENTRY) || !existsSync(CLIENT_ENTRY)) {
-    throw new Error('run "npm run build" first');
-  }
+  assertBundleFresh('server bundle', SERVER_ENTRY, SERVER_SOURCES);
+  assertBundleFresh('client bundle', CLIENT_ENTRY, CLIENT_SOURCES);
+  assertServerBundleCarries();
   const inUse = await fetch(BASE, { signal: AbortSignal.timeout(1500) }).then(
     () => true,
     () => false,
@@ -468,14 +615,43 @@ const LAUNCH_OPTS = {
   protocolTimeout: Number(process.env.E2E_PROTOCOL_TIMEOUT ?? 300000),
 };
 
+/**
+ * A console.warn whose TEXT names the wire is a failed run, not chatter.
+ *
+ * This harness used to drop every non-error console message on the floor — it filtered by LEVEL,
+ * and the one signal that would have named the six-hour-stale server instantly was net.ts's
+ * one-shot `rift net: rift_snap carries no \`dayPhase\` — the server is not sending a
+ * protocol-required field`. A warning that says the client is silently defaulting a protocol
+ * field describes a world this matrix is about to photograph and grade as if it were real.
+ *
+ * Filtering by CONTENT rather than by level, because a browser warns about plenty that is not a
+ * defect (deprecations, texture-unit chatter): everything else a warn says still reaches the
+ * operator on stderr and is counted in the manifest, but only these fail the run.
+ */
+const FATAL_WARN_RE = /rift net:|protocol-required|rift_snap|rift_begin|carries no |is not sending/i;
+
 function trackErrors(page, tag) {
   page.on('console', (m) => {
-    if (m.type() !== 'error') return;
+    const type = m.type();
     const url = m.location()?.url ?? '';
-    if (/favicon/.test(url) || /favicon/.test(m.text())) return;
+    const text = m.text();
+    if (/favicon/.test(url) || /favicon/.test(text)) return;
+    if (type === 'warning' || type === 'warn') {
+      // Shutdown noise only: a killed server makes the client warn about its socket.
+      if ((tearingDown || serverExit !== null) && /WebSocket/.test(text)) return;
+      pageWarnings.push(`[${tag}] console.warn: ${text} (${url})`);
+      log(`[warn] [${tag}] ${text}`);
+      if (FATAL_WARN_RE.test(text)) {
+        pageErrors.push(
+          `[${tag}] console.warn NAMES THE WIRE — a protocol field the client is silently defaulting: ${text} (${url})`,
+        );
+      }
+      return;
+    }
+    if (type !== 'error') return;
     // Shutdown noise only: a killed server makes the client log socket errors.
-    if ((tearingDown || serverExit !== null) && /WebSocket connection to .* failed/.test(m.text())) return;
-    pageErrors.push(`[${tag}] console.error: ${m.text()} (${url})`);
+    if ((tearingDown || serverExit !== null) && /WebSocket connection to .* failed/.test(text)) return;
+    pageErrors.push(`[${tag}] console.error: ${text} (${url})`);
   });
   page.on('pageerror', (e) => pageErrors.push(`[${tag}] pageerror: ${e.message}`));
   page.on('error', (e) => pageErrors.push(`[${tag}] page CRASHED: ${e.message}`));
@@ -483,6 +659,112 @@ function trackErrors(page, tag) {
     if (/favicon/.test(r.url())) return;
     pageErrors.push(`[${tag}] requestfailed: ${r.url()} — ${r.failure()?.errorText ?? '?'}`);
   });
+}
+
+// ---- the wire tap ---------------------------------------------------------------------------
+//
+// `window.__rift.snaps()` is the client's PARSED ring, and the client is precisely the thing that
+// HIDES a missing field: net.ts's `dayPhaseOf` substitutes 0 for an absent `dayPhase` and moves
+// on. So `serverDayPhase()` — which reads that ring — can never distinguish "the server sent 0"
+// from "the server sent nothing", and for a whole judge round it reported a confident, constant,
+// entirely fictional 0. The frames themselves are the only witness, so they are read off CDP
+// before any client code touches them.
+// The tap DETACHES ITSELF after WIRE_TAP_KEEP frames, and that is not tidiness. `Network.enable`
+// ships every WebSocket payload across the CDP channel, and at ~40 snaps/s for a ten-minute match
+// that is a sustained megabyte-per-second of extra work on the exact pipe whose starvation this
+// harness already documents as the cause of mid-run socket drops (see GL_LADDER). Four frames is
+// all the protocol check needs, so the firehose lasts a few hundred milliseconds.
+const WIRE_TAP_TIMEOUT_MS = 20000;
+const WIRE_TAP_KEEP = 4;
+
+async function tapWire(page, tag) {
+  const cdp = await page.createCDPSession();
+  await cdp.send('Network.enable');
+  let kept = 0;
+  cdp.on('Network.webSocketFrameReceived', ({ response }) => {
+    if (kept >= WIRE_TAP_KEEP) return;
+    if (response?.opcode !== 1) return; // 1 = text; the protocol is JSON text (net.ts)
+    const data = response.payloadData;
+    if (typeof data !== 'string' || !data.includes('"rift_snap"')) return;
+    wireSnaps.push(data);
+    if (wireSnaps.length > WIRE_TAP_KEEP) wireSnaps.shift();
+    if (++kept < WIRE_TAP_KEEP) return;
+    void cdp
+      .send('Network.disable')
+      .then(() => cdp.detach())
+      .then(() => log(`[${tag}] wire tap detached after ${kept} rift_snap frame(s)`))
+      .catch(() => {}); // the page may already be gone; the frames are already captured
+  });
+  log(`[${tag}] wire tap attached (raw rift_snap frames off CDP)`);
+}
+
+/** The frozen `EntKind` set (shared/src/types.ts). A kind off the wire that is not in here means
+ *  the running server and this harness disagree about the vocabulary. */
+const ENT_KINDS = new Set([
+  'hero', 'melee', 'ranged', 'siege', 'shade', 'tower', 'guard', 'ancient', 'ward', 'proj',
+  'campPack', 'campBrute', 'campHive',
+]);
+
+/**
+ * Assert the WIRE carries what protocol.ts says it carries — on a real frame, before the first
+ * in-world shot, and specifically for the class of field the client silently defaults.
+ *
+ * `dayPhase` is checked for PRESENCE first (`'dayPhase' in snap`), not merely for being a usable
+ * number: "absent" and "0" are the same value to every downstream reader in this harness, and
+ * telling them apart is the entire point. A field that is present and 0 is a full day; a field
+ * that is absent is a server that predates the feature, and every night shot taken against it is
+ * a lie with correct-looking lighting.
+ */
+async function assertWireProtocol() {
+  const t0 = Date.now();
+  while (wireSnaps.length === 0) {
+    if (Date.now() - t0 > WIRE_TAP_TIMEOUT_MS) {
+      throw new Error(
+        `no raw rift_snap frame reached the CDP wire tap within ${WIRE_TAP_TIMEOUT_MS}ms — the protocol cannot ` +
+          'be checked against the socket, only against the client\'s forgiving parse of it',
+      );
+    }
+    await sleep(200);
+  }
+  const text = wireSnaps[wireSnaps.length - 1];
+  let snap;
+  try {
+    snap = JSON.parse(text);
+  } catch (err) {
+    throw new Error(`a rift_snap frame off the socket is not JSON (${errText(err)}): ${text.slice(0, 200)}`);
+  }
+  if (snap === null || typeof snap !== 'object' || snap.t !== 'rift_snap') {
+    throw new Error(`the tapped frame is not a rift_snap envelope: ${text.slice(0, 200)}`);
+  }
+  if (!('dayPhase' in snap)) {
+    throw new Error(
+      'rift_snap ON THE WIRE HAS NO `dayPhase` — protocol.ts freezes it as always present and always in [0,1], ' +
+        'and net.ts substitutes 0 for it, so every reader in this harness would report a confident full day. ' +
+        'The night shots would be renderer-pinned over a full-day server with no night vision penalty applied. ' +
+        'The running server predates the field: rebuild (npm run build) and check room.ts sets it. ' +
+        `Frame keys: ${Object.keys(snap).join(', ')}`,
+    );
+  }
+  const d = snap.dayPhase;
+  if (typeof d !== 'number' || !Number.isFinite(d) || d < 0 || d > 1) {
+    throw new Error(
+      `rift_snap.dayPhase on the wire is ${JSON.stringify(d)} — protocol.ts requires a finite number in [0,1]`,
+    );
+  }
+  const ents = Array.isArray(snap.ents) ? snap.ents : null;
+  if (ents === null) throw new Error('rift_snap on the wire has no `ents` array');
+  const unknown = [...new Set(ents.map((e) => e?.k).filter((k) => !ENT_KINDS.has(k)))];
+  if (unknown.length > 0) {
+    throw new Error(
+      `rift_snap carries EntKind(s) this harness does not know: ${unknown.map((k) => JSON.stringify(k)).join(', ')} — ` +
+        'shared/src/types.ts and the running server have diverged',
+    );
+  }
+  log(
+    `wire protocol OK: rift_snap.dayPhase = ${d.toFixed(4)} (present on the frame, not defaulted) at ` +
+      `matchTick ${String(snap.matchTick)}, ${ents.length} ents, kinds ${[...new Set(ents.map((e) => e.k))].sort().join('/')}`,
+  );
+  return d;
 }
 
 /** GL backends, best first. verify-rift only needed "webgl2 or swiftshader",
@@ -520,6 +802,7 @@ async function launchOne(vp, tag) {
         log(`[${tag}] [warn] SOFTWARE rendering — frames cost ~25x a GPU frame; the live socket may be dropped mid-match`);
       }
       trackErrors(page, tag);
+      await tapWire(page, tag);
       page.__browser = browser;
       return page;
     }
@@ -1474,6 +1757,11 @@ async function run() {
       );
     }
     log(`live: ${String(begin.lanes)} lanes, teamSize ${String(begin.teamSize)}, side ${MAP_SIDE}`);
+    // Before ANY in-world shutter: prove the socket carries the fields this matrix reasons about.
+    // Everything downstream — the night trio, `waitDayPhaseBelow`, the camp stand-off vision
+    // arithmetic — reads `dayPhase` through a client parse that cannot fail, so this is the last
+    // point at which a server that never sends it is distinguishable from a full day.
+    await assertWireProtocol();
     await waitWorldBuilt(page);
     log(
       `terrain facts: river ${JSON.stringify(FACTS.river)} cliff edge ${JSON.stringify(FACTS.cliff)} ` +
@@ -1900,6 +2188,7 @@ if (WANTED.length === 0) {
       worstTriangles: 0,
       overBudget: [],
       pageErrors: [],
+      pageWarnings: [],
       shots: [],
     }),
   );
@@ -1988,6 +2277,11 @@ log(
       (overBudget.length > 0 ? `, ${overBudget.length} budget/health failure(s)` : ''),
 );
 for (const e of pageErrors.slice(0, 12)) log(`  ${e}`);
+// Warnings never fail the run on their own (the wire-naming subset was already promoted into
+// pageErrors), but they are REPORTED — dropping them on the floor is what let a one-shot
+// "rift_snap carries no dayPhase" warning pass unread through a whole judge round.
+if (pageWarnings.length > 0) log(`${pageWarnings.length} console warning(s):`);
+for (const w of pageWarnings.slice(0, 12)) log(`  ${w}`);
 
 console.log(
   JSON.stringify({
@@ -1997,6 +2291,7 @@ console.log(
     worstTriangles,
     overBudget,
     pageErrors,
+    pageWarnings,
     shots,
   }),
 );
