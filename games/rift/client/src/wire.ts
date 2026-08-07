@@ -17,7 +17,8 @@ import { createHud } from './ui/hud.js';
 import { createShop } from './ui/shop.js';
 import { createMinimap } from './ui/minimap.js';
 import { createMenus } from './ui/menus.js';
-import { createAudio } from './ui/audio.js';
+import { createAudio } from './audio/index.js';
+import { createAudioSettingsPanel } from './audio/settingsPanel.js';
 import { createNameLabels } from './ui/nameLabels.js';
 
 export function wire(root: HTMLElement): void {
@@ -56,6 +57,9 @@ export function wire(root: HTMLElement): void {
     },
   };
 
+  const audio = createAudio();
+  createAudioSettingsPanel(root, audio);
+
   const game = new Game(root, {
     scene,
     units: unitsFacade,
@@ -65,7 +69,7 @@ export function wire(root: HTMLElement): void {
     shop: createShop(root),
     minimap: createMinimap(root),
     menus: createMenus(root),
-    audio: createAudio(),
+    audio,
     nameLabels: createNameLabels(root),
   });
 

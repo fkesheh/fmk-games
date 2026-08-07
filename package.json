@@ -14,7 +14,8 @@
     "typecheck": "npm run typecheck --workspaces",
     "test": "vitest run",
     "e2e:wordbomb": "node scripts/e2e-wordbomb.mjs",
-    "e2e:rift": "node scripts/e2e-rift.mjs"
+    "e2e:rift": "node scripts/e2e-rift.mjs",
+    "audio:rift": "node scripts/audio-render-rift.mjs"
   },
   "devDependencies": {
     "concurrently": "10.0.3",

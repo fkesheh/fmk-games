@@ -40,7 +40,20 @@
 // ============================================================================
 import { rng } from '@platform/shared';
 import type { RiftEvent } from '@rift/shared';
-import type { AudioHandle } from '../contract.js';
+
+// INTEGRATION NOTE (orchestrator, not a content change): this file no longer
+// imports `AudioHandle` from '../contract.js'. That name now re-exports the
+// widened `RiftAudioHandle` (Audio amendment carve-out 1), which this legacy
+// copy — by design — does not implement; it intentionally keeps the OLD
+// three-method surface it is A/B-compared against. `LegacyAudioHandle` below
+// is that old surface, declared locally so the type-checker sees exactly what
+// this file has always returned. No behaviour, gain, envelope, or topology
+// changed.
+interface LegacyAudioHandle {
+  event(ev: RiftEvent): void;
+  ui(kind: 'click' | 'buy' | 'error' | 'levelup'): void;
+  setPhase(p: 'menu' | 'live'): void;
+}
 
 // ---- tuning constants -------------------------------------------------------
 const MASTER_GAIN = 0.5;
@@ -105,7 +118,7 @@ interface RiftAudioInner {
  *  sound can have through this seam. */
 const CAST_SLOT_HZ: readonly number[] = [320, 380, 452, 240];
 
-export function createBaselineAudio(ctx: BaseAudioContext, dest: AudioNode): AudioHandle {
+export function createBaselineAudio(ctx: BaseAudioContext, dest: AudioNode): LegacyAudioHandle {
   const st: RiftAudioInner = {
     ctx: null,
     master: null,

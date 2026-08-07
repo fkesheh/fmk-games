@@ -144,6 +144,16 @@ export class Game {
   private readonly snapsRing: SnapMsg[] = [];
   private lastFogMs = -FOG_EVERY_MS;
   private selfEntId = -1;
+  // Preallocated, mutated in place each update — the audio module's own
+  // AudioWorldCtx/ListenerState fields are readonly to the callee only
+  // (client/src/audio/contract.ts §"Everything the deriver needs" / §2).
+  private readonly audioWorld = {
+    selfPid: null as string | null,
+    selfEntId: -1,
+    selfTeam: null as TeamId | null,
+    isVisible: (x: number, z: number): boolean => this.modules.fog.isVisible(x, z),
+  };
+  private readonly audioListener = { x: 0, z: 0, height: CAM_DEFAULT_H };
   private lastYouHp: number | null = null;
   private lastYouLevel = 0;
   private toast: { text: string; untilMs: number } | null = null; // cast-denied note
@@ -273,6 +283,11 @@ export class Game {
     }, ROOMS_EVERY_MS);
 
     this.modules.audio.setPhase('menu');
+    // Resume-on-gesture: WebAudio autoplay policy requires a real user
+    // gesture; `resume()` is a documented safe-to-call-repeatedly no-op once
+    // already running, so no de-dup bookkeeping is needed here.
+    window.addEventListener('pointerdown', () => this.modules.audio.resume(), { once: true });
+    window.addEventListener('keydown', () => this.modules.audio.resume(), { once: true });
     this.lastFrameMs = performance.now();
     requestAnimationFrame((t) => this.frame(t));
   }
@@ -429,6 +444,11 @@ export class Game {
         this.roomId = msg.roomId;
         this.persistResume();
         this.state.error = null; // a successful (re)join clears the drop banner
+        // Identity + team are known now, before any snapshot has arrived
+        // (audio needs this for lobby-phase events like hero picks).
+        this.audioWorld.selfPid = msg.you;
+        this.audioWorld.selfTeam = msg.team;
+        this.modules.audio.setWorld(this.audioWorld);
         if (this.state.phase === 'menu') this.setPhase('lobby');
         break;
       }
@@ -506,6 +526,8 @@ export class Game {
         }
       }
     }
+    this.audioWorld.selfEntId = this.selfEntId;
+    this.modules.audio.snapshot(msg);
 
     const you = msg.you;
     if (you !== null) {
@@ -913,6 +935,12 @@ export class Game {
     }
     m.scene.render(dtMs);
     m.fx.tick(dtMs);
+    // Camera ground point is the audio listener (SONIC_BIBLE §2); mutate the
+    // preallocated ListenerState in place, no per-frame allocation.
+    this.audioListener.x = this.camX;
+    this.audioListener.z = this.camZ;
+    this.audioListener.height = this.camH;
+    m.audio.tick(dtMs, this.audioListener);
 
     // Refresh the single preallocated ClientState in place (no per-frame alloc).
     const s = this.state;
