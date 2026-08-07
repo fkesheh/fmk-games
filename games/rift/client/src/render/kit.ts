@@ -13,8 +13,12 @@
 //     constructors in the codebase. `new THREE.Mesh*Material(...)` in an
 //     implementer file is a contract violation. Everything is
 //     MeshStandardMaterial, built from the frozen SURFACES table in
-//     @rift/shared, cached per (id, tint) so identical surfaces share ONE
-//     instance and bucket into ONE draw call.
+//     @rift/shared, cached per (id, tint, emissive) so identical surfaces share
+//     ONE instance and bucket into ONE draw call. That sharing is also why
+//     `transparent`, `opacity`, `depthWrite`, `blending` and `polygonOffset`
+//     are NOT call-site dials: mutating a cached material reaches every other
+//     consumer of the family. A family that needs different blend state is a
+//     different family in the table (AMENDMENT_3 §C added three).
 //
 //  2. VERTEX-COLOUR LAW. Every material here has `vertexColors: true`,
 //     therefore every geometry that reaches the renderer MUST carry a `color`
@@ -50,6 +54,7 @@
 //
 //   planar XZ  groundMoss groundDirt lanePaving cliffRock wetRock riverWater
 //              monumentStone canopy fern cloth leather iron bronze gold crystal
+//              fxAdditive fxDecal shroud
 //   cylindrical bark  (and any part tinted/branched off it — trunk forms)
 //   local       any part built with `PartOpts.uvLocal === true` (small props
 //               and unit parts, where the primitive's own normalised UVs are
@@ -190,6 +195,19 @@ export interface PartOpts {
   readonly uvLocal?: boolean;
 }
 
+/** An emissive override on one part or one anim part: the APAL key the glow
+ *  takes and the intensity it burns at. Independent of `tint`, which is the
+ *  ALBEDO — a team crystal is azure-tinted AND azure-glowing, and collapsing
+ *  the two is exactly how the tint got swamped (AMENDMENT_3 §A).
+ *
+ *  `colorKey` is an APAL key NAME (`'azure'`, `'ember'`, a hero accent), not a
+ *  hex — an unknown key falls back to the family's own emissive rather than
+ *  throwing, because a builder must never white-screen the game. */
+export interface EmissiveSpec {
+  readonly colorKey: string;
+  readonly intensity: number;
+}
+
 /** One piece of a build: a geometry plus the surface family it renders in.
  *
  *  `bake()` CONSUMES its parts — it rewrites their attributes in place and the
@@ -203,6 +221,18 @@ export interface Part {
    *  draw-call bucket — use the family's {base, Lit, Deep} ladder rather than
    *  a continuum, or the bucket count grows without bound. */
   readonly tint?: string;
+  /** Optional emissive override (AMENDMENT_3 §A). Present means `bake()` builds
+   *  this part's bucket through `emissiveSurface(surface, colorKey, intensity,
+   *  tint)` instead of `surface(surface, tint)` — so a glowing part keeps its
+   *  team tint, and the bucket carries the right material from the start.
+   *
+   *  NEVER re-point a baked bucket at a different material afterwards:
+   *  `BakedMesh.parts` is readonly, and the workaround that did it discarded
+   *  every team tint in the game. Declare it here instead.
+   *
+   *  A part with an emissive is a bloom input: pass the bucket's mesh (or the
+   *  whole `BakedMesh.group`) to `markBloom()`, or it glows without blooming. */
+  readonly emissive?: EmissiveSpec;
 }
 
 /** One merged bucket of a bake: everything in the build that shares one
@@ -212,9 +242,16 @@ export interface BakedPart {
   readonly material: THREE.MeshStandardMaterial;
 }
 
-/** The output of `bake()`: one geometry per surface id (per (id, tint) pair,
- *  since a tint mints its own material), and a single parent Group holding one
- *  Mesh per bucket. Add `group` to the scene; that is the whole integration. */
+/** The output of `bake()`: one geometry per (surface id, tint, emissive)
+ *  triple — each of the three mints its own material and therefore its own
+ *  bucket — and a single parent Group holding one Mesh per bucket. Add `group`
+ *  to the scene; that is the whole integration.
+ *
+ *  `parts` is readonly and MEANS it. A bucket arrives carrying the material its
+ *  parts asked for; if that is not the material you wanted, say so on the
+ *  `Part` (`tint`, `emissive`) rather than re-pointing the bucket after the
+ *  fact. Four modules re-pointed, and because the old `emissiveSurface()` took
+ *  no tint, all four silently discarded team colour (AMENDMENT_3 §A). */
 export interface BakedMesh {
   readonly group: THREE.Group;
   readonly parts: readonly BakedPart[];
@@ -329,13 +366,55 @@ export interface InstanceXform {
   readonly variant: number;
 }
 
+/** The one animated carve-out of a unit build: a geometry that does NOT go
+ *  through `bake()` (it has to stay a separate object so it can be transformed
+ *  every frame), plus everything the renderer needs to give it the right
+ *  material and the right bloom state.
+ *
+ *  It carries its material description rather than a material because the mesh
+ *  module and the renderer are different agents: before AMENDMENT_3 §B `anim`
+ *  was a bare `BufferGeometry`, three modules smuggled the missing fields
+ *  through `geo.userData.rift*`, a fourth did not, and `units.ts` fell back to
+ *  picking a material by `animKind` — which is why the ward eye rendered with
+ *  the ancient's heart material. Everything the renderer needs is now in the
+ *  type, and `userData.rift*` is banned.
+ *
+ *  BECAUSE `geo` NEVER PASSES THROUGH `bake()`, THE MESH MODULE OWNS THE TWO
+ *  THINGS `bake()` WOULD OTHERWISE DO FOR IT:
+ *
+ *   1. THE VERTEX-COLOUR LAW. Call `whiteVertexColors(geo)` before returning.
+ *      Every kit material has `vertexColors: true`; a geometry with no `color`
+ *      attribute renders BLACK, and it typechecks perfectly.
+ *   2. UV SCALING. `bake()`'s world-space reprojection at 1 UV unit = 1 metre
+ *      does not run here. An anim part is a small unit part, so its primitive's
+ *      own normalised UVs are normally the intended layout (build it with
+ *      `PartOpts.uvLocal`); if it needs the world-space density instead, scale
+ *      the UVs in the module. */
+export interface AnimPart {
+  /** The geometry, already `whiteVertexColors`-ed and UV-scaled by its module. */
+  readonly geo: THREE.BufferGeometry;
+  /** The surface family it renders in. */
+  readonly surfaceId: SurfaceId;
+  /** Optional albedo override, same meaning as `Part.tint`. */
+  readonly tint?: string;
+  /** Optional emissive override, same meaning as `Part.emissive`. Present means
+   *  the renderer builds the material through `emissiveSurface(surfaceId,
+   *  colorKey, intensity, tint)`. */
+  readonly emissive?: EmissiveSpec;
+  /** Whether the renderer must pass this part's mesh to `markBloom()`. Not
+   *  derived from `emissive`: gold blooms without being emissive (STYLE_BIBLE
+   *  §6), and a dim emissive filler may deliberately stay out of the bloom
+   *  pass. The module that built the part decides. */
+  readonly bloom: boolean;
+}
+
 /** The frozen shape every unit builder returns (GRAPHICS_CONTRACT §2). */
 export interface UnitBuild {
   /** SurfaceId-bucketed body; `body.group` is what the scene adds. */
   readonly body: BakedMesh;
   /** The one animated carve-out part, unbaked so it can be transformed per
    *  frame, or null when the build is entirely static. */
-  readonly anim: THREE.BufferGeometry | null;
+  readonly anim: AnimPart | null;
   readonly animKind: 'orbit' | 'bob' | 'spin' | null;
   /** Height in metres at which the animated part orbits/bobs/spins. */
   readonly animY: number;
@@ -907,9 +986,42 @@ function apalHex(key: string, fallback: string): string {
   return v ?? fallback;
 }
 
+/** One LENGTH-PREFIXED field of a cache key: `7:#5a8fd6`. */
+function keyField(s: string): string {
+  return `${s.length}:${s}`;
+}
+
+/**
+ * The material cache key. It is the FULL identity of a material — surface id,
+ * tint and emissive — because `matCache` is global and process-lifetime: two
+ * calls that produce the same key get the SAME `MeshStandardMaterial` object,
+ * and if the key omits a parameter the second caller silently receives the
+ * first caller's colours. Every field that reaches `buildMaterial` or is
+ * written onto the result afterwards must appear here.
+ *
+ * Every variable-length field is LENGTH-PREFIXED rather than joined with a
+ * separator, and that is not decoration. `tint` and `colorKey` are free-form
+ * `string`s (a tint may be any `mix()`/`composite()` output, and nothing stops
+ * a caller passing a literal). Under the old `${id}|${tint}` and
+ * `${id}|e|${colorKey}|${intensity}` schemes, a tint that happened to contain
+ * the separator could produce a key already owned by a different, visually
+ * distinct surface — `surface('crystal', 'e|azure|2.200')` collides with
+ * `emissiveSurface('crystal', 'azure', 2.2)`. A length prefix makes the
+ * decoding unambiguous, so no combination of field contents can collide.
+ *
+ * `intensity` is fixed to 3 decimals so 2.2 and 2.2000000000000002 share a
+ * material instead of minting two buckets that render identically.
+ */
+function matKey(id: SurfaceId, tint: string | undefined, em: EmissiveSpec | undefined): string {
+  const t = tint === undefined ? '-' : keyField(tint);
+  const e = em === undefined ? '-' : `${keyField(em.colorKey)}${em.intensity.toFixed(3)}`;
+  return `${keyField(id)}${t}${e}`;
+}
+
 /** Everything both material factories share: the vertex-colour law, the
  *  family's physical parameters, and the generated maps. */
 function buildMaterial(id: SurfaceId, def: SurfaceDef, albedo: string): THREE.MeshStandardMaterial {
+  const offset = def.polygonOffset ?? null;
   const m = new THREE.MeshStandardMaterial({
     color: albedo,
     roughness: def.roughness,
@@ -917,9 +1029,23 @@ function buildMaterial(id: SurfaceId, def: SurfaceDef, albedo: string): THREE.Me
     flatShading: def.flatShading,
     transparent: def.transparent,
     opacity: def.opacity,
+    // BLEND AND DEPTH STATE COMES FROM THE TABLE (AMENDMENT_3 §C), never from a
+    // call site. `matCache` hands the same instance to every consumer of a
+    // family, so a call-site `m.depthWrite = false` silently drags all of them
+    // with it — which is why a family that must not occlude declares it here
+    // and gets it on every instance by construction. The three defaults below
+    // are THREE's own, so every family authored before the amendment renders
+    // exactly as it did.
+    depthWrite: def.depthWrite ?? true,
+    blending: def.blending === 'additive' ? THREE.AdditiveBlending : THREE.NormalBlending,
+    polygonOffset: offset !== null,
+    polygonOffsetFactor: offset?.factor ?? 0,
+    polygonOffsetUnits: offset?.units ?? 0,
     // VERTEX-COLOUR LAW: unconditional, on every material, forever. Baked AO
     // rides in the geometry's `color` attribute and would otherwise be
-    // silently ignored.
+    // silently ignored. It holds on the transparent families too — an additive
+    // FX fades by writing its vertex colour, precisely because it may not
+    // touch the shared material's opacity.
     vertexColors: true,
   });
   m.name = `rift:${id}`;
@@ -957,7 +1083,7 @@ function buildMaterial(id: SurfaceId, def: SurfaceDef, albedo: string): THREE.Me
  * negotiable at the call site.
  */
 export function surface(id: SurfaceId, tint?: string): THREE.MeshStandardMaterial {
-  const key = `${id}|${tint ?? ''}`;
+  const key = matKey(id, tint, undefined);
   const hit = matCache.get(key);
   if (hit) return hit;
   const def = SURFACES[id];
@@ -976,23 +1102,48 @@ export function surface(id: SurfaceId, tint?: string): THREE.MeshStandardMateria
  * Every object built with this MUST be passed to `markBloom()`
  * (GRAPHICS_CONTRACT §7.9): unmarked emissives do not bloom, and the whole
  * night lighting state is emissive geometry acting as the primary light.
+ *
+ * `tint` is the ALBEDO, on exactly the same terms as `surface(id, tint)`, and
+ * is a SEPARATE channel from `colorKey` — glow colour and diffuse colour are
+ * two different reads and a team crystal needs both. Without it there was no
+ * way to build a tinted glowing part at all: `surface('crystal', teamKey)` has
+ * its tint swamped by the family's unconditional `ward` emissive and renders
+ * cream, and this factory ignored the tint entirely, so the four mesh modules
+ * that routed around the first defect hit the second and shipped a game with
+ * no team colour on its primary glow surface (AMENDMENT_3 §A).
  */
 export function emissiveSurface(
   id: SurfaceId,
   colorKey: string,
   intensity: number,
+  tint?: string,
 ): THREE.MeshStandardMaterial {
-  const key = `${id}|e|${colorKey}|${intensity.toFixed(3)}`;
+  const key = matKey(id, tint, { colorKey, intensity });
   const hit = matCache.get(key);
   if (hit) return hit;
   const def = SURFACES[id];
   const fallback = def.emissive !== null ? APAL[def.emissive.color] : APAL.ward;
-  const m = buildMaterial(id, def, APAL[def.albedo]);
+  const albedo = tint === undefined ? APAL[def.albedo] : mix(APAL[def.albedo], tint, TINT_MIX);
+  const m = buildMaterial(id, def, albedo);
   m.emissive = new THREE.Color(apalHex(colorKey, fallback));
   m.emissiveIntensity = intensity;
-  m.name = `rift:${id}:${colorKey}`;
+  m.name = tint === undefined ? `rift:${id}:${colorKey}` : `rift:${id}:${colorKey}:${tint}`;
   matCache.set(key, m);
   return m;
+}
+
+/** The one place that turns a `Part` / `AnimPart` material description into a
+ *  material. `bake()`, `bakeChunked()` and every renderer that mounts an
+ *  `AnimPart` go through it, so a tinted emissive resolves identically
+ *  everywhere and there is still exactly one construction path. */
+export function partMaterial(
+  id: SurfaceId,
+  tint: string | undefined,
+  emissive: EmissiveSpec | undefined,
+): THREE.MeshStandardMaterial {
+  return emissive === undefined
+    ? surface(id, tint)
+    : emissiveSurface(id, emissive.colorKey, emissive.intensity, tint);
 }
 
 // ============================================================================
@@ -1207,6 +1358,12 @@ const UV_PROJECTION: Record<SurfaceId, 'planarXZ' | 'cylindrical'> = {
   bronze: 'planarXZ',
   gold: 'planarXZ',
   crystal: 'planarXZ',
+  // The transparent families are flat quads, ground decals and overlay planes —
+  // all of them broadly horizontal, all of them wanting the world-space ground
+  // projection so a scar's texel density matches the terrain it lies on.
+  fxAdditive: 'planarXZ',
+  fxDecal: 'planarXZ',
+  shroud: 'planarXZ',
 };
 
 /** Rewrite one triangle's UVs into world space at 1 UV unit = 1 metre, on the
@@ -1344,8 +1501,13 @@ interface Bucket {
   readonly geos: THREE.BufferGeometry[];
 }
 
+/** A bake bucket is keyed by the MATERIAL its parts resolve to — the same key
+ *  `matCache` uses — so buckets and materials stay 1:1 by construction. Two
+ *  parts share a draw call exactly when they share a material, and a part with
+ *  an emissive gets its own bucket rather than inheriting the plain family's
+ *  (AMENDMENT_3 §A). */
 function bucketKey(p: Part): string {
-  return `${p.surface}|${p.tint ?? ''}`;
+  return matKey(p.surface, p.tint, p.emissive);
 }
 
 function mergeBucket(key: string, b: Bucket): THREE.BufferGeometry {
@@ -1364,10 +1526,10 @@ function bakedMeshOf(geo: THREE.BufferGeometry, material: THREE.MeshStandardMate
 }
 
 /**
- * Merge parts into ONE geometry per surface id — per (id, tint) pair, since a
- * tint mints its own material and therefore its own draw-call bucket. The
- * draw-call budget (GRAPHICS_CONTRACT §5, <= 700) depends on this being used
- * for every static build and every per-unit build.
+ * Merge parts into ONE geometry per surface id — per (id, tint, emissive)
+ * triple, since each of the three mints its own material and therefore its own
+ * draw-call bucket. The draw-call budget (GRAPHICS_CONTRACT §5, <= 700) depends
+ * on this being used for every static build and every per-unit build.
  *
  * `bake()` CONSUMES its parts: it rewrites their attributes in place and
  * disposes them after the merge. Every kit primitive returns a fresh geometry,
@@ -1383,7 +1545,7 @@ export function bake(parts: readonly Part[]): BakedMesh {
     const key = bucketKey(p);
     let b = buckets.get(key);
     if (b === undefined) {
-      b = { material: surface(p.surface, p.tint), geos: [] };
+      b = { material: partMaterial(p.surface, p.tint, p.emissive), geos: [] };
       buckets.set(key, b);
     }
     b.geos.push(normalizePart(p));
@@ -1571,7 +1733,7 @@ export function bakeChunked(parts: readonly Part[], budgetMs: number): ChunkedBa
         const key = bucketKey(p);
         let b = buckets.get(key);
         if (b === undefined) {
-          b = { material: surface(p.surface, p.tint), geos: [] };
+          b = { material: partMaterial(p.surface, p.tint, p.emissive), geos: [] };
           buckets.set(key, b);
         }
         b.geos.push(normalizePart(p));

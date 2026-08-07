@@ -42,13 +42,14 @@ import {
   markBloom,
   noiseTexture,
   normalFromHeight,
+  partMaterial,
   ribbon,
   rng,
   roughnessTexture,
   scatter,
   surface,
 } from './kit.js';
-import type { InstanceXform, Part } from './kit.js';
+import type { AnimPart, InstanceXform, Part, UnitBuild } from './kit.js';
 
 /** Every position of a geometry, as a flat array — the only way to inspect a
  *  merged buffer without trusting the code that produced it. */
@@ -200,6 +201,124 @@ describe('surface() — the only material constructor', () => {
     // white-screens the game (GRAPHICS_CONTRACT §7.7).
     expect(() => emissiveSurface('crystal', 'notAPaletteKey', 1)).not.toThrow();
   });
+
+  // AMENDMENT_3 §A. Before the fourth argument existed there was NO way to
+  // build a tinted glowing part: `surface('crystal', teamKey)` has its tint
+  // swamped by the family's unconditional ward emissive and renders cream, and
+  // this factory ignored the tint, so the mesh modules that re-pointed their
+  // baked buckets at it threw the team colour away instead. The two assertions
+  // below are the two halves of that.
+  it('emissiveSurface tints the ALBEDO, independently of the glow colour', () => {
+    const untinted = emissiveSurface('crystal', 'azure', 2.2);
+    const tinted = emissiveSurface('crystal', 'azure', 2.2, APAL.azureDeep);
+    // The glow is the colourKey on both; only the diffuse moved.
+    expect(untinted.emissive.getHexString()).toBe(APAL.azure.slice(1));
+    expect(tinted.emissive.getHexString()).toBe(APAL.azure.slice(1));
+    expect(untinted.color.getHexString()).toBe(APAL.ward.slice(1));
+    expect(tinted.color.getHexString()).toBe(APAL.azureDeep.slice(1));
+    // ...and the family's physics are untouched by either.
+    expect(tinted.roughness).toBe(SURFACES.crystal.roughness);
+    expect(tinted.flatShading).toBe(SURFACES.crystal.flatShading);
+    expect(tinted.vertexColors).toBe(true);
+  });
+
+  it('never shares one cached material between two different tints', () => {
+    // The cache is global and process-lifetime: a key that omits a parameter
+    // hands the second caller the first caller's colours, and the two surfaces
+    // silently merge. Every parameter must separate.
+    const azure = emissiveSurface('crystal', 'azure', 2.2, APAL.azure);
+    const ember = emissiveSurface('crystal', 'azure', 2.2, APAL.ember);
+    const plain = emissiveSurface('crystal', 'azure', 2.2);
+    expect(azure).not.toBe(ember);
+    expect(azure).not.toBe(plain);
+    expect(azure.color.getHexString()).toBe(APAL.azure.slice(1));
+    expect(ember.color.getHexString()).toBe(APAL.ember.slice(1));
+    // Same (id, tint) but different glow, and different intensity, also split.
+    expect(emissiveSurface('crystal', 'ember', 2.2, APAL.azure)).not.toBe(azure);
+    expect(emissiveSurface('crystal', 'azure', 3.1, APAL.azure)).not.toBe(azure);
+    // An emissive material is never the plain family's material.
+    expect(azure).not.toBe(surface('crystal', APAL.azure));
+    // ...and identical arguments still collapse onto one draw-call bucket.
+    expect(emissiveSurface('crystal', 'azure', 2.2, APAL.azure)).toBe(azure);
+  });
+
+  it('keys on the free-form colorKey, which no other field can forge', () => {
+    // `colorKey` is the one field with no validation anywhere — `apalHex` falls
+    // back instead of throwing — so it is the field a caller can push arbitrary
+    // punctuation through. It still has to select its own material, and an
+    // unrecognised key still has to fall back rather than white-screen the
+    // game (GRAPHICS_CONTRACT §7.7).
+    const real = emissiveSurface('crystal', 'azure', 2.2, APAL.azure);
+    const forged = emissiveSurface('crystal', 'azure|2.200', 2.2, APAL.azure);
+    expect(forged).not.toBe(real);
+    expect(emissiveSurface('crystal', 'azure', 2.2, APAL.azure)).toBe(real);
+    expect(real.emissive.getHexString()).toBe(APAL.azure.slice(1));
+    expect(forged.emissive.getHexString()).toBe(APAL.ward.slice(1)); // family fallback
+  });
+});
+
+// ---- the transparent families (AMENDMENT_3 §C) ------------------------------
+//
+// These three exist so that blend and depth state comes from the table instead
+// of from a call site mutating a shared cached material. What is asserted is
+// exactly what shipped wrong: an opaque depth-writing dome that occluded every
+// fight, a decal lifted into a mound units stood buried in, and a fog overlay
+// that was a clone with eight overrides.
+
+describe('transparent surface families', () => {
+  it('makes fxAdditive additive and depth-free — a dome can never occlude', () => {
+    const m = surface('fxAdditive');
+    expect(m.transparent).toBe(true);
+    expect(m.depthWrite).toBe(false);
+    expect(m.blending).toBe(THREE.AdditiveBlending);
+    expect(m.roughness).toBe(1);
+    expect(m.metalness).toBe(0);
+    expect(m.normalMap).toBeNull();
+    expect(m.vertexColors).toBe(true);
+  });
+
+  it('biases fxDecal TOWARD the camera instead of lifting it off the ground', () => {
+    const m = surface('fxDecal');
+    expect(m.transparent).toBe(true);
+    expect(m.depthWrite).toBe(false);
+    expect(m.blending).toBe(THREE.NormalBlending);
+    expect(m.polygonOffset).toBe(true);
+    // Negative is toward the camera. A positive offset pushes the decal INTO
+    // the terrain and a zero one z-fights; both are the failure this replaces.
+    expect(m.polygonOffsetFactor).toBeLessThan(0);
+    expect(m.polygonOffsetUnits).toBeLessThan(0);
+    expect(m.vertexColors).toBe(true);
+  });
+
+  it('gives the fog overlay a real family instead of a cloned cloth', () => {
+    const m = surface('shroud');
+    expect(m.transparent).toBe(true);
+    expect(m.depthWrite).toBe(false);
+    expect(m.blending).toBe(THREE.NormalBlending);
+    expect(m.color.getHexString()).toBe(APAL.shroud.slice(1));
+    expect(m.roughness).toBe(0.95);
+    expect(m.metalness).toBe(0);
+    expect(m.normalMap).toBeNull();
+    expect(m.vertexColors).toBe(true);
+  });
+
+  it('leaves every opaque family writing depth and blending normally', () => {
+    // The three new fields are optional; their absence must mean THREE's own
+    // defaults, or the amendment silently re-rendered the whole world.
+    for (const id of SURFACE_IDS) {
+      const def = SURFACES[id];
+      const m = surface(id);
+      expect(m.depthWrite, id).toBe(def.depthWrite ?? true);
+      expect(m.blending, id).toBe(
+        def.blending === 'additive' ? THREE.AdditiveBlending : THREE.NormalBlending,
+      );
+      expect(m.polygonOffset, id).toBe((def.polygonOffset ?? null) !== null);
+      expect(m.vertexColors, id).toBe(true);
+    }
+    expect(surface('groundMoss').depthWrite).toBe(true);
+    expect(surface('groundMoss').blending).toBe(THREE.NormalBlending);
+    expect(surface('groundMoss').polygonOffset).toBe(false);
+  });
 });
 
 // ---- generated textures -----------------------------------------------------
@@ -279,6 +398,56 @@ describe('bake() — one geometry per surface id', () => {
       { geo: box(1, 1, 1, { x: 3 }), surface: 'canopy', tint: APAL.canopyLit },
     ]);
     expect(baked.parts).toHaveLength(2);
+  });
+
+  // AMENDMENT_3 §A. The bucket has to arrive carrying the right material,
+  // because `BakedMesh.parts` is readonly and the four modules that re-pointed
+  // it afterwards discarded every team tint in the game doing so.
+  it('gives a part with an emissive its OWN bucket, built with its tint', () => {
+    const baked = bake([
+      { geo: box(1, 1, 1), surface: 'crystal' },
+      { geo: box(1, 1, 1, { x: 2 }), surface: 'crystal', tint: APAL.azure },
+      {
+        geo: box(1, 1, 1, { x: 4 }),
+        surface: 'crystal',
+        tint: APAL.azure,
+        emissive: { colorKey: 'azure', intensity: 3 },
+      },
+      {
+        geo: box(1, 1, 1, { x: 6 }),
+        surface: 'crystal',
+        tint: APAL.ember,
+        emissive: { colorKey: 'ember', intensity: 3 },
+      },
+    ]);
+    // Four visually distinct surfaces, four buckets — the emissive is part of
+    // the bucket identity, not an afterthought applied to a shared one.
+    expect(baked.parts).toHaveLength(4);
+    expect(new Set(baked.parts.map((p) => p.material)).size).toBe(4);
+
+    const glowAzure = baked.parts.find((p) => p.material.emissiveIntensity === 3);
+    expect(glowAzure).toBeDefined();
+    if (glowAzure === undefined) return;
+    // THE defect: the tint must survive onto the glowing bucket's albedo.
+    expect(glowAzure.material).toBe(emissiveSurface('crystal', 'azure', 3, APAL.azure));
+    expect(glowAzure.material.color.getHexString()).toBe(APAL.azure.slice(1));
+    expect(glowAzure.material.emissive.getHexString()).toBe(APAL.azure.slice(1));
+    // ...and the plain-tinted bucket keeps the family's own cream glow, which
+    // is exactly the cream a tinted crystal used to render as.
+    const plainTinted = baked.parts.find(
+      (p) => p.material === surface('crystal', APAL.azure),
+    );
+    expect(plainTinted).toBeDefined();
+    expect(plainTinted?.material.emissive.getHexString()).toBe(APAL.ward.slice(1));
+  });
+
+  it('merges two parts that share a surface, tint AND emissive into one bucket', () => {
+    const em = { colorKey: 'ember', intensity: 2.4 } as const;
+    const baked = bake([
+      { geo: box(1, 1, 1), surface: 'crystal', tint: APAL.ember, emissive: em },
+      { geo: box(1, 1, 1, { x: 2 }), surface: 'crystal', tint: APAL.ember, emissive: em },
+    ]);
+    expect(baked.parts).toHaveLength(1);
   });
 
   it('emits a color attribute on EVERY output geometry, white by default', () => {
@@ -429,6 +598,129 @@ describe('bakeChunked() — the cold-load scheduler', () => {
     const job = bakeChunked(demoParts(), 0);
     job.step();
     expect(job.mesh.parts.length).toBe(0); // still normalising parts
+  });
+
+  it('buckets emissives exactly as bake() does — the slow path is not a fork', () => {
+    const parts = (): Part[] => [
+      { geo: box(1, 1, 1), surface: 'crystal', tint: APAL.azure },
+      {
+        geo: box(1, 1, 1, { x: 2 }),
+        surface: 'crystal',
+        tint: APAL.azure,
+        emissive: { colorKey: 'azure', intensity: 3 },
+      },
+    ];
+    const job = bakeChunked(parts(), 1000);
+    while (job.step());
+    expect(job.mesh.parts).toHaveLength(2);
+    const mats = new Set(job.mesh.parts.map((p) => p.material));
+    expect(mats.has(surface('crystal', APAL.azure))).toBe(true);
+    expect(mats.has(emissiveSurface('crystal', 'azure', 3, APAL.azure))).toBe(true);
+    expect(job.mesh.parts.map((p) => p.material)).toEqual(
+      bake(parts()).parts.map((p) => p.material),
+    );
+  });
+});
+
+// ---- the typed anim part (AMENDMENT_3 §B) -----------------------------------
+//
+// `UnitBuild.anim` used to be a bare BufferGeometry, so the renderer could not
+// tell an emissive anim part from an ordinary one. Three mesh modules smuggled
+// the missing fields through `geo.userData.rift*`, a fourth did not, and
+// `units.ts` fell back to choosing a material by `animKind` — which is why the
+// ward eye rendered with the ancient heart's material. The point of the type is
+// that two anim parts with the SAME animKind can no longer collapse.
+
+describe('AnimPart — the anim part carries its own material description', () => {
+  /** The ward eye and the ancient heart: same animKind, different materials. */
+  function wardEye(): AnimPart {
+    return {
+      geo: box(0.2, 0.2, 0.2),
+      surfaceId: 'crystal',
+      tint: APAL.ward,
+      emissive: { colorKey: 'ward', intensity: 1.6 },
+      bloom: true,
+    };
+  }
+  function ancientHeart(): AnimPart {
+    return {
+      geo: box(0.9, 0.9, 0.9),
+      surfaceId: 'crystal',
+      tint: APAL.azure,
+      emissive: { colorKey: 'azure', intensity: 3.4 },
+      bloom: true,
+    };
+  }
+
+  it('round-trips through UnitBuild with every field intact', () => {
+    const anim = ancientHeart();
+    const build: UnitBuild = {
+      body: bake([{ geo: box(1, 2, 1), surface: 'monumentStone' }]),
+      anim,
+      animKind: 'spin',
+      animY: 2.4,
+      barH: 3.1,
+      barW: 1.2,
+    };
+    expect(build.anim).not.toBeNull();
+    if (build.anim === null) return;
+    expect(build.anim.geo).toBe(anim.geo);
+    expect(build.anim.surfaceId).toBe('crystal');
+    expect(build.anim.tint).toBe(APAL.azure);
+    expect(build.anim.emissive?.colorKey).toBe('azure');
+    expect(build.anim.emissive?.intensity).toBe(3.4);
+    expect(build.anim.bloom).toBe(true);
+    // A static build still says so, and the type still admits it.
+    const staticBuild: UnitBuild = { ...build, anim: null, animKind: null, animY: 0 };
+    expect(staticBuild.anim).toBeNull();
+  });
+
+  it('resolves two same-animKind parts to DIFFERENT materials', () => {
+    const eye = wardEye();
+    const heart = ancientHeart();
+    const eyeMat = partMaterial(eye.surfaceId, eye.tint, eye.emissive);
+    const heartMat = partMaterial(heart.surfaceId, heart.tint, heart.emissive);
+    expect(eyeMat).not.toBe(heartMat);
+    expect(eyeMat.emissive.getHexString()).toBe(APAL.ward.slice(1));
+    expect(heartMat.emissive.getHexString()).toBe(APAL.azure.slice(1));
+    expect(eyeMat.color.getHexString()).toBe(APAL.ward.slice(1));
+    expect(heartMat.color.getHexString()).toBe(APAL.azure.slice(1));
+    expect(heartMat.emissiveIntensity).toBe(3.4);
+  });
+
+  it('requires surfaceId and bloom — the renderer may not be left to guess', () => {
+    // Compile-time assertions. The whole defect in §B was a renderer having to
+    // INFER an anim part's material and bloom state; an optional field puts it
+    // straight back. `@ts-expect-error` fails the typecheck in BOTH directions:
+    // it errors now if these compiled, and it errors if the field ever becomes
+    // optional and the expected error stops appearing.
+    // @ts-expect-error `bloom` is required, never inferred from `emissive`.
+    const noBloom: AnimPart = { geo: box(1, 1, 1), surfaceId: 'gold' };
+    // @ts-expect-error `surfaceId` is required — this IS the amendment.
+    const noSurface: AnimPart = { geo: box(1, 1, 1), bloom: true };
+    expect(noBloom.geo).toBeDefined();
+    expect(noSurface.geo).toBeDefined();
+  });
+
+  it('treats bloom as its own flag, not something derived from emissive', () => {
+    // gold blooms without being emissive; a dim filler emissive may sit out.
+    const goldTrim: AnimPart = { geo: box(1, 1, 1), surfaceId: 'gold', bloom: true };
+    const dimGlow: AnimPart = {
+      geo: box(1, 1, 1),
+      surfaceId: 'crystal',
+      emissive: { colorKey: 'ward', intensity: 0.4 },
+      bloom: false,
+    };
+    expect(goldTrim.emissive).toBeUndefined();
+    expect(goldTrim.bloom).toBe(true);
+    expect(dimGlow.emissive).toBeDefined();
+    expect(dimGlow.bloom).toBe(false);
+    // The renderer marks on `bloom`; marking on `emissive !== undefined` would
+    // both miss the gold and haze the frame with the filler.
+    const mesh = new THREE.Mesh(goldTrim.geo, partMaterial(goldTrim.surfaceId, undefined, undefined));
+    if (goldTrim.bloom) markBloom(mesh);
+    expect(mesh.layers.isEnabled(BLOOM_LAYER)).toBe(true);
+    expect(mesh.layers.isEnabled(0)).toBe(true);
   });
 });
 
