@@ -23,6 +23,8 @@ import {
   ARMOR_K,
   ASSIST_GOLD,
   buildMap,
+  CAMP_LEASH_RADIUS,
+  CAMP_PACK,
   CREEP_MELEE,
   ELEV_HIGH,
   ELEV_LOW,
@@ -97,8 +99,10 @@ function physMult(armor: number): number {
 }
 
 const PASSIVE_PER_TICK = PASSIVE_GOLD_PER_S * TICK_DT;
-/** Off-lane arena, far from every tower. */
-const ARENA = { x: 20, z: 60 };
+
+/** Every world in this file is `buildMap(1)`, and buildMap is a pure function
+ *  of the lane count — so one shared copy is the same map every world gets. */
+const MAP = buildMap(1);
 
 // --- terrain fixtures -------------------------------------------------------
 
@@ -131,6 +135,70 @@ function quiet(map: MapDef, x: number, z: number, clearance: number): boolean {
   }
   return true;
 }
+
+/** The widest offset any test in this file puts between the arena centre and a
+ *  combatant, plus the room a chasing hero needs to close on one. */
+const ARENA_SPREAD = 8;
+
+/** Clearance the arena needs from a camp CLEARING — the centre is not the edge
+ *  of a camp's reach. A member acquires inside
+ *  `CAMP_LEASH_RADIUS - CAMP_ACQUIRE_MARGIN` and retains out to
+ *  `CAMP_LEASH_RADIUS`, measured from the clearing, so the whole arena
+ *  footprint must sit outside that disc with margin. The same number is used
+ *  for towers and lane corridors, where it is comfortably more than enough. */
+const ARENA_CLEAR = CAMP_LEASH_RADIUS + ARENA_SPREAD + 6;
+
+/** True when every metre of the square of half-width `r` around (x, z) is
+ *  walkable, in bounds, and at ONE elevation.
+ *
+ *  Flatness is not cosmetic: TERRAIN_CONTRACT §4 makes a LOW->HIGH swing miss
+ *  `HIGH_GROUND_MISS` of the time, so an arena straddling a ramp would drop
+ *  swings out of every cadence and damage assertion in this file at a rate
+ *  that depends on the entity ids the test happened to allocate. */
+function flatOpen(map: MapDef, x: number, z: number, r: number): boolean {
+  for (let dz = -r; dz <= r; dz++) {
+    for (let dx = -r; dx <= r; dx++) {
+      const px = x + dx;
+      const pz = z + dz;
+      if (px < 0 || pz < 0 || px > map.side || pz > map.side) return false;
+      if (!isPassable(map.terrain, px, pz)) return false;
+      if (elevationAt(map.terrain, px, pz) !== ELEV_LOW) return false;
+    }
+  }
+  return true;
+}
+
+/** The duelling arena: a quiet, flat, walkable pocket every staged fight in
+ *  this file happens in. SEARCHED in row-major order, so it is a pure function
+ *  of the map and identical on every run — never written down.
+ *
+ *  It used to be the literal `(20, 60)`, which cost nothing right up until
+ *  `stepCamps` was wired into `advance()`: that point is 1.6 m from the camp
+ *  clearing at (21.5, 61.5), so three campBrutes began spawning inside the
+ *  fixture and swinging at whatever it contained. Four tests that assert on
+ *  cadence, bounty and first blood were measuring a three-on-one brawl. A
+ *  literal cannot notice the map moving underneath it; this search can. */
+function findArena(map: MapDef): Vec2 {
+  const dim = map.terrain.grid.dim;
+  for (let cz = 0; cz < dim; cz++) {
+    for (let cx = 0; cx < dim; cx++) {
+      const x = cx + 0.5;
+      const z = cz + 0.5;
+      if (!quiet(map, x, z, ARENA_CLEAR)) continue;
+      if (!flatOpen(map, x, z, ARENA_SPREAD)) continue;
+      return { x, z };
+    }
+  }
+  throw new Error(`no ${ARENA_SPREAD}m flat arena with ${ARENA_CLEAR}m of clearance`);
+}
+
+/** Off-lane arena, far from every tower, lane and camp. */
+const ARENA: Vec2 = findArena(MAP);
+
+/** A point on the far side of the map from the arena: outside every share
+ *  radius and every aggro radius the arena can reach, and still in bounds
+ *  wherever the arena search lands. */
+const FAR_FROM_ARENA: Vec2 = { x: MAP.side - ARENA.x, z: MAP.side - ARENA.z };
 
 /** Two quiet, passable cell centres at the requested elevations, no more than
  *  `gap` metres apart. Scans in row-major order, so the answer is a pure
@@ -207,15 +275,65 @@ function forceNeutral(e: Ent): void {
   Object.assign(e, { team: NEUTRAL_TEAM });
 }
 
-/** A neutral jungle creep. camps.ts owns real camp tuning; this fixture only
- *  needs an entity on NEUTRAL_TEAM that dies in one hit and carries loot, so it
- *  sets bounty/xp directly (neither is touched by recomputeEnt). */
+/** The single blow every neutral-loot test below lands on its fixture. */
+const NEUTRAL_KILL_DAMAGE = 50;
+
+/** The health bar `neutral()` hands its fixture. Small and explicit: these
+ *  tests are about who gets paid when a neutral dies, not about how much a
+ *  campPack can take, so the death must be a certainty rather than an
+ *  arithmetic race against a balance constant. Pinned against
+ *  NEUTRAL_KILL_DAMAGE by the first test in the `neutral deaths` block. */
+const NEUTRAL_FIXTURE_HP = 10;
+
+/** A neutral jungle creep carrying known loot and a health bar the FIXTURE
+ *  owns.
+ *
+ *  This used to set only `bounty`/`xpValue` and inherit its health, silently
+ *  depending on `mobileTuning('campPack')` returning null and `spawnMobile`
+ *  falling back to a 1 hp marker. AMENDMENT_2 §D.2 required that arm to exist
+ *  — `Ent.radius` is readonly and written once from the tuning, so a brute's
+ *  combat reach cannot be corrected afterwards — and the moment it landed a
+ *  campPack had CAMP_PACK's real 240 hp and the 50-damage blow below stopped
+ *  killing anything. The production change was right; the hidden dependency
+ *  was the defect.
+ *
+ *  Only `hp` is written, deliberately. `recomputeEnt` rewrites `maxHp` from
+ *  the base core on every tick of `advance()`, so a fixture that also assigned
+ *  `maxHp` would be asserting a number the next tick silently discards — the
+ *  same species of lie this helper is being fixed for. The current bar is the
+ *  part a fixture can actually own, and it is the part these tests need. */
 function neutral(w: World, x: number, z: number, bounty: number, xp: number): Ent {
   const e = must(w.get(w.spawnMobile('campPack', NEUTRAL_TEAM, x, z, -1, 0, NO_ENT)));
+  e.hp = NEUTRAL_FIXTURE_HP;
   e.bounty = bounty;
   e.xpValue = xp;
   return e;
 }
+
+describe('the staged-fight arena', () => {
+  it('stays empty of everything the sim spawns on its own', () => {
+    // Every duel, bounty and first-blood assertion in this file assumes the
+    // arena contains exactly the entities the test put there. That was true by
+    // luck until stepCamps was wired into advance(); it is true by search now,
+    // and this is what notices if it stops being true again.
+    const w = makeWorld();
+    const dummy = must(w.get(w.spawnMobile('melee', 0, ARENA.x, ARENA.z, -1, 0, NO_ENT)));
+    w.stun(dummy.id, 3600); // it never moves, so the arena stays centred on it
+    const intruders = new Set<string>();
+    for (let i = 0; i < 400; i++) {
+      w.advance();
+      for (const e of w.mobiles()) {
+        if (e.id === dummy.id) continue;
+        if (Math.hypot(e.x - ARENA.x, e.z - ARENA.z) <= ARENA_SPREAD) {
+          intruders.add(`${e.kind}#${e.id}`);
+        }
+      }
+    }
+    expect([...intruders]).toEqual([]);
+    expect(dummy.hp).toBe(dummy.maxHp); // and nothing took a swing at it
+    expect(dummy.alive).toBe(true);
+  });
+});
 
 describe('mitigation', () => {
   it('applies the exact armor formula to physical damage', () => {
@@ -596,7 +714,6 @@ describe('missRoll', () => {
 });
 
 describe('uphill miss', () => {
-  const MAP = buildMap(1);
   const GAP = 4;
   const CLEAR = 22;
 
@@ -723,6 +840,25 @@ describe('uphill miss', () => {
 // --- TERRAIN_CONTRACT §5: neutral-safe attribution ---------------------------
 
 describe('neutral deaths', () => {
+  it('the fixture carries real camp tuning and still dies to the blow below', () => {
+    // Both halves of the trap that broke this block, pinned. If the camp arms
+    // of mobileTuning() go away the first two assertions fail; if the fixture
+    // goes back to inheriting its health from the tuning table the third does.
+    const w = makeWorld();
+    const camp = neutral(w, ARENA.x + 1, ARENA.z, 60, 120);
+    expect(camp.maxHp).toBe(CAMP_PACK.hp);
+    expect(camp.radius).toBe(CAMP_PACK.radius);
+    expect(camp.hp).toBe(NEUTRAL_FIXTURE_HP);
+    expect(NEUTRAL_KILL_DAMAGE * physMult(CAMP_PACK.armor)).toBeGreaterThan(NEUTRAL_FIXTURE_HP);
+    // `maxHp` is the world's — recomputeEnt rewrites it from the base core
+    // every tick — and `hp` is the fixture's, held because a camp does not
+    // regenerate (AMENDMENT_1 §C, AMENDMENT_2 §D.5).
+    advance(w, 20);
+    expect(camp.alive).toBe(true);
+    expect(camp.maxHp).toBe(CAMP_PACK.hp);
+    expect(camp.hp).toBe(NEUTRAL_FIXTURE_HP);
+  });
+
   it('pays xp and bounty to the killer team only, never to both', () => {
     const w = makeWorld();
     const p0 = hero(w, 'p0'); // team 0
@@ -738,7 +874,7 @@ describe('neutral deaths', () => {
     const g1 = p1.gold;
     const x0 = p0.xp;
     const x1 = p1.xp;
-    w.damage(p0.id, camp.id, 50, 'physical');
+    w.damage(p0.id, camp.id, NEUTRAL_KILL_DAMAGE, 'physical');
     w.advance();
     expect(camp.alive).toBe(false);
     expect(p0.xp - x0).toBeCloseTo(120, 6); // whole share, one team, one hero
@@ -762,7 +898,7 @@ describe('neutral deaths', () => {
     const x0 = p0.xp;
     const x1 = p1.xp;
     const x2 = p2.xp;
-    w.damage(p0.id, camp.id, 50, 'physical');
+    w.damage(p0.id, camp.id, NEUTRAL_KILL_DAMAGE, 'physical');
     w.advance();
     expect(camp.alive).toBe(false);
     expect(p0.xp - x0).toBeCloseTo(50, 6);
@@ -785,7 +921,10 @@ describe('neutral deaths', () => {
     p1.z = ARENA.z;
     const camp = neutral(w, ARENA.x + 1, ARENA.z, 60, 120);
     expect(Math.hypot(p1.x - camp.x, p1.z - camp.z)).toBeLessThan(XP_SHARE_RADIUS);
-    const creep = must(w.get(w.spawnMobile('melee', 0, ARENA.x + 40, ARENA.z, -1, 0, NO_ENT)));
+    const creep = must(
+      w.get(w.spawnMobile('melee', 0, FAR_FROM_ARENA.x, FAR_FROM_ARENA.z, -1, 0, NO_ENT)),
+    );
+    expect(Math.hypot(creep.x - camp.x, creep.z - camp.z)).toBeGreaterThan(XP_SHARE_RADIUS);
     // a real blow, small enough that the camp outlives the creep that dealt it
     w.damage(creep.id, camp.id, 0.25, 'physical');
     expect(camp.lastHitBy).toBe(creep.id);
@@ -823,7 +962,7 @@ describe('neutral deaths', () => {
     const camp = neutral(w, ARENA.x + 1, ARENA.z, 60, 120);
     const x0 = p0.xp;
     const x1 = p1.xp;
-    w.damage(camp.id, camp.id, 50, 'physical'); // neutral last-hitter
+    w.damage(camp.id, camp.id, NEUTRAL_KILL_DAMAGE, 'physical'); // neutral last-hitter
     w.advance();
     expect(camp.alive).toBe(false);
     expect(p0.xp - x0).toBeCloseTo(0, 9);
@@ -838,7 +977,7 @@ describe('neutral deaths', () => {
     p0.z = ARENA.z;
     const camp = neutral(w, ARENA.x + 1, ARENA.z, 60, 120);
     const deathsBefore = p0.deaths + p1.deaths;
-    w.damage(p0.id, camp.id, 50, 'physical');
+    w.damage(p0.id, camp.id, NEUTRAL_KILL_DAMAGE, 'physical');
     w.advance();
     expect(camp.alive).toBe(false);
     expect(w.drainEvents().some((e) => e.k === 'kill')).toBe(false);

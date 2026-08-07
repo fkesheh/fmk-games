@@ -8,9 +8,14 @@ This file is the handoff. Read `AMENDMENT_1/2/3.md` for the rulings they must ob
 | workspace | typecheck | tests |
 | --- | --- | --- |
 | `@rift/shared` | **EXIT 0** | green |
-| `@rift/server` | 4 errors, all in `bots.ts` / `bots.test.ts` (S_BOTS, not yet run) | 433/442 |
-| `@rift/client` | ~38 errors, 33 of them in `units.ts` (R_UNITS, not yet run) | — |
+| `@rift/server` | 4 errors, all in `bots.ts` / `bots.test.ts` (S_BOTS, not yet run) | sim **255/255 EXIT 0** |
+| `@rift/client` | 44 errors, 33 of them in `units.ts` (R_UNITS, in the fix wave) | — |
 | client **build** | **BROKEN** | — |
+
+> **Correction.** Earlier revisions of this file quoted "433/442" for the server. That number was
+> mine and it was wrong — it corresponds to nothing measurable. `games/rift/server/src/sim` was
+> 242 tests at the S_WORLD baseline and is 255 now; the whole server workspace was 299 and is 308.
+> Quote the workspace you actually ran.
 
 The client build fails with `MISSING_EXPORT`: `render/units.ts:37` and `render/mapMesh.ts:29`
 still import `sceneCore` / `paintGeo` from `./scene.js`, which R_SCENE removed. R_UNITS and
