@@ -200,6 +200,66 @@ describe('terrain primitives', () => {
     expect(kindAt(stepped, 8.5, 2.5)).toBe('cliff');
   });
 
+  it('refuses an elevation change on a map with NO cliff cell anywhere', () => {
+    // The case above paints its wall's non-ramp cells as 'cliff', so the cliff
+    // rule ALONE satisfies it: `cellStep` reduced to "the target is not a
+    // cliff" still passes it, and the elevation half of the rule is unpinned.
+    // Here the fixture contains no cliff at all, so the only thing that can
+    // refuse the step is the elevation rule (TERRAIN_CONTRACT §3).
+    const stepped = terrainOf(16, (x) => (x < 8 ? 'ground' : 'high'));
+    const cliffCode = TERRAIN_KINDS.indexOf('cliff');
+    expect(stepped.grid.kind.includes(cliffCode)).toBe(false);
+
+    expect(segmentWalkable(stepped, 7.5, 5, 8.5, 5)).toBe(false); // low -> high
+    expect(segmentWalkable(stepped, 8.5, 5, 7.5, 5)).toBe(false); // high -> low
+    // Each level is freely walkable within itself, so it is the CHANGE that is
+    // refused and not one of the two terrains.
+    expect(segmentWalkable(stepped, 2.5, 5, 6.5, 5)).toBe(true);
+    expect(segmentWalkable(stepped, 9.5, 5, 13.5, 5)).toBe(true);
+
+    // And a ramp at the boundary — still with no cliff on the map — is what
+    // makes the crossing legal, at that row and nowhere else.
+    const ramped = terrainOf(16, (x, z) =>
+      x < 8 ? 'ground' : x < 9 && z > 4 && z < 6 ? 'ramp' : 'high',
+    );
+    expect(ramped.grid.kind.includes(cliffCode)).toBe(false);
+    expect(segmentWalkable(ramped, 7.5, 5.5, 9.5, 5.5)).toBe(true);
+    expect(segmentWalkable(ramped, 7.5, 2.5, 9.5, 2.5)).toBe(false);
+    // Coming back DOWN is the other half of the rule and needs the other end of
+    // it: the step off the ramp onto low ground has a ramp on the FROM side and
+    // ordinary ground on the TO side, so a test of the target cell alone lets
+    // a unit walk up a ramp and never back down it.
+    expect(segmentWalkable(ramped, 9.5, 5.5, 7.5, 5.5)).toBe(true);
+    expect(segmentWalkable(ramped, 9.5, 2.5, 7.5, 2.5)).toBe(false);
+  });
+
+  it('refuses a diagonal that cuts the corner between two cells', () => {
+    // The step (4,4) -> (5,5) is diagonal, both cells are open ground and both
+    // are at the SAME elevation, so `cellStep(from, to)` on its own says yes.
+    // Only the no-corner-cutting rule says no — and it must say no when EITHER
+    // orthogonal cell between them is solid, or a hero slips diagonally
+    // between two cliff corners that a straight walk cannot pass.
+    const corner = (blockViaX: boolean, blockViaZ: boolean): TerrainDef =>
+      terrainOf(16, (x, z) => {
+        const cx = Math.floor(x);
+        const cz = Math.floor(z);
+        if (blockViaX && cx === 5 && cz === 4) return 'cliff';
+        if (blockViaZ && cx === 4 && cz === 5) return 'cliff';
+        return 'ground';
+      });
+    for (const t of [corner(true, false), corner(false, true), corner(true, true)]) {
+      // Both ENDS stay open ground the whole way through: the endpoints are
+      // never what is being refused.
+      expect(isPassable(t, 4.5, 4.5)).toBe(true);
+      expect(isPassable(t, 5.5, 5.5)).toBe(true);
+      expect(segmentWalkable(t, 4.5, 4.5, 5.5, 5.5)).toBe(false);
+      expect(segmentWalkable(t, 5.5, 5.5, 4.5, 4.5)).toBe(false); // and back
+    }
+    // Control: with both orthogonal cells open the same diagonal is legal, so
+    // the rule is not simply forbidding diagonals.
+    expect(segmentWalkable(corner(false, false), 4.5, 4.5, 5.5, 5.5)).toBe(true);
+  });
+
   it('reads a ramp as high ground and a cliff as low, per §3', () => {
     const stepped = terrainOf(8, (x) => (x < 3 ? 'ground' : x < 4 ? 'ramp' : x < 5 ? 'cliff' : 'high'));
     expect(stepped.grid.elev[3]).toBe(ELEV_HIGH);
@@ -300,6 +360,37 @@ describe('hero pathing over cliffs', () => {
     orderMove(h, 8, 40); // a different CELL does re-plan
     tick(w);
     expect(h.path).not.toBe(planned);
+  });
+
+  it('keeps the route it is holding while it chases (AMENDMENT_1 §D)', () => {
+    const w = worldOf(mapOf(wallWithRamp));
+    const h = hero(w, 'p0');
+    h.x = 6;
+    h.z = 6;
+    orderMove(h, 40, 6);
+    tick(w);
+    const planned = h.path;
+    expect(planned?.length ?? 0).toBeGreaterThan(1);
+
+    // A chase is straight-line steering that never READS the route, so nothing
+    // about it makes the route stale. Clearing it on every chase tick is what
+    // forced a fresh A* the instant the chase ended — the per-tick search §D
+    // exists to forbid — and it is why `clearPath` is called only where THIS
+    // file issues or completes an order.
+    const foe = must(w.get(spawn(w, 'melee', 1, 6, 20, -1)));
+    h.order = 'attack';
+    h.orderTarget = foe.id;
+    tick(w, 5);
+    expect(h.order).toBe('attack');
+    expect(h.path).toBe(planned); // same array object: not dropped, not re-planned
+    expect(pathSearchesUsed()).toBe(0); // and the chase cost the tick no search
+
+    // And when the chase ends the hero resumes on that same route rather than
+    // paying for a search it never needed to make.
+    h.order = 'move';
+    h.orderTarget = NO_ENT;
+    tick(w);
+    expect(h.path).toBe(planned);
   });
 
   it('re-plans a route it has been displaced off, to the very same destination', () => {
@@ -799,6 +890,71 @@ describe('neutral camps — the EXECUTING half of the seam (AMENDMENT_1 §A)', (
   });
 });
 
+describe('camp members are immovable in separation (AMENDMENT_2 §A)', () => {
+  const flat = terrainOf(48, () => 'ground');
+
+  it('takes NONE of the displacement when a hero overlaps it', () => {
+    const w = worldOf(mapOf(flat));
+    const e = must(standCamp(w, 'brute', 20, 20)[0]);
+    const h = hero(w, 'p0');
+    h.order = 'idle';
+    h.x = e.x + 0.1; // deep overlap, as a hero walking onto it produces
+    h.z = e.z;
+    const x0 = e.x;
+    const z0 = e.z;
+    const hx0 = h.x;
+    tick(w);
+    expect(e.x).toBe(x0); // bit-identical: infinite mass
+    expect(e.z).toBe(z0);
+    expect(h.x).toBeGreaterThan(hx0); // the hero took the whole overlap
+    // ...and the pair really was separated, so this is not "nothing happened".
+    expect(Math.hypot(h.x - e.x, h.z - e.z)).toBeGreaterThanOrEqual(
+      h.radius + e.radius - 1e-9,
+    );
+  });
+
+  it('cannot be bulldozed out of its clearing by a hero driven into it', () => {
+    // The measured exploit: AMENDMENT_1 §A forbids the position clamp, which
+    // bounds a camp's CHASE at CAMP_LEASH_RADIUS but bounds a SHOVE at nothing.
+    // A hero driven into a member at 8 m/s every tick carried it 31 m from its
+    // clearing — into a lane, dragging neutrals into a fight they should never
+    // be in, deterministically.
+    const w = worldOf(mapOf(flat));
+    const posts = standCamp(w, 'pack', 20, 20).map((e) => ({ e, x: e.x, z: e.z }));
+    expect(posts.length).toBeGreaterThan(1);
+    const h = hero(w, 'p0');
+    h.moveSpeed = 8;
+    h.x = 12;
+    h.z = 20;
+    orderMove(h, 44, 20); // straight through the camp
+    for (let i = 0; i < 200; i++) {
+      tick(w);
+      for (const p of posts) {
+        expect(p.e.x).toBe(p.x);
+        expect(p.e.z).toBe(p.z);
+      }
+    }
+  });
+
+  it('still separates two camp members from each other, evenly', () => {
+    // Immovable against the OTHER party, not against its own kind: two members
+    // stacked by a respawn or a displacement would otherwise never come apart,
+    // which is the failure the distinct-post ring exists to avoid in the first
+    // place.
+    const w = worldOf(mapOf(flat));
+    const members = standCamp(w, 'pack', 20, 20);
+    const a = must(members[0]);
+    const b = must(members[1]);
+    a.x = 20;
+    a.z = 20;
+    b.x = 20.2;
+    b.z = 20;
+    tick(w);
+    expect(b.x - a.x).toBeGreaterThan(0.2);
+    expect(20 - a.x).toBeCloseTo(b.x - 20.2, 12); // symmetric halves
+  });
+});
+
 describe('determinism', () => {
   it('produces bit-identical paths and positions in two identical worlds', () => {
     const terrain = terrainOf(48, (x, z) => {
@@ -823,6 +979,76 @@ describe('determinism', () => {
     expect(ha.z).toBe(hb.z);
     expect(ha.pathIndex).toBe(hb.pathIndex);
     expect(JSON.stringify(ha.path)).toBe(JSON.stringify(hb.path));
+  });
+
+  it('breaks an exact A* tie on (f, h, cell index), not on heap order', () => {
+    // One wall, two gaps one cell either side of the straight line, and a start
+    // and goal exactly ON that line: the northern and southern routes have
+    // IDENTICAL octile cost at every step, so which one comes back is decided
+    // entirely by the open set's tie-break keys.
+    //
+    // GOLDEN, because the route is the only observable those keys have. The
+    // search is already a pure function of (grid, start, goal) — every scratch
+    // array is refilled or guarded before it is read, which the two cases below
+    // pin — so a same-process re-run cannot tell a total order from a merely
+    // reproducible insertion order, however many times it is repeated. Only the
+    // route itself can, and only on a fixture that actually ties.
+    //
+    // Verified against four mutations of `betterSlot`, each of which moves this
+    // route: reversing the cell-index key, deleting it, deleting the `h` key,
+    // and reversing it. z = 15 is the lower cell index of the two gaps.
+    const symmetric = terrainOf(32, (x, z) => {
+      if (x > 16 && x < 17) {
+        const cz = Math.floor(z);
+        return cz === 15 || cz === 17 ? 'ground' : 'cliff';
+      }
+      return 'ground';
+    });
+    expect(findPath(symmetric, 3.5, 16.5, 30.5, 16.5)).toEqual([
+      { x: 17.5, z: 15.5 },
+      { x: 30.5, z: 16.5 },
+    ]);
+  });
+
+  it('keys the open set on the f a node was PUSHED with, not its live f', () => {
+    // Lazy deletion re-pushes a cell every time an incoming edge improves it,
+    // which lowers `fCost[cell]` under the entry already sitting in the tree.
+    // A comparator that re-read `fCost` would therefore see the key of a node
+    // already placed in the heap change beneath it, and every ordering argument
+    // about the structure would be void — the heap property is stated over the
+    // keys AT INSERTION.
+    //
+    // Fourteen 3x3 blocks scattered over an open field: the corridors between
+    // them are exactly the shape that reopens nodes, which a single wall with a
+    // gap never does. Golden, for the same reason as the tie-break case above —
+    // the route is the only observable. Reading `fCost[heap[i]]` in place of
+    // `heapF[i]` moves this route.
+    const blocks: readonly (readonly [number, number])[] = [
+      [28, 20], [16, 14], [7, 20], [17, 10], [20, 9], [18, 29], [25, 5],
+      [23, 27], [2, 25], [25, 26], [4, 23], [27, 12], [25, 2], [26, 27],
+    ];
+    const scattered = terrainOf(32, (x, z) => {
+      const cx = Math.floor(x);
+      const cz = Math.floor(z);
+      for (const [bx, bz] of blocks) {
+        if (cx >= bx && cx < bx + 3 && cz >= bz && cz < bz + 3) return 'cliff';
+      }
+      return 'ground';
+    });
+    expect(findPath(scattered, 1.5, 1.5, 30.5, 30.5)).toEqual([
+      { x: 20.5, z: 22.5 },
+      { x: 27.5, z: 24.5 },
+      { x: 30.5, z: 27.5 },
+      { x: 30.5, z: 30.5 },
+    ]);
+    // Every leg of it is legal, so the golden is a route and not just a hash.
+    let px = 1.5;
+    let pz = 1.5;
+    for (const p of findPath(scattered, 1.5, 1.5, 30.5, 30.5) ?? []) {
+      expect(segmentWalkable(scattered, px, pz, p.x, p.z)).toBe(true);
+      px = p.x;
+      pz = p.z;
+    }
   });
 
   it('returns the same route for the same query on the real map', () => {

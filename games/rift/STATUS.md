@@ -23,7 +23,24 @@ R_MAPMESH are the only two blockers. Until they land, **no render module can be 
 pixels** — which is why R_FOG could never measure its boot cost and R_FX's bloom numbers are
 array-proven only.
 
+## Open balance failures — a measured consequence of AMENDMENT_2 §A/§B
+
+`balance.test.ts` is 2 red out of the server's 322. Both belong to **S_BALANCE** (Wave 3):
+
+1. **`median match duration by Ancient kill is 12-18 min`** — moved **17.38 → 19.59 min**. This is
+   caused by my own rulings, not a defect: §A (camp members immovable) and §B (out-of-combat
+   reset) together make the jungle meaningfully harder to farm — no bulldozing a camp into a
+   lane, no whittling one down for free from 9.5 m. Income is down, so matches run long.
+   S_JUNGLE verified against the pre-change tree that this failure is new and attributed it
+   correctly rather than letting it surface later as a mystery.
+2. **`team gold divergence at 10 min is < 40%`** (41.1%) — already failing before that change.
+
+S_BALANCE re-baselines both. Per `BUILD_SPECS`, determinism must not be weakened to get there:
+if identical seeds stop producing identical matches, that is a real defect, not a threshold.
+
 ## The 9 failing tests, and who owns them
+
+**(RESOLVED — all 9 fixed. Kept for the record.)**
 
 **7 in `combat.test.ts` — cross-task, triggered by S_WORLD, owned by S_COMBAT.**
 `neutral()` at `combat.test.ts:213` spawns a `campPack` and sets only `bounty` and `xpValue`,

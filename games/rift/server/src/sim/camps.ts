@@ -42,6 +42,14 @@
 //   5. NEVER A LANE UNIT. Members spawn with lane = -1, owner = NO_ENT,
 //      team = NEUTRAL_TEAM and path = null. A camp creep with lane >= 0 walks a
 //      lane polyline, which is the single most likely way this feature breaks.
+//   6. A CAMP OUT OF COMBAT RESETS (AMENDMENT_2 §B). Rule 3's arrival restore
+//      only fires for a member that was pulled off its post; a camp poked from
+//      outside its own reach never chases, never leashes, never arrives, and so
+//      — with hpRegen 0 — could be whittled down for free across several
+//      visits. After CAMP_RESET_S with no damage and every living member idle,
+//      the whole camp goes back to full hp and forgets who hit it. The arrival
+//      restore stays as well: it is immediate, which is what makes a broken
+//      chase read as clean rather than laggy.
 //
 // Determinism: no RNG, no clock. Member posts come from a fixed unit-vector
 // table (no trigonometry), acquisition ties break on entity id, and there is no
@@ -49,25 +57,24 @@
 // ============================================================================
 import {
   AGGRO_RADIUS,
-  CAMP_BRUTE,
+  CAMP_ACQUIRE_MARGIN,
   CAMP_BRUTE_COUNT,
   CAMP_BRUTE_RESPAWN_S,
-  CAMP_HIVE,
   CAMP_HIVE_COUNT,
   CAMP_HIVE_RESPAWN_S,
   CAMP_LEASH_RADIUS,
-  CAMP_PACK,
   CAMP_PACK_COUNT,
   CAMP_PACK_RESPAWN_S,
+  CAMP_RESET_S,
   NEUTRAL_TEAM,
   TICK_RATE,
   isPlayerTeam,
 } from '@rift/shared';
-import type { CampDef, CreepTuning, EntKind } from '@rift/shared';
+import type { CampDef, EntKind } from '@rift/shared';
 import { segmentWalkable } from './pathing.js';
 import { NO_ENT } from './types.js';
 import type { CampState, Ent } from './types.js';
-import type { CoreStats, SimWorld } from './world.js';
+import type { SimWorld } from './world.js';
 
 type CampTier = CampDef['tier'];
 
@@ -77,14 +84,6 @@ const TIER_KIND: Record<CampTier, EntKind> = {
   pack: 'campPack',
   brute: 'campBrute',
   hive: 'campHive',
-};
-
-/** The frozen per-tier statlines. Every number here is config's; this module
- *  invents none of them (shared/config.ts carries the derivation). */
-const TIER_TUNING: Record<CampTier, CreepTuning> = {
-  pack: CAMP_PACK,
-  brute: CAMP_BRUTE,
-  hive: CAMP_HIVE,
 };
 
 /** Members spawned per camp. The camp respawns whole, never trickles. */
@@ -101,6 +100,11 @@ const TIER_RESPAWN_TICKS: Record<CampTier, number> = {
   brute: Math.round(CAMP_BRUTE_RESPAWN_S * TICK_RATE),
   hive: Math.round(CAMP_HIVE_RESPAWN_S * TICK_RATE),
 };
+
+/** Ticks of quiet before an out-of-combat camp resets (AMENDMENT_2 §B).
+ *  Rounded once at module load, exactly like the respawn clocks above, so the
+ *  delay is identical in every replay. */
+const CAMP_RESET_TICKS = Math.round(CAMP_RESET_S * TICK_RATE);
 
 /** Radius of the ring of resting posts around the clearing centre.
  *
@@ -138,16 +142,19 @@ const POST_DIRS: readonly (readonly [number, number])[] = [
  *  ambiguous between two members. */
 const POST_ARRIVE_EPS = 0.15;
 
-/** Hysteresis band on acquisition, in metres inside the leash disc.
+/** The acquire radius: the inner disc of the acquisition hysteresis band.
  *
- *  A member RETAINS a target out to CAMP_LEASH_RADIUS but only ACQUIRES one
- *  inside `CAMP_LEASH_RADIUS - this`. Without the band a target loitering on
- *  the disc edge is dropped and re-taken on alternate ticks — and because
- *  `lastHitBy` survives until the camp resets, a hero who once poked the camp
- *  would re-pull it every other tick for the rest of the match. One metre is
- *  more than a camp member covers in a tick at any tier's moveSpeed (3.4 m/s ->
- *  0.17 m), so a target that crosses the band has genuinely walked out. */
-const CAMP_ACQUIRE_MARGIN = 1;
+ *  A member RETAINS a target out to the full CAMP_LEASH_RADIUS but only
+ *  ACQUIRES one inside this. Without the band a target loitering on the disc
+ *  edge is dropped and re-taken on alternate ticks — and because `lastHitBy`
+ *  survives until the camp resets, a hero who once poked the camp would re-pull
+ *  it every other tick for the rest of the match.
+ *
+ *  BOTH numbers are config's (AMENDMENT_2 §C promoted `CAMP_ACQUIRE_MARGIN` out
+ *  of this file for exactly that reason: it is balance-visible). This is the
+ *  derived radius and nothing else — restating the margin here as a local
+ *  constant is what made a balance edit to config silently inert. */
+const CAMP_ACQUIRE_RADIUS = CAMP_LEASH_RADIUS - CAMP_ACQUIRE_MARGIN;
 
 /** The resting post of member `index` of a `count`-member camp: a fixed spoke
  *  of the ring, spread as evenly as the 8-direction table allows. Pure in
@@ -214,13 +221,12 @@ function withinCampReach(w: SimWorld, c: CampState, t: Ent, radius: number): boo
  *  the world's shared scratch buffer and allocates nothing. */
 function nearestHostile(w: SimWorld, c: CampState, e: Ent): Ent | undefined {
   const n = w.inRadius(e.x, e.z, AGGRO_RADIUS, w.scratchA);
-  const acquireR = CAMP_LEASH_RADIUS - CAMP_ACQUIRE_MARGIN;
   let best: Ent | undefined;
   let bestD = Infinity;
   for (let i = 0; i < n; i++) {
     const t = w.scratchA[i];
     if (!t || !hostileToCamp(w, t)) continue;
-    if (!withinCampReach(w, c, t, acquireR)) continue;
+    if (!withinCampReach(w, c, t, CAMP_ACQUIRE_RADIUS)) continue;
     const d = Math.hypot(t.x - e.x, t.z - e.z);
     if (d < bestD || (d === bestD && best !== undefined && t.id < best.id)) {
       bestD = d;
@@ -235,8 +241,9 @@ function nearestHostile(w: SimWorld, c: CampState, e: Ent): Ent | undefined {
  *
  * Priority, and every step of it is capped:
  *  1. the victim it already has, while that victim is still legal and still
- *     inside the disc. Retention uses the FULL leash radius — the band in
- *     {@link CAMP_ACQUIRE_MARGIN} is what stops it flickering at the edge;
+ *     inside the disc. Retention uses the FULL leash radius — the band between
+ *     that and {@link CAMP_ACQUIRE_RADIUS} is what stops it flickering at the
+ *     edge;
  *  2. otherwise the nearest hostile inside AGGRO_RADIUS. This sits ABOVE the
  *     damager pull deliberately: a pull that outranked proximity let a sniper
  *     far away shadow a hero standing on top of the member;
@@ -253,8 +260,7 @@ function pickTarget(w: SimWorld, c: CampState, e: Ent): Ent | undefined {
   if (near) return near;
   if (e.lastHitBy !== NO_ENT) {
     const dmg = w.get(e.lastHitBy);
-    const acquireR = CAMP_LEASH_RADIUS - CAMP_ACQUIRE_MARGIN;
-    if (dmg && hostileToCamp(w, dmg) && withinCampReach(w, c, dmg, acquireR)) return dmg;
+    if (dmg && hostileToCamp(w, dmg) && withinCampReach(w, c, dmg, CAMP_ACQUIRE_RADIUS)) return dmg;
   }
   return undefined;
 }
@@ -303,52 +309,92 @@ function restAtPost(e: Ent, px: number, pz: number): void {
 function arriveAtPost(e: Ent, px: number, pz: number): void {
   restAtPost(e, px, pz);
   e.hp = e.maxHp;
+  // The walk home is not a safe corridor: `beginReturn` zeroed both of these on
+  // the tick the member disengaged, but anything may shoot it on the way back
+  // and `World.damage` writes `lastHitBy` on EVERY victim. Without this wipe a
+  // member that was poked while returning arrives home at full hp still holding
+  // its attacker, and re-pulls onto it the moment that attacker steps inside
+  // the acquire disc — a fight it already walked away from.
   e.lastHitBy = NO_ENT;
   e.recentDamagers.length = 0;
 }
 
-/** Stamp one freshly spawned member with its tier's statline.
+// --- the out-of-combat reset (AMENDMENT_2 §B) --------------------------------
+
+/**
+ * One camp's combat memory: enough to answer "has this camp taken damage in the
+ * last CAMP_RESET_S?" and nothing else.
  *
- *  Both halves are required. `Ent.*` is what combat, movement and the snapshot
- *  read this tick; `SimWorld.base` is what recomputeEnt() derives those same
- *  fields from every single tick (advance step 3) — write only the first and
- *  the camp is back to 1 hp within a tick. bounty, xpValue and vision live on
- *  the Ent alone (recomputeEnt does not touch them), exactly as they do for
- *  wave creeps.
+ * It hangs off a WeakMap keyed by the CampState rather than sitting as a field
+ * ON it because `sim/types.ts` is frozen and is not this task's to widen. The
+ * key IS the camp — a CampState is built once per `map.terrain.camps` entry and
+ * never replaced or resized — so this is exactly as per-camp as a field would
+ * be, two SimWorlds stepped in lockstep keep entirely separate counters, and a
+ * world that is dropped takes its entries with it. Nothing ever iterates the
+ * map, so it introduces no ordering and no determinism surface.
+ */
+interface CampCombat {
+  /** Summed hp of the living members as of the last tick this camp was stepped.
+   *  A DROP is the damage signal, and it is the only one that needs no
+   *  cooperation from combat.ts: it catches basic attacks, abilities, damage
+   *  over time and a member dying outright, all of which are "this camp is in a
+   *  fight". A RISE (an arrival restore, or this reset) is not damage. */
+  hp: number;
+  /** Match tick of the most recent drop. */
+  tick: number;
+}
+
+const campCombat = new WeakMap<CampState, CampCombat>();
+
+/** Put every living member back to full and forget the fight. Returns the new
+ *  summed hp so the caller's watermark does not read the restore as damage on
+ *  the next tick. */
+function restoreCamp(w: SimWorld, c: CampState): number {
+  const ids = c.memberIds;
+  let hp = 0;
+  for (let i = 0; i < ids.length; i++) {
+    const id = ids[i];
+    if (id === undefined) continue;
+    const e = w.get(id);
+    if (!e || !e.alive) continue;
+    e.hp = e.maxHp;
+    // `recentDamagers` is what AMENDMENT_2 §B names; `lastHitBy` is the field
+    // that actually re-pulls the camp (see pickTarget step 3), and a camp that
+    // has reset must not answer a poke it has already forgotten.
+    e.lastHitBy = NO_ENT;
+    e.recentDamagers.length = 0;
+    hp += e.hp;
+  }
+  return hp;
+}
+
+/**
+ * AMENDMENT_2 §B. A camp that has taken no damage for CAMP_RESET_S, with every
+ * living member idle, goes back to full hp and forgets who hit it.
  *
- *  hpRegen is 0 in BOTH, per AMENDMENT_1 §C: stepUnits' regen loop would
- *  otherwise heal a camp passively mid-fight, which is in no design document
- *  and interacts badly with the leash restore. */
-function applyCampStats(w: SimWorld, e: Ent, t: CreepTuning): void {
-  e.maxHp = t.hp;
-  e.hp = t.hp;
-  e.mana = 0;
-  e.maxMana = 0;
-  e.damage = t.damage;
-  e.armor = t.armor;
-  e.attackPeriod = t.attackPeriod;
-  e.attackRange = t.attackRange;
-  e.moveSpeed = t.moveSpeed;
-  e.hpRegen = 0;
-  e.manaRegen = 0;
-  e.lifesteal = 0;
-  e.vision = t.vision;
-  e.bounty = t.bounty;
-  e.xpValue = t.xp;
-  const core: CoreStats = {
-    maxHp: t.hp,
-    maxMana: 0,
-    damage: t.damage,
-    armor: t.armor,
-    attackPeriod: t.attackPeriod,
-    attackRange: t.attackRange,
-    moveSpeed: t.moveSpeed,
-    hpRegen: 0,
-    manaRegen: 0,
-    lifesteal: 0,
-    vision: t.vision,
-  };
-  w.base.set(e.id, core);
+ * BOTH conditions are load-bearing and neither implies the other:
+ *  - NO DAMAGE closes the actual exploit. A hero parked in the hysteresis band
+ *    — outside the acquire disc, inside the retention radius — is never
+ *    acquired, so the camp never chases, never breaks its leash, and never
+ *    reaches the arrival restore. With hpRegen 0 that hero whittles the camp
+ *    down for free, over as many visits as it likes.
+ *  - EVERY MEMBER IDLE keeps it out of live fights. A camp trading with a hero
+ *    who is between attack cooldowns has taken no damage "recently" for whole
+ *    seconds at a time; healing it back to full mid-fight would make the jungle
+ *    unkillable rather than merely un-whittleable.
+ */
+function resetIfOutOfCombat(w: SimWorld, c: CampState, hpSum: number, allIdle: boolean): void {
+  let mem = campCombat.get(c);
+  if (!mem) {
+    mem = { hp: hpSum, tick: w.tick };
+    campCombat.set(c, mem);
+  }
+  if (hpSum < mem.hp) mem.tick = w.tick;
+  mem.hp = hpSum;
+  if (!allIdle) return;
+  if (w.tick - mem.tick < CAMP_RESET_TICKS) return;
+  mem.hp = restoreCamp(w, c);
+  mem.tick = w.tick;
 }
 
 /**
@@ -394,12 +440,21 @@ function despawnOldGeneration(w: SimWorld, c: CampState): void {
  * jungle up) and again on every respawn. Entity ids are never recycled —
  * `memberIds` is rewritten in place with brand-new ids, so a stale id held by
  * anything else resolves to `undefined` rather than to somebody else's creep.
+ *
+ * NO STATLINE IS STAMPED HERE. `spawnMobile` reads the tier's `CreepTuning`
+ * through `mobileTuning()` and writes every field of it — the Ent AND the
+ * `w.base` core recomputeEnt() re-derives from each tick, with `hpRegen: 0`
+ * (AMENDMENT_2 §D.2/§D.5). This file used to re-stamp all of that afterwards
+ * from the same constants; once world.ts grew its camp arms that became a
+ * complete no-op, and a no-op that shadows another module's write is worse than
+ * nothing — it reads as the owner of numbers it does not own. `radius` proves
+ * the ownership: it is `readonly`, written once by `makeEnt`, and could never
+ * have been corrected from here at all.
  */
 export function spawnCamp(w: SimWorld, c: CampState): void {
   despawnOldGeneration(w, c);
   const tier = c.def.tier;
   const kind = TIER_KIND[tier];
-  const tuning = TIER_TUNING[tier];
   const count = TIER_COUNT[tier];
   const ids = c.memberIds;
   for (let i = 0; i < count; i++) {
@@ -411,7 +466,6 @@ export function spawnCamp(w: SimWorld, c: CampState): void {
     const id = w.spawnMobile(kind, NEUTRAL_TEAM, px, pz, -1, -1, NO_ENT);
     const e = w.get(id);
     if (!e) continue;
-    applyCampStats(w, e, tuning);
     e.lane = -1;
     e.waypoint = 0;
     e.path = null;
@@ -425,6 +479,10 @@ export function spawnCamp(w: SimWorld, c: CampState): void {
   }
   c.aliveCount = ids.length;
   c.respawnAtTick = -1; // -1 is the ONLY "camp is up" encoding
+  // A new generation carries none of the old one's combat memory: the hp
+  // watermark below belongs to bodies that no longer exist, and an ancient
+  // `tick` would let the fresh camp "reset" on its very first idle tick.
+  campCombat.delete(c);
 }
 
 /** Decide what one member wants. Writes intent only — never `x`/`z`. */
@@ -469,11 +527,14 @@ function stepMember(w: SimWorld, c: CampState, e: Ent, index: number, count: num
   else restAtPost(e, px, pz);
 }
 
-/** Recount liveness, drive the living, stamp/serve the respawn clock. */
+/** Recount liveness, drive the living, run the out-of-combat reset, stamp/serve
+ *  the respawn clock. */
 function stepOneCamp(w: SimWorld, c: CampState): void {
   const ids = c.memberIds;
   const count = ids.length;
   let alive = 0;
+  let hpSum = 0;
+  let allIdle = true;
   for (let i = 0; i < count; i++) {
     const id = ids[i];
     if (id === undefined) continue;
@@ -483,11 +544,19 @@ function stepOneCamp(w: SimWorld, c: CampState): void {
     if (!e || !e.alive) continue;
     alive += 1;
     stepMember(w, c, e, i, count);
+    // Read AFTER stepMember, so `allIdle` is this tick's decision and not last
+    // tick's, and `hpSum` includes an arrival restore that landed just above.
+    hpSum += e.hp;
+    if (e.order !== 'idle') allIdle = false;
   }
   c.aliveCount = alive;
 
   if (alive > 0) {
-    c.respawnAtTick = -1;
+    // `respawnAtTick` is already -1 on every path that reaches here — it is set
+    // to -1 by spawnCamp and only ever leaves -1 in the alive === 0 branch
+    // below — so there is nothing to re-clear, and a clear that can never fire
+    // is a line no test can pin.
+    resetIfOutOfCombat(w, c, hpSum, allIdle);
     return;
   }
   if (c.respawnAtTick < 0) {

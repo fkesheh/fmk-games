@@ -41,6 +41,11 @@
 //     Lane creeps and summons still refuse to acquire camps, while hero
 //     attack-move (`nearestEnemyAny`) still does — get that backwards and
 //     either the jungle is inert or every creep wave suicides into it.
+//  4. A CAMP MEMBER IS IMMOVABLE IN THE SEPARATION PASS (AMENDMENT_2 §A). It
+//     takes none of the pair's displacement and the other party takes all of
+//     it. The leash bounds what a camp CHOOSES to do; nothing bounded what
+//     could be done TO it, and a member was measured shoved 31 m out of its
+//     clearing by a hero driven into it every tick.
 //
 // Terrain collision is POINT-vs-cell, deliberately: unit radii resolve against
 // other units and structures, as they always have, and a 1 m cell grid with
@@ -603,11 +608,26 @@ export function stepMovement(w: SimWorld): void {
       const overlap = minD - d;
       const nx = dx / d;
       const nz = dz / d;
-      // Weight split: hero-vs-creep pairs push the hero at half weight
-      // (hero 1/3, creep 2/3); equal kinds split evenly.
+      // Weight split. A CAMP MEMBER HAS INFINITE MASS (AMENDMENT_2 §A): it does
+      // not move, and the whole displacement goes to the other party, so heroes
+      // and creeps slide around a camp instead of pushing it. AMENDMENT_1 §A
+      // forbids the position clamp, which bounds a camp's CHASE at
+      // CAMP_LEASH_RADIUS but bounds a SHOVE at nothing — a hero driven into a
+      // member at 8 m/s every tick was measured carrying it 31 m from its
+      // clearing, and a camp shoved into a lane drags neutrals into a fight
+      // they should never be in, deterministically. Making the member immovable
+      // removes that at the source and leaves the leash rule doing one job.
+      // This wins over the hero split below: against a camp, a hero is the one
+      // that moves. Camp-vs-camp is a normal even split, or two overlapping
+      // members of the same camp would never separate at all.
+      const aCamp = isCampKind(a.kind);
+      const bCamp = isCampKind(b.kind);
       let shareA = 0.5;
-      if (a.kind === 'hero' && b.kind !== 'hero') shareA = 1 / 3;
-      else if (a.kind !== 'hero' && b.kind === 'hero') shareA = 2 / 3;
+      if (aCamp !== bCamp) shareA = aCamp ? 0 : 1;
+      // Hero-vs-creep pairs push the hero at half weight (hero 1/3, creep 2/3);
+      // equal kinds split evenly.
+      else if (!aCamp && a.kind === 'hero' && b.kind !== 'hero') shareA = 1 / 3;
+      else if (!aCamp && a.kind !== 'hero' && b.kind === 'hero') shareA = 2 / 3;
       a.x -= nx * overlap * shareA;
       a.z -= nz * overlap * shareA;
       b.x += nx * overlap * (1 - shareA);

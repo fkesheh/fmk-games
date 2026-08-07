@@ -139,10 +139,10 @@ export function cellMidZ(g: TerrainGrid, idx: number): number {
  * as a call to `isPassable` for one measured reason: `isPassable` takes world
  * metres, so A* would have to convert an index it already has into a coordinate
  * and back again inside its inner loop. The equivalence is therefore pinned by
- * a test instead of by construction — `movement.test.ts`'s "cellPassable agrees
- * with the frozen isPassable" case sweeps a real map and compares the two — and
- * neither predicate names a literal terrain index: both resolve `'cliff'`
- * through `TERRAIN_KINDS`.
+ * a test instead of by construction — `movement.test.ts`'s "is the frozen
+ * isPassable, cell-indexed — the pathfinder derives nothing" sweeps every cell
+ * of the 3-lane map and compares the two — and neither predicate names a
+ * literal terrain index: both resolve `'cliff'` through `TERRAIN_KINDS`.
  *
  * An out-of-range index reads as solid: for movement, "off the grid" and "wall"
  * are the same answer, and it is the only default that cannot let a unit escape

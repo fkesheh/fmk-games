@@ -38,6 +38,7 @@ import {
   CAMP_PACK,
   CAMP_PACK_COUNT,
   CAMP_PACK_RESPAWN_S,
+  CAMP_RESET_S,
   ELEV_HIGH,
   ELEV_LOW,
   NEUTRAL_TEAM,
@@ -84,6 +85,9 @@ const TIER_RESPAWN_TICKS: Record<CampTier, number> = {
   brute: Math.round(CAMP_BRUTE_RESPAWN_S * TICK_RATE),
   hive: Math.round(CAMP_HIVE_RESPAWN_S * TICK_RATE),
 };
+/** The out-of-combat reset delay in ticks (AMENDMENT_2 §B), derived here the
+ *  same way camps.ts derives it, so the timing assertions move with config. */
+const CAMP_RESET_TICKS = Math.round(CAMP_RESET_S * TICK_RATE);
 
 /** The abilities engine is injected, never imported: it only has to drain. */
 class EngineDouble implements AbilitiesEngine {
@@ -356,11 +360,23 @@ describe('spawn', () => {
     }
   });
 
-  it('survives stat recomputation — the base table is stamped too', () => {
+  it('carries its tier statline through recomputeEnt, radius included (§D.2)', () => {
+    // CROSS-MODULE, and deliberately so. camps.ts stamps NOTHING: `spawnMobile`
+    // writes both the Ent and the `w.base` core that recomputeEnt() re-derives
+    // from every tick, out of `mobileTuning(kind)`. This file used to re-stamp
+    // all of it from the same constants afterwards, which was a complete no-op
+    // once AMENDMENT_2 §D.2 added world.ts's camp arms — so that function is
+    // gone and this is what guards the door it went through.
+    //
+    // `radius` is the proof that the ownership had to move: it is `readonly`
+    // and written once by `makeEnt`, so camps.ts could never have corrected it.
+    // Drop world.ts's camp arms and radius falls to the 0.3 default and hp to
+    // 1, and every assertion below fails.
     const w = campWorld([campAt(0, 'brute', 32, 32)]);
     standUp(w);
     const c = must(campsOf(w)[0]);
     const e = ent(w, must(c.memberIds[0]));
+    expect(e.radius).toBe(CAMP_BRUTE.radius);
     w.recomputeEnt(e); // advance() step (3) runs this every tick, for everyone
     expect(e.maxHp).toBe(CAMP_BRUTE.hp);
     expect(e.damage).toBe(CAMP_BRUTE.damage);
@@ -369,15 +385,16 @@ describe('spawn', () => {
     expect(e.attackRange).toBe(CAMP_BRUTE.attackRange);
   });
 
-  it('carries no hp regen at all — the leash restore is the only heal (§C)', () => {
+  it('carries no hp regen at all — the resets are the only heals (§C, §D.5)', () => {
     const w = campWorld([campAt(0, 'hive', 32, 32)]);
     standUp(w);
     const c = must(campsOf(w)[0]);
     for (const id of c.memberIds) {
       const e = ent(w, id);
       expect(e.hpRegen).toBe(0);
-      // stepUnits' regen loop reads the BASE table through recomputeEnt, so a
-      // non-zero there would heal a camp mid-fight even with the ent at 0.
+      // Also cross-module: stepUnits' regen loop reads the BASE table through
+      // recomputeEnt, so a non-zero there would heal a camp mid-fight even with
+      // the Ent at 0 — which is why §D.5 forbids world.ts giving camps regen.
       expect(must(w.base.get(id)).hpRegen).toBe(0);
     }
   });
@@ -508,28 +525,205 @@ describe('aggro', () => {
     }
   });
 
-  it('ignores a damager OUTSIDE the leash disc, and never heals while it is poked', () => {
+  it('ignores a damager in the hysteresis band, then RESETS out of combat (§B)', () => {
     const w = campWorld([campAt(0, 'brute', 32, 32)]);
     standUp(w);
     const c = must(campsOf(w)[0]);
     const victim = must(c.memberIds[0]);
     const e = ent(w, victim);
-    // Beyond CAMP_LEASH_RADIUS: a target the camp could never reach without
-    // being dragged out of its clearing.
-    const sniper = w.spawnMobile('ranged', 1, 32 + CAMP_LEASH_RADIUS + 3, 32, -1, -1, NO_ENT);
+    // 9.5 m from the clearing centre: OUTSIDE the 9 m acquire disc, INSIDE the
+    // 10 m retention radius, and 7.9 m from the nearest post — outside every
+    // member's AGGRO_RADIUS. That is the live exploit AMENDMENT_2 §B closes:
+    // the camp never acquires, so it never chases, never breaks its leash and
+    // never reaches the arrival restore, and with hpRegen 0 it could be
+    // whittled down for free across as many visits as the hero cared to make.
+    // This test previously asserted that behaviour as CORRECT; it is inverted.
+    const sniper = w.spawnMobile('ranged', 1, 32 + 9.5, 32, -1, -1, NO_ENT);
 
-    let hp = e.hp;
     for (let i = 0; i < 60; i++) {
       w.damage(sniper, victim, 3, 'physical');
-      hp = e.hp;
+      // `recentDamagers` is only filled by world.ts for HERO victims, so drive
+      // it through the world's own door — otherwise the list is empty for the
+      // whole test and "the reset clears it" is an assertion about nothing.
+      w.noteDamager(e, sniper);
+      const hp = e.hp;
       tickSim(w);
+      // Still ignored: the pull is capped at the acquire radius, not the leash.
       expect(e.order).toBe('idle');
       expect(e.orderTarget).toBe(NO_ENT);
-      // The hp it was left with is the hp it still has: no regen, and no
-      // resting heal. A camp shot from outside its clearing must actually die.
+      // And still hurt: no regen, no resting heal, and no reset while the
+      // damage keeps landing — the timer restarts on every tick that hurts.
       expect(e.hp).toBe(hp);
     }
-    expect(e.hp).toBeLessThan(e.maxHp);
+    const hurt = e.hp;
+    expect(hurt).toBeLessThan(e.maxHp);
+    expect(e.recentDamagers.length).toBe(1); // there really is something to clear
+
+    // The poking stops. Every member is idle and nothing damages the camp, so
+    // after CAMP_RESET_S — and not one tick before it — the camp is whole.
+    for (let i = 0; i < CAMP_RESET_TICKS - 1; i++) tickSim(w);
+    expect(e.hp).toBe(hurt);
+    tickSim(w);
+    for (const m of living(w, c)) {
+      expect(m.hp).toBe(m.maxHp);
+      expect(m.recentDamagers.length).toBe(0);
+      expect(m.lastHitBy).toBe(NO_ENT);
+    }
+  });
+
+  it('does not reset while a member is still engaged, however quiet the fight', () => {
+    const w = campWorld([campAt(0, 'pack', 32, 32)]);
+    standUp(w);
+    const c = must(campsOf(w)[0]);
+    const victim = must(c.memberIds[0]);
+    const e = ent(w, victim);
+    const bait = hero(w, 'p0');
+    bait.order = 'idle';
+    bait.x = 35;
+    bait.z = 32; // inside the clearing, inside every member's AGGRO_RADIUS
+    w.damage(bait.id, victim, 40, 'physical');
+    const hurt = e.hp;
+    expect(hurt).toBeLessThan(e.maxHp);
+    stepCamps(w);
+    for (const m of living(w, c)) expect(m.order).toBe('attack');
+
+    // Twice CAMP_RESET_S of a standoff. Nothing damages the camp again — a hero
+    // between attack cooldowns does not, either — but the camp is still holding
+    // an attack order, so the all-members-idle half of §B refuses to reset it.
+    // Heal here and a hero could bait a camp and farm it for ever.
+    for (let i = 0; i < CAMP_RESET_TICKS * 2; i++) {
+      // Pinned: camp members are immovable (§A), so an unpinned bait would be
+      // shoved out of the clearing and would end the fight for the wrong reason.
+      bait.x = 35;
+      bait.z = 32;
+      tickSim(w);
+    }
+    expect(e.order).toBe('attack');
+    expect(e.hp).toBe(hurt);
+  });
+
+  it('a respawned camp starts with a clean combat memory (§B)', () => {
+    const w = campWorld([campAt(0, 'pack', 32, 32)]);
+    standUp(w);
+    const c = must(campsOf(w)[0]);
+    const sniper = w.spawnMobile('ranged', 1, 32 + 9.5, 32, -1, -1, NO_ENT);
+    // Leave the OUTGOING generation on a low hp watermark, then kill it.
+    for (const id of c.memberIds) ent(w, id).hp = 10;
+    tickSim(w);
+    for (const id of c.memberIds) ent(w, id).hp = 0;
+    tickSim(w);
+    expect(c.aliveCount).toBe(0);
+
+    w.tick = c.respawnAtTick;
+    stepCamps(w);
+    expect(c.aliveCount).toBe(CAMP_PACK_COUNT);
+
+    // The fresh generation is poked one tick after it stands up. The outgoing
+    // generation's watermark is far BELOW the new camp's total, so a memory
+    // carried across the respawn would not read this as damage at all — and its
+    // equally stale "last hurt" tick is already older than CAMP_RESET_S, so the
+    // poke would be healed away on the very tick it landed.
+    const victim = must(c.memberIds[0]);
+    const e = ent(w, victim);
+    w.damage(sniper, victim, 20, 'physical');
+    const hurt = e.hp;
+    expect(hurt).toBeLessThan(e.maxHp);
+    tickSim(w);
+    expect(e.hp).toBe(hurt);
+  });
+
+  it('will not ACQUIRE inside the hysteresis band, only retain there (§C)', () => {
+    const w = campWorld([campAt(0, 'pack', 32, 32)]);
+    standUp(w);
+    const c = must(campsOf(w)[0]);
+    const e = ent(w, must(c.memberIds[0]));
+    // Displaced 4 m out along +x. From a resting post (1.6 m out) nothing in
+    // the 9..10 m band is within AGGRO_RADIUS of anybody at all, so the band is
+    // only observable from a member that has been moved off its post.
+    e.x = 36;
+    e.z = 32;
+    e.order = 'idle';
+    e.orderTarget = NO_ENT;
+    const band = w.spawnMobile('melee', 0, 32 + 9.5, 32, -1, -1, NO_ENT);
+    expect(Math.hypot(e.x - (32 + 9.5), e.z - 32)).toBeLessThan(AGGRO_RADIUS);
+    stepCamps(w);
+    // 9.5 m from the centre: inside the leash disc, outside the acquire disc.
+    expect(e.orderTarget).toBe(NO_ENT);
+    expect(e.order).not.toBe('attack');
+
+    // Control: the same enemy one metre further in IS taken, so the member is
+    // not simply refusing everything.
+    ent(w, band).x = 32 + 8.5;
+    e.x = 36;
+    e.z = 32;
+    e.order = 'idle';
+    e.orderTarget = NO_ENT;
+    stepCamps(w);
+    expect(e.orderTarget).toBe(band);
+  });
+
+  it('RETAINS a target out to the full leash radius once it has one (§C)', () => {
+    const w = campWorld([campAt(0, 'pack', 32, 32)]);
+    standUp(w);
+    const c = must(campsOf(w)[0]);
+    const e = ent(w, must(c.memberIds[0]));
+    e.x = 36;
+    e.z = 32;
+    e.order = 'idle';
+    e.orderTarget = NO_ENT;
+    const foe = w.spawnMobile('melee', 0, 32 + 8.5, 32, -1, -1, NO_ENT);
+    stepCamps(w);
+    expect(e.orderTarget).toBe(foe); // acquired inside the acquire disc
+
+    // It backs off INTO the band: still inside the leash disc, no longer inside
+    // the acquire disc. Retention is the FULL radius, so the fight continues.
+    // Narrow retention to the acquire radius and a target loitering on the
+    // boundary is dropped and re-taken on alternate ticks for ever, which is
+    // the flicker the band exists to remove.
+    ent(w, foe).x = 32 + 9.5;
+    stepCamps(w);
+    expect(e.order).toBe('attack');
+    expect(e.orderTarget).toBe(foe);
+
+    // Past the leash radius it IS dropped: retention is wider than acquisition,
+    // not unbounded.
+    ent(w, foe).x = 32 + CAMP_LEASH_RADIUS + 0.5;
+    stepCamps(w);
+    expect(e.orderTarget).toBe(NO_ENT);
+  });
+
+  it('breaks an exact distance tie on the lower entity id, not on scan order', () => {
+    const w = campWorld([campAt(0, 'pack', 32, 32)]);
+    standUp(w);
+    const c = must(campsOf(w)[0]);
+    for (const pid of ['p0', 'p1']) {
+      const h = hero(w, pid);
+      h.order = 'idle';
+      h.x = 2;
+      h.z = 2;
+    }
+    const e = ent(w, must(c.memberIds[0]));
+    e.x = 32;
+    e.z = 32;
+    e.order = 'idle';
+    e.orderTarget = NO_ENT;
+    // Two hostiles EXACTLY equidistant (3 m) and both well inside the disc.
+    const lo = w.spawnMobile('melee', 0, 32, 32 + 3, -1, -1, NO_ENT);
+    const hi = w.spawnMobile('melee', 0, 32, 32 - 3, -1, -1, NO_ENT);
+    expect(hi).toBeGreaterThan(lo);
+    // `inRadius` walks `mobileMap` in INSERTION order, which is ascending id,
+    // so the id tie-break can only ever be exercised by presenting the HIGHER
+    // id first — which is precisely the "map iteration order" the rule exists
+    // to be immune to. Re-inserting `lo` moves it to the back of the Map.
+    const loEnt = ent(w, lo);
+    w.mobileMap.delete(lo);
+    w.mobileMap.set(lo, loEnt);
+    const scanned = [...w.mobileMap.values()]
+      .filter((m) => m.id === lo || m.id === hi)
+      .map((m) => m.id);
+    expect(scanned).toEqual([hi, lo]); // the higher id really is scanned first
+    stepCamps(w);
+    expect(e.orderTarget).toBe(lo);
   });
 
   it('ignores a target it cannot walk to, and still takes one it can', () => {
@@ -637,12 +831,54 @@ describe('leash', () => {
     while (e.order === 'move' && walked < 400) {
       tickSim(w);
       walked += 1;
+      // POKED ON THE WAY HOME, on one tick of the walk. `beginReturn` zeroed
+      // the damage bookkeeping when the member disengaged, so without this the
+      // wipe in `arriveAtPost` only ever restates what `beginReturn` already
+      // guaranteed and the assertions below cannot fail. `World.damage` writes
+      // `lastHitBy` on EVERY victim, so the return leg genuinely refills it —
+      // and a member that arrives home still holding its attacker re-pulls onto
+      // it the moment that attacker steps back inside the acquire disc.
+      if (walked === 2) {
+        w.damage(h.id, e.id, 1, 'physical');
+        w.noteDamager(e, h.id);
+        expect(e.lastHitBy).toBe(h.id);
+        expect(e.recentDamagers.length).toBe(1);
+      }
     }
+    expect(walked).toBeGreaterThan(2); // the poke really did land mid-walk
     expect(walked).toBeLessThan(400);
     expect(e.order).toBe('idle');
     expect(e.hp).toBe(e.maxHp);
+    expect(e.lastHitBy).toBe(NO_ENT);
     expect(e.recentDamagers.length).toBe(0);
     expect(Math.hypot(e.x - postX, e.z - postZ)).toBeLessThan(0.2); // its OWN post
+  });
+
+  it('leashes a member carried out of the disc even mid-fight', () => {
+    // The leash is the FIRST rule stepMember applies, and it is the only one
+    // that can catch this. Everything else defers to the chase cap, which is
+    // applied to the TARGET measured from the clearing centre — so a member
+    // that has been moved by something other than its own chase (separation, a
+    // structure push-out, a displacement) still holds a target the cap is
+    // perfectly happy with, and would go on fighting from outside its clearing.
+    const w = campWorld([campAt(0, 'pack', 32, 32)]);
+    standUp(w);
+    const c = must(campsOf(w)[0]);
+    const e = ent(w, must(c.memberIds[0]));
+    const foe = w.spawnMobile('melee', 0, 32 + 2, 32, -1, -1, NO_ENT);
+    stepCamps(w);
+    expect(e.order).toBe('attack');
+    expect(e.orderTarget).toBe(foe);
+
+    e.x = 32 + CAMP_LEASH_RADIUS + 2;
+    e.z = 32;
+    stepCamps(w);
+    expect(e.order).toBe('move');
+    expect(e.orderTarget).toBe(NO_ENT);
+    // The target it dropped is still perfectly legal — it is the MEMBER that
+    // is out of bounds, which is the whole point of the rule.
+    expect(ent(w, foe).alive).toBe(true);
+    expect(distTo(ent(w, foe), 32, 32)).toBeLessThan(CAMP_LEASH_RADIUS);
   });
 
   it('walks home rather than being snapped there, however far out it was shoved', () => {
