@@ -2,9 +2,8 @@
 // ANCIENTS (rift) client — MENUS (CONTRACT §6 ui/menus.ts + §8, T9). The three
 // non-live screens: .menu (name entry, create with teamSize + speed settings,
 // join-by-code with ?code= prefill), .lobby (team roster, hero pick grid with
-// role/blurb/ability tooltips, a live picker-COUNT badge per hero — duplicates
-// are allowed (CONTRACT §2 amendment), the grid never greys out — teamSize
-// readout,
+// role/blurb/ability tooltips — every card always pickable, duplicates legal,
+// a muted headcount marks heroes others already picked — teamSize readout,
 // START reflecting canStart, invite code), and .end-screen (winner banner, the
 // full rift_end stats table, back-to-menu). All states per §8 look intentional:
 // every screen renders real copy even when its data is still arriving.
@@ -139,6 +138,14 @@ export function createMenus(parent: HTMLElement): UiHandle {
   nameInput.placeholder = 'Player';
   nameInput.value = storedName();
 
+  // QUICK MATCH is the primary, first-seen action (D5): two players who each
+  // press the first button they see must land in the SAME room. It is wired
+  // below with the other buttons; only its DOM position (and style.css's
+  // existing .menu-quick gold treatment) makes it lead.
+  const quickBtn = el('button', 'menu-btn menu-quick', menu);
+  quickBtn.style.fontSize = '14px';
+  quickBtn.textContent = 'QUICK MATCH — first open public room';
+
   const createBox = el('div', 'menu-create', menu);
   const createTitle = el('h2', 'menu-heading', createBox);
   createTitle.style.fontSize = '14px';
@@ -186,10 +193,6 @@ export function createMenus(parent: HTMLElement): UiHandle {
   const joinBtn = el('button', 'menu-btn', joinBox);
   joinBtn.style.fontSize = '14px';
   joinBtn.textContent = 'JOIN PRIVATE ROOM';
-
-  const quickBtn = el('button', 'menu-btn menu-quick', menu);
-  quickBtn.style.fontSize = '14px';
-  quickBtn.textContent = 'QUICK MATCH — first open public room';
 
   const roomsTitle = el('h2', 'menu-rooms-title', menu);
   roomsTitle.style.fontSize = '14px';
@@ -327,7 +330,7 @@ export function createMenus(parent: HTMLElement): UiHandle {
   }
   const pickTitle = el('h2', 'lobby-heading', lobby);
   pickTitle.style.fontSize = '14px';
-  pickTitle.textContent = 'CHOOSE YOUR HERO — duplicates allowed; ×N is the live picker count';
+  pickTitle.textContent = 'CHOOSE YOUR HERO — duplicate picks are allowed';
   const pickGrid = el('div', 'pick-grid', lobby);
   const lobbyStart = el('button', 'lobby-start', lobby);
   lobbyStart.style.fontSize = '16px';
@@ -374,16 +377,15 @@ export function createMenus(parent: HTMLElement): UiHandle {
       }
     }
 
-    // Live picker counts, derived from lobby.picks (re-broadcast with EVERY
-    // accepted pick — room.ts handlePick — so this map is never stale; the old
-    // "taken" greying read the roster, which only updates on rift_roster, and
-    // lagged a pick until the next membership change). CONTRACT §2 amendment:
-    // duplicates are allowed, so NO card is ever disabled or dimmed — the
-    // badge carries the popularity signal and every hero stays clickable.
-    const counts = new Map<HeroId, number>();
-    for (const pid of Object.keys(picks)) {
-      const h = picks[pid];
-      if (h != null) counts.set(h, (counts.get(h) ?? 0) + 1);
+    // RIFT has 6 heroes and up to 16 seats: duplicate picks are legal (bots and
+    // auto-fill already dupe at teamSize > 3, and the server accepts manual
+    // dupes too). No card is ever disabled — everyone can always pick anything.
+    // othersOnHero is a non-blocking headcount only, shown as a small marker.
+    const othersOnHero = new Map<HeroId, number>();
+    for (const r of roster) {
+      if (r.pick !== null && r.id !== me) {
+        othersOnHero.set(r.pick, (othersOnHero.get(r.pick) ?? 0) + 1);
+      }
     }
 
     pickGrid.replaceChildren();
@@ -401,9 +403,13 @@ export function createMenus(parent: HTMLElement): UiHandle {
       const role = el('i', null, card);
       role.style.fontSize = `${FONT_MIN_PX}px`;
       role.textContent = `${def.role} — ${def.blurb}`;
-      // classless like its siblings; .pick-card > u owns the look (≥12px, APAL)
-      const badge = el('u', null, card);
-      badge.textContent = `×${String(counts.get(def.id) ?? 0)}`;
+      const others = othersOnHero.get(def.id) ?? 0;
+      if (others > 0) {
+        const taken = el('i', null, card);
+        taken.style.fontSize = `${FONT_MIN_PX}px`;
+        taken.style.opacity = '0.6';
+        taken.textContent = `also picked by ${others}`;
+      }
       card.onclick = () => actionsRef?.send({ t: 'rift_pick', hero: def.id });
     }
   }

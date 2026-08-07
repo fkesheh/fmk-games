@@ -192,9 +192,7 @@ describe('riftModule', () => {
     const a = riftModule.createRoom({ visibility: 'public', io });
     expect(a.info().game).toBe('rift');
     const b = riftModule.createRoom({ visibility: 'public', io, settings: { teamSize: 2, speed: 20 } });
-    // a waiting rift lobby reports 'warmup' so the platform's quick_join
-    // preference can find it (the quick-join regression — see quickjoin.test.ts)
-    expect(b.info().phase).toBe('warmup');
+    expect(b.info().phase).toBe('lobby');
     a.stop();
     b.stop();
   });
@@ -269,37 +267,30 @@ describe('lobby contract', () => {
     room.handleMessage('p1', { t: 'rift_buy', item: 'wardstone' });
     // all dropped: no error frame, no crash, state unchanged
     expect(io.all('p1').length).toBe(before);
-    expect(room.info().phase).toBe('warmup'); // internal phase 'lobby' is reported as 'warmup'
+    expect(room.info().phase).toBe('lobby');
     expect(io.last('p1', 'rift_lobby').countdownEndsAt).toBe(0);
   });
 
-  it('duplicate picks are accepted and visible to every client the moment they land', () => {
+  it('picks allow DUPLICATES: any seated human may pick an already-taken hero', () => {
     const { room, io } = boot([
       ['p1', 'Ada'],
       ['p2', 'Bob'],
-      ['p3', 'Cy'],
     ]);
     room.handleMessage('p1', { t: 'rift_pick', hero: 'bullwark' });
     expect(io.last('p1', 'rift_lobby').picks['p1']).toBe('bullwark');
+    expect(io.events('p2', 'rift_pick').some((e) => e.id === 'p1' && e.hero === 'bullwark')).toBe(true);
 
-    // p2 picks the SAME hero: accepted (CONTRACT §2 — six heroes, up to
-    // sixteen seats; duplicates expected), and every seated client — including
-    // the bystander p3 — sees it synchronously: the rift_pick event AND a
-    // fresh rift_lobby land in the same call.
-    room.handleMessage('p2', { t: 'rift_pick', hero: 'bullwark' });
-    for (const id of ['p1', 'p2', 'p3'] as const) {
-      const lobby = io.last(id, 'rift_lobby');
-      expect(lobby.picks['p1']).toBe('bullwark');
-      expect(lobby.picks['p2']).toBe('bullwark');
-      expect(io.events(id, 'rift_pick').some((e) => e.id === 'p2' && e.hero === 'bullwark')).toBe(true);
-    }
+    const p2EventsBefore = io.events('p2', 'rift_pick').length;
+    room.handleMessage('p2', { t: 'rift_pick', hero: 'bullwark' }); // same hero as p1 -> now ACCEPTED
+    expect(io.last('p2', 'rift_lobby').picks['p2']).toBe('bullwark'); // no longer refused
+    expect(io.last('p1', 'rift_lobby').picks['p1']).toBe('bullwark'); // p1's own pick untouched
+    expect(io.events('p2', 'rift_pick').length).toBe(p2EventsBefore + 1); // the duplicate pick IS broadcast
+    expect(io.events('p2', 'rift_pick').some((e) => e.id === 'p2' && e.hero === 'bullwark')).toBe(true);
 
-    // a re-pick replaces, still immediately propagated to everyone
-    room.handleMessage('p2', { t: 'rift_pick', hero: 'longbow' });
-    expect(io.last('p3', 'rift_lobby').picks['p2']).toBe('longbow');
-    expect(io.events('p1', 'rift_pick').some((e) => e.id === 'p2' && e.hero === 'longbow')).toBe(true);
+    room.handleMessage('p2', { t: 'rift_pick', hero: 'longbow' }); // re-pick to something else: also legal
+    expect(io.last('p1', 'rift_lobby').picks['p2']).toBe('longbow');
 
-    // picks outside the lobby are ignored in silence
+    // picks outside the lobby are still ignored in silence
     pressStartAndLock(room, 'p1');
     room.handleMessage('p1', { t: 'rift_pick', hero: 'hex' });
     pump(room, 1);
@@ -307,27 +298,99 @@ describe('lobby contract', () => {
     expect(snap.you?.hero).toBe('bullwark'); // unchanged
   });
 
-  it('auto-assign and bot fill cycle the LEAST-picked heroes first', () => {
-    const { room, io } = boot([
-      ['p1', 'Ada'],
-      ['p2', 'Bob'],
-      ['p3', 'Cy'],
-    ]);
-    room.handleMessage('p1', { t: 'rift_pick', hero: 'reaver' });
-    room.handleMessage('p2', { t: 'rift_pick', hero: 'reaver' }); // duplicate pick
-    pressStartAndLock(room, 'p1');
+  it('rift_pick ignores invalid input in silence and never throws: unknown hero id, out-of-phase', () => {
+    const { room, io } = boot([['p1', 'Ada']]);
+
+    const before = io.all('p1').length;
+    expect(() => room.handleMessage('p1', { t: 'rift_pick', hero: 'not-a-real-hero' })).not.toThrow();
+    // parseRiftC2S rejects the unknown hero id before it ever reaches the
+    // room: no lobby resend, no pick event, no error frame.
+    expect(io.all('p1').length).toBe(before);
+    expect(io.last('p1', 'rift_lobby').picks['p1']).toBeNull();
+
+    pressStartAndLock(room, 'p1'); // phase is now 'live'
+    const liveBefore = io.all('p1').length;
+    expect(() => room.handleMessage('p1', { t: 'rift_pick', hero: 'hex' })).not.toThrow();
+    expect(io.all('p1').length).toBe(liveBefore); // dropped: rift_pick is lobby-only
     pump(room, 1);
-    const snap = latestSnap(io, 'p1');
-    const heroOf = (pid: string): string | undefined => snap.board.find((r) => r.id === pid)?.hero;
-    // both duplicate picks locked in as-is
-    expect(heroOf('p1')).toBe('reaver');
-    expect(heroOf('p2')).toBe('reaver');
-    // reaver (pick count 2) sorts LAST in the cycle, so the unpicked human
-    // and the bot fill take never-picked heroes in HERO_LIST order instead
-    expect(heroOf('p3')).toBe(HERO_LIST[0]?.id);
-    const bots = snap.board.filter((r) => r.bot);
-    expect(bots).toHaveLength(1); // 3 humans -> 2v2, one bot seat
-    expect(bots[0]?.hero).toBe(HERO_LIST[1]?.id);
+    expect(latestSnap(io, 'p1').you?.hero).not.toBe('hex'); // never applied
+  });
+
+  it('supports MORE than 6 humans picking across up to MAX_PLAYERS seats, duplicates included', () => {
+    const heroes = HERO_LIST.map((h) => h.id);
+    expect(heroes).toHaveLength(6); // RIFT: exactly 6 heroes
+
+    const n = 9; // > 6 humans, well under MAX_PLAYERS (16)
+    const players: Array<readonly [PlayerId, string]> = [];
+    for (let i = 0; i < n; i++) players.push([`h${i}`, `Human ${i}`]);
+    const { room, io } = boot(players);
+    expect(io.roster('h0')).toHaveLength(n);
+    expect(n).toBeLessThanOrEqual(MAX_PLAYERS);
+
+    for (let i = 0; i < n; i++) {
+      const hero = heroes[i % heroes.length];
+      if (hero === undefined) throw new Error('unreachable: heroes is non-empty');
+      room.handleMessage(`h${i}`, { t: 'rift_pick', hero });
+    }
+
+    const lobby = io.last('h0', 'rift_lobby');
+    for (let i = 0; i < n; i++) {
+      const hero = heroes[i % heroes.length];
+      expect(lobby.picks[`h${i}`]).toBe(hero);
+    }
+    // h0 and h6 both landed on heroes[0]: a real duplicate, both accepted
+    expect(lobby.picks['h0']).not.toBeNull();
+    expect(lobby.picks['h0']).toBe(lobby.picks['h6']);
+
+    // every pick — including the duplicate — was individually broadcast
+    for (let i = 0; i < n; i++) {
+      const hero = heroes[i % heroes.length];
+      expect(io.events('h0', 'rift_pick').some((e) => e.id === `h${i}` && e.hero === hero)).toBe(true);
+    }
+  });
+
+  it("info().players reports connected humans, NOT seat count, once bots fill a room (D1)", () => {
+    const { room, io } = boot([['p1', 'Ada']]);
+    pressStartAndLock(room, 'p1'); // 2v2: 1 human seat + 3 bot seats
+
+    const roster = io.roster('p1');
+    expect(roster).toHaveLength(4); // seats.length === 4
+    expect(roster.filter((r) => r.bot)).toHaveLength(3);
+    expect(roster.filter((r) => r.bot).every((r) => !r.connected)).toBe(true); // bot seats: connected: false
+
+    expect(room.playerCount()).toBe(1); // exactly the connected humans
+    expect(room.info().players).toBe(room.playerCount());
+    expect(room.info().players).toBe(1);
+    expect(room.info().players).not.toBe(roster.length); // must NOT equal seats.length (4)
+  });
+
+  it('ghost seats from non-permanent lobby leaves never inflate the room_full guard (D2)', () => {
+    const initial: Array<readonly [PlayerId, string]> = [];
+    for (let i = 0; i < MAX_PLAYERS; i++) initial.push([`g${i}`, `Ghost ${i}`]);
+    const { room, io } = boot(initial);
+    expect(io.roster('g0')).toHaveLength(MAX_PLAYERS); // seats.length === MAX_PLAYERS
+
+    // every seat but g0 does a NON-permanent leave: lobby ghost seats are
+    // kept (for reconnect), so seats.length stays at MAX_PLAYERS while
+    // connected humans drops to 1.
+    for (let i = 1; i < MAX_PLAYERS; i++) room.removePlayer(`g${i}`);
+    expect(room.playerCount()).toBe(1); // only g0 remains connected
+    const rosterAfterLeaves = io.roster('g0');
+    expect(rosterAfterLeaves).toHaveLength(MAX_PLAYERS); // ghost seats retained, not evicted
+    expect(rosterAfterLeaves.filter((r) => r.connected)).toHaveLength(1);
+
+    // a genuinely new joiner must be SEATED, not bounced with room_full:
+    // seats.length (MAX_PLAYERS) is at the old wrong threshold, but
+    // connectedHumans (1) is nowhere near it.
+    room.addPlayer('newcomer', 'Newbie');
+    expect(io.all('newcomer').some((m) => m.t === 'error')).toBe(false);
+    expect(io.has('newcomer', 'rift_hello')).toBe(true);
+
+    const seat = io.roster('g0').find((r) => r.id === 'newcomer');
+    expect(seat).toBeDefined();
+    expect(seat?.bot).toBe(false);
+    expect(seat?.connected).toBe(true);
+    expect(room.playerCount()).toBe(2); // g0 + newcomer
   });
 });
 
@@ -340,7 +403,9 @@ describe('lock', () => {
 
     expect(room.info().phase).toBe('live');
     expect(room.info().label).toBe('2v2');
-    expect(room.info().players).toBe(4); // seats, humans + bots
+    // D1: connected humans (1), NOT seats.length (4 = 1 human + 3 bots) —
+    // a bot-filled room must never advertise itself as full.
+    expect(room.info().players).toBe(1);
 
     const begin = io.last('p1', 'rift_begin') as Begin;
     expect(begin.teamSize).toBe(2);
@@ -694,7 +759,7 @@ describe('match end and full reset', () => {
 
     // MATCH_END_MS later: bots removed, sim discarded, picks KEPT, and it WAITS
     vi.advanceTimersByTime(MATCH_END_MS);
-    expect(room.info().phase).toBe('warmup'); // internal phase 'lobby' is reported as 'warmup'
+    expect(room.info().phase).toBe('lobby');
     expect(room.info().label).toBe('lobby');
     const lobby = io.last('p1', 'rift_lobby');
     expect(lobby.picks['p1']).toBe('reaver'); // picks kept
@@ -722,7 +787,7 @@ describe('robustness', () => {
     room.stop();
     room.stop();
     room.start();
-    expect(room.info().phase).toBe('warmup'); // internal phase 'lobby' is reported as 'warmup'
+    expect(room.info().phase).toBe('lobby');
     expect(room.playerCount()).toBe(0);
     expect(room.stalePlayers()).toEqual([]);
     room.removePlayer('nobody');
@@ -742,7 +807,9 @@ describe('robustness', () => {
     expect(io.all('p1').filter((m) => m.t === 'rift_snap')).toHaveLength(3);
     expect(room.info().phase).toBe('live');
     expect(room.playerCount()).toBe(0);
-    expect(room.info().players).toBe(4); // seats still counted
+    // D1: info().players tracks connectedHumans()/playerCount(), so it
+    // drops to 0 with the seat bot-converted — NOT seats.length (4).
+    expect(room.info().players).toBe(0);
     expect(tickBefore).toBe(3);
   });
 });

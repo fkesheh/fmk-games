@@ -40,14 +40,16 @@ Phases: `'lobby' | 'live' | 'ended'`.
   team 0). On join the room sends `rift_hello` + a fresh `rift_lobby`, and
   broadcasts `rift_roster`. `rift_lobby` is re-broadcast to all seated clients
   on EVERY lobby change (join, leave, pick, start-press, countdown).
-- **Picks.** `rift_pick` is accepted in lobby for ANY hero — duplicates are
-  allowed and expected at teamSize > 3 (six heroes, up to sixteen seats);
-  anything invalid is ignored in silence and never throws. Picks broadcast via
-  `rift_pick` events AND an immediate `rift_lobby` re-broadcast, so every
-  client sees the pick (and its running count) the moment it lands. The pick
-  grid never greys a hero out — it shows how many players currently hold each
-  hero. Auto-assignment and bot fill cycle `HERO_LIST` from the LEAST-picked
-  heroes first, wrapping with duplicates allowed.
+- **Picks.** `rift_pick` is accepted in lobby for ANY valid hero — duplicates
+  are allowed and expected: there are six heroes and up to sixteen seats, so
+  once six humans have picked, uniqueness would leave the rest with nothing
+  legal to pick. Invalid input (an unknown hero id, or a pick outside the
+  lobby phase) is ignored in silence and never throws. Accepted picks
+  broadcast via `rift_pick` events. Auto-assignment and bot fill cycle
+  `HERO_LIST` from the first un-picked hero (picked-hero set collapses
+  duplicates for this purpose only), wrapping with duplicates allowed there
+  too — at teamSize > 3 there will be duplicate heroes on a team, which is
+  legal and expected.
 - **canStart** = phase is lobby AND no countdown running AND connected humans
   >= `MIN_PLAYERS` (1). Any seated human may send `rift_start`; illegal presses
   are ignored in silence. On accept: `countdownEndsAt = now +
@@ -67,9 +69,11 @@ Phases: `'lobby' | 'live' | 'ended'`.
   oldest bot (normal remove flow) and INHERITS its hero, level, gold, items,
   and position — via the normal join path. If no bot exists and a seat is free
   under the locked teamSize, the joiner gets a fresh level-1 hero at their
-  team's fountain (cycle-assigned hero). `info().players` counts seats (humans
-  + bots) so the platform's `room_full` works. `info().label` is
-  `'<teamSize>v<teamSize>'` once locked, `'lobby'` before.
+  team's fountain (cycle-assigned hero). `info().players` counts CONNECTED
+  HUMANS only (same as `playerCount()`, which the platform's own room_full
+  guard uses) — never seats, since bot-fill and ghost seats from
+  disconnect-without-leave would otherwise over-report a room as full.
+  `info().label` is `'<teamSize>v<teamSize>'` once locked, `'lobby'` before.
 - **Disconnect.** `removePlayer(id)` with permanent=false: the hero stays in
   the sim, driven by a fresh bot brain until `addPlayer(id, name, resume)`
   rebinds it (score, items, cooldowns intact). permanent=true (explicit leave):

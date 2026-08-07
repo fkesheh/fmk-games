@@ -267,7 +267,7 @@ export class Lobby {
   roomCount(): number;
 }
 ```
-- quick_join: first public room with players < MAX_PLAYERS (prefer warmup), else create (random map
+- quick_join: first public room with players < MAX_PLAYERS (players = connected humans only, never bot fill; prefer warmup), else create (random map
   via rng(Date.now()) — server-side only exception to the seeded-rng rule).
 - create_public: new PUBLIC room on the requested map (appears in list_rooms), then join it.
 - create_private: new room, code = 5 chars [A-Z0-9] via same rng; join_private validates code (error

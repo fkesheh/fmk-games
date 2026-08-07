@@ -138,7 +138,8 @@ interface Seat {
   /** True for bot-fill seats and for permanent leavers (seat converted). */
   bot: boolean;
   connected: boolean;
-  /** Manual lobby pick (duplicates allowed, CONTRACT §2); null = cycle-assigned. */
+  /** Manual lobby pick; duplicates across humans are allowed (six heroes,
+   *  up to sixteen seats). null = cycle-assigned. */
   pick: HeroId | null;
   /** Locked hero; null before lock and again after full-reset. */
   hero: HeroId | null;
@@ -275,17 +276,15 @@ export class RiftRoom implements GameRoomHandle {
       code: this.code,
       game: 'rift',
       label: this.lockedTeamSize > 0 ? `${this.lockedTeamSize}v${this.lockedTeamSize}` : 'lobby',
-      // seats, humans + bots — the lobby list's fullness signal (CONTRACT §2)
-      players: this.seats.length,
+      // connected humans — the lobby list's fullness signal (CONTRACT §2);
+      // seats (humans + bots) would over-report a bot-filled room as full.
+      players: this.playerCount(),
       maxPlayers: MAX_PLAYERS,
-      // RoomInfo.phase is game-defined, and the platform's quick_join PREFERS
-      // rooms reporting 'warmup' (fps convention) before falling back to any
-      // room with space. Rift's pre-match phase is named 'lobby', which the
-      // preference never matched — a quick-joiner was routed into an older
-      // IN-PROGRESS room instead of a rift lobby still waiting for players
-      // (proven by scripts/repro-quickjoin2.mjs). Report 'warmup' while this
-      // room waits for START.
-      phase: this.phase === 'lobby' ? 'warmup' : this.phase,
+      // Reported verbatim. An earlier local experiment mapped 'lobby' to
+      // 'warmup' to court quick_join's fps-convention preference; PR #6 closed
+      // the quick-join collisions a different way and its lobby.test.ts asserts
+      // the 'lobby' fallback path explicitly, so the mapping is gone.
+      phase: this.phase,
       visibility: this.visibility,
     };
   }
@@ -314,8 +313,12 @@ export class RiftRoom implements GameRoomHandle {
       }
       if (resume !== undefined && this.rebindGhost(resume, id, name)) return;
       if (this.phase === 'lobby') {
-        if (this.seats.length >= MAX_PLAYERS) {
-          // unreachable via the lobby (it guards room_full first); never throws
+        if (this.connectedHumans() >= MAX_PLAYERS) {
+          // Must agree with the platform's own guard (room.playerCount(), i.e.
+          // connected humans) — seats.length drifts above that count because a
+          // non-permanent lobby leave deliberately keeps a ghost seat for
+          // reconnect, so comparing seats.length here COULD map a joiner into
+          // a room they hold no seat in. Never throws.
           this.io.send(id, { t: 'error', code: 'room_full', message: 'room is full' });
           return;
         }
@@ -512,11 +515,11 @@ export class RiftRoom implements GameRoomHandle {
   }
 
   /**
-   * ANY hero is pickable in the lobby — duplicates are allowed and expected
-   * (six heroes, up to sixteen seats; CONTRACT §2). Only a pick outside the
-   * lobby is ignored, in silence and never throwing. Every ACCEPTED pick
-   * broadcasts the rift_pick event AND a fresh rift_lobby in the same call,
-   * so every seated client sees it the moment it lands.
+   * Any hero, picked by any number of humans: duplicates are allowed and
+   * expected once teamSize exceeds the hero count (6 heroes, up to 16 seats).
+   * `hero` is already a validated HeroId (parseRiftC2S / isHeroId) by the time
+   * this runs. A pick outside the lobby phase is ignored in silence and never
+   * throws. Accepted picks broadcast a rift_pick event + fresh lobby.
    */
   private handlePick(seat: Seat, hero: HeroId): void {
     if (this.phase !== 'lobby') return;
@@ -555,17 +558,15 @@ export class RiftRoom implements GameRoomHandle {
     const teamSize = this.resolvedTeamSize();
     const lanes = LANES_FOR_TEAM_SIZE[teamSize] ?? 1;
 
-    // Heroes: manual picks apply as-is (duplicates legal, CONTRACT §2); the
-    // cycle orders HERO_LIST by ascending pick count — stable sort, ties keep
-    // HERO_LIST order — so auto-assignment and bot fill take the LEAST-picked
-    // heroes first, wrapping with duplicates allowed.
-    const pickCount = new Map<HeroId, number>();
-    for (const s of this.seats) {
-      if (s.pick !== null) pickCount.set(s.pick, (pickCount.get(s.pick) ?? 0) + 1);
-    }
-    this.heroCycle = HERO_LIST.map((d) => d.id).sort(
-      (a, b) => (pickCount.get(a) ?? 0) - (pickCount.get(b) ?? 0),
-    );
+    // Heroes: manual picks first (duplicates across humans allowed — the Set
+    // below just collapses repeats when building the cycle's exclusion list);
+    // the cycle starts at the first un-picked hero and wraps with duplicates
+    // allowed too (CONTRACT §2).
+    const manual = new Set<HeroId>();
+    for (const s of this.seats) if (s.pick !== null) manual.add(s.pick);
+    const avail: HeroId[] = [];
+    for (const def of HERO_LIST) if (!manual.has(def.id)) avail.push(def.id);
+    this.heroCycle = avail.length > 0 ? avail : HERO_LIST.map((d) => d.id);
     this.heroCycleIdx = 0;
     for (const s of this.seats) s.hero = s.pick ?? this.nextCycleHero();
 
