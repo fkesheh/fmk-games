@@ -83,14 +83,39 @@ const SUN_AZIMUTH_DAY_DEG = 225;
 const SUN_ELEV_NIGHT_DEG = 62;
 const SUN_AZIMUTH_NIGHT_DEG = 285;
 /**
- * Key intensity, calibrated on pixels rather than by feel: with the fill below,
- * sun-lit moss measures L* 28.7 against the palette's L* 22.1 (+6.6, inside the
- * +/-10 the exposure note has always claimed) and drops to L* 13.0 in the sun's
- * own shadow — a 15.7 L* step, which is what "long raking shadows across the
- * lanes" has to mean on a histogram. Raising either number flattens that step;
- * lowering the fill takes shadowed ground below the fog shroud.
+ * Key intensity.
+ *
+ * The previous 2.05 made this rig OVERCAST, and that is what inverted the value
+ * ladder. Against the fill below the key was worth 0.219 of cosine-weighted
+ * radiance on flat ground and the IBL 0.170 — a key:fill of 1.3:1, which is a
+ * white-sky day, not "the last half-hour of usable light". Worse, an IBL fill
+ * is not isotropic: the environment's up-hemisphere is the palette's sky (dark
+ * by S1 — `skyHigh` is L* 5.1) while its down-hemisphere used to be `moss`
+ * (L* 22.1), so a VERTICAL surface collected 2.38x the ambient irradiance of a
+ * HORIZONTAL one and the world was lit from below. Canopy (albedo L* 41.8) then
+ * out-read sun-lit moss (albedo L* 22.1) by ~20 L* and read as flat unlit green
+ * over near-black ground — STYLE_BIBLE §0.2's failure, exactly.
+ *
+ * The fix is a key that dominates, because the key is the only term in the rig
+ * that favours the ground: it lands on flat ground at sin(28 deg) = 0.469 and on
+ * a canopy shell's average visible normal at rather less. At this value the key
+ * is worth 0.749 of radiance on flat ground against the fill's 0.207 — 3.6:1,
+ * a real sun — and a canopy shell now has a lit side and a shade side instead of
+ * one ambient wash. `SURFACES.groundMoss` states the rule this serves: "a moss
+ * ground that crushes to black is a lighting failure, not a licence to raise
+ * this albedo."
+ *
+ * The value is the second reading of a two-step measurement. At 5.6 the day
+ * matrix came back with sun-lit moss finally readable but the palette's BRIGHT
+ * end blown: `close-ancient` — a monument-stone colossus filling the frame,
+ * albedo L* 49.3 — measured frame-mean 178/255 with 46% of its pixels above
+ * L* 80, against 45-105 across the eleven Dota references. The palette spans
+ * 8:1 in linear albedo from `moss` to `monument`, which is more range than a
+ * straight exposure can seat. The top is pulled back here; the bottom is held up
+ * by the grade's sub-unity contrast (post.ts `DAY.contrast`), which compresses
+ * toward 18% grey instead of expanding away from it.
  */
-const SUN_INTENSITY_DAY = 2.05;
+const SUN_INTENSITY_DAY = 4.6;
 /**
  * "Much weaker directional intensity but *harder* shadows" — less than half the
  * day key, and the hardness is the CONTRAST rather than the kernel, because the
@@ -98,11 +123,15 @@ const SUN_INTENSITY_DAY = 2.05;
  *
  * The floor under this number is measured, not stylistic: the tone-map curve is
  * quadratic below ~0.08, so night crushes far faster than it looks like it
- * should. At the value below, moonlit moss measures L* 10.1 against the
- * palette's own statement of what moss looks like under a moon (`nightGround`,
- * L* 11.6). Halve it again and the ground stops reading as a surface at all.
+ * should. Below this the ground stops reading as a surface at all.
+ *
+ * It moves with the day key rather than being re-derived, so "much weaker" stays
+ * a RATIO: 1.7 against 4.6 is 37% of the day key, where the previous pair was
+ * 49%. Night is therefore relatively darker than it used to be, not brighter,
+ * which is what keeps §4's point intact — the braziers, crystals and hearts stay
+ * the primary light sources in the frame.
  */
-const SUN_INTENSITY_NIGHT = 1;
+const SUN_INTENSITY_NIGHT = 1.7;
 const SUN_SHADOW_INTENSITY_DAY = 0.92;
 const SUN_SHADOW_INTENSITY_NIGHT = 1;
 const EXPOSURE_DAY = 2.75;
@@ -177,11 +206,16 @@ const FALLBACK_SKY_W = 256;
  * three adds an AmbientLight straight into the diffuse irradiance, whereas the
  * environment contributes `PI` times its mean radiance, so this is not
  * ENV_HDR_GAIN and cannot be derived from it. It is measured: on the same frame
- * at 1280x720, sun-lit moss reads L* 19.5 here against L* 19.1 with the full
- * PMREM environment and L* 22.1 for the raw palette entry. At 0.55 it read
- * L* 6.3 — lit, but a night frame in daylight.
+ * at 1280x720, sun-lit moss read L* 19.5 at 2.1 against L* 19.1 with the full
+ * PMREM environment OF THAT ROUND, and L* 22.1 for the raw palette entry. At
+ * 0.55 it read L* 6.3 — lit, but a night frame in daylight.
+ *
+ * It is now SCALED with {@link ENV_AMBIENT} rather than re-measured, because it
+ * only has one job — keep the no-PMREM frame at roughly the brightness of the
+ * frame that does have one — and the rig it was matched against has moved:
+ * 2.1 * (110 / 58) = 3.98.
  */
-const EMERGENCY_FILL = 2.1;
+const EMERGENCY_FILL = 4;
 /**
  * Ambient intensity in the ENVIRONMENT SOURCE SCENE — never in the world scene,
  * where a second fill alongside `scene.environment` is a hard ban. It exists so
@@ -191,18 +225,28 @@ const EMERGENCY_FILL = 2.1;
  *
  * three renders an ambient-lit diffuse surface at `albedo * color * intensity /
  * PI`; with `APAL.paper` (linear ~0.806) that is `albedo * 0.2566 * intensity`.
- * 58 therefore lifts every sky stop to ~15x its low-dynamic-range palette value
+ * 92 therefore lifts every sky stop to ~24x its low-dynamic-range palette value
  * — {@link ENV_HDR_GAIN} — which is the fill level that replaces the removed
- * hemisphere light, measured against the key in {@link SUN_INTENSITY_DAY}.
+ * hemisphere light, sized against the key in {@link SUN_INTENSITY_DAY}.
  * Normal and roughness maps on those materials are inert here: ambient
  * irradiance is normal-independent and there is no environment inside the
  * source scene to reflect.
+ *
+ * It was 58, and 58 was the number that CRUSHED the ground (110 in the first
+ * corrected round, trimmed with the key when the bright end blew). The
+ * cosine-weighted
+ * sky the bands below present to a flat, up-facing surface is dark by law: S1
+ * pins the zenith at least 12 L* under the horizon, and the zenith owns 62% of
+ * that weight (sin^2 52 deg), so shadowed moss came out at L* 13.7 — under the
+ * fog shroud, which is what "large near-black regions of ground" measured as.
+ * The fill is not free to be small here the way it is in a scene with a bright
+ * sky; it is the ONLY thing lighting ground the sun does not reach.
  */
-const ENV_AMBIENT = 58;
+const ENV_AMBIENT = 92;
 /** `0.2566 * ENV_AMBIENT`, i.e. how far above its palette value each sky stop
  *  renders inside the environment. Written out so the background gain below can
  *  be derived from it instead of guessed. */
-const ENV_HDR_GAIN = 15;
+const ENV_HDR_GAIN = 24;
 /** Day->night dimming of the environment, baked into the source scene so the
  *  discs keep their relative punch (a moon that dims with its own sky is not a
  *  specular anchor any more). The other half of "noticeably dimmer and bluer"
@@ -678,7 +722,38 @@ function envMaterials(q: number): EnvMaterials {
     // palette derivation rather than a mix of mixes.
     mid: surface('groundMoss', mix(APAL.inkLit, APAL.ink, q)),
     horizon: surface('groundMoss', mix(APAL.horizon, APAL.nightHorizon, q)),
-    ground: surface('groundMoss', mix(APAL.moss, APAL.nightGround, q)),
+    // THE BOUNCE TERM, and §4 asks for it at "low albedo" for a reason this
+    // build learned on pixels. It used to be `moss`/`nightGround` — the ground's
+    // OWN albedo, L* 22.1, brighter than the horizon stop (L* 20.8) and nearly
+    // 4x the zenith (L* 5.1). An environment whose lower hemisphere out-shines
+    // its upper one lights the world FROM BELOW: a vertical surface collected
+    // 2.38x the ambient irradiance of a horizontal one, so tree canopy read as
+    // flat unlit green over near-black ground and the value ladder came out
+    // upside down.
+    //
+    // A bounce is sky irradiance times ground albedo, so it belongs an order of
+    // magnitude under the sky, not over it. `mossDeep` -> `ink` is 2.6x under
+    // the old pair and puts the vertical:horizontal ambient ratio at 1.50
+    // instead of 2.38, while keeping the hue a single-level palette mix and the
+    // bounce the colour of the ground it bounces off.
+    //
+    // It went one stop FURTHER — `ink` -> `inkDeep`, ratio 1.18 — and came back,
+    // and the reason is worth recording because it is not in this module. Two
+    // things other than a vertical wall read this hemisphere:
+    //   * the off-map BACKGROUND. Pitched 55 deg down with a 50 deg FOV, the
+    //     frame spans polar 120-170 deg, which is deep in this band and never
+    //     touches the three sky bands at all.
+    //   * the FOG-OF-WAR LID, whose shading normal faces DOWN into this band —
+    //     R_FOG writes the sheet's normals flat and the lid draws its light from
+    //     below. At `inkDeep` the unexplored mass of `wide-base-enemy` measured
+    //     modal L* 11 in a cold (40, 36, 47); at `ink` it measures L* 21 in a
+    //     neutral (49, 51, 42), which is STYLE_BIBLE §10's "dark but you can
+    //     still read terrain shape in it" rather than a black lid.
+    // The ladder cost of the stop back is 1 L* on moss and 1 L* on foliage,
+    // measured over eight day shots. The shroud gain is 10 L*. That is the trade,
+    // and it is only this cheap because the lid is mis-normalled; if R_FOG ever
+    // faces the sheet upward, this stop can go back down.
+    ground: surface('groundMoss', mix(APAL.mossDeep, APAL.ink, q)),
     sun: emissiveSurface(DISC_SURFACE, 'goldLit', SUN_DISC_INTENSITY * (1 - q)),
     moon: emissiveSurface(DISC_SURFACE, 'moon', MOON_DISC_INTENSITY * q),
   };

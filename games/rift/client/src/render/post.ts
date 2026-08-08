@@ -77,6 +77,32 @@
 //     `needsUpdate` (AMENDMENT_3 §D.3) on the way. That also means the capture
 //     adds ZERO shadow draws, in either shadow-update mode.
 //
+// AMBIENT OCCLUSION AND THE DRAW BUDGET. `GTAOPass` renders its own depth+
+// normal gbuffer by traversing the whole scene a second time
+// (`_renderOverride` -> `renderer.render( this.scene, this.camera )`), and that
+// traversal — not the fullscreen quads — was the post stack's cost: it scales
+// 1:1 with the beauty pass in BOTH draw calls and triangles, which is why the
+// worst frame measured 898 draws / 1,521,572 triangles against budgets of 700 /
+// 1,200,000, and why removing `createPost` altogether took the same frame to
+// roughly 345 / 842,100.
+//
+// Three fixes were on the table and only one of them is real:
+//   * HALF-RESOLUTION AO does not help. It is the standard advice and it is
+//     advice about FILL RATE. The gbuffer traversal issues the same draw calls
+//     and the same triangles into a smaller target, so neither budgeted number
+//     moves at all.
+//   * A DEPTH/NORMAL PREPASS instead of a full material re-render does not help
+//     either, and it is what `GTAOPass` already does: the traversal runs with
+//     `scene.overrideMaterial = MeshNormalMaterial`, so it is already the cheap
+//     material. The cost is the traversal, not the shading.
+//   * REUSING THE DEPTH THE BEAUTY PASS ALREADY WROTE removes the traversal
+//     outright, and that is what this file now does. The composer's working
+//     buffer carries a sampleable `DepthTexture` (see `halfFloatTarget`), and
+//     `gtaoPass.setGBuffer(depth)` points the AO and denoise shaders at it and
+//     sets `_renderGBuffer = false`.
+// Disabling the pass was never on the table — STYLE_BIBLE §6 mandates it and
+// AMENDMENT_3 §D.1 makes dropping one to save frame time a banned regression.
+//
 // METERING. `renderer.info.autoReset` stays `false` and `renderer.info.reset()`
 // is never called from this file. The composer resets nothing by itself, so
 // the per-frame draw-call and triangle totals accumulate across the scene
@@ -98,15 +124,18 @@
 //       separable blur, 1 mip composite, 1 additive blend), 4 for GTAO's AO
 //       and denoise, 4 for combine + grade + output + AA. FIXED, and the only
 //       part that resolution changes the COST of rather than the count.
-//   +   the GTAO gbuffer, which is one more full traversal of the beauty pass
-//       (18 here) — so it scales 1:1 with visible draw calls.
+//   +   the GTAO gbuffer, which was one more full traversal of the beauty pass
+//       (18 there) — so it scaled 1:1 with visible draw calls. THIS TERM IS NOW
+//       GONE; see AMBIENT OCCLUSION AND THE DRAW BUDGET above.
 //   +   the bloom capture, one traversal of the BLOOM_LAYER meshes alone
 //       (5 here) and no shadow draws at all.
 //
-// The extra 17 in the `autoUpdate = true` row is the shadow map rendered a
+// The extra 17 in the `autoUpdate = true` row was the shadow map rendered a
 // second time by GTAO's traversal — the double shadow render AMENDMENT_3 §D.3
-// assigns to R_SCENE, not to this file. The bloom capture contributes zero
-// shadow draws in either row (see CAPTURE PARITY).
+// assigns to R_SCENE. With the traversal removed there is no second scene
+// render in the stack at all, so that hazard is now structural rather than
+// flag-dependent. The bloom capture contributes zero shadow draws either way
+// (see CAPTURE PARITY).
 //
 // DEGRADATION. Every construction step runs inside one try/catch. If any pass
 // fails to build (no WebGL2, a shader that will not compile, an out-of-memory
@@ -168,12 +197,20 @@ const BLOOM_THRESHOLD = 0;
 /** GTAO radius in METRES. Tuned to contact scale, not scene scale: we want the
  *  darkening where a unit's foot meets the ground and where a rock meets a
  *  rock, in the centimetres-to-a-metre range. A scene-scale radius produces a
- *  soft global dimming that reads as a mistuned exposure, not as occlusion. */
-const AO_RADIUS_M = 0.55;
+ *  soft global dimming that reads as a mistuned exposure, not as occlusion.
+ *
+ *  It sits at the TOP of that range rather than the bottom (it was 0.55) because
+ *  of what the value-ladder measurement showed: canopy shells are 1.1-2.6 m
+ *  across and `SURFACES.canopy` is marked non-casting by R_VEG, so a leaf mass
+ *  neither shadows itself nor shadows the jungle floor. Screen-space occlusion
+ *  is the only term in the whole rig that darkens the inside of a canopy cluster
+ *  and the ground it stands over, and at 0.55 m it could not reach across one
+ *  shell to the next. */
+const AO_RADIUS_M = 1;
 
 /** GTAO strength multiplier inside the AO shader. With `blendIntensity` at 1.0
  *  this is what makes the AO survive a side-by-side on/off check. */
-const AO_SCALE = 1.35;
+const AO_SCALE = 1.7;
 
 /** GTAO sample count. 16 is the quality knee: 8 aliases into visible banding
  *  on the cliff faces, 32 costs roughly double for a difference the denoiser
@@ -190,7 +227,16 @@ const AO_DENOISE_SAMPLES = 16;
  *  hue without moving value. */
 const TINT_PURITY = 0.55;
 
-/** Linear-space pivot the contrast curve rotates around — 18% mid grey. */
+/** Linear-space pivot the contrast curve rotates around — 18% mid grey.
+ *
+ *  Note the SIGN of the exponent that rotates about it. `DAY.contrast` is now
+ *  BELOW 1, so the curve compresses toward the pivot rather than expanding away
+ *  from it: a toe that lifts the shadows and a shoulder that holds the
+ *  highlights, in one power function. That is not a stylistic preference, it is
+ *  what this palette needs. It spans 8:1 in linear albedo between `moss`
+ *  (L* 22.1) and `monument` (L* 49.3), and at a single exposure either the moss
+ *  crushes or the monument blows — measured both ways in the same judge loop, at
+ *  frame-mean 11-15/255 and at 178/255. */
 const GRADE_PIVOT = 0.18;
 
 /** Luminance where the split tone hands over from the shadow tint to the
@@ -229,12 +275,23 @@ interface PostState {
   readonly highlightTint: string;
 }
 
+/** DAY's bloom is deliberately small. It was 0.62 at 0.48, tuned against a world
+ *  so dark that an emissive was the only lit thing in frame; against a lit world
+ *  the same numbers are a haze. The shot that measured it is `close-ancient` —
+ *  a 14 m colossus around a suspended team crystal, filling the frame — which
+ *  came back at frame-mean 176/255 and then 160/255 while the same round's
+ *  `wide-mid` sat at a healthy 86. Sampled on the dais, well clear of the
+ *  crystal, the STONE read (180, 207, 252): not over-exposed monument stone,
+ *  which is warm grey, but the crystal's halo laid over the whole structure.
+ *  Bloom on exactly the light sources is §6's rule; bloom over the building
+ *  they stand in is the amateur tell it exists to prevent. Night is untouched —
+ *  a dominant bloom at night is the entire point of §4's night state. */
 const DAY: PostState = {
-  bloomStrength: 0.62,
-  bloomRadius: 0.48,
+  bloomStrength: 0.34,
+  bloomRadius: 0.4,
   aoIntensity: 1.0,
   split: 0.3,
-  contrast: 1.05,
+  contrast: 0.9,
   vignette: 0.22,
   shadowTint: APAL.skyHigh,
   highlightTint: APAL.goldLit,
@@ -257,7 +314,10 @@ const NIGHT: PostState = {
   bloomRadius: 0.72,
   aoIntensity: 0.78,
   split: 0.42,
-  contrast: 1.1,
+  // Night keeps a touch more contrast than day, but still under 1: the night
+  // frame is authored dark and a curve that expands away from 18% grey is what
+  // takes moonlit moss under the shroud.
+  contrast: 0.98,
   vignette: 0.36,
   shadowTint: APAL.nightSky,
   highlightTint: APAL.gold,
@@ -310,9 +370,11 @@ void main() {
  *     one, weighted by luminance so mid-tones are left alone. The two windows
  *     meet at {@link SPLIT_HANDOVER} and neither reaches past it, so "left
  *     alone" is exact: no pixel is multiplied by both tints;
- *   * a gentle contrast rotation about 18% grey, which is a filmic S in
- *     everything but name and, being a power function, preserves HDR headroom
- *     for `OutputPass` to tone map;
+ *   * a contrast rotation about 18% grey. The exponent is now BELOW 1, so it
+ *     compresses toward the pivot — a toe and a shoulder in one power function
+ *     — which is what seats this palette's 8:1 albedo span at one exposure.
+ *     Being a power function it still preserves HDR headroom for `OutputPass`
+ *     to tone map, and it is monotone, so no value ordering can invert in it;
  *   * a radial vignette normalised so `r` is 0 at the centre and 1 at the
  *     corner at ANY aspect ratio (`uAspect` carries that normalisation, set
  *     on resize), so the vignette does not stretch into an oval on a wide
@@ -443,9 +505,20 @@ function isLight(o: THREE.Object3D): o is THREE.Light {
  *  the whole chain up to `OutputPass` is linear HDR, and an 8-bit working
  *  buffer would clip every emissive before the bloom combine ever saw it.
  *  The composer clones this for its second buffer, so one call yields the
- *  pair. */
-function halfFloatTarget(w: number, h: number): THREE.WebGLRenderTarget {
-  return new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType });
+ *  pair — and `RenderTarget.copy` CLONES the depth texture rather than sharing
+ *  it, so each buffer ends up with its own.
+ *
+ *  `depth` swaps the default depth RENDERBUFFER for a sampleable
+ *  `DepthTexture`. The main chain needs one because GTAO reads the beauty
+ *  pass's depth instead of re-rendering the scene for its own (see
+ *  AMBIENT OCCLUSION AND THE DRAW BUDGET in the header); the bloom capture does
+ *  not, and a half-resolution depth texture nobody samples is just memory. */
+function halfFloatTarget(w: number, h: number, depth: boolean): THREE.WebGLRenderTarget {
+  if (!depth) return new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType });
+  return new THREE.WebGLRenderTarget(w, h, {
+    type: THREE.HalfFloatType,
+    depthTexture: new THREE.DepthTexture(w, h),
+  });
 }
 
 function lerp(a: number, b: number, t: number): number {
@@ -507,6 +580,19 @@ export function createPost(scene: SceneHandle): PostHandle {
   let composer: EffectComposer | null = null;
   let bloomComposer: EffectComposer | null = null;
   let installed = false;
+
+  /** The one main-chain buffer `RenderPass` draws into, and therefore the one
+   *  whose `DepthTexture` holds the beauty pass's depth for GTAO to read.
+   *
+   *  `EffectComposer` ping-pongs its pair on every swapping pass, and this
+   *  chain has an ODD number of them (GTAO, combine, grade, output, AA — five;
+   *  `RenderPass` sets `needsSwap = false`), so left alone the pair would end
+   *  each frame transposed and `RenderPass` would alternate between the two
+   *  buffers frame by frame. GTAO would then read a depth texture written one
+   *  frame ago, every other frame. The frame pass restores the pairing after
+   *  `render()` by comparing against this reference rather than by counting
+   *  passes, so it stays correct if the stack ever gains or loses one. */
+  let sceneBuffer: THREE.WebGLRenderTarget | null = null;
 
   // Every pass, held for tuning and disposal.
   let gtaoPass: GTAOPass | null = null;
@@ -628,6 +714,7 @@ export function createPost(scene: SceneHandle): PostHandle {
     disposables.length = 0;
     composer = null;
     bloomComposer = null;
+    sceneBuffer = null;
     gtaoPass = null;
     bloomPass = null;
     combinePass = null;
@@ -744,8 +831,17 @@ export function createPost(scene: SceneHandle): PostHandle {
 
       // --- main chain ------------------------------------------------------
       // `tBloom` needs no per-frame rebind: it points into `bloomPass`, whose
-      // buffers are resized in place and never replaced.
+      // buffers are resized in place and never replaced. Neither does GTAO's
+      // depth: the untranspose below pins `RenderPass` to one buffer for the
+      // life of the stack.
       comp.render(dt);
+
+      // Undo the odd swap this chain ends on, so the NEXT frame's `RenderPass`
+      // draws into `sceneBuffer` again — the buffer whose depth texture GTAO is
+      // bound to. Reference comparison, not a pass count: a chain that ever
+      // becomes even-swapping leaves this a no-op instead of breaking it.
+      const scene = sceneBuffer;
+      if (scene !== null && comp.readBuffer !== scene) comp.swapBuffers();
     } catch (err) {
       degrade(err);
       renderer.render(three, camera);
@@ -774,7 +870,7 @@ export function createPost(scene: SceneHandle): PostHandle {
     // in the header for the 12-disposal churn that costs when it is left out.
     // The ratio is already baked into the drawing-buffer size; applying it
     // again would allocate at 4x the area on a retina display.
-    bloomComposer = new EffectComposer(renderer, halfFloatTarget(bw0, bh0));
+    bloomComposer = new EffectComposer(renderer, halfFloatTarget(bw0, bh0, false));
     disposables.push(bloomComposer);
     bloomComposer.renderToScreen = false;
     bloomComposer.setPixelRatio(1);
@@ -793,18 +889,23 @@ export function createPost(scene: SceneHandle): PostHandle {
     bloomComposer.addPass(bloomPass);
 
     // --- main composer, STYLE_BIBLE §6 order ------------------------------
-    composer = new EffectComposer(renderer, halfFloatTarget(w0, h0));
+    composer = new EffectComposer(renderer, halfFloatTarget(w0, h0, true));
     disposables.push(composer);
     composer.setPixelRatio(1);
+    // `RenderPass` draws into the composer's READ buffer — it is the one pass in
+    // the chain with `needsSwap = false` — so this is the buffer whose depth
+    // texture will carry the beauty pass's depth for GTAO.
+    sceneBuffer = composer.readBuffer;
 
     // 1. RenderPass
     const scenePass = new RenderPass(three, camera);
     disposables.push(scenePass);
     composer.addPass(scenePass);
 
-    // 2. Ambient occlusion (GTAO). It renders its own depth+normal gbuffer,
-    //    which is a second traversal of the scene and is the largest single
-    //    line item in the raised ≤ 700 draw-call budget.
+    // 2. Ambient occlusion (GTAO), reading the BEAUTY PASS'S DEPTH rather than
+    //    re-rendering the scene into a gbuffer of its own. See AMBIENT
+    //    OCCLUSION AND THE DRAW BUDGET in the header for the measurement and
+    //    for what it costs visually.
     gtaoPass = new GTAOPass(three, camera, w0, h0);
     disposables.push(gtaoPass);
     gtaoPass.output = GTAOPass.OUTPUT.Default;
@@ -827,6 +928,33 @@ export function createPost(scene: SceneHandle): PostHandle {
       rings: 2,
       samples: AO_DENOISE_SAMPLES,
     });
+    // Hand GTAO the scene depth. It must happen AFTER construction, never
+    // through the constructor's `parameters` argument: three r1xx's
+    // `setGBuffer` ends with `this.depthRenderMaterial.uniforms.tDepth.value =
+    // this.normalRenderTarget.depthTexture`, and on the external-gbuffer branch
+    // `normalRenderTarget` does not exist yet, so passing the texture to the
+    // constructor throws. Called here, the constructor's own default pass has
+    // already built (but, with `_renderGBuffer` now false, will never draw into)
+    // that target, and `setSize` / `dispose` keep working for the same reason.
+    //
+    // No normal texture goes with it: the beauty pass writes colour and depth,
+    // not normals, so GTAO's `NORMAL_VECTOR_TYPE` drops to 0 and both the AO and
+    // the denoise shaders reconstruct view normals from depth. That is the whole
+    // visual cost of the change and it is small — AO is a low-frequency term and
+    // the denoise pass runs over it afterwards. It also removes a real defect:
+    // the gbuffer traversal drew EVERY mesh through an opaque
+    // `MeshNormalMaterial` override, so the fog-of-war lid — transparent in the
+    // beauty pass, opaque in the override — occluded the whole unexplored map in
+    // the AO buffer while the beauty buffer showed the ground under it.
+    //
+    // It throws rather than degrading quietly if the buffer has no depth
+    // texture: silently AO-ing nothing is exactly the "green gate that measures
+    // nothing" AMENDMENT_6 is about. The throw lands in the try/catch below.
+    const sceneDepth = composer.readBuffer.depthTexture;
+    if (sceneDepth === null || sceneDepth === undefined) {
+      throw new Error('rift post: composer buffer carries no depth texture for GTAO');
+    }
+    gtaoPass.setGBuffer(sceneDepth);
     composer.addPass(gtaoPass);
 
     // 3. Selective bloom, combined additively from the layer-masked capture.

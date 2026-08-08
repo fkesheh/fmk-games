@@ -26,6 +26,7 @@
 // ============================================================================
 import {
   buildMap,
+  dayPhase,
   FOUNTAIN_RADIUS,
   HERO_LIST,
   HERO_VISION,
@@ -182,6 +183,12 @@ interface SnapMut {
   phase: Phase;
   matchTick: number;
   overtime: boolean;
+  /** Mirrors `rift_snap.dayPhase`: the day/night cycle position, always
+   *  present and always in [0,1]. Sourced from the ONE hoisted definition in
+   *  `@rift/shared` (AMENDMENT_1 §B.1) — never re-derived here, because
+   *  `sim/vision.ts` scales vision by that same function and a second
+   *  derivation is exactly how server night and client lighting drift apart. */
+  dayPhase: number;
   wardStock: number;
   kills: [number, number];
   board: BoardEntry[];
@@ -774,6 +781,13 @@ export class RiftRoom implements GameRoomHandle {
 
   // --- events ----------------------------------------------------------------
 
+  /** Does this player id name a seat in this room? The board is built from
+   *  `seats`, so this is exactly "would the client be able to resolve it". */
+  private hasSeat(pid: string): boolean {
+    for (const s of this.seats) if (s.pid === pid) return true;
+    return false;
+  }
+
   private dispatchEvents(w: World, events: SimEvent[]): void {
     for (const ev of events) {
       switch (ev.k) {
@@ -790,7 +804,38 @@ export class RiftRoom implements GameRoomHandle {
           }
           break;
         }
+        case 'miss': {
+          // AMENDMENT_1 §B.2. Filtered on the ATTACKER exactly like 'cast' —
+          // `attacker`/`target` are ENTITY ids, and the swing is the thing the
+          // client draws a MISS float on, so the team that can see the swinger
+          // is the team entitled to the feedback. (Filtering on `target`
+          // instead would tell a team about a swing it never saw.)
+          //
+          // Consequence, reported as a CONTRACT_GAP rather than papered over
+          // here: `stepCombat` also calls `fire()` for towers and guards, and
+          // `computeTeamVisible` never puts a STRUCTURE id in a vision set, so
+          // a tower's uphill miss reaches nobody. protocol.ts freezes this
+          // filter as "exactly like rift_cast" and casters are always mobiles,
+          // so widening it is a contract decision, not the room's to take.
+          const wire: RiftEvent = { t: 'rift_miss', attacker: ev.attacker, target: ev.target };
+          const msg = { t: 'event', ev: wire };
+          for (const team of [0, 1] as const) {
+            if (!this.visSets[team].has(ev.attacker)) continue;
+            for (const s of this.seats) {
+              if (s.team === team && s.connected) this.io.send(s.pid, msg);
+            }
+          }
+          break;
+        }
         case 'kill':
+          // The wire's `victim` is a PLAYER id that the client resolves against
+          // the snapshot board (protocol.ts §RiftEvent). A death with no seat
+          // behind it — a neutral camp creep has no pid at all — resolves to
+          // nothing, so it is not a kill as far as the wire is concerned and is
+          // dropped here rather than shipped as an unrenderable feed row. The
+          // scoreboard needs no matching guard: buildBoard walks `seats`, so a
+          // neutral can never occupy a row in the first place.
+          if (!this.hasSeat(ev.victimPid)) break;
           this.broadcastEvent({
             t: 'rift_kill',
             killer: ev.killerPid,
@@ -882,6 +927,7 @@ export class RiftRoom implements GameRoomHandle {
       phase: 'live',
       matchTick: 0,
       overtime: false,
+      dayPhase: dayPhase(0),
       wardStock: 0,
       kills: [0, 0],
       board: [],
@@ -894,6 +940,13 @@ export class RiftRoom implements GameRoomHandle {
   private pushSnapshots(w: World): void {
     this.snapSeq += 1;
     const serverTime = Date.now(); // wall clock for clock sync; match time is ticks
+    // ONE call per tick, shared by every channel. `w.tick` is the match tick,
+    // the same argument sim/vision.ts passes, so the vision multiplier the sim
+    // applied this tick and the phase the client lights the world with are the
+    // same number by construction. Deliberately NOT derived from serverTime:
+    // the capture harness pins a phase by pinning a tick, and a wall-clock
+    // term would make every screenshot irreproducible.
+    const phase = dayPhase(w.tick);
     const kills: [number, number] = [0, 0];
     for (const e of w.mobiles()) {
       // narrow before indexing the 2-tuple: camp creeps are neutral (team 2)
@@ -908,6 +961,7 @@ export class RiftRoom implements GameRoomHandle {
       snap.phase = this.phase;
       snap.matchTick = w.tick;
       snap.overtime = w.overtime;
+      snap.dayPhase = phase;
       snap.wardStock = w.wardStock(ch.seat.team);
       snap.kills[0] = kills[0];
       snap.kills[1] = kills[1];
@@ -995,6 +1049,11 @@ export class RiftRoom implements GameRoomHandle {
    * ents array with pooled EntSnap objects: structures ALWAYS (hp <= 0 means
    * destroyed), mobiles only when in the player's team's visible set (which
    * already encodes: own-team always, wards own-team only, projs both teams).
+   *
+   * Neutral jungle camps ride this exact path and get no carve-out: a camp
+   * creep is a mobile, `EntSnap.team` is an `EntTeam` so its NEUTRAL_TEAM
+   * survives serialization unchanged, and a camp sitting in unexplored jungle
+   * is simply absent from both teams' sets and therefore never sent.
    */
   private fillEnts(ch: Channel, w: World): void {
     const out = ch.snap.ents;

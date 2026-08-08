@@ -20,7 +20,7 @@
 //
 // SHOT LIST (each at 1280x720, 1920x1080 and 2560x1080 — 16:9 pair + one 21:9):
 //   menu, lobby (hero pick grid), live-hud (default zoom), live-close (closest
-//   zoom, camH 18), shop (panel open), scoreboard (TAB held), combat (creep
+//   zoom, camH 11), shop (panel open), scoreboard (TAB held), combat (creep
 //   engagement at mid lane), fog-edge (shroud boundary at an unexplored map
 //   corner). Saved under screenshots/rift/ (artifacts — never committed).
 //   shop and scoreboard are IN-WORLD shots: their panels sit over the live
@@ -63,13 +63,18 @@
 //   - HUD roots exist during live: .hud .ability-bar .item-bar .topbar
 //     .minimap .killfeed;
 //   - drawCalls() in (0, 700] and triangles() in (0, 1.2M] (GRAPHICS_CONTRACT
-//     §5). Both meters accumulate across post passes because scene.ts sets
+//     §5), asserted TWICE: at the mid-lane clash in the 3-lane 8v8 room, and
+//     again across every world shot in the (also 3-lane 8v8) world room, whose
+//     jungle and night framings are where the peak actually is — the worst
+//     assembled frame in the matrix is `night-wide-mid`, and only the mid-lane
+//     figure used to be checked. Both meters accumulate across post passes
+//     because scene.ts sets
 //     renderer.info.autoReset = false and calls reset() exactly once at the top
 //     of render(dtMs) — that is WHY the budget rose from 400, and it is also
 //     why a collapsed meter is a real risk. §5 requires the meters be proven
 //     LIVE by showing the reported count RISES when a pass is added to the
 //     frame, so the proof is a controlled A/B on one page at one camera target:
-//     the closest framing (camH 18, ~36 m of ground) against the widest (camH
+//     the closest framing (camH 11, ~22 m of ground) against the widest (camH
 //     55, the whole map). Every extra chunk and instance that enters the
 //     frustum is another pass through the renderer, so a live meter must go UP.
 //     A meter that was reset per composer pass reports the LAST pass alone — a
@@ -98,19 +103,31 @@
 // chatter goes to stderr.
 //
 // Flags: --keep-server (leave the platform server up for debugging).
+// BUILD DISCIPLINE: this harness NEVER builds, and it refuses to run against a dist
+// that is OLDER than its own sources or a server bundle that does not contain the
+// protocol vocabulary it verifies (see STALE DIST below) — existence was never enough.
 // ============================================================================
 import { spawn } from 'node:child_process';
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
-import { CAMP_APPROACH_M, CAMP_VISIBLE_M, loadTerrain, terrainFacts } from './rift-terrain-facts.mjs';
+import {
+  assertCampBand,
+  CAMP_STAND_MAX_M,
+  CAMP_STAND_MIN_M,
+  CAMP_VISIBLE_M,
+  loadConfig,
+  loadTerrain,
+  terrainFacts,
+} from './rift-terrain-facts.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = Number(process.env.RIFT_VERIFY_PORT ?? 8092);
 const BASE = `http://localhost:${PORT}`;
 const SERVER_ENTRY = path.join(ROOT, 'platform/server/dist/server.js');
+const CLIENT_ENTRY = path.join(ROOT, 'games/rift/client/dist/index.html');
 const OUT_DIR = path.join(ROOT, 'screenshots', 'rift');
 
 const VIEWPORTS = [
@@ -131,6 +148,9 @@ const HERO_PICK = 'reaver';
 // Filled by loadFacts() inside the fatal handler in main — NOT at module scope.
 let TERRAIN = null;
 let FACTS = null;
+/** shared/src/config.ts — every balance constant the camp checks reason about
+ *  is read from it rather than copied into this file. */
+let CONFIG = null;
 let MAP_SIDE = 0; // buildTerrain(LANES).grid.side — read, never assumed
 let MID = 0; // mid-lane clash point (64, 64) at 3 lanes
 
@@ -196,6 +216,15 @@ const WORLD_POSE_TIMEOUT_MS = 90000;
 const WORLD_POSE_TOLERANCE_M = 2.5;
 const WORLD_READY_TIMEOUT_MS = 60000;
 const CAMP_VISIBLE_TIMEOUT_MS = 30000;
+/** The SERVER day phase the camp shot is taken at — not the renderer pin, which
+ *  fixes lighting only. 0.15 leaves hero vision at 10.59-11.00 m, well over the
+ *  ~9.4 m a member can sit at from the far end of the stand-off band, and it
+ *  comes round every 120 s of wall clock. */
+const CAMP_SHOT_MAX_DAY_PHASE = 0.15;
+const DAY_PHASE_WAIT_MS = 150000; // > one full 120 s wall cycle
+/** The camp pose is held tighter than WORLD_POSE_TOLERANCE_M: the stand-off
+ *  band is under a metre wide, so 2.5 m of slop would swallow it whole. */
+const CAMP_POSE_TOLERANCE_M = 0.6;
 // The night trio reuses the day framings. `night-close-hero` needs a hero in
 // frame, so it poses one at a MAP FACT — a fixed fraction along the own->enemy
 // diagonal, expressed in half-0 coordinates so `mirror()` maps it onto the
@@ -233,6 +262,11 @@ const KEEP_SERVER = process.argv.slice(2).includes('--keep-server');
 // ---- state ---------------------------------------------------------------------
 const manifest = [];
 const pageErrors = [];
+/** Every console.warn the pages emitted, verbatim. Reported, not fatal — the fatal subset is
+ *  promoted into `pageErrors` by FATAL_WARN_RE. */
+const pageWarnings = [];
+/** Raw `rift_snap` frame texts off the socket, newest last (see `tapWire`). */
+const wireSnaps = [];
 const failures = [];
 const browsers = [];
 let serverChild = null;
@@ -272,6 +306,10 @@ const failOnce = (key, msg) => {
 // ============================================================================
 async function loadFacts() {
   TERRAIN = await loadTerrain();
+  CONFIG = await loadConfig();
+  // Fail before anything is launched if a balance edit has moved the camp
+  // stand-off band out from under the constants it was derived from.
+  assertCampBand(CONFIG);
   FACTS = terrainFacts(TERRAIN, LANES);
   MAP_SIDE = FACTS.side;
   MID = MAP_SIDE / 2;
@@ -280,11 +318,180 @@ async function loadFacts() {
 
 const mirrorFor = (team) => (p) => (team === 0 ? { x: p.x, z: p.z } : { x: FACTS.side - p.x, z: FACTS.side - p.z });
 
+// ---- STALE DIST: freshness, not existence -----------------------------------------
+//
+// This guard used to be `if (!existsSync(SERVER_ENTRY))`, and a six-hour-stale
+// `platform/server/dist/server.js` walked straight through it: the file existed, it was simply
+// the WRONG file. It predated the commit that put `rift_snap.dayPhase` and `rift_miss` on the
+// wire, so `dayPhase` was absent from the wire entirely — and `net.ts` substitutes 0 for an
+// absent `dayPhase` behind a one-shot console.warn, so a missing feature read as a plausible
+// "full day" forever: the night shots were renderer-pinned over a full-day server with the night
+// vision penalty never applied, and every dayPhase-gated wait returned instantly against a
+// constant 0. It was the THIRD such round — an earlier bundle contained zero occurrences of
+// `campBrute`, so no camp had ever reached the wire in any test that claimed to check one.
+//
+// So: EXISTENCE IS NOT FRESHNESS. Each bundle is compared against the newest mtime among the
+// sources that compile into it, and a bundle that lost that race fails the run with both
+// timestamps and the file that beat it. Hard failure, never a warning, and this harness still
+// NEVER builds — a harness that silently rebuilds hides exactly the defect above.
+const FRESHNESS_EXTS = new Set(['.ts', '.tsx', '.js', '.mjs', '.cjs', '.json', '.css', '.html', '.glsl', '.frag', '.vert']);
+
+/** Everything esbuild pulls into `platform/server/dist/server.js` THAT CAN CHANGE RIFT'S WIRE.
+ *  Deliberately NOT the whole bundle: `platform/server/src/index.ts` also links @bank/@fps/@kart/
+ *  @wordbomb servers, and none of them can alter a rift snapshot. Including them would red this
+ *  harness every time an unrelated agent edited another game — a gate that cries wolf gets an
+ *  escape hatch bolted onto it, and then it is not a gate. Widen this list only for code that
+ *  rift's server actually executes. */
+const SERVER_SOURCES = [
+  'platform/server/src',
+  'platform/shared/src',
+  'games/rift/server/src',
+  'games/rift/shared/src',
+].map((p) => path.join(ROOT, p));
+
+/** ...and everything vite pulls into `games/rift/client/dist/`. */
+const CLIENT_SOURCES = [
+  'games/rift/client/src',
+  'games/rift/client/index.html',
+  'games/rift/client/vite.config.ts',
+  'games/rift/shared/src',
+  'platform/shared/src',
+].map((p) => path.join(ROOT, p));
+
+/** Newest `{file, mtimeMs}` under `roots` (each a directory or a single file). `*.test.ts` is
+ *  skipped because no bundler ever imports one — a test edit must not demand a rebuild. */
+function newestSource(roots) {
+  let newest = null;
+  const consider = (p) => {
+    const mtimeMs = statSync(p).mtimeMs;
+    if (newest === null || mtimeMs > newest.mtimeMs) newest = { file: p, mtimeMs };
+  };
+  const walk = (dir) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      if (e.name === 'node_modules' || e.name === 'dist') continue;
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        walk(p);
+        continue;
+      }
+      if (!e.isFile() || e.name.endsWith('.test.ts') || e.name.endsWith('.test.tsx')) continue;
+      if (!FRESHNESS_EXTS.has(path.extname(e.name))) continue;
+      consider(p);
+    }
+  };
+  for (const r of roots) {
+    // A root that has moved is a SILENTLY WEAKENED gate, so it is a failure, not a skip.
+    if (!existsSync(r)) throw new Error(`freshness gate: source root ${path.relative(ROOT, r)} does not exist`);
+    if (statSync(r).isDirectory()) walk(r);
+    else consider(r);
+  }
+  return newest;
+}
+
+const fmtGap = (ms) => {
+  const s = Math.round(ms / 1000);
+  if (s < 90) return `${s}s`;
+  const m = Math.round(s / 60);
+  return m < 90 ? `${m}m` : `${(m / 60).toFixed(1)}h`;
+};
+
+function assertBundleFresh(label, bundle, roots) {
+  if (!existsSync(bundle)) {
+    throw new Error(
+      `${label}: ${path.relative(ROOT, bundle)} does not exist — run "npm run build" first (this harness NEVER builds)`,
+    );
+  }
+  const bundleMs = statSync(bundle).mtimeMs;
+  const newest = newestSource(roots);
+  if (newest === null) {
+    throw new Error(
+      `${label}: no source files found under ${roots.map((r) => path.relative(ROOT, r)).join(', ')} — the ` +
+        'freshness gate cannot run, and a gate that cannot run is not a gate',
+    );
+  }
+  if (bundleMs >= newest.mtimeMs) {
+    log(
+      `${label} fresh: built ${new Date(bundleMs).toISOString()}, newest source ` +
+        `${path.relative(ROOT, newest.file)} ${new Date(newest.mtimeMs).toISOString()}`,
+    );
+    return;
+  }
+  throw new Error(
+    `${label} IS STALE — this run would verify code that is not in the bundle.\n` +
+      `    bundle  ${path.relative(ROOT, bundle)}\n` +
+      `            built ${new Date(bundleMs).toISOString()}\n` +
+      `    source  ${path.relative(ROOT, newest.file)}\n` +
+      `            saved ${new Date(newest.mtimeMs).toISOString()} — ${fmtGap(newest.mtimeMs - bundleMs)} NEWER than the bundle\n` +
+      '    Run "npm run build" and re-run. This harness NEVER builds: a six-hour-stale server.js is what\n' +
+      '    made three "night" captures grade a full-day server, silently, for a whole judge round.',
+  );
+}
+
+/** Literal strings the SERVER bundle must contain. Each is a protocol feature that has already
+ *  shipped once as "present in the source, absent from the running binary" — the failure a
+ *  freshness check catches only when the mtimes happen to tell the truth (a `git checkout` or a
+ *  restored dist can produce a NEW file built from OLD source). The build is not minified, so
+ *  these survive verbatim. */
+const REQUIRED_SERVER_SYMBOLS = [
+  ['dayPhase', 'rift_snap.dayPhase — absent from the wire, net.ts substitutes 0 and night never happens'],
+  ['rift_miss', 'the uphill-miss event (TERRAIN_CONTRACT §4)'],
+  ['campBrute', 'the neutral camp EntKinds — a bundle with zero occurrences shipped, and no camp ever reached the wire'],
+  ['campPack', 'the neutral camp EntKinds (tier 1)'],
+  ['campHive', 'the neutral camp EntKinds (tier 3)'],
+];
+
+function assertServerBundleCarries() {
+  const bundle = readFileSync(SERVER_ENTRY, 'utf8');
+  const missing = REQUIRED_SERVER_SYMBOLS.filter(([sym]) => !bundle.includes(sym));
+  if (missing.length === 0) return;
+  throw new Error(
+    `${path.relative(ROOT, SERVER_ENTRY)} does not contain ${missing.map(([s]) => `\`${s}\``).join(', ')} — the ` +
+      'bundle was built from sources that predate these features:\n' +
+      missing.map(([s, why]) => `    ${s}: ${why}`).join('\n') +
+      '\n    Run "npm run build".',
+  );
+}
+
+/** The bundle mtimes as of the FIRST gate, so the mid-run restart can check the right thing. */
+let gatedBundles = null;
+
+/**
+ * The build gate. Full freshness on the first start; on the RESTART the disconnect capture
+ * performs, only that the bundles have not moved.
+ *
+ * The distinction matters. Re-running the full freshness check at the restart would fail this run
+ * for a source edit somebody else made while it was in flight — an edit that cannot affect the
+ * binary being restarted, since that binary is the same file this run already gated. What CAN
+ * affect it is somebody REBUILDING mid-run: the restarted server would then be a different binary
+ * from the one every earlier shot was taken against, and half the manifest would describe one
+ * build and half another. That is the property checked here.
+ */
+function assertBuildGate() {
+  const now = () => ({ server: statSync(SERVER_ENTRY).mtimeMs, client: statSync(CLIENT_ENTRY).mtimeMs });
+  if (gatedBundles !== null) {
+    const seen = now();
+    for (const [key, entry] of [
+      ['server', SERVER_ENTRY],
+      ['client', CLIENT_ENTRY],
+    ]) {
+      if (seen[key] === gatedBundles[key]) continue;
+      throw new Error(
+        `the ${key} bundle was REBUILT mid-run (${path.relative(ROOT, entry)}: ` +
+          `${new Date(gatedBundles[key]).toISOString()} -> ${new Date(seen[key]).toISOString()}) — the restarted ` +
+          'server would be a different binary from the one every earlier shot was taken against',
+      );
+    }
+    return;
+  }
+  assertBundleFresh('server bundle', SERVER_ENTRY, SERVER_SOURCES);
+  assertBundleFresh('client bundle', CLIENT_ENTRY, CLIENT_SOURCES);
+  assertServerBundleCarries();
+  gatedBundles = now();
+}
+
 // ---- server ----------------------------------------------------------------------
 async function startServer() {
-  if (!existsSync(SERVER_ENTRY)) {
-    throw new Error(`missing ${path.relative(ROOT, SERVER_ENTRY)} — run 'npm run build' first`);
-  }
+  assertBuildGate();
   const inUse = await fetch(BASE, { signal: AbortSignal.timeout(1500) }).then(
     () => true,
     () => false,
@@ -358,14 +565,43 @@ const LAUNCH_OPTS = {
   protocolTimeout: Number(process.env.E2E_PROTOCOL_TIMEOUT ?? 300000),
 };
 
+/**
+ * A console.warn whose TEXT names the wire is a failed run, not chatter.
+ *
+ * This harness used to drop every non-error console message on the floor — it filtered by LEVEL,
+ * and the one signal that would have named the six-hour-stale server instantly was net.ts's
+ * one-shot `rift net: rift_snap carries no \`dayPhase\` — the server is not sending a
+ * protocol-required field`. A warning saying the client is silently defaulting a protocol field
+ * describes a world this suite is about to certify as healthy.
+ *
+ * Filtered by CONTENT rather than by level, because a browser warns about plenty that is not a
+ * defect: everything else a warn says still reaches the operator on stderr and is counted in the
+ * manifest, but only these fail the run.
+ */
+const FATAL_WARN_RE = /rift net:|protocol-required|rift_snap|rift_begin|carries no |is not sending/i;
+
 function trackErrors(page, tag) {
   page.on('console', (m) => {
-    if (m.type() !== 'error') return;
+    const type = m.type();
     const url = m.location()?.url ?? '';
-    if (/favicon/.test(url) || /favicon/.test(m.text())) return;
+    const text = m.text();
+    if (/favicon/.test(url) || /favicon/.test(text)) return;
+    if (type === 'warning' || type === 'warn') {
+      // Shutdown noise only: a killed server makes every client warn about its socket.
+      if ((tearingDown || serverExit !== null || expectDisconnect) && /WebSocket/.test(text)) return;
+      pageWarnings.push(`[${tag}] console.warn: ${text} (${url})`);
+      log(`[warn] [${tag}] ${text}`);
+      if (FATAL_WARN_RE.test(text)) {
+        pageErrors.push(
+          `[${tag}] console.warn NAMES THE WIRE — a protocol field the client is silently defaulting: ${text} (${url})`,
+        );
+      }
+      return;
+    }
+    if (type !== 'error') return;
     // Shutdown noise only: a killed server makes every client log socket errors.
-    if ((tearingDown || serverExit !== null || expectDisconnect) && /WebSocket connection to .* failed/.test(m.text())) return;
-    pageErrors.push(`[${tag}] console.error: ${m.text()} (${url})`);
+    if ((tearingDown || serverExit !== null || expectDisconnect) && /WebSocket connection to .* failed/.test(text)) return;
+    pageErrors.push(`[${tag}] console.error: ${text} (${url})`);
   });
   page.on('pageerror', (e) => pageErrors.push(`[${tag}] pageerror: ${e.message}`));
   page.on('error', (e) => pageErrors.push(`[${tag}] page CRASHED: ${e.message}`));
@@ -373,6 +609,110 @@ function trackErrors(page, tag) {
     if (/favicon/.test(r.url())) return;
     pageErrors.push(`[${tag}] requestfailed: ${r.url()} — ${r.failure()?.errorText ?? '?'}`);
   });
+}
+
+// ---- the wire tap -----------------------------------------------------------------
+//
+// `window.__rift.snaps()` is the client's PARSED ring, and the client is precisely the thing that
+// HIDES a missing field: net.ts's `dayPhaseOf` substitutes 0 for an absent `dayPhase` and moves
+// on. So `serverDayPhase()` — which reads that ring — can never distinguish "the server sent 0"
+// from "the server sent nothing", and for a whole round it reported a confident, constant,
+// entirely fictional 0 that the camp stand-off vision arithmetic then trusted. The frames
+// themselves are the only witness, so they are read off CDP before any client code touches them.
+// The tap DETACHES ITSELF after WIRE_TAP_KEEP frames, and that is not tidiness. `Network.enable`
+// ships every WebSocket payload across the CDP channel, and at ~40 snaps/s across a long 8v8 run
+// that is a sustained megabyte-per-second of extra work on the exact pipe whose starvation this
+// harness already documents as the cause of mid-run socket drops (see GL_LADDER). Four frames is
+// all the protocol check needs, so the firehose lasts a few hundred milliseconds.
+const WIRE_TAP_TIMEOUT_MS = 20000;
+const WIRE_TAP_KEEP = 4;
+
+async function tapWire(page, tag) {
+  const cdp = await page.createCDPSession();
+  await cdp.send('Network.enable');
+  let kept = 0;
+  cdp.on('Network.webSocketFrameReceived', ({ response }) => {
+    if (kept >= WIRE_TAP_KEEP) return;
+    if (response?.opcode !== 1) return; // 1 = text; the protocol is JSON text (net.ts)
+    const data = response.payloadData;
+    if (typeof data !== 'string' || !data.includes('"rift_snap"')) return;
+    wireSnaps.push(data);
+    if (wireSnaps.length > WIRE_TAP_KEEP) wireSnaps.shift();
+    if (++kept < WIRE_TAP_KEEP) return;
+    void cdp
+      .send('Network.disable')
+      .then(() => cdp.detach())
+      .then(() => log(`[${tag}] wire tap detached after ${kept} rift_snap frame(s)`))
+      .catch(() => {}); // the page may already be gone; the frames are already captured
+  });
+  log(`[${tag}] wire tap attached (raw rift_snap frames off CDP)`);
+}
+
+/** The frozen `EntKind` set (shared/src/types.ts). A kind off the wire that is not in here means
+ *  the running server and this harness disagree about the vocabulary. */
+const ENT_KINDS = new Set([
+  'hero', 'melee', 'ranged', 'siege', 'shade', 'tower', 'guard', 'ancient', 'ward', 'proj',
+  'campPack', 'campBrute', 'campHive',
+]);
+
+/**
+ * Assert the WIRE carries what protocol.ts says it carries — on a real frame, before anything
+ * downstream reads it through the client's forgiving parse.
+ *
+ * `dayPhase` is checked for PRESENCE first (`'dayPhase' in snap`), not merely for being a usable
+ * number: "absent" and "0" are the same value to every downstream reader here, and telling them
+ * apart is the entire point. Present and 0 is a full day; absent is a server that predates the
+ * feature, and every night frame taken against it is a lie with correct-looking lighting.
+ */
+async function assertWireProtocol() {
+  const t0 = Date.now();
+  while (wireSnaps.length === 0) {
+    if (Date.now() - t0 > WIRE_TAP_TIMEOUT_MS) {
+      throw new Error(
+        `no raw rift_snap frame reached the CDP wire tap within ${WIRE_TAP_TIMEOUT_MS}ms — the protocol cannot ` +
+          "be checked against the socket, only against the client's forgiving parse of it",
+      );
+    }
+    await sleep(200);
+  }
+  const text = wireSnaps[wireSnaps.length - 1];
+  let snap;
+  try {
+    snap = JSON.parse(text);
+  } catch (err) {
+    throw new Error(`a rift_snap frame off the socket is not JSON (${errText(err)}): ${text.slice(0, 200)}`);
+  }
+  if (snap === null || typeof snap !== 'object' || snap.t !== 'rift_snap') {
+    throw new Error(`the tapped frame is not a rift_snap envelope: ${text.slice(0, 200)}`);
+  }
+  if (!('dayPhase' in snap)) {
+    throw new Error(
+      'rift_snap ON THE WIRE HAS NO `dayPhase` — protocol.ts freezes it as always present and always in [0,1], ' +
+        'and net.ts substitutes 0 for it, so every reader in this suite would report a confident full day and the ' +
+        'night vision penalty would never be applied. The running server predates the field: rebuild ' +
+        `(npm run build) and check room.ts sets it. Frame keys: ${Object.keys(snap).join(', ')}`,
+    );
+  }
+  const d = snap.dayPhase;
+  if (typeof d !== 'number' || !Number.isFinite(d) || d < 0 || d > 1) {
+    throw new Error(
+      `rift_snap.dayPhase on the wire is ${JSON.stringify(d)} — protocol.ts requires a finite number in [0,1]`,
+    );
+  }
+  const ents = Array.isArray(snap.ents) ? snap.ents : null;
+  if (ents === null) throw new Error('rift_snap on the wire has no `ents` array');
+  const unknown = [...new Set(ents.map((e) => e?.k).filter((k) => !ENT_KINDS.has(k)))];
+  if (unknown.length > 0) {
+    throw new Error(
+      `rift_snap carries EntKind(s) this harness does not know: ${unknown.map((k) => JSON.stringify(k)).join(', ')} — ` +
+        'shared/src/types.ts and the running server have diverged',
+    );
+  }
+  log(
+    `wire protocol OK: rift_snap.dayPhase = ${d.toFixed(4)} (present on the frame, not defaulted) at ` +
+      `matchTick ${String(snap.matchTick)}, ${ents.length} ents, kinds ${[...new Set(ents.map((e) => e.k))].sort().join('/')}`,
+  );
+  return d;
 }
 
 /** GL backends, best first. The BACKEND decides whether a live 3-lane 8v8
@@ -410,6 +750,7 @@ async function launchOne(vp, tag) {
         log(`[${tag}] [warn] SOFTWARE rendering — frames cost ~25x a GPU frame; the 8v8 socket may be dropped mid-run`);
       }
       trackErrors(page, tag);
+      await tapWire(page, tag);
       page.__browser = browser;
       return page;
     }
@@ -616,8 +957,9 @@ async function shot(page, name, vp, { night = false, inWorld = false } = {}) {
   );
 }
 
-/** Pan the camera by clicking the minimap canvas (world [0,side]^2 maps
- *  linearly onto it — ui/minimap.ts pointerdown -> actions.panCameraTo). */
+/** Click the minimap canvas at normalised CANVAS coordinates, (0,0) being its
+ *  top-left pixel. Canvas space only — anything that means a WORLD point goes
+ *  through `panTo`, which owns the mapping. */
 async function minimapPan(page, u, v) {
   const rect = await page.$eval('.minimap canvas', (el) => {
     const r = el.getBoundingClientRect();
@@ -626,8 +968,22 @@ async function minimapPan(page, u, v) {
   await page.mouse.click(rect.x + u * rect.w, rect.y + v * rect.h);
 }
 
-/** Aim the camera at a WORLD point. */
-const panTo = (page, x, z) => minimapPan(page, x / MAP_SIDE, z / MAP_SIDE);
+/**
+ * Aim the camera at a WORLD point.
+ *
+ * THE MINIMAP IS DRAWN — AND HIT-TESTED — ROTATED 180°. `ui/minimap.ts` says so
+ * in its header ("world x -> canvas LEFT, world z -> canvas UP", measured by
+ * scripts/repro-pan.mjs against the fixed camera rig) and its `toWorld()`
+ * implements `world = (1 - u) * side`. This harness sent `u = x / side`, so
+ * every pan landed on the point-reflection `(side - x, side - z)` of what it
+ * asked for. The map is point-symmetric about its centre (TERRAIN_CONTRACT §3),
+ * which is exactly why it went unnoticed: the mirror of the map centre is the
+ * map centre and the mirror of a cliff cell is another cliff cell, so the
+ * frames looked plausible. The shots it actually broke were the ones framing
+ * something UNIQUE — a posed hero, or the one patch of ground that hero's
+ * vision had lit.
+ */
+const panTo = (page, x, z) => minimapPan(page, 1 - x / MAP_SIDE, 1 - z / MAP_SIDE);
 
 /** Wheel-zoom `steps` notches; dir -1 zooms in (lower camH), +1 out. */
 async function zoom(page, vp, steps, dir) {
@@ -638,26 +994,34 @@ async function zoom(page, vp, steps, dir) {
   }
 }
 
-// input.ts ZOOM_STEP = 1.12/notch, game.ts clamps camH to [18, 55]. 12 notches
-// move 3.9x — more than the 3.06x range — so 12 notches in either direction
-// always lands ON a clamp, which is what makes a rung reproducible.
-const ZOOM_CLAMP_STEPS = 12;
+// input.ts ZOOM_STEP = 1.12/notch; game.ts clamps camH to [CAM_MIN_H 11,
+// CAM_MAX_H 55]. STYLE_BIBLE §5 moved the lower clamp 18 -> 11, which
+// invalidated the step count here: the clamp-driving trick only works when the
+// notches OVERSHOOT the range, and 55/11 = 5.0x.
+//   12 notches = 3.896x -> 55 / 3.896 = 14.12 m, which is NOT a clamp. Every
+//                          'in' rung was landing on an unspecified height and
+//                          `zoomTo` had quietly become a relative zoom.
+//   15 notches = 5.474x -> 55 / 5.474 = 10.05 (clamps at 11) and
+//                          11 * 5.474 = 60.2 (clamps at 55). Both legs land. ✓
+const ZOOM_CLAMP_STEPS = 15;
 const ZOOM_RUNGS = {
   out: 0, // the 55 m clamp
   default: 4, // 4 notches in from 55 -> 34.96 m
-  in: ZOOM_CLAMP_STEPS, // the 18 m clamp
+  in: ZOOM_CLAMP_STEPS, // the 11 m clamp
 };
-const HIGH_GROUND_STEPS_FROM_IN = 3; // 18 * 1.12^3 = 25.29 m ~= §5's camH 24
+const HIGH_GROUND_STEPS_FROM_IN = 7; // 11 * 1.12^7 = 24.32 m ~= §5's camH 24
 //   (the wheel is multiplicative, so 24 is not exactly reachable; this is the
-//   nearest rung that is, and it is reached from a clamp so it never drifts)
+//   nearest rung that is, and it is reached from a clamp so it never drifts.
+//   Against the old 18 m clamp this was 3 notches; carried onto the 14.12 m
+//   the broken clamp produced, it framed 19.84 m.)
 
 let zoomLevel = null;
 async function zoomTo(page, vp, level) {
   if (zoomLevel === level) return;
   await zoom(page, vp, ZOOM_CLAMP_STEPS, +1); // -> the 55 m clamp
   if (level === 'campH24') {
-    await zoom(page, vp, ZOOM_CLAMP_STEPS, -1); // -> the 18 m clamp
-    await zoom(page, vp, HIGH_GROUND_STEPS_FROM_IN, +1); // -> 25.29 m
+    await zoom(page, vp, ZOOM_CLAMP_STEPS, -1); // -> the 11 m clamp
+    await zoom(page, vp, HIGH_GROUND_STEPS_FROM_IN, +1); // -> 24.32 m
   } else {
     const steps = ZOOM_RUNGS[level] ?? 0;
     if (steps > 0) await zoom(page, vp, steps, -1);
@@ -736,7 +1100,7 @@ async function captureViewport(vp) {
     });
     if (missingRoots.length > 0) fail(`${tag}: HUD roots missing during live: ${missingRoots.join(', ')}`);
 
-    // -- live at closest zoom (camH 18) ---------------------------------------------------
+    // -- live at closest zoom (camH 11, the CAM_MIN_H clamp) ------------------------------
     await zoom(page, vp, ZOOM_STEPS_IN, -1);
     await settle(page);
     await shot(page, 'live-close', vp, { inWorld: true });
@@ -779,7 +1143,7 @@ async function captureViewport(vp) {
       60000,
       `creep engagement (tick >= ${COMBAT_MIN_TICK} or a kill/cast event)`,
     );
-    await minimapPan(page, 0.5, 0.5); // mid-lane clash point (the map centre)
+    await panTo(page, MID, MID); // mid-lane clash point
     await settle(page, { ms: 800 }); // interp + the 5Hz fog mask refresh
     const { calls: maxDrawCalls, tris: maxTriangles } = await sampleMeters(page);
     log(
@@ -805,9 +1169,12 @@ async function captureViewport(vp) {
     await shot(page, 'combat', vp, { inWorld: true });
 
     // -- fog boundary at the map edge ---------------------------------------------------------
-    // (u 0.97, v 0.03) -> the far off-lane corner, which neither team explores
-    // — the frame shows the shroud meeting the explored lane corridor.
-    await minimapPan(page, 0.97, 0.03);
+    // The far off-lane corner, which neither team explores — the frame shows
+    // the shroud meeting the explored lane corridor. Expressed in WORLD
+    // coordinates: this used to be a raw canvas click, which the minimap's 180°
+    // rotation silently turned into the OTHER off-lane corner. Both are
+    // unexplored, so the shot survived, but the coordinate meant nothing.
+    await panTo(page, MAP_SIDE * 0.03, MAP_SIDE * 0.97);
     await settle(page, { ms: 800 });
     await shot(page, 'fog-edge', vp, { inWorld: true });
 
@@ -855,17 +1222,26 @@ async function waitWorldBuilt(page, tag) {
  *  order so a stun, a death + respawn or a bumped path never strands it. The
  *  camera is then aimed at the POINT, not at the hero, so the framing is
  *  identical every round regardless of where inside the tolerance it stopped. */
-async function poseHero(page, x, z, timeoutMs) {
+async function poseHero(page, x, z, timeoutMs, tolerance = WORLD_POSE_TOLERANCE_M) {
   const t0 = Date.now();
   for (;;) {
     const you = await latestYou(page).catch(() => null);
-    if (you !== null && you.respawnAtTick === 0 && Math.hypot(you.x - x, you.z - z) <= WORLD_POSE_TOLERANCE_M) {
+    if (you !== null && you.respawnAtTick === 0 && Math.hypot(you.x - x, you.z - z) <= tolerance) {
       await page.evaluate(() => window.__rift.order('stop')).catch(() => {});
       await sleep(400);
       return;
     }
     if (Date.now() - t0 > timeoutMs) {
-      throw new Error(`the hero never reached (${x.toFixed(1)}, ${z.toFixed(1)}) within ${timeoutMs}ms`);
+      // Tagged, because this is the one world-shot failure a retry cannot fix.
+      // A stand cell the hero could not path to in 90 s is not one it reaches
+      // in another 90 — the target is unreachable, not unlucky — and the room
+      // is a wasting asset: measured, three of these burned 270 s out of a
+      // speed-5 match whose 1800 game-second hard cap is 360 s of wall clock,
+      // and every shot queued behind them was then taken against an ended
+      // match. Failing fast leaves the rest of the list a match to run in.
+      const err = new Error(`the hero never reached (${x.toFixed(1)}, ${z.toFixed(1)}) within ${timeoutMs}ms`);
+      err.poseTimeout = true;
+      throw err;
     }
     await page.evaluate((x2, z2) => window.__rift.order('move', x2, z2), x, z).catch(() => {});
     await sleep(1000);
@@ -885,6 +1261,91 @@ const neutralsNear = (page, cx, cz, radius) =>
     cz,
     radius,
   );
+
+/** Camp members near a clearing centre, with positions — so the stand-off
+ *  band's POST_RING_R assumption can be CHECKED rather than trusted. */
+const campMembers = (page, cx, cz, radius) =>
+  page.evaluate(
+    (x, z, r) => {
+      const ring = window.__rift?.snaps() ?? [];
+      const s = ring.length > 0 ? ring[ring.length - 1] : null;
+      if (s === null || s === undefined) return [];
+      return s.ents
+        .filter((e) => e.team === 2 && e.hp > 0 && Math.hypot(e.x - x, e.z - z) <= r)
+        .map((e) => ({ x: e.x, z: e.z }));
+    },
+    cx,
+    cz,
+    radius,
+  );
+
+/** The two properties the stand-off band exists to produce, checked on the live
+ *  snapshot: the CLEARING CENTRE is inside the HERO'S OWN vision (so the ground
+ *  this shot frames is lit by this hero, not by a bot that happened to be
+ *  standing usefully), and no member has reached the hero (so the camp has not
+ *  pulled). Every constant is read from shared config.ts, `nightVisionScale`
+ *  included — a stale local copy of exactly this vision figure is what made this
+ *  shot intermittent.
+ *
+ *  It asks about the CLEARING, not about the nearest member, and it does not
+ *  check members against their posts at all: a member may legitimately range to
+ *  CAMP_LEASH_RADIUS chasing a lane creep, and a member-based test fails good
+ *  frames when one has simply drifted to the far side of the clearing. */
+async function assertCampStandOff(page, cx, cz) {
+  const members = await campMembers(page, cx, cz, CAMP_VISIBLE_M);
+  if (members.length === 0) throw new Error('no camp members in the snapshot at the moment of the shot');
+  const you = await latestYou(page);
+  if (you === null) throw new Error('no local hero in the snapshot');
+  const phase = await serverDayPhase(page);
+  if (phase === null) throw new Error('rift_snap.dayPhase is missing — the hero vision radius cannot be computed');
+  const vision = CONFIG.HERO_VISION * CONFIG.nightVisionScale(phase);
+  const toClearing = Math.hypot(cx - you.x, cz - you.z);
+  if (toClearing > vision) {
+    throw new Error(
+      `the hero stands ${toClearing.toFixed(2)}m from the clearing centre but its vision at dayPhase ` +
+        `${phase.toFixed(3)} is only ${vision.toFixed(2)}m — the camp is revealed by somebody else, not by this hero`,
+    );
+  }
+  let nearest = Infinity;
+  for (const m of members) nearest = Math.min(nearest, Math.hypot(m.x - you.x, m.z - you.z));
+  if (nearest <= CONFIG.AGGRO_RADIUS) {
+    throw new Error(
+      `a camp member is ${nearest.toFixed(2)}m from the hero, inside AGGRO_RADIUS ${CONFIG.AGGRO_RADIUS} — the stand-off failed`,
+    );
+  }
+}
+
+/** The SERVER's day phase (`rift_snap.dayPhase`). `setDayPhase` pins only the
+ *  renderer; THIS is the value that scales every vision radius, and a hero's
+ *  vision disc is the only thing lighting an off-lane frame. */
+const serverDayPhase = (page) =>
+  page.evaluate(() => {
+    const ring = window.__rift?.snaps() ?? [];
+    const s = ring.length > 0 ? ring[ring.length - 1] : null;
+    if (s === null || s === undefined) return null;
+    const d = s.dayPhase;
+    return typeof d === 'number' && Number.isFinite(d) ? d : null;
+  });
+
+/** Block until the server's day phase drops to `max`, so a vision-dependent
+ *  shot always lands at the same point of a cycle that is 120 s of wall clock
+ *  wide (DAY_PERIOD_S 600 at speed 5). */
+async function waitDayPhaseBelow(page, max) {
+  const t0 = Date.now();
+  for (;;) {
+    const p = await serverDayPhase(page);
+    if (p === null) {
+      throw new Error(
+        'rift_snap.dayPhase is missing — a vision-dependent shot cannot be pinned to a point in the day/night cycle',
+      );
+    }
+    if (p <= max) return p;
+    if (Date.now() - t0 > DAY_PHASE_WAIT_MS) {
+      throw new Error(`the server day phase never fell to ${max} within ${DAY_PHASE_WAIT_MS}ms (last ${p.toFixed(3)})`);
+    }
+    await sleep(1000);
+  }
+}
 
 /** Max drawCalls()/triangles() over DRAW_SAMPLES reads, so one unlucky frame
  *  cannot decide a budget or a liveness verdict. */
@@ -906,8 +1367,8 @@ async function sampleMeters(page) {
  * pass is added".
  *
  * It is a controlled A/B on ONE page at ONE camera target, so the only variable
- * is how much of the world the frustum contains: the closest rung (camH 18,
- * ~36 m of ground, a handful of 16 m chunks) against the widest (camH 55, the
+ * is how much of the world the frustum contains: the closest rung (camH 11,
+ * ~22 m of ground, a handful of 16 m chunks) against the widest (camH 55, the
  * whole map). Every additional chunk and instanced archetype that enters the
  * frustum is another pass through the renderer, so a live accumulating meter
  * must report a strictly higher count at the wide rung.
@@ -922,6 +1383,21 @@ async function sampleMeters(page) {
  */
 async function measureMeterLiveness(page, vp, tag) {
   try {
+    // The A/B is only an A/B while the match is running. Once the room ends,
+    // `panCameraTo` and the wheel stop moving anything and both rungs sample
+    // the same frozen frame — which this test then reports as "the meter is not
+    // accumulating", a defect in R_SCENE's renderer.info handling that is not
+    // there. Measured: it fired exactly that way when the world flow's retries
+    // pushed it past the end of a speed-5 match. A check must not be able to
+    // blame another module for its own sequencing.
+    const s = await riftState(page);
+    if (s === null || s.phase !== 'live') {
+      fail(
+        `${tag}: the §5 meter-liveness proof never ran — the client was in phase '${String(s?.phase)}', not 'live', so ` +
+          'the two rungs would have sampled the same frozen frame. This is a harness sequencing failure, not a renderer one',
+      );
+      return;
+    }
     await zoomTo(page, vp, 'in');
     await panTo(page, MID, MID);
     await settle(page, { ms: 700 });
@@ -931,7 +1407,7 @@ async function measureMeterLiveness(page, vp, tag) {
     await settle(page, { ms: 700 });
     const wide = await sampleMeters(page);
     log(
-      `${tag}: meter liveness at the map centre — camH 18: ${near.calls} calls / ${near.tris} tris, ` +
+      `${tag}: meter liveness at the map centre — camH 11: ${near.calls} calls / ${near.tris} tris, ` +
         `camH 55: ${wide.calls} calls / ${wide.tris} tris`,
     );
 
@@ -947,7 +1423,7 @@ async function measureMeterLiveness(page, vp, tag) {
       );
     } else if (wide.calls <= near.calls) {
       fail(
-        `${tag}: drawCalls() did not rise when passes were added to the frame (camH 18: ${near.calls}, camH 55: ${wide.calls}) — ` +
+        `${tag}: drawCalls() did not rise when passes were added to the frame (camH 11: ${near.calls}, camH 55: ${wide.calls}) — ` +
           'either renderer.info is reset per pass, or the map is one unculled merge, both banned by GRAPHICS_CONTRACT §5',
       );
     }
@@ -964,7 +1440,7 @@ async function measureMeterLiveness(page, vp, tag) {
       fail(`${tag}: triangles() reported 0 on a live frame — the meter is dead or renderer.info was reset a second time`);
     } else if (wide.tris <= near.tris) {
       fail(
-        `${tag}: triangles() did not rise when passes were added to the frame (camH 18: ${near.tris}, camH 55: ${wide.tris}) — ` +
+        `${tag}: triangles() did not rise when passes were added to the frame (camH 11: ${near.tris}, camH 55: ${wide.tris}) — ` +
           'the triangle meter is not accumulating across the frame',
       );
     }
@@ -993,7 +1469,21 @@ async function captureWorldStates(vp) {
       45000,
       'world-room live',
     );
+    // Before any world shot: prove the socket carries the fields this flow reasons about. The
+    // camp stand-off check computes a vision radius from `dayPhase`, and it reads that through a
+    // client parse that cannot fail — this is the last point at which a server that never sends
+    // the field is distinguishable from a full day.
+    await assertWireProtocol();
     await waitWorldBuilt(page, tag);
+
+    // The §5 meter-liveness proof runs FIRST, not last. It is the cheapest and
+    // most deterministic measurement in this flow — one page, one camera
+    // target, two zoom rungs — and it needs nothing but a built map. Queued
+    // behind the world shots it was competing with a wasting asset: the shots
+    // pose a hero across the jungle at speed 5, and by the time the queue
+    // drained the match had ended and the proof measured a frozen frame.
+    await measureMeterLiveness(page, vp, tag);
+    zoomLevel = null; // the world shots drive their own rungs from a clamp
 
     const mirror = mirrorFor(live.team ?? 0);
     if (FACTS.cliff === null || FACTS.river === null || FACTS.wall === null || FACTS.brute === null) {
@@ -1009,35 +1499,56 @@ async function captureWorldStates(vp) {
       );
     }
 
-    /** One world shot: pin the phase, pose the hero so its vision lights the
-     *  subject, frame the POINT, assert the frame is live and shoot it. */
+    /**
+     * One world shot: pin the phase, pose the hero so its vision lights the
+     * subject, frame the POINT, assert the frame is live and shoot it.
+     *
+     * ATTEMPTED TWICE. This is an 8v8 room, and the hero doing the lighting is
+     * a single mid-lane body walking to unescorted jungle: measured across a
+     * run, one shot lost its pose to a 90 s march that never finished and
+     * another was refused by `assertShootable` because the hero had died on the
+     * way. Both are recoverable — the second attempt re-marches from wherever
+     * the respawn put it — and neither is a defect in the thing being verified,
+     * so failing the harness on the first one turns a live-match accident into
+     * a red build. What is NOT retried is anything `assertShootable` exists to
+     * catch at the shutter: a retry re-runs the whole pose-and-frame sequence,
+     * it never re-photographs a frame that was already rejected.
+     */
+    const WORLD_SHOT_TRIES = 2;
     const worldShot = async (name, target, level, dayT, { pose = true, before = null } = {}) => {
       if (target === null) {
         fail(`${tag}: ${name} skipped — no terrain point (see above)`);
         return;
       }
-      try {
-        const p = mirror(target);
-        if (pose) {
-          const stand = FACTS.nearestPassable(p.x, p.z);
-          await poseHero(page, stand.x, stand.z, WORLD_POSE_TIMEOUT_MS);
-        }
-        if (before !== null) await before(p);
-        if (!(await pinDayPhase(page, dayT))) {
-          failOnce(
-            'setDayPhase',
-            'window.__rift.setDayPhase is missing — the world/night shots would not be reproducible, so they are not captured',
-          );
-          fail(`${tag}: ${name} not captured (dayPhase unpinnable)`);
+      let lastErr = null;
+      for (let attempt = 1; attempt <= WORLD_SHOT_TRIES; attempt++) {
+        try {
+          const p = mirror(target);
+          if (pose) {
+            const stand = FACTS.nearestPassable(p.x, p.z);
+            await poseHero(page, stand.x, stand.z, WORLD_POSE_TIMEOUT_MS);
+          }
+          if (before !== null) await before(p);
+          if (!(await pinDayPhase(page, dayT))) {
+            failOnce(
+              'setDayPhase',
+              'window.__rift.setDayPhase is missing — the world/night shots would not be reproducible, so they are not captured',
+            );
+            fail(`${tag}: ${name} not captured (dayPhase unpinnable)`);
+            return;
+          }
+          await zoomTo(page, vp, level);
+          await panTo(page, p.x, p.z);
+          await settle(page, { ms: 900 }); // interp + the 5Hz fog mask refresh
+          await shot(page, name, vp, { inWorld: true, night: dayT === NIGHT_PIN });
           return;
+        } catch (err) {
+          lastErr = err;
+          if (err instanceof Error && err.poseTimeout === true) break;
+          if (attempt < WORLD_SHOT_TRIES) log(`[warn] ${tag}: ${name}: attempt ${attempt} — ${errText(err)} — retrying`);
         }
-        await zoomTo(page, vp, level);
-        await panTo(page, p.x, p.z);
-        await settle(page, { ms: 900 }); // interp + the 5Hz fog mask refresh
-        await shot(page, name, vp, { inWorld: true, night: dayT === NIGHT_PIN });
-      } catch (err) {
-        fail(`${tag}: ${name}: ${errText(err)}`);
       }
+      fail(`${tag}: ${name}: ${errText(lastErr)}`);
     };
 
     // Day states first: they explore ground the night trio then reuses.
@@ -1057,17 +1568,32 @@ async function captureWorldStates(vp) {
         // stand-off march below is the only pose this shot needs.
         pose: false,
         before: async (p) => {
-          const c = { x: MAP_SIDE / 2, z: MAP_SIDE / 2 };
-          const dx = c.x - p.x;
-          const dz = c.z - p.z;
-          const dl = Math.hypot(dx, dz) || 1;
-          const stand = FACTS.nearestPassable(p.x + (dx / dl) * CAMP_APPROACH_M, p.z + (dz / dl) * CAMP_APPROACH_M);
-          await poseHero(page, stand.x, stand.z, WORLD_POSE_TIMEOUT_MS);
+          // The stand-off cell comes from ./rift-terrain-facts.mjs's band:
+          // outside the camp's acquisition reach (AGGRO_RADIUS 7 measured from
+          // a member resting POST_RING_R 1.6 m off centre) and close enough
+          // that a member is still inside hero vision AFTER nightVisionScale
+          // has taken it down to 8.25 m. The old recipe walked out a fixed
+          // 10.5 m — derived against DAY vision alone — and then SNAPPED to the
+          // nearest passable cell, which was free to move the result straight
+          // back out of the band it had just been placed in.
+          const stand = FACTS.campStand(p.x, p.z, MAP_SIDE / 2, MAP_SIDE / 2);
+          if (stand === null) {
+            throw new Error(
+              `no passable cell ${CAMP_STAND_MIN_M}-${CAMP_STAND_MAX_M}m from the brute clearing ` +
+                `(${p.x.toFixed(1)}, ${p.z.toFixed(1)}) — the hero cannot stand where the camp is both safe and visible`,
+            );
+          }
+          // The renderer pin fixes the LIGHTING; vision radii are the server's
+          // and follow the real matchTick, so a shot that depends on a camp
+          // being revealed waits for a fixed point in the day/night cycle too.
+          await waitDayPhaseBelow(page, CAMP_SHOT_MAX_DAY_PHASE);
+          await poseHero(page, stand.x, stand.z, WORLD_POSE_TIMEOUT_MS, CAMP_POSE_TOLERANCE_M);
           await waitFor(
             async () => (await neutralsNear(page, p.x, p.z, CAMP_VISIBLE_M)) > 0,
             CAMP_VISIBLE_TIMEOUT_MS,
             `neutral camp entities within ${CAMP_VISIBLE_M}m of the brute clearing (${p.x.toFixed(1)}, ${p.z.toFixed(1)})`,
           );
+          await assertCampStandOff(page, p.x, p.z);
         },
       },
     );
@@ -1088,9 +1614,58 @@ async function captureWorldStates(vp) {
     await worldShot('night-wide-mid', { x: MID, z: MID }, 'out', NIGHT_PIN, { pose: false });
     await worldShot('night-close-hero', nightHero, 'in', NIGHT_PIN);
 
-    // The §5 meter-liveness proof, on this room because it is the 3-lane 8v8
-    // one the budgets are specified against.
-    await measureMeterLiveness(page, vp, tag);
+    // ---- the §5 budgets, measured on the frames that actually spend them ----
+    // The combat check inside captureViewport already asserts both budgets, but
+    // it asserts them at ONE framing — the mid-lane clash at camH 35 — and that
+    // is not where the peak is. The world shots are: this room is the same
+    // 3-lane 8v8 peak with camps populated that GRAPHICS_CONTRACT §5 specifies
+    // the budgets against, and the jungle and night framings are where the
+    // vegetation, the camps and the night lighting all land in one frustum at
+    // once. Measured, the worst assembled frame in the matrix is `night-wide-mid`
+    // — the whole map at camH 55 at dayPhase 1 — and nothing was checking it.
+    //
+    // Both figures come from `renderer.info` through the frozen debug surface
+    // (AMENDMENT_1 §B.5), and render/core.ts holds `info.autoReset = false` with
+    // one reset per frame, so each is the WHOLE frame including the shadow pass
+    // (AMENDMENT_3 §D.5) — not one composer pass.
+    {
+      const worldFrames = manifest.filter((m) => m.viewport === vp.tag && WORLD_SHOTS.includes(m.shot));
+      let worstCalls = { shot: null, v: -1 };
+      let worstTris = { shot: null, v: -1 };
+      for (const m of worldFrames) {
+        if (m.drawCalls > worstCalls.v) worstCalls = { shot: m.shot, v: m.drawCalls };
+        if (m.triangles > worstTris.v) worstTris = { shot: m.shot, v: m.triangles };
+      }
+      log(
+        `${tag}: world-shot peak over ${worldFrames.length} assembled frames — ` +
+          `${worstCalls.v} calls (${String(worstCalls.shot)})/${DRAW_CALL_BUDGET}, ` +
+          `${worstTris.v} tris (${String(worstTris.shot)})/${TRIANGLE_BUDGET}`,
+      );
+      if (worldFrames.length === 0) {
+        fail(`${tag}: no world shot landed, so the §5 budgets were never measured on a peak frame`);
+      } else {
+        if (worstCalls.v < MIN_LIVE_DRAW_CALLS) {
+          fail(
+            `${tag}: the world shots peaked at ${worstCalls.v} draw calls — below the ${MIN_LIVE_DRAW_CALLS} floor, so the ` +
+              'meter is reporting one composer pass rather than the assembled frame',
+          );
+        } else if (worstCalls.v > DRAW_CALL_BUDGET) {
+          fail(
+            `${tag}: ${String(worstCalls.shot)} draws ${worstCalls.v} calls, over the ${DRAW_CALL_BUDGET} budget ` +
+              '(GRAPHICS_CONTRACT §5, at the 3-lane 8v8 peak these shots are captured at)',
+          );
+        }
+        if (worstTris.v <= 0) {
+          fail(`${tag}: the world shots reported ${worstTris.v} triangles — the meter is dead, so the 1.2M budget is unmeasured`);
+        } else if (worstTris.v > TRIANGLE_BUDGET) {
+          fail(
+            `${tag}: ${String(worstTris.shot)} rasterises ${worstTris.v} triangles, over the ${TRIANGLE_BUDGET} budget ` +
+              '(GRAPHICS_CONTRACT §5, at the 3-lane 8v8 peak these shots are captured at)',
+          );
+        }
+      }
+    }
+
 
     // Hand the renderer back to the snapshot clock: leaving it pinned would
     // outlive this page in any --keep-server debugging session.
@@ -1352,6 +1927,13 @@ if (manifest.length < expected) {
 if (pageErrors.length > 0) {
   fail(`${pageErrors.length} page error(s):\n  ${pageErrors.slice(0, 12).join('\n  ')}`);
 }
+// Warnings never fail the run on their own (the wire-naming subset was already promoted into
+// pageErrors), but they are REPORTED — dropping them on the floor is what let a one-shot
+// "rift_snap carries no dayPhase" warning pass unread through a whole round.
+if (pageWarnings.length > 0) {
+  log(`${pageWarnings.length} console warning(s):`);
+  for (const w of pageWarnings.slice(0, 12)) log(`  ${w}`);
+}
 if (badServerExit !== null) {
   fail(
     `the platform server exited mid-run (code ${badServerExit.code}, signal ${badServerExit.signal}) — ` +
@@ -1379,5 +1961,7 @@ log(
       `worst triangles ${worstTriangles}/${TRIANGLE_BUDGET}, zero page errors`
     : `RED: ${failures.length} failure(s), ${manifest.length}/${expected} shots`,
 );
-console.log(JSON.stringify({ ok: failures.length === 0, worstDrawCalls, worstTriangles, failures, shots: manifest }));
+console.log(
+  JSON.stringify({ ok: failures.length === 0, worstDrawCalls, worstTriangles, failures, pageWarnings, shots: manifest }),
+);
 process.exit(failures.length === 0 ? 0 : 1);

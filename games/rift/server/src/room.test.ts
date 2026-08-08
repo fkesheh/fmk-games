@@ -16,18 +16,25 @@
 // ============================================================================
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  buildMap,
+  DAY_PERIOD_S,
+  dayPhase,
   HERO_LIST,
+  isCampKind,
   LOBBY_COUNTDOWN_MS,
   MATCH_END_MS,
   MAX_PLAYERS,
   MIN_PLAYERS,
+  NEUTRAL_TEAM,
   STARTING_GOLD,
+  TICK_RATE,
 } from '@rift/shared';
 import type { EntSnap, RiftEvent, RiftS2C, RosterEntry } from '@rift/shared';
 import type { PlayerId, RoomIO, Visibility } from '@platform/shared';
 import type { RoomDeps } from './ports.js';
 import { RiftRoom } from './room.js';
 import { riftModule } from './module.js';
+import type { BotBrain, BotPercept, CampPercept, World } from './sim/types.js';
 
 // ---- wire shapes ---------------------------------------------------------------
 
@@ -157,6 +164,87 @@ function heroEntByPid(snap: Snap, pid: PlayerId): EntSnap {
 
 function isMobileKind(k: EntSnap['k']): boolean {
   return k !== 'tower' && k !== 'guard' && k !== 'ancient';
+}
+
+function campEnts(snap: Snap): EntSnap[] {
+  return snap.ents.filter((e) => isCampKind(e.k));
+}
+
+/**
+ * Test-only view of the room's private live state. The room exposes no getter
+ * for either — nothing in production needs one — but three things it MUST
+ * handle cannot be provoked through the public surface inside a test's budget:
+ * a `miss` SimEvent (needs an attacker on low ground and a target on high one,
+ * plus a losing `missRoll`), a `kill` whose victim holds no seat, and a camp
+ * wiped to the last creep. Driving them through `World.pushEvent` / a direct
+ * hp write is the same world seam the sim itself uses, so the room still runs
+ * its real dispatch and snapshot paths.
+ */
+interface RoomInternals {
+  world: World | null;
+  seats: Array<{ pid: PlayerId; bot: boolean; brain: BotBrain | null }>;
+}
+
+function internals(room: RiftRoom): RoomInternals {
+  return room as unknown as RoomInternals;
+}
+
+function worldOf(room: RiftRoom): World {
+  const w = internals(room).world;
+  if (w === null) throw new Error('room has no live world');
+  return w;
+}
+
+/** Zero every living member of one camp; the next tickOnce reaps them. */
+function wipeCamp(room: RiftRoom, campId: number): number {
+  const w = worldOf(room);
+  const camp = w.camps[campId];
+  if (camp === undefined) throw new Error(`no camp ${campId}`);
+  let n = 0;
+  for (const id of camp.memberIds) {
+    const e = w.get(id);
+    if (e !== undefined && e.alive) {
+      e.hp = 0;
+      n += 1;
+    }
+  }
+  return n;
+}
+
+/**
+ * One tick's percept as the bot actually received it. `camps` is a buffer the
+ * room owns and mutates, so reading it later cannot distinguish "refreshed in
+ * place" from "refilled with fresh objects" — the element references and the
+ * `up` flags have to be copied out AT THE MOMENT of the call. (A first cut of
+ * this file read them live and a rebuild-every-tick mutation went undetected.)
+ */
+interface PerceptShot {
+  percept: BotPercept;
+  /** The array instance handed over. */
+  campsArray: readonly CampPercept[];
+  /** Its element references at that instant. */
+  entries: readonly CampPercept[];
+  /** Their `up` flags at that instant. */
+  up: readonly boolean[];
+}
+
+/** Replace a bot seat's brain with a recorder and return the capture log. */
+function recordBotPercepts(room: RiftRoom): PerceptShot[] {
+  const seen: PerceptShot[] = [];
+  const seat = internals(room).seats.find((s) => s.bot);
+  if (seat === undefined) throw new Error('no bot seat to record');
+  seat.brain = {
+    tick(p: BotPercept) {
+      seen.push({
+        percept: p,
+        campsArray: p.camps,
+        entries: [...p.camps],
+        up: p.camps.map((c) => c.up),
+      });
+      return [];
+    },
+  };
+  return seen;
 }
 
 beforeEach(() => {
@@ -774,6 +862,320 @@ describe('match end and full reset', () => {
     pressStartAndLock(room, 'p1');
     expect(room.info().phase).toBe('live');
     expect(room.info().label).toBe('2v2');
+  });
+});
+
+// ---- the day/night cycle on the wire ------------------------------------------------------
+
+describe('rift_snap.dayPhase (AMENDMENT_1 §B.1)', () => {
+  it('is on EVERY snapshot, equals the hoisted shared dayPhase(matchTick), and advances in play', () => {
+    const { room, io } = boot([
+      ['p1', 'Ada'],
+      ['p2', 'Bob'],
+    ]);
+    pressStartAndLock(room, 'p1');
+
+    const seen: number[] = [];
+    for (let i = 0; i < 40; i++) {
+      room.tickOnce();
+      const s = latestSnap(io, 'p1');
+      // The ONE definition, not a second derivation. Bit-identical, because a
+      // sawtooth `(t / TICK_RATE / DAY_PERIOD_S) % 1` agrees with the frozen
+      // triangle only at t === 0 and is exactly half of it everywhere in the
+      // first half-cycle — that divergence is what §B.1 hoisted this to stop.
+      expect(s.dayPhase).toBe(dayPhase(s.matchTick));
+      expect(s.dayPhase).toBeGreaterThanOrEqual(0);
+      expect(s.dayPhase).toBeLessThanOrEqual(1);
+      seen.push(s.dayPhase);
+    }
+    // Derived from the CONSTANTS rather than from the function, so this still
+    // fails if room.ts and config.ts agree on the wrong shape: a triangle
+    // reaches 1 at half a cycle, so the first half ramps at 1/(cycle/2).
+    const half = (DAY_PERIOD_S * TICK_RATE) / 2;
+    expect(seen[seen.length - 1]).toBeCloseTo(40 / half, 12);
+    expect(seen[0]).toBeCloseTo(1 / half, 12);
+    // it MOVES — the field being absent read as a permanently frozen noon
+    expect(seen[seen.length - 1]).toBeGreaterThan(seen[0] ?? 0);
+    // both teams get the same phase on the same tick
+    expect(latestSnap(io, 'p2').dayPhase).toBe(latestSnap(io, 'p1').dayPhase);
+  });
+
+  it('is a pure function of matchTick: the wall clock cannot move it', () => {
+    const a = boot([
+      ['p1', 'Ada'],
+      ['p2', 'Bob'],
+    ]);
+    pressStartAndLock(a.room, 'p1');
+    const seqA: number[] = [];
+    for (let i = 0; i < 30; i++) {
+      a.room.tickOnce();
+      seqA.push(latestSnap(a.io, 'p1').dayPhase);
+    }
+    const timeA = latestSnap(a.io, 'p1').serverTime;
+    a.room.stop(); // its tick interval must not steal room B's countdown timer
+
+    // A fresh, identical room half a day later on the wall clock.
+    vi.setSystemTime(new Date(Date.now() + 12 * 60 * 60 * 1000));
+    const b = boot([
+      ['p1', 'Ada'],
+      ['p2', 'Bob'],
+    ]);
+    pressStartAndLock(b.room, 'p1');
+    const seqB: number[] = [];
+    for (let i = 0; i < 30; i++) {
+      b.room.tickOnce();
+      seqB.push(latestSnap(b.io, 'p1').dayPhase);
+    }
+    expect(seqB).toEqual(seqA);
+    // ...and the clock really did jump, so the equality above means something
+    expect(latestSnap(b.io, 'p1').serverTime).toBeGreaterThan(timeA + 11 * 60 * 60 * 1000);
+  });
+
+  it('stays inside [0,1] and climbs monotonically across a long pump', { timeout: 30_000 }, () => {
+    const { room, io } = boot([['p1', 'Ada']], { clone: false });
+    pressStartAndLock(room, 'p1');
+    let prev = -1;
+    for (let i = 0; i < 900; i++) {
+      room.tickOnce();
+      const s = latestSnap(io, 'p1');
+      expect(s.dayPhase).toBeGreaterThanOrEqual(0);
+      expect(s.dayPhase).toBeLessThanOrEqual(1);
+      expect(s.dayPhase).toBeGreaterThan(prev); // 900 ticks is deep inside the first ramp
+      prev = s.dayPhase;
+    }
+    expect(prev).toBeCloseTo(900 / ((DAY_PERIOD_S * TICK_RATE) / 2), 12);
+  });
+});
+
+// ---- neutral jungle camps on the wire ------------------------------------------------------
+
+describe('neutral camps on the wire (TERRAIN_CONTRACT §5)', () => {
+  it('withholds a camp sitting in unexplored jungle from BOTH teams', () => {
+    const { room, io } = boot([
+      ['p1', 'Ada'],
+      ['p2', 'Bob'],
+    ]);
+    pressStartAndLock(room, 'p1');
+    pump(room, 5);
+
+    // the jungle is populated — the absence below is fog, not an empty map
+    const w = worldOf(room);
+    expect(w.camps.length).toBeGreaterThan(0);
+    expect(w.camps.every((c) => c.aliveCount > 0)).toBe(true);
+    expect([...w.mobiles()].some((e) => isCampKind(e.kind))).toBe(true);
+
+    // ...and neither fountain can see any of it
+    expect(campEnts(latestSnap(io, 'p1'))).toHaveLength(0);
+    expect(campEnts(latestSnap(io, 'p2'))).toHaveLength(0);
+  });
+
+  it('sends a camp once a hero walks it into vision, with team === NEUTRAL_TEAM', { timeout: 60_000 }, () => {
+    const { room, io } = boot([
+      ['p1', 'Ada'],
+      ['p2', 'Bob'],
+    ]);
+    pressStartAndLock(room, 'p1');
+    pump(room, 2);
+
+    // camp 0 on the 1-lane map sits in team 0's half, ~50 m out from the base
+    const camp = buildMap(1).terrain.camps[0];
+    expect(camp).toBeDefined();
+    let seen: EntSnap[] = [];
+    for (let round = 0; round < 60 && seen.length === 0; round++) {
+      room.handleMessage('p1', { t: 'rift_order', kind: 'move', x: camp?.x ?? 0, z: camp?.z ?? 0 });
+      pump(room, 20);
+      seen = campEnts(latestSnap(io, 'p1'));
+    }
+    expect(seen.length).toBeGreaterThan(0);
+    for (const e of seen) {
+      expect(e.team).toBe(NEUTRAL_TEAM);
+      expect(isCampKind(e.k)).toBe(true);
+      expect(e.maxHp).toBeGreaterThan(0);
+      expect(e.hp).toBeGreaterThan(0);
+      // a camp is never a laner and never anyone's minion on the wire
+      expect(e.pid).toBeUndefined();
+      expect(e.hero).toBeUndefined();
+    }
+    // the same fog rule applies per team: p2, still at its own fountain across
+    // the map, is told nothing about a camp team 0 is standing in
+    expect(campEnts(latestSnap(io, 'p2'))).toHaveLength(0);
+  });
+});
+
+// ---- miss events ---------------------------------------------------------------------------
+
+describe('rift_miss (AMENDMENT_1 §B.2)', () => {
+  it('goes to the teams that see the ATTACKER, and never to the target-only team', () => {
+    const { room, io } = boot([
+      ['p1', 'Ada'],
+      ['p2', 'Bob'],
+    ]);
+    pressStartAndLock(room, 'p1');
+    pump(room, 3);
+
+    // The two fountains are ~105 m apart, so each team's vision set holds its
+    // own hero and not the enemy's — the exact split that tells filtering on
+    // `attacker` apart from filtering on `target`.
+    const h1 = heroEntByPid(latestSnap(io, 'p1'), 'p1').id;
+    const h2 = heroEntByPid(latestSnap(io, 'p2'), 'p2').id;
+    expect(latestSnap(io, 'p1').ents.some((e) => e.id === h2)).toBe(false);
+
+    worldOf(room).pushEvent({ k: 'miss', attacker: h1, target: h2 });
+    room.tickOnce();
+    expect(io.events('p1', 'rift_miss')).toEqual([{ t: 'rift_miss', attacker: h1, target: h2 }]);
+    expect(io.events('p2', 'rift_miss')).toHaveLength(0);
+
+    // mirrored: the same pair with the roles swapped reaches p2 and only p2
+    worldOf(room).pushEvent({ k: 'miss', attacker: h2, target: h1 });
+    room.tickOnce();
+    expect(io.events('p2', 'rift_miss')).toEqual([{ t: 'rift_miss', attacker: h2, target: h1 }]);
+    expect(io.events('p1', 'rift_miss')).toHaveLength(1); // unchanged
+  });
+
+  it('carries ENTITY ids straight through — never a player id, never a remap', () => {
+    const { room, io } = boot([
+      ['p1', 'Ada'],
+      ['p2', 'Bob'],
+    ]);
+    pressStartAndLock(room, 'p1');
+    pump(room, 3);
+
+    const snap = latestSnap(io, 'p1');
+    const h1 = heroEntByPid(snap, 'p1').id;
+    const ally = snap.ents.find((e) => e.k === 'hero' && e.team === 0 && e.pid !== 'p1');
+    expect(ally).toBeDefined();
+    worldOf(room).pushEvent({ k: 'miss', attacker: h1, target: ally?.id ?? 0 });
+    room.tickOnce();
+
+    const ev = io.events('p1', 'rift_miss')[0];
+    expect(ev?.attacker).toBe(h1);
+    expect(ev?.target).toBe(ally?.id);
+    expect(typeof ev?.attacker).toBe('number');
+    expect(typeof ev?.target).toBe('number');
+  });
+});
+
+// ---- neutral deaths ------------------------------------------------------------------------
+
+describe('a neutral death is not a kill', () => {
+  it('wiping a camp emits no rift_kill and leaves the scoreboard untouched', () => {
+    const { room, io } = boot([
+      ['p1', 'Ada'],
+      ['p2', 'Bob'],
+    ]);
+    pressStartAndLock(room, 'p1');
+    pump(room, 5);
+    expect(io.events('p1', 'rift_kill')).toHaveLength(0);
+    const boardBefore = latestSnap(io, 'p1').board.map((r) => `${r.id}/${r.team}/${r.kills}`);
+
+    const wiped = wipeCamp(room, 0);
+    expect(wiped).toBeGreaterThan(0);
+    pump(room, 3); // reap + the ticks after it
+
+    expect(worldOf(room).camps[0]?.aliveCount).toBe(0);
+    expect(io.events('p1', 'rift_kill')).toHaveLength(0);
+    expect(io.events('p2', 'rift_kill')).toHaveLength(0);
+
+    // the board still holds exactly the seats, all on player teams
+    const board = latestSnap(io, 'p1').board;
+    expect(board).toHaveLength(internals(room).seats.length);
+    expect(board.map((r) => `${r.id}/${r.team}/${r.kills}`)).toEqual(boardBefore);
+    for (const row of board) {
+      expect(row.team === 0 || row.team === 1).toBe(true);
+      expect(internals(room).seats.some((s) => s.pid === row.id)).toBe(true);
+    }
+  });
+
+  it('drops a kill event whose victim holds no seat, and only that one', () => {
+    const { room, io } = boot([
+      ['p1', 'Ada'],
+      ['p2', 'Bob'],
+    ]);
+    pressStartAndLock(room, 'p1');
+    pump(room, 3);
+
+    // '' is what combat.ts emits for a victim with a null pid; a camp creep
+    // never had a pid to begin with. Neither resolves against the snapshot
+    // board, so neither is renderable as a kill feed row.
+    worldOf(room).pushEvent({ k: 'kill', killerPid: null, victimPid: '', gold: 0, firstBlood: false });
+    worldOf(room).pushEvent({ k: 'kill', killerPid: 'p1', victimPid: 'camp-1004', gold: 42, firstBlood: false });
+    room.tickOnce();
+    expect(io.events('p1', 'rift_kill')).toHaveLength(0);
+    expect(io.events('p2', 'rift_kill')).toHaveLength(0);
+
+    // control: a real seated victim still goes out, unchanged, to everyone
+    worldOf(room).pushEvent({ k: 'kill', killerPid: 'p1', victimPid: 'p2', gold: 300, firstBlood: true });
+    room.tickOnce();
+    expect(io.events('p1', 'rift_kill')).toEqual([
+      { t: 'rift_kill', killer: 'p1', victim: 'p2', gold: 300, firstBlood: true },
+    ]);
+    expect(io.events('p2', 'rift_kill')).toHaveLength(1);
+  });
+});
+
+// ---- bot camp percepts ---------------------------------------------------------------------
+
+describe('bot camp percepts (TERRAIN_CONTRACT §5)', () => {
+  it('feeds one CampPercept per World.camps entry, index === id, matching the map', () => {
+    const { room } = boot([['p1', 'Ada']]);
+    pressStartAndLock(room, 'p1');
+    const seen = recordBotPercepts(room);
+    // 3 ticks, not 1: the refresh runs at the TOP of tickOnce and stepCamps
+    // spawns the first generation inside advance(), so tick 1 legitimately
+    // reports every camp down. Tick 2 onward is the steady state.
+    pump(room, 3);
+
+    const defs = buildMap(1).terrain.camps;
+    const shot = seen[seen.length - 1];
+    expect(defs.length).toBeGreaterThan(0);
+    expect(shot?.entries).toHaveLength(defs.length);
+    defs.forEach((def, i) => {
+      const p = shot?.entries[i];
+      expect(p?.id).toBe(i); // index === id, so a bot can hand the id back
+      expect(p?.tier).toBe(def.tier);
+      expect(p?.x).toBe(def.x);
+      expect(p?.z).toBe(def.z);
+      expect(shot?.up[i]).toBe(true);
+    });
+    // the percept is the room's table, not a copy the bot could be handed
+    expect(shot?.percept.camps).toBe(shot?.campsArray);
+  });
+
+  it('refreshes `up` IN PLACE — one array and one object per camp for the match', () => {
+    const { room } = boot([['p1', 'Ada']]);
+    pressStartAndLock(room, 'p1');
+    const seen = recordBotPercepts(room);
+    room.tickOnce();
+    room.tickOnce();
+    room.tickOnce();
+
+    // Identity of the ARRAY and of every ELEMENT, compared against references
+    // captured on the earlier tick — 16 bots at 20 Hz must allocate nothing.
+    expect(seen).toHaveLength(3);
+    const first = seen[0];
+    const steady = seen[2];
+    expect(steady?.campsArray).toBe(first?.campsArray);
+    // reference equality per element, NOT toEqual — a rebuilt table holding
+    // fresh objects with identical field values is deep-equal and is exactly
+    // the allocation this rule forbids
+    expect(steady?.entries.map((e, i) => e === first?.entries[i])).toEqual(
+      first?.entries.map(() => true),
+    );
+    expect(steady?.up.every((u) => u)).toBe(true);
+
+    wipeCamp(room, 0);
+    room.tickOnce(); // advance() reaps the members
+    room.tickOnce(); // the refresh at the top of THIS tick reads aliveCount 0
+    const after = seen[seen.length - 1];
+
+    expect(worldOf(room).camps[0]?.aliveCount).toBe(0);
+    expect(after?.up[0]).toBe(false);
+    expect(after?.up.slice(1).every((u) => u)).toBe(true);
+    // still the very same table and the very same objects: `up` was rewritten
+    // on the object the bot already held, not swapped for a fresh one
+    expect(after?.campsArray).toBe(first?.campsArray);
+    expect(after?.entries[0]).toBe(first?.entries[0]);
+    expect(first?.entries[0]?.up).toBe(false);
   });
 });
 

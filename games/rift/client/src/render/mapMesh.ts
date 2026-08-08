@@ -107,9 +107,26 @@
 // The tripling of the heights (the tower was 3.5 m) is exactly the kind of
 // change a hand-typed radius survives silently, and the old
 // `PLATFORM_RADIUS = 7.6` in this file was one of those. The
-// measured envelope is what keeps kerbs and stelae off the structures, and it is
-// what `reportClearance` compares against `GUARD_FLANK_DIST` so the Ancient /
-// guard overlap is stated in numbers rather than in adjectives.
+// measured envelope is what keeps kerbs and stelae off the structures, and its
+// RADIAL SILHOUETTE — the greatest reach per bearing, not one disc radius — is
+// what `reportClearance` walks against the real placement so the Ancient/guard
+// clearance is stated in numbers rather than in adjectives.
+//
+// GUARD INSET. The guards' visual envelope does not fit the ground the frozen
+// placement gives them: at `GUARD_FLANK_DIST` 7.51 m from its Ancient, a guard's
+// scattered plinth stone reached 10.11-10.27 m from the base plateau's centre
+// against a `BASE_PLATFORM_RADIUS` of 10, so all four guards on the map hung
+// over the cliff ring, and the team-1 flank grazed the Ancient's dais. Neither
+// side can move: `GUARD_FLANK_DIST` drives tower aggro and pathing, and the
+// plateau is a 1 m grid disc whose cliff ring already runs out to `BASE_INSET`
+// with nothing spare. So the guard archetype is drawn with a HORIZONTAL inset —
+// `guardInset`, ~0.87 — solved in closed form as the largest scale whose every
+// vertex still lands inside the plateau rim. It is a mesh-side change only: the
+// build stays on its entity's own coordinate, its height is untouched, and the
+// sim's `GUARD_TOWER.radius` 1.2 never sees it. It also RETIRES ITSELF — the
+// solve returns 1 the day R_MESH_STRUCT brings the guard's ground scatter inside
+// 2.44 m of outward reach, which is what it would take to carry the authored
+// "18% broader than a lane tower" tell at full size.
 //
 // LANDMARK FOOTPRINT. R_VEG keeps `LANDMARK_KEEP_R` = 4 m clear around every
 // landmark anchor and says in its own comment that the number is an assumption
@@ -383,30 +400,64 @@ interface Placement {
 // Structure archetypes
 // ============================================================================
 
+/** Bearing buckets in a structure's radial silhouette, one degree each. Chosen
+ *  against the vertex counts actually shipped — the guard archetype carries 4020
+ *  vertices and the Ancient 8496, so a one-degree bucket holds ten or more of
+ *  them and the profile is sampled, not guessed. Empty buckets are filled from
+ *  their nearest occupied neighbours in `envelopeOf`, upwards: an unsampled
+ *  bearing over-states the silhouette, so the clearance report errs towards
+ *  firing rather than towards silence. */
+const HULL_SECTORS = 360;
+
 /** The measured reach and height of a built archetype. Both come off the baked
- *  buckets' bounding boxes, so they track whatever R_MESH_STRUCT actually
- *  shipped rather than a number written down beside it. The hidden damage layer
- *  is excluded: it is never drawn on a healthy structure, and including it would
+ *  buckets' own vertices, so they track whatever R_MESH_STRUCT actually shipped
+ *  rather than a number written down beside it. The hidden damage layer is
+ *  excluded: it is never drawn on a healthy structure, and including it would
  *  over-report the envelope of every structure on the map. */
 interface Envelope {
   /** Greatest horizontal distance from the build origin to any visible VERTEX.
    *  Measured per vertex, not off the axis-aligned bounding box: a box corner
-   *  distance over-reports a piece that is offset diagonally, and this number is
-   *  quoted straight into a clearance complaint aimed at another module. On the
-   *  shipped team-0 archetypes the AABB form inflated the Ancient from 5.19 m to
-   *  7.10 m and the guard from 2.94 m to 3.96 m, which would have asked
-   *  R_MESH_STRUCT to cut 3.55 m off an overlap that is really 0.62 m. */
+   *  distance over-reports a piece that is offset diagonally. This is the disc
+   *  that keeps kerbs and stelae out — a prop can stand at any bearing, so for
+   *  a keep-out the worst bearing IS the right number. */
   readonly radius: number;
   /** Top of the visible geometry above the build origin, metres. */
   readonly top: number;
+  /** Greatest horizontal reach per bearing bucket, metres, indexed by
+   *  `sectorOf`. Two structures at a KNOWN separation meet along one bearing,
+   *  not along their worst two, and the difference is not academic: summing the
+   *  disc radii called every Ancient/guard pair 0.51-0.62 m interpenetrated
+   *  when, walked by bearing, three of the four flanks stand 0.23-1.08 m clear
+   *  and the fourth grazes by 0.02 m. Quoting the disc sum at R_MESH_STRUCT
+   *  would have asked for 0.6 m off the biggest build in the game to close a
+   *  2 cm graze — the same mistake, one level up, that `radius` already avoids
+   *  by not being an AABB corner. */
+  readonly hull: Float32Array;
 }
 
-function envelopeOf(group: THREE.Object3D): Envelope {
+/** Bucket index for a bearing, from a horizontal offset. */
+function sectorOf(x: number, z: number): number {
+  const s = Math.floor(((Math.atan2(z, x) + Math.PI) / (2 * Math.PI)) * HULL_SECTORS);
+  return s < 0 ? 0 : s >= HULL_SECTORS ? HULL_SECTORS - 1 : s;
+}
+
+/** The silhouette's reach in the direction of a horizontal offset, metres. */
+function hullAt(env: Envelope, x: number, z: number): number {
+  return env.hull[sectorOf(x, z)] ?? 0;
+}
+
+/** Measure an archetype, optionally as it will be DRAWN rather than as it was
+ *  built: `xz` is the horizontal inset the instance matrices will carry, so
+ *  every number this returns describes pixels on the screen. A caller that
+ *  passes 1 measures the build itself.
+ */
+function envelopeOf(group: THREE.Object3D, xz: number): Envelope {
   // The archetype comes out of `bake()`, whose bucket meshes sit at identity —
   // but the world matrix is applied anyway, so a builder that ever nests a
   // transform cannot silently shrink the measured envelope.
   group.updateMatrixWorld(true);
   const v = new THREE.Vector3();
+  const seen = new Float32Array(HULL_SECTORS);
   let r2 = 0;
   let top = 0;
   group.traverse((o) => {
@@ -416,12 +467,32 @@ function envelopeOf(group: THREE.Object3D): Envelope {
     if (pos === undefined) return;
     for (let i = 0; i < pos.count; i++) {
       v.fromBufferAttribute(pos, i).applyMatrix4(mesh.matrixWorld);
-      const d = v.x * v.x + v.z * v.z;
+      const x = v.x * xz;
+      const z = v.z * xz;
+      const d = x * x + z * z;
       if (d > r2) r2 = d;
       if (v.y > top) top = v.y;
+      const s = sectorOf(x, z);
+      const r = Math.sqrt(d);
+      if (r > (seen[s] ?? 0)) seen[s] = r;
     }
   });
-  return { radius: Math.sqrt(r2), top };
+  // Close the bearings no vertex landed in, from the nearest occupied bucket on
+  // each side, keeping the larger. Two wrapping laps per direction so a run of
+  // empties that straddles the +/-180 seam is filled from both ends.
+  const hull = Float32Array.from(seen);
+  for (const dir of [1, -1] as const) {
+    let carry = 0;
+    for (let lap = 0; lap < 2; lap++) {
+      for (let n = 0; n < HULL_SECTORS; n++) {
+        const s = dir === 1 ? n : HULL_SECTORS - 1 - n;
+        const hit = seen[s] ?? 0;
+        if (hit > 0) carry = hit;
+        else if (carry > (hull[s] ?? 0)) hull[s] = carry;
+      }
+    }
+  }
+  return { radius: Math.sqrt(r2), top, hull };
 }
 
 /** One archetype = one (kind, team) pair, built once and instanced across every
@@ -1045,50 +1116,180 @@ function placeLandmarks(chunks: ChunkSet, map: MapDef, core: SceneCore, r: Rng):
 // Clearance (AMENDMENT_3 §G.3, and the R_MESH_STRUCT seam)
 // ============================================================================
 
+/** Metres of daylight a guard's drawn silhouette must keep inside
+ *  `BASE_PLATFORM_RADIUS`. The plateau is painted on the frozen 1 m terrain grid
+ *  and its cliff ring is carved from the LOW side, so the rim a player sees is a
+ *  staircase about the nominal 10 m; a tenth of a metre is the smallest inset
+ *  that reads as "standing on the plateau" rather than "level with its edge",
+ *  and it costs the guard 0.03 of its scale over asking for zero. */
+const RIM_CLEARANCE = 0.1;
+
+/** Metres of daylight required between the Ancient's silhouette and a guard's,
+ *  measured radially at the bearing where they face. Not zero: two builds that
+ *  merely fail to share a vertex still read as one mass from the 55 deg camera,
+ *  and `close-ancient` is a shot whose whole job is to show them apart. */
+const STRUCT_CLEARANCE = 0.1;
+
+/** Floor on `guardInset`. If the rim ever demanded more than this the answer is
+ *  no longer "inset the guard" — a guard squashed past a fifth of its authored
+ *  breadth stops reading as the broader-than-a-lane-tower build it is drawn to
+ *  be — so the solve stops here and lets `reportClearance` say so out loud. */
+const MIN_GUARD_INSET = 0.8;
+
+/** Where one team's guards stand RELATIVE to the Ancient they flank — which is
+ *  also relative to the centre of the base platform, since `terrain.ts` paints
+ *  that disc on the Ancient. Read off `map.structures` rather than rebuilt from
+ *  `GUARD_FLANK_DIST` and the diagonal, so a change to the placement rule
+ *  arrives here on its own. */
+function flankOffsets(map: MapDef, team: TeamId): Vec2[] {
+  const seat = map.structures.find((s) => s.kind === 'ancient' && s.team === team);
+  if (seat === undefined) return [];
+  const out: Vec2[] = [];
+  for (const s of map.structures) {
+    if (s.kind === 'guard' && s.team === team) out.push({ x: s.x - seat.x, z: s.z - seat.z });
+  }
+  return out;
+}
+
 /**
- * The Ancient and its two guards are placed by `shared/src/map.ts` at
- * `GUARD_FLANK_DIST` (7.51 m), a distance derived from the GAMEPLAY radii:
- * `ANCIENT.radius` 2.3 + `GUARD_TOWER.radius` 1.2 + `STRUCTURE_MARGIN` 4. The
- * VISUAL envelopes are an entirely different pair of numbers, and after the
- * height tripling they are much larger. Neither the mesh module nor the map
- * generator can see both at once. This module can — it is where the archetypes
- * and the placement meet — so this is where the comparison belongs.
+ * The horizontal scale the guard archetype is DRAWN at, solved from the plateau
+ * it stands on.
  *
- * It cannot fix either side, and deliberately does not try. `GUARD_FLANK_DIST`
- * is frozen gameplay data, and moving a mesh off its entity's own coordinate
- * would decouple the silhouette from its hitbox, its attack range and its click
- * target — a far worse defect than the overlap. So the finding is REPORTED, with
- * the measured numbers, once per match: loudly enough that it cannot be mistaken
- * for cosmetic, and precisely enough that the fix is arithmetic. For the two
- * builds to stand clear, `ancient.radius + guard.radius` must come inside
- * `GUARD_FLANK_DIST`; for the guard to stand on the plateau rather than over its
- * cliff ring, `guard.radius` must come inside
- * `BASE_PLATFORM_RADIUS - GUARD_FLANK_DIST` = 2.49 m.
+ * A guard sits at `GUARD_FLANK_DIST` (7.51 m) from its Ancient, on a base
+ * platform of `BASE_PLATFORM_RADIUS` (10 m) centred on that same Ancient. Both
+ * numbers are frozen: `GUARD_FLANK_DIST` is derived from the GAMEPLAY radii
+ * (`ANCIENT.radius` 2.3 + `GUARD_TOWER.radius` 1.2 + `STRUCTURE_MARGIN` 4) and
+ * drives tower aggro and pathing, and the platform's radius plus its one-cell
+ * cliff ring exactly fills the ground out to `BASE_INSET` with nothing spare.
+ * The guard's VISUAL envelope answers to neither and, as shipped, overhung: its
+ * scattered plinth stone reached 10.11-10.27 m from the plateau centre.
+ *
+ * So the geometry gives way, on the only side that can: for each placement this
+ * asks for the largest scale `k` at which EVERY vertex still lands inside the
+ * rim. |D + k v| = R is a quadratic in k with one positive root per vertex —
+ * `(v.v)k^2 + 2(D.v)k + (D.D - R^2) = 0`, and `D.D < R^2` because the guard's
+ * own origin is well inside the platform, so the discriminant is never negative
+ * and the root is always real. The smallest root over every vertex and both
+ * flanks is the answer, capped at 1: a guard that already fits is left alone.
+ *
+ * This changes pixels and nothing else. The build keeps its coordinate, its
+ * yaw, its height and its hitbox; only its horizontal spread comes in, by ~13%.
  */
-function reportClearance(envelopes: ReadonlyMap<string, Envelope>): void {
+function guardInset(group: THREE.Object3D, offsets: readonly Vec2[]): number {
+  group.updateMatrixWorld(true);
+  const rim = BASE_PLATFORM_RADIUS - RIM_CLEARANCE;
+  const v = new THREE.Vector3();
+  let k = 1;
+  for (const d of offsets) {
+    const c = d.x * d.x + d.z * d.z - rim * rim;
+    group.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      if (mesh.isMesh !== true || mesh.visible === false) return;
+      const pos = mesh.geometry.getAttribute('position') as THREE.BufferAttribute | undefined;
+      if (pos === undefined) return;
+      for (let i = 0; i < pos.count; i++) {
+        v.fromBufferAttribute(pos, i).applyMatrix4(mesh.matrixWorld);
+        const a = v.x * v.x + v.z * v.z;
+        // A vertex on the build's own axis cannot leave the rim at any scale.
+        if (a < 1e-9) continue;
+        const b = d.x * v.x + d.z * v.z;
+        const root = (-b + Math.sqrt(b * b - a * c)) / a;
+        if (root < k) k = root;
+      }
+    });
+  }
+  return k < MIN_GUARD_INSET ? MIN_GUARD_INSET : k;
+}
+
+/**
+ * Walk the DRAWN Ancient and guard silhouettes against the REAL placement and
+ * say, in metres, whether they stand clear of each other and of the plateau.
+ *
+ * This is the one place in the build that can see both sides — the archetypes
+ * come from `structures.ts` and the coordinates from `map.ts`, and neither
+ * module can see the other — so the measurement belongs here, and it is a
+ * measurement of pixels: the envelopes it reads were taken AFTER `guardInset`,
+ * so what it reports is what renders.
+ *
+ * It walks BEARINGS, not disc radii. Two builds 7.51 m apart meet along one
+ * direction; adding the greatest reach of each, in whatever direction each
+ * happens to have it, is a bound and not a measurement — on the shipped
+ * archetypes it called every pair 0.51-0.62 m interpenetrated when the worst of
+ * the four flanks grazes by 0.02 m and the other three stand 0.23-1.08 m clear,
+ * and quoting that at R_MESH_STRUCT would have asked for 0.6 m off the biggest
+ * build in the game to close a 2 cm graze.
+ * Walking bearings is also STRICTER where it counts: it tests each flank
+ * separately (the two differ by 0.28 m at the rim, which one disc cannot say),
+ * it tests both directions of penetration, and it measures the true distance
+ * from the plateau centre instead of assuming the worst vertex lies on the
+ * outward ray.
+ *
+ * It reports; it does not fix. `guardInset` is the only lever this module
+ * pulls, and it is solved from the rim alone — if the Ancient and its guard
+ * still crowd each other after it, that IS R_MESH_STRUCT's to answer, and the
+ * warning below is what asks, with the bearing and the metres.
+ */
+function reportClearance(map: MapDef, envelopes: ReadonlyMap<string, Envelope>): void {
   for (const team of [0, 1] as const) {
     const anc = envelopes.get(`ancient:${String(team)}`);
     const gua = envelopes.get(`guard:${String(team)}`);
-    if (anc === undefined || gua === undefined) continue;
-    const need = anc.radius + gua.radius;
-    const overlap = need - GUARD_FLANK_DIST;
-    const overhang = GUARD_FLANK_DIST + gua.radius - BASE_PLATFORM_RADIUS;
-    if (overlap > 0) {
-      console.warn(
-        `rift mapMesh: team ${String(team)} Ancient and guard INTERPENETRATE by ` +
-          `${overlap.toFixed(2)} m — measured envelopes ${anc.radius.toFixed(2)} m + ` +
-          `${gua.radius.toFixed(2)} m = ${need.toFixed(2)} m against GUARD_FLANK_DIST ` +
-          `${GUARD_FLANK_DIST.toFixed(2)} m. The meshes must come in; the placement is ` +
-          'frozen gameplay data.',
-      );
-    }
-    if (overhang > 0) {
-      console.warn(
-        `rift mapMesh: team ${String(team)} guard overhangs the base plateau rim by ` +
-          `${overhang.toFixed(2)} m — GUARD_FLANK_DIST ${GUARD_FLANK_DIST.toFixed(2)} m + ` +
-          `envelope ${gua.radius.toFixed(2)} m against BASE_PLATFORM_RADIUS ` +
-          `${BASE_PLATFORM_RADIUS.toFixed(2)} m.`,
-      );
+    const seat = map.structures.find((s) => s.kind === 'ancient' && s.team === team);
+    if (anc === undefined || gua === undefined || seat === undefined) continue;
+    for (const g of map.structures) {
+      if (g.kind !== 'guard' || g.team !== team) continue;
+      const dx = g.x - seat.x;
+      const dz = g.z - seat.z;
+      const bearing = (Math.atan2(dz, dx) * 180) / Math.PI;
+      let far = 0;
+      let gap = Infinity;
+      let gapAt = 0;
+      // The guard's silhouette, bucket by bucket, in the Ancient's frame: how
+      // far out on the plateau it reaches, and how much of the Ancient's own
+      // reach is left under it.
+      for (let s = 0; s < HULL_SECTORS; s++) {
+        const phi = ((s + 0.5) / HULL_SECTORS) * 2 * Math.PI - Math.PI;
+        const r = gua.hull[s] ?? 0;
+        const wx = dx + r * Math.cos(phi);
+        const wz = dz + r * Math.sin(phi);
+        const dist = Math.hypot(wx, wz);
+        if (dist > far) far = dist;
+        const clear = dist - hullAt(anc, wx, wz);
+        if (clear < gap) {
+          gap = clear;
+          gapAt = (Math.atan2(wz, wx) * 180) / Math.PI;
+        }
+      }
+      // ...and the Ancient's silhouette in the guard's frame, which is the half
+      // that catches an arm or a standard reaching sideways into the guard.
+      for (let s = 0; s < HULL_SECTORS; s++) {
+        const phi = ((s + 0.5) / HULL_SECTORS) * 2 * Math.PI - Math.PI;
+        const r = anc.hull[s] ?? 0;
+        const wx = r * Math.cos(phi) - dx;
+        const wz = r * Math.sin(phi) - dz;
+        const clear = Math.hypot(wx, wz) - hullAt(gua, wx, wz);
+        if (clear < gap) {
+          gap = clear;
+          gapAt = (phi * 180) / Math.PI;
+        }
+      }
+      if (gap < STRUCT_CLEARANCE) {
+        console.warn(
+          `rift mapMesh: team ${String(team)} Ancient and its guard at bearing ` +
+            `${bearing.toFixed(0)} deg stand ${gap.toFixed(2)} m apart at bearing ` +
+            `${gapAt.toFixed(0)} deg — under the ${STRUCT_CLEARANCE.toFixed(2)} m two ` +
+            'silhouettes need to read as separate builds. The meshes must come in; ' +
+            `GUARD_FLANK_DIST ${GUARD_FLANK_DIST.toFixed(2)} m is frozen gameplay data.`,
+        );
+      }
+      if (far > BASE_PLATFORM_RADIUS) {
+        console.warn(
+          `rift mapMesh: team ${String(team)} guard at bearing ${bearing.toFixed(0)} deg ` +
+            `overhangs the base plateau rim by ${(far - BASE_PLATFORM_RADIUS).toFixed(2)} m — ` +
+            `its silhouette reaches ${far.toFixed(2)} m from the plateau centre against ` +
+            `BASE_PLATFORM_RADIUS ${BASE_PLATFORM_RADIUS.toFixed(2)} m, and the inset ` +
+            `hit its ${MIN_GUARD_INSET.toFixed(2)} floor.`,
+        );
+      }
     }
   }
 }
@@ -1244,20 +1445,28 @@ export function buildMapMeshes(scene: SceneHandle, map: MapDef): void {
         const done = build;
         if (done === null) return false;
 
-        // -- phase 1: measure the envelope (a full vertex scan of the archetype)
-        //    and compose the per-instance transforms. `heightAt` is the single
-        //    authority for the foot of every structure.
+        // -- phase 1: solve the guard's horizontal inset, measure the envelope
+        //    AS DRAWN (a full vertex scan of the archetype) and compose the
+        //    per-instance transforms. `heightAt` is the single authority for
+        //    the foot of every structure.
         if (phase === 1) {
-          envelopes.set(`${a.kind}:${String(a.team)}`, envelopeOf(done.body.group));
+          // Only the guards are inset, and only by what the plateau rim demands
+          // (`guardInset`). Every other archetype is drawn exactly as authored.
+          const inset =
+            a.kind === 'guard' ? guardInset(done.body.group, flankOffsets(map, a.team)) : 1;
+          envelopes.set(`${a.kind}:${String(a.team)}`, envelopeOf(done.body.group, inset));
           mats = [];
           const q = new THREE.Quaternion();
           const pos = new THREE.Vector3();
-          const one = new THREE.Vector3(1, 1, 1);
+          // Horizontal only: the guard's 9.10 m is a navigation tell against the
+          // lane tower's 9.41 m, and scaling it away would trade one defect for
+          // a worse one.
+          const scale = new THREE.Vector3(inset, 1, inset);
           const axis = new THREE.Vector3(0, 1, 0);
           for (const s of a.at) {
             pos.set(s.x, core.heightAt(s.x, s.z), s.z);
             q.setFromAxisAngle(axis, yawOf(s, r));
-            mats.push(new THREE.Matrix4().compose(pos, q, one));
+            mats.push(new THREE.Matrix4().compose(pos, q, scale));
           }
           phase = 2;
           return mats.length > 0;
@@ -1314,7 +1523,7 @@ export function buildMapMeshes(scene: SceneHandle, map: MapDef): void {
   queue.push({
     heavy: false,
     step(): boolean {
-      reportClearance(envelopes);
+      reportClearance(map, envelopes);
       const kerbs = placeKerbs(map, core, envelopes, r);
       const rings = placeBaseRim(map, core, envelopes);
       const chunks = new ChunkSet();
