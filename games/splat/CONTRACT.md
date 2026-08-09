@@ -381,6 +381,96 @@ gets a new seed; `telemetry().drawCalls < 80`. Captures the §9.6 screenshot
 set to `screenshots/`. Add `"e2e:splat"` to root package.json — via the
 orchestrator, not by editing it yourself.
 
+## §7a Client-internal API seams (frozen — wave 2 codes against these)
+
+These freeze the boundaries BETWEEN client tasks so C2 never has to guess.
+Implementations may add methods; these exact signatures may not change.
+
+```ts
+// R1 render/scene.ts
+export class SplatScene {
+  constructor(parent: HTMLElement);
+  readonly world: THREE.Scene;              // R2 attaches here
+  buildTerrain(slope: SlopeDef): void;      // idempotent, disposes prior
+  setCamera(x: number, y: number, z: number, yaw: number,
+            v: number, steer: number, dt: number): void;
+  plantHit(): void;                         // retriggers the dip spring
+  prewarm(): boolean;
+  resize(): void;
+  render(): void;
+  drawCalls(): number;
+}
+
+// R2 render/plants.ts
+export class PlantField {
+  constructor(world: THREE.Scene, slope: SlopeDef);
+  hitPlant(plantIx: number): void;          // squash/shake; not consumed
+  update(dt: number, camZ: number): void;   // anims + distance culling
+}
+// R2 render/skiers.ts
+export class SkierVisuals {
+  constructor(world: THREE.Scene);
+  add(id: string, slot: number): void;
+  remove(id: string): void;
+  update(id: string, x: number, y: number, z: number,
+         yaw: number, steer: number, dt: number): void;
+  setOwnSkis(steer: number, v: number, dt: number): void;
+}
+// R2 render/fx.ts
+export type FxKind = 'spray' | 'puff' | 'confetti';
+export class SplatFx {
+  constructor(world: THREE.Scene);
+  burst(kind: FxKind, x: number, y: number, z: number): void;
+  update(dt: number, camX: number, camZ: number): void;
+}
+
+// C3 ui/hud.ts — C2 builds the state; render() is change-guarded
+export interface HudRacer { slot: number; z: number; finished: boolean; finishMs: number }
+export interface HudState {
+  phase: Phase; countdown: number; speedKmh: number; place: number;
+  total: number; you: HudRacer; racers: readonly HudRacer[];
+  results: readonly HudRacer[] | null;      // non-null only in results
+  colorFor(slot: number): string; glyphFor(slot: number): string;
+}
+export class SplatHud {
+  constructor(parent: HTMLElement);
+  render(s: HudState): void;
+  showSteerHint(): void;                    // first-run, UX_BIBLE
+}
+
+// C4 audio.ts
+export type SplatSfx = 'rustle' | 'beep' | 'go' | 'finish' | 'sting';
+export class SplatAudio {
+  resume(): void;                           // on every user gesture
+  wind(speedFrac: number): void;            // per frame, 0..1
+  carve(amount: number): void;              // per frame, 0..1
+  sfx(kind: SplatSfx, opts?: { distance?: number }): void;
+}
+
+// C1 drive.ts — keyboard internal; touch wired by C2 through `touch`;
+// debug/e2e via setInput (merged additively, the kart ext-latch pattern)
+export class DriveController {
+  constructor(slope: SlopeDef);
+  readonly touch: {
+    press(pointerId: number, side: 'left' | 'right' | null): void;
+    retarget(pointerId: number, side: 'left' | 'right' | null): void;
+    release(pointerId: number): void;
+    clear(): void;
+    isDown(side: 'left' | 'right'): boolean;
+  };
+  setInput(steer: number): void;            // external latch, -1..1
+  setAssist(on: boolean): void;             // forwards to predictor
+  step(dtMs: number): void;                 // per rAF
+  flush(send: (m: SplatC2S) => void): number;
+  reconcile(auth: Readonly<SkierSim>, ackSeq: number): number;
+  reset(x: number, z: number, yaw: number): void;
+  state(): SkierSim;
+  steerVisual(): number;                    // ramped steer for skis/roll
+}
+```
+
+---
+
 ## §8 Non-functional budgets (frozen)
 
 - **Performance:** 60 fps on iPad Air-class hardware at 8 players (measured on
