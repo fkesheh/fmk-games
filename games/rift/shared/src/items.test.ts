@@ -4,7 +4,9 @@
 // Mechanical validation of the frozen ITEMS record (CONTRACT §12 T2): every
 // item costs gold, carries display strings, and any active matches the frozen
 // ItemActive union shape. ITEM_LIST must be exactly Object.values(ITEMS), and
-// isItemId accepts exactly the 11 ids.
+// isItemId accepts exactly the 12 ids. Recipe items (item.ts header) get
+// their own gate: non-empty base-item components, no self-reference, and
+// recipe.cost === cost.
 //
 // Frozen data under test (Layer-1, IMMUTABLE): item.ts.
 // ============================================================================
@@ -21,17 +23,18 @@ const EXPECTED_ITEM_IDS: readonly ItemId[] = [
   'fang',
   'stormbow',
   'aegisheart',
+  'bulwarkplate',
   'blinkstone',
   'warhorn',
   'wardstone',
 ];
 
 describe('ITEMS record', () => {
-  it('holds exactly the 11 frozen item ids, keyed by their own id', () => {
+  it('holds exactly the 12 frozen item ids, keyed by their own id', () => {
     const keys = Object.keys(ITEMS).sort();
     expect(
       keys,
-      `ITEMS keys [${keys.join(', ')}] diverge from the frozen 11 [${[...EXPECTED_ITEM_IDS]
+      `ITEMS keys [${keys.join(', ')}] diverge from the frozen 12 [${[...EXPECTED_ITEM_IDS]
         .sort()
         .join(', ')}]`,
     ).toEqual([...EXPECTED_ITEM_IDS].sort());
@@ -104,6 +107,36 @@ describe('ITEMS record', () => {
     }
   });
 
+  it('recipes are valid: base-item components, no self-reference, cost consistent', () => {
+    const withRecipe = Object.values(ITEMS).filter((d) => d.recipe !== undefined);
+    expect(
+      withRecipe.length,
+      `expected exactly 5 recipe items (fang/stormbow/aegisheart/bulwarkplate/warhorn), found ` +
+        `${withRecipe.length}: [${withRecipe.map((d) => d.id).join(', ')}]`,
+    ).toBe(5);
+
+    for (const def of withRecipe) {
+      const recipe = def.recipe;
+      if (recipe === undefined) continue;
+      expect(
+        recipe.components.length,
+        `${def.id}: recipe must list at least one component`,
+      ).toBeGreaterThan(0);
+      expect(
+        recipe.cost === def.cost && def.cost > 0,
+        `${def.id}: recipe.cost ${recipe.cost} must equal the top-level cost ${def.cost} (and cost > 0)`,
+      ).toBe(true);
+      for (const comp of recipe.components) {
+        expect(comp, `${def.id}: a recipe may not consume itself`).not.toBe(def.id);
+        const compDef = ITEMS[comp]; // ItemId-typed: a bad id is a compile error, not a runtime one
+        expect(
+          compDef.recipe,
+          `${def.id}: component '${comp}' has its own recipe — components must be base items (one level only)`,
+        ).toBeUndefined();
+      }
+    }
+  });
+
   it('ITEM_LIST is exactly Object.values(ITEMS), element-for-element', () => {
     const values = Object.values(ITEMS);
     expect(
@@ -119,7 +152,7 @@ describe('ITEMS record', () => {
     });
   });
 
-  it('isItemId accepts exactly the 11 frozen ids', () => {
+  it('isItemId accepts exactly the 12 frozen ids', () => {
     for (const id of EXPECTED_ITEM_IDS) {
       expect(isItemId(id), `isItemId('${id}') should be true`).toBe(true);
     }

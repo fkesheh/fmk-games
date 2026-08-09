@@ -772,7 +772,8 @@ body {
 .hud > div:not([class])::before,
 .kill-row::before,
 .hint::before,
-.banner::before {
+.banner::before,
+.tooltip::before {
   content: '';
   position: absolute;
   inset: 0;
@@ -802,6 +803,7 @@ body {
 .shop-panel,
 .hint,
 .banner,
+.tooltip,
 .minimap {
   border: 1px solid var(--edge);
   box-shadow:
@@ -1783,6 +1785,108 @@ body {
   animation: none;
 }
 
+/* ---- ability tooltip (ONE shared card; hud.ts drives it on hover/focus) ----
+   A transient panel, so it takes the ::before fill WITHOUT the backdrop-blur
+   pass — the same call the kill rows and hints make (a blurred backdrop is a
+   per-region GPU pass, and this card appears and vanishes with the cursor).
+   All inner structure is classless by the §6 convention: header (glyph / name
+   / key badge / ULT-or-PASSIVE tag), the blurb, and the stat rows. */
+.tooltip {
+  position: fixed; /* hud.ts writes left/top on show — above the ability bar */
+  z-index: 6; /* above the bottom cluster and its pop/float effects */
+  width: 252px;
+  max-width: calc(100vw - 16px);
+  padding: 10px 12px;
+  border-radius: 8px;
+  color: var(--paper);
+  font-size: 12px; /* exactly the §8 floor — the smallest text this card carries */
+  line-height: 1.35;
+  pointer-events: none; /* it must never swallow a click meant for the bar */
+}
+
+.tooltip > header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.tooltip > header > b {
+  /* ability glyph — the same read as the portrait/slot glyphs */
+  font-size: 26px;
+  line-height: 1;
+  color: var(--gold-lit);
+  text-shadow: 0 2px 5px var(--ink-deep);
+}
+
+.tooltip > header > strong {
+  /* ability name — grows so the badge and tag pin to the card's right edge */
+  flex: 1;
+  font-size: 14px;
+}
+
+.tooltip > header > kbd {
+  /* Q/W/E/R badge — the same read as the slot's own badge */
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--ink-deep);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--gold-lit);
+}
+
+.tooltip > header > em {
+  /* ULT / PASSIVE tag — the WORD carries the meaning, the colour is garnish */
+  font-style: normal;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--gold);
+}
+
+.tooltip > i {
+  /* the one-line blurb */
+  display: block;
+  font-style: normal;
+  color: var(--paper-dim);
+  margin-bottom: 6px;
+}
+
+.tooltip > ul {
+  margin: 0;
+  padding: 6px 0 0;
+  border-top: 1px solid var(--edge);
+  list-style: none;
+  display: grid;
+  gap: 2px;
+}
+
+.tooltip > ul > li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.tooltip > ul > li > span {
+  /* stat label */
+  color: var(--paper-deep);
+}
+
+.tooltip > ul > li > b {
+  /* stat value, `current → next rank` while a next rank exists */
+  font-weight: 700;
+  text-align: right;
+}
+
+/* Touch: there is no hover to drive the card, and a focus-triggered popup
+   over the ability bar would fight the cast it's explaining — stay hidden. */
+@media (hover: none) {
+  .tooltip {
+    display: none;
+  }
+}
+
 .banner {
   position: fixed;
   top: calc(64px + var(--safe-top, 0px));
@@ -2005,6 +2109,15 @@ body {
   }
 
   .ability-cd {
+    font-size: 17px;
+  }
+
+  .tooltip {
+    width: 300px;
+    font-size: 14px;
+  }
+
+  .tooltip > header > strong {
     font-size: 17px;
   }
 

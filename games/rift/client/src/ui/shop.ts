@@ -1,10 +1,12 @@
 // ============================================================================
 // ANCIENTS (rift) client — SHOP (CONTRACT §6 ui/shop.ts, T9). A .shop-panel
 // toggled from the HUD gold readout: a .shop-grid of every ITEM_LIST entry
-// with icon, name, .shop-cost, and blurb. Buying is SERVER-AUTHORITATIVE: the
-// client only greys (insufficient gold / outside own fountain radius) and the
-// server ignores anything illegal — the grey is courtesy, not a gate. Click
-// buys into the first free slot via actions.send({t:'rift_buy'}).
+// with icon, name, .shop-cost, and blurb (recipe items add a classless
+// "Needs: …" build-path line). Buying is SERVER-AUTHORITATIVE: the client
+// only greys (insufficient gold / missing recipe components / outside own
+// fountain radius) and the server ignores anything illegal — the grey is
+// courtesy, not a gate. Click buys into the first free slot via
+// actions.send({t:'rift_buy'}).
 //
 // DOM CLASS CONTRACT (§6): renders only .shop-panel .shop-grid .shop-item
 // .shop-cost; structural children (icon, name, blurb, header) are classless —
@@ -12,7 +14,8 @@
 // entries; the disabled state is inline opacity (the class list has no state
 // classes). Gold text is >= 12px inline (§8 floor).
 // ============================================================================
-import { APAL, FOUNTAIN_RADIUS, ITEM_LIST } from '@rift/shared';
+import { APAL, FOUNTAIN_RADIUS, ITEMS, ITEM_LIST } from '@rift/shared';
+import type { ItemId } from '@rift/shared';
 import type { ClientState, UiActions, UiHandle } from '../contract.js';
 
 const FONT_MIN_PX = 12;
@@ -36,6 +39,8 @@ interface ShopRow {
   button: HTMLButtonElement;
   cost: HTMLElement;
   costValue: number;
+  /** Recipe component ids when the item combines, else null. */
+  components: readonly ItemId[] | null;
 }
 
 export function createShop(parent: HTMLElement): UiHandle {
@@ -76,10 +81,18 @@ export function createShop(parent: HTMLElement): UiHandle {
     blurb.textContent = def.blurb;
     blurb.style.fontSize = `${FONT_MIN_PX}px`;
     button.title = def.blurb;
+    if (def.recipe) {
+      // Build path, classless like the blurb: `Needs: Warmail + Plategirdle + 350g`.
+      const path = def.recipe.components.map((c) => ITEMS[c].name).join(' + ');
+      const needs = el('i', null, button);
+      needs.textContent = `Needs: ${path} + ${def.recipe.cost}g`;
+      needs.style.fontSize = `${FONT_MIN_PX}px`;
+      button.title = `${def.blurb}\nRequires: ${path} + ${def.recipe.cost}g`;
+    }
     button.onclick = () => {
       actionsRef?.send({ t: 'rift_buy', item: def.id });
     };
-    rows.push({ button, cost, costValue: def.cost });
+    rows.push({ button, cost, costValue: def.cost, components: def.recipe?.components ?? null });
   }
 
   let actionsRef: UiActions | null = null;
@@ -113,7 +126,12 @@ export function createShop(parent: HTMLElement): UiHandle {
       setText(goldReadout, ` ${gold}g `);
 
       for (const row of rows) {
-        const affordable = you !== null && you.gold >= row.costValue;
+        // Recipe rows also grey out while a component is missing — courtesy
+        // only; the server remains the gate.
+        const hasComponents =
+          row.components === null ||
+          (you !== null && row.components.every((c) => you.items.includes(c)));
+        const affordable = you !== null && you.gold >= row.costValue && hasComponents;
         const enabled = affordable && atFountain;
         row.button.disabled = !enabled;
         row.button.style.opacity = enabled ? '' : '0.4';

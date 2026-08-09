@@ -208,20 +208,45 @@ const SHOULDER_REACH = 4.5;
 // The two radii are used for two different rules, and the difference is
 // deliberate and measured:
 //
-//   * LANE / RAMP / BASE use `envLow`. BUILD_SPECS §R_VEG gives the reason for
-//     this rule in the same sentence as the rule: "vegetation must not encroach
-//     on walkable lane width, because there is no collision on it and players
-//     will read it as blocking when it is not." Only geometry a player can walk
-//     into reads as blocking, so only geometry inside the walkable band has to
-//     clear. Applying `envFull` instead was measured against the terrain
-//     itself: at a 5.8 m lane keep-out only 31.4% of the `foliage` zone is left
-//     plantable at 3 lanes and 26.2% at 2 — and the real `envFull` of a
-//     broadleaf is 7.42 m, so the true figures are lower still. That makes
-//     STYLE_BIBLE §8's floor of 8 trees per 100 m² OF THE ZONE arithmetically
-//     unreachable, whichever way the rest of the module is tuned. A canopy that
-//     overhangs a lane at 6 m is what a jungle edge looks like; a trunk in the
-//     lane is the defect. Verified: zero instances put walkable-band geometry
-//     over a lane, ramp or base cell at 1, 2 or 3 lanes.
+//   * LANE / RAMP / BASE use `envLow`, PLUS A SIGHTLINE WEDGE. The walkable-band
+//     rule stands: BUILD_SPECS §R_VEG gives the reason for it in the same
+//     sentence as the rule: "vegetation must not encroach on walkable lane
+//     width, because there is no collision on it and players will read it as
+//     blocking when it is not." Only geometry a player can walk into reads as
+//     blocking, so only geometry inside the walkable band has to clear.
+//     Applying `envFull` EVERYWHERE was measured against the terrain itself: at
+//     a 5.8 m lane keep-out only 31.4% of the `foliage` zone is left plantable
+//     at 3 lanes and 26.2% at 2 — and the real `envFull` of a broadleaf is
+//     7.42 m, so the true figures are lower still. That makes STYLE_BIBLE §8's
+//     floor of 8 trees per 100 m² OF THE ZONE arithmetically unreachable,
+//     whichever way the rest of the module is tuned.
+//
+//     But the walkable-band rule alone is not the whole law, because it
+//     answers the wrong question for the one direction the camera looks from.
+//     The camera is a fixed 55° top-down and ALWAYS sits at smaller z than its
+//     target (`applyCamera` in scene.ts: eye z = target z − camH/tan(55°)), so
+//     the sightline to any lane point arrives FROM THE SOUTH at a slope of
+//     tan(55°) ≈ 1.428, whatever the zoom. A tree h metres tall standing d
+//     metres south of a lane point therefore blocks it whenever d < h/1.428 —
+//     and with tree archetypes reaching 6-11.5 m (≈15 m at the kit's +30%
+//     scale cap) that reach is over 10 m, far beyond the ~1.5 m walkable-band
+//     clearance a trunk is owed. A canopy that overhangs a lane at 6 m FROM
+//     THE FAR SIDE is what a jungle edge looks like; the same canopy on the
+//     CAMERA side is a wall in front of the gameplay. So the lane law is
+//     two-part:
+//
+//       - EVERYWHERE: walkable-band (`envLow`) keep-out, as above. Verified:
+//         zero instances put walkable-band geometry over a lane, ramp or base
+//         cell at 1, 2 or 3 lanes.
+//       - IN THE SOUTHERN WEDGE — a candidate with ANY lane cell north of it
+//         (larger z, the side the camera looks toward) within
+//         `OCCLUSION_REACH` — tall families (`Family.sightlineKeep`, the tree
+//         families) must clear the lane with their FULL envelope:
+//         `envFull + WEDGE_MARGIN`. Where no lane cell is north within the
+//         reach nothing changes, because an overhang there can never stand
+//         between the camera and the lane. Verified: zero tree instances
+//         whose full envelope can touch a lane cell from the south within
+//         the reach, at 1, 2 and 3 lanes.
 //
 //   * CAMP CLEARINGS AND LANDMARK ANCHORS use `envFull`. The camera is a fixed
 //     55° top-down (STYLE_BIBLE §5), so an overhanging canopy DOES bury a camp
@@ -234,6 +259,22 @@ const SHOULDER_REACH = 4.5;
  *  hero (STYLE_BIBLE §7); 2.6 m clears it with head room, so nothing below this
  *  height may enter a lane, ramp or base cell. */
 const LANE_HEADROOM = 2.6;
+
+/** How far south of a lane the fixed camera's sightline can still be blocked,
+ *  metres. The sightline slope is tan(55 deg) ≈ 1.428 regardless of zoom
+ *  (scene.ts `CAMERA_PITCH_DEG`, `applyCamera`), so a tree of top height h
+ *  occludes a lane point from d < h/1.428 ≈ 0.7·h; the tallest thing this file
+ *  plants is the 11.5 m emergent giant at the kit's +30% scale cap, ≈15 m, a
+ *  reach of ≈10.5 m. 14 covers that with margin — conservative, because the
+ *  cost of over-applying the wedge rule is a slightly wider tree-free band the
+ *  density numbers above already absorb, while the cost of under-applying it
+ *  is the defect this constant exists to kill. */
+const OCCLUSION_REACH = 14;
+/** Extra clearance added beyond the FULL envelope inside the southern
+ *  sightline wedge, metres. Same role as {@link SITE_MARGIN}: breathing room
+ *  on top of the exact chamfer and cell-centre corrections in `clearanceAt`,
+ *  which for a keep-out must err toward rejecting. */
+const WEDGE_MARGIN = 0.5;
 
 /** The kit's per-instance scale and lean maxima, frozen in `InstanceXform`'s
  *  doc comment ("already varied +/-30%", "magnitude never exceeds 12 deg").
@@ -1081,6 +1122,16 @@ interface Family {
   readonly clearCliff: number;
   /** Minimum distance from the river channel. */
   readonly clearRiver: number;
+  /** Whether the southern sightline-wedge keep-out applies to this family —
+   *  see PLANTING CLEARANCE. True for the TALL tree families (`treeDense`,
+   *  `treeOpen`): their canopies reach above LANE_HEADROOM and can stand
+   *  between the fixed 55° camera and a lane, so inside the wedge they owe the
+   *  lane their FULL envelope, not just the walkable band. Low families —
+   *  tufts, undergrowth, rocks, deadwood, ruins, bank dressing — never reach
+   *  the sightline and keep the plain `envLow` rule, which is also why this is
+   *  a family flag and not a per-archetype test: the substitution walk in the
+   *  scatter loop must not trade a too-tall archetype down into the wedge. */
+  readonly sightlineKeep: boolean;
   /** The family's dominant ladder. `scatter` needs a {base, Lit, Deep} triplet
    *  (it rejects fewer than three steps) and returns one step per instance;
    *  this module keeps only the STEP INDEX and re-resolves it against each
@@ -1094,35 +1145,35 @@ const FAMILIES: readonly Family[] = [
   // Jungle — foliage cells. Top of the §8 range (8-14 trees, 20-35 undergrowth):
   // the sim treats these cells as concealing, and a player must be able to guess
   // where they are hidden from the density alone.
-  { key: 'treeDense', zones: M_DENSE, archs: [A_GIANT, A_BROAD, A_BROAD, A_SLENDER, A_FORKED, A_CONIFER, A_MOSSY, A_MOSSY], density: 14, spacing: 1.8, clearLane: 1.6, clearCliff: 1.4, clearRiver: 1.6, ladder: LADDER_CANOPY, max: 460 },
-  { key: 'underDense', zones: M_DENSE, archs: [A_FERN, A_BUSH, A_SAPLING], density: 28, spacing: 1.25, clearLane: 1.2, clearCliff: 0.7, clearRiver: 1.0, ladder: LADDER_FERN, max: 620 },
+  { key: 'treeDense', zones: M_DENSE, archs: [A_GIANT, A_BROAD, A_BROAD, A_SLENDER, A_FORKED, A_CONIFER, A_MOSSY, A_MOSSY], density: 14, spacing: 1.8, clearLane: 1.6, clearCliff: 1.4, clearRiver: 1.6, sightlineKeep: true, ladder: LADDER_CANOPY, max: 460 },
+  { key: 'underDense', zones: M_DENSE, archs: [A_FERN, A_BUSH, A_SAPLING], density: 28, spacing: 1.25, clearLane: 1.2, clearCliff: 0.7, clearRiver: 1.0, sightlineKeep: false, ladder: LADDER_FERN, max: 620 },
   // Jungle proper — open low ground away from the lanes. Mid range, and the one
   // in eight dead trunk STYLE_BIBLE §7 asks for in a tree line.
-  { key: 'treeOpen', zones: M_OPEN, archs: [A_BROAD, A_BROAD, A_SLENDER, A_SLENDER, A_FORKED, A_CONIFER, A_MOSSY, A_DEAD], density: 10, spacing: 2.1, clearLane: 1.6, clearCliff: 1.4, clearRiver: 1.6, ladder: LADDER_CANOPY, max: 380 },
-  { key: 'underOpen', zones: M_OPEN, archs: [A_FERN, A_BUSH, A_SAPLING], density: 23, spacing: 1.3, clearLane: 1.2, clearCliff: 0.7, clearRiver: 1.0, ladder: LADDER_FERN, max: 640 },
-  { key: 'rockJungle', zones: M_DENSE | M_OPEN, archs: [A_BOULDER, A_ROCKS, A_OUTCROP], density: 7.5, spacing: 2.6, clearLane: 1.4, clearCliff: 0.8, clearRiver: 1.2, ladder: LADDER_CLIFF, max: 400 },
-  { key: 'deadwood', zones: M_DENSE | M_OPEN, archs: [A_LOG, A_STUMP], density: 3.5, spacing: 4.0, clearLane: 1.6, clearCliff: 1.0, clearRiver: 1.4, ladder: LADDER_BARK, max: 190 },
-  { key: 'ruins', zones: M_DENSE | M_OPEN | M_SHOULDER, archs: [A_RUINBLOCK, A_RUINCOLUMN], density: 1.4, spacing: 5.5, clearLane: 1.8, clearCliff: 1.0, clearRiver: 1.4, ladder: LADDER_MONUMENT, max: 130 },
+  { key: 'treeOpen', zones: M_OPEN, archs: [A_BROAD, A_BROAD, A_SLENDER, A_SLENDER, A_FORKED, A_CONIFER, A_MOSSY, A_DEAD], density: 10, spacing: 2.1, clearLane: 1.6, clearCliff: 1.4, clearRiver: 1.6, sightlineKeep: true, ladder: LADDER_CANOPY, max: 380 },
+  { key: 'underOpen', zones: M_OPEN, archs: [A_FERN, A_BUSH, A_SAPLING], density: 23, spacing: 1.3, clearLane: 1.2, clearCliff: 0.7, clearRiver: 1.0, sightlineKeep: false, ladder: LADDER_FERN, max: 640 },
+  { key: 'rockJungle', zones: M_DENSE | M_OPEN, archs: [A_BOULDER, A_ROCKS, A_OUTCROP], density: 7.5, spacing: 2.6, clearLane: 1.4, clearCliff: 0.8, clearRiver: 1.2, sightlineKeep: false, ladder: LADDER_CLIFF, max: 400 },
+  { key: 'deadwood', zones: M_DENSE | M_OPEN, archs: [A_LOG, A_STUMP], density: 3.5, spacing: 4.0, clearLane: 1.6, clearCliff: 1.0, clearRiver: 1.4, sightlineKeep: false, ladder: LADDER_BARK, max: 190 },
+  { key: 'ruins', zones: M_DENSE | M_OPEN | M_SHOULDER, archs: [A_RUINBLOCK, A_RUINCOLUMN], density: 1.4, spacing: 5.5, clearLane: 1.8, clearCliff: 1.0, clearRiver: 1.4, sightlineKeep: false, ladder: LADDER_MONUMENT, max: 130 },
   // Lane shoulders — sparse, so the lanes stay clean and the fights readable.
-  { key: 'tufts', zones: M_SHOULDER, archs: [A_GRASS, A_FERN], density: 5.5, spacing: 2.1, clearLane: 0.9, clearCliff: 0.7, clearRiver: 1.0, ladder: LADDER_FERN, max: 400 },
-  { key: 'rockShoulder', zones: M_SHOULDER, archs: [A_BOULDER, A_ROCKS], density: 3, spacing: 3.2, clearLane: 1.4, clearCliff: 0.8, clearRiver: 1.2, ladder: LADDER_CLIFF, max: 220 },
+  { key: 'tufts', zones: M_SHOULDER, archs: [A_GRASS, A_FERN], density: 5.5, spacing: 2.1, clearLane: 0.9, clearCliff: 0.7, clearRiver: 1.0, sightlineKeep: false, ladder: LADDER_FERN, max: 400 },
+  { key: 'rockShoulder', zones: M_SHOULDER, archs: [A_BOULDER, A_ROCKS], density: 3, spacing: 3.2, clearLane: 1.4, clearCliff: 0.8, clearRiver: 1.2, sightlineKeep: false, ladder: LADDER_CLIFF, max: 220 },
   // High ground — bare and wind-scoured. The contrast with the dense low jungle
   // is what makes elevation READ from a fixed 55 deg camera.
-  { key: 'rockHigh', zones: M_HIGH, archs: [A_OUTCROP, A_BOULDER, A_ROCKS], density: 3, spacing: 3.0, clearLane: 1.6, clearCliff: 0.9, clearRiver: 1.2, ladder: LADDER_CLIFF, max: 160 },
+  { key: 'rockHigh', zones: M_HIGH, archs: [A_OUTCROP, A_BOULDER, A_ROCKS], density: 3, spacing: 3.0, clearLane: 1.6, clearCliff: 0.9, clearRiver: 1.2, sightlineKeep: false, ladder: LADDER_CLIFF, max: 160 },
   // "Occasional dead tree" (§8). The plateaus are small and ringed by cliff, so
   // this family lives or dies on `clearCliff`: at 1.8 m it landed 1-4 dead trees
   // across the whole map and the archetype was baked, AO'd and instanced for
   // nothing. 1.1 m still keeps a 6.5 m trunk off the lip.
-  { key: 'treeHigh', zones: M_HIGH, archs: [A_DEAD, A_DEAD, A_CONIFER], density: 2.4, spacing: 3.4, clearLane: 1.8, clearCliff: 1.1, clearRiver: 1.6, ladder: LADDER_BARK, max: 60 },
+  { key: 'treeHigh', zones: M_HIGH, archs: [A_DEAD, A_DEAD, A_CONIFER], density: 2.4, spacing: 3.4, clearLane: 1.8, clearCliff: 1.1, clearRiver: 1.6, sightlineKeep: false, ladder: LADDER_BARK, max: 60 },
   // River banks — reeds, wet stones, driftwood.
-  { key: 'reeds', zones: M_BANK, archs: [A_REEDS], density: 14, spacing: 1.35, clearLane: 1.0, clearCliff: 0.7, clearRiver: 0.55, ladder: LADDER_FERN, max: 300 },
-  { key: 'bankStones', zones: M_BANK, archs: [A_BANKSTONE], density: 9, spacing: 1.8, clearLane: 1.0, clearCliff: 0.7, clearRiver: 0.55, ladder: LADDER_WET, max: 220 },
+  { key: 'reeds', zones: M_BANK, archs: [A_REEDS], density: 14, spacing: 1.35, clearLane: 1.0, clearCliff: 0.7, clearRiver: 0.55, sightlineKeep: false, ladder: LADDER_FERN, max: 300 },
+  { key: 'bankStones', zones: M_BANK, archs: [A_BANKSTONE], density: 9, spacing: 1.8, clearLane: 1.0, clearCliff: 0.7, clearRiver: 0.55, sightlineKeep: false, ladder: LADDER_WET, max: 220 },
   // Driftwood at density 1.6 and spacing 5.0 landed 6 / 0 / 12 instances at
   // 1 / 2 / 3 lanes — NONE AT ALL on the 2-lane map, an archetype baked, AO'd
   // and instanced for no read. The bank zone is ~736 m2 spread thinly over 22
   // tiles at 3 lanes, so at that density a tile's target rounds to zero or one
   // and `scatter` returns nothing at all when it rounds to zero.
-  { key: 'driftwood', zones: M_BANK, archs: [A_DRIFTWOOD], density: 4.5, spacing: 3.0, clearLane: 1.2, clearCliff: 0.9, clearRiver: 0.6, ladder: LADDER_BARK, max: 70 },
+  { key: 'driftwood', zones: M_BANK, archs: [A_DRIFTWOOD], density: 4.5, spacing: 3.0, clearLane: 1.2, clearCliff: 0.9, clearRiver: 0.6, sightlineKeep: false, ladder: LADDER_BARK, max: 70 },
 ];
 
 // ============================================================================
@@ -1419,6 +1470,46 @@ export function createVegetation(scene: SceneHandle, map: MapDef): VegetationHan
     dLane = distanceField(terrain, (c) => c === K_LANE || c === K_RAMP || c === K_BASE);
     return true;
   });
+
+  // LANE CELLS BY ROW, x ascending (the row-major scan yields them sorted), for
+  // the sightline wedge's side test — see `laneNorthWithin`. A distance field
+  // alone cannot answer "is any lane cell NORTH of me?", and the nearest lane
+  // cell's z is the wrong proxy for it on a diagonal corridor, where the
+  // nearest cell can sit south of the candidate while its northern edge cells
+  // — the ones the candidate's canopy actually reaches — sit north.
+  const laneRows: number[][] = [];
+  push('lane rows: north probe', () => {
+    for (let z = 0; z < dim; z++) laneRows.push([]);
+    for (let i = 0; i < dim * dim; i++) {
+      const c = grid.kind[i] ?? K_GROUND;
+      if (c === K_LANE || c === K_RAMP || c === K_BASE) laneRows[Math.floor(i / dim)]?.push(i % dim);
+    }
+    return true;
+  });
+
+  /** Wedge side test: is there a lane/ramp/base cell NORTH of (x, z) — larger
+   *  z, the direction the fixed camera looks toward — within `reach` metres?
+   *  Exact euclidean over the row lists, O(rows-in-reach x cells-in-row) and
+   *  deterministic; cell-centre fuzz is at most half a cell against a 14 m
+   *  reach, absorbed by OCCLUSION_REACH's own margin. */
+  const laneNorthWithin = (x: number, z: number, reach: number): boolean => {
+    const r0 = Math.max(0, Math.floor(z * res));
+    const r1 = Math.min(dim - 1, Math.ceil((z + reach) * res));
+    for (let r = r0; r <= r1; r++) {
+      const dz = (r + 0.5) / res - z;
+      if (dz <= 0) continue; // same row or south of it — not the camera side
+      if (dz >= reach) break; // rows ascend, so nothing further can reach
+      const dxMax = Math.sqrt(reach * reach - dz * dz);
+      const row = laneRows[r];
+      if (row === undefined) continue;
+      for (const cx of row) {
+        const dx = (cx + 0.5) / res - x;
+        if (Math.abs(dx) <= dxMax) return true;
+      }
+    }
+    return false;
+  };
+
   push('distance field: cliff', () => {
     dCliff = distanceField(terrain, (c) => c === K_CLIFF);
     return true;
@@ -1626,8 +1717,10 @@ export function createVegetation(scene: SceneHandle, map: MapDef): VegetationHan
 
     /** The exact, per-archetype half of the keep-out law: nothing of this
      *  archetype's walkable-band geometry may enter a lane, ramp or base cell,
-     *  and nothing of it AT ANY HEIGHT may cross a camp clearing or a landmark
-     *  anchor.
+     *  nothing of it AT ANY HEIGHT may cross a camp clearing or a landmark
+     *  anchor, and — for the tall families only — nothing of it at any height
+     *  may cross a lane cell from the southern camera wedge either (see
+     *  `OCCLUSION_REACH`).
      *
      *  This has to be a LOWER BOUND on the true Euclidean clearance, and two
      *  things stand between the stored field and that bound:
@@ -1655,11 +1748,27 @@ export function createVegetation(scene: SceneHandle, map: MapDef): VegetationHan
     const fits = (x: number, z: number, archId: number): boolean => {
       const st = archStates[archId];
       if (st === undefined) return false;
-      const lane = Math.max(fam.clearLane, st.envLow);
-      return (
-        clearanceAt(dLane, x, z) >= lane &&
-        clearanceAt(dSite, x, z) >= st.envFull + SITE_MARGIN
-      );
+      const laneClear = clearanceAt(dLane, x, z);
+      let lane = Math.max(fam.clearLane, st.envLow);
+      // SIGHTLINE WEDGE (PLANTING CLEARANCE, first bullet): a TALL family
+      // standing south of a lane cell — the side the fixed 55° camera always
+      // looks from — and close enough that its crown can cross the sightline
+      // owes the lane its FULL envelope, so no part of the tree at any height
+      // can touch a lane cell from the camera side. The reach test reads the
+      // same lower bound the keep-out does: `laneClear` >= OCCLUSION_REACH
+      // means the true distance is >= the reach and the wedge cannot apply,
+      // which is the safe direction for a keep-out. The side test is
+      // `laneNorthWithin`: "south of the lane" means SOME lane cell north of
+      // the candidate is within the reach, not that the NEAREST lane cell is —
+      // on a diagonal corridor the nearest cell can sit south of the candidate
+      // while the corridor's northern edge, which is what its canopy would
+      // bury, sits north. Where no lane cell is north within the reach the
+      // walkable-band rule stands alone: an overhang on the far side never
+      // stands between the camera and the gameplay.
+      if (fam.sightlineKeep && laneClear < OCCLUSION_REACH && laneNorthWithin(x, z, OCCLUSION_REACH)) {
+        lane = Math.max(lane, st.envFull + WEDGE_MARGIN);
+      }
+      return laneClear >= lane && clearanceAt(dSite, x, z) >= st.envFull + SITE_MARGIN;
     };
 
     for (let tz = 0; tz < TILES; tz++) {

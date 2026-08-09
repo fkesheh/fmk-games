@@ -250,6 +250,13 @@ const SPIN_RATE = 1.1;
 const BOB_AMP = 0.22;
 const BOB_RATE = 0.85;
 
+/** Written over a dead structure's instance in every bucket it occupies. A
+ *  zero-scale matrix collapses the instance to a single degenerate point at
+ *  the origin — zero-area triangles are never rasterised — which is the one
+ *  way to remove ONE instance from a static bake that has no per-instance
+ *  visibility. */
+const ZERO_INSTANCE = new THREE.Matrix4().makeScale(0, 0, 0);
+
 // ============================================================================
 // Small geometry helpers
 // ============================================================================
@@ -562,6 +569,9 @@ interface AnimRig {
   readonly pz: Float32Array;
   /** Per-instance phase offset, so twelve crystals do not turn in lockstep. */
   readonly phase: Float32Array;
+  /** 1 at a dead structure's index: the frame hook skips it, so the zero-scale
+   *  matrix `hideStructure` writes is never overwritten by the animation. */
+  readonly dead: Uint8Array;
 }
 
 function makeAnimRig(
@@ -592,6 +602,7 @@ function makeAnimRig(
     py: new Float32Array(n),
     pz: new Float32Array(n),
     phase: new Float32Array(n),
+    dead: new Uint8Array(n),
   };
   for (let i = 0; i < n; i++) {
     const s = at[i];
@@ -602,6 +613,40 @@ function makeAnimRig(
     rig.phase[i] = r.next() * Math.PI * 2;
   }
   return rig;
+}
+
+/** Where one structure lives in the baked statics: the same instance index in
+ *  every bucket `InstancedMesh` of its archetype, plus its anim-rig slot and
+ *  the composed placement matrix they all share (kept so `resetStructures`
+ *  can restore a hidden instance without re-measuring anything). */
+interface StructureSlot {
+  readonly buckets: readonly THREE.InstancedMesh[];
+  readonly rig: AnimRig | null;
+  readonly index: number;
+  readonly mat: THREE.Matrix4;
+  hidden: boolean;
+}
+
+/** Control over the baked structures after the build: collapse one dead
+ *  structure's instance out of every bucket that draws it (and stop its anim
+ *  rig), or restore them all at a rematch.
+ *
+ *  `buildMapMeshes` returns this AND installs it on the `SceneHandle` itself
+ *  as `riftStructureControl`, because the one consumer that needs it — the
+ *  Game (T8), which sees every snapshot — may not import this module
+ *  (CONTRACT §6) and wire.ts has no channel for it. The Game reads the
+ *  property off `ClientModules.scene` through the same kind of cast seam
+ *  render/core.ts's `sceneCore` reads `.core` through. */
+export interface MapStructureControl {
+  /** Collapse one structure's instance in every bucket of its archetype.
+   *  Idempotent; safe before the archetype's bake has run (the hide is
+   *  applied when phase 2 of its job lands) and a no-op for an id the map
+   *  does not have. */
+  hideStructure(structureId: number): void;
+  /** Restore every hidden instance. Called on rift_begin: a rematch on the
+   *  same map reuses this bake (wire.ts), and last match's dead towers must
+   *  not stay down. */
+  resetStructures(): void;
 }
 
 // ============================================================================
@@ -1411,8 +1456,13 @@ function instancedPropJob(
  * one `buildStructure` call. Everything happens on the frame hook, one bounded
  * slice at a time, because a synchronous map build is precisely the one-second
  * join freeze this repo has already shipped once.
+ *
+ * The returned {@link MapStructureControl} collapses a dead structure's
+ * instance out of the static bake (`hideStructure`) — the ONLY mutable door
+ * into it. Because the build above is sliced, a hide that lands before its
+ * archetype's bake is queued and applied when that bake finishes.
  */
-export function buildMapMeshes(scene: SceneHandle, map: MapDef): void {
+export function buildMapMeshes(scene: SceneHandle, map: MapDef): MapStructureControl {
   const core = sceneCore(scene);
   core.fitMap(map);
 
@@ -1421,6 +1471,59 @@ export function buildMapMeshes(scene: SceneHandle, map: MapDef): void {
   const rigs: AnimRig[] = [];
   const queue: Job[] = [];
   let failed = false;
+
+  // ---- per-structure control state ------------------------------------------
+  // Filled as each archetype's phase 2 lands; `pendingHide` carries deaths the
+  // snapshots reported before the dead structure's bucket meshes existed.
+  const slots = new Map<number, StructureSlot>();
+  const pendingHide = new Set<number>();
+
+  const applyHide = (slot: StructureSlot): void => {
+    if (slot.hidden) return;
+    slot.hidden = true;
+    for (const b of slot.buckets) {
+      b.setMatrixAt(slot.index, ZERO_INSTANCE);
+      b.instanceMatrix.needsUpdate = true;
+    }
+    // The rig's matrices are rewritten every frame, so zeroing one here is not
+    // enough — the `dead` flag is what keeps the frame hook off it.
+    const rig = slot.rig;
+    if (rig !== null) {
+      rig.dead[slot.index] = 1;
+      rig.mesh.setMatrixAt(slot.index, ZERO_INSTANCE);
+      rig.mesh.instanceMatrix.needsUpdate = true;
+    }
+  };
+
+  const control: MapStructureControl = {
+    hideStructure(structureId: number): void {
+      const slot = slots.get(structureId);
+      if (slot === undefined) {
+        // Not baked yet (or not a structure of this map — the pending set is
+        // drained per archetype, so a foreign id costs one Set entry until
+        // the build drains, then is dropped).
+        pendingHide.add(structureId);
+        return;
+      }
+      applyHide(slot);
+    },
+    resetStructures(): void {
+      pendingHide.clear();
+      for (const slot of slots.values()) {
+        if (!slot.hidden) continue;
+        slot.hidden = false;
+        for (const b of slot.buckets) {
+          b.setMatrixAt(slot.index, slot.mat);
+          b.instanceMatrix.needsUpdate = true;
+        }
+        const rig = slot.rig;
+        if (rig !== null) rig.dead[slot.index] = 0;
+      }
+    },
+  };
+  // The Game (T8) reads this off `ClientModules.scene`; see MapStructureControl.
+  (scene as SceneHandle & { riftStructureControl?: MapStructureControl }).riftStructureControl =
+    control;
 
   // ---- 1. one job per structure archetype, in THREE indivisible phases -------
   // Each phase ends the frame's slice by itself (`heavy`), because none of the
@@ -1475,6 +1578,7 @@ export function buildMapMeshes(scene: SceneHandle, map: MapDef): void {
         // -- phase 2: one InstancedMesh per bucket, plus the anim rig.
         const group = new THREE.Group();
         group.name = `rift:struct:${a.kind}:${String(a.team)}`;
+        const buckets: THREE.InstancedMesh[] = [];
         for (const child of done.body.group.children) {
           if (!(child instanceof THREE.Mesh)) continue;
           // The hidden damage layer is never drawn on a healthy structure, and
@@ -1496,18 +1600,35 @@ export function buildMapMeshes(scene: SceneHandle, map: MapDef): void {
           // Bloom is INHERITED from the archetype's own decision, never re-made.
           if (child.layers.isEnabled(BLOOM_LAYER)) markBloom(inst);
           group.add(inst);
+          buckets.push(inst);
         }
         // R_SCENE owns `castShadow`. This module names the class; it never
         // writes the flag.
         applyShadowPolicy(group, 'structure');
         core.three.add(group);
 
+        let rig: AnimRig | null = null;
         const anim = done.anim;
         if (anim !== null && done.animKind !== null) {
-          const rig = makeAnimRig(anim, done.animKind, done.animY, a.at, core, r);
+          rig = makeAnimRig(anim, done.animKind, done.animY, a.at, core, r);
           applyShadowPolicy(rig.mesh, null);
           core.three.add(rig.mesh);
           rigs.push(rig);
+        }
+
+        // Every structure of this archetype now has an addressable slot, so a
+        // death the snapshot reported before this phase landed can be applied.
+        for (let i = 0; i < a.at.length; i++) {
+          const s = a.at[i];
+          const m = mats[i];
+          if (s === undefined || m === undefined) continue;
+          slots.set(s.id, { buckets, rig, index: i, mat: m, hidden: false });
+        }
+        for (const id of pendingHide) {
+          const slot = slots.get(id);
+          if (slot === undefined) continue;
+          pendingHide.delete(id);
+          applyHide(slot);
         }
         return false;
       },
@@ -1593,6 +1714,9 @@ export function buildMapMeshes(scene: SceneHandle, map: MapDef): void {
       for (const rig of rigs) {
         const n = rig.mesh.count;
         for (let i = 0; i < n; i++) {
+          // A dead structure's rig instance keeps the zero-scale matrix
+          // `hideStructure` wrote; rewriting it would resurrect the crystal.
+          if (rig.dead[i] !== 0) continue;
           const ph = rig.phase[i] ?? 0;
           const bx = rig.px[i] ?? 0;
           const by = rig.py[i] ?? 0;
@@ -1619,4 +1743,6 @@ export function buildMapMeshes(scene: SceneHandle, map: MapDef): void {
       console.error('rift mapMesh: build/animation failed — the map is INCOMPLETE', err);
     }
   });
+
+  return control;
 }

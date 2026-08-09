@@ -3,8 +3,8 @@
 // composition, siege cadence, compounding growth, overtime surge rules, lane
 // assignment), respawn timing, fountain heal, level-ups via XP_THRESHOLDS,
 // passive gold, expiry reaping (summons/wards/projs), shop buy validation
-// (gold / fountain radius / first free slot / wardstone charge-stacking),
-// spendSkillPoint rank caps + ULT_LEVEL_REQ, useItem spend-then-enqueue for
+// (gold / fountain radius / first free slot / wardstone charge-stacking /
+// recipe combining), spendSkillPoint rank caps + ULT_LEVEL_REQ, useItem spend-then-enqueue for
 // dash/aura actives, and ward placement (charges + team stock + restock).
 // The abilities engine is a recording double; abilities.ts is never imported.
 //
@@ -323,7 +323,7 @@ describe('shop (buy)', () => {
     const { w } = makeWorld();
     const p0 = hero(w, 'p0'); // at its fountain, STARTING_GOLD
     // too expensive: silent no-op
-    w.buy(p0.id, 'aegisheart'); // 900 > 600
+    w.buy(p0.id, 'blinkstone'); // 650 > 600
     expect(p0.gold).toBe(STARTING_GOLD);
     expect(p0.items.every((i) => i === null)).toBe(true);
     // legal buy: spends gold, fills slot 0, applies stats
@@ -352,13 +352,15 @@ describe('shop (buy)', () => {
     const { w } = makeWorld();
     const p0 = hero(w, 'p0');
     p0.gold = 100000;
-    const buys = ['bladestone', 'warmail', 'plategirdle', 'swiftboots', 'manacharm', 'fang'] as const;
+    // Non-recipe items only: a recipe in the fill list would combine mid-fill
+    // and free a slot, defeating the test.
+    const buys = ['bladestone', 'warmail', 'plategirdle', 'swiftboots', 'manacharm', 'blinkstone'] as const;
     for (const item of buys) w.buy(p0.id, item);
     expect(p0.items.filter((i) => i !== null)).toHaveLength(INVENTORY_SLOTS);
     const gold = p0.gold;
-    w.buy(p0.id, 'stormbow');
+    w.buy(p0.id, 'wardstone');
     expect(p0.gold).toBe(gold);
-    expect(p0.items).not.toContain('stormbow');
+    expect(p0.items).not.toContain('wardstone');
   });
 
   it('stacks wardstone charges into the existing wardstone slot', () => {
@@ -370,6 +372,85 @@ describe('shop (buy)', () => {
     expect(p0.items[0]).toBe('wardstone');
     expect(p0.itemCharges[0]).toBe(4);
     expect(p0.items[1]).toBeNull(); // no second slot consumed
+  });
+
+  it('combines a recipe item: consumes components, charges recipe cost only, recomputes stats', () => {
+    const { w } = makeWorld();
+    const p0 = hero(w, 'p0');
+    p0.gold = 1000;
+    w.buy(p0.id, 'bladestone'); // 400, +12 damage
+    expect(p0.damage).toBeCloseTo(58 + 12, 6);
+    w.buy(p0.id, 'fang'); // combines: bladestone + 300g
+    expect(p0.gold).toBe(1000 - 400 - 300); // recipe cost only, not the old 700
+    expect(p0.items[0]).toBe('fang'); // result takes the freed slot
+    expect(p0.itemCharges[0]).toBe(0);
+    expect(p0.items[1]).toBeNull();
+    expect(p0.damage).toBeCloseTo(58 + 8, 6); // bladestone's +12 gone, fang's +8 on
+    expect(p0.lifesteal).toBeCloseTo(0.12, 6);
+  });
+
+  it('silently no-ops a recipe buy when a component is missing', () => {
+    const { w } = makeWorld();
+    const p0 = hero(w, 'p0');
+    p0.gold = 5000;
+    w.buy(p0.id, 'aegisheart'); // needs warmail
+    expect(p0.gold).toBe(5000);
+    expect(p0.items.every((i) => i === null)).toBe(true);
+  });
+
+  it('silently no-ops a recipe buy with components held but insufficient gold', () => {
+    const { w } = makeWorld();
+    const p0 = hero(w, 'p0');
+    p0.gold = 899;
+    w.buy(p0.id, 'warmail'); // 450
+    w.buy(p0.id, 'aegisheart'); // 449 < 450 recipe cost
+    expect(p0.gold).toBe(899 - 450);
+    expect(p0.items[0]).toBe('warmail'); // component NOT consumed
+    expect(p0.items[1]).toBeNull();
+  });
+
+  it('combines into a full inventory: the result takes the lowest freed slot', () => {
+    const { w } = makeWorld();
+    const p0 = hero(w, 'p0');
+    p0.gold = 100000;
+    const buys = ['warmail', 'bladestone', 'plategirdle', 'swiftboots', 'manacharm', 'blinkstone'] as const;
+    for (const item of buys) w.buy(p0.id, item);
+    expect(p0.items.filter((i) => i !== null)).toHaveLength(INVENTORY_SLOTS);
+    const gold = p0.gold;
+    w.buy(p0.id, 'stormbow'); // bladestone at slot 1 frees it
+    expect(p0.gold).toBe(gold - 400);
+    expect(p0.items[1]).toBe('stormbow');
+    expect(p0.items.filter((i) => i !== null)).toHaveLength(INVENTORY_SLOTS);
+    expect(p0.items).not.toContain('bladestone');
+  });
+
+  it('combines a two-component recipe end-to-end (bulwarkplate)', () => {
+    const { w } = makeWorld();
+    const p0 = hero(w, 'p0');
+    const hp0 = p0.maxHp;
+    const armor0 = p0.armor;
+    const regen0 = p0.hpRegen;
+    p0.gold = 1200;
+    w.buy(p0.id, 'warmail'); // 450
+    w.buy(p0.id, 'plategirdle'); // 400
+    w.buy(p0.id, 'bulwarkplate'); // combines both + 350g
+    expect(p0.gold).toBe(0);
+    expect(p0.items[0]).toBe('bulwarkplate'); // lowest freed slot
+    expect(p0.items[1]).toBeNull();
+    expect(p0.items[2]).toBeNull();
+    // Components' stats are gone; only the recipe item's stats apply.
+    expect(p0.maxHp).toBeCloseTo(hp0 + 300, 6);
+    expect(p0.armor).toBeCloseTo(armor0 + 8, 6);
+    expect(p0.hpRegen).toBeCloseTo(regen0 + 2, 6);
+  });
+
+  it('still buys a recipe component standalone through the normal path', () => {
+    const { w } = makeWorld();
+    const p0 = hero(w, 'p0');
+    w.buy(p0.id, 'bladestone'); // no recipe: plain purchase
+    expect(p0.gold).toBe(STARTING_GOLD - 400);
+    expect(p0.items[0]).toBe('bladestone');
+    expect(p0.damage).toBeCloseTo(58 + 12, 6);
   });
 });
 
@@ -446,7 +527,8 @@ describe('useItem', () => {
     const { w, engine } = makeWorld();
     const p0 = hero(w, 'p0');
     p0.gold = 5000;
-    w.buy(p0.id, 'warhorn');
+    w.buy(p0.id, 'manacharm'); // warhorn's component
+    w.buy(p0.id, 'warhorn'); // combines: manacharm + 400g
     const slot = p0.items.indexOf('warhorn');
     w.useItem(p0.id, slot, null, null);
     w.advance();

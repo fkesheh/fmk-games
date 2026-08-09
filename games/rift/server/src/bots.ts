@@ -388,7 +388,9 @@ export function createBotBrain(seed: number, hero: HeroId): BotBrain {
   }
 
   /** First unowned build-order item; buy it only when locally affordable into
-   *  a free slot (the server re-validates; this keeps the wire clean). */
+   *  a free slot (the server re-validates; this keeps the wire clean). A
+   *  recipe target is built up component-first, in recipe order; the combine
+   *  itself frees the component slots, so it needs no free slot. */
   function nextPurchase(self: Ent): ItemId | null {
     for (let i = 0; i < build.length; i++) {
       const item = build[i];
@@ -401,6 +403,19 @@ export function createBotBrain(seed: number, hero: HeroId): BotBrain {
         if (held === null) freeSlot = true;
       }
       if (owned) continue;
+      const recipe = ITEMS[item].recipe;
+      if (recipe) {
+        let next: ItemId = item;
+        for (const comp of recipe.components) {
+          if (!self.items.includes(comp)) {
+            next = comp;
+            break;
+          }
+        }
+        if (next !== item && !freeSlot) return null; // components still need a slot
+        const cost = ITEMS[next].cost;
+        return self.gold >= cost ? next : null;
+      }
       if (!freeSlot) return null;
       const cost = ITEMS[item].cost;
       return self.gold >= cost ? item : null;

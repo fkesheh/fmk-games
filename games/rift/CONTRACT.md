@@ -318,6 +318,11 @@ this list (extend ONLY via the orchestrator):
   .shop-panel .shop-grid .shop-item .shop-cost .minimap .scoreboard
   .menu .menu-* .lobby .lobby-* .pick-grid .pick-card .end-screen .end-*
   .death-overlay .respawn-count .hint .banner .error-banner .dmg-number
+  .tooltip
+
+`.tooltip` (added by the ability-tooltip pass, R_HUD territory): ONE shared
+rich-tooltip element replacing the native `title` on `.ability-slot`s. Its
+inner structure is classless and styled by descendant selectors.
 
 - **main.ts** (T8) — mirror APAL onto CSS vars, `unhandledrejection` banner,
   `boot(root)` in try/catch with `.error-banner` fallback.

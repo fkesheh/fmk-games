@@ -394,6 +394,7 @@ describe('basic attack cycle', () => {
     const w = makeWorld();
     const p0 = hero(w, 'p0');
     p0.gold = 5000;
+    w.buy(p0.id, 'bladestone'); // fang recipe component
     w.buy(p0.id, 'fang'); // 12% lifesteal (p0 is at its fountain)
     expect(p0.items).toContain('fang');
     p0.x = ARENA.x;

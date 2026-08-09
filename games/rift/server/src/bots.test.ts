@@ -306,6 +306,28 @@ describe('fountain actions', () => {
     expect(cmds).toContainEqual({ c: 'buy', item: 'fang' });
   });
 
+  it('buys a recipe target component-first, then combines once components are held', () => {
+    // Ranged-carry opens with stormbow, which combines from bladestone + 400g:
+    // with nothing held, the component is the purchase, not the stormbow.
+    const brain = createBotBrain(3, 'longbow');
+    const empty = makeHero(1000, 0, 'longbow', { x: 11, z: 11, gold: 800 });
+    expect(brain.tick(makePercept(empty, { atFountain: true }))).toContainEqual({
+      c: 'buy',
+      item: 'bladestone',
+    });
+    // Component held: the next buy is the combine itself (400g recipe cost).
+    const holding = makeHero(1000, 0, 'longbow', {
+      x: 11,
+      z: 11,
+      gold: 400,
+      items: ['bladestone', null, null, null, null, null],
+    });
+    expect(brain.tick(makePercept(holding, { atFountain: true }))).toContainEqual({
+      c: 'buy',
+      item: 'stormbow',
+    });
+  });
+
   it('does not emit a buy away from the fountain or without gold', () => {
     const brain = createBotBrain(3, 'reaver');
     const poor = makeHero(1000, 0, 'reaver', { x: 11, z: 11, gold: 100 });
