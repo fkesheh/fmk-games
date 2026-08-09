@@ -342,7 +342,9 @@ export interface ClientModules {
 // Frozen create-function SIGNATURES (bodies are T7's/T9's; wire.ts imports
 // them from the implementation modules):
 //   T7 render/scene.ts:   export function createScene(parent: HTMLElement): SceneHandle;
-//   T7 render/mapMesh.ts: export function buildMapMeshes(scene: SceneHandle, map: MapDef): void;
+//   T7 render/mapMesh.ts: export function buildMapMeshes(scene: SceneHandle, map: MapDef): MapStructureControl;
+//     (also installs the same control as `scene.riftStructureControl` — hideStructure(id)
+//      zero-scales a dead structure's baked instances; resetStructures() on rematch)
 //   T7 render/units.ts:   export function createUnits(scene: SceneHandle, map: MapDef): UnitsHandle;
 //   T7 render/fog.ts:     export function createFog(scene: SceneHandle, map: MapDef): FogHandle;
 //   T7 render/fx.ts:      export function createFx(scene: SceneHandle): FxHandle;

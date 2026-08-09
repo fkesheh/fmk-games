@@ -17,10 +17,14 @@ towers, and win by destroying the enemy Ancient. The recognisable core of the
 genre, deliberately not the full thing.
 
 **Explicitly OUT of scope for v1:** neutral jungle camps, a Roshan equivalent,
-denying, courier, backpack/stash, item recipes and combining, more than one map
+denying, courier, backpack/stash, more than one map
 archetype, ranked/MMR, cross-session persistence (there is no database and no
 file storage anywhere in this project — the only persistence that exists
 anywhere is the player's name in `localStorage`).
+
+Item recipes and combining have since SHIPPED: upgraded items are bought by
+combining their base components plus a recipe cost in gold, Dota-style (see
+`games/rift/shared/src/item.ts`).
 
 ---
 

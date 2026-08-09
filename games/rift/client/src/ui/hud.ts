@@ -95,10 +95,14 @@
 //   .item-bar .item-slot .item-charges .item-cd .gold-readout .kda
 //   .topbar .match-clock .team-score .tower-count .killfeed .kill-row
 //   .scoreboard .death-overlay .respawn-count .hint .banner .dmg-number
+//   .tooltip
+// `.tooltip` is the ONE class the ability-tooltip pass added (ratified in
+// CONTRACT §6's class list): a single shared element, never rebuilt per frame.
 // Structural children that have no class in the contract (bar fills, glyph
-// spans, key hints, the dial, the state chips, scoreboard columns) are
-// CLASSLESS elements — style.css styles them via descendant selectors (e.g.
-// `.bar > i`, `.ability-slot > b`, `.match-clock > i`, `.hud-bars > div`).
+// spans, key hints, the dial, the state chips, scoreboard columns, tooltip
+// sections) are CLASSLESS elements — style.css styles them via descendant
+// selectors (e.g. `.bar > i`, `.ability-slot > b`, `.match-clock > i`,
+// `.hud-bars > div`, `.tooltip > ul > li`).
 // State MODIFIERS of a frozen class are the established extension form and
 // mint no new element name. The full set this file toggles is `--ready`,
 // `--ult-locked`, `--learned`, `--pop`, `--empty`, `--denied`, `--low`,
@@ -137,13 +141,16 @@ import {
 } from '@rift/shared';
 import type {
   AbilityDef,
+  AuraStat,
   BoardEntry,
+  Effect,
   HeroId,
   ItemId,
   MapDef,
   RiftEvent,
   RosterEntry,
   TeamId,
+  YouSnap,
 } from '@rift/shared';
 import type { ClientState, UiActions, UiHandle } from '../contract.js';
 
@@ -495,6 +502,22 @@ export function createHud(parent: HTMLElement): UiHandle {
     abilityDoms.push({ slot, glyph, key, cost, cd, rank, plus });
   }
 
+  // -- ability tooltip (one shared card for all four slots) ---------------------
+  // Replaces the native `title` one-liner. Built ONCE here; populated and
+  // positioned on pointerenter/focus, hidden on pointerleave/blur — never
+  // touched by the per-frame render (GRAPHICS_CONTRACT §5). pointer-events:
+  // none in style.css, so it can never swallow a click meant for the bar.
+  const tooltip = el('div', 'tooltip', root);
+  tooltip.style.display = 'none';
+  for (let i = 0; i < abilityDoms.length; i++) {
+    const dom = abilityDoms[i];
+    if (!dom) continue;
+    dom.slot.onpointerenter = () => showAbilityTooltip(i);
+    dom.slot.onfocus = () => showAbilityTooltip(i);
+    dom.slot.onpointerleave = hideAbilityTooltip;
+    dom.slot.onblur = hideAbilityTooltip;
+  }
+
   const itemBar = el('div', 'item-bar', bottom);
   const itemDoms: ItemSlotDom[] = [];
   for (let i = 0; i < 6; i++) {
@@ -573,6 +596,7 @@ export function createHud(parent: HTMLElement): UiHandle {
   // -- render-cycle state (no per-frame allocation beyond the killfeed rebuild) --------
   let heroId: HeroId | null = null; // hero of the current match (slot glyphs are static per match)
   let heroDefs: readonly AbilityDef[] = [];
+  let lastYou: YouSnap | null = null; // latest you-snapshot — the tooltip reads ranks off it at hover time
   let beginRef: ClientState['begin'] = null; // identity watch: a new begin = a new match
   let matchMap: MapDef | null = null; // built once per match: lane arrow + terrain chips
   let matchMapFailed = false; // buildMap threw (impossible lane count) — never retry
@@ -704,6 +728,146 @@ export function createHud(parent: HTMLElement): UiHandle {
       n.remove();
       liveFloats[channel]--;
     }, 900); // > the 0.8s rise animation
+  }
+
+  // ---- ability tooltip content -------------------------------------------------
+  // The card's numbers are read out of the SAME sources the per-frame ability
+  // render uses — the frozen `AbilityDef` (heroDefs) and the live rank off
+  // `lastYou.abilities` — evaluated ONCE at hover time. An unlearned ability
+  // previews its rank-1 values and says so; a learned one below max rank shows
+  // the next rank's value after an arrow, but only where the value actually
+  // changes (a flat 70 mana cost across all ranks reads `70`, not `70 → 70`).
+
+  /** Compact number: integers stay bare, fractions keep one decimal. */
+  function fmtNum(n: number): string {
+    return Number.isInteger(n) ? String(n) : n.toFixed(1);
+  }
+
+  /** Human-readable aura stat names (schema vocabulary is camelCase). */
+  const AURA_STAT_LABEL: Record<AuraStat, string> = {
+    armor: 'Armour',
+    damage: 'Damage',
+    attackSpeed: 'Attack speed',
+    moveSpeed: 'Move speed',
+    hpRegen: 'Health regen',
+    manaRegen: 'Mana regen',
+  };
+
+  /** Row label for one effect primitive. */
+  function effectLabel(fx: Effect): string {
+    switch (fx.kind) {
+      case 'damage':
+        return fx.school === 'magic' ? 'Magic damage' : 'Physical damage';
+      case 'heal':
+        return 'Heal';
+      case 'stun':
+        return 'Stun';
+      case 'slow':
+        return 'Slow';
+      case 'dash':
+        return 'Dash';
+      case 'aura': {
+        const stat = AURA_STAT_LABEL[fx.stat] ?? fx.stat;
+        return fx.duration === 0 ? `Aura — ${stat}` : `${stat} bonus`;
+      }
+      case 'summon':
+        return 'Summon';
+    }
+  }
+
+  /** One effect's headline numbers at `rank` (1-based). */
+  function effectValue(fx: Effect, rank: number): string {
+    switch (fx.kind) {
+      case 'damage':
+      case 'heal':
+        return fmtNum(rankVal(fx.amount, rank));
+      case 'stun':
+        return `${fmtNum(rankVal(fx.duration, rank))}s`;
+      case 'slow':
+        return `${String(Math.round(rankVal(fx.pct, rank) * 100))}% · ${fmtNum(rankVal(fx.duration, rank))}s`;
+      case 'dash':
+        return `${fmtNum(fx.distance)}m`; // scalar — same at every rank
+      case 'aura': {
+        const v = fx.pct
+          ? `+${String(Math.round(rankVal(fx.amount, rank) * 100))}%`
+          : `+${fmtNum(rankVal(fx.amount, rank))}`;
+        const bits = [v];
+        if (fx.radius > 0) bits.push(`${fmtNum(fx.radius)}m`);
+        if (fx.duration > 0) bits.push(`${fmtNum(fx.duration)}s`);
+        return bits.join(' · ');
+      }
+      case 'summon': {
+        const count = rankVal(fx.count, rank);
+        return `${String(count)} shade${count > 1 ? 's' : ''} · ${fmtNum(rankVal(fx.duration, rank))}s`;
+      }
+    }
+  }
+
+  function showAbilityTooltip(i: number): void {
+    const dom = abilityDoms[i];
+    const ab = heroDefs[i];
+    if (!dom || !ab) return; // no hero bound yet — nothing honest to show
+    const rank = lastYou?.abilities[i]?.rank ?? 0;
+    const cur = Math.max(rank, 1); // unlearned previews rank-1 values
+    const nxt = rank >= 1 && rank < ab.maxRank ? rank + 1 : null;
+
+    // Built into a detached host, then swapped in one replaceChildren — the
+    // same pattern as rebuildScoreboard, and hover-triggered, never per frame.
+    // Every element is classless; style.css styles `.tooltip > *` descendants.
+    const host = document.createElement('div');
+    const header = el('header', null, host);
+    el('b', null, header).textContent = ab.icon;
+    el('strong', null, header).textContent = ab.name;
+    el('kbd', null, header).textContent = SLOT_KEYS[i] ?? '';
+    if (ab.ult) el('em', null, header).textContent = 'ULT';
+    else if (ab.isPassive) el('em', null, header).textContent = 'PASSIVE';
+    el('i', null, host).textContent = ab.blurb;
+
+    const list = el('ul', null, host);
+    const row = (label: string, curText: string, nextText?: string): void => {
+      const li = el('li', null, list);
+      el('span', null, li).textContent = label;
+      el('b', null, li).textContent =
+        nextText !== undefined && nextText !== curText
+          ? `${curText} → ${nextText}`
+          : curText;
+    };
+    const at = (arr: readonly number[], suffix: string): [string, string | undefined] => [
+      `${fmtNum(rankVal(arr, cur))}${suffix}`,
+      nxt === null ? undefined : `${fmtNum(rankVal(arr, nxt))}${suffix}`,
+    ];
+    row(
+      'Rank',
+      rank === 0
+        ? `not learned — rank 1 of ${String(ab.maxRank)}`
+        : `${String(rank)} of ${String(ab.maxRank)}`,
+    );
+    if (!ab.isPassive) {
+      row('Cooldown', ...at(ab.cooldown, 's'));
+      row('Mana cost', ...at(ab.manaCost, ''));
+    }
+    if (rankVal(ab.castRange, cur) > 0) row('Cast range', ...at(ab.castRange, 'm'));
+    if (ab.aoeRadius) row('Effect radius', ...at(ab.aoeRadius, 'm'));
+    for (const fx of ab.effects) {
+      row(effectLabel(fx), effectValue(fx, cur), nxt === null ? undefined : effectValue(fx, nxt));
+    }
+    tooltip.replaceChildren(...Array.from(host.childNodes));
+
+    // Above the hovered slot, horizontally clamped to the viewport (the bar
+    // sits bottom-centre, so there is always room above it).
+    tooltip.style.display = '';
+    const rect = dom.slot.getBoundingClientRect();
+    const box = tooltip.getBoundingClientRect();
+    const left = Math.max(
+      8,
+      Math.min(rect.left + rect.width / 2 - box.width / 2, window.innerWidth - box.width - 8),
+    );
+    tooltip.style.left = `${left.toFixed(0)}px`;
+    tooltip.style.top = `${Math.max(8, rect.top - box.height - 10).toFixed(0)}px`;
+  }
+
+  function hideAbilityTooltip(): void {
+    if (tooltip.style.display !== 'none') tooltip.style.display = 'none';
   }
 
   function resetMatchHints(): void {
@@ -1063,6 +1227,7 @@ export function createHud(parent: HTMLElement): UiHandle {
 
       const snap = s.snap;
       const you = snap?.you ?? null;
+      lastYou = you;
       const matchTick = snap?.matchTick ?? 0;
       const gameS = matchTick * TICK_DT;
 
@@ -1139,7 +1304,11 @@ export function createHud(parent: HTMLElement): UiHandle {
             const ab = heroDefs[i];
             if (!dom || !ab) continue;
             setText(dom.glyph, ab.icon);
-            dom.slot.title = `${ab.name} — ${ab.blurb}`;
+            // The rich `.tooltip` card owns the long-form explanation now, so
+            // the slot carries NO native `title` (a one-line plain-text popup
+            // duplicating the card would be the worse of the two); aria-label
+            // keeps the one-line accessible name.
+            dom.slot.setAttribute('aria-label', `${ab.name} (${SLOT_KEYS[i] ?? ''})`);
           }
         }
 

@@ -710,6 +710,36 @@ export class SimWorld implements World {
     const def = ITEMS[item];
     if (!def || h.gold < def.cost) return;
     if (!this.atOwnFountain(h)) return;
+    // Recipe combine: consumes every listed component plus `cost` gold and the
+    // result takes the LOWEST slot the components freed — so a full inventory
+    // holding the components still combines. Missing component: silent no-op.
+    const recipe = def.recipe;
+    if (recipe) {
+      const slots: number[] = [];
+      for (const comp of recipe.components) {
+        let found = -1;
+        for (let i = 0; i < INVENTORY_SLOTS; i++) {
+          if (h.items[i] === comp && !slots.includes(i)) {
+            found = i;
+            break;
+          }
+        }
+        if (found < 0) return;
+        slots.push(found);
+      }
+      h.gold -= def.cost;
+      for (const i of slots) {
+        h.items[i] = null;
+        h.itemCharges[i] = 0;
+        h.itemCdUntilTick[i] = 0;
+      }
+      const slot = Math.min(...slots);
+      h.items[slot] = def.id;
+      h.itemCharges[slot] = def.active?.kind === 'ward' ? def.active.charges : 0;
+      h.itemCdUntilTick[slot] = 0;
+      this.recomputeEnt(h);
+      return;
+    }
     // Wardstone stacks charges into an existing wardstone slot.
     if (def.active?.kind === 'ward') {
       for (let i = 0; i < INVENTORY_SLOTS; i++) {

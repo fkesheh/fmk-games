@@ -39,6 +39,7 @@ import type {
   HelloMsg,
   InterpHandle,
   LobbyMsg,
+  SceneHandle,
   SnapMsg,
   UiActions,
 } from './contract.js';
@@ -195,6 +196,26 @@ export interface WireProbes {
   postTimeOfDay(t: number): void;
 }
 
+/** Control over the baked structure instances (hide a dead one, restore all
+ *  at a rematch), built by render/mapMesh.ts's `buildMapMeshes`. The Game may
+ *  not import that module (CONTRACT §6) and the frozen Game signature has no
+ *  map channel, so mapMesh installs the control on the `SceneHandle` itself
+ *  and this side reads it through a cast — the same seam render/core.ts's
+ *  `sceneCore` reads `.core` through. The type is re-declared here, never
+ *  imported; mapMesh.ts's `MapStructureControl` is the authoring side. */
+interface MapStructureControl {
+  hideStructure(structureId: number): void;
+  resetStructures(): void;
+}
+
+/** Null until the first rift_begin builds the map — and stays null on the
+ *  late-joiner path where a live snap arrives with no rift_begin at all. */
+function structureControlOf(scene: SceneHandle): MapStructureControl | null {
+  const c = (scene as SceneHandle & { riftStructureControl?: MapStructureControl })
+    .riftStructureControl;
+  return c ?? null;
+}
+
 function cleanName(v: string): string {
   return v.trim().slice(0, NAME_MAX) || 'Player';
 }
@@ -233,6 +254,10 @@ export class Game {
   private lastYouHp: number | null = null;
   private lastYouLevel = 0;
   private toast: { text: string; untilMs: number } | null = null; // cast-denied note
+  /** Structure ids already hidden in the baked map (death = hp <= 0; dead
+   *  structures never leave the snapshot, so without this set the fold in
+   *  onSnap would re-hide them every tick). */
+  private readonly deadStructures = new Set<number>();
 
   // ---- day/night --------------------------------------------------------------
   /** Capture pin from `__rift.setDayPhase`; null = follow the snapshot. */
@@ -563,6 +588,12 @@ export class Game {
         this.lastYouHp = null;
         this.lastYouLevel = 0;
         this.centeredOnHero = false;
+        // A rematch on the same map reuses the static bake (wire.ts), so last
+        // match's fallen structures are still hidden — stand them back up
+        // before the new match's snaps start reporting deaths. Null on the
+        // first begin (the bake does not exist yet; onBegin below builds it).
+        this.deadStructures.clear();
+        structureControlOf(this.modules.scene)?.resetStructures();
         this.setPhase('live');
         this.modules.audio.setPhase('live');
         // camera starts on the own base until the first snap centres the hero
@@ -620,6 +651,23 @@ export class Game {
           break;
         }
       }
+    }
+
+    // Structure deaths. The snap carries no alive flag and dead structures are
+    // sent forever (hp <= 0), so a death is detected exactly once per id here —
+    // which also means a late joiner's FIRST snap hides every structure that
+    // is already down. Allocation-free: a Set hit per already-dead structure,
+    // and the one add/hide per death transition.
+    for (const e of msg.ents) {
+      if (e.hp > 0) continue;
+      if (e.k !== 'tower' && e.k !== 'guard' && e.k !== 'ancient') continue;
+      if (this.deadStructures.has(e.id)) continue;
+      // No control = the map bake is not up (snap before rift_begin): do NOT
+      // mark the id, so the next snap retries once the bake exists.
+      const control = structureControlOf(this.modules.scene);
+      if (control === null) continue;
+      this.deadStructures.add(e.id);
+      control.hideStructure(e.id);
     }
 
     const you = msg.you;

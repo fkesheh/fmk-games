@@ -1,8 +1,11 @@
 // ============================================================================
 // ANCIENTS (rift) — ITEMS + SHOP. Pure data. Flat-stat items plus two actives
-// and the ward consumable. No recipes, no combining (handoff §1). Shop is
-// reachable only inside your own fountain radius; gold is spent at buy time;
-// there is no selling in v1.
+// and the ward consumable. Recipes: buying a recipe item COMBINES — it
+// consumes every listed component from inventory plus `cost` gold (which
+// equals the top-level `cost`); components must be base items — a component
+// may not itself have a recipe (enforced in items.test.ts). Shop is reachable
+// only inside your own fountain radius; gold is spent at buy time; there is
+// no selling in v1.
 // ============================================================================
 
 export type ItemId =
@@ -14,6 +17,7 @@ export type ItemId =
   | 'fang'
   | 'stormbow'
   | 'aegisheart'
+  | 'bulwarkplate'
   | 'blinkstone'
   | 'warhorn'
   | 'wardstone';
@@ -55,6 +59,12 @@ export interface ItemDef {
    *  per charge; the slot clears when charges reach 0. Other actives have a
    *  cooldown and are never consumed. */
   readonly active?: ItemActive;
+  /** Present = buying COMBINES: every listed component is consumed from
+   *  inventory plus `cost` gold, and the result takes the lowest freed slot.
+   *  `cost` must equal the top-level `cost` (the gold charged at buy time);
+   *  total investment = sum(component costs) + cost. Components are base
+   *  items — a component may not itself have a recipe. */
+  readonly recipe?: { readonly components: readonly ItemId[]; readonly cost: number };
   readonly blurb: string;
 }
 
@@ -85,19 +95,28 @@ export const ITEMS: Record<ItemId, ItemDef> = {
     blurb: '+150 mana, +0.8 mana regen.',
   },
   fang: {
-    id: 'fang', name: 'Lifedrinker Fang', icon: '🩸', cost: 700,
+    id: 'fang', name: 'Lifedrinker Fang', icon: '🩸', cost: 300,
     stats: { damage: 8, lifesteal: 0.12 },
+    recipe: { components: ['bladestone'], cost: 300 }, // 400 + 300 = 700
     blurb: '+8 damage, 12% lifesteal.',
   },
   stormbow: {
-    id: 'stormbow', name: 'Stormbow', icon: '🏹', cost: 800,
+    id: 'stormbow', name: 'Stormbow', icon: '🏹', cost: 400,
     stats: { damage: 10, attackSpeed: 0.3 },
+    recipe: { components: ['bladestone'], cost: 400 }, // 400 + 400 = 800
     blurb: '+10 damage, +30% attack speed.',
   },
   aegisheart: {
-    id: 'aegisheart', name: 'Aegis Heart', icon: '💚', cost: 900,
+    id: 'aegisheart', name: 'Aegis Heart', icon: '💚', cost: 450,
     stats: { maxHp: 400, hpRegen: 4 },
+    recipe: { components: ['warmail'], cost: 450 }, // 450 + 450 = 900
     blurb: '+400 health, +4 health regen.',
+  },
+  bulwarkplate: {
+    id: 'bulwarkplate', name: 'Bulwark Plate', icon: '🏰', cost: 350,
+    stats: { maxHp: 300, armor: 8, hpRegen: 2 },
+    recipe: { components: ['warmail', 'plategirdle'], cost: 350 }, // 450 + 400 + 350 = 1200
+    blurb: '+300 health, +8 armour, +2 health regen.',
   },
   blinkstone: {
     id: 'blinkstone', name: 'Blinkstone', icon: '✨', cost: 650,
@@ -105,8 +124,9 @@ export const ITEMS: Record<ItemId, ItemDef> = {
     blurb: 'Active: blink 8m. 14s cooldown.',
   },
   warhorn: {
-    id: 'warhorn', name: 'Warhorn', icon: '📯', cost: 800,
+    id: 'warhorn', name: 'Warhorn', icon: '📯', cost: 400,
     active: { kind: 'aura', stat: 'damage', pct: true, amount: 0.2, radius: 10, duration: 6, cooldown: 45 },
+    recipe: { components: ['manacharm'], cost: 400 }, // 400 + 400 = 800
     blurb: 'Active: nearby allies deal +20% damage for 6s. 45s cooldown.',
   },
   wardstone: {

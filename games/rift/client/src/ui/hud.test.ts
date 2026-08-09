@@ -174,6 +174,17 @@ class El {
   title = '';
   innerHTML = '';
   onclick: ((ev: unknown) => void) | null = null;
+  onpointerenter: ((ev: unknown) => void) | null = null;
+  onpointerleave: ((ev: unknown) => void) | null = null;
+  onfocus: ((ev: unknown) => void) | null = null;
+  onblur: ((ev: unknown) => void) | null = null;
+  readonly attrs: Record<string, string> = {};
+  setAttribute(name: string, value: string): void {
+    this.attrs[name] = value;
+  }
+  getAttribute(name: string): string | null {
+    return this.attrs[name] ?? null;
+  }
   readonly dataset: Record<string, string> = {};
   readonly childNodes: El[] = [];
   parentNode: El | null = null;
@@ -681,6 +692,125 @@ describe('per-frame DOM traffic (GRAPHICS_CONTRACT §5)', () => {
     const locked = findAll(root, (e) => e.className === 'ability-cd').at(3);
     expect(locked?.style.height).toBe('100%');
     expect(locked?.textContent).toBe('LV 6');
+  });
+});
+
+// ---- the ability tooltip (rich card replacing the native title) -------------
+
+describe('ability tooltip', () => {
+  const abilitySlots = (root: El): El[] =>
+    findAll(root, (e) => e.className.split(/\s+/).includes('ability-slot'));
+  /** The card's whole text — the double's textContent does not roll children
+   *  up into the parent, so walk and join. */
+  const tipText = (tip: El): string =>
+    [tip.textContent, ...[...tip.walk()].map((e) => e.textContent)].join(' | ');
+
+  it('shows on hover with current-rank numbers and the next rank after an arrow', () => {
+    // the fixture: bullwark, Q (Shield Crash) at rank 1 of 4
+    const { hud, root } = mk();
+    hud.render(state(), ACTIONS);
+    const q = abilitySlots(root)[0]!;
+    q.onpointerenter?.(null);
+    const tip = byClass(root, 'tooltip')!;
+    expect(tip).not.toBeNull();
+    expect(tip.style.display).not.toBe('none');
+    const text = tipText(tip);
+    expect(text).toContain('Shield Crash');
+    expect(text).toContain('⬢');
+    expect(text).toContain('Q');
+    expect(text).toContain('Dash to a point'); // the blurb line
+    expect(text).toContain('1 of 4');
+    expect(text).toContain('Cooldown');
+    expect(text).toContain('14s → 13s'); // rank 1 → rank 2
+    expect(text).toContain('Mana cost');
+    expect(text).not.toContain('70 → 70'); // flat across ranks: no empty arrow
+    expect(text).toContain('Cast range');
+    expect(text).toContain('7m');
+    expect(text).toContain('Effect radius');
+    expect(text).toContain('2.2m');
+    expect(text).toContain('Physical damage');
+    expect(text).toContain('70 → 120');
+    expect(text).toContain('Stun');
+    expect(text).toContain('0.8s → 1s');
+    expect(text).toContain('Dash');
+    // positioned above the slot, horizontally clamped inside the viewport
+    expect(tip.style.top).toMatch(/^\d+px$/);
+    expect(Number((tip.style.left ?? '').replace('px', ''))).toBeGreaterThanOrEqual(8);
+  });
+
+  it('sets no native title on the ability slots and carries a one-line aria-label', () => {
+    const { hud, root } = mk();
+    hud.render(state(), ACTIONS);
+    const slots = abilitySlots(root);
+    expect(slots).toHaveLength(4);
+    for (const s of slots) expect(s.title).toBe('');
+    expect(slots[0]!.attrs['aria-label']).toBe('Shield Crash (Q)');
+  });
+
+  it('hides on pointerleave and shows/hides on focus/blur for keyboard users', () => {
+    const { hud, root } = mk();
+    hud.render(state(), ACTIONS);
+    const q = abilitySlots(root)[0]!;
+    const tip = byClass(root, 'tooltip')!;
+    expect(tip.style.display).toBe('none'); // hidden by default
+    q.onpointerenter?.(null);
+    expect(tip.style.display).not.toBe('none');
+    q.onpointerleave?.(null);
+    expect(tip.style.display).toBe('none');
+    q.onfocus?.(null);
+    expect(tip.style.display).not.toBe('none');
+    q.onblur?.(null);
+    expect(tip.style.display).toBe('none');
+  });
+
+  it('an unlearned ability previews rank-1 values and says so (no next-rank arrow)', () => {
+    // the fixture leaves the ult (Rally) at rank 0
+    const { hud, root } = mk();
+    hud.render(state(), ACTIONS);
+    abilitySlots(root)[3]!.onpointerenter?.(null);
+    const text = tipText(byClass(root, 'tooltip')!);
+    expect(text).toContain('Rally');
+    expect(text).toContain('ULT');
+    expect(text).toContain('not learned — rank 1 of 2');
+    expect(text).toContain('80s'); // rank-1 cooldown
+    expect(text).toContain('200'); // rank-1 heal
+    expect(text).not.toContain('→'); // no next-rank preview while unlearned
+  });
+
+  it('a passive shows the PASSIVE tag and no cooldown/mana rows', () => {
+    // Bulwark (W) at rank 1: a flat armor aura, radius 8
+    const { hud, root } = mk();
+    hud.render(state(), ACTIONS);
+    abilitySlots(root)[1]!.onpointerenter?.(null);
+    const text = tipText(byClass(root, 'tooltip')!);
+    expect(text).toContain('Bulwark');
+    expect(text).toContain('PASSIVE');
+    expect(text).toContain('Aura — Armour');
+    expect(text).toContain('+3 · 8m → +5 · 8m');
+    expect(text).not.toContain('Cooldown');
+    expect(text).not.toContain('Mana cost');
+  });
+
+  it('a max-rank ability shows no next-rank preview', () => {
+    const { hud, root } = mk();
+    hud.render(
+      state({
+        youSnap: you({
+          abilities: [
+            { rank: 4, cdUntilTick: 0 },
+            { rank: 1, cdUntilTick: 0 },
+            { rank: 1, cdUntilTick: 0 },
+            { rank: 0, cdUntilTick: 0 },
+          ],
+        }),
+      }),
+      ACTIONS,
+    );
+    abilitySlots(root)[0]!.onpointerenter?.(null);
+    const text = tipText(byClass(root, 'tooltip')!);
+    expect(text).toContain('4 of 4');
+    expect(text).toContain('11s'); // rank-4 cooldown
+    expect(text).not.toContain('→');
   });
 });
 
