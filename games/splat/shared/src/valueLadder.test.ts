@@ -69,8 +69,11 @@ const MACHADO: Record<'protanopia' | 'deuteranopia', Mat3> = {
 /** Simulate `hex` under a Machado matrix; returns the clamped sRGB triple. */
 function simulate(hex: string, m: Mat3): [number, number, number] {
   const { r, g, b } = hexToRgb(hex);
-  const v = [r / 255, g / 255, b / 255];
-  const out = m.map((row) => row[0] * v[0] + row[1] * v[1] + row[2] * v[2]);
+  const [vr, vg, vb] = [r / 255, g / 255, b / 255];
+  const out = m.map((row) => {
+    const [m0, m1, m2] = row;
+    return m0 * vr + m1 * vg + m2 * vb;
+  });
   return [
     Math.min(1, Math.max(0, out[0] ?? 0)),
     Math.min(1, Math.max(0, out[1] ?? 0)),

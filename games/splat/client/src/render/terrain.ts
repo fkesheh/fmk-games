@@ -10,9 +10,11 @@
 //     the shadow side from the per-vertex sun dot, snowDeep blended into the
 //     steep/carved bands. Terrain heightmap geometry is a §2.5 factory
 //     exemption; colours still trace to SPAL.
-//   * Forest walls: ONE InstancedMesh of a vertex-coloured mature-pine
-//     archetype OUTSIDE both piste edges — sparse near the start, denser
-//     downhill — the rails that make the piste corridor read at 60 km/h.
+//   * Forest walls: TWO InstancedMeshes of vertex-coloured mature-pine
+//     archetypes (a tall fir + a wide offset-tier spruce, interleaved ~70/30
+//     by the seeded rng, with per-axis scale jitter) OUTSIDE both piste edges
+//     — sparse near the start, denser downhill — the rails that make the
+//     piste corridor read at 60 km/h.
 //   * Ridge rock outcrops (rockLit/rock, snow-dusted) baked to a handful of
 //     draw calls, and distant-peak horizon cards pre-hazed into skyHorizon
 //     (also a §2.5 exemption), so the world dissolves into the morning sky.
@@ -42,6 +44,7 @@ const FOREST_MAX = 2200; // hard cap — total visual instances <= 3k with R2
 const FOREST_Z0 = -12;
 const FOREST_Z_PAD = 60; // trees continue past the finish into the runout
 const FOREST_SINK = 0.15; // trunks sit slightly INTO the snow
+const SPRUCE_SHARE = 0.3; // ~30% of instances are the wide spruce archetype
 
 // ---- ridge rocks ------------------------------------------------------------------
 const ROCK_CLUSTERS = 14;
@@ -80,12 +83,14 @@ const COL_SHADE = new THREE.Color(SPAL.snowShade);
 const COL_DEEP = new THREE.Color(SPAL.snowDeep);
 
 function snowColor(out: THREE.Color, sunDot: number, steepness: number): void {
-  // sun-facing -> snowLit, shadow side -> snowShade, through the snow base
-  const t = clamp01((sunDot - 0.02) / 0.82);
+  // sun-facing -> snowLit, shadow side -> snowShade, through the snow base.
+  // Remapped (not raw N·L): the Lambert term already applies N·L once more at
+  // render time, so mid-slope must paint near snowLit or the piste goes dusk.
+  const t = clamp01((sunDot + 0.10) / 0.62);
   if (t < 0.5) out.lerpColors(COL_SHADE, COL_BASE, t * 2);
   else out.lerpColors(COL_BASE, COL_LIT, (t - 0.5) * 2);
   // steep rolls and the carved skirt bands sink toward snowDeep
-  const deep = smooth01((steepness - 0.05) / 0.23) * 0.6;
+  const deep = smooth01((steepness - 0.05) / 0.23) * 0.3;
   if (deep > 0) out.lerp(COL_DEEP, deep);
 }
 
@@ -164,15 +169,17 @@ function buildSlopeMesh(slope: SlopeDef, material: THREE.Material): THREE.Mesh {
 
   const mesh = new THREE.Mesh(geo, material);
   mesh.receiveShadow = true; // the long tree shadows across the piste land HERE
-  mesh.castShadow = true; // the skirt walls throw the ridge shadows
+  mesh.castShadow = false; // 22m skirt walls would blanket the piste in shadow
+                           // at this low sun — ridge shade is painted, not cast
   return mesh;
 }
 
 // ---- vertex-coloured merge (one material-coloured group -> one geometry) ----------
-// The forest archetype is built from the shared factories (each mesh carrying a
-// cached SPAL material) and collapsed into a single BufferGeometry with a color
-// attribute so ONE InstancedMesh draws the whole forest in one call. bake()
-// first applies every world transform, so matrices below are identity-safe.
+// Each forest archetype is built from the shared factories (each mesh carrying
+// a cached SPAL material) and collapsed into a single BufferGeometry with a
+// color attribute so ONE InstancedMesh draws that archetype's whole wall in
+// one call. bake() first applies every world transform, so matrices below are
+// identity-safe.
 function mergeVertexColored(root: THREE.Group): THREE.BufferGeometry {
   root.updateMatrixWorld(true);
   const meshes: THREE.Mesh[] = [];
@@ -235,9 +242,10 @@ function mergeVertexColored(root: THREE.Group): THREE.BufferGeometry {
   return out;
 }
 
-/** Mature pine: bark trunk + four stacked cones (pineDark -> pineLit), snow-
- *  dusted tier caps and a snowLit tip — the STYLE_BIBLE model sheet, scaled
- *  up to forest-tree height (proto is ~5.2 m tall before instance scale). */
+/** Mature pine (the FIR): bark trunk + four stacked cones (pineDark ->
+ *  pineLit), snow-dusted tier caps and a snowLit tip — the STYLE_BIBLE model
+ *  sheet, scaled up to forest-tree height (proto is ~5.2 m tall before
+ *  instance scale). */
 function buildForestGeometry(): THREE.BufferGeometry {
   const g = new THREE.Group();
   g.add(at(cyl(mat, 0.13, 0.24, 1.3, 6, SPAL.bark), 0, 0.65, 0));
@@ -260,18 +268,48 @@ function buildForestGeometry(): THREE.BufferGeometry {
   return geo;
 }
 
-/** Forest walls: one InstancedMesh, both sides, sparse -> dense downhill. */
-function buildForest(slope: SlopeDef, material: THREE.Material): THREE.InstancedMesh {
+/** Second archetype (the SPRUCE): fewer, WIDER tiers with alternating yaw
+ *  offsets, a squatter silhouette (~4.7 m before instance scale) and a
+ *  heavier trunk — interleaved with the fir so the forest walls stop reading
+ *  as one stamped asset. Same merge-to-one-geometry path. */
+function buildSpruceGeometry(): THREE.BufferGeometry {
+  const g = new THREE.Group();
+  g.add(at(cyl(mat, 0.17, 0.3, 1.1, 6, SPAL.bark), 0, 0.55, 0));
+  const tiers: ReadonlyArray<readonly [number, number, number, string]> = [
+    // [radius, height, baseY, hex] — wide, overlapping, drooping skirt
+    [2.0, 2.0, 0.7, SPAL.pineDark],
+    [1.5, 1.8, 1.9, SPAL.pine],
+    [1.0, 1.6, 3.05, SPAL.pineLit],
+  ];
+  let k = 0;
+  for (const [r, h, baseY, hex] of tiers) {
+    const tier = cone(mat, r, h, 7, hex);
+    tier.rotation.y = (k++ % 2) * (Math.PI / 7); // offset tiers — the spruce read
+    g.add(at(tier, 0, baseY + h / 2, 0));
+    g.add(at(cone(mat, r * 0.5 + 0.05, h * 0.3, 6, SPAL.snowLit), 0, baseY + h * 0.76, 0));
+  }
+  g.add(at(cone(mat, 0.2, 0.4, 5, SPAL.snowLit), 0, 3.05 + 1.6 - 0.06, 0));
+  const baked = bake(g);
+  return mergeVertexColored(baked);
+}
+
+/** Forest walls: TWO InstancedMeshes (fir + spruce), both sides, sparse ->
+ *  dense downhill. Every draw — archetype pick, position, rotation and the
+ *  per-axis scale jitter — comes from the seeded rng, in a fixed order. */
+function buildForest(slope: SlopeDef, material: THREE.Material): THREE.Group {
   const halfW = slope.width / 2;
   const next = rng(slope.seed ^ 0x5f3a);
   const z1 = slope.finishZ + FOREST_Z_PAD;
 
-  // scatter into plain arrays first so the InstancedMesh is sized exactly
+  // scatter into plain arrays first so the InstancedMeshes are sized exactly
   const px: number[] = [];
   const py: number[] = [];
   const pz: number[] = [];
   const rot: number[] = [];
-  const scl: number[] = [];
+  const arch: number[] = []; // 0 = fir, 1 = spruce
+  const sx: number[] = [];
+  const sy: number[] = [];
+  const sz: number[] = [];
   for (let side = -1; side <= 1; side += 2) {
     for (let z = FOREST_Z0; z < z1; z += FOREST_STEP) {
       // density ramp: open meadows near the gate, closing walls downhill
@@ -286,25 +324,42 @@ function buildForest(slope: SlopeDef, material: THREE.Material): THREE.Instanced
         pz.push(zz);
         py.push(groundHeight(slope, x, zz) - FOREST_SINK);
         rot.push(next() * TAU);
-        scl.push(rngRange(next, 0.85, 1.65));
+        arch.push(next() < SPRUCE_SHARE ? 1 : 0);
+        // per-axis jitter: girth (x/z) varies independently from height (y),
+        // so even same-archetype neighbours never read as clones
+        const h = rngRange(next, 0.85, 1.65);
+        sy.push(h);
+        sx.push(h * rngRange(next, 0.85, 1.15));
+        sz.push(h * rngRange(next, 0.85, 1.15));
       }
     }
   }
 
-  const mesh = new THREE.InstancedMesh(buildForestGeometry(), material, px.length);
+  const geos = [buildForestGeometry(), buildSpruceGeometry()];
+  const group = new THREE.Group();
   const dummy = new THREE.Object3D();
-  for (let i = 0; i < px.length; i++) {
-    dummy.position.set(px[i] ?? 0, py[i] ?? 0, pz[i] ?? 0);
-    dummy.rotation.y = rot[i] ?? 0;
-    dummy.scale.setScalar(scl[i] ?? 1);
-    dummy.updateMatrix();
-    mesh.setMatrixAt(i, dummy.matrix);
+  for (let a = 0; a < geos.length; a++) {
+    const ids: number[] = [];
+    for (let i = 0; i < px.length; i++) if (arch[i] === a) ids.push(i);
+    if (ids.length === 0) continue; // a tiny slope may draw one archetype only
+    const geo = geos[a];
+    if (geo === undefined) continue;
+    const mesh = new THREE.InstancedMesh(geo, material, ids.length);
+    for (let k = 0; k < ids.length; k++) {
+      const i = ids[k] ?? 0;
+      dummy.position.set(px[i] ?? 0, py[i] ?? 0, pz[i] ?? 0);
+      dummy.rotation.y = rot[i] ?? 0;
+      dummy.scale.set(sx[i] ?? 1, sy[i] ?? 1, sz[i] ?? 1);
+      dummy.updateMatrix();
+      mesh.setMatrixAt(k, dummy.matrix);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    mesh.frustumCulled = false; // spans the whole run; the bounding sphere lies
+    group.add(mesh);
   }
-  mesh.instanceMatrix.needsUpdate = true;
-  mesh.castShadow = true;
-  mesh.receiveShadow = true;
-  mesh.frustumCulled = false; // spans the whole run; the bounding sphere lies
-  return mesh;
+  return group;
 }
 
 /** Ridge-line rock outcrops on the rising skirt, snow-dusted, baked. */

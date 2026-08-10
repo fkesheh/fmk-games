@@ -118,9 +118,9 @@ function thornProto(): THREE.Group {
     pivot.rotation.set(0, yaw, 0);
     const arm = new THREE.Group();
     arm.rotation.x = tilt;
-    arm.add(at(cyl(mat, 0.016, 0.05, len, 5, hex), 0, len / 2, 0));
+    arm.add(at(cyl(mat, 0.03, 0.08, len, 5, hex), 0, len / 2, 0));
     // One kinked twig near the tip — the angular "nasty" read.
-    const twig = at(cyl(mat, 0.01, 0.026, len * 0.45, 4, hex), 0, len * 0.86, 0);
+    const twig = at(cyl(mat, 0.02, 0.05, len * 0.45, 4, hex), 0, len * 0.86, 0);
     twig.rotation.x = -0.7;
     arm.add(twig);
     pivot.add(arm);

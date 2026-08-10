@@ -3,7 +3,9 @@
 // the FINISH GATE at slope.finishZ (sunGold pennants — THE goal read: at race
 // speed the gold string fading in through the morning haze is what every
 // skier steers toward), and the lodge with chimney smoke beyond the line.
-// STYLE_BIBLE model sheets: two banner poles + a pennant string per gate;
+// STYLE_BIBLE model sheets: two banner poles + a pennant string per gate, and
+// at the finish gold pennant flags + a sunGold banner panel slung between the
+// poles;
 // bark/lodge palette on the lodge, warm sunGold windows, cartoon smoke puffs
 // rising off the chimney. Everything static is collapsed by bake() into one
 // mesh per SPAL colour.
@@ -19,7 +21,8 @@ const START_POLE_H = 3.2;
 
 // ---- finish gate ------------------------------------------------------------------
 const FINISH_POLE_X = 9; // wider, taller — the sprint corridor landmark
-const FINISH_POLE_H = 4.2;
+const FINISH_POLE_H = 8.4; // ~2x the start gate — monumental, readable at 200 m
+const FINISH_BULK = 1.9; // pole/flag bulk multiplier vs the start gate
 
 // ---- lodge ---------------------------------------------------------------------------
 const LODGE_X = 14; // beside the runout, NOT blocking it
@@ -54,7 +57,9 @@ function pennantString(
   }
 }
 
-/** Two banner poles with topper orbs; returns the pole-top y for the string. */
+/** Two banner poles; returns nothing — toppers are orbs, or (finish gate)
+ *  real pennant flags flying inward toward the piste centre. `bulk` scales
+ *  the pole girth and the flag (the finish gate is built monumental). */
 function bannerPoles(
   g: THREE.Group,
   slope: SlopeDef,
@@ -62,19 +67,33 @@ function bannerPoles(
   halfSpan: number,
   height: number,
   topperHex: string,
+  flags: boolean,
+  bulk = 1,
 ): void {
   for (let side = -1; side <= 1; side += 2) {
     const x = side * halfSpan;
     const base = slope.height(x, z);
-    g.add(at(cyl(mat, 0.09, 0.13, height, 6, SPAL.bark), x, base + height / 2, z));
-    g.add(at(sphere(mat, 0.16, 6, topperHex), x, base + height + 0.1, z));
+    g.add(at(cyl(mat, 0.09 * bulk, 0.13 * bulk, height, 6, SPAL.bark), x, base + height / 2, z));
+    if (flags) {
+      // gold pennant flag streaming toward the piste centre
+      g.add(
+        at(
+          box(mat, 0.5 * bulk, 0.3 * bulk, 0.04, topperHex),
+          x - side * 0.25 * bulk,
+          base + height - 0.15 * bulk,
+          z,
+        ),
+      );
+    } else {
+      g.add(at(sphere(mat, 0.16, 6, topperHex), x, base + height + 0.1, z));
+    }
   }
 }
 
 /** Start gate: cool-coloured pennants (the race begins calm; gold is finish-only). */
 function buildStartGate(g: THREE.Group, slope: SlopeDef): void {
   const z = 0;
-  bannerPoles(g, slope, z, START_POLE_X, START_POLE_H, SPAL.snowDeep);
+  bannerPoles(g, slope, z, START_POLE_X, START_POLE_H, SPAL.snowDeep, false);
   const yTop = slope.height(START_POLE_X, z) + START_POLE_H - 0.15;
   pennantString(g, -START_POLE_X, START_POLE_X, yTop, z, 0.16, 0.4, [
     SPAL.skyZenith,
@@ -82,15 +101,20 @@ function buildStartGate(g: THREE.Group, slope: SlopeDef): void {
   ]);
 }
 
-/** FINISH GATE: sunGold pennants + gold toppers — the goal read (STYLE_BIBLE). */
+/** FINISH GATE: MONUMENTAL — 2x-height poles with thick gold flags, big
+ *  ALL-sunGold pennants and a wide sunGold banner panel slung between them:
+ *  the goal read at 200 m through the morning haze, the biggest man-made
+ *  thing on the mountain after the lodge (STYLE_BIBLE). Gold is finish-only;
+ *  the start gate stays cool and modest. */
 function buildFinishGate(g: THREE.Group, slope: SlopeDef): void {
   const z = slope.finishZ;
-  bannerPoles(g, slope, z, FINISH_POLE_X, FINISH_POLE_H, SPAL.sunGold);
-  const yTop = slope.height(FINISH_POLE_X, z) + FINISH_POLE_H - 0.18;
-  pennantString(g, -FINISH_POLE_X, FINISH_POLE_X, yTop, z, 0.22, 0.55, [
-    SPAL.sunGold,
-    SPAL.snowLit,
-  ]);
+  bannerPoles(g, slope, z, FINISH_POLE_X, FINISH_POLE_H, SPAL.sunGold, true, FINISH_BULK);
+  const yTop = slope.height(FINISH_POLE_X, z) + FINISH_POLE_H - 0.35;
+  pennantString(g, -FINISH_POLE_X, FINISH_POLE_X, yTop, z, 0.42, 1.05, [SPAL.sunGold]);
+  // banner panel between the poles, below the pennant string — wide and tall
+  // enough to read as a finish BANNER, not a ribbon
+  const yBanner = slope.height(0, z) + FINISH_POLE_H * 0.58;
+  g.add(at(box(mat, FINISH_POLE_X * 1.5, 1.7, 0.1, SPAL.sunGold), 0, yBanner, z));
 }
 
 /**

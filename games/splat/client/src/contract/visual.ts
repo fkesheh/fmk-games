@@ -102,10 +102,11 @@ export function bake(root: THREE.Group): THREE.Group {
 }
 
 // ---- the sun rig (ONE direction, read by light + terrain shading + sky) -------
-// Low MORNING sun, behind and to the skier's right at the gate, so long soft
-// shadows rake forward-left across the piste (STYLE_BIBLE lighting recipe).
+// Low MORNING sun, ahead and to the skier's right, so the camera-facing
+// downslope takes real key light while long soft shadows still rake across
+// the piste (STYLE_BIBLE lighting recipe).
 export const SUN_ELEV = 0.24; // rad (~14°) — low morning angle
-export const SUN_AZ = 2.2; // rad; yaw-convention azimuth of the visible sun
+export const SUN_AZ = 1.05; // rad; yaw-convention azimuth of the visible sun
 
 /** Unit vector TOWARD the sun, derived once from SUN_ELEV/SUN_AZ. */
 export const SUN_DIR: readonly [number, number, number] = ((): [number, number, number] => {

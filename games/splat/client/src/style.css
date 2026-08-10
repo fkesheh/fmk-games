@@ -390,25 +390,60 @@ body {
   right: 0;
 }
 
-/* edge thumb hints: translucent marks at the outer edges, where a resting
-   thumb already is — the "hold a side" read without words (the HUD's own
-   first-run hint says the words once) */
+/* edge steering affordances: NO dashed debug rect — a soft ink wash pooling
+   in each bottom corner (the same scrim language as the HUD) with a large
+   chevron glyph pointing along the steer direction. The wash darkens the
+   bright snow just enough for the paper chevron to read; on dark tree cover
+   the chevron's own ink shadow keeps it legible. Safe-area insets clear the
+   home indicator and rounded corners. */
 .touch-thumb {
   position: absolute;
-  bottom: calc(24px + var(--safe-bottom));
-  width: clamp(56px, 9vw, 92px);
-  height: clamp(84px, 16vh, 140px);
-  border-radius: 24px;
-  border: 2px dashed color-mix(in srgb, var(--paper) 34%, transparent);
-  background: color-mix(in srgb, var(--paper) 5%, transparent);
+  bottom: calc(20px + var(--safe-bottom));
+  width: clamp(72px, 12vw, 120px);
+  height: clamp(96px, 18vh, 150px);
+  border-radius: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 90ms ease;
+}
+
+.touch-thumb::before {
+  font-size: clamp(40px, 7vw, 64px);
+  font-weight: 700;
+  line-height: 1;
+  padding-bottom: 0.12em; /* optical centre for the chevron glyphs */
+  color: color-mix(in srgb, var(--paper) 58%, transparent);
+  text-shadow:
+    0 1px 2px color-mix(in srgb, var(--ink) 55%, transparent),
+    0 2px 12px color-mix(in srgb, var(--ink) 40%, transparent);
+  transition: color 90ms ease, text-shadow 90ms ease;
 }
 
 .touch-thumb-left {
-  left: calc(18px + var(--safe-left));
+  left: calc(14px + var(--safe-left));
+  background: radial-gradient(
+    130% 100% at 0% 100%,
+    color-mix(in srgb, var(--ink) 30%, transparent),
+    transparent 72%
+  );
 }
 
 .touch-thumb-right {
-  right: calc(18px + var(--safe-right));
+  right: calc(14px + var(--safe-right));
+  background: radial-gradient(
+    130% 100% at 100% 100%,
+    color-mix(in srgb, var(--ink) 30%, transparent),
+    transparent 72%
+  );
+}
+
+.touch-thumb-left::before {
+  content: '‹';
+}
+
+.touch-thumb-right::before {
+  content: '›';
 }
 
 /* Pressed. Loud on purpose: a thumb COVERS its own hint, so "is my finger
@@ -421,11 +456,42 @@ body {
   );
 }
 
-.touch-zone-left.is-down .touch-thumb-left,
+.touch-zone-left.is-down .touch-thumb-left {
+  background: radial-gradient(
+    130% 100% at 0% 100%,
+    color-mix(in srgb, var(--sun-gold) 26%, transparent),
+    color-mix(in srgb, var(--ink) 34%, transparent) 55%,
+    transparent 78%
+  );
+}
+
 .touch-zone-right.is-down .touch-thumb-right {
-  border-color: color-mix(in srgb, var(--paper) 80%, transparent);
-  background: color-mix(in srgb, var(--paper) 14%, transparent);
-  box-shadow: 0 0 26px color-mix(in srgb, var(--paper) 26%, transparent);
+  background: radial-gradient(
+    130% 100% at 100% 100%,
+    color-mix(in srgb, var(--sun-gold) 26%, transparent),
+    color-mix(in srgb, var(--ink) 34%, transparent) 55%,
+    transparent 78%
+  );
+}
+
+.touch-zone-left.is-down .touch-thumb-left::before,
+.touch-zone-right.is-down .touch-thumb-right::before {
+  color: var(--paper);
+  text-shadow:
+    0 1px 2px color-mix(in srgb, var(--ink) 65%, transparent),
+    0 0 22px color-mix(in srgb, var(--sun-gold) 65%, transparent);
+}
+
+/* Tablet: the bottom corners belong to the steering thumbs, so the speed
+   chip rides just above the thumb block (thumb gap + thumb height + a 12px
+   gap) instead of inside it. Desktop (no .tablet) keeps hud.css's normal
+   bottom-left placement; the lefty overrides below still swap its side, so
+   on a left-handed tablet it sits above the RIGHT thumb. The chip keeps its
+   own ink scrim (hud.css .sh-speed background) in both modes. */
+.race.tablet .splat-hud .sh-speed {
+  bottom: calc(
+    20px + clamp(96px, 18vh, 150px) + 12px + var(--safe-b, var(--safe-bottom))
+  );
 }
 
 /* ---- LEFT-HANDED: mirrors the HUD chip layout only ----------------------------
@@ -676,7 +742,9 @@ body {
   .btn,
   .menu-name,
   .menu-code-input,
-  .touch-zone {
+  .touch-zone,
+  .touch-thumb,
+  .touch-thumb::before {
     transition: none;
   }
 }

@@ -249,27 +249,30 @@
 
 .sh-hint-thumb {
   position: absolute;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 84px;
-  height: 120px;
+  /* One "where to hold" lesson: the hint's outlines sit exactly where the
+     persistent touch-zone thumbs sit (style.css .touch-thumb) — the bottom
+     corners, the ergonomic rest position — same size, same insets. */
+  bottom: calc(24px + var(--safe-b));
+  width: clamp(56px, 9vw, 92px);
+  height: clamp(84px, 16vh, 140px);
   border-radius: 24px;
   border: 2px dashed rgba(var(--paperc), 0.7);
   background: rgba(var(--paperc), 0.08);
 }
 
 .sh-hint-left {
-  left: calc(24px + var(--safe-l));
+  left: calc(18px + var(--safe-l));
 }
 
 .sh-hint-right {
-  right: calc(24px + var(--safe-r));
+  right: calc(18px + var(--safe-r));
 }
 
 .sh-hint-label {
   position: absolute;
   left: 50%;
-  bottom: calc(20% + var(--safe-b));
+  /* above the bottom-corner thumbs, never inside them */
+  bottom: calc(24px + clamp(84px, 16vh, 140px) + 40px + var(--safe-b));
   transform: translateX(-50%);
   font-size: 16px;
   font-weight: 600;

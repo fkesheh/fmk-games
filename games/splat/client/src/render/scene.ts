@@ -4,8 +4,8 @@
 // vertex-gradient sky dome (skyZenith -> skyHorizon — the ONE exempt unlit
 // material), FogExp2 matched EXACTLY to skyHorizon so the world dissolves
 // into the sky, a warm low morning sun whose shadow box follows the camera
-// target, a hemisphere fill (sky azure up / snow-bounce below), and the kart
-// grade+vignette fullscreen post pass.
+// target, a hemisphere fill (morning-sky up / snow-bounce below), and the kart
+// grade+vignette fullscreen post pass plus a plant-hit edge flash.
 //
 // The camera is FIRST PERSON, never third person: eye at (x, y+EYE_HEIGHT, z)
 // looking along yaw, pitch following the terrain LOOK_AHEAD metres out so the
@@ -31,26 +31,29 @@ import {
   SPAL,
 } from '@splat/shared';
 import type { SlopeDef } from '@splat/shared';
+import { mix } from '@platform/shared';
 import { SUN_DIR } from '../contract/visual.js';
 import { buildTerrain } from './terrain.js';
 import { buildGates } from './gates.js';
 
 // ---- renderer / atmosphere -----------------------------------------------------
-const EXPOSURE = 1.15; // subtle tone-map lift — ACES stays
+const EXPOSURE = 1.3; // tone-map lift — a BRIGHT winter morning, ACES stays
 const FOG_DENSITY = 0.0045; // the finish fades in at ~150 m (STYLE_BIBLE)
 const DOME_RADIUS = 620;
 const CAM_FAR = 2400; // covers the horizon peak cards from anywhere on the run
 
 // ---- lights ----------------------------------------------------------------------
 const SUN_INTENSITY = 2.3; // the warm key carries the frame
-const HEMI_INTENSITY = 0.55; // weak azure fill — the sun's shadows must register
+const HEMI_INTENSITY = 0.8; // morning fill — shadows stay blue but BRIGHT blue
 const SUN_DISTANCE = 120; // light sits at target + SUN_DIR x this
 const SHADOW_EXTENT = 55; // ortho shadow box half-size, follows the camera
 const SHADOW_MAP_SIZE = 2048;
 
 // ---- post pass ----------------------------------------------------------------------
-const GRADE_ALPHA = 0.05; // warm sunGold lift, weighted to the ground half
-const VIGNETTE_ALPHA = 0.28; // cool ink corner darkening
+const GRADE_ALPHA = 0.07; // warm sunGold lift, weighted to the ground half
+const VIGNETTE_ALPHA = 0.16; // cool ink corner darkening
+const FLASH_S = 0.12; // plant-hit edge-flash decay (s)
+const FLASH_PEAK = 0.5; // peak edge alpha on a plant hit
 
 // ---- first-person rig ------------------------------------------------------------------
 const LOOK_AHEAD = 14; // terrain pitch sample distance (m)
@@ -120,11 +123,14 @@ export class SplatScene {
   private pitch = 0; // eased terrain-following pitch (rad, negative downhill)
   private dip = 0; // plant-hit dip spring offset (<= 0 while bouncing)
   private dipV = 0;
+  private flash = 0; // plant-hit edge flash, 1 -> 0 over FLASH_S
   private prevX = 0;
   private prevZ = 0;
 
   private readonly lookScratch = new THREE.Vector3();
   private readonly sunVec = new THREE.Vector3(SUN_DIR[0], SUN_DIR[1], SUN_DIR[2]);
+  /** Live uniform object for the hit-flash quad — mutated, never replaced. */
+  private readonly flashAlpha = { value: 0 };
 
   constructor(parent: HTMLElement) {
     const canvas = document.createElement('canvas');
@@ -188,9 +194,14 @@ export class SplatScene {
     this.world.add(this.sun);
     this.world.add(this.sun.target);
 
-    // hemisphere fill: sky azure up / snow-bounce below — shadows on snow go
-    // BLUE, never grey; weak enough that the key still reads as a key
-    this.hemi = new THREE.HemisphereLight(SPAL.skyZenith, SPAL.snow, HEMI_INTENSITY);
+    // hemisphere fill: morning sky (skyZenith/skyHorizon 50-50) up / snow-bounce
+    // below — shadows on snow go BLUE, never grey, but BRIGHT blue: the raw
+    // zenith stop was saturating them to navy dusk
+    this.hemi = new THREE.HemisphereLight(
+      mix(SPAL.skyZenith, SPAL.skyHorizon, 0.5),
+      SPAL.snow,
+      HEMI_INTENSITY,
+    );
     this.world.add(this.hemi);
 
     // sky dome: vertex-gradient skyHorizon -> skyZenith + warm blob around the
@@ -274,6 +285,8 @@ export class SplatScene {
       const dipA = -DIP_SPRING * this.dip - DIP_DAMP * this.dipV;
       this.dipV += dipA * dtc;
       this.dip += this.dipV * dtc;
+      // hit flash decays linearly over FLASH_S
+      if (this.flash > 0) this.flash = Math.max(0, this.flash - dtc / FLASH_S);
       // pitch eases toward the terrain fall
       this.pitch += (pitchTarget - this.pitch) * (1 - Math.exp(-PITCH_EASE * dtc));
       this.camTime += dtc;
@@ -323,11 +336,15 @@ export class SplatScene {
       y,
       z + Math.cos(yaw) * LOOK_AHEAD,
     );
+
+    // push the hit-flash envelope to the post quad (scalar write, no alloc)
+    this.flashAlpha.value = this.flash * FLASH_PEAK;
   }
 
-  /** Plant contact: retrigger the dip spring (works mid-bounce). */
+  /** Plant contact: retrigger the dip spring (works mid-bounce) + flash. */
   plantHit(): void {
     this.dipV -= DIP_HIT;
+    this.flash = 1;
   }
 
   /**
@@ -434,9 +451,11 @@ export class SplatScene {
 
   /**
    * Dome vertex colours: a thin pure skyHorizon rim the fog fuses into,
-   * ramping to skyZenith at the top, distant snow land (snowShade) below the
-   * horizon line, and a warm sunWarm blob around the sun azimuth so the light
-   * reads directional. All stops are literal SPAL entries or SPAL lerps.
+   * ramping to full skyZenith by mid-frame and deepening toward a zenith/ink
+   * mix at the top (real blue presence overhead), distant snow land
+   * (snowShade) below the horizon line, and a warm sunWarm blob around the
+   * sun azimuth so the light reads directional. All stops are literal SPAL
+   * entries or SPAL lerps.
    */
   private tintSky(): void {
     const geo = this.sky.geometry;
@@ -446,6 +465,9 @@ export class SplatScene {
 
     const horizon = new THREE.Color(SPAL.skyHorizon);
     const zenith = new THREE.Color(SPAL.skyZenith);
+    // deeper top-of-frame blue: zenith pulled toward ink so the upper half of
+    // the dome reads as SKY, not a washed-out extension of the snowfield
+    const zenithDeep = new THREE.Color(mix(SPAL.skyZenith, SPAL.ink, 0.22));
     const below = new THREE.Color(SPAL.skyHorizon).lerp(new THREE.Color(SPAL.snowShade), 0.55);
     const warmGlow = new THREE.Color(SPAL.sunWarm);
     const c = new THREE.Color();
@@ -457,12 +479,14 @@ export class SplatScene {
         c.copy(horizon).lerp(below, smooth01(-y * 2.5));
       } else if (y < 0.06) {
         c.copy(horizon); // flat rim — the fog has to disappear into it
-      } else if (y < 0.32) {
-        c.copy(horizon).lerp(zenith, smooth01((y - 0.06) / 0.26) * 0.55);
+      } else if (y < 0.38) {
+        // full horizon -> zenith ramp low in the frame: blue presence arrives
+        // fast above the fog-fused rim instead of topping out at 55%
+        c.copy(horizon).lerp(zenith, smooth01((y - 0.06) / 0.32));
       } else if (y < 0.8) {
-        c.copy(horizon).lerp(zenith, 0.55 + 0.45 * smooth01((y - 0.32) / 0.48));
+        c.copy(zenith).lerp(zenithDeep, smooth01((y - 0.38) / 0.42));
       } else {
-        c.copy(zenith);
+        c.copy(zenithDeep);
       }
       // warm glow around the sun, kept out of the horizon rim
       dir.set(pos.getX(i), pos.getY(i), pos.getZ(i)).normalize();
@@ -475,9 +499,11 @@ export class SplatScene {
   }
 
   /**
-   * Dependency-free post pass (the kart render.ts pattern): two fullscreen
+   * Dependency-free post pass (the kart render.ts pattern): three fullscreen
    * quads — a subtle warm sunGold grade lift weighted to the GROUND half
-   * (reinforcing the cool-sky / warm-ground split) and an ink vignette.
+   * (reinforcing the cool-sky / warm-ground split), an ink vignette, and a
+   * plant-hit edge flash (snowLit->snowShade white-blue, strongest at the
+   * frame edges, alpha driven by the flash envelope from plantHit()).
    * Shader outputs raw sRGB, so uniforms are hand-decoded sRGB components.
    */
   private buildPost(): void {
@@ -492,6 +518,13 @@ export class SplatScene {
       '  vec2 p = (vUv - 0.5) * vec2(1.15, 1.0);' +
       '  float a = smoothstep(0.52, 1.05, length(p) * 1.4142) * uAlpha;' +
       '  gl_FragColor = vec4(uColor, a);' +
+      '}';
+    const FLASH_FRAG =
+      'varying vec2 vUv; uniform vec3 uColor; uniform float uAlpha;' +
+      'void main() {' +
+      '  vec2 p = (vUv - 0.5) * vec2(1.15, 1.0);' +
+      '  float edge = smoothstep(0.3, 0.95, length(p) * 1.4142);' +
+      '  gl_FragColor = vec4(uColor, uAlpha * edge);' +
       '}';
     const gradeMat = new THREE.ShaderMaterial({
       vertexShader: VERT,
@@ -509,16 +542,31 @@ export class SplatScene {
       depthTest: false,
       depthWrite: false,
     });
-    this.disposables.push(gradeMat, vignetteMat);
+    const flashMat = new THREE.ShaderMaterial({
+      vertexShader: VERT,
+      fragmentShader: FLASH_FRAG,
+      uniforms: {
+        uColor: { value: srgbUniform(mix(SPAL.snowLit, SPAL.snowShade, 0.45)) },
+        uAlpha: this.flashAlpha,
+      },
+      transparent: true,
+      depthTest: false,
+      depthWrite: false,
+    });
+    this.disposables.push(gradeMat, vignetteMat, flashMat);
     const grade = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), gradeMat);
     grade.frustumCulled = false;
     grade.renderOrder = 1;
     const vignette = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), vignetteMat);
     vignette.frustumCulled = false;
     vignette.renderOrder = 2;
-    this.disposables.push(grade.geometry, vignette.geometry);
+    const flash = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), flashMat);
+    flash.frustumCulled = false;
+    flash.renderOrder = 3;
+    this.disposables.push(grade.geometry, vignette.geometry, flash.geometry);
     this.postScene.add(grade);
     this.postScene.add(vignette);
+    this.postScene.add(flash);
   }
 
   /** Tracked context-error overlay (single element; never duplicated). */
