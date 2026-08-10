@@ -5,6 +5,7 @@
 // game validates it with its own parser and silently drops invalid messages.
 // Invalid lobby input => null; never throw on wire data.
 // ============================================================================
+import { SIG_MAX, SIG_MIN } from './identity.js';
 import type { PlayerId, RoomInfo } from './module.js';
 
 /** Transport liveness: ws protocol-level ping cadence, used by net.ts. */
@@ -17,11 +18,11 @@ export const NET = {
 // `settings` is opaque to the platform; the module validates it in createRoom.
 export type LobbyC2S =
   | { t: 'list_rooms' }
-  | { t: 'quick_join'; name: string; game?: string; resume?: PlayerId }
-  | { t: 'join_public'; name: string; roomId: string; resume?: PlayerId } // join a specific public room by id (room list rows)
-  | { t: 'create_public'; name: string; game?: string; settings?: Record<string, unknown>; resume?: PlayerId }
-  | { t: 'create_private'; name: string; game?: string; settings?: Record<string, unknown>; resume?: PlayerId }
-  | { t: 'join_private'; name: string; code: string; resume?: PlayerId }
+  | { t: 'quick_join'; name: string; game?: string; resume?: PlayerId; sig?: string }
+  | { t: 'join_public'; name: string; roomId: string; resume?: PlayerId; sig?: string } // join a specific public room by id (room list rows)
+  | { t: 'create_public'; name: string; game?: string; settings?: Record<string, unknown>; resume?: PlayerId; sig?: string }
+  | { t: 'create_private'; name: string; game?: string; settings?: Record<string, unknown>; resume?: PlayerId; sig?: string }
+  | { t: 'join_private'; name: string; code: string; resume?: PlayerId; sig?: string }
   | { t: 'leave' }
   | { t: 'ping'; ts: number };
 
@@ -29,6 +30,21 @@ export type LobbyC2S =
 export function cleanResume(v: unknown): PlayerId | undefined | null {
   if (v === undefined) return undefined;
   return typeof v === 'string' && v.length >= 4 && v.length <= 24 ? v : null;
+}
+
+/**
+ * Sanitize a browser signature (@platform/shared identity), or undefined.
+ *
+ * Unlike `resume` this is DURABLE: the same browser presents the same value
+ * across reloads, purges and reconnects, so a room can rebind a ghost seat by
+ * signature when the playerId chain has already been broken. It is a rejoin
+ * hint only — never a credential, and never trusted for anything a player
+ * could gain by forging it (a forged sig can at most claim a ghost seat in
+ * the room it is sent to, which is the same reach `resume` already had).
+ */
+export function cleanSig(v: unknown): string | undefined | null {
+  if (v === undefined) return undefined;
+  return typeof v === 'string' && v.length >= SIG_MIN && v.length <= SIG_MAX ? v : null;
 }
 
 /** Room-level pass-through: envelope-checked ({t: string}) but NOT validated. */
@@ -87,23 +103,27 @@ export function parseC2S(raw: unknown): C2S | null {
       const name = cleanName(raw.name);
       const game = cleanGame(raw.game);
       const resume = cleanResume(raw.resume);
-      if (name === null || game === null || resume === null) return null;
-      const msg: { t: 'quick_join'; name: string; game?: string; resume?: PlayerId } = { t: 'quick_join', name };
+      const sig = cleanSig(raw.sig);
+      if (name === null || game === null || resume === null || sig === null) return null;
+      const msg: { t: 'quick_join'; name: string; game?: string; resume?: PlayerId; sig?: string } = { t: 'quick_join', name };
       if (game !== undefined) msg.game = game;
       if (resume !== undefined) msg.resume = resume;
+      if (sig !== undefined) msg.sig = sig;
       return msg;
     }
     case 'join_public': {
       const name = cleanName(raw.name);
       const resume = cleanResume(raw.resume);
-      if (name === null || resume === null) return null;
+      const sig = cleanSig(raw.sig);
+      if (name === null || resume === null || sig === null) return null;
       if (!str(raw.roomId, 16)) return null;
-      const msg: { t: 'join_public'; name: string; roomId: string; resume?: PlayerId } = {
+      const msg: { t: 'join_public'; name: string; roomId: string; resume?: PlayerId; sig?: string } = {
         t: 'join_public',
         name,
         roomId: raw.roomId,
       };
       if (resume !== undefined) msg.resume = resume;
+      if (sig !== undefined) msg.sig = sig;
       return msg;
     }
     case 'create_public': {
@@ -111,14 +131,16 @@ export function parseC2S(raw: unknown): C2S | null {
       const game = cleanGame(raw.game);
       const settings = cleanSettings(raw.settings);
       const resume = cleanResume(raw.resume);
-      if (name === null || game === null || settings === null || resume === null) return null;
-      const msg: { t: 'create_public'; name: string; game?: string; settings?: Record<string, unknown>; resume?: PlayerId } = {
+      const sig = cleanSig(raw.sig);
+      if (name === null || game === null || settings === null || resume === null || sig === null) return null;
+      const msg: { t: 'create_public'; name: string; game?: string; settings?: Record<string, unknown>; resume?: PlayerId; sig?: string } = {
         t: 'create_public',
         name,
       };
       if (game !== undefined) msg.game = game;
       if (settings !== undefined) msg.settings = settings;
       if (resume !== undefined) msg.resume = resume;
+      if (sig !== undefined) msg.sig = sig;
       return msg;
     }
     case 'create_private': {
@@ -126,26 +148,30 @@ export function parseC2S(raw: unknown): C2S | null {
       const game = cleanGame(raw.game);
       const settings = cleanSettings(raw.settings);
       const resume = cleanResume(raw.resume);
-      if (name === null || game === null || settings === null || resume === null) return null;
-      const msg: { t: 'create_private'; name: string; game?: string; settings?: Record<string, unknown>; resume?: PlayerId } = {
+      const sig = cleanSig(raw.sig);
+      if (name === null || game === null || settings === null || resume === null || sig === null) return null;
+      const msg: { t: 'create_private'; name: string; game?: string; settings?: Record<string, unknown>; resume?: PlayerId; sig?: string } = {
         t: 'create_private',
         name,
       };
       if (game !== undefined) msg.game = game;
       if (settings !== undefined) msg.settings = settings;
       if (resume !== undefined) msg.resume = resume;
+      if (sig !== undefined) msg.sig = sig;
       return msg;
     }
     case 'join_private': {
       if (!str(raw.name, 16) || !str(raw.code, 8)) return null;
       const resume = cleanResume(raw.resume);
-      if (resume === null) return null;
-      const msg: { t: 'join_private'; name: string; code: string; resume?: PlayerId } = {
+      const sig = cleanSig(raw.sig);
+      if (resume === null || sig === null) return null;
+      const msg: { t: 'join_private'; name: string; code: string; resume?: PlayerId; sig?: string } = {
         t: 'join_private',
         name: raw.name.trim().slice(0, 16) || 'Player',
         code: raw.code.toUpperCase(),
       };
       if (resume !== undefined) msg.resume = resume;
+      if (sig !== undefined) msg.sig = sig;
       return msg;
     }
     case 'leave':

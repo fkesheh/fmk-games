@@ -16,6 +16,10 @@ import type {
   Team,
   WeaponId,
 } from '@fps/shared';
+// shared cross-game identity (CONTRACT_IDENTITY.md): ONE display name for the
+// whole platform, migrated automatically from the old 'stricken.name' key on
+// first read — never write that key again.
+import { cleanName, loadName, saveName } from '@platform/shared';
 import { weaponIcon } from './hud.js';
 
 /**
@@ -44,7 +48,6 @@ export interface MenuCallbacks {
 }
 
 // ---- private constants ------------------------------------------------------
-const NAME_KEY = 'stricken.name';
 const STYLE_ID = 'fps-menus-style';
 const CONSOLE_MAX_LINES = 50; // dev console keeps only the tail of the output log
 const SCORE_REFRESH_MS = 120; // open-scoreboard re-read cadence (alive/K/D move)
@@ -285,6 +288,7 @@ export class Menus {
   private readonly layers: Record<LayerId, HTMLElement>;
 
   private nameInput: HTMLInputElement | null = null;
+  private joiningSubEl: HTMLElement | null = null; // showJoining()'s swappable status line
   private removeBotBtn: HTMLButtonElement | null = null;
   private removeAllBotsBtn: HTMLButtonElement | null = null;
   private teamBtns: Record<Team, { btn: HTMLButtonElement; tag: HTMLElement }> | null = null;
@@ -384,10 +388,13 @@ export class Menus {
     nameInput.spellcheck = false;
     nameInput.autocomplete = 'off';
     nameInput.placeholder = 'Player';
-    nameInput.value = this.loadName();
+    // loadName() is '' the first time this browser is ever seen — leave the
+    // field EMPTY so the placeholder shows, rather than pre-filling 'Player'
+    // (which would make an unset name indistinguishable from a chosen one).
+    nameInput.value = loadName();
     nameInput.addEventListener('input', () => {
       const v = nameInput.value.trim();
-      if (v !== '') this.persistName(v);
+      if (v !== '') saveName(v);
     });
     nameInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') this.cb.onQuickJoin(this.name());
@@ -1195,14 +1202,25 @@ export class Menus {
     const bar = el('div', 'm9-join-bar');
     bar.appendChild(el('span', 'm9-join-bar-fill'));
     box.appendChild(bar);
-    box.appendChild(el('div', 'm9-join-sub', 'Reserving a slot on the server…'));
+    const sub = el('div', 'm9-join-sub', 'Reserving a slot on the server…');
+    this.joiningSubEl = sub; // showJoining() re-labels this for the auto-rejoin path
+    box.appendChild(sub);
     this.layers.joining.appendChild(box);
   }
 
-  showJoining(): void {
+  /**
+   * `subtitle` lets a caller distinguish a fresh join ("Reserving a slot…",
+   * the default) from an auto-rejoin after a boot/drop ("Reconnecting…") —
+   * same overlay, same layer, just the status line so the player never gets
+   * silently bounced to the main menu while we're recovering their room.
+   */
+  showJoining(subtitle?: string): void {
     this.showExclusive('joining');
     this.hideScoreboard();
     this.hide('chip');
+    if (this.joiningSubEl !== null) {
+      this.joiningSubEl.textContent = subtitle ?? 'Reserving a slot on the server…';
+    }
   }
 
   private buildPause(): void {
@@ -1392,29 +1410,11 @@ export class Menus {
     }
   }
 
-  // ---- name persistence ----------------------------------------------------------
+  // ---- name persistence (@platform/shared — shared across all five games) --------
   private name(): string {
     const raw = this.nameInput ? this.nameInput.value : '';
-    const n = raw.trim() || 'Player';
-    this.persistName(n);
-    return n;
-  }
-
-  private loadName(): string {
-    try {
-      const v = localStorage.getItem(NAME_KEY);
-      return v !== null && v.trim() !== '' ? v : 'Player';
-    } catch {
-      return 'Player'; // storage blocked (private mode) — non-fatal
-    }
-  }
-
-  private persistName(n: string): void {
-    try {
-      localStorage.setItem(NAME_KEY, n);
-    } catch {
-      // storage blocked — non-fatal
-    }
+    saveName(raw); // stores the trimmed/capped raw value, even '' (clears a stale name)
+    return cleanName(raw); // 'Player' fallback for the wire — never sent blank
   }
 }
 

@@ -57,6 +57,7 @@ import type {
   TrackId,
 } from '@kart/shared';
 import type { LobbyC2S, RoomInfo } from '@platform/shared';
+import { cleanName, clearSession, loadName, loadSession, loadSig, saveName, saveSession } from '@platform/shared';
 import { KartScene } from './render.js';
 import { DriveController, TouchPointers } from './drive.js';
 import type { TouchControl } from './drive.js';
@@ -71,9 +72,11 @@ type LobbyMsg =
   | { t: 'pong'; ts: number; serverTime: number }
   | { t: 'error'; code: string; message: string };
 
-// the frozen contract carries no code; servers that know the room's invite code
-// piggyback it (private rooms only) — optional on the wire, null when unknown
-type JoinedMsg = Extract<KartS2C, { t: 'kart_joined' }> & { code: string | null };
+// kart_joined carries roomId + code straight off the frozen contract — the
+// rejoin pointer a reloading driver needs to re-enter THIS grid rather than
+// quick-joining a stranger's race (platform contract §3; stored via
+// @platform/shared SessionRecord in onJoined() below).
+type JoinedMsg = Extract<KartS2C, { t: 'kart_joined' }>;
 type SnapshotMsg = Extract<KartS2C, { t: 'kart_snapshot' }>;
 type RaceEventMsg = Extract<KartS2C, { t: 'race_event' }>;
 
@@ -307,7 +310,7 @@ function parseS2C(raw: unknown): S2C | null {
         : null;
     case 'kart_joined': {
       const ph = kartPhase(raw.phase);
-      if (!str(raw.you) || !num(raw.slot) || !num(raw.color) || ph === null) return null;
+      if (!str(raw.you) || !num(raw.slot) || !num(raw.color) || ph === null || !str(raw.roomId)) return null;
       if (!Array.isArray(raw.players)) return null;
       const players: KartPlayerInfo[] = [];
       for (const p of raw.players) {
@@ -323,6 +326,7 @@ function parseS2C(raw: unknown): S2C | null {
         phase: ph,
         trackId: isTrackId(raw.trackId) ? raw.trackId : DEFAULT_TRACK_ID,
         players,
+        roomId: raw.roomId,
         code: str(raw.code) ? raw.code : null,
       };
     }
@@ -608,11 +612,6 @@ function readKidsStored(): boolean {
   return readFlag(KIDS_KEY) === true;
 }
 
-/** Trimmed, length-capped display name; 'Player' when whitespace-only (lobby rule). */
-function cleanName(v: string): string {
-  return v.trim().slice(0, NAME_MAX) || 'Player';
-}
-
 /** 'm:ss.mmm' race-clock format; '—' for unset (-1) times. */
 function fmtMs(ms: number): string {
   if (!Number.isFinite(ms) || ms < 0) return '—';
@@ -882,6 +881,7 @@ export class KartApp {
     this.nameInput.maxLength = NAME_MAX;
     this.nameInput.placeholder = 'your name';
     this.nameInput.autocomplete = 'off';
+    this.nameInput.value = loadName(); // shared across every game; '' leaves the placeholder showing
     this.menuEl.appendChild(this.nameInput);
 
     const menuActions = el('div', 'menu-actions');
@@ -1383,31 +1383,49 @@ export class KartApp {
   }
 
   // ---- lobby actions (game filter 'kart' on every create/join; kart has no settings) --
+  /**
+   * Stamp identity on every outgoing join: `sig` always (the durable per-browser
+   * signature — @platform/shared), `resume` when a dropped kart session exists
+   * (exact and cheapest, so the room's rebind rule tries it first — platform
+   * contract §2.3). Every join call site below routes through this; never stamp
+   * inline.
+   */
+  private withIdentity<T extends LobbyC2S>(msg: T): T {
+    const resume = loadSession('kart')?.playerId;
+    return resume !== undefined ? { ...msg, sig: loadSig(), resume } : { ...msg, sig: loadSig() };
+  }
+
   private joinQuick(name: string): void {
+    const clean = cleanName(name);
+    saveName(clean);
     const msg: Extract<LobbyC2S, { t: 'quick_join' }> = {
       t: 'quick_join',
-      name: cleanName(name),
+      name: clean,
       game: 'kart',
     };
-    this.send(msg);
+    this.send(this.withIdentity(msg));
   }
   private createPublic(name: string): void {
+    const clean = cleanName(name);
+    saveName(clean);
     const msg: Extract<LobbyC2S, { t: 'create_public' }> = {
       t: 'create_public',
-      name: cleanName(name),
+      name: clean,
       game: 'kart',
       settings: { trackId: this.selectedTrackId },
     };
-    this.send(msg);
+    this.send(this.withIdentity(msg));
   }
   private createPrivate(name: string): void {
+    const clean = cleanName(name);
+    saveName(clean);
     const msg: Extract<LobbyC2S, { t: 'create_private' }> = {
       t: 'create_private',
-      name: cleanName(name),
+      name: clean,
       game: 'kart',
       settings: { trackId: this.selectedTrackId },
     };
-    this.send(msg);
+    this.send(this.withIdentity(msg));
   }
   private joinPrivate(name: string, code: string): void {
     const c = code.trim();
@@ -1415,35 +1433,59 @@ export class KartApp {
       this.setNotice('enter a room code first');
       return;
     }
+    const clean = cleanName(name);
+    saveName(clean);
     const msg: Extract<LobbyC2S, { t: 'join_private' }> = {
       t: 'join_private',
-      name: cleanName(name),
+      name: clean,
       code: c,
     };
-    this.send(msg);
+    this.send(this.withIdentity(msg));
   }
 
-  /** Room-list row click: join a specific room by id (same flow as joinPrivate; kart
-   *  carries no resume token — docs/KART.md: "resume token optional v1: NOT required"). */
+  /** Room-list row click: join a specific room by id (same flow as joinPrivate). Carries
+   *  `sig` + `resume` like every other join — kart used to carry no resume token
+   *  (docs/KART.md: "resume token optional v1: NOT required"); that call is reversed:
+   *  kart now persists a rejoin pointer like every other game (see @platform/shared
+   *  SessionRecord and onJoined() below). */
   private joinPublic(name: string, roomId: string): void {
+    const clean = cleanName(name);
+    saveName(clean);
     const msg: Extract<LobbyC2S, { t: 'join_public' }> = {
       t: 'join_public',
-      name: cleanName(name),
+      name: clean,
       roomId,
     };
-    this.send(msg);
+    this.send(this.withIdentity(msg));
   }
 
   // ---- message routing -------------------------------------------------------------
   private onMessage(msg: S2C): void {
     switch (msg.t) {
-      case 'welcome':
+      case 'welcome': {
         this.playerId = msg.playerId;
         this.welcomed = true;
         this.send({ t: 'list_rooms' });
-        this.setNotice('');
+        // Auto-rejoin is the point of the identity contract: 'welcome' is the
+        // first message on EVERY connection — fresh boot and post-drop
+        // reconnect alike — so a stored kart session re-enters that same room
+        // with no click. Refresh the session's playerId first so the `resume`
+        // this join sends (via withIdentity) chains to THIS socket, not a
+        // dropped one — otherwise a second drop would resume a dead id.
+        const session = loadSession('kart');
+        if (session !== null) {
+          saveSession('kart', { ...session, playerId: msg.playerId });
+          this.setNotice('reconnecting…');
+          const name = cleanName(loadName());
+          if (session.code !== null) this.joinPrivate(name, session.code);
+          else if (session.roomId !== null) this.joinPublic(name, session.roomId);
+          else this.joinQuick(name);
+        } else {
+          this.setNotice('');
+        }
         this.renderMenu();
         break;
+      }
       case 'room_list':
         this.rooms = msg.rooms.filter((r) => r.game === 'kart'); // kart-only room list
         if (this.screen === 'menu') this.renderRooms();
@@ -1464,6 +1506,13 @@ export class KartApp {
         break;
       }
       case 'error':
+        // 'no_room' is the server confirming the stored rejoin pointer is dead
+        // (reaped room / stale code) — NOT a transport hiccup. Clear it so
+        // auto-rejoin on the next 'welcome' falls through to quickJoin instead
+        // of retrying the same corpse forever. Any other error code (e.g. a
+        // drop) must leave the session alone: that is exactly what resume is
+        // for (platform contract §3).
+        if (msg.code === 'no_room') clearSession('kart');
         this.setNotice(msg.message);
         break;
       case 'kart_joined':
@@ -1544,6 +1593,13 @@ export class KartApp {
     this.slot = msg.slot;
     this.colorIdx = msg.color;
     this.roomCode = msg.code; // private rooms carry their invite code; null = public
+    // Store the rejoin pointer: welcome always precedes kart_joined, so
+    // this.playerId is set here (this.selfId()'s 'you' fallback is only for
+    // pre-welcome debug reads). A reload/drop re-enters THIS room via welcome's
+    // auto-rejoin, not a fresh quick_join.
+    if (this.playerId !== null) {
+      saveSession('kart', { playerId: this.playerId, roomId: msg.roomId, code: msg.code });
+    }
     this.updateInviteChip();
     this.phase = msg.phase; // set directly — joining is not a phase TRANSITION
     this.applyFreeze(); // mid-race joiners drive at once; everyone else waits for GO
@@ -1567,6 +1623,7 @@ export class KartApp {
 
   private leaveToMenu(notice: string): void {
     this.send({ t: 'leave' });
+    clearSession('kart'); // explicit leave — never on a drop, which keeps the pointer for auto-rejoin
     this.resetRoom();
     this.showMenu(notice);
     if (this.welcomed) this.send({ t: 'list_rooms' });

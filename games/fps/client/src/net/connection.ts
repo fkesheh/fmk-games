@@ -9,6 +9,7 @@
 // ============================================================================
 import { decodeS2C, NET } from '@fps/shared';
 import type { C2S, MapId, S2C } from '@fps/shared';
+import type { LobbyC2S } from '@platform/shared';
 
 /**
  * Platform lobby create envelopes (platform/shared/src/protocol.ts LobbyC2S):
@@ -102,8 +103,20 @@ export class Connection {
     });
   }
 
-  /** No-op unless the socket is open (mirrors the server's Session.send). */
-  send(msg: C2S | LobbyCreate): void {
+  /**
+   * No-op unless the socket is open (mirrors the server's Session.send).
+   * Accepts three overlapping shapes: fps's own room-level `C2S`, this
+   * file's `LobbyCreate` (create_* with a typed `{mapId}` settings payload),
+   * and the platform's `LobbyC2S` (imported verbatim, never hand-redeclared
+   * — CONTRACT_IDENTITY.md §2.2 owns that shape). `LobbyC2S` is the ONLY
+   * source for `join_public`: fps's own C2S never had it because it is a
+   * lobby-level message, not a room one, and CONTRACT_IDENTITY.md forbids
+   * editing games/fps/shared to add it. Auto-rejoin into a public room
+   * (clientGame.ts tryAutoRejoin) needs exactly this shape — without it the
+   * only option left is quick_join, which can matchmake into a DIFFERENT
+   * room than the one being resumed.
+   */
+  send(msg: C2S | LobbyCreate | LobbyC2S): void {
     const ws = this.ws;
     if (ws === null || ws.readyState !== WebSocket.OPEN) return;
     try {

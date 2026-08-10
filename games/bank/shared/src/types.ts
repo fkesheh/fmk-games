@@ -57,6 +57,13 @@ export interface BankState {
   winnerId: string | null; // set at matchEnd
   code: string | null; // the room's private join code (null for public rooms)
   /**
+   * The room's id. Public rooms have no join code, so without this a reload
+   * could only ever rejoin SOME room via quick_join — never the one it left.
+   * The client stores it in the shared rejoin pointer (@platform/shared
+   * SessionRecord) and re-enters with `join_public`.
+   */
+  roomId: string;
+  /**
    * COSMETIC ONLY. True in a POST-MATCH lobby (the previous match finished and
    * the room reset), false in a cold lobby and during play. BOTH lobbies wait
    * for `{t:'start'}` — this bit only lets the client say "match complete"

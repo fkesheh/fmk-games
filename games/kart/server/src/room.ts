@@ -133,9 +133,12 @@ function randomToken(next: () => number, len: number): string {
 }
 
 /**
- * Server-side player record, join order = Map insertion order. Disconnects
- * delete the entry immediately (racing has no rejoin-value v1); only their
- * finishOrder entry survives if they had already finished.
+ * Server-side player record, join order = Map insertion order. A socket drop
+ * GHOSTS the entry (connected:false) instead of deleting it — slot, color and
+ * every field of the race survive so a rejoin (resume, then sig) resumes
+ * exactly where the driver left the circuit; an explicit leave still deletes
+ * it outright. Either way, a finishOrder entry always survives: a finished
+ * player keeps their result even after the seat itself is gone.
  */
 interface Player {
   id: PlayerId;
@@ -143,6 +146,17 @@ interface Player {
   slot: number; // grid slot (lowest free at join)
   color: number; // index into KART_COLORS
   lastStateAt: number; // serverTime ms of join / last valid message; stale sweep
+  // ---- connection ----
+  // `connected` is what turns a live racer into a GHOST: false means the
+  // socket dropped (removePlayer without `permanent`) while the seat below —
+  // slot, color, lap, progress, finish state, everything — is kept exactly as
+  // it was, so a rejoin can pick the SAME driver back up mid-corner instead of
+  // putting them back on the grid. `sig` is the durable browser signature the
+  // last connection sent; a rejoin whose `resume` no longer matches (a fresh
+  // playerId, e.g. after a full page reload) falls back to matching on it
+  // (contract: resume first, then sig — see addPlayer).
+  connected: boolean;
+  sig: string | null;
   // ---- authoritative simulation ----
   // `sim` IS the kart: position, yaw, velocity, gearbox, drift and respawn
   // anchor. Nothing on the wire writes to it — only stepDrive (from consumed
@@ -339,36 +353,80 @@ export class KartRoom implements GameRoomHandle {
     };
   }
 
-  /** Entries are deleted on disconnect, so the map size IS the count. */
+  /**
+   * CONNECTED racers only — a ghost (dropped socket, seat kept for rejoin)
+   * still owns a row in `players` but must never count as "here": it is what
+   * keeps the lobby's "2/8" honest and MIN_PLAYERS gating from being fooled by
+   * a driver who is not coming back this tick.
+   */
   playerCount(): number {
+    let n = 0;
+    for (const p of this.players.values()) if (p.connected) n++;
+    return n;
+  }
+
+  /**
+   * Every seated row, ghosts included — the SLOT census. A ghost still holds
+   * its grid slot (lowestFreeSlot skips it too), so this — not playerCount —
+   * is what the room_full guard below must check: connected-only would let a
+   * fresh joiner collide with a ghost's still-reserved slot.
+   */
+  private seatedCount(): number {
     return this.players.size;
   }
 
-  /** Players with no valid message (kart_input/nitro/start) for INPUT_STALE_MS. */
+  /**
+   * Players with no valid message (kart_input/nitro/start) for INPUT_STALE_MS.
+   * A ghost's `lastStateAt` stops moving the instant it ghosts (nothing ever
+   * arrives under its old id again), so without this guard it would look
+   * PERMANENTLY stale and the platform would try to evict an already-gone
+   * connection forever — a ghost is never returned here.
+   */
   stalePlayers(): PlayerId[] {
     const now = Date.now();
     const out: PlayerId[] = [];
     for (const p of this.players.values()) {
+      if (!p.connected) continue;
       if (now - p.lastStateAt > INPUT_STALE_MS) out.push(p.id);
     }
     return out;
   }
 
-  addPlayer(id: PlayerId, name: string, _resume?: PlayerId): void {
+  /**
+   * Seat a joiner (contract 2.3, resume-where-you-left-off):
+   *   1. `id` itself already has a row (any state) -> same-session re-add:
+   *      keep everything, just refresh name/liveness. This is what a socket
+   *      that reconnects under the SAME playerId hits, ghost or not.
+   *   2. else `resume` names a ghost's playerId -> rebind onto the new id.
+   *   3. else `sig` matches a ghost's stored signature -> rebind onto the new
+   *      id — the fallback for when `resume` is gone (e.g. a fresh page load
+   *      handed the client a brand-new playerId before it could reconnect).
+   *   4. else -> a genuinely new driver: freshPlayer, gated on the SEATED cap
+   *      (seatedCount, not playerCount — a ghost still owns its slot).
+   * Only case 4 can grow the roster, so it is the only branch capacity-checked;
+   * rebind and same-session both re-use a seat that already exists.
+   */
+  addPlayer(id: PlayerId, name: string, resume?: PlayerId, sig?: string): void {
     try {
       const now = Date.now();
       const existing = this.players.get(id);
       if (existing !== undefined) {
-        // same-session re-add: keep slot + race state, play on
         existing.name = name;
         existing.lastStateAt = now;
+        existing.connected = true;
+        if (sig !== undefined) existing.sig = sig;
       } else {
-        if (this.playerCount() >= MAX_PLAYERS) {
-          // unreachable via the lobby (it guards room_full first); never throws
-          this.io.send(id, { t: 'error', code: 'room_full', message: 'room is full' });
-          return;
+        const ghost = this.findGhost(resume, sig);
+        if (ghost !== null) {
+          this.rebind(ghost, id, name, sig, now);
+        } else {
+          if (this.seatedCount() >= MAX_PLAYERS) {
+            // unreachable via the lobby (it guards room_full first); never throws
+            this.io.send(id, { t: 'error', code: 'room_full', message: 'room is full' });
+            return;
+          }
+          this.players.set(id, this.freshPlayer(id, name, now, sig ?? null));
         }
-        this.players.set(id, this.freshPlayer(id, name, now));
       }
       // NO AUTO-START (frozen lobby contract): a full lobby still WAITS. The
       // room leaves 'lobby' only on an explicit `{t:'start'}` from a seated
@@ -377,7 +435,8 @@ export class KartRoom implements GameRoomHandle {
       // Championship registration happens AFTER the seat exists, so a joiner
       // who was bounced for room_full above never lands in the standings. A
       // mid-season arrival starts on zero with joinedRound = the current round;
-      // they cannot touch anybody else's row.
+      // they cannot touch anybody else's row. A rebind's entry was already
+      // re-keyed onto `id` by rebind() above, so this is just a name refresh.
       this.ensureEntry(p);
       this.standingsDirty = true; // `here` flips, and a re-add may have renamed them
       this.io.send(id, this.joinedFor(p));
@@ -386,18 +445,75 @@ export class KartRoom implements GameRoomHandle {
     }
   }
 
+  /** A disconnected seat matching `resume` (exact playerId) or, failing that, `sig`. */
+  private findGhost(resume: PlayerId | undefined, sig: string | undefined): Player | null {
+    if (resume !== undefined) {
+      const byResume = this.players.get(resume);
+      if (byResume !== undefined && !byResume.connected) return byResume;
+    }
+    if (sig !== undefined) {
+      for (const p of this.players.values()) {
+        if (!p.connected && p.sig === sig) return p;
+      }
+    }
+    return null;
+  }
+
   /**
-   * Immediate removal (socket drop or explicit leave alike — no ghosting v1).
-   * A finishOrder entry is NOT removed: a finished player keeps their result.
+   * Re-key a ghosted seat onto a new playerId — slot, color, lap, progress,
+   * finish state, nitro, everything stays; only the id (and the championship
+   * row it is filed under) moves. Never creates a second entry for one
+   * driver: the SeasonEntry is re-keyed in place here, not re-registered by
+   * the ensureEntry call that follows in addPlayer.
    */
-  removePlayer(id: PlayerId, _permanent?: boolean): void {
+  private rebind(ghost: Player, newId: PlayerId, name: string, sig: string | undefined, now: number): void {
+    const oldId = ghost.id;
+    this.players.delete(oldId);
+    ghost.id = newId;
+    ghost.name = name;
+    ghost.connected = true;
+    ghost.lastStateAt = now;
+    if (sig !== undefined) ghost.sig = sig;
+    ghost.snap.id = newId; // the wire roster entry follows the seat, not the old socket
+    this.players.set(newId, ghost);
+    const entry = this.entries.get(oldId);
+    if (entry !== undefined) {
+      this.entries.delete(oldId);
+      entry.id = newId;
+      this.entries.set(newId, entry);
+      this.standingsDirty = true;
+    }
+  }
+
+  /**
+   * A socket drop GHOSTS the seat (connected:false, everything else kept) so
+   * a rejoin (resume, then sig) resumes the SAME race; an explicit leave
+   * (`permanent`) deletes it outright. Either way a finishOrder entry is NOT
+   * removed: a finished player keeps their result.
+   */
+  removePlayer(id: PlayerId, permanent?: boolean): void {
     try {
-      if (!this.players.delete(id)) return;
-      // The row SURVIVES the seat (F1: you keep the points you scored), it just
-      // stops being `here`. Eviction of departed rows is the standings cap's job.
+      const p = this.players.get(id);
+      if (p === undefined) return;
+      if (permanent === true) {
+        // explicit leave (C2S 'leave'): the seat is gone for good.
+        this.players.delete(id);
+      } else {
+        // socket drop: GHOST it. The row SURVIVES — slot, color, race state,
+        // everything — so a rejoin resumes the SAME race instead of a fresh
+        // grid seat. The input queue is cleared and tickPlayer itself refuses
+        // to step a disconnected seat, so the ghost's kart freezes on the
+        // spot: no throttle, no steer, and (rebuildOrder skips it too) no more
+        // collisions to give or take.
+        p.connected = false;
+        p.inputQueue.length = 0;
+      }
+      // Either way the championship row survives (F1: you keep the points you
+      // scored); it just stops being `here`. Eviction of departed rows is the
+      // standings cap's job, not this one's.
       this.standingsDirty = true;
       const now = Date.now();
-      const n = this.playerCount();
+      const n = this.playerCount(); // CONNECTED count: a ghost never props this up
       if (n === 0 && this.phase !== 'lobby') {
         this.resetToLobby(now); // nobody left to show the race/results to
       } else if ((this.phase === 'ready' || this.phase === 'countdown') && n < MIN_PLAYERS) {
@@ -406,7 +522,8 @@ export class KartRoom implements GameRoomHandle {
         this.phaseEndsAt = 0;
         this.countdown = 0;
       } else if (this.phase === 'racing' && this.allFinished()) {
-        // the leaver was the last one still out: race over for the rest
+        // the leaver was the last one still out (or connected at all): race
+        // over for the rest — allFinished() already ignores ghosts.
         this.enterResults(now);
       }
       // low pop mid-race (n >= 1): the race RUNS ON for the remaining players
@@ -427,6 +544,7 @@ export class KartRoom implements GameRoomHandle {
       if (parsed === null) return;
       const p = this.players.get(id);
       if (p === undefined) return;
+      if (!p.connected) return; // a ghost takes no input, ever
       const now = Date.now();
       p.lastStateAt = now; // any valid message is liveness
       if (parsed.t === 'nitro') {
@@ -536,6 +654,7 @@ export class KartRoom implements GameRoomHandle {
    * cap during the whole countdown.
    */
   private tickPlayer(p: Player, now: number): void {
+    if (!p.connected) return; // ghost: frozen, never simulated as an active racer
     const q = p.inputQueue;
     if (q.length === 0) return;
     const win = Math.floor(now / 1000);
@@ -610,11 +729,17 @@ export class KartRoom implements GameRoomHandle {
     for (const p of list) clampToBarrier(p.sim, this.track);
   }
 
-  /** The shared scratch roster, refilled in place (never reallocated). */
+  /**
+   * The shared scratch roster, refilled in place (never reallocated).
+   * CONNECTED only: this feeds both contact resolution and place computation,
+   * and a ghost must do neither — it cannot shove or be shoved (no collide-
+   * grief in either direction) and it cannot occupy a place a live racer
+   * should hold.
+   */
   private rebuildOrder(): Player[] {
     const list = this.order;
     list.length = 0;
-    for (const p of this.players.values()) list.push(p);
+    for (const p of this.players.values()) if (p.connected) list.push(p);
     return list;
   }
 
@@ -673,6 +798,7 @@ export class KartRoom implements GameRoomHandle {
     this.raceEndsAt = now + RACE_TIMEOUT_S * 1000;
     this.phaseEndsAt = this.raceEndsAt;
     for (const p of this.players.values()) {
+      if (!p.connected) continue; // a ghost is not re-gridded or refuelled for a race it is not in
       // Grid wipe: a fresh kart on the slot, and the pre-GO input backlog is
       // DROPPED but ACKED — dropping alone would leave those seqs pending in
       // the client's replay queue forever (it would keep re-applying inputs the
@@ -715,6 +841,14 @@ export class KartRoom implements GameRoomHandle {
     // reset below calls gridSlot(this.track, ...) and has to place karts on the
     // circuit they are about to race, not the one they just left.
     this.advanceSeason();
+    // Ghosts do NOT survive a full reset. Their whole point was letting the
+    // race they were IN resume; that race just ended, so an unclaimed seat
+    // would otherwise squat on a slot forever and block a real driver from
+    // taking it in the next one (never haunt a new grid). Their championship
+    // row is untouched — F1 points survive; the seat does not.
+    for (const [id, p] of this.players) {
+      if (!p.connected) this.players.delete(id);
+    }
     for (const p of this.players.values()) this.resetRaceState(p);
     this.finishOrder.length = 0; // pooled like every other per-race array here
     this.phase = 'lobby';
@@ -944,7 +1078,11 @@ export class KartRoom implements GameRoomHandle {
       r.delta = e.delta;
       r.wins = e.wins;
       r.bestFinish = e.bestFinish;
-      r.here = this.players.has(e.id); // a departed driver keeps the row, loses the flag
+      // `here` means CONNECTED, not merely seated: a ghost still owns a row in
+      // `players` (that is the whole point — it can rebind back into it), but
+      // it must read exactly like a fully-departed driver on this flag.
+      const seat = this.players.get(e.id);
+      r.here = seat !== undefined && seat.connected;
       r.joinedRound = e.joinedRound;
     }
   }
@@ -1047,11 +1185,21 @@ export class KartRoom implements GameRoomHandle {
     return Math.hypot(p.sim.x - gate.x, p.sim.z - gate.z);
   }
 
-  /** Every connected player has finished (and someone is connected). */
+  /**
+   * Every CONNECTED player has finished (and at least one is connected). A
+   * ghost is skipped entirely — its `finished` flag is frozen at whatever it
+   * was when it dropped and must never be required to become true, or a race
+   * with one ghost who never finishes would never end (the bug this exists
+   * to prevent).
+   */
   private allFinished(): boolean {
-    if (this.players.size === 0) return false;
-    for (const p of this.players.values()) if (!p.finished) return false;
-    return true;
+    let any = false;
+    for (const p of this.players.values()) {
+      if (!p.connected) continue;
+      any = true;
+      if (!p.finished) return false;
+    }
+    return any;
   }
 
   // -------------------------------------------------------------------------
@@ -1059,7 +1207,7 @@ export class KartRoom implements GameRoomHandle {
   // -------------------------------------------------------------------------
 
   /** Fresh entry: grid spawn; a mid-race joiner starts lap 1 NOW and races too. */
-  private freshPlayer(id: PlayerId, name: string, now: number): Player {
+  private freshPlayer(id: PlayerId, name: string, now: number, sig: string | null): Player {
     const slot = this.lowestFreeSlot();
     const spawn = gridSlot(this.track, slot);
     const color = slot % KART_COLORS.length;
@@ -1101,6 +1249,8 @@ export class KartRoom implements GameRoomHandle {
       slot,
       color,
       lastStateAt: now,
+      connected: true,
+      sig,
       sim,
       steer: 0,
       inputQueue: [],
@@ -1179,17 +1329,21 @@ export class KartRoom implements GameRoomHandle {
   }
 
   /**
-   * kart_joined payload (frozen): the full seated roster, joiner included.
-   * `code` is an additive field (same convention as bank_state) so clients can
-   * show the private-room invite code; the frozen KartS2C union is untouched.
+   * kart_joined payload: the full seated roster (ghosts included — the row is
+   * still theirs), joiner included. `roomId`/`code` are room identity
+   * (@platform/shared identity contract): a reloading client stores
+   * `{ playerId, roomId, code }` and re-enters THIS room on its next
+   * connection — `join_public` takes `roomId`, `join_private` takes `code`
+   * (null on a public room).
    */
-  private joinedFor(you: Player): KartS2C & { code: string | null } {
+  private joinedFor(you: Player): Extract<KartS2C, { t: 'kart_joined' }> {
     const players: KartPlayerInfo[] = [];
     for (const p of this.players.values()) {
       players.push({ id: p.id, name: p.name, slot: p.slot, color: p.color });
     }
     return {
       t: 'kart_joined',
+      roomId: this.id,
       code: this.code, // private-room invite code (null for public); everyone in the room may see it
       you: you.id,
       slot: you.slot,
@@ -1210,6 +1364,7 @@ export class KartRoom implements GameRoomHandle {
     if (this.phase !== 'racing' || you.place <= 1) return 0;
     let ahead: Player | undefined;
     for (const p of this.players.values()) {
+      if (!p.connected) continue; // `place` is only current for connected racers
       if (p.place === you.place - 1) {
         ahead = p;
         break;

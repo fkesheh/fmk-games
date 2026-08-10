@@ -105,6 +105,13 @@ interface Player {
   eligible: boolean;
   /** Words this player has SCORED this match. Committed at the boom (I4). */
   used: Set<string>;
+  /**
+   * The joiner's durable browser signature (@platform/shared identity), or
+   * null when they joined before signatures existed / storage was blocked.
+   * SERVER-SIDE SEAT METADATA ONLY — never put this on `WbPublicState` or any
+   * other outgoing message; it is a rejoin hint, not something to broadcast.
+   */
+  sig: string | null;
 }
 
 type Validation = { ok: true; word: string } | { ok: false; reason: WbRejectReason };
@@ -225,7 +232,14 @@ export class WordbombRoom implements GameRoomHandle {
     return out;
   }
 
-  addPlayer(id: PlayerId, name: string, resume?: PlayerId): void {
+  /**
+   * §2.3 rebind order: `resume` first (exact, cheapest, and what already-
+   * shipped clients send — keeps I8 green), then `sig` against a disconnected
+   * seat (durable across purge/rotation, for a client that lost its playerId
+   * chain — e.g. a reload out of a room the old resume record never named).
+   * Both paths funnel through `rebindGhost`; there is no second rebind path.
+   */
+  addPlayer(id: PlayerId, name: string, resume?: PlayerId, sig?: string): void {
     try {
       const now = Date.now();
       const existing = this.players.get(id);
@@ -234,8 +248,12 @@ export class WordbombRoom implements GameRoomHandle {
         existing.connected = true;
         existing.name = name;
         existing.lastMsgAt = now;
-      } else if (resume !== undefined && this.rebindGhost(resume, id, name, now)) {
+        if (sig !== undefined) existing.sig = sig; // keep the seat's sig current
+      } else if (resume !== undefined && this.rebindGhost(resume, id, name, sig, now)) {
         // resume matched a disconnected entry: re-bound in place above (I8)
+      } else if (sig !== undefined && this.rebindGhostBySig(sig, id, name, now)) {
+        // resume missed (new tab, purge, rotated playerId) but the durable sig
+        // still finds the ghost seat — see §2.3.
       } else {
         if (this.playerCount() >= MAX_PLAYERS) {
           // unreachable via the lobby (it guards room_full first); never throws
@@ -257,6 +275,7 @@ export class WordbombRoom implements GameRoomHandle {
           lastSubmitAt: 0,
           eligible: this.phase === 'lobby',
           used: new Set<string>(),
+          sig: sig ?? null,
         });
       }
       // A full lobby is STILL just a lobby. Reaching MIN_PLAYERS only flips
@@ -641,23 +660,44 @@ export class WordbombRoom implements GameRoomHandle {
   // -------------------------------------------------------------------------
 
   /**
-   * Resume-token rejoin (I8): `oldId` names an existing entry that is currently
-   * disconnected — re-bind it to the new session id, keeping its exact
-   * join-order slot, score, used-word set and locked word. Returns false when
-   * there is no such entry or it is still connected (the caller joins as new).
+   * Rejoin rebind (I8), by resume token OR by sig (§2.3 — both callers land
+   * here; this is the ONLY rebind path). `oldId` names an existing entry that
+   * is currently disconnected — re-bind it to the new session id, keeping its
+   * exact join-order slot, score, used-word set and locked word. Returns false
+   * when there is no such entry or it is still connected (the caller joins as
+   * new).
    */
-  private rebindGhost(oldId: PlayerId, newId: PlayerId, name: string, now: number): boolean {
+  private rebindGhost(
+    oldId: PlayerId,
+    newId: PlayerId,
+    name: string,
+    sig: string | undefined,
+    now: number,
+  ): boolean {
     const ghost = this.players.get(oldId);
     if (ghost === undefined || ghost.connected) return false;
     ghost.id = newId;
     ghost.name = name;
     ghost.connected = true;
     ghost.lastMsgAt = now;
+    if (sig !== undefined) ghost.sig = sig; // keep the seat's sig current on every rebind
     // rebuild the map so the re-bound entry keeps its exact join-order slot
     const entries = [...this.players.entries()];
     this.players.clear();
     for (const [key, p] of entries) this.players.set(key === oldId ? newId : key, p);
     return true;
+  }
+
+  /**
+   * §2.3 fallback path: find a disconnected seat by durable sig (there is at
+   * most one — a sig is stamped on at most one seat at a time) and rebind it
+   * through the SAME `rebindGhost` the resume path uses.
+   */
+  private rebindGhostBySig(sig: string, newId: PlayerId, name: string, now: number): boolean {
+    for (const p of this.players.values()) {
+      if (!p.connected && p.sig === sig) return this.rebindGhost(p.id, newId, name, sig, now);
+    }
+    return false;
   }
 
   /**
@@ -718,6 +758,10 @@ export class WordbombRoom implements GameRoomHandle {
     return {
       t: 'wb_public',
       code: this.code,
+      // §2.2: public rooms have no join code, so this is the ONLY way a
+      // reload can find its way back to a public room (@platform/shared
+      // SessionRecord.roomId + join_public). Same source `info()` uses.
+      roomId: this.id,
       phase: this.phase,
       round: this.round,
       rounds: this.settings.rounds,

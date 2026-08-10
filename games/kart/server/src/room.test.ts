@@ -1421,6 +1421,192 @@ describe('KartRoom robustness', () => {
 });
 
 // ==============================================================================
+// GHOSTING + REBIND — a socket drop no longer deletes the seat (contract:
+// browser signature, shared name, resume-where-you-left-off). It GHOSTS it
+// (connected:false, everything else kept) so a rejoin — resume first, then
+// sig — picks the SAME driver back up mid-corner, on the SAME slot/color,
+// with lap/progress/bestLapMs and the championship row intact. A ghost must
+// never count as "here", never block a race from ending, and never survive a
+// full reset back to the lobby.
+// ==============================================================================
+describe('KartRoom ghosting + rebind', () => {
+  /**
+   * setupRace (see above), but the initial join(s) can carry a `sig` — plain
+   * setupRace never sends one, so a sig-only rebind test needs this instead.
+   */
+  function setupRaceWithSig(
+    io: FakeIO,
+    sigs: Partial<Record<PlayerId, string>>,
+    ids: PlayerId[] = ['p1', 'p2'],
+  ): { room: KartRoom; drivers: Driver[] } {
+    const room = new KartRoom(DEFAULT_TRACK_ID, 'public', io);
+    ids.forEach((id, i) => room.addPlayer(id, `Driver${i + 1}`, undefined, sigs[id]));
+    room.start();
+    room.handleMessage(ids[0]!, { t: 'start' });
+    advanceToPhase(io, ids[0]!, 'racing');
+    return { room, drivers: ids.map((id, i) => new Driver(id, i)) };
+  }
+
+  it('drop mid-race then rejoin with resume: seat, race state and the season row all follow', () => {
+    const io = new FakeIO();
+    const { room, drivers } = setupRace(io, ['p1', 'p2']);
+    const d1 = drivers[0]!;
+
+    // drive a full lap so lap/progress/bestLapMs all move off their fresh-join
+    // defaults — a rebind that accidentally built a FRESH seat would show the
+    // exact same defaults (lap 1, progress 0, bestLapMs -1), so this is what
+    // makes the "preserved" assertions below actually mean something
+    driveUntil(room, io, [d1], () => io.lastSnap('p1').you.progress >= GATES, 1200);
+    settle();
+
+    const before = io.lastSnap('p1').you;
+    expect(before.bestLapMs, 'a full lap was actually driven').toBeGreaterThan(0);
+    const beforeSlot = snapOf(io, 'p1').slot;
+    const beforeColor = snapOf(io, 'p1').color;
+    const beforeSeason = io.lastSnap('p1').championship;
+    if (beforeSeason === null) throw new Error('default room should carry a championship');
+    const beforeRow = beforeSeason.standings.find((r) => r.id === 'p1');
+    if (beforeRow === undefined) throw new Error('p1 should already have a standings row');
+
+    room.removePlayer('p1'); // socket drop: ghost, not delete
+    settle();
+    expect(room.playerCount(), 'the ghost does not count').toBe(1);
+
+    room.addPlayer('p1b', 'Driver1', 'p1'); // new connection, same driver, resume = old id
+    const joined = io.joined('p1b');
+    expect(joined.slot).toBe(beforeSlot);
+    expect(joined.color).toBe(beforeColor);
+    expect(joined.players.map((p) => p.id), 'no leftover row under the old id').toEqual(['p2', 'p1b']);
+    settle();
+
+    const after = io.lastSnap('p1b').you;
+    expect(after.lap).toBe(before.lap);
+    expect(after.progress).toBe(before.progress);
+    expect(after.bestLapMs).toBe(before.bestLapMs);
+    expect(room.playerCount()).toBe(2);
+
+    const afterSeason = io.lastSnap('p1b').championship;
+    if (afterSeason === null) throw new Error('championship should still be on');
+    const rows = afterSeason.standings.filter((r) => r.id === 'p1' || r.id === 'p1b');
+    expect(rows.length, 'exactly one row for this driver, re-keyed onto the new id').toBe(1);
+    expect(rows[0]!.id).toBe('p1b');
+    expect(rows[0]!.points).toBe(beforeRow.points);
+    expect(rows[0]!.joinedRound).toBe(beforeRow.joinedRound);
+    room.stop();
+  });
+
+  it('drop then rejoin by sig alone (no resume, brand-new playerId): still the same rebind', () => {
+    const io = new FakeIO();
+    const { room, drivers } = setupRaceWithSig(io, { p1: 'sig-p1' }, ['p1', 'p2']);
+    const d1 = drivers[0]!;
+
+    driveUntil(room, io, [d1], () => io.lastSnap('p1').you.progress >= 1, 400);
+    settle();
+    const before = io.lastSnap('p1').you;
+    const beforeSlot = snapOf(io, 'p1').slot;
+
+    room.removePlayer('p1');
+    settle();
+
+    // a fresh playerId (as if `resume` was lost, e.g. after a full reload)
+    // but the SAME durable browser signature
+    room.addPlayer('p1c', 'Driver1', undefined, 'sig-p1');
+    const joined = io.joined('p1c');
+    expect(joined.slot).toBe(beforeSlot);
+    expect(joined.players.map((p) => p.id)).toEqual(['p2', 'p1c']);
+    settle();
+    expect(io.lastSnap('p1c').you.progress).toBe(before.progress);
+    expect(room.playerCount()).toBe(2);
+    room.stop();
+  });
+
+  it('a resume/sig that match nothing seats a genuinely fresh driver', () => {
+    const io = new FakeIO();
+    const { room, drivers } = setupRace(io, ['p1', 'p2']);
+    const d1 = drivers[0]!;
+    driveUntil(room, io, [d1], () => io.lastSnap('p1').you.progress >= 1, 400);
+    settle();
+
+    room.addPlayer('p3', 'Driver3', 'no-such-id', 'no-such-sig');
+    const joined = io.joined('p3');
+    expect(joined.players.map((p) => p.id), 'appended, not rebound onto p1').toEqual(['p1', 'p2', 'p3']);
+    settle();
+    const you = io.lastSnap('p3').you;
+    expect(you.progress).toBe(0); // fresh grid start, not p1's mid-race progress
+    expect(you.lap).toBe(1);
+    expect(room.playerCount()).toBe(3);
+    room.stop();
+  });
+
+  it('an explicit (permanent) leave cannot be resumed: the old resume seats a fresh driver', () => {
+    const io = new FakeIO();
+    const { room, drivers } = setupRace(io, ['p1', 'p2']);
+    const d1 = drivers[0]!;
+    driveUntil(room, io, [d1], () => io.lastSnap('p1').you.progress >= 1, 400);
+    settle();
+
+    room.removePlayer('p1', true); // explicit leave: gone for good, no ghost left behind
+    settle();
+    expect(room.playerCount()).toBe(1);
+
+    room.addPlayer('p1', 'Driver1', 'p1'); // same id AND resume, but nothing left to find
+    settle();
+    const you = io.lastSnap('p1').you;
+    expect(you.progress).toBe(0); // fresh, not the old mid-race progress
+    expect(you.lap).toBe(1);
+    expect(room.playerCount()).toBe(2);
+    room.stop();
+  });
+
+  it('a ghost never counts in playerCount and never surfaces from stalePlayers', () => {
+    const io = new FakeIO();
+    const { room } = setupRace(io, ['p1', 'p2']);
+    expect(room.playerCount()).toBe(2);
+
+    room.removePlayer('p1'); // ghost
+    expect(room.playerCount()).toBe(1);
+
+    // push the ghost's lastStateAt arbitrarily far into the past: if
+    // stalePlayers() ever again treated a ghost like a live player, this is
+    // exactly the state that would report it as stale forever
+    vi.advanceTimersByTime(10 * 60 * 1000);
+    expect(room.stalePlayers()).not.toContain('p1');
+    expect(room.stalePlayers(), 'p2 is connected but genuinely idle here').toContain('p2');
+    room.stop();
+  });
+
+  it('a race with one ghosted driver still reaches results once the connected kart finishes', () => {
+    const io = new FakeIO();
+    const { room, drivers } = setupRace(io, ['p1', 'p2']);
+    const d1 = drivers[0]!;
+
+    room.removePlayer('p2'); // ghost: never drives, never finishes
+    const steps = driveUntil(room, io, [d1], () => io.lastSnap('p1').you.finished, 3600);
+    expect(steps).toBeGreaterThan(0);
+    settle();
+    expect(
+      io.lastSnap('p1').phase,
+      'the ghost never finishing must not block the race from ending',
+    ).toBe('results');
+    room.stop();
+  });
+
+  it("kart_joined carries the room's roomId and code", () => {
+    const io = new FakeIO();
+    const pub = new KartRoom(DEFAULT_TRACK_ID, 'public', io);
+    pub.addPlayer('p1', 'Alpha');
+    expect(io.joined('p1').roomId).toBe(pub.id);
+    expect(io.joined('p1').code).toBeNull();
+
+    const priv = new KartRoom(DEFAULT_TRACK_ID, 'private', io);
+    priv.addPlayer('p2', 'Bravo');
+    expect(priv.code).not.toBeNull();
+    expect(io.joined('p2').roomId).toBe(priv.id);
+    expect(io.joined('p2').code).toBe(priv.code);
+  });
+});
+
+// ==============================================================================
 // MULTI-TRACK CONTRACT — trackId travels on kart_joined and every kart_snapshot,
 // and the lobby label names the circuit instead of a generic "circuit" placeholder.
 // ==============================================================================

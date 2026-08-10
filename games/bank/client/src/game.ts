@@ -16,6 +16,7 @@ import type {
   BankState,
   RollEffect,
 } from '@bank/shared';
+import { cleanName, clearSession, loadName, loadSession, loadSig, saveName, saveSession } from '@platform/shared';
 import type { LobbyC2S, RoomInfo } from '@platform/shared';
 import { DiceView } from './dice.js';
 import { BankAudio } from './audio.js';
@@ -94,7 +95,7 @@ function parseState(v: Record<string, unknown>): BankState | null {
   if (!num(v.safeRolls) || !num(v.turnEndsAt)) return null;
   if (!(str(v.currentId) || v.currentId === null)) return null;
   if (!(str(v.winnerId) || v.winnerId === null)) return null;
-  if (!str(v.you) || !Array.isArray(v.players)) return null;
+  if (!str(v.you) || !str(v.roomId) || !Array.isArray(v.players)) return null;
   const players: BankPlayerState[] = [];
   for (const p of v.players) {
     const player = parsePlayer(p);
@@ -132,6 +133,9 @@ function parseState(v: Record<string, unknown>): BankState | null {
     lastRoll,
     winnerId: v.winnerId,
     code: v.code === null ? null : str(v.code) ? v.code : null,
+    // public-room rejoin target (join_public): no join code exists for a
+    // public room, so this is what a reload targets instead of one.
+    roomId: v.roomId,
     // additive + tolerant: a server that predates the manual-restart change
     // sends no `awaitingStart`, and `false` is exactly the old behaviour
     awaitingStart: v.awaitingStart === true,
@@ -261,9 +265,8 @@ const DENSE_SEATS = 12;
 const TIMER_LOW_FRAC = 0.28;
 const NAME_MAX = 16; // lobby cleanName cap (platform protocol)
 const CODE_MAX = 8;
+const GAME = 'bank'; // this client's GameModule.id — the key for loadSession/saveSession/clearSession
 const DICE_TUMBLE_MS = 600; // tumble frames before the dice settle on d1/d2
-const RESUME_KEY = 'bank.resume'; // localStorage: { playerId, code } rejoin record
-const NAME_KEY = 'bank.name'; // localStorage: last joined name (invite-link auto-join)
 
 /**
  * Event-log entry kinds. These map 1:1 onto the frozen `log-kind-*` classes
@@ -292,11 +295,6 @@ function el<K extends keyof HTMLElementTagNameMap>(
   return node;
 }
 
-/** Trimmed, length-capped display name; 'Player' when whitespace-only (lobby rule). */
-function cleanName(v: string): string {
-  return v.trim().slice(0, NAME_MAX) || 'Player';
-}
-
 /** Variant chip text, mirroring the server's info().label (docs/BANK.md). */
 function variantLabel(s: BankSettings): string {
   const bonus = s.sevenBonus ? '7=70' : 'plain 7';
@@ -307,8 +305,15 @@ export class BankGame {
   private ws: WebSocket | null = null;
   private welcomed = false;
   private playerId: string | null = null;
-  private resumeToken: string | null = null; // rejoin token loaded from localStorage
+  private resumeToken: string | null = null; // rejoin token loaded from the shared session pointer
   private roomCode: string | null = null; // code of the room we're in/joining, when known
+  /**
+   * Public-room id we're in/joining, when known — the `join_public` target for
+   * a PUBLIC room, exactly what `roomCode` is for a private one. Without this
+   * a reload out of a public room (no code) could only quick_join into some
+   * stranger's table, never back to its own.
+   */
+  private sessionRoomId: string | null = null;
   private state: BankState | null = null;
   private stateCode: string | null = null; // private-room code piggybacked on bank_state
   private pendingJoin: { name: string; code: string } | null = null; // invite-link auto-join
@@ -367,6 +372,7 @@ export class BankGame {
     this.nameInput.maxLength = NAME_MAX;
     this.nameInput.placeholder = 'your name';
     this.nameInput.autocomplete = 'off';
+    this.nameInput.value = loadName(); // may be '' (never typed) — placeholder covers that
     this.menuEl.appendChild(this.nameInput);
 
     // ---- create-section variant picker (docs/BANK.md "VARIANT UI") -----------
@@ -602,8 +608,13 @@ export class BankGame {
       start: () => this.startMatch(),
     };
 
-    // ---- rejoin record (token captured BEFORE welcome overwrites storage) ------
-    this.loadResume();
+    // ---- rejoin record (shared @platform/shared session pointer for 'bank') ----
+    const session = loadSession(GAME);
+    if (session !== null) {
+      this.resumeToken = session.playerId;
+      this.roomCode = session.code;
+      this.sessionRoomId = session.roomId;
+    }
     if (this.roomCode !== null) this.codeInput.value = this.roomCode; // stored-code prefill
 
     // ---- invite link (?code=XXXXX): prefill + auto-join, then strip the param ----
@@ -611,8 +622,8 @@ export class BankGame {
     if (linkCode !== null && linkCode.length > 0) {
       history.replaceState(null, '', location.pathname + location.hash); // no re-trigger on refresh
       this.codeInput.value = linkCode; // link code beats the stored-code prefill
-      const name = this.storedName();
-      if (name !== null) this.pendingJoin = { name, code: linkCode }; // attempted after welcome
+      const name = loadName();
+      if (name !== '') this.pendingJoin = { name, code: linkCode }; // attempted after welcome
     }
 
     this.connect();
@@ -664,63 +675,35 @@ export class BankGame {
     return Date.now() + this.offset;
   }
 
-  // ---- rejoin record (localStorage 'bank.resume': { playerId, code }) -----------
-  /** Reads the stored record once at startup; corrupt/blocked storage is non-fatal. */
-  private loadResume(): void {
-    try {
-      const raw = localStorage.getItem(RESUME_KEY);
-      if (raw === null) return;
-      const v: unknown = JSON.parse(raw);
-      if (!isObj(v)) return;
-      if (str(v.playerId)) this.resumeToken = v.playerId;
-      if (str(v.code)) this.roomCode = v.code;
-    } catch {
-      // storage blocked or corrupt JSON — play without rejoin
-    }
+  /**
+   * Stamps the rejoin hints shared by every join message (contract §2.2): the
+   * durable browser signature ALWAYS, and the previous session's playerId
+   * when we have one. One helper instead of five near-identical inline
+   * stamps — every `t:'*_join'`/`create_*` message shape carries both fields
+   * as optional, so this is safe for all five call sites.
+   */
+  private stampJoin<T extends { resume?: string; sig?: string }>(msg: T): T {
+    msg.sig = loadSig();
+    if (this.resumeToken !== null) msg.resume = this.resumeToken;
+    return msg;
   }
 
-  /** Writes { playerId, code } — after every welcome and after joining a room. */
-  private persistResume(): void {
-    if (this.playerId === null) return;
-    try {
-      localStorage.setItem(
-        RESUME_KEY,
-        JSON.stringify({ playerId: this.playerId, code: this.roomCode }),
-      );
-    } catch {
-      // storage blocked — non-fatal
-    }
-  }
-
-  /** Drops the whole record on an explicit leave (the ghost is removed, not kept). */
-  private clearResume(): void {
-    this.resumeToken = null;
-    this.roomCode = null;
-    try {
-      localStorage.removeItem(RESUME_KEY);
-    } catch {
-      // storage blocked — non-fatal
-    }
-  }
-
-  // ---- last-joined name (localStorage 'bank.name') ------------------------------
-  /** The stored name for the invite-link auto-join; blocked storage => null. */
-  private storedName(): string | null {
-    try {
-      const v = localStorage.getItem(NAME_KEY);
-      return v !== null && v.trim().length > 0 ? v : null;
-    } catch {
-      return null; // storage blocked — no auto-join
-    }
-  }
-
-  /** Remembers the cleaned name on every join so an invite link can auto-join later. */
-  private persistName(name: string): void {
-    try {
-      localStorage.setItem(NAME_KEY, name);
-    } catch {
-      // storage blocked — non-fatal
-    }
+  /**
+   * Boot/reconnect auto-rejoin (contract §3): re-enter the room this browser
+   * was last in without the player clicking anything. `code` wins when known
+   * (join_private targets one exact room); otherwise `roomId` (join_public —
+   * the ONLY way back into a specific PUBLIC room, since it has no code);
+   * otherwise a bare quick_join so a session that predates roomId tracking
+   * still tries to rebind by resume/sig rather than stranding the player. A
+   * cold boot with no stored session at all (`resumeToken === null`) does
+   * nothing — the menu just waits, same as before this existed.
+   */
+  private autoRejoin(): void {
+    if (this.resumeToken === null) return;
+    const name = this.menuName();
+    if (this.roomCode !== null) this.joinPrivate(name, this.roomCode);
+    else if (this.sessionRoomId !== null) this.joinPublic(name, this.sessionRoomId);
+    else this.joinQuick(name);
   }
 
   // ---- lobby actions (game filter 'bank' on every create/join) -------------------
@@ -732,9 +715,10 @@ export class BankGame {
       name: cleanName(name),
       game: 'bank',
     };
-    if (this.resumeToken !== null) msg.resume = this.resumeToken;
+    this.stampJoin(msg);
     this.roomCode = null; // public room: no code
-    this.persistName(msg.name);
+    this.sessionRoomId = null; // unknown until bank_state reports it — any room may answer
+    saveName(msg.name);
     this.send(msg);
   }
   /** Variant chosen in the create section (or the e2e override passed in). */
@@ -752,9 +736,10 @@ export class BankGame {
       game: 'bank',
       settings: { sevenBonus: s.sevenBonus, totalRounds: s.totalRounds, raceTarget: s.raceTarget },
     };
-    if (this.resumeToken !== null) msg.resume = this.resumeToken;
+    this.stampJoin(msg);
     this.roomCode = null; // public room: no code
-    this.persistName(msg.name);
+    this.sessionRoomId = null; // a brand-new room — unknown until bank_state reports it
+    saveName(msg.name);
     this.send(msg);
   }
   private createPrivate(name: string, settings?: BankSettings): void {
@@ -765,9 +750,10 @@ export class BankGame {
       game: 'bank',
       settings: { sevenBonus: s.sevenBonus, totalRounds: s.totalRounds, raceTarget: s.raceTarget },
     };
-    if (this.resumeToken !== null) msg.resume = this.resumeToken;
+    this.stampJoin(msg);
     this.roomCode = null; // the code is server-generated; not known client-side
-    this.persistName(msg.name);
+    this.sessionRoomId = null; // a brand-new room — unknown until bank_state reports it
+    saveName(msg.name);
     this.send(msg);
   }
   private joinPublic(name: string, roomId: string): void {
@@ -776,9 +762,10 @@ export class BankGame {
       name: cleanName(name),
       roomId,
     };
-    if (this.resumeToken !== null) msg.resume = this.resumeToken;
+    this.stampJoin(msg);
     this.roomCode = null; // public room: no code
-    this.persistName(msg.name);
+    this.sessionRoomId = roomId; // candidate; a 'no_room' error clears it again
+    saveName(msg.name);
     this.send(msg);
   }
   private joinPrivate(name: string, code: string): void {
@@ -792,9 +779,10 @@ export class BankGame {
       name: cleanName(name),
       code: c,
     };
-    if (this.resumeToken !== null) msg.resume = this.resumeToken;
+    this.stampJoin(msg);
     this.roomCode = c; // candidate; a 'no_room' error clears it again
-    this.persistName(msg.name);
+    this.sessionRoomId = null; // a code join targets a specific room by code, not by id
+    saveName(msg.name);
     this.send(msg);
   }
   private roll(): void {
@@ -814,14 +802,19 @@ export class BankGame {
       case 'welcome':
         this.playerId = msg.playerId;
         this.welcomed = true;
-        this.persistResume(); // fresh session id for the next page load
         this.send({ t: 'list_rooms' });
         this.setNotice('');
         this.renderMenu();
         if (this.pendingJoin !== null) {
+          // an invite link is an explicit ask for THAT room — it outranks a
+          // stored session pointer, which is only a fallback for "no ask made"
           const { name, code } = this.pendingJoin;
           this.pendingJoin = null; // single attempt — on failure the error notice shows
           this.joinPrivate(name, code);
+        } else {
+          // boot or reconnect with no explicit ask: fall back to wherever this
+          // browser last was (contract §3) — no-op when there is no session
+          this.autoRejoin();
         }
         break;
       case 'room_list':
@@ -834,9 +827,17 @@ export class BankGame {
         break;
       }
       case 'error':
-        if (msg.code === 'no_room' && this.roomCode !== null) {
-          this.roomCode = null; // stale room — drop the stored code (token stays)
-          this.persistResume();
+        // stale room — drop the stored pointer (the resume token stays; only
+        // the ROOM target was wrong). Both `roomCode` and `sessionRoomId` are
+        // cleared unconditionally because 'no_room' can only come from a
+        // join_private (bad code) or join_public (bad roomId) attempt, and
+        // only one of those is ever the candidate in flight at a time.
+        if (msg.code === 'no_room' && (this.roomCode !== null || this.sessionRoomId !== null)) {
+          this.roomCode = null;
+          this.sessionRoomId = null;
+          if (this.playerId !== null) {
+            saveSession(GAME, { playerId: this.playerId, roomId: null, code: null });
+          }
         }
         this.setNotice(msg.message);
         break;
@@ -872,11 +873,6 @@ export class BankGame {
       this.potShown = s.pot; // no count-up animation on the very first snapshot
       this.pushLog('You joined the table', 'join');
       if (s.lastRoll !== null) this.settleDice(s.lastRoll.d1, s.lastRoll.d2);
-      if (this.playerId !== null) {
-        // joined: a rebind makes the CURRENT session id the valid rejoin token
-        this.resumeToken = this.playerId;
-        this.persistResume();
-      }
     }
     //  matchEnd -> lobby is the server's full reset. This used to eject the
     //  player back to the MENU ("Match over."), which is incompatible with the
@@ -896,6 +892,15 @@ export class BankGame {
     this.state = s;
     this.stateCode = code; // refreshed every snapshot; drives the invite chip
     this.potTarget = s.pot;
+
+    // full rejoin pointer (contract §3): the seat WE hold in THIS room, its id
+    // (join_public target for a PUBLIC room) and its code (join_private target
+    // for a PRIVATE one) — refreshed on every snapshot so a drop mid-match
+    // always resumes into the seat we actually ended up in, not a stale one.
+    this.resumeToken = s.you;
+    this.roomCode = s.code;
+    this.sessionRoomId = s.roomId;
+    saveSession(GAME, { playerId: s.you, roomId: s.roomId, code: s.code });
 
     const myTurn = s.phase === 'playing' && s.currentId === this.playerId;
     if (myTurn && !wasMyTurn) this.audio.sfx('turn');
@@ -969,7 +974,12 @@ export class BankGame {
   // ---- actions -> screens ------------------------------------------------------------
   private leaveToMenu(notice: string): void {
     this.send({ t: 'leave' });
-    this.clearResume(); // explicit leave: no rejoin back into that room
+    // explicit leave: no rejoin back into that room (never on a socket drop —
+    // this method only runs from an intentional LEAVE click)
+    clearSession(GAME);
+    this.resumeToken = null;
+    this.roomCode = null;
+    this.sessionRoomId = null;
     this.state = null;
     this.stateCode = null;
     this.logLines.length = 0;

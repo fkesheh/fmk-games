@@ -61,6 +61,13 @@ export interface WbPlayerState {
 export interface WbPublicState {
   t: 'wb_public';
   code: string | null;
+  /**
+   * The room's id. Public rooms have no join code, so without this a reload
+   * could only ever rejoin SOME room via quick_join — never the one it left.
+   * The client stores it in the shared rejoin pointer (@platform/shared
+   * SessionRecord) and re-enters with `join_public`.
+   */
+  roomId: string;
   phase: WbPhase;
   /** 1-based; 0 while in lobby. */
   round: number;

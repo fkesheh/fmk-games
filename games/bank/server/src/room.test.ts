@@ -826,6 +826,152 @@ describe('BankRoom', () => {
   });
 });
 
+// ---- sig rebind + roomId (browser-identity contract §2.3 / BankState.roomId) --
+// `sig` is the durable browser signature, stamped on the seat by every
+// addPlayer call that carries one. These rooms are built directly (not via
+// boot()) so each seat's sig is known up front, matching how a real client
+// stamps every join.
+
+describe('BankRoom sig rebind + roomId', () => {
+  it('drop then rejoin by sig alone (no resume, new playerId): same seat, score and join-order slot preserved', () => {
+    const io = new FakeIO();
+    const room = new BankRoom('public', io);
+    room.start();
+    room.addPlayer('p1', 'Alice', undefined, 'sig-alice');
+    room.addPlayer('p2', 'Bob', undefined, 'sig-bob');
+    room.addPlayer('p3', 'Carol', undefined, 'sig-carol');
+    tracked.push(room);
+    room.handleMessage('p1', { t: 'start' });
+    const pot = rollAt(room, io, EPOCH + 1_000).potAfter; // p1 rolls
+    room.handleMessage('p1', { t: 'bank' }); // p1 banks: score = pot > 0
+    expect(player(io.state('p2'), 'p1').score).toBe(pot);
+    room.removePlayer('p1'); // disconnect: ghost stays, sig retained
+    expect(player(io.state('p2'), 'p1').connected).toBe(false);
+    // brand-new session id, NO resume — only the durable sig matches
+    room.addPlayer('p1new', 'Alice', undefined, 'sig-alice');
+    const st = io.state('p2');
+    expect(st.players).toHaveLength(3); // no duplicate row
+    const alice = st.players[0]; // join-order slot preserved (p1 was first)
+    expect(alice?.id).toBe('p1new');
+    expect(alice?.score).toBe(pot); // score preserved
+    expect(alice?.banked).toBe(true); // banked flag preserved
+    expect(alice?.connected).toBe(true);
+    expect(room.playerCount()).toBe(3); // no double-count
+    expect(io.state('p1new').you).toBe('p1new');
+  });
+
+  it('resume and sig BOTH present and pointing at the same ghost: one rebind, one entry', () => {
+    const io = new FakeIO();
+    const room = new BankRoom('public', io);
+    room.start();
+    room.addPlayer('p1', 'Alice', undefined, 'sig-alice');
+    room.addPlayer('p2', 'Bob', undefined, 'sig-bob');
+    tracked.push(room);
+    room.handleMessage('p1', { t: 'start' });
+    const pot = rollAt(room, io, EPOCH + 1_000).potAfter;
+    room.handleMessage('p1', { t: 'bank' });
+    room.removePlayer('p1');
+    // resume='p1' (exact) AND sig='sig-alice' both point at the SAME ghost —
+    // step 1 (resume) wins and rebinds; step 2 must never run a second rebind
+    room.addPlayer('p1b', 'Alice', 'p1', 'sig-alice');
+    const st = io.state('p2');
+    expect(st.players).toHaveLength(2); // NOT a duplicate row from a double rebind
+    const alice = player(st, 'p1b');
+    expect(alice.score).toBe(pot);
+    expect(alice.banked).toBe(true);
+    expect(alice.connected).toBe(true);
+    expect(room.playerCount()).toBe(2);
+  });
+
+  it('wrong resume + wrong sig: a fresh seat, no rebind', () => {
+    const io = new FakeIO();
+    const room = new BankRoom('public', io);
+    room.start();
+    room.addPlayer('p1', 'Alice', undefined, 'sig-alice');
+    room.addPlayer('p2', 'Bob', undefined, 'sig-bob');
+    tracked.push(room);
+    room.handleMessage('p1', { t: 'start' });
+    const pot = rollAt(room, io, EPOCH + 1_000).potAfter;
+    room.handleMessage('p1', { t: 'bank' });
+    room.removePlayer('p1'); // p1 ghosted, sig 'sig-alice' retained
+    room.addPlayer('p3', 'Mallory', 'not-p1', 'not-sig-alice');
+    const st = io.state('p2');
+    expect(st.players).toHaveLength(3); // fresh seat added, ghost untouched
+    const ghost = player(st, 'p1');
+    expect(ghost.connected).toBe(false); // the real ghost was never touched
+    expect(ghost.score).toBe(pot);
+    const mallory = player(st, 'p3');
+    expect(mallory.score).toBe(0); // nothing transferred to the fresh entry
+    expect(mallory.connected).toBe(true);
+    expect(room.playerCount()).toBe(2); // p2 + p3 connected; p1's ghost holds no seat
+  });
+
+  it('BankState.roomId is populated and stable across states', () => {
+    const io = new FakeIO();
+    const room = boot(io, [['p1', 'Alice'], ['p2', 'Bob']]);
+    const st1 = io.state('p1');
+    expect(st1.roomId).toBe(room.id);
+    expect(st1.roomId.length).toBeGreaterThan(0);
+    rollAt(room, io, EPOCH + 1_000);
+    const st2 = io.state('p1');
+    expect(st2.roomId).toBe(st1.roomId); // stable across further snapshots
+    expect(st2.roomId).toBe(room.info().id);
+  });
+
+  it('a mid-match drop of the CURRENT turn holder, then a sig rejoin: turn handed off on the drop, rejoiner is back in rotation with score intact', () => {
+    // 3 seats, not 2: dropping the turn holder must stay ABOVE MIN_PLAYERS
+    // (2) so the room hands the turn off normally instead of low-pop
+    // aborting to the lobby — that abort path is covered elsewhere.
+    const io = new FakeIO();
+    const room = new BankRoom('public', io);
+    room.start();
+    room.addPlayer('p1', 'Alice', undefined, 'sig-alice');
+    room.addPlayer('p2', 'Bob', undefined, 'sig-bob');
+    room.addPlayer('p3', 'Carol', undefined, 'sig-carol');
+    tracked.push(room);
+    room.handleMessage('p1', { t: 'start' });
+    expect(io.state('p1').currentId).toBe('p1'); // p1 opens round 1
+    let now = EPOCH;
+    now += 1_000;
+    const pot1 = rollAt(room, io, now).potAfter; // p1 rolls; turn -> p2
+    room.handleMessage('p1', { t: 'bank' }); // p1 banks round 1's pot (off-turn, allowed)
+    expect(player(io.state('p1'), 'p1').score).toBe(pot1);
+    room.handleMessage('p2', { t: 'bank' });
+    room.handleMessage('p3', { t: 'bank' }); // all banked -> round ends
+    expect(io.state('p1').phase).toBe('roundEnd');
+    now += ROUND_END_MS;
+    vi.advanceTimersByTime(ROUND_END_MS); // round 2 starts
+    expect(io.state('p1').phase).toBe('playing');
+    expect(io.state('p1').currentId).toBe('p1'); // fixed round-start seat: p1 again
+    // p3 sits out the rest of round 2 up front, so the rotation below is
+    // unambiguous: only p1/p1new and p2 remain eligible to roll
+    room.handleMessage('p3', { t: 'bank' });
+    // p1 holds the turn RIGHT NOW — drop them
+    room.removePlayer('p1');
+    const afterDrop = io.state('p2');
+    expect(player(afterDrop, 'p1').connected).toBe(false);
+    expect(player(afterDrop, 'p1').score).toBe(pot1); // score survives the drop
+    expect(afterDrop.currentId).toBe('p2'); // the dropped turn was handed off at once
+    // sig-only rejoin: a brand-new session id, no resume
+    room.addPlayer('p1new', 'Alice', undefined, 'sig-alice');
+    const st = io.state('p2');
+    expect(st.players).toHaveLength(3); // no duplicate row
+    expect(st.players[0]?.id).toBe('p1new'); // join-order slot preserved
+    const alice = player(st, 'p1new');
+    expect(alice.connected).toBe(true);
+    expect(alice.score).toBe(pot1); // score intact through the rejoin
+    expect(alice.banked).toBe(false); // round 2's banked flag, untouched by the rebind
+    expect(st.currentId).toBe('p2'); // the rejoin itself doesn't steal the turn
+    // and the rejoiner is truly back in the rotation, not just a static row
+    now += 1_000;
+    rollAt(room, io, now, 'p2'); // p2 rolls; p3 is banked (sits out) -> turn wraps to p1new
+    expect(io.state('p2').currentId).toBe('p1new');
+    now += 1_000;
+    const ev = rollAt(room, io, now, 'p1new'); // p1new can roll on their turn
+    expect(ev.rollerId).toBe('p1new');
+  });
+});
+
 // ---- room variants (docs/BANK.md "Room variants") --------------------------
 // Variant rooms are built through bankModule.createRoom, the frozen entry
 // point that validates settings. The dice stream never depends on settings,

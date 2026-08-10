@@ -60,6 +60,10 @@ import type {
   WeaponId,
   YouSnap,
 } from '@fps/shared';
+// shared cross-game browser identity (CONTRACT_IDENTITY.md): durable `sig` on
+// every join, `resume` when we have a session on file, and the room pointer
+// that lets a reload/reconnect re-enter the SAME room with no click.
+import { cleanName, clearSession, loadName, loadSession, loadSig, saveSession } from '@platform/shared';
 import { Connection } from '../net/connection.js';
 import { InterpBuffer } from '../net/interpolation.js';
 import { Predictor } from '../net/prediction.js';
@@ -86,6 +90,9 @@ import {
 } from '../render/scene.js';
 import type { Menus } from '../ui/menus.js';
 import { ClientState } from './state.js';
+
+// ---- identity (CONTRACT_IDENTITY.md) -----------------------------------------
+const GAME = 'fps'; // this client's @platform/shared session-storage key
 
 // ---- tuning (frozen by CONTRACT.md / UX_BIBLE.md) ---------------------------
 const TICK_MS = 1000 / TICK_RATE;
@@ -132,6 +139,22 @@ function clamp(v: number, lo: number, hi: number): number {
 /** Console `buy` argument validation (WEAPON_ORDER is the frozen id list). */
 function isWeaponId(s: string): s is WeaponId {
   return (WEAPON_ORDER as readonly string[]).includes(s);
+}
+
+/**
+ * Stamp identity onto an outgoing join — the ONE place all four join C2S
+ * messages pick up `sig` (always; the durable per-browser signature) and
+ * `resume` (only when a stored session exists; the previous playerId, which
+ * the room's addPlayer() prefers over `sig` for a rebind — exact and
+ * cheapest, per CONTRACT_IDENTITY.md §2.3). `msg` is never a literal at the
+ * call site, so the extra fields ride as structural extras of Connection's
+ * C2S/LobbyCreate union rather than tripping an excess-property error.
+ */
+function withIdentity<T extends { t: string }>(msg: T): T & { sig: string; resume?: PlayerId } {
+  const session = loadSession(GAME);
+  return session === null
+    ? { ...msg, sig: loadSig() }
+    : { ...msg, sig: loadSig(), resume: session.playerId };
 }
 
 /** Per-room render/sim bundle. Built on 'joined', disposed wholesale on leave. */
@@ -195,6 +218,12 @@ export class ClientGame {
   private botPromptVisible = false;
   private botPromptTimer: ReturnType<typeof setTimeout> | null = null;
   private lastGuardErrMs = Number.NEGATIVE_INFINITY; // guard() error-log rate limit
+  // set true only for the in-flight join started by tryAutoRejoin(); read once
+  // by the 'error' handler to tell "the stored room is gone" (clear the
+  // session so the next reconnect stops retrying a grave) apart from any
+  // other join-time rejection (bad manual code, full room, etc.), which must
+  // leave a possibly-unrelated stored session untouched
+  private rejoinInFlight = false;
   // Warmup START control, mirrored verbatim from the latest snapshot. canStart
   // is the SERVER's verdict on `{t:'start'}` — never recomputed here; seated /
   // minPlayers are displayed so the player can read WHY it is not ready yet.
@@ -255,26 +284,32 @@ export class ClientGame {
     // the GPU context can die mid-session (driver reset, VRAM pressure) —
     // surface it through the standard menu error path, not a frozen canvas
     this.canvas.addEventListener('webglcontextlost', this.onContextLost);
+    // AUTO-REJOIN (CONTRACT_IDENTITY.md §3): main.ts's boot() ALWAYS ends with
+    // a synchronous menus.showMain() right after constructing us — deferring
+    // to a microtask lets that finish first, so a stored session's overlay
+    // lands on top of it instead of being clobbered by it. No stored session
+    // -> tryAutoRejoin() is a no-op and the main menu stands untouched.
+    queueMicrotask(() => this.tryAutoRejoin());
   }
 
   // ---- public API (frozen; called by C11 main.ts) -----------------------------
 
   joinQuick(name: string): void {
-    this.startJoin((c) => c.send({ t: 'quick_join', name }));
+    this.startJoin((c) => c.send(withIdentity({ t: 'quick_join', name })));
   }
 
   createPublic(name: string, mapId: MapId): void {
     // platform lobby envelope: mapId rides inside opaque settings (see
     // connection.ts LobbyCreate); the module validates it in createRoom
-    this.startJoin((c) => c.send({ t: 'create_public', name, settings: { mapId } }));
+    this.startJoin((c) => c.send(withIdentity({ t: 'create_public', name, settings: { mapId } })));
   }
 
   createPrivate(name: string, mapId: MapId): void {
-    this.startJoin((c) => c.send({ t: 'create_private', name, settings: { mapId } }));
+    this.startJoin((c) => c.send(withIdentity({ t: 'create_private', name, settings: { mapId } })));
   }
 
   joinPrivate(name: string, code: string): void {
-    this.startJoin((c) => c.send({ t: 'join_private', name, code }));
+    this.startJoin((c) => c.send(withIdentity({ t: 'join_private', name, code })));
   }
 
   listRooms(): Promise<RoomInfo[]> {
@@ -311,6 +346,11 @@ export class ClientGame {
     this.resetState();
     this.hud.show(false);
     this.menus.showMain();
+    // the ONLY clearSession call site: an explicit leave/back-to-menu means
+    // the player chose to abandon the room, so there is nothing left to
+    // auto-rejoin. A socket drop must NEVER reach this — that is exactly the
+    // case the stored session exists to recover from (see handleClose).
+    clearSession(GAME);
   }
 
   frame(nowMs: number): void {
@@ -514,7 +554,16 @@ export class ClientGame {
 
   // ---- join / connection plumbing ----------------------------------------------
 
-  private startJoin(sendJoin: (conn: Connection) => void): void {
+  /**
+   * `subtitle` distinguishes a fresh join (default "Reserving a slot…") from
+   * an AUTO-REJOIN after boot/a drop ("Reconnecting…", see tryAutoRejoin) —
+   * same overlay, same flow, the player just needs to know which one it is.
+   */
+  private startJoin(
+    sendJoin: (conn: Connection) => void,
+    subtitle?: string,
+    isRejoin = false,
+  ): void {
     if (this.disposed) return;
     // re-joining from inside a room: drop the old world + socket first
     if (this.world !== null) {
@@ -525,8 +574,13 @@ export class ClientGame {
       this.hud.show(false);
     }
     this.joining = true;
+    // every call re-stamps this (never left stale from a previous join): the
+    // 'error' handler below reads it exactly once, right after this join's
+    // own rejection, so there is no window for a later unrelated join to
+    // inherit a stale true
+    this.rejoinInFlight = isRejoin;
     const token = ++this.joinToken;
-    this.menus.showJoining();
+    this.menus.showJoining(subtitle);
     this.ensureConn()
       .then((conn) => sendJoin(conn))
       .catch(() => {
@@ -534,6 +588,44 @@ export class ClientGame {
         this.joining = false;
         this.menus.showMain('Could not reach the server');
       });
+  }
+
+  /**
+   * AUTO-REJOIN — the whole point of CONTRACT_IDENTITY.md: with a stored
+   * session on file, re-enter THAT room with zero clicks (boot, and again
+   * after every socket drop via handleClose). `code` wins when present
+   * (private rooms are keyed by it); else `roomId` targets the exact public
+   * room via `join_public` (Connection now accepts platform's `LobbyC2S`,
+   * see connection.ts send() — this is precisely the shape that was
+   * unreachable before); only a session with neither falls back to
+   * quick_join, which is matchmaking and can land in a DIFFERENT room —
+   * acceptable only when there is no specific room left to ask for.
+   * `isRejoin: true` marks this join so the 'error' handler can tell a dead
+   * stored room apart from any other join-time rejection (see handleMessage
+   * 'error' + rejoinInFlight).
+   */
+  private tryAutoRejoin(): void {
+    if (this.disposed || this.world !== null || this.joining) return; // already somewhere
+    const session = loadSession(GAME);
+    if (session === null) return; // nothing to resume — the main menu stands as-is
+    const name = cleanName(loadName());
+    const code = session.code;
+    const roomId = session.roomId;
+    if (code !== null) {
+      this.startJoin(
+        (c) => c.send(withIdentity({ t: 'join_private', name, code })),
+        'Reconnecting…',
+        true,
+      );
+    } else if (roomId !== null) {
+      this.startJoin(
+        (c) => c.send(withIdentity({ t: 'join_public', name, roomId })),
+        'Reconnecting…',
+        true,
+      );
+    } else {
+      this.startJoin((c) => c.send(withIdentity({ t: 'quick_join', name })), 'Reconnecting…', true);
+    }
   }
 
   /** Reuse the live lobby connection, or open a fresh one. */
@@ -561,9 +653,24 @@ export class ClientGame {
       this.teardownWorld();
       this.resetState();
       this.hud.show(false);
-      this.menus.showMain('Connection lost');
+      this.reconnectOrShowMain();
     } else if (this.joining) {
       this.joining = false;
+      this.reconnectOrShowMain();
+    }
+  }
+
+  /**
+   * A drop is exactly the case the stored session exists to recover from —
+   * see tryAutoRejoin's doc and clearSession's ONE call site in leave(). With
+   * a session on file, go straight back into the same room instead of
+   * bouncing the player to the main menu; only fall back to the old
+   * "Connection lost" banner when there is truly nothing to resume.
+   */
+  private reconnectOrShowMain(): void {
+    if (loadSession(GAME) !== null) {
+      this.tryAutoRejoin();
+    } else {
       this.menus.showMain('Connection lost');
     }
   }
@@ -685,6 +792,17 @@ export class ClientGame {
         // join-time rejections (no_room / room_full / rooms_full) land here
         if (this.joining) {
           this.joining = false;
+          // 'no_room' is the platform lobby's ONLY signal for "that room does
+          // not exist" (platform/server/src/lobby.ts joinPublic/joinPrivate —
+          // reaped public room, or a private code nobody holds any more).
+          // When it rejects the join tryAutoRejoin() itself started, the
+          // stored pointer is provably dead: forget it, or every future
+          // reconnect (boot, or the next drop) retries the same grave
+          // forever. Any OTHER join-time rejection (room_full, a manually
+          // mistyped code, rooms_full) must NOT touch the session — it says
+          // nothing about whether the stored room still exists.
+          if (msg.code === 'no_room' && this.rejoinInFlight) clearSession(GAME);
+          this.rejoinInFlight = false;
           this.menus.showMain(msg.message);
         } else if (this.world !== null) {
           // in-room rejections (team_full on a denied switch, etc.): the
@@ -701,6 +819,11 @@ export class ClientGame {
 
   private onJoined(msg: Extract<S2C, { t: 'joined' }>): void {
     this.joining = false;
+    // the ROOM POINTER, for auto-rejoin: `msg.you` becomes the resume token
+    // for the NEXT drop (this is the "roll the current id into the stored
+    // record" step — playerId is fresh per socket, so this write is what
+    // keeps the resume chain valid across repeated reconnects).
+    saveSession(GAME, { playerId: msg.you, roomId: msg.roomId, code: msg.code });
     const s = this.state;
     s.youId = msg.you;
     s.team = msg.team;
