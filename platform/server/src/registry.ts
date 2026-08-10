@@ -7,6 +7,14 @@ import { fpsModule } from '@fps/server';
 import { kartModule } from '@kart/server';
 import type { GameModule } from '@platform/shared';
 import { riftModule } from '@rift/server';
+import { splatModule } from '@splat/server';
 import { wordbombModule } from '@wordbomb/server';
 
-export const GAMES: GameModule[] = [fpsModule, bankModule, kartModule, wordbombModule, riftModule];
+export const GAMES: GameModule[] = [
+  fpsModule,
+  bankModule,
+  kartModule,
+  wordbombModule,
+  riftModule,
+  splatModule,
+];

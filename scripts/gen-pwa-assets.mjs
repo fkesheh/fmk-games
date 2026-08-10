@@ -20,9 +20,9 @@
 // an iPad was in a child's hands.
 //
 // Usage:
-//   node scripts/gen-pwa-assets.mjs      # regenerates all five games in place
+//   node scripts/gen-pwa-assets.mjs      # regenerates all six games in place
 //
-// SCOPE: the five GAME installs only. The launcher's own manifest and icons
+// SCOPE: the six GAME installs only. The launcher's own manifest and icons
 // (`/manifest.webmanifest`, `/icons/…`) are generated and served by
 // platform/server/src/pwa.ts — deliberately not duplicated here, because two
 // generators for one icon is how the launcher ends up with two different looks.
@@ -204,7 +204,7 @@ class Canvas {
 // ---- glyphs ----------------------------------------------------------------
 // `s` is the glyph box edge in normalised units, centred on the icon. Each
 // glyph must read at 48 CSS px on a home screen and be told apart from the
-// other four by SHAPE ALONE — a 4-year-old navigates by colour first, but two
+// other five by SHAPE ALONE — a 4-year-old navigates by colour first, but two
 // games sharing a hue family must not also share a silhouette. RIFT's moss and
 // BANK's felt are the one such pair (both green), which is why RIFT is the only
 // lattice and BANK the only glyph built from pips.
@@ -290,6 +290,25 @@ const GLYPHS = {
     c.circle(bx, by, s * 0.135, col.dark);
     c.circle(bx, by, s * 0.08, col.light);
   },
+
+  /** SKI SPLAT — a snow-capped race mountain with the finish pennant planted
+   *  at the summit: a filled peak (stacked strokes widening toward the base),
+   *  then the gold pole + flag. The only peaked silhouette in the set. */
+  splat(c, s, col) {
+    const apexY = 0.5 - s * 0.3;
+    const baseY = 0.5 + s * 0.34;
+    const halfW = s * 0.46; // half base width
+    const steps = 24; // stacked horizontal strokes => a solid triangle
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      const y = apexY + (baseY - apexY) * t;
+      const w = halfW * t;
+      c.stroke(0.5 - w, y, 0.5 + w, y, s * 0.035, col.light);
+    }
+    // finish pennant at the summit: pole, then flag flying right
+    c.stroke(0.5, apexY - s * 0.18, 0.5, apexY + s * 0.02, s * 0.045, col.hot);
+    c.rect(0.5 + s * 0.02, apexY - s * 0.18, s * 0.17, s * 0.1, col.hot);
+  },
 };
 
 // ---- palette + paint-guard extraction --------------------------------------
@@ -310,7 +329,7 @@ function paintGuardHex(htmlFile) {
   return m[1];
 }
 
-// ---- the five game installs (TOUCH_PWA.md §1.1) ----------------------------
+// ---- the six game installs (TOUCH_PWA.md §1.1) -----------------------------
 // The launcher install of §1.1 is separate; it lives in platform/server (T2).
 
 const GAMES = [
@@ -372,6 +391,21 @@ const GAMES = [
     // moss + gold ARE the launcher card's identity pair (LPAL.riftTint /
     // LPAL.riftAccent in platform/server/src/index.ts) — one source of truth.
     colors: { bg: 'moss', light: 'gold', dark: 'ink' },
+  },
+  {
+    id: 'splat',
+    name: 'SKI SPLAT',
+    shortName: 'SKI SPLAT', // 9
+    // A downhill course is wider than it is tall on screen; the steering lane
+    // needs the horizontal run, same argument as rift/kart.
+    orientation: 'landscape',
+    glyph: 'splat',
+    palette: 'games/splat/shared/src/palette.ts',
+    html: 'games/splat/client/index.html',
+    out: 'games/splat/client/public',
+    // skyZenith + sunGold are the launcher card's identity pair
+    // (LPAL.splatAccent; LPAL.splatTint is skyZenith deepened) — one source.
+    colors: { bg: 'skyZenith', light: 'snow', hot: 'sunGold' },
   },
 ];
 

@@ -9,6 +9,7 @@ export default defineConfig({
       '@kart/shared': fileURLToPath(new URL('./games/kart/shared/src', import.meta.url)),
       '@wordbomb/shared': fileURLToPath(new URL('./games/wordbomb/shared/src', import.meta.url)),
       '@rift/shared': fileURLToPath(new URL('./games/rift/shared/src', import.meta.url)),
+      '@splat/shared': fileURLToPath(new URL('./games/splat/shared/src', import.meta.url)),
       '@platform/shared': fileURLToPath(new URL('./platform/shared/src', import.meta.url)),
     },
   },
@@ -29,6 +30,9 @@ export default defineConfig({
       'games/rift/shared/src/**/*.test.ts',
       'games/rift/server/src/**/*.test.ts',
       'games/rift/client/src/**/*.test.ts',
+      'games/splat/shared/src/**/*.test.ts',
+      'games/splat/server/src/**/*.test.ts',
+      'games/splat/client/src/**/*.test.ts',
       // The PLATFORM had no include at all, so platform/server/src/lobby.test.ts —
       // the only coverage matchmaking has ever had — would have been silently
       // skipped. Same defect that hid games/bank/shared and the kart client.
