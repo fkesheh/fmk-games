@@ -158,6 +158,7 @@ const IDENTITY: Record<string, PwaIdentity | undefined> = {
   bank: { accent: LPAL.bankAccent, tint: LPAL.bankTint },
   kart: { accent: LPAL.kartAccent, tint: LPAL.kartTint },
   wordbomb: { accent: LPAL.wordbombAccent, tint: LPAL.wordbombTint },
+  rift: { accent: LPAL.riftAccent, tint: LPAL.riftTint },
 };
 const NEUTRAL_IDENTITY: PwaIdentity = {
   accent: LPAL.neutralAccent,
