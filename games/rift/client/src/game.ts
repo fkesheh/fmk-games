@@ -30,6 +30,7 @@ import {
   WARD_PLACE_RANGE,
 } from '@rift/shared';
 import type { HeroId, RiftC2S, RiftEvent, RiftSettings, TeamId } from '@rift/shared';
+import { cleanName, clearSession, loadName, loadSession, loadSig, saveName, saveSession } from '@platform/shared';
 import type { LobbyC2S, RoomInfo } from '@platform/shared';
 import type {
   BeginMsg,
@@ -48,8 +49,7 @@ import { createInterp } from './interp.js';
 import { createInput, type InputHandle } from './input.js';
 
 // ---- tuning ----------------------------------------------------------------------
-const RESUME_KEY = 'rift.resume'; // localStorage: { playerId, code, roomId }
-const NAME_KEY = 'rift.name'; // localStorage: last joined name
+const GAME = 'rift'; // this client's GameModule.id (@platform/shared session/identity key)
 const EVENTS_MAX = 32; // state.events ring (killfeed/audio), newest last
 const SNAPS_MAX = 32; // __rift.snaps() ring
 const FOG_EVERY_MS = 200; // fog mask refresh ≈ 5Hz (CONTRACT §6)
@@ -80,7 +80,6 @@ const CAM_MIN_H = 11;
 const CAM_MAX_H = 55;
 const CAM_DEFAULT_H = 36;
 const ROOMS_EVERY_MS = 3000; // menu room-list poll (wordbomb pattern)
-const NAME_MAX = 16; // lobby cleanName cap (platform protocol)
 const TOAST_MS = 1500; // cast-denied note lifetime (UX: transient, not a banner)
 
 type Phase = ClientState['phase'];
@@ -214,10 +213,6 @@ function structureControlOf(scene: SceneHandle): MapStructureControl | null {
   const c = (scene as SceneHandle & { riftStructureControl?: MapStructureControl })
     .riftStructureControl;
   return c ?? null;
-}
-
-function cleanName(v: string): string {
-  return v.trim().slice(0, NAME_MAX) || 'Player';
 }
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -393,7 +388,7 @@ export class Game {
     };
 
     // ---- rejoin record + invite link (wordbomb pattern) -----------------------------
-    this.loadResume();
+    this.loadStoredSession();
     const linkCode = new URLSearchParams(location.search).get('code');
     if (linkCode !== null && linkCode.length > 0) {
       history.replaceState(null, '', location.pathname + location.hash);
@@ -412,68 +407,58 @@ export class Game {
     requestAnimationFrame((t) => this.frame(t));
   }
 
-  // ---- localStorage (try/catch'd — storage may be blocked) -------------------------
-  private loadResume(): void {
-    try {
-      const raw = localStorage.getItem(RESUME_KEY);
-      if (raw === null) return;
-      const v: unknown = JSON.parse(raw);
-      if (typeof v !== 'object' || v === null) return;
-      const o = v as Record<string, unknown>;
-      if (typeof o.playerId === 'string') this.resumeToken = o.playerId;
-      if (typeof o.code === 'string') this.roomCode = o.code;
-      if (typeof o.roomId === 'string') this.roomId = o.roomId;
-    } catch {
-      // storage blocked or corrupt JSON — play without rejoin
-    }
+  // ---- shared identity / session (@platform/shared — try/catch'd internally,
+  //      storage may be blocked; everything degrades to in-memory-only) -------------
+  /** Rehydrate {@link resumeToken}/{@link roomCode}/{@link roomId} from the
+   *  platform-shared session pointer (was a private 'rift.resume' record —
+   *  identical shape, so this is a straight swap, not a redesign). */
+  private loadStoredSession(): void {
+    const rec = loadSession(GAME);
+    if (rec === null) return;
+    this.resumeToken = rec.playerId;
+    this.roomCode = rec.code;
+    this.roomId = rec.roomId;
   }
 
-  private persistResume(): void {
+  private persistSession(): void {
     if (this.playerId === null) return;
-    try {
-      localStorage.setItem(
-        RESUME_KEY,
-        JSON.stringify({ playerId: this.resumeToken ?? this.playerId, code: this.roomCode, roomId: this.roomId }),
-      );
-    } catch {
-      // storage blocked — non-fatal
-    }
+    saveSession(GAME, { playerId: this.resumeToken ?? this.playerId, roomId: this.roomId, code: this.roomCode });
   }
 
+  /** Forget the room pointer — explicit leave ONLY, never a socket drop
+   *  (CONTRACT §2.1: clearSession is the "I'm done with this room" signal). */
   private clearResume(): void {
     this.resumeToken = null;
     this.roomCode = null;
     this.roomId = null;
-    try {
-      localStorage.removeItem(RESUME_KEY);
-    } catch {
-      // storage blocked — non-fatal
-    }
+    clearSession(GAME);
   }
 
+  /** name-input prefill: '' from loadName() means "never typed one", which the
+   *  original 'rift.name' probe reported as null — preserved so callers (menus'
+   *  prefill, the wasDropped auto-resume fallback below) keep their exact
+   *  "nothing stored yet" branch. */
   private storedName(): string | null {
-    try {
-      const v = localStorage.getItem(NAME_KEY);
-      return v !== null && v.trim().length > 0 ? v : null;
-    } catch {
-      return null;
-    }
-  }
-
-  private persistName(name: string): void {
-    try {
-      localStorage.setItem(NAME_KEY, name);
-    } catch {
-      // storage blocked — non-fatal
-    }
+    const n = loadName();
+    return n !== '' ? n : null;
   }
 
   // ---- lobby actions (game:'rift' on every create/join) ------------------------------
-  private withResume<T extends LobbyC2S>(msg: T): T {
-    if (this.resumeToken !== null && 'name' in msg) {
-      return { ...msg, resume: this.resumeToken };
+  /**
+   * Stamp every lobby join with this browser's identity (CONTRACT §2.2/§3):
+   * `sig` — the durable per-browser signature — ALWAYS, and `resume` — the
+   * previous session's playerId — whenever we hold one. The room tries
+   * `resume` first (exact, cheapest) and falls back to `sig` (CONTRACT §2.3),
+   * so sending both on every join is what makes that fallback reachable at
+   * all; `resume` alone (the old `withResume` behaviour) is still exactly
+   * what a room sees when this browser has never held a session.
+   */
+  private withIdentity<T extends LobbyC2S>(msg: T): T {
+    if (!('name' in msg)) return msg;
+    if (this.resumeToken !== null) {
+      return { ...msg, resume: this.resumeToken, sig: loadSig() };
     }
-    return msg;
+    return { ...msg, sig: loadSig() };
   }
 
   private static settingsRecord(settings?: RiftSettings): Record<string, unknown> {
@@ -485,41 +470,41 @@ export class Game {
 
   private quickJoin(name: string): void {
     const clean = cleanName(name);
-    this.persistName(clean);
-    this.net.send(this.withResume({ t: 'quick_join', name: clean, game: 'rift' }));
+    saveName(clean);
+    this.net.send(this.withIdentity({ t: 'quick_join', name: clean, game: 'rift' }));
   }
 
   private createPublic(name: string, settings?: RiftSettings): void {
     const clean = cleanName(name);
-    this.persistName(clean);
+    saveName(clean);
     this.net.send(
-      this.withResume({ t: 'create_public', name: clean, game: 'rift', settings: Game.settingsRecord(settings) }),
+      this.withIdentity({ t: 'create_public', name: clean, game: 'rift', settings: Game.settingsRecord(settings) }),
     );
   }
 
   private createPrivate(name: string, settings?: RiftSettings): void {
     const clean = cleanName(name);
-    this.persistName(clean);
+    saveName(clean);
     this.roomCode = null; // server-generated; arrives on rift_hello
     this.net.send(
-      this.withResume({ t: 'create_private', name: clean, game: 'rift', settings: Game.settingsRecord(settings) }),
+      this.withIdentity({ t: 'create_private', name: clean, game: 'rift', settings: Game.settingsRecord(settings) }),
     );
   }
 
   private joinPublic(name: string, roomId: string): void {
     const clean = cleanName(name);
-    this.persistName(clean);
+    saveName(clean);
     this.roomId = roomId;
-    this.net.send(this.withResume({ t: 'join_public', name: clean, roomId }));
+    this.net.send(this.withIdentity({ t: 'join_public', name: clean, roomId }));
   }
 
   private joinPrivate(name: string, code: string): void {
     const c = code.length > 0 ? code : (this.roomCode ?? '');
     if (c.length === 0) return; // menus surface their own validation copy
     const clean = cleanName(name);
-    this.persistName(clean);
+    saveName(clean);
     this.roomCode = c; // candidate; a 'no_room' error clears it again
-    this.net.send(this.withResume({ t: 'join_private', name: clean, code: c }));
+    this.net.send(this.withIdentity({ t: 'join_private', name: clean, code: c }));
   }
 
   // ---- message routing ---------------------------------------------------------------
@@ -551,7 +536,7 @@ export class Game {
         if (msg.code === 'no_room') {
           this.roomCode = null;
           this.roomId = null;
-          this.persistResume();
+          this.persistSession();
         }
         this.state.error = msg.message;
         this.modules.audio.ui('error');
@@ -562,7 +547,7 @@ export class Game {
         this.resumeToken = this.playerId ?? this.resumeToken;
         if (msg.code !== null) this.roomCode = msg.code;
         this.roomId = msg.roomId;
-        this.persistResume();
+        this.persistSession();
         this.state.error = null; // a successful (re)join clears the drop banner
         if (this.state.phase === 'menu') this.setPhase('lobby');
         break;

@@ -82,12 +82,24 @@ interface Ammo {
   reserve: number;
 }
 
-/** Full server-side state for one connected player. */
+/** Full server-side state for one seated player — connected OR ghosted. */
 interface PlayerState {
-  id: PlayerId;
+  id: PlayerId; // the CURRENT session's id; re-keyed in place on a rebind (map key follows)
   name: string;
   team: Team;
-  bot: boolean; // server-driven (S4 brain); no session, exempt from stale/kick guards
+  bot: boolean; // server-driven (S4 brain); no session, exempt from stale/kick guards, never ghosted
+  // Rejoin (identity contract §2.3): false while the seat is a GHOST — the
+  // socket dropped but the entry survives (team/money/stats intact) for a
+  // rebind. Every read of `this.players` that means "actually here right now"
+  // (playerCount, team balance, alive/round checks, stalePlayers, snapshots)
+  // must filter on this; a read that means "holds a seat" (roster, match
+  // stats, capacity) leaves ghosts in. Bots are always true — see `bot` above.
+  connected: boolean;
+  // Durable browser signature (@platform/shared identity), set from whichever
+  // joiner last supplied one. Cheaper `resume` (exact playerId match) is tried
+  // first on rejoin; this is the fallback once the playerId chain is broken
+  // (a purge, a second tab, a rotated id). null until a client ever sends one.
+  sig: string | null;
   // movement / aim
   body: BodyState;
   yaw: number;
@@ -252,15 +264,18 @@ export class GameRoom {
       game: 'fps',
       label: this.map.name, // map display name (lobby list subtitle)
       mapId: this.mapId,
-      players: this.players.size,
+      players: this.playerCount(), // lobby list: a ghost holding a seat isn't a browsable player
       maxPlayers: MAX_PLAYERS,
       phase: this.phase,
       visibility: this.visibility,
     };
   }
 
+  /** CONNECTED players only — a ghost (dropped socket, seat retained for rebind) never counts. */
   playerCount(): number {
-    return this.players.size;
+    let n = 0;
+    for (const p of this.players.values()) if (p.connected) n++;
+    return n;
   }
 
   /**
@@ -271,32 +286,137 @@ export class GameRoom {
    * solo player who adds a bot can start.
    *
    * Recomputed from live state every snapshot, so dropping back below the
-   * minimum (a leaver, a removed bot) makes it false again immediately.
+   * minimum (a leaver, a removed bot) makes it false again immediately. Uses
+   * playerCount() (connected only): a ghost cannot itself be part of "enough
+   * players", though in practice this never matters — warmup never holds a
+   * ghost, see removePlayer.
    */
   canStartMatch(): boolean {
-    return this.phase === 'warmup' && this.players.size >= MIN_PLAYERS_FOR_MATCH;
+    return this.phase === 'warmup' && this.playerCount() >= MIN_PLAYERS_FOR_MATCH;
   }
 
-  addPlayer(id: PlayerId, name: string): void {
+  // identity contract §2.3: resume (exact, cheap) first, then sig (durable),
+  // else a fresh seat. A rebind is NOT a fresh join — it re-keys the existing
+  // seat and returns before the capacity/displacement logic below ever runs,
+  // so a room "full" of ghosts still lets its own players back in.
+  addPlayer(id: PlayerId, name: string, resume?: PlayerId, sig?: string): void {
     try {
       if (this.players.has(id)) return;
+      if (this.tryRebind(id, name, resume, sig)) return;
       if (this.players.size >= MAX_PLAYERS) {
         // full room: displace the longest-connected bot so the human can join
         const oldest = this.bots.keys().next();
         if (oldest.done) return; // full of humans: join refused
-        this.removePlayer(oldest.value);
+        this.removePlayer(oldest.value); // a bot is always a full delete, see removePlayer
       }
-      this.joinPlayer(id, name, false);
+      this.joinPlayer(id, name, false, sig ?? null);
     } catch (err) {
       console.error('[game] addPlayer failed', err);
     }
   }
 
-  removePlayer(id: PlayerId): void {
+  /**
+   * Look for a GHOSTED seat this joiner may be rejoining and, if found, re-key
+   * it onto the new session id in place — same PlayerState object, so team,
+   * money, kills/deaths/streak, weapons/armor and joinSeq all survive
+   * untouched. Never creates a second entry for the same player. Always
+   * leaves the rebound seat `pending` (re-enters at the NEXT beginFreeze,
+   * exactly the mid-round-join mechanism already used for fresh joiners) —
+   * simpler and always-correct versus trying to drop them back into a tick
+   * that may already be mid-round.
+   */
+  private tryRebind(newId: PlayerId, name: string, resume: PlayerId | undefined, sig: string | undefined): boolean {
+    let old: PlayerState | undefined;
+    if (resume !== undefined) {
+      const byResume = this.players.get(resume);
+      if (byResume !== undefined && !byResume.connected) old = byResume;
+    }
+    if (old === undefined && sig !== undefined) {
+      for (const p of this.players.values()) {
+        if (!p.connected && p.sig === sig) {
+          old = p;
+          break;
+        }
+      }
+    }
+    if (old === undefined) return false;
+
+    const oldId = old.id;
+    this.players.delete(oldId);
+    old.id = newId;
+    old.name = name;
+    if (sig !== undefined) old.sig = sig;
+    old.connected = true;
+    old.pending = true; // spawns at the next freeze, economy/team intact
+    old.snap.id = newId; // the snapshot object is reused in place (no hot alloc)
+    // the NEW session starts its own seq/timeout bookkeeping from scratch —
+    // without this, the old session's high lastProcessedSeq would silently
+    // swallow every one of the new session's inputs as "stale/duplicate"
+    // (handleInput: msg.seq <= p.lastProcessedSeq), and a stale lastInputAt
+    // would make them look immediately timed-out to stalePlayers()
+    old.lastProcessedSeq = 0;
+    old.lastInputAt = Date.now();
+    old.inputWindow = 0;
+    old.inputWindowCount = 0;
+    old.prevButtons = 0;
+    old.inputQueue.length = 0;
+    this.players.set(newId, old);
+    // a switch queued by the dropped session would otherwise sit orphaned
+    // under an id nothing maps to any more
+    this.teamSwitchQueue.delete(oldId);
+
+    this.io.send(newId, {
+      t: 'joined', roomId: this.id, code: this.code, mapId: this.mapId,
+      you: newId, team: old.team, tick: this.tickN, serverTime: Date.now(),
+      round: this.round, scoreT: this.scoreT, scoreCT: this.scoreCT,
+      roster: this.buildRoster(newId),
+    });
+    this.broadcastExcept(newId, { t: 'player_joined', entry: this.rosterEntry(old, null) });
+    if (!old.bot) {
+      this.sendEvent(newId, {
+        t: 'notice',
+        code: 'joining_next_round',
+        text: 'Round in progress — you spawn at the start of the next round',
+      });
+    }
+    return true;
+  }
+
+  /**
+   * permanent=true (explicit leave, C2S 'leave'): remove the seat outright —
+   * today's behaviour, unchanged.
+   * permanent=false/omitted (socket dropped): GHOST the seat instead of
+   * deleting it, so identity contract §2.3 has something for tryRebind to
+   * find. `connected=false`; despawned (alive=false, hp=0, pending cleared)
+   * so a disconnected player is never a standing target or a corpse-camp;
+   * team/money/kills/deaths/headshots/damageDealt/streak/armor/hasKevlar/
+   * helmet/weapons/ownedOrdered all RETAINED. Still broadcasts `player_left`
+   * so live clients stop rendering them immediately, same as a real leave.
+   *
+   * Two cases always fall back to a full delete regardless of `permanent`:
+   *  - a bot: no session, no `sig`, nothing could ever rebind into it — a
+   *    ghosted bot would be a permanent phantom seat.
+   *  - warmup: nothing is at stake there (no round, no economy pressure —
+   *    see beginFreeze/handleStart), so ghosting buys nothing but upkeep.
+   *    This also upholds an invariant every ghost-purge site below relies
+   *    on: a ghost can exist ONLY in freeze/live/roundEnd/matchEnd.
+   */
+  removePlayer(id: PlayerId, permanent?: boolean): void {
     try {
-      if (!this.players.delete(id)) return;
-      this.bots.delete(id);
-      this.teamSwitchQueue.delete(id); // drop any pending switch for the leaver
+      const p = this.players.get(id);
+      if (p === undefined) return;
+      if (permanent === true || p.bot || this.phase === 'warmup') {
+        this.players.delete(id);
+        this.bots.delete(id);
+        this.teamSwitchQueue.delete(id);
+        this.broadcast({ t: 'player_left', id });
+        return;
+      }
+      p.connected = false;
+      p.alive = false;
+      p.hp = 0;
+      p.pending = false;
+      this.teamSwitchQueue.delete(id); // a queued switch for a gone player is moot
       this.broadcast({ t: 'player_left', id });
     } catch (err) {
       console.error('[game] removePlayer failed', err);
@@ -310,7 +430,7 @@ export class GameRoom {
       const n = this.botCounter;
       const brain = new BotBrain(this.botSeed(n));
       const id = this.freshPlayerId();
-      this.joinPlayer(id, `Bot ${n}`, true); // identical join flow, roster bot: true
+      this.joinPlayer(id, `Bot ${n}`, true, null); // identical join flow, roster bot: true
       if (!this.players.has(id)) return null; // join refused (already logged)
       this.bots.set(id, {
         brain,
@@ -368,7 +488,7 @@ export class GameRoom {
    * unconditionally, which left drop-ins standing in the map as shootable
    * targets who could not act until the round rolled over.
    */
-  private joinPlayer(id: PlayerId, name: string, bot: boolean): void {
+  private joinPlayer(id: PlayerId, name: string, bot: boolean, sig: string | null): void {
     if (this.players.has(id) || this.players.size >= MAX_PLAYERS) return;
     const now = Date.now();
     const team = this.pickTeam();
@@ -391,7 +511,7 @@ export class GameRoom {
       seated: 0, minPlayers: MIN_PLAYERS_FOR_MATCH, canStart: false,
     };
     const p: PlayerState = {
-      id, name, team, bot,
+      id, name, team, bot, connected: true, sig,
       body: makeBody(0, 0, 0),
       yaw: 0, pitch: 0, scoped: false,
       inputQueue: [], lastProcessedSeq: 0, lastInputAt: now,
@@ -461,7 +581,10 @@ export class GameRoom {
     for (const [id, team] of this.teamSwitchQueue) {
       this.teamSwitchQueue.delete(id); // consumed either way
       const p = this.players.get(id);
-      if (p === undefined || p.team === team) continue; // gone or already there
+      // gone, already there, or a ghost — a disconnected player isn't playing
+      // either side right now, so honouring their stale request would just
+      // reassign a team they aren't around to see
+      if (p === undefined || p.team === team || !p.connected) continue;
       if (!this.teamSwitchAllowed(team)) {
         this.io.send(id, { t: 'error', code: 'team_full', message: 'team is full' });
         continue;
@@ -514,7 +637,9 @@ export class GameRoom {
     let bestRank = Infinity;
     let bestSeq = -1;
     for (const p of this.players.values()) {
-      if (p.team !== from) continue;
+      // a ghost isn't playing either side right now: moving them would
+      // silently reassign the team they left on, contradicting "RETAIN team"
+      if (p.team !== from || !p.connected) continue;
       // moved at the previous freeze: only picked when nothing else is left
       const movedLastRound = p.balancedRound === this.round - 1 ? 1 : 0;
       const rank = (p.bot ? 0 : 2) + movedLastRound;
@@ -790,6 +915,7 @@ export class GameRoom {
     const out: PlayerId[] = [];
     for (const p of this.players.values()) {
       if (p.bot) continue; // server-driven: no socket to time out
+      if (!p.connected) continue; // already ghosted: no socket left to close
       if (now - p.lastInputAt > NET.inputTimeoutMs) out.push(p.id);
     }
     return out;
@@ -812,7 +938,10 @@ export class GameRoom {
     this.tickN++;
     this.advancePhase(now);
     this.tickBots(now); // bots emit their input BEFORE any movement is consumed
-    for (const p of this.players.values()) this.tickPlayer(p, now);
+    for (const p of this.players.values()) {
+      if (!p.connected) continue; // ghost: no input, not alive, nothing to tick
+      this.tickPlayer(p, now);
+    }
     this.pushLagBuffer();
     if (this.phase === 'live') this.checkElimination(now);
     this.updateSpectators();
@@ -926,8 +1055,10 @@ export class GameRoom {
         return; // lobby: only handleStart leaves warmup — never a timer, never a headcount
       case 'freeze':
       case 'live': {
-        // low-population abort: match collapses straight back to warmup
-        if (this.players.size < MIN_PLAYERS_FOR_MATCH) {
+        // low-population abort: match collapses straight back to warmup.
+        // playerCount() (connected only) — a ghost holding a seat is not a
+        // player available to keep the match going.
+        if (this.playerCount() < MIN_PLAYERS_FOR_MATCH) {
           this.abortToWarmup(now);
           return;
         }
@@ -947,7 +1078,7 @@ export class GameRoom {
         return;
       }
       case 'roundEnd':
-        if (this.players.size < MIN_PLAYERS_FOR_MATCH) {
+        if (this.playerCount() < MIN_PLAYERS_FOR_MATCH) {
           this.abortToWarmup(now);
           return;
         }
@@ -972,6 +1103,10 @@ export class GameRoom {
     this.autoBalanceTeams();
     this.beginSpawnWave(); // one claim set per round: no two teammates share a point
     for (const p of this.players.values()) {
+      // a ghost must NOT be placed back in the world — that would resurrect a
+      // disconnected player as an alive, unpiloted body every single freeze,
+      // exactly the standing-target/corpse-camp bug removePlayer prevents
+      if (!p.connected) continue;
       p.pending = false; // mid-round joiners join THIS round, from the freeze
       this.placeAtSpawn(p, now); // teleported, healed, protected
       this.refillWeapons(p); // every owned weapon refills mag+reserve for free
@@ -1000,6 +1135,10 @@ export class GameRoom {
     const rewards = roundRewards(winner, this.lossStreak);
     this.lossStreak.t = winner === 'T' ? 0 : this.lossStreak.t + 1;
     this.lossStreak.ct = winner === 'CT' ? 0 : this.lossStreak.ct + 1;
+    // deliberately NOT filtered to connected: a ghost's economy is retained,
+    // not frozen, so it keeps pace with the side it is seated on and "resumes
+    // with their economy intact" (contract §2.3) never means resuming poorer
+    // than the round they dropped in actually paid out
     for (const p of this.players.values()) {
       const gain = p.team === 'T' ? rewards.t : rewards.ct;
       p.money = Math.min(ECONOMY.max, p.money + gain); // clamp is caller-side per S3 table
@@ -1028,8 +1167,11 @@ export class GameRoom {
       // start the second half on the base rung (contract C3)
       this.lossStreak.t = 0;
       this.lossStreak.ct = 0;
-      // per-recipient roster: each player sees only their own money
+      // per-recipient roster: each player sees only their own money. Ghosts
+      // have no socket to receive this on — skip them, they'll get a fresh
+      // roster (already post-swap) in their own 'joined' payload on rebind.
       for (const p of this.players.values()) {
+        if (!p.connected) continue;
         this.sendEvent(p.id, { t: 'halftime', roster: this.buildRoster(p.id) });
       }
     }
@@ -1052,6 +1194,10 @@ export class GameRoom {
    * C5's end-of-match scoreboard: EVERY player still in the room, both teams,
    * bots and mid-round joiners included (a joiner sitting out the last round is
    * still present, and reports the zeroes that are the truth about their match).
+   * Ghosts included too, deliberately — this is a historical record of the
+   * match, not a "who's here now" list, and a player who dropped mid-match
+   * still earned whatever the row says. fullReset purges ghosts AFTER this
+   * fires, never before.
    *
    * The order is the server's and is TOTAL, so the client renders it as received
    * — including the top-3 cut the end screen makes — and never re-sorts:
@@ -1098,7 +1244,14 @@ export class GameRoom {
     this.lossStreak.t = 0;
     this.lossStreak.ct = 0;
     this.beginSpawnWave();
-    for (const p of this.players.values()) {
+    for (const [id, p] of this.players) {
+      // a ghost does not survive into a brand-new match — there is no round
+      // in progress any more for it to rebind back into, and warmup (where
+      // this room now sits) never carries a ghost, see removePlayer
+      if (!p.connected) {
+        this.players.delete(id);
+        continue;
+      }
       p.pending = false; // fresh match: nobody is sitting a round out any more
       p.balancedRound = -1;
       resetMatchStats(p); // back in the lobby: the scoreboard clears with the scores
@@ -1122,7 +1275,13 @@ export class GameRoom {
     this.scoreCT = 0;
     this.lossStreak.t = 0;
     this.lossStreak.ct = 0;
-    for (const p of this.players.values()) {
+    for (const [id, p] of this.players) {
+      // same purge as fullReset: this room is back in warmup, and a ghost
+      // must not survive into it (nor into whatever match starts next)
+      if (!p.connected) {
+        this.players.delete(id);
+        continue;
+      }
       p.money = ECONOMY.start;
       p.spectateTarget = null;
       p.balancedRound = -1;
@@ -1369,6 +1528,7 @@ export class GameRoom {
 
   private updateSpectators(): void {
     for (const p of this.players.values()) {
+      if (!p.connected) continue; // no socket to spectate FROM
       if (p.alive) {
         p.spectateTarget = null;
         continue;
@@ -1397,7 +1557,10 @@ export class GameRoom {
       // mid-round joiners have no body this round: they are not in the world,
       // so they are not in ANYONE's snapshot (their own included). The client's
       // first-self-snapshot reset then rebases prediction when they do spawn.
-      if (p.pending) continue;
+      // A ghost is the same story for a different reason — no socket is
+      // piloting that body, so leaving it in the list would be exactly the
+      // standing-target/corpse-camp bug removePlayer exists to prevent.
+      if (p.pending || !p.connected) continue;
       const s = p.snap;
       s.x = p.body.x;
       s.y = p.body.y;
@@ -1413,10 +1576,13 @@ export class GameRoom {
     }
     const canBuy = this.canBuyAt(now);
     // lobby gate, recomputed every tick so the button never lies: a leaver or a
-    // removed bot flips canStart back to false on the very next snapshot
-    const seated = this.players.size;
+    // removed bot flips canStart back to false on the very next snapshot.
+    // playerCount() (connected only): a ghost is not one of the players the
+    // room is waiting on.
+    const seated = this.playerCount();
     const canStart = this.canStartMatch();
     for (const p of this.players.values()) {
+      if (!p.connected) continue; // no live socket to send a personal snapshot to
       const def = WEAPONS[p.weapon];
       const ammo = p.ammo.get(p.weapon);
       const you = p.you;
@@ -1572,12 +1738,20 @@ export class GameRoom {
     return this.phase === 'freeze' || (this.phase === 'live' && now < this.buyOpenUntil);
   }
 
+  // CONNECTED members of `team` — the count every balance/capacity decision
+  // (pickTeam, teamSwitchAllowed, autoBalanceTeams, the forfeit check in
+  // advancePhase) means when it says "how many players are on this side": a
+  // ghost is not there to fight for it or to be counted full against it.
   private countConnected(team: Team): number {
     let n = 0;
-    for (const p of this.players.values()) if (p.team === team) n++;
+    for (const p of this.players.values()) if (p.team === team && p.connected) n++;
     return n;
   }
 
+  // Not additionally filtered on `connected`: alive is already false for
+  // every ghost (removePlayer sets it, and nothing sets it back true for a
+  // disconnected seat — placeAtSpawn is skipped for ghosts everywhere it
+  // would otherwise run), so this is never over-counting one.
   private countAlive(team: Team): number {
     let n = 0;
     for (const p of this.players.values()) if (p.team === team && p.alive) n++;
@@ -1591,11 +1765,17 @@ export class GameRoom {
       kills: p.kills, deaths: p.deaths, headshots: p.headshots,
       bot: p.bot,
       money: p.id === forId ? p.money : null,
-      connected: true,
+      connected: p.connected, // lets a client scoreboard grey out a ghost instead of losing it
       joiningNextRound: p.pending, // scoreboard tag: seated, spawns next round
     };
   }
 
+  // Ghosts stay IN the roster (connected: false) rather than being dropped —
+  // this is the scoreboard's source of truth for "who holds a seat", and it
+  // is what a JOINING player's own 'joined' payload uses (they have never
+  // seen the player_left that told existing clients to stop rendering them
+  // in the world). Live clients still get the real-time removal via
+  // broadcast({t:'player_left'}) in removePlayer.
   private buildRoster(forId: PlayerId | null): RosterEntry[] {
     const out: RosterEntry[] = [];
     for (const p of this.players.values()) out.push(this.rosterEntry(p, forId));

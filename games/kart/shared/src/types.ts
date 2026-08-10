@@ -181,6 +181,15 @@ export type KartS2C =
       phase: KartPhase;
       trackId: TrackId;
       players: KartPlayerInfo[];
+      /**
+       * Room identity, so a reloading driver re-enters THIS grid rather than
+       * quick-joining a stranger's race. `code` is the private join code
+       * (null for public rooms); `roomId` is what `join_public` takes. The
+       * client keeps both in the shared rejoin pointer (@platform/shared
+       * SessionRecord).
+       */
+      roomId: string;
+      code: string | null;
     }
   | {
       t: 'kart_snapshot';

@@ -5,7 +5,7 @@
 // same dustbowl solids the server sim uses — fully deterministic.
 // ============================================================================
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ECONOMY, GEAR, INPUT_FIRE, MAPS, MAX_PLAYERS, MIN_PLAYERS_FOR_MATCH, MULTIKILL_WINDOW, PLAYER, ROUNDS, WEAPONS, boxToAABB, hitscan } from '@fps/shared';
+import { ECONOMY, GEAR, INPUT_FIRE, MAPS, MAX_PLAYERS, MIN_PLAYERS_FOR_MATCH, MULTIKILL_WINDOW, NET, PLAYER, ROUNDS, WEAPONS, boxToAABB, hitscan } from '@fps/shared';
 import type { C2S, GameEvent, HitscanTarget, MapId, PlayerId, RoomPhase, S2C, Team, Vec3, WeaponDef } from '@fps/shared';
 import { GameRoom } from './game.js';
 import type { RoomIO } from './game.js';
@@ -2230,6 +2230,252 @@ describe('GameRoom match stats (C5)', () => {
     expect(p2?.damage).toBe(0);
     expect(p2?.deaths).toBe(1);
     expect(Object.keys(ev).sort()).toEqual(['scoreCT', 'scoreT', 'stats', 't', 'winner']);
+    room.stop();
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// Rejoin — identity contract §2.3. addPlayer(id, name, resume?, sig?) rebinds
+// a GHOSTED seat (socket dropped, entry retained by removePlayer) onto a new
+// session id in place; removePlayer(id, permanent?) is what creates the ghost
+// in the first place instead of deleting outright. These tests reach past the
+// wire into the room's own PlayerState map — the wire (RosterEntry.connected,
+// YouSnap.joiningNextRound) is exercised incidentally, but the field-level
+// assertions (team/money/kills/joinSeq preserved, exactly one Map entry) need
+// server-side truth the wire doesn't carry in full.
+// ---------------------------------------------------------------------------
+
+/** The PlayerState fields these tests need straight off the room, untyped by the wire. */
+interface RejoinFields {
+  connected: boolean;
+  sig: string | null;
+  pending: boolean;
+  team: Team;
+  money: number;
+  kills: number;
+  deaths: number;
+  alive: boolean;
+  joinSeq: number;
+}
+
+interface RejoinInternals {
+  players: Map<PlayerId, RejoinFields>;
+}
+
+function rejoinInternals(room: GameRoom): RejoinInternals {
+  return room as unknown as RejoinInternals;
+}
+
+function rejoinFieldsOf(room: GameRoom, id: PlayerId): RejoinFields {
+  const p = rejoinInternals(room).players.get(id);
+  if (p === undefined) throw new Error(`no player ${id} in the room`);
+  return p;
+}
+
+describe('GameRoom rejoin (identity contract §2.3)', () => {
+  it('drop then rejoin with resume: same team, stats/money preserved, one entry, pending until the next freeze then spawned', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io);
+    const feed = new InputFeed();
+    advanceToPhase(io, 'p1', 'live');
+    fightUntilKill(room, io, feed, 'p2', 'p1'); // p2 gets a kill + kill/win money
+
+    const before = rejoinFieldsOf(room, 'p2');
+    expect(before.kills).toBe(1);
+    const team = before.team;
+    const money = before.money;
+    const joinSeq = before.joinSeq;
+
+    room.removePlayer('p2'); // socket drop (no `permanent`): ghosted, not deleted
+    const ghost = rejoinFieldsOf(room, 'p2');
+    expect(ghost.connected).toBe(false);
+    expect(ghost.alive).toBe(false);
+    expect(room.playerCount()).toBe(1); // the ghost holds a seat but isn't "here"
+
+    room.addPlayer('p2-new', 'Bravo', 'p2'); // resume === the ghost's old playerId
+    expect(rejoinInternals(room).players.has('p2')).toBe(false); // re-keyed, never duplicated
+    expect(rejoinInternals(room).players.size).toBe(2); // still exactly one entry per player
+    const rebound = rejoinFieldsOf(room, 'p2-new');
+    expect(rebound.connected).toBe(true);
+    expect(rebound.team).toBe(team);
+    expect(rebound.money).toBe(money);
+    expect(rebound.kills).toBe(1);
+    expect(rebound.joinSeq).toBe(joinSeq); // rebind preserves join order, not append order
+    expect(rebound.pending).toBe(true);
+    expect(room.playerCount()).toBe(2);
+
+    // pending: not in the world yet
+    tick();
+    expect(io.lastSnap('p2-new').you.alive).toBe(false);
+    expect(io.lastSnap('p2-new').you.joiningNextRound).toBe(true);
+    expect(io.lastSnap('p1').players.some((p) => p.id === 'p2-new')).toBe(false);
+
+    // the next freeze spawns them, same as any other mid-round joiner
+    advanceToPhase(io, 'p1', 'freeze');
+    expect(io.lastSnap('p2-new').you.alive).toBe(true);
+    expect(io.lastSnap('p2-new').you.joiningNextRound).toBe(false);
+    room.stop();
+  });
+
+  it('drop then rejoin with sig only (no resume, a different new playerId): same rebind', () => {
+    const io = new FakeIO();
+    const room = new GameRoom('dustbowl', 'public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.addPlayer('p2', 'Bravo', undefined, 'sig-bravo-0000000000000000');
+    room.start();
+    startMatch(room, 'p1');
+    advanceToPhase(io, 'p1', 'live');
+
+    const before = rejoinFieldsOf(room, 'p2');
+    const team = before.team;
+    const money = before.money;
+    const joinSeq = before.joinSeq;
+
+    room.removePlayer('p2'); // ghosted
+    expect(rejoinFieldsOf(room, 'p2').sig).toBe('sig-bravo-0000000000000000');
+
+    // a brand new session id, no resume at all — only sig matches
+    room.addPlayer('totally-different-id', 'Bravo', undefined, 'sig-bravo-0000000000000000');
+    expect(rejoinInternals(room).players.has('p2')).toBe(false);
+    expect(rejoinInternals(room).players.size).toBe(2);
+    const rebound = rejoinFieldsOf(room, 'totally-different-id');
+    expect(rebound.connected).toBe(true);
+    expect(rebound.team).toBe(team);
+    expect(rebound.money).toBe(money);
+    expect(rebound.joinSeq).toBe(joinSeq);
+    expect(rebound.pending).toBe(true);
+    room.stop();
+  });
+
+  it('drop then rejoin with a WRONG resume and WRONG sig: a genuinely fresh seat, no rebind', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io);
+    advanceToPhase(io, 'p1', 'live');
+    room.removePlayer('p2'); // ghosted
+
+    room.addPlayer('p3', 'Charlie', 'not-a-real-playerid', 'not-a-real-sig');
+    const p3 = rejoinFieldsOf(room, 'p3');
+    expect(p3.connected).toBe(true);
+    expect(p3.money).toBe(ECONOMY.start); // fresh economy — NOT p2's
+    expect(p3.kills).toBe(0);
+    // p2's ghost is untouched by the failed match — still seated, still gone
+    const ghost = rejoinFieldsOf(room, 'p2');
+    expect(ghost.connected).toBe(false);
+    expect(rejoinInternals(room).players.size).toBe(3); // p1, ghost p2, fresh p3
+    room.stop();
+  });
+
+  it('an explicit leave (permanent=true) cannot be resumed — the old resume just seats a fresh player', () => {
+    const io = new FakeIO();
+    const room = setupDuel(io);
+    advanceToPhase(io, 'p1', 'live');
+    room.removePlayer('p2', true); // explicit leave: full delete, no ghost
+    expect(rejoinInternals(room).players.has('p2')).toBe(false);
+
+    room.addPlayer('p2-again', 'Bravo', 'p2'); // resume points at an id that no longer exists
+    const fresh = rejoinFieldsOf(room, 'p2-again');
+    expect(fresh.connected).toBe(true);
+    expect(fresh.money).toBe(ECONOMY.start); // fresh seat, not a rebind
+    expect(fresh.kills).toBe(0);
+    room.stop();
+  });
+
+  it('a ghost is invisible to playerCount() and never appears in stalePlayers()', () => {
+    const io = new FakeIO();
+    const room = new GameRoom('dustbowl', 'public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.addPlayer('p2', 'Bravo');
+    room.start();
+    startMatch(room, 'p1');
+    advanceToPhase(io, 'p1', 'live');
+    expect(room.playerCount()).toBe(2);
+
+    room.removePlayer('p2'); // socket drop mid-live: ghosted, not deleted
+    expect(room.playerCount()).toBe(1);
+    expect(room.stalePlayers()).not.toContain('p2'); // no socket, so nothing to time out
+
+    // stop the tick loop before aging the clock so a cascading phase change
+    // (this room is now below MIN_PLAYERS_FOR_MATCH, connected) doesn't
+    // purge the ghost before the assertion below gets to see it
+    room.stop();
+    vi.advanceTimersByTime(NET.inputTimeoutMs + 5000); // long past any real timeout
+    expect(room.stalePlayers()).not.toContain('p2'); // still excluded once "stale" by the clock
+  });
+
+  it(
+    'a round in progress still resolves (forfeit) while a whole side is ghosts, and beginFreeze never resurrects them',
+    () => {
+      const io = new FakeIO();
+      const room = new GameRoom('dustbowl', 'public', io);
+      room.addPlayer('p1', 'Alpha');
+      room.addPlayer('p2', 'Bravo');
+      room.addPlayer('p3', 'Charlie');
+      room.addPlayer('p4', 'Delta');
+      room.start();
+      startMatch(room, 'p1');
+      advanceToPhase(io, 'p1', 'live');
+
+      // 4 sequential joins always settle 2v2 (pickTeam fills the smaller side)
+      const all: PlayerId[] = ['p1', 'p2', 'p3', 'p4'];
+      const team1 = teamOf(io, 'p1');
+      const side = all.filter((id) => teamOf(io, id) === team1);
+      const otherSide = all.filter((id) => teamOf(io, id) !== team1);
+      expect(side.length).toBe(2);
+      expect(otherSide.length).toBe(2);
+
+      // ghost BOTH players on one side: it still holds two seats, but zero
+      // CONNECTED players. An unfiltered countConnected would still see 2v2
+      // and this forfeit would never fire — that is the exact regression a
+      // missed audit site in removePlayer/countConnected would cause.
+      for (const id of side) room.removePlayer(id);
+      expect(room.playerCount()).toBe(otherSide.length);
+
+      const watcher = otherSide[0] as PlayerId;
+      const ended = advanceUntil(() => io.lastSnap(watcher).phase === 'roundEnd', 60);
+      expect(ended).toBe(true);
+      const ends = eventsOfType(io, watcher, 'round_end');
+      expect(ends.length).toBe(1);
+      expect(ends[0]?.reason).toBe('forfeit');
+      expect(ends[0]?.winner).toBe(teamOf(io, watcher));
+
+      // beginFreeze must not resurrect the ghosts into the world
+      advanceToPhase(io, watcher, 'freeze', 300);
+      for (const id of side) {
+        const p = rejoinFieldsOf(room, id);
+        expect(p.connected).toBe(false);
+        expect(p.alive).toBe(false); // the regression: beginFreeze flips this true if it forgets to skip ghosts
+        expect(io.lastSnap(watcher).players.some((snap) => snap.id === id)).toBe(false);
+      }
+      room.stop();
+    },
+  );
+
+  it('a ghost does not survive a match-end reset (fullReset purges it)', () => {
+    const io = new FakeIO();
+    const room = new GameRoom('dustbowl', 'public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.addPlayer('p2', 'Bravo');
+    room.addPlayer('p3', 'Charlie');
+    room.start();
+    startMatch(room, 'p1');
+    advanceToPhase(io, 'p1', 'live');
+    room.removePlayer('p3'); // socket drop mid-match: ghosted, and stays a ghost all match
+    expect(rejoinFieldsOf(room, 'p3').connected).toBe(false);
+
+    // race p1's side to a loss every round so p2's side takes the match —
+    // same pattern as the C5 "reset: the lobby return..." test
+    for (let r = 0; r < ROUNDS.winRounds; r++) {
+      advanceToPhase(io, 'p1', 'live', 300);
+      room.handleSuicide('p1');
+      advanceToPhase(io, 'p1', 'roundEnd', 60);
+      if (r < ROUNDS.winRounds - 1) advanceToPhase(io, 'p1', 'freeze', 300);
+    }
+    advanceToPhase(io, 'p1', 'matchEnd', 300);
+    expect(rejoinFieldsOf(room, 'p3').connected).toBe(false); // still just a ghost at match_end
+
+    advanceToPhase(io, 'p1', 'warmup', 300); // fullReset, 6s later
+    expect(rejoinInternals(room).players.has('p3')).toBe(false); // purged — never reaches the new match
+    expect(room.playerCount()).toBe(2); // p1 + p2 only
     room.stop();
   }, 60_000);
 });

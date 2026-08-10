@@ -30,6 +30,7 @@
 // ============================================================================
 import { APAL, HERO_LIST, MAX_TEAM_SIZE, MIN_TEAM_SIZE, heroById } from '@rift/shared';
 import type { HeroDef, HeroId, RosterEntry } from '@rift/shared';
+import { loadName, saveName } from '@platform/shared';
 import type { RoomInfo } from '@platform/shared';
 import type { ClientState, UiActions, UiHandle } from '../contract.js';
 
@@ -87,23 +88,6 @@ function heroTooltip(def: HeroDef): string {
   return `${def.name}, ${def.title} — ${def.role}\n${def.blurb}\n${lines.join('\n')}`;
 }
 
-/** localStorage is a courtesy, never a dependency (§6: try/catch'd). */
-function storedName(): string {
-  try {
-    return window.localStorage.getItem('rift.name') ?? '';
-  } catch {
-    return '';
-  }
-}
-
-function storeName(name: string): void {
-  try {
-    window.localStorage.setItem('rift.name', name);
-  } catch {
-    // private mode etc. — the name simply won't persist
-  }
-}
-
 /** ?code= invite prefill (§6); read once, T8 owns the replaceState cleanup. */
 function urlCode(): string {
   try {
@@ -136,7 +120,7 @@ export function createMenus(parent: HTMLElement): UiHandle {
   const nameInput = el('input', 'menu-name', nameLabel);
   nameInput.maxLength = 16;
   nameInput.placeholder = 'Player';
-  nameInput.value = storedName();
+  nameInput.value = loadName();
 
   // QUICK MATCH is the primary, first-seen action (D5): two players who each
   // press the first button they see must land in the SAME room. It is wired
@@ -223,14 +207,14 @@ export function createMenus(parent: HTMLElement): UiHandle {
     const d = debugSurface();
     if (!d) return;
     const name = cleanName();
-    storeName(name);
+    saveName(name);
     d.createPrivate(name, currentSettings());
   };
   createPublicBtn.onclick = () => {
     const d = debugSurface();
     if (!d || typeof d.createPublic !== 'function') return;
     const name = cleanName();
-    storeName(name);
+    saveName(name);
     d.createPublic(name, currentSettings());
   };
   joinBtn.onclick = () => {
@@ -239,14 +223,14 @@ export function createMenus(parent: HTMLElement): UiHandle {
     const code = codeInput.value.trim().toUpperCase();
     if (code.length === 0) return;
     const name = cleanName();
-    storeName(name);
+    saveName(name);
     d.joinPrivate(name, code);
   };
   quickBtn.onclick = () => {
     const d = debugSurface();
     if (!d || typeof d.quickJoin !== 'function') return;
     const name = cleanName();
-    storeName(name);
+    saveName(name);
     d.quickJoin(name);
   };
 
@@ -303,7 +287,7 @@ export function createMenus(parent: HTMLElement): UiHandle {
         const d2 = debugSurface();
         if (!d2 || typeof d2.joinPublic !== 'function') return;
         const name = cleanName();
-        storeName(name);
+        saveName(name);
         d2.joinPublic(name, roomId);
       };
     }

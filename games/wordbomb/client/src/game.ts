@@ -127,6 +127,7 @@ import type {
   WordbombSettings,
 } from '@wordbomb/shared';
 import type { LobbyC2S, RoomInfo } from '@platform/shared';
+import { cleanName, clearSession, loadName, loadSession, loadSig, NAME_MAX, saveName, saveSession } from '@platform/shared';
 
 // ---- wire parsing (platform style: invalid => null, never throw) -------------
 type LobbyMsg =
@@ -210,6 +211,7 @@ function parsePublic(v: Record<string, unknown>): WbPublicState | null {
   const phase = phaseOf(v.phase);
   const difficulty = difficultyOf(v.difficulty);
   if (phase === null || difficulty === null) return null;
+  if (!str(v.roomId)) return null; // §2.2 — always present, unlike `code`
   if (!(str(v.code) || v.code === null)) return null;
   if (!(str(v.fragment) || v.fragment === null)) return null;
   if (!(str(v.winnerId) || v.winnerId === null)) return null;
@@ -230,6 +232,7 @@ function parsePublic(v: Record<string, unknown>): WbPublicState | null {
   return {
     t: 'wb_public',
     code: v.code,
+    roomId: v.roomId,
     phase,
     round: v.round,
     rounds: v.rounds,
@@ -355,12 +358,10 @@ const PING_EVERY_MS = 2000; // mirrors NET.pingEveryMs (platform protocol)
 const ROOMS_EVERY_MS = 3000; // menu room-list poll
 const TICK_MS = 100; // fuse bar + countdowns (setInterval: survives tab blur)
 const LOG_MAX = 7;
-const NAME_MAX = 16; // lobby cleanName cap (platform protocol)
 const CODE_MAX = 8;
 const LOW_SUBMITS = 5; // warn about the budget below this many left
 const MSG_LOG_MAX = 4000; // messageLog() ring cap — a full match is far below this
-const RESUME_KEY = 'wordbomb.resume'; // localStorage: { playerId, code }
-const NAME_KEY = 'wordbomb.name'; // localStorage: last joined name
+const GAME = 'wordbomb'; // this client's GameModule.id — the @platform/shared session key
 
 type LogKind = 'lock' | 'boom' | 'reject' | 'join';
 interface LogEntry {
@@ -400,10 +401,9 @@ function el<K extends keyof HTMLElementTagNameMap>(
   return node;
 }
 
-/** Trimmed, length-capped display name; 'Player' when whitespace-only (lobby rule). */
-function cleanName(v: string): string {
-  return v.trim().slice(0, NAME_MAX) || 'Player';
-}
+// `cleanName` is imported from '@platform/shared' — NAME_MAX/'Player' now live
+// there (identity.ts NAME_MAX/DEFAULT_NAME) as the platform-wide rule, not a
+// per-game copy of the same two numbers.
 
 /** Seat colour as a CSS custom-property reference — never a literal. */
 function seatVar(index: number): string {
@@ -420,6 +420,7 @@ class WordbombGame {
   private playerId: string | null = null;
   private resumeToken: string | null = null;
   private roomCode: string | null = null; // code of the room we're in/joining, when known
+  private roomId: string | null = null; // id of the room we're in/joining, when known (public rejoin)
   private offset = 0; // serverNow = Date.now() + offset
 
   // THE MERGE. Two independent messages; either may be null, either may arrive
@@ -768,17 +769,20 @@ class WordbombGame {
       messageLog: () => this.msgLog.slice(),
     };
 
-    // ---- rejoin record (I8: restores score + yourWord to us alone) -----------
-    this.loadResume();
+    // ---- shared name + rejoin record (I8: restores score + yourWord to us alone) --
+    this.nameInput.value = loadName(); // may be '' — the placeholder covers that (§3)
+    this.loadSessionRecord();
     if (this.roomCode !== null) this.codeInput.value = this.roomCode;
 
     // ---- invite link (?code=XXXXX): prefill + auto-join, then strip the param -
+    // Takes priority over the stored session below — an explicit shared link is
+    // a stronger signal than "wherever I happened to be last".
     const linkCode = new URLSearchParams(location.search).get('code');
     if (linkCode !== null && linkCode.length > 0) {
       history.replaceState(null, '', location.pathname + location.hash);
       this.codeInput.value = linkCode;
-      const name = this.storedName();
-      if (name !== null) this.pendingJoin = { name, code: linkCode };
+      const name = loadName();
+      if (name !== '') this.pendingJoin = { name, code: linkCode };
     }
 
     this.connect();
@@ -836,57 +840,41 @@ class WordbombGame {
     return Date.now() + this.offset;
   }
 
-  // ---- rejoin record (localStorage 'wordbomb.resume') ------------------------
-  private loadResume(): void {
-    try {
-      const raw = localStorage.getItem(RESUME_KEY);
-      if (raw === null) return;
-      const v: unknown = JSON.parse(raw);
-      if (!isObj(v)) return;
-      if (str(v.playerId)) this.resumeToken = v.playerId;
-      if (str(v.code)) this.roomCode = v.code;
-    } catch {
-      // storage blocked or corrupt JSON — play without rejoin
-    }
+  // ---- rejoin record (@platform/shared SessionRecord, keyed by GAME) ---------
+  /** Pull the stored pointer into memory. Absent/corrupt/blocked -> no-op (play without rejoin). */
+  private loadSessionRecord(): void {
+    const rec = loadSession(GAME);
+    if (rec === null) return;
+    this.resumeToken = rec.playerId;
+    this.roomId = rec.roomId;
+    this.roomCode = rec.code;
   }
 
-  private persistResume(): void {
+  /** Write the CURRENT pointer. No-op before `welcome` (no playerId to anchor it to). */
+  private persistSession(): void {
     if (this.playerId === null) return;
-    try {
-      localStorage.setItem(
-        RESUME_KEY,
-        JSON.stringify({ playerId: this.playerId, code: this.roomCode }),
-      );
-    } catch {
-      // storage blocked — non-fatal
-    }
+    saveSession(GAME, { playerId: this.playerId, roomId: this.roomId, code: this.roomCode });
   }
 
-  private clearResume(): void {
+  /** Explicit leave ONLY (§3) — never call this on a socket drop. */
+  private clearSessionRecord(): void {
     this.resumeToken = null;
+    this.roomId = null;
     this.roomCode = null;
-    try {
-      localStorage.removeItem(RESUME_KEY);
-    } catch {
-      // storage blocked — non-fatal
-    }
+    clearSession(GAME);
   }
 
-  private storedName(): string | null {
-    try {
-      const v = localStorage.getItem(NAME_KEY);
-      return v !== null && v.trim().length > 0 ? v : null;
-    } catch {
-      return null;
-    }
-  }
-
-  private persistName(name: string): void {
-    try {
-      localStorage.setItem(NAME_KEY, name);
-    } catch {
-      // storage blocked — non-fatal
-    }
+  /**
+   * Stamp `resume` (this connection's chain, when we have one) and `sig`
+   * (ALWAYS — the durable fallback the server rebinds by when `resume`
+   * misses, contract §2.3) on an outgoing join message. The five join sites
+   * below used to each repeat the `resume` line individually; adding a
+   * second repeated `sig` line to every one of them would drift the moment
+   * only four of five got updated. One helper instead.
+   */
+  private stampIdentity<T extends { resume?: string; sig?: string }>(msg: T): void {
+    if (this.resumeToken !== null) msg.resume = this.resumeToken;
+    msg.sig = loadSig();
   }
 
   // ---- lobby actions (game:'wordbomb' on every create/join) -------------------
@@ -909,9 +897,10 @@ class WordbombGame {
       name: cleanName(name),
       game: 'wordbomb',
     };
-    if (this.resumeToken !== null) msg.resume = this.resumeToken;
+    this.stampIdentity(msg);
     this.roomCode = null;
-    this.persistName(msg.name);
+    this.roomId = null; // unknown until the first wb_public names it
+    saveName(msg.name);
     this.send(msg);
   }
 
@@ -923,9 +912,10 @@ class WordbombGame {
       game: 'wordbomb',
       settings: { rounds: s.rounds, difficulty: s.difficulty },
     };
-    if (this.resumeToken !== null) msg.resume = this.resumeToken;
+    this.stampIdentity(msg);
     this.roomCode = null;
-    this.persistName(msg.name);
+    this.roomId = null; // server-generated; arrives on the first wb_public
+    saveName(msg.name);
     this.send(msg);
   }
 
@@ -937,9 +927,10 @@ class WordbombGame {
       game: 'wordbomb',
       settings: { rounds: s.rounds, difficulty: s.difficulty },
     };
-    if (this.resumeToken !== null) msg.resume = this.resumeToken;
+    this.stampIdentity(msg);
     this.roomCode = null; // server-generated; arrives on the first wb_public
-    this.persistName(msg.name);
+    this.roomId = null; // ditto
+    saveName(msg.name);
     this.send(msg);
   }
 
@@ -949,9 +940,10 @@ class WordbombGame {
       name: cleanName(name),
       roomId,
     };
-    if (this.resumeToken !== null) msg.resume = this.resumeToken;
+    this.stampIdentity(msg);
     this.roomCode = null;
-    this.persistName(msg.name);
+    this.roomId = roomId; // candidate; a 'no_room' error clears it again
+    saveName(msg.name);
     this.send(msg);
   }
 
@@ -966,10 +958,28 @@ class WordbombGame {
       name: cleanName(name),
       code: c,
     };
-    if (this.resumeToken !== null) msg.resume = this.resumeToken;
+    this.stampIdentity(msg);
     this.roomCode = c; // candidate; a 'no_room' error clears it again
-    this.persistName(msg.name);
+    this.roomId = null; // unknown until the first wb_public names it
+    saveName(msg.name);
     this.send(msg);
+  }
+
+  /**
+   * §3 AUTO-REJOIN — fires on every `welcome`, which covers BOTH boot and
+   * reconnect (a dropped socket reconnects and gets a fresh `welcome` too).
+   * A stored SessionRecord means some room is waiting for us: re-enter it
+   * without the player clicking anything, preferring the exact room over a
+   * random one. `code` before `roomId` mirrors the server's own §2.3 order
+   * (resume before sig) — the cheaper, more specific pointer wins.
+   */
+  private autoRejoin(): void {
+    const rec = loadSession(GAME);
+    if (rec === null) return;
+    const name = cleanName(loadName());
+    if (rec.code !== null) this.joinPrivate(name, rec.code);
+    else if (rec.roomId !== null) this.joinPublic(name, rec.roomId);
+    else this.joinQuick(name); // a record with neither pointer: get back in SOME room
   }
 
   /** The entire client->server room surface (docs/WORDBOMB.md §4.1). */
@@ -1000,7 +1010,10 @@ class WordbombGame {
       case 'welcome':
         this.playerId = msg.playerId;
         this.welcomed = true;
-        this.persistResume();
+        // roll the fresh session id into the stored pointer NOW, so a reload
+        // that lands before we ever rejoin still has a resume candidate (the
+        // "repeated reconnects" case — see @platform/shared SessionRecord).
+        this.persistSession();
         this.send({ t: 'list_rooms' });
         this.setNotice('');
         this.renderMenu();
@@ -1008,6 +1021,8 @@ class WordbombGame {
           const { name, code } = this.pendingJoin;
           this.pendingJoin = null; // single attempt — on failure the notice shows
           this.joinPrivate(name, code);
+        } else {
+          this.autoRejoin(); // boot AND reconnect alike: same event, same pointer
         }
         break;
       case 'room_list':
@@ -1020,9 +1035,13 @@ class WordbombGame {
         break;
       }
       case 'error':
-        if (msg.code === 'no_room' && this.roomCode !== null) {
+        if (msg.code === 'no_room' && (this.roomCode !== null || this.roomId !== null)) {
+          // the candidate pointer we just tried was stale — drop both; only
+          // one of the two is ever a live candidate at a time (see the join
+          // methods above), so clearing the pair is exact, not a guess.
           this.roomCode = null;
-          this.persistResume();
+          this.roomId = null;
+          this.persistSession();
         }
         this.setNotice(msg.message);
         break;
@@ -1054,9 +1073,13 @@ class WordbombGame {
   private onPublic(s: WbPublicState): void {
     const first = this.pub === null;
     this.pub = s;
-    if (s.code !== null && s.code !== this.roomCode) {
+    // `roomId` is always present (§2.2 — it's what makes a PUBLIC room
+    // reload findable at all, since public rooms have no code); `code` stays
+    // null for them.
+    if (s.roomId !== this.roomId || s.code !== this.roomCode) {
+      this.roomId = s.roomId;
       this.roomCode = s.code;
-      this.persistResume();
+      this.persistSession();
     }
     if (first) {
       this.showTable();
@@ -1064,7 +1087,7 @@ class WordbombGame {
       if (this.playerId !== null) {
         // joined: the CURRENT session id becomes the valid rejoin token (I8)
         this.resumeToken = this.playerId;
-        this.persistResume();
+        this.persistSession();
       }
     }
     this.onLobbyEntry(s);
@@ -1162,7 +1185,7 @@ class WordbombGame {
   // ---- screens ---------------------------------------------------------------
   private leaveToMenu(notice: string): void {
     this.send({ t: 'leave' });
-    this.clearResume();
+    this.clearSessionRecord(); // explicit leave ONLY (§3) — never on a socket drop
     this.pub = null;
     this.priv = null;
     this.boom = null;

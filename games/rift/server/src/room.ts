@@ -150,6 +150,16 @@ interface Seat {
   brain: BotBrain | null;
   /** Insertion-order index at lock — the hashSeed(roomId, index) input. */
   seatIndex: number;
+  /**
+   * The joiner's durable browser signature (@platform/shared identity), or
+   * null when never presented. Server-side seat metadata ONLY — never put
+   * this on RosterEntry/BoardEntry or any other broadcast shape (CONTRACT
+   * §2.2: sig is a rejoin hint, not a credential, and has no business on the
+   * wire outward). Kept so a LATER join with no `resume` (playerId chain
+   * broken by a purge/rotation/reconnect) can still find this seat by `sig`
+   * — see `rebindGhost`.
+   */
+  sig: string | null;
 }
 
 /** Mutable mirror of YouSnap (the frozen wire type's arrays are readonly-typed). */
@@ -308,17 +318,22 @@ export class RiftRoom implements GameRoomHandle {
     return [];
   }
 
-  addPlayer(id: PlayerId, name: string, resume?: PlayerId): void {
+  addPlayer(id: PlayerId, name: string, resume?: PlayerId, sig?: string): void {
     try {
       const self = this.seats.find((s) => s.pid === id);
       if (self !== undefined) {
         if (!self.connected) this.rebindSeat(self, id, name); // same-id ghost rejoin
         else self.name = name;
+        if (sig !== undefined) self.sig = sig; // keep the fingerprint fresh either way
         this.sendJoinPayloads(self);
         this.afterMembershipChange();
         return;
       }
-      if (resume !== undefined && this.rebindGhost(resume, id, name)) return;
+      // CONTRACT §2.3: `resume` first — exact, cheapest, and what every
+      // already-shipped client sends, so this order alone is what keeps every
+      // resume-based test green unmodified — then `sig` as a fallback for a
+      // playerId chain already broken by a purge/rotation/reconnect.
+      if (this.rebindGhost(id, name, resume, sig)) return;
       if (this.phase === 'lobby') {
         if (this.connectedHumans() >= MAX_PLAYERS) {
           // Must agree with the platform's own guard (room.playerCount(), i.e.
@@ -341,13 +356,14 @@ export class RiftRoom implements GameRoomHandle {
           entId: NO_ENT,
           brain: null,
           seatIndex: 0,
+          sig: sig ?? null,
         };
         this.seats.push(seat);
         this.sendJoinPayloads(seat);
         this.afterMembershipChange();
         return;
       }
-      this.joinLive(id, name);
+      this.joinLive(id, name, sig);
     } catch (err) {
       console.error('[rift] addPlayer failed', err);
     }
@@ -596,6 +612,7 @@ export class RiftRoom implements GameRoomHandle {
           entId: NO_ENT,
           brain: null,
           seatIndex: 0,
+          sig: null, // bot-fill seat: never a real joiner, never sig-matchable (bot: true)
         });
         botN += 1;
         count += 1;
@@ -1178,11 +1195,25 @@ export class RiftRoom implements GameRoomHandle {
     if (this.phase === 'live') this.ensureChannel(seat);
   }
 
-  /** Resume-token rejoin: oldId names a disconnected, non-bot seat. */
-  private rebindGhost(oldId: PlayerId, newId: PlayerId, name: string): boolean {
-    const seat = this.seats.find((s) => s.pid === oldId && !s.connected && !s.bot);
+  /**
+   * Ghost rejoin (CONTRACT §2.3), the ONE rebind lookup path: try `resume`
+   * first — a disconnected, non-bot seat whose pid is the exact token the
+   * joiner presented — then fall back to `sig`, a disconnected, non-bot seat
+   * whose stored fingerprint matches. `resume` is tried first and exclusively
+   * when it hits, so every already-shipped resume-only client keeps its exact
+   * behaviour. `!s.bot` on BOTH lookups is what keeps this from ever
+   * reclaiming a seat an explicit leave already turned into a PERMANENT bot
+   * (removePlayer's permanent=true path, CONTRACT §2 "leaving is final") —
+   * that seat is displaceable by a late joiner like any other bot, never
+   * silently handed back to its old occupant.
+   */
+  private rebindGhost(newId: PlayerId, name: string, resume?: PlayerId, sig?: string): boolean {
+    const seat =
+      (resume !== undefined ? this.seats.find((s) => s.pid === resume && !s.connected && !s.bot) : undefined) ??
+      (sig !== undefined ? this.seats.find((s) => s.sig === sig && !s.connected && !s.bot) : undefined);
     if (seat === undefined) return false;
     this.rebindSeat(seat, newId, name);
+    if (sig !== undefined) seat.sig = sig; // refresh — the fingerprint may since have rotated
     this.sendJoinPayloads(seat);
     this.afterMembershipChange();
     return true;
@@ -1195,7 +1226,7 @@ export class RiftRoom implements GameRoomHandle {
    * exists and a seat is free under the locked teamSize, a fresh level-1 hero
    * spawns at the team's fountain. Otherwise the room is genuinely full.
    */
-  private joinLive(id: PlayerId, name: string): void {
+  private joinLive(id: PlayerId, name: string, sig?: string): void {
     for (const s of this.seats) {
       if (!s.bot) continue;
       s.bot = false;
@@ -1204,6 +1235,7 @@ export class RiftRoom implements GameRoomHandle {
       s.name = name;
       s.brain = null;
       s.pick = null;
+      if (sig !== undefined) s.sig = sig;
       const ent = this.world?.get(s.entId);
       if (ent !== undefined) ent.pid = id;
       if (this.phase === 'live') this.ensureChannel(s);
@@ -1265,6 +1297,7 @@ export class RiftRoom implements GameRoomHandle {
         entId,
         brain: null,
         seatIndex: this.seats.length,
+        sig: sig ?? null,
       };
       this.seats.push(seat);
       if (this.phase === 'live') this.ensureChannel(seat);

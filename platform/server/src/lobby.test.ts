@@ -280,3 +280,191 @@ describe('cross-module consistency (every module in registry.ts GAMES)', () => {
     });
   }
 });
+
+// ---- sig pass-through: lobby forwards `sig` to GameRoomHandle.addPlayer ----
+//
+// The platform never interprets `sig` — no dedup, no "kick the old session
+// with this sig", no room steering (see lobby.ts joinRoom). All it does is
+// carry the value from the wire message to addPlayer's 4th parameter,
+// exactly like `resume` already does. A stub GameModule with a spied
+// addPlayer is used here (rather than the real riftModule, as the
+// quick_join describe block above uses) because what these tests need to
+// observe is the exact argument tuple Lobby hands to the room — something
+// a real module's addPlayer would swallow silently.
+
+/** A minimal GameModule whose addPlayer records every call it receives, so
+ *  tests can assert on the exact (id, name, resume, sig) tuple Lobby sent. */
+function makeSpyModule(id: string): {
+  mod: GameModule;
+  calls: Array<[PlayerId, string, PlayerId | undefined, string | undefined]>;
+} {
+  const calls: Array<[PlayerId, string, PlayerId | undefined, string | undefined]> = [];
+  let nextRoomId = 0;
+
+  const mod: GameModule = {
+    id,
+    name: id,
+    clientDist: '',
+    minPlayers: 1,
+    maxPlayers: 4,
+    createRoom(opts) {
+      const roomId: RoomId = `${id}-room-${nextRoomId++}`;
+      let count = 0;
+      const code: string | null = opts.visibility === 'private' ? `CODE${roomId}` : null;
+      const room: GameRoomHandle = {
+        id: roomId,
+        info: () => ({
+          id: roomId,
+          code,
+          game: id,
+          label: '',
+          players: count,
+          maxPlayers: 4,
+          phase: 'warmup',
+          visibility: opts.visibility,
+        }),
+        playerCount: () => count,
+        stalePlayers: () => [],
+        addPlayer(playerId, name, resume, sig) {
+          calls.push([playerId, name, resume, sig]);
+          count++;
+          // Mirrors real modules ("the room sends its own join payload"), so
+          // tests below can recover roomId/code the same way a real client
+          // would: off the session's own message stream, not module internals.
+          opts.io.send(playerId, { t: 'spy_hello', roomId, code });
+        },
+        removePlayer() {
+          count = Math.max(0, count - 1);
+        },
+        handleMessage() {},
+        start() {},
+        stop() {},
+      };
+      return room;
+    },
+  };
+  return { mod, calls };
+}
+
+/** Reads the {roomId, code} a session was told on join, same pattern as
+ *  riftRoomIdSeenBy above but for makeSpyModule's synthetic join payload. */
+function spyHelloSeenBy(sess: FakeSession): { roomId: RoomId; code: string | null } {
+  const hello = sess.all().find((m) => m.t === 'spy_hello');
+  if (hello === undefined) throw new Error('no spy_hello observed for this session');
+  const h = hello as unknown as { roomId: unknown; code: unknown };
+  if (typeof h.roomId !== 'string') throw new Error('spy_hello carried no string roomId');
+  return { roomId: h.roomId, code: typeof h.code === 'string' ? h.code : null };
+}
+
+describe('sig pass-through to GameRoomHandle.addPlayer', () => {
+  let tracked: Lobby[] = [];
+
+  afterEach(() => {
+    for (const l of tracked) l.close();
+    tracked = [];
+  });
+
+  it('a join carrying `sig` reaches the room addPlayer as the 4th argument', () => {
+    const { mod, calls } = makeSpyModule('spy1');
+    const lobby = new Lobby([mod]);
+    tracked.push(lobby);
+
+    lobby.handleMessage(asSession(new FakeSession('p1')), {
+      t: 'quick_join',
+      name: 'Ada',
+      game: 'spy1',
+      sig: 'sig-abcdefgh',
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.[3]).toBe('sig-abcdefgh');
+  });
+
+  it('a join carrying BOTH resume and sig forwards both, in order', () => {
+    const { mod, calls } = makeSpyModule('spy2');
+    const lobby = new Lobby([mod]);
+    tracked.push(lobby);
+
+    lobby.handleMessage(asSession(new FakeSession('p1')), {
+      t: 'quick_join',
+      name: 'Ada',
+      game: 'spy2',
+      resume: 'old-player-id',
+      sig: 'sig-abcdefgh',
+    });
+
+    expect(calls[0]).toEqual(['p1', 'Ada', 'old-player-id', 'sig-abcdefgh']);
+  });
+
+  it('a join carrying neither resume nor sig still calls addPlayer, both undefined, unchanged from today', () => {
+    const { mod, calls } = makeSpyModule('spy3');
+    const lobby = new Lobby([mod]);
+    tracked.push(lobby);
+
+    lobby.handleMessage(asSession(new FakeSession('p1')), { t: 'quick_join', name: 'Ada', game: 'spy3' });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toEqual(['p1', 'Ada', undefined, undefined]);
+  });
+
+  it('all five join message types forward sig', () => {
+    const { mod, calls } = makeSpyModule('spy4');
+    const lobby = new Lobby([mod]);
+    tracked.push(lobby);
+
+    // create_public — opens a fresh public room
+    const pubCreator = new FakeSession('pub-creator');
+    lobby.handleMessage(asSession(pubCreator), {
+      t: 'create_public',
+      name: 'A',
+      game: 'spy4',
+      sig: 'sig-createpub1',
+    });
+    const pubRoomId = spyHelloSeenBy(pubCreator).roomId; // learned the same way a real client would
+
+    // join_public — same room, addressed by the id the creator was told
+    lobby.handleMessage(asSession(new FakeSession('pub-joiner')), {
+      t: 'join_public',
+      name: 'B',
+      roomId: pubRoomId,
+      sig: 'sig-joinpub1',
+    });
+
+    // create_private — opens a fresh private room
+    const privCreator = new FakeSession('priv-creator');
+    lobby.handleMessage(asSession(privCreator), {
+      t: 'create_private',
+      name: 'C',
+      game: 'spy4',
+      sig: 'sig-createpriv1',
+    });
+    const privCode = spyHelloSeenBy(privCreator).code;
+    if (privCode === null) throw new Error('expected a private room code');
+
+    // join_private — same room, addressed by the code the creator was told
+    lobby.handleMessage(asSession(new FakeSession('priv-joiner')), {
+      t: 'join_private',
+      name: 'D',
+      code: privCode,
+      sig: 'sig-joinpriv1',
+    });
+
+    // quick_join — the public room from above still has space and reports
+    // 'warmup', so this lands there rather than opening a third room; either
+    // way it is still a fifth addPlayer call carrying its own sig.
+    lobby.handleMessage(asSession(new FakeSession('quick-joiner')), {
+      t: 'quick_join',
+      name: 'E',
+      game: 'spy4',
+      sig: 'sig-quickjoin1',
+    });
+
+    expect(calls.map((c) => c[3])).toEqual([
+      'sig-createpub1',
+      'sig-joinpub1',
+      'sig-createpriv1',
+      'sig-joinpriv1',
+      'sig-quickjoin1',
+    ]);
+  });
+});

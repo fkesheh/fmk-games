@@ -34,13 +34,21 @@ export interface GameRoomHandle {
   /** ids with no input for the game's timeout — the platform closes their sockets. */
   stalePlayers(): PlayerId[];
   /** Called when a session joins. The room sends its own join payload to the player. */
-  addPlayer(id: PlayerId, name: string, resume?: PlayerId): void;
+  addPlayer(id: PlayerId, name: string, resume?: PlayerId, sig?: string): void;
   // resume: a playerId from a previous (disconnected) session. Games that support
   // rejoin may re-bind the new session to the old entry; others ignore it.
+  //
+  // sig: the joiner's DURABLE browser signature (@platform/shared identity).
+  // Where `resume` is ephemeral — it only matches while the ghost still holds
+  // the exact playerId of the dropped socket — `sig` is the same value across
+  // reloads, reconnects and playerId rotation. Rooms that support rejoin
+  // SHOULD match on `resume` first (cheapest, exact, and what existing
+  // clients send) and fall back to `sig`; a room that ignores both is still
+  // contract-compliant, it just won't resume anyone.
   /**
    * permanent=true: the player explicitly left (C2S 'leave') — remove them fully.
    * permanent=false/omitted: socket dropped — games MAY ghost the entry briefly
-   * (rejoin via resume) and purge later.
+   * (rejoin via resume/sig) and purge later.
    */
   removePlayer(id: PlayerId, permanent?: boolean): void;
   /**

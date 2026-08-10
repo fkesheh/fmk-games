@@ -424,11 +424,17 @@ function substrings3plus(w: string): string[] {
   return [...out];
 }
 
-/** Deep-equal "modulo timestamps": zero every absolute-ms field. */
+/**
+ * Deep-equal "modulo timestamps (and room identity)": zero every absolute-ms
+ * field, plus `roomId` — each `leakScenario()` call `boot()`s a BRAND NEW
+ * room with its own random id (§2.2), which is irrelevant to what this test
+ * proves (B's stream shape does not depend on the word's length) and would
+ * otherwise fail the comparison for a reason that has nothing to do with I1.
+ */
 function stripTimes(msgs: readonly WbMsg[]): unknown[] {
   return msgs.map((m) => {
     if (m.t !== 'wb_public') return m;
-    return { ...m, roundStartedAt: 0, revealEndsAt: 0, countdownEndsAt: 0, matchEndsAt: 0 };
+    return { ...m, roundStartedAt: 0, revealEndsAt: 0, countdownEndsAt: 0, matchEndsAt: 0, roomId: '' };
   });
 }
 
@@ -1339,6 +1345,116 @@ describe('I8 — reconnect is safe', () => {
     expect(boom.answers).toHaveLength(3);
     expect(answerOf(boom, 'a2')).toMatchObject({ word: 'motion', points: 72 });
     expect(playerOf(h.io.pub('b'), 'a2').score).toBe(144); // 72 + 72, not doubled
+  });
+});
+
+// =============================================================================
+// Identity contract §2.3 — the `sig` fallback rebind, and the `roomId` that
+// makes a public-room reload findable at all. `boot()` seats players with no
+// sig (mirrors already-shipped clients); each test stamps one via a same-id
+// `addPlayer` call — the "existing" branch that keeps a connected seat's sig
+// current — before dropping and rejoining.
+// =============================================================================
+describe('§2.3 — sig-based rebind', () => {
+  it('rejoins by sig alone (no resume, new playerId): same seat, score, used set and locked word preserved', () => {
+    const h = boot([
+      ['a', 'Alice'],
+      ['b', 'Bob'],
+      ['c', 'Carol'],
+    ]);
+    h.room.addPlayer('a', 'Alice', undefined, 'sig-a'); // stamp the seat's durable sig
+    advance();
+    submit(h.room, 'a', 'nation'); // round 1, fragment 'ion'
+    toBoom();
+    expect(playerOf(h.io.pub('a'), 'a').score).toBe(72);
+    afterReveal(); // round 2, fragment 'tio' — 'nation' also contains 'tio'
+
+    h.room.removePlayer('a'); // socket dropped mid-round, nothing locked yet
+    h.room.addPlayer('a2', 'Alice', undefined, 'sig-a'); // NO resume — sig only
+    const st = h.io.pub('b');
+    expect(st.players).toHaveLength(3); // re-bind, not a duplicate row
+    expect(st.players.map((p) => p.id)).toEqual(['a2', 'b', 'c']); // join slot kept
+    expect(playerOf(st, 'a2')).toMatchObject({ score: 72, connected: true, locked: false });
+
+    // the `used` set survived the sig rebind (I4): a word already SCORED this
+    // match is still burned, even though it fits round 2's fragment too.
+    submit(h.room, 'a2', 'nation');
+    expect(h.io.rejects('a2')).toContain('already_used');
+    cooldown();
+    submit(h.room, 'a2', 'motion'); // a fresh word this round
+    expect(playerOf(h.io.pub('b'), 'a2').locked).toBe(true);
+
+    toBoom();
+    const boom = lastBoom(h.io, 'b');
+    expect(answerOf(boom, 'a2')).toMatchObject({ word: 'motion', points: 72 });
+    expect(playerOf(h.io.pub('b'), 'a2').score).toBe(144); // 72 + 72, not doubled
+  });
+
+  it('resume and sig both present for the same ghost: one rebind, one entry', () => {
+    const h = boot([
+      ['a', 'Alice'],
+      ['b', 'Bob'],
+    ]);
+    h.room.addPlayer('a', 'Alice', undefined, 'sig-a');
+    advance();
+    h.room.removePlayer('a');
+    h.room.addPlayer('a2', 'Alice', 'a', 'sig-a'); // resume AND sig point at the same ghost
+    const st = h.io.pub('b');
+    expect(st.players).toHaveLength(2); // ONE rebind — resume matched first, sig never consulted
+    expect(st.players.map((p) => p.id)).toEqual(['a2', 'b']);
+  });
+
+  it('wrong resume + wrong sig: fresh seat, no rebind', () => {
+    const h = boot([
+      ['a', 'Alice'],
+      ['b', 'Bob'],
+    ]);
+    h.room.addPlayer('a', 'Alice', undefined, 'sig-a');
+    advance();
+    h.room.removePlayer('a'); // 'a' ghosts; still 2 seats (MIN_PLAYERS), match stays live
+    h.room.addPlayer('c', 'Carol', 'nobody', 'sig-nobody'); // neither token matches the ghost
+    const st = h.io.pub('b');
+    expect(st.players).toHaveLength(3); // a fresh seat for 'c', the ghost untouched
+    expect(st.players.map((p) => p.id)).toEqual(['a', 'b', 'c']);
+    expect(playerOf(st, 'a').connected).toBe(false);
+    expect(playerOf(st, 'c').connected).toBe(true);
+  });
+
+  it('WbPublicState.roomId is populated, and no outgoing message anywhere carries a sig', () => {
+    const h = boot([
+      ['a', 'Alice'],
+      ['b', 'Bob'],
+    ]);
+    h.room.addPlayer('a', 'Alice', undefined, 'sig-a');
+    advance();
+
+    const pub = h.io.pub('a');
+    expect(pub.roomId).toBe(h.room.id);
+    expect(pub.roomId.length).toBeGreaterThan(0);
+
+    // sig is server-side seat metadata (§2 privacy invariant) — it must never
+    // ride ANY outgoing message, not even back to the player who sent it.
+    for (const id of ['a', 'b'] as const) {
+      expect(JSON.stringify(h.io.all(id)).toLowerCase()).not.toContain('sig-a');
+    }
+  });
+
+  it('a player who locked a word, dropped, and rejoined by sig still has it scored at reveal (§2.1 over the sig path)', () => {
+    const h = boot([
+      ['a', 'Alice'],
+      ['b', 'Bob'],
+      ['c', 'Carol'],
+    ]);
+    h.room.addPlayer('a', 'Alice', undefined, 'sig-a');
+    advance();
+    submit(h.room, 'a', 'nation'); // locks a word this round
+    h.room.removePlayer('a'); // socket dropped WHILE the word is locked (§2.1: still scored)
+    h.room.addPlayer('a2', 'Alice', undefined, 'sig-a'); // sig-only rejoin restores it
+    expect(h.io.priv('a2').yourWord).toBe('nation');
+
+    toBoom();
+    const boom = lastBoom(h.io, 'b');
+    expect(answerOf(boom, 'a2')).toMatchObject({ word: 'nation', points: 72 });
   });
 });
 

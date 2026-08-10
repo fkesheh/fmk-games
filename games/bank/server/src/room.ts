@@ -66,6 +66,13 @@ interface Player {
   banked: boolean; // sits out the rest of the round after banking
   connected: boolean;
   lastMsgAt: number; // serverTime ms of last room-level message; stale sweep
+  /**
+   * Durable browser signature (@platform/shared identity), or null when the
+   * joiner sent none (older client, or blocked storage). Recorded on every
+   * join so a LATER drop can be found again by `sig` even after the `resume`
+   * chain has broken (purge, rotation) — see `addPlayer` and `rebindGhost`.
+   */
+  sig: string | null;
 }
 
 export class BankRoom implements GameRoomHandle {
@@ -146,7 +153,7 @@ export class BankRoom implements GameRoomHandle {
     return out;
   }
 
-  addPlayer(id: PlayerId, name: string, resume?: PlayerId): void {
+  addPlayer(id: PlayerId, name: string, resume?: PlayerId, sig?: string): void {
     try {
       const now = Date.now();
       const existing = this.players.get(id);
@@ -155,8 +162,13 @@ export class BankRoom implements GameRoomHandle {
         existing.connected = true;
         existing.name = name;
         existing.lastMsgAt = now;
-      } else if (resume !== undefined && this.rebindGhost(resume, id, name, now)) {
+        if (sig !== undefined) existing.sig = sig; // keep the seat's sig current
+      } else if (resume !== undefined && this.rebindGhost(resume, id, name, now, sig)) {
         // resume matched a disconnected entry: re-bound in place above
+      } else if (this.rebindBySig(sig, id, name, now)) {
+        // contract §2.3 step 2: resume didn't rebind (absent, unknown, or
+        // still connected) — sig matched a disconnected entry instead. Reuses
+        // rebindGhost so there is exactly one rebind path.
       } else {
         if (this.playerCount() >= MAX_PLAYERS) {
           // unreachable via the lobby (it guards room_full first); never throws
@@ -172,6 +184,7 @@ export class BankRoom implements GameRoomHandle {
           banked: false,
           connected: true,
           lastMsgAt: now,
+          sig: sig ?? null,
         });
       }
       // NO AUTO-START. Reaching MIN_PLAYERS makes the room *startable*, not
@@ -464,19 +477,41 @@ export class BankRoom implements GameRoomHandle {
    * keeping its exact join-order slot, score and banked flag. Returns false
    * when there is no such entry or it is still connected (caller joins as new).
    */
-  private rebindGhost(oldId: PlayerId, newId: PlayerId, name: string, now: number): boolean {
+  private rebindGhost(oldId: PlayerId, newId: PlayerId, name: string, now: number, sig?: string): boolean {
     const ghost = this.players.get(oldId);
     if (ghost === undefined || ghost.connected) return false;
     ghost.id = newId;
     ghost.name = name;
     ghost.connected = true;
     ghost.lastMsgAt = now;
+    if (sig !== undefined) ghost.sig = sig; // keep the seat's sig current on every rebind
     // rebuild the map so the re-bound entry keeps its exact join-order slot
     const entries = [...this.players.entries()];
     this.players.clear();
     for (const [key, p] of entries) this.players.set(key === oldId ? newId : key, p);
     if (this.currentId === oldId) this.currentId = newId; // id reference update
     return true;
+  }
+
+  /**
+   * Contract §2.3 step 2, the `sig` fallback: find a DISCONNECTED entry whose
+   * stored signature matches, and rebind through the same `rebindGhost` path
+   * (never a second rebind implementation). `sig` undefined or matching
+   * nothing returns false so the caller falls through to a fresh seat.
+   */
+  private rebindBySig(sig: string | undefined, newId: PlayerId, name: string, now: number): boolean {
+    if (sig === undefined) return false;
+    const ghostId = this.findGhostBySig(sig);
+    if (ghostId === undefined) return false;
+    return this.rebindGhost(ghostId, newId, name, now, sig);
+  }
+
+  /** First disconnected seat carrying this signature, or undefined. */
+  private findGhostBySig(sig: string): PlayerId | undefined {
+    for (const p of this.players.values()) {
+      if (!p.connected && p.sig !== null && p.sig === sig) return p.id;
+    }
+    return undefined;
   }
 
   /**
@@ -558,6 +593,9 @@ export class BankRoom implements GameRoomHandle {
     return {
       t: 'bank_state',
       code: this.code, // private-room invite code (null for public); everyone in the room may see it
+      // public rooms have no code, so this is what a reload rejoins BY
+      // (join_public) when the stored SessionRecord has no code to use instead.
+      roomId: this.id,
       phase: this.phase,
       settings: this.settings, // frozen variant; never mutated, shared by reference
       round: this.round,

@@ -182,7 +182,7 @@ function campEnts(snap: Snap): EntSnap[] {
  */
 interface RoomInternals {
   world: World | null;
-  seats: Array<{ pid: PlayerId; bot: boolean; brain: BotBrain | null }>;
+  seats: Array<{ pid: PlayerId; bot: boolean; brain: BotBrain | null; sig: string | null }>;
 }
 
 function internals(room: RiftRoom): RoomInternals {
@@ -807,6 +807,184 @@ describe('disconnect and resume', () => {
     // the seat keeps playing: a later joiner can displace it like any bot
     room.addPlayer('p4', 'Dee');
     expect(io.roster('p2').some((r) => r.id === 'p4' && !r.bot)).toBe(true);
+  });
+});
+
+// ---- sig-based rebind (CONTRACT §2.3: durable browser-signature fallback) ------------------
+//
+// `resume` (the previous session's playerId) is exact but ephemeral — it only
+// matches while the ghost still holds precisely that id. `sig` is the durable
+// per-browser fingerprint @platform/shared mints once and a client presents on
+// every join; it survives a purge/rotation/reconnect that would break the
+// resume chain. addPlayer's lookup tries resume FIRST (proven above, unchanged)
+// and falls back to sig ONLY when resume is absent or misses — never the other
+// way — and never against a seat an explicit leave already made a PERMANENT bot.
+
+describe('sig-based rebind', () => {
+  it('drop mid-match then rejoin by sig alone (no resume, new playerId): same seat/hero/entity, level/gold/KDA intact, brain released', () => {
+    const SIG_P1 = 'sig-p1-durable-fingerprint-aaaa';
+    const { room, io } = boot([
+      ['p2', 'Bob'],
+      ['p3', 'Cid'],
+    ]);
+    room.addPlayer('p1', 'Ada', undefined, SIG_P1); // presents its sig on the very first join
+    pressStartAndLock(room, 'p1');
+    pump(room, 2);
+
+    // join order (p2, p3, p1) puts p1 on team0 with p2 (ties -> team0); p1's
+    // own snapshot always shows itself regardless of fog, so read entId/level
+    // from p1's OWN view — never an enemy's (p3 is the enemy here).
+    const teamBefore = io.roster('p3').find((r) => r.id === 'p1')?.team;
+    const snap0 = latestSnap(io, 'p1');
+    const entId = heroEntByPid(snap0, 'p1').id;
+
+    room.removePlayer('p1'); // socket drop: permanent=false -> ghost, fresh bot brain takes over
+    expect(io.roster('p3').find((r) => r.id === 'p1')?.connected).toBe(false);
+    expect(internals(room).seats.find((s) => s.pid === 'p1')?.brain).not.toBeNull();
+
+    // let the bot brain play long enough for passive gold (PASSIVE_GOLD_PER_S)
+    // to clear STARTING_GOLD by a wide margin — the "intact, not reset" proof.
+    pump(room, 200);
+    // board (the TAB scoreboard) is one shared row set sent identically to
+    // everyone — unlike `.ents`, it is never fog-filtered, so any id works.
+    const boardBefore = latestSnap(io, 'p3').board.find((b) => b.id === 'p1');
+    if (boardBefore === undefined) throw new Error('p1 missing from board');
+    const levelBefore = heroEntByPid(latestSnap(io, 'p2'), 'p1').lvl; // p2 is p1's teammate: allies are always visible
+
+    // rejoin: a BRAND NEW playerId, NO resume — sig alone must find the ghost.
+    room.addPlayer('p1-new-session', 'Ada2', undefined, SIG_P1);
+    expect(io.last('p1-new-session', 'rift_hello').team).toBe(teamBefore);
+    pump(room, 1);
+
+    const snap1 = latestSnap(io, 'p1-new-session');
+    const rebound = heroEntByPid(snap1, 'p1-new-session');
+    expect(rebound.id).toBe(entId); // SAME hero ent, not a fresh spawn
+    expect(rebound.lvl).toBe(levelBefore);
+    const boardAfter = snap1.board.find((b) => b.id === 'p1-new-session');
+    expect(boardAfter?.kills).toBe(boardBefore.kills);
+    expect(boardAfter?.deaths).toBe(boardBefore.deaths);
+    expect(boardAfter?.assists).toBe(boardBefore.assists);
+    expect(boardAfter?.bot).toBe(false);
+    expect(boardAfter?.connected).toBe(true);
+    expect(snap1.you?.gold).not.toBe(STARTING_GOLD); // the ghost's accumulated purse, not a fresh stake
+    // the bot brain that drove the ghost must be released back to the human
+    expect(internals(room).seats.find((s) => s.pid === 'p1-new-session')?.brain).toBeNull();
+  });
+
+  it('resume and sig both present for the same ghost: one rebind, one seat, no duplicate', () => {
+    const SIG_P1 = 'sig-p1-both-present-bbbbbbbbbb';
+    const { room, io } = boot([
+      ['p2', 'Bob'],
+      ['p3', 'Cid'],
+    ]);
+    room.addPlayer('p1', 'Ada', undefined, SIG_P1);
+    pressStartAndLock(room, 'p1');
+    pump(room, 2);
+    const seatCountBefore = internals(room).seats.length;
+
+    room.removePlayer('p1');
+    // BOTH tokens point at the same ghost — resume must win, and win exactly once.
+    room.addPlayer('p1-rejoin', 'Ada2', 'p1', SIG_P1);
+
+    expect(internals(room).seats.length).toBe(seatCountBefore); // no seat created
+    const roster = io.roster('p3');
+    expect(roster.filter((r) => r.id === 'p1-rejoin').length).toBe(1);
+    expect(roster.some((r) => r.id === 'p1')).toBe(false); // old pid mutated away, not duplicated
+    expect(internals(room).seats.find((s) => s.pid === 'p1-rejoin')?.brain).toBeNull();
+  });
+
+  it('wrong resume + wrong sig: never a silent rebind onto someone else\'s hero', () => {
+    const { room, io } = boot([
+      ['p1', 'Ada'],
+      ['p2', 'Bob'],
+    ]);
+    pressStartAndLock(room, 'p1');
+    pump(room, 2);
+    // p1 and p2 land on OPPOSITE teams (ties -> team0, then team1) — an enemy
+    // snapshot fog-filters p1's ent, so read it from p1's OWN view instead.
+    const p1EntId = heroEntByPid(latestSnap(io, 'p1'), 'p1').id;
+
+    room.removePlayer('p1'); // socket drop -> ghost (bot-driven, but seat.bot stays false)
+    pump(room, 1);
+
+    // neither token matches any seat's resume pid or stored sig.
+    room.addPlayer('p9', 'Eve', 'bogus-resume-id', 'bogus-sig-that-matches-nothing-zzzz');
+
+    const roster = io.roster('p2');
+    const p1Seat = roster.find((r) => r.id === 'p1');
+    expect(p1Seat?.connected).toBe(false); // p1's ghost untouched
+    expect(p1Seat?.bot).toBe(false); // still just ghosted, not converted
+
+    const p9Seat = roster.find((r) => r.id === 'p9');
+    expect(p9Seat).toBeDefined();
+    expect(p9Seat?.connected).toBe(true);
+
+    pump(room, 1);
+    const p9Ent = heroEntByPid(latestSnap(io, 'p9'), 'p9');
+    expect(p9Ent.id).not.toBe(p1EntId); // NEVER p1's hero: a fresh/displaced seat, not a rebind
+  });
+
+  it('a seat turned permanent-bot by an explicit leave is NOT reclaimed by its old sig', () => {
+    const SIG_P1 = 'sig-p1-permanent-leave-ccccccc';
+    // p0 joins first (no sig) so its seat sits ahead of p1's in join order —
+    // the decisive check below only works if SOME bot seat precedes p1's.
+    const { room, io } = boot([
+      ['p0', 'Zed'],
+      ['p2', 'Cid'],
+    ]);
+    room.addPlayer('p1', 'Ada', undefined, SIG_P1);
+    pressStartAndLock(room, 'p0');
+    pump(room, 2);
+
+    // p2 is the enemy of both p0 and p1 (join order puts p0+p1 on team0,
+    // ties -> team0) — an enemy view fog-filters them, so read each hero's
+    // ent id from its own owner's snapshot, which is always self-visible.
+    const p0EntId = heroEntByPid(latestSnap(io, 'p0'), 'p0').id;
+    const p1EntId = heroEntByPid(latestSnap(io, 'p1'), 'p1').id;
+
+    // BOTH leave on purpose — p0 first, so p0's converted seat is the earliest
+    // bot-flagged seat in join order once p1 also converts.
+    room.removePlayer('p0', true);
+    room.removePlayer('p1', true);
+    pump(room, 1);
+    expect(io.roster('p2').find((r) => r.id === 'p1')?.bot).toBe(true);
+
+    // A joiner presenting p1's OLD sig, no resume: sig lookup excludes
+    // bot:true seats, so it must NOT land on p1's seat/hero. Ordinary late-join
+    // displacement still applies (existing rules) and picks the earliest
+    // displaceable bot seat instead — p0's.
+    room.addPlayer('p-late', 'Newcomer', undefined, SIG_P1);
+    pump(room, 1);
+
+    const roster = io.roster('p2');
+    expect(roster.find((r) => r.id === 'p1')?.bot).toBe(true); // p1's seat: still untouched
+    expect(roster.find((r) => r.id === 'p1')?.connected).toBe(false);
+
+    const lateEnt = heroEntByPid(latestSnap(io, 'p-late'), 'p-late');
+    expect(lateEnt.id).not.toBe(p1EntId); // never p1's hero
+    expect(lateEnt.id).toBe(p0EntId); // the earliest displaceable bot seat instead
+  });
+
+  it('no outgoing message anywhere contains a sig field', () => {
+    const SIG_A = 'sig-no-leak-check-dddddddddddd';
+    const { room, io } = boot([
+      ['p2', 'Bob'],
+      ['p3', 'Cid'],
+    ]);
+    room.addPlayer('p1', 'Ada', undefined, SIG_A);
+    pressStartAndLock(room, 'p1');
+    pump(room, 2);
+    room.removePlayer('p1');
+    room.addPlayer('p1-again', 'Ada2', undefined, SIG_A); // sig-based rebind path
+    pump(room, 1);
+
+    // Match the wire KEY, not the bare substring — "laneAssignment" contains
+    // "sig" as a substring and would otherwise false-positive this check.
+    for (const id of ['p1', 'p1-again', 'p2', 'p3'] as const) {
+      for (const msg of io.all(id)) {
+        expect(JSON.stringify(msg)).not.toMatch(/"sig"\s*:/);
+      }
+    }
   });
 });
 
