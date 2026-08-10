@@ -3,10 +3,10 @@
 // error banner. Pattern cloned from kart's main.ts: walk the frozen SPAL and
 // publish every entry onto documentElement as --<kebab> (+ -rgb channels), so
 // style.css and ui/hud.css can never name a palette colour that does not
-// exist. Task C2 owns app.ts and mounts SplatApp here; until it lands, the
-// boot shows the palette splash below (a real loading screen, not a stub).
+// exist. Task C2's SplatApp (./app.js) is mounted below.
 // ============================================================================
 import { SPAL } from '@splat/shared';
+import { SplatApp } from './app.js';
 
 // snowLit -> snow-lit. SPAL keys are camelCase with no digits.
 function kebab(key: string): string {
@@ -44,13 +44,7 @@ window.addEventListener('unhandledrejection', (ev: PromiseRejectionEvent) => {
 try {
   const root = document.getElementById('app');
   if (root === null) throw new Error('missing #app element');
-  // C2 replaces this splash with `new SplatApp(root)`.
-  const splash = document.createElement('div');
-  splash.style.cssText =
-    'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;' +
-    `color:${SPAL.paper};font:600 20px/1.4 system-ui,sans-serif;letter-spacing:0.12em`;
-  splash.textContent = 'SKI SPLAT';
-  root.appendChild(splash);
+  new SplatApp(root);
 } catch (err) {
   showError(`Error: ${err instanceof Error ? err.message : String(err)}`);
 }
