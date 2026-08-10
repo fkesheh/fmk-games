@@ -51,7 +51,7 @@ import type {
   SplatRoster,
   SplatSnapshot,
 } from '@splat/shared';
-import { NET, cleanName, loadName, loadSig, saveName } from '@platform/shared';
+import { NET } from '@platform/shared';
 import type { LobbyC2S } from '@platform/shared';
 import { DriveController } from './drive.js';
 import { SplatScene } from './render/scene.js';
@@ -245,6 +245,7 @@ const WATCHDOG_MS = 200; // background-tab keepalive cadence (rAF pauses there)
 const FRAME_STALE_MS = 250; // rAF silence that wakes the watchdog
 const CORRECTION_EPS_M = 0.05; // reconciles smaller than this count as "converged"
 const SESSION_KEY = 'splat.session'; // localStorage rejoin pointer + seq watermark
+const NAME_KEY = 'splat.name'; // localStorage display name (splat-local; the shared platform identity lands separately)
 const TABLET_KEY = 'splat.tablet'; // '1'/'0' = decided; absent = auto-detect
 const LEFTY_KEY = 'splat.lefty';
 const ASSIST_KEY = 'splat.assist';
@@ -355,6 +356,28 @@ function writeFlag(key: string, on: boolean): void {
     localStorage.setItem(key, on ? '1' : '0');
   } catch {
     // storage unavailable — the toggle still works for this session
+  }
+}
+
+/** Trimmed, whitespace-collapsed, length-capped display name; 'Skier' when empty. */
+function cleanName(v: string): string {
+  return v.trim().replace(/\s+/g, ' ').slice(0, NAME_MAX_LEN) || 'Skier';
+}
+
+/** The stored display name, or '' when never typed (the input shows its placeholder). */
+function loadName(): string {
+  try {
+    return localStorage.getItem(NAME_KEY) ?? '';
+  } catch {
+    return ''; // storage blocked (private mode) reads as never-set
+  }
+}
+
+function saveName(name: string): void {
+  try {
+    localStorage.setItem(NAME_KEY, cleanName(name));
+  } catch {
+    // storage unavailable — the name still applies for this session
   }
 }
 
@@ -603,7 +626,7 @@ export class SplatApp {
     this.nameInput.maxLength = NAME_MAX_LEN;
     this.nameInput.placeholder = 'your name';
     this.nameInput.autocomplete = 'off';
-    this.nameInput.value = loadName(); // shared across every game on the platform
+    this.nameInput.value = loadName(); // '' when never typed — the placeholder shows
     this.menuEl.appendChild(this.nameInput);
 
     const menuActions = el('div', 'menu-actions');
@@ -879,13 +902,14 @@ export class SplatApp {
 
   // ---- lobby actions (game filter 'splat' on every create/join) --------------------
   /**
-   * Stamp identity on every outgoing join: `sig` always (the durable per-browser
-   * signature — @platform/shared), `resume` when a dropped splat session exists
-   * (the LAST socket's playerId — the exact rebind the room tries first).
+   * Stamp identity on every outgoing join: `resume` when a dropped splat session
+   * exists (the LAST socket's playerId — the exact rebind the room tries). The
+   * durable per-browser `sig` comes with the shared platform identity module;
+   * until that lands, `resume` alone carries the per-session rebind splat uses.
    */
   private withIdentity<T extends LobbyC2S>(msg: T): T {
     const resume = loadSession()?.playerId;
-    return resume !== undefined ? { ...msg, sig: loadSig(), resume } : { ...msg, sig: loadSig() };
+    return resume !== undefined ? { ...msg, resume } : msg;
   }
 
   private joinQuick(name: string): void {
