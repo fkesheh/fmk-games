@@ -152,6 +152,10 @@ export class SplatScene {
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    // drawCalls() telemetry must see the WHOLE frame: render() draws two
+    // passes (world + post), so info is reset once per render() instead of
+    // three's per-render() auto-reset (which would report the post pass only).
+    renderer.info.autoReset = false;
 
     this.world = new THREE.Scene();
     const fogCol = new THREE.Color(SPAL.skyHorizon); // S2: exactly the horizon stop
@@ -355,6 +359,7 @@ export class SplatScene {
   }
 
   render(): void {
+    this.renderer.info.reset(); // autoReset is off: one accumulation per FRAME
     this.renderer.render(this.world, this.camera);
     // post pass: grade + vignette quads drawn over the frame (no deps)
     this.renderer.autoClear = false;

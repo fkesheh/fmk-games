@@ -487,7 +487,7 @@ export class SplatApp {
   // ---- slope + modules (C1/R1/R2/C3/C4 via the frozen §7a seams) -------------------
   private seed = -1; // -1 = no race yet; rebuild terrain on CHANGE (rematch = new mountain)
   private slope: SlopeDef | null = null;
-  private drive: DriveController | null = null; // recreated on seed change, never on reconnect
+  private drive: DriveController | null = null; // created on join, recreated on seed change, never on reconnect
   private scene: SplatScene | null = null; // null only if WebGL construction failed
   private plants: PlantField | null = null;
   private skiers: SkierVisuals | null = null;
@@ -1016,6 +1016,16 @@ export class SplatApp {
     // the waiting screen has the world behind it. The predictor re-bases from
     // the first snapshot's you.sim (resetArmed).
     if (msg.seed !== -1 && msg.seed !== this.seed) this.rebuildSlope(msg.seed, null);
+    if (this.drive === null) {
+      // Fresh-lobby join (seed -1, no mountain yet): the predictor must still
+      // EXIST — its outbox/seq machinery is the lobby keepalive, and the
+      // server's INPUT_STALE_MS sweep evicts idle seats in any phase. A
+      // stand-in slope is enough: outside racing the server consumes-but-
+      // doesn't-integrate, resetArmed re-bases from the first snapshot's
+      // you.sim, and the first real seed rebuilds the drive (rebuildSlope
+      // carries the wire seq via seqOffset).
+      this.drive = new DriveController(genSlope(0));
+    }
     this.drive?.setAssist(this.assist);
     if (this.assist) this.send({ t: 'splat_assist', on: true }); // stored per player, never broadcast
     this.netBannerEl.classList.add('hidden');
@@ -1276,9 +1286,11 @@ export class SplatApp {
   };
 
   /** rAF pauses in background tabs: keep the sim + the input stream alive at a
-   *  slow clip (well under INPUT_STALE_MS). Never double-steps while rAF runs. */
+   *  slow clip (well under INPUT_STALE_MS). Never double-steps while rAF runs.
+   *  Every phase, like the frame loop — the lobby sweep does not care that the
+   *  tab is backgrounded. */
   private watchdog(): void {
-    if (this.screen !== 'race' || !this.joined || this.phase !== 'racing') return;
+    if (this.screen !== 'race' || !this.joined) return;
     if (performance.now() - this.lastFrame <= FRAME_STALE_MS) return;
     this.drive?.step(WATCHDOG_MS);
     this.drive?.flush(this.sendInput);
@@ -1417,11 +1429,18 @@ export class SplatApp {
     if (this.screen === 'race') {
       const drive = this.drive;
       const slope = this.slope;
-      if (this.joined && this.seated && drive !== null && slope !== null) {
-        // the pre-GO freeze: the sim integrates only while racing (the server
-        // acks but does not integrate outside it, so neither do we)
-        if (this.phase === 'racing') drive.step(dtMs);
+      // step + flush in EVERY phase (the kart pattern): outside racing the
+      // server consumes-but-doesn't-integrate (the pre-GO freeze still acks),
+      // and the steady input stream is the liveness the INPUT_STALE_MS lobby
+      // sweep looks for — a seat with no room-bound input for 10s is evicted,
+      // racing or not. The predictor's idle creep is re-based by the next
+      // snapshot's reconcile (and the countdown-entry grid wipe) before it
+      // can show on screen.
+      if (this.joined && drive !== null) {
+        drive.step(dtMs);
         drive.flush(this.sendInput);
+      }
+      if (this.joined && this.seated && drive !== null && slope !== null) {
         const s = drive.state(); // module scratch — consume, never retain
         const cx = s.x + drive.errorX(); // the visual error offset is a CAMERA
         const cz = s.z + drive.errorZ(); // channel only (drive.ts header)
