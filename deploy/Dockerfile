@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 
 # ---- build: full workspace install (devDeps included), then vite (fps + bank +
-# kart + wordbomb clients) + esbuild (platform server bundle; every @<game>/server
-# and the shared packages are inlined).
+# kart + wordbomb + rift + splat clients) + esbuild (platform server bundle; every
+# @<game>/server and the shared packages are inlined).
 FROM node:22-alpine AS build
 WORKDIR /app
 # Root devDep puppeteer must not download a browser into the build image.
@@ -25,6 +25,9 @@ COPY games/wordbomb/client/package.json games/wordbomb/client/package.json
 COPY games/rift/shared/package.json games/rift/shared/package.json
 COPY games/rift/server/package.json games/rift/server/package.json
 COPY games/rift/client/package.json games/rift/client/package.json
+COPY games/splat/shared/package.json games/splat/shared/package.json
+COPY games/splat/server/package.json games/splat/server/package.json
+COPY games/splat/client/package.json games/splat/client/package.json
 # npm install (not ci): the committed lock skews across platforms (macOS vs linux
 # optional deps) and npm versions — let the image resolve on-platform.
 RUN npm install
@@ -55,6 +58,9 @@ COPY games/wordbomb/client/package.json games/wordbomb/client/package.json
 COPY games/rift/shared/package.json games/rift/shared/package.json
 COPY games/rift/server/package.json games/rift/server/package.json
 COPY games/rift/client/package.json games/rift/client/package.json
+COPY games/splat/shared/package.json games/splat/shared/package.json
+COPY games/splat/server/package.json games/splat/server/package.json
+COPY games/splat/client/package.json games/splat/client/package.json
 RUN npm install --omit=dev
 
 # ---- runtime. Each game module resolves its clientDist as
@@ -75,6 +81,7 @@ COPY --from=build /app/games/kart/client/dist ./games/kart/client/dist
 COPY --from=build /app/games/wordbomb/client/dist ./games/wordbomb/client/dist
 COPY --from=build /app/games/wordbomb/server/data ./games/wordbomb/server/data
 COPY --from=build /app/games/rift/client/dist ./games/rift/client/dist
+COPY --from=build /app/games/splat/client/dist ./games/splat/client/dist
 USER node
 EXPOSE 8080
 CMD ["node", "platform/server/dist/server.js"]

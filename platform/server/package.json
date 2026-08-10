@@ -15,6 +15,7 @@
     "@kart/server": "0.0.0",
     "@platform/shared": "0.0.0",
     "@rift/server": "0.0.0",
+    "@splat/server": "0.0.0",
     "@wordbomb/server": "0.0.0",
     "ws": "8.21.1"
   },

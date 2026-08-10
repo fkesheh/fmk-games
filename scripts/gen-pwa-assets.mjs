@@ -20,9 +20,9 @@
 // an iPad was in a child's hands.
 //
 // Usage:
-//   node scripts/gen-pwa-assets.mjs      # regenerates all four games in place
+//   node scripts/gen-pwa-assets.mjs      # regenerates all six games in place
 //
-// SCOPE: the four GAME installs only. The launcher's own manifest and icons
+// SCOPE: the six GAME installs only. The launcher's own manifest and icons
 // (`/manifest.webmanifest`, `/icons/…`) are generated and served by
 // platform/server/src/pwa.ts — deliberately not duplicated here, because two
 // generators for one icon is how the launcher ends up with two different looks.
@@ -204,8 +204,10 @@ class Canvas {
 // ---- glyphs ----------------------------------------------------------------
 // `s` is the glyph box edge in normalised units, centred on the icon. Each
 // glyph must read at 48 CSS px on a home screen and be told apart from the
-// other four by SHAPE ALONE — a 4-year-old navigates by colour first, but two
-// games sharing a hue family must not also share a silhouette.
+// other five by SHAPE ALONE — a 4-year-old navigates by colour first, but two
+// games sharing a hue family must not also share a silhouette. RIFT's moss and
+// BANK's felt are the one such pair (both green), which is why RIFT is the only
+// lattice and BANK the only glyph built from pips.
 
 const GLYPHS = {
   /** KART — chequered flag: a 4x4 chequer block. */
@@ -262,6 +264,51 @@ const GLYPHS = {
     c.circle(fx + s * 0.32, fy - s * 0.07, s * 0.085, col.hot);
     c.circle(fx + s * 0.32, fy - s * 0.07, s * 0.04, col.light);
   },
+
+  /** ANCIENTS — the three-lane map: two ancients on opposite corners of a
+   *  square, joined by top, mid (the diagonal) and bottom lanes. No other
+   *  glyph here is a lattice, which is what keeps it apart from BANK's felt
+   *  green at 48px. */
+  rift(c, s, col) {
+    const inset = s * 0.14; // keeps the bent lanes off the glyph-box edge
+    const ax = 0.5 - s / 2 + inset; // radiant ancient, bottom-left
+    const ay = 0.5 + s / 2 - inset;
+    const bx = 0.5 + s / 2 - inset; // dire ancient, top-right
+    const by = 0.5 - s / 2 + inset;
+    const w = s * 0.075;
+    // mid lane — the diagonal, drawn first so the ancients cap it
+    c.stroke(ax, ay, bx, by, w, col.light);
+    // top lane — up the left side, then across the top
+    c.stroke(ax, ay, ax, by, w, col.light);
+    c.stroke(ax, by, bx, by, w, col.light);
+    // bottom lane — across the bottom, then up the right side
+    c.stroke(ax, ay, bx, ay, w, col.light);
+    c.stroke(bx, ay, bx, by, w, col.light);
+    // the two ancients: a dark socket so the lanes visually terminate
+    c.circle(ax, ay, s * 0.135, col.dark);
+    c.circle(ax, ay, s * 0.08, col.light);
+    c.circle(bx, by, s * 0.135, col.dark);
+    c.circle(bx, by, s * 0.08, col.light);
+  },
+
+  /** SKI SPLAT — a snow-capped race mountain with the finish pennant planted
+   *  at the summit: a filled peak (stacked strokes widening toward the base),
+   *  then the gold pole + flag. The only peaked silhouette in the set. */
+  splat(c, s, col) {
+    const apexY = 0.5 - s * 0.3;
+    const baseY = 0.5 + s * 0.34;
+    const halfW = s * 0.46; // half base width
+    const steps = 24; // stacked horizontal strokes => a solid triangle
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      const y = apexY + (baseY - apexY) * t;
+      const w = halfW * t;
+      c.stroke(0.5 - w, y, 0.5 + w, y, s * 0.035, col.light);
+    }
+    // finish pennant at the summit: pole, then flag flying right
+    c.stroke(0.5, apexY - s * 0.18, 0.5, apexY + s * 0.02, s * 0.045, col.hot);
+    c.rect(0.5 + s * 0.02, apexY - s * 0.18, s * 0.17, s * 0.1, col.hot);
+  },
 };
 
 // ---- palette + paint-guard extraction --------------------------------------
@@ -282,8 +329,8 @@ function paintGuardHex(htmlFile) {
   return m[1];
 }
 
-// ---- the four game installs (TOUCH_PWA.md §1.1) ----------------------------
-// The fifth install in §1.1 is the launcher; it lives in platform/server (T2).
+// ---- the six game installs (TOUCH_PWA.md §1.1) -----------------------------
+// The launcher install of §1.1 is separate; it lives in platform/server (T2).
 
 const GAMES = [
   {
@@ -329,6 +376,36 @@ const GAMES = [
     html: 'games/wordbomb/client/index.html',
     out: 'games/wordbomb/client/public',
     colors: { bg: 'fuse', light: 'paperLit', dark: 'ink', hot: 'boom' },
+  },
+  {
+    id: 'rift',
+    name: 'ANCIENTS',
+    shortName: 'ANCIENTS', // 8
+    // A MOBA is unplayable in portrait: the lane the camera must show is wider
+    // than it is tall, and the ability bar needs the horizontal run.
+    orientation: 'landscape',
+    glyph: 'rift',
+    palette: 'games/rift/shared/src/palette.ts',
+    html: 'games/rift/client/index.html',
+    out: 'games/rift/client/public',
+    // moss + gold ARE the launcher card's identity pair (LPAL.riftTint /
+    // LPAL.riftAccent in platform/server/src/index.ts) — one source of truth.
+    colors: { bg: 'moss', light: 'gold', dark: 'ink' },
+  },
+  {
+    id: 'splat',
+    name: 'SKI SPLAT',
+    shortName: 'SKI SPLAT', // 9
+    // A downhill course is wider than it is tall on screen; the steering lane
+    // needs the horizontal run, same argument as rift/kart.
+    orientation: 'landscape',
+    glyph: 'splat',
+    palette: 'games/splat/shared/src/palette.ts',
+    html: 'games/splat/client/index.html',
+    out: 'games/splat/client/public',
+    // skyZenith + sunGold are the launcher card's identity pair
+    // (LPAL.splatAccent; LPAL.splatTint is skyZenith deepened) — one source.
+    colors: { bg: 'skyZenith', light: 'snow', hot: 'sunGold' },
   },
 ];
 

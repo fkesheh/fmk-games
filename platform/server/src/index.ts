@@ -91,6 +91,11 @@ const LPAL = {
   wordbombTint: '#28303a', //  WPAL.slate    — WORDBOMB: dark-room slate
   riftAccent: '#d9b25f', //    APAL.gold     — ANCIENTS: ancient gold
   riftTint: '#2e3827', //      APAL.moss     — ANCIENTS: dusk moss
+  splatAccent: '#f2b72e', //   SPAL.sunGold  — SKI SPLAT: ski-race gold
+  // SPAL has no dark entry suited to a card tint (SPAL.ink is the paint guard
+  // itself), so this is skyZenith-derived: #2c5fb8 deepened into the other
+  // tints' ~20 L* band — the night piste under lights.
+  splatTint: '#1c3357', //    SPAL.skyZenith, deepened — SKI SPLAT: night piste
 
   // ---- fallback identity for a game with no launcher copy yet ----
   neutralAccent: '#9aa3ad', // PALETTE.steel
@@ -137,6 +142,12 @@ const COPY: Record<string, GameCopy | undefined> = {
       'Push lanes, last-hit for gold, raze towers. Break their Ancient before they break yours — 2v2 to 8v8, bots fill the rest.',
     tags: ['2v2–8v8', 'Bot fill'],
   },
+  splat: {
+    genre: 'Downhill ski racer',
+    blurb:
+      'Eight skiers, one 800 m slope. Carve the fall line, dodge the pines, and hit the finish gate first.',
+    tags: ['800 m slope'],
+  },
 };
 
 /**
@@ -145,7 +156,9 @@ const COPY: Record<string, GameCopy | undefined> = {
  * game linking to its /<id>/ client. Responsive down to one column; all colour
  * comes from `LPAL`.
  */
-const LAUNCHER_NAME = 'ARCADE — four browser multiplayer games';
+// The count is derived from the registry — every hand-written count on this
+// page had gone stale (the "four games" copy survived two game launches).
+const LAUNCHER_NAME = `ARCADE — ${GAMES.length} browser multiplayer games`;
 const LAUNCHER_SHORT_NAME = 'ARCADE'; // ≤ 12 chars so a home-screen label is not truncated (§1.2)
 
 /**
@@ -158,6 +171,8 @@ const IDENTITY: Record<string, PwaIdentity | undefined> = {
   bank: { accent: LPAL.bankAccent, tint: LPAL.bankTint },
   kart: { accent: LPAL.kartAccent, tint: LPAL.kartTint },
   wordbomb: { accent: LPAL.wordbombAccent, tint: LPAL.wordbombTint },
+  rift: { accent: LPAL.riftAccent, tint: LPAL.riftTint },
+  splat: { accent: LPAL.splatAccent, tint: LPAL.splatTint },
 };
 const NEUTRAL_IDENTITY: PwaIdentity = {
   accent: LPAL.neutralAccent,
@@ -172,6 +187,9 @@ const NEUTRAL_IDENTITY: PwaIdentity = {
  * the one automated run that exercises it.
  */
 function launcherHtml(modules: readonly GameModule[], registerSw: boolean): string {
+  // Names + count come from the registry, never from hand-written copy — the
+  // hardcoded "four games" / four-name strings had gone stale.
+  const names = modules.map((m) => escapeHtml(m.name)).join(' · ');
   const swScript = registerSw
     ? `    <script>
       // PWA (docs/TOUCH_PWA.md §2.0): scope '/' is the launcher's own, and the
@@ -217,8 +235,8 @@ function launcherHtml(modules: readonly GameModule[], registerSw: boolean): stri
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="dark" />
-    <meta name="description" content="Four browser multiplayer games on one server: STRICKEN, BANK, KART GP and WORDBOMB." />
-    <title>ARCADE — STRICKEN · BANK · KART GP · WORDBOMB</title>
+    <meta name="description" content="${modules.length} browser multiplayer games on one server: ${names}." />
+    <title>ARCADE — ${names}</title>
     <!-- PWA install surface (docs/TOUCH_PWA.md §1). theme-color MUST stay
          byte-equal to the page floor below (LPAL.ink) or the launch flashes.
          The apple-* tags are not decoration: display:standalone alone does NOT
@@ -239,10 +257,11 @@ function launcherHtml(modules: readonly GameModule[], registerSw: boolean): stri
         margin: 0; min-height: 100vh; display: flex; flex-direction: column;
         color: ${LPAL.paper};
         background-color: ${LPAL.ink};
-        /* Four washes, one per game, on four non-overlapping anchors — upper
-           left, upper right, mid-left flank, bottom centre — so no two tints
-           stack into mud. WORDBOMB's slate is the coolest and takes the
-           otherwise-empty mid-left band between the fps and bank pools. */
+        /* Four washes on four non-overlapping anchors — upper left, upper
+           right, mid-left flank, bottom centre — so no two tints stack into
+           mud. WORDBOMB's slate is the coolest and takes the otherwise-empty
+           mid-left band between the fps and bank pools. (Covers the four
+           original games only; rift/splat tints are not yet washed in.) */
         background-image:
           radial-gradient(90ch 52ch at 18% -12%, ${LPAL.fpsTint}2e, transparent 62%),
           radial-gradient(80ch 46ch at 84% 6%, ${LPAL.kartTint}26, transparent 60%),
@@ -278,8 +297,9 @@ function launcherHtml(modules: readonly GameModule[], registerSw: boolean): stri
         margin: 0; font-size: clamp(40px, 11vw, 82px); font-weight: 900; line-height: 0.98;
         letter-spacing: 0.18em; text-indent: 0.18em;
         color: ${LPAL.paper};
-        /* Four accents, hue-ordered hot -> cool so the sweep never doubles
-           back: WORDBOMB's saturated fuse orange leads, the two near-identical
+        /* Four accents (the original four games; rift/splat are not yet swept
+           in), hue-ordered hot -> cool so the sweep never doubles back:
+           WORDBOMB's saturated fuse orange leads, the two near-identical
            ambers (fps dusk, bank gold) are packed close in the middle so they
            read as one warm body rather than two wasted thirds, and KART's sky
            takes the long cool tail. */
@@ -296,10 +316,10 @@ function launcherHtml(modules: readonly GameModule[], registerSw: boolean): stri
       }
 
       /* ---- cards ---- */
-      /* One column when narrow. Above that, an even 2x2: with four games,
-         auto-fit settles on three columns at this max-width and orphans the
-         fourth card alone on its own row. The 760px cap keeps each card at
-         roughly the width three columns used to give it. */
+      /* One column when narrow. Above that, a two-column grid: auto-fit would
+         settle on three columns at this max-width and orphan the leftover
+         cards on their own row. The 760px cap keeps each card at roughly the
+         width three columns used to give it. */
       .grid {
         display: grid; gap: clamp(14px, 2vw, 20px);
         grid-template-columns: repeat(auto-fit, minmax(248px, 1fr));
@@ -334,10 +354,13 @@ function launcherHtml(modules: readonly GameModule[], registerSw: boolean): stri
       .card--fps { --accent: ${LPAL.fpsAccent}; --tint: ${LPAL.fpsTint}; --wash: ${LPAL.fpsTint}3d; --halo: ${LPAL.fpsAccent}2b; }
       .card--bank { --accent: ${LPAL.bankAccent}; --tint: ${LPAL.bankTint}; --wash: ${LPAL.bankTint}4d; --halo: ${LPAL.bankAccent}2b; }
       .card--kart { --accent: ${LPAL.kartAccent}; --tint: ${LPAL.kartTint}; --wash: ${LPAL.kartTint}3d; --halo: ${LPAL.kartAccent}2b; }
-      /* WORDBOMB's tint is the darkest of the four (WPAL.slate, L 19), so its
-         wash carries more alpha to land at the same visual weight. */
+      /* WORDBOMB's tint is the darkest of the original four (WPAL.slate, L 19),
+         so its wash carries more alpha to land at the same visual weight. */
       .card--wordbomb { --accent: ${LPAL.wordbombAccent}; --tint: ${LPAL.wordbombTint}; --wash: ${LPAL.wordbombTint}70; --halo: ${LPAL.wordbombAccent}2b; }
       .card--rift { --accent: ${LPAL.riftAccent}; --tint: ${LPAL.riftTint}; --wash: ${LPAL.riftTint}70; --halo: ${LPAL.riftAccent}2b; }
+      /* SKI SPLAT's tint (deepened skyZenith, L 21) sits in the same dark band
+         as slate/moss, so it takes the same high-alpha wash. */
+      .card--splat { --accent: ${LPAL.splatAccent}; --tint: ${LPAL.splatTint}; --wash: ${LPAL.splatTint}70; --halo: ${LPAL.splatAccent}2b; }
 
       .mark {
         width: 50px; height: 50px; border-radius: 13px; flex: none;
@@ -392,6 +415,19 @@ function launcherHtml(modules: readonly GameModule[], registerSw: boolean): stri
           linear-gradient(80deg, var(--accent), var(--accent));
         background-size: 26% 26%, 26% 26%, 14% 52%, 14% 52%;
         background-position: 50% 26%, 50% 26%, 30% 72%, 70% 72%;
+      }
+      /* SKI SPLAT: a race-course mountain — two slope lines meeting at the
+         summit (152deg/28deg gradient iso-lines are the steep "/" and "\"),
+         then a gold pennant planted at the peak: pole, then flag, drawn over
+         the slopes. The only peaked silhouette among the marks. */
+      .mark--splat {
+        background-image:
+          linear-gradient(152deg, transparent calc(50% - 1.3px), var(--accent) calc(50% - 1.3px) calc(50% + 1.3px), transparent calc(50% + 1.3px)),
+          linear-gradient(28deg, transparent calc(50% - 1.3px), var(--accent) calc(50% - 1.3px) calc(50% + 1.3px), transparent calc(50% + 1.3px)),
+          linear-gradient(var(--accent), var(--accent)),
+          linear-gradient(var(--accent), var(--accent));
+        background-size: 40% 58%, 40% 58%, 3.5% 22%, 14% 9%;
+        background-position: 17% 71%, 83% 71%, 50% 20%, 62% 12%;
       }
 
       .head { display: flex; flex-direction: column; gap: 3px; }
@@ -451,7 +487,7 @@ function launcherHtml(modules: readonly GameModule[], registerSw: boolean): stri
   <body>
     <div class="page">
       <header class="hero">
-        <p class="eyebrow">Four games &middot; one tab &middot; no install</p>
+        <p class="eyebrow">${modules.length} games &middot; one tab &middot; no install</p>
         <h1>ARCADE</h1>
         <hr class="rule" />
         <p class="lede">Real-time multiplayer, straight from the browser. Pick a game, grab a room, send the invite link.</p>
