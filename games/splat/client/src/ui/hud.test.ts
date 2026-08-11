@@ -70,6 +70,7 @@ class El {
   className = '';
   readonly childNodes: El[] = [];
   parentNode: El | null = null;
+  readonly attrs = new Map<string, string>();
   private text = '';
 
   /** Write counters: a write is counted only when it CHANGES the value, which
@@ -93,6 +94,33 @@ class El {
         return true;
       },
     });
+  }
+
+  setAttribute(k: string, v: string): void {
+    this.attrs.set(k, v);
+  }
+
+  // ---- element event surface: the double's stand-in for the DOM event
+  // path (no bubbling/capture is simulated — dispatch() calls only this
+  // element's own listeners). Used by the JUMP chip tests. ----------------
+  private readonly listeners = new Map<string, Array<(ev: unknown) => void>>();
+
+  addEventListener(type: string, fn: (ev: unknown) => void): void {
+    const list = this.listeners.get(type) ?? [];
+    list.push(fn);
+    this.listeners.set(type, list);
+  }
+  removeEventListener(type: string, fn: (ev: unknown) => void): void {
+    const list = this.listeners.get(type) ?? [];
+    const at = list.indexOf(fn);
+    if (at >= 0) list.splice(at, 1);
+  }
+  /** Dispatch one event to this element's listeners. */
+  dispatch(type: string, ev?: unknown): void {
+    for (const fn of [...(this.listeners.get(type) ?? [])]) fn(ev);
+  }
+  listenerCount(type: string): number {
+    return (this.listeners.get(type) ?? []).length;
   }
 
   private names(): string[] {
@@ -503,6 +531,104 @@ describe('steer hint (UX_BIBLE first 60 s: once ever, dismissible by any input)'
     expect(byClass(root, 'sh-hint')?.classList.contains('hidden')).toBe(true);
     expect(timers).toHaveLength(0); // no timer, no listeners armed
     expect(winHandlers.get('pointerdown') ?? []).toHaveLength(0);
+  });
+
+  it('extends the hint with the v2 JUMP line under the steer line', () => {
+    const { hud, root } = mk();
+    hud.showSteerHint();
+    expect(byClass(root, 'sh-hint-jump')?.textContent).toBe(
+      'SPACE / JUMP = hop — ramps send you flying!',
+    );
+    // one hint, two lines: the steer lesson is still there and the whole
+    // hint still rides the once-per-localStorage gate
+    expect(byClass(root, 'sh-hint-label')?.textContent).toBe('hold a side to steer');
+    expect(byClass(root, 'sh-hint')?.classList.contains('hidden')).toBe(false);
+    store.set('splat.hintseen', '1');
+    const { hud: hud2, root: root2 } = mk();
+    hud2.showSteerHint();
+    expect(byClass(root2, 'sh-hint')?.classList.contains('hidden')).toBe(true);
+  });
+});
+
+// ---- (6b) v2 JUMP chip ------------------------------------------------------
+
+describe('JUMP chip (UX_BIBLE §V2: one edge per press, cancel-safe)', () => {
+  function jumpBtn(root: El): El {
+    const b = byClass(root, 'sh-jump');
+    if (b === null) throw new Error('no JUMP chip in the HUD');
+    return b;
+  }
+  const press = (btn: El): void => {
+    btn.dispatch('pointerdown', { preventDefault: () => {} });
+  };
+
+  it('sits in the race HUD as a button with a sunGold-ringed arrow-up glyph', () => {
+    const { hud, root } = mk();
+    const btn = jumpBtn(root);
+    // a real <button> (keyboard/AT activation) carrying an arrow-up glyph —
+    // labelled by glyph, never colour alone (§V2.8)
+    expect(btn.tagName).toBe('button');
+    expect(byClass(root, 'sh-jump-glyph')?.textContent).toBe('↑');
+    expect(btn.attrs.get('aria-label')).toBe('Jump — hop');
+    // lobby: the whole HUD root is hidden (chip included — same as every
+    // other race chip)
+    hud.render(state({ phase: 'lobby' }));
+    expect(root.classList.contains('hidden')).toBe(true);
+    // race: the root is live and the chip with it
+    hud.render(state());
+    expect(root.classList.contains('hidden')).toBe(false);
+    expect(btn.classList.contains('hidden')).toBe(false);
+  });
+
+  it('fires the seam exactly ONCE per press — the follow-up click is consumed', () => {
+    const { hud, root } = mk();
+    const fn = vi.fn();
+    hud.onJump(fn);
+    hud.render(state());
+    const btn = jumpBtn(root);
+
+    press(btn);
+    expect(fn).toHaveBeenCalledTimes(1);
+    // a real pointer press also emits click: the same press must NOT double-fire
+    btn.dispatch('click');
+    expect(fn).toHaveBeenCalledTimes(1);
+
+    // a second press is a fresh edge
+    press(btn);
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
+
+  it('never fires for a cancelled press, and the next press still works', () => {
+    const { hud, root } = mk();
+    const fn = vi.fn();
+    hud.onJump(fn);
+    hud.render(state());
+    const btn = jumpBtn(root);
+
+    press(btn);
+    expect(fn).toHaveBeenCalledTimes(1);
+    btn.dispatch('pointercancel');
+    btn.dispatch('lostpointercapture');
+    btn.dispatch('blur');
+    expect(fn).toHaveBeenCalledTimes(1); // cancellation never fires an edge
+
+    press(btn); // the cancelled press must not have broken the chip
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
+
+  it('fires for a keyboard/AT click with no preceding pointer press', () => {
+    const { hud, root } = mk();
+    const fn = vi.fn();
+    hud.onJump(fn);
+    hud.render(state());
+    jumpBtn(root).dispatch('click');
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it('is a silent no-op before the app wires the seam', () => {
+    const { hud, root } = mk();
+    hud.render(state());
+    expect(() => press(jumpBtn(root))).not.toThrow();
   });
 });
 

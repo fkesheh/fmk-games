@@ -144,6 +144,47 @@
   background: var(--sun-gold);
 }
 
+/* --- (6b) v2 JUMP chip: round, sunGold ring + ink arrow-up on paper ------- */
+.sh-jump {
+  position: absolute;
+  /* bottom-right, ABOVE the touch zone area — never inside a steering half */
+  right: calc(18px + var(--safe-r));
+  bottom: calc(24px + clamp(84px, 16vh, 140px) + 32px + var(--safe-b));
+  width: 72px; /* >= 64 px touch target (STYLE_BIBLE §V2.8) */
+  height: 72px;
+  border-radius: 50%;
+  border: 3px solid var(--sun-gold);
+  background: var(--paper);
+  color: var(--ink);
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  /* the HUD root is pointer-events: none so it never blocks the steer zones;
+     the chip re-enables events for itself */
+  pointer-events: auto;
+  touch-action: none; /* no scroll / zoom / double-tap gestures start here */
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  box-shadow: 0 4px 18px rgba(var(--inkc), 0.35);
+  transition: transform 150ms ease;
+}
+
+.sh-jump:active {
+  /* a press always gets an answer: the chip pulses down (UX_BIBLE §V2) */
+  transform: scale(0.92);
+}
+
+.sh-jump-glyph {
+  font-size: 34px;
+  font-weight: 800;
+  line-height: 1;
+  /* optical centering: an up-arrow glyph sits a touch high in the disc */
+  transform: translateY(-1px);
+}
+
 /* --- (4) countdown overlay: 3-2-1 then GO! -------------------------------- */
 .splat-hud .sh-countdown {
   position: absolute;
@@ -268,14 +309,29 @@
   right: calc(18px + var(--safe-r));
 }
 
-.sh-hint-label {
+.sh-hint-text {
   position: absolute;
   left: 50%;
   /* above the bottom-corner thumbs, never inside them */
   bottom: calc(24px + clamp(84px, 16vh, 140px) + 40px + var(--safe-b));
   transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+.sh-hint-label {
   font-size: 16px;
   font-weight: 600;
   text-shadow: 0 1px 6px rgba(var(--inkc), 0.6);
   white-space: nowrap;
+}
+
+.sh-hint-jump {
+  /* the v2 line: sunGold, echoing the ringed JUMP chip it points at (§V2.8) */
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--sun-gold);
+  text-shadow: 0 1px 6px rgba(var(--inkc), 0.6);
 }

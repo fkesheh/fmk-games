@@ -120,6 +120,7 @@ interface SkierSnapWire {
   yaw: number;
   v: number;
   steer: number;
+  airborne: boolean;
   finished: boolean;
   finishMs: number;
   place: number;
@@ -542,7 +543,7 @@ export class SplatRoom implements GameRoomHandle {
         const prevGateIx = p.sim.lastGateIx;
         const prevBoostUntilMs = p.sim.boostUntilMs;
         const prevFinished = p.sim.finished;
-        stepSki(p.sim, inp.steer, inp.dt, slope, { assist: p.assist });
+        stepSki(p.sim, inp.steer, inp.dt, slope, { assist: p.assist, jump: inp.jump === true });
         p.simUsed += inp.dt;
         if (p.sim.lastPlantIx !== prevPlantIx || p.sim.lastPlantHitMs !== prevPlantHitMs) {
           this.broadcastEvent({
@@ -800,6 +801,7 @@ export class SplatRoom implements GameRoomHandle {
       yaw: sim.yaw,
       v: sim.v,
       steer: 0,
+      airborne: false,
       finished: false,
       finishMs: 0,
       place: slot + 1,
@@ -911,6 +913,7 @@ export class SplatRoom implements GameRoomHandle {
       s.yaw = k.yaw;
       s.v = k.v;
       s.steer = p.steer;
+      s.airborne = k.airborne;
       s.finished = k.finished;
       s.finishMs = k.finishMs;
       s.place = p.place;

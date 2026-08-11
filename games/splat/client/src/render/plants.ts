@@ -2,12 +2,17 @@
 // SKI SPLAT — PlantField (task R2, CONTRACT §7). The in-piste gameplay plants:
 // ONE InstancedMesh per kind (pine/bush/thorn), each instancing a baked
 // vertex-coloured archetype built from the STYLE_BIBLE model sheets:
-//   pine  = 3-4 stacked cones (pineDark -> pine -> pineLit) on a stub bark
-//           trunk, snowLit dust-cap cones on every tier;
-//   bush  = 2-3 squashed foliage spheres (shrub/shrubDark/shrubLit),
-//           half-buried, snowLit cap;
-//   thorn = bare angular branch cylinders radiating low (thorn/thornLit —
-//           the warm "danger" read).
+//   pine  = 5 tiers (pineDark -> pine -> pineLit) on a stub bark trunk — the
+//           LOWEST tier sags outward (the weight-of-snow droop), every tier
+//           carries TWO snow caps (flat + a smaller nested mid-shoulder one)
+//           plus the apex tip and a base dust ring, and each instance leans
+//           slightly (deterministic rot.z) so no two pines stand upright;
+//   bush  = 5 squashed foliage blobs (shrub/shrubDark/shrubLit) incl. a
+//           trailing shadow-side blob + top highlight, layered snow caps on
+//           each, and bare shrubDark twig tips poking through the snow;
+//   thorn = 9 bare angular branch cylinders radiating low (thorn/thornLit —
+//           the warm "danger" read) with kinked twigs and snowLit spheres
+//           caught in the branch crotches.
 // An InstancedMesh carries exactly one material, so each archetype is merged
 // into a single vertex-coloured geometry (all colours traced from SPAL) and
 // drawn with one shared vertexColors Lambert: 3 draw calls for every plant on
@@ -56,31 +61,57 @@ const _v = new THREE.Vector3();
 // Archetype prototypes (feet at y=0, facing arbitrary — instanced yaw varies).
 // ---------------------------------------------------------------------------
 
-/** Pine sapling: stub trunk + 4 stacked cones + snow dust caps, ~1.9 m tall. */
+/** Pine: leaner + taller — 5 tiers, the LOWEST sagging under snow; every tier
+ *  gets TWO snow caps (flat + a smaller nested one at the mid-shoulder) plus
+ *  the apex tip and a base dust ring. ~2.3 m tall. */
 function pineProto(): THREE.Group {
   const g = new THREE.Group();
-  g.add(at(cyl(mat, 0.05, 0.085, 0.42, 6, SPAL.bark), 0, 0.21, 0));
+  g.add(at(cyl(mat, 0.04, 0.07, 0.46, 6, SPAL.bark), 0, 0.23, 0));
   // [radius, height, yBase, hex] bottom -> top; hue lightens with height so the
-  // sun-lit tip reads against the darker base even before shadows land.
+  // sun-lit tip reads against the darker base even before shadows land. Radii
+  // are ~12% leaner than R1, heights stretched so the tree reads taller.
   const tiers: ReadonlyArray<readonly [number, number, number, string]> = [
-    [0.62, 0.62, 0.3, SPAL.pineDark],
-    [0.48, 0.58, 0.72, SPAL.pine],
-    [0.34, 0.52, 1.1, SPAL.pineLit],
-    [0.21, 0.44, 1.44, SPAL.pineLit],
+    [0.55, 0.6, 0.36, SPAL.pineDark],
+    [0.42, 0.58, 0.82, SPAL.pine],
+    [0.3, 0.54, 1.26, SPAL.pineLit],
+    [0.19, 0.48, 1.66, SPAL.pineLit],
   ];
   for (const [r, h, y, hex] of tiers) {
     g.add(at(cone(mat, r, h, 7, hex), 0, y + h / 2, 0));
-    // Snow dust cap: a flat snowLit cone sitting on the sloped shoulder of the
-    // tier (radius matched to the cone's taper at that height, plus a lip).
-    const f = 0.55;
-    g.add(at(cone(mat, r * (1 - f) + 0.07, 0.1, 6, SPAL.snowLit), 0, y + h * f, 0));
+    // Flat snow dust cap on the tier's shoulder (radius matched to the cone's
+    // taper at that height, plus a lip).
+    g.add(at(cone(mat, r * 0.45 + 0.07, 0.1, 6, SPAL.snowLit), 0, y + h * 0.55, 0));
+    // Nested cap at the tier's mid-shoulder: smaller and snugger against the
+    // taper, so the snow reads DEEP on every tier.
+    g.add(at(cone(mat, r * 0.32 + 0.02, 0.06, 6, SPAL.snowLit), 0, y + h * 0.68, 0));
   }
-  // Snow tip on the apex.
-  g.add(at(cone(mat, 0.09, 0.16, 5, SPAL.snowLit), 0, 1.44 + 0.44 - 0.03, 0));
+  // LOWEST tier: two drooping skirt cones — tilted ~0.25 rad outward and with
+  // their bases dropped below the first upright tier, the weight-of-snow read.
+  const droop: ReadonlyArray<readonly [number, number, number, string]> = [
+    [0.0, 0.52, 0.6, SPAL.pineDark],
+    [Math.PI * 0.92, 0.46, 0.54, SPAL.pineDark],
+  ];
+  for (const [yaw, r, h, hex] of droop) {
+    const pivot = new THREE.Group();
+    pivot.position.set(0, 0.27, 0);
+    pivot.rotation.set(0, yaw, 0);
+    const arm = new THREE.Group();
+    arm.rotation.x = 0.25; // the droop: sag outward from the trunk
+    arm.add(at(cone(mat, r, h, 7, hex), 0, h / 2, 0));
+    arm.add(at(cone(mat, r * 0.45 + 0.07, 0.1, 6, SPAL.snowLit), 0, h * 0.55, 0));
+    arm.add(at(cone(mat, r * 0.32 + 0.02, 0.06, 6, SPAL.snowLit), 0, h * 0.68, 0));
+    pivot.add(arm);
+    g.add(pivot);
+  }
+  // Snow tip on the apex + a dust ring where the skirt meets the ground.
+  g.add(at(cone(mat, 0.07, 0.18, 5, SPAL.snowLit), 0, 1.66 + 0.48 - 0.02, 0));
+  g.add(at(cone(mat, 0.5, 0.09, 6, SPAL.snowLit), 0, 0.15, 0));
   return g;
 }
 
-/** Powder bush: 3 squashed foliage spheres, half-buried, snow caps. */
+/** Powder bush: 5 squashed foliage blobs (main + side dark/lit + a trailing
+ *  shadow-side blob and a top highlight), layered snow caps on each, and bare
+ *  twig tips poking through the snow on the shadow side. */
 function bushProto(): THREE.Group {
   const g = new THREE.Group();
   const blob = (r: number, hex: string, x: number, y: number, z: number, sy: number): THREE.Mesh => {
@@ -88,32 +119,56 @@ function bushProto(): THREE.Group {
     m.scale.set(1, sy, 1);
     return at(m, x, y, z);
   };
-  g.add(blob(0.55, SPAL.shrub, 0, 0.26, 0, 0.58));
-  g.add(blob(0.42, SPAL.shrubDark, 0.38, 0.18, 0.16, 0.52));
-  g.add(blob(0.38, SPAL.shrubLit, -0.33, 0.22, -0.18, 0.58));
-  // Snow caps hugging the top of each blob.
-  g.add(blob(0.34, SPAL.snowLit, 0, 0.5, 0, 0.2));
-  g.add(blob(0.24, SPAL.snowLit, 0.38, 0.36, 0.16, 0.18));
-  g.add(blob(0.2, SPAL.snowLit, -0.33, 0.4, -0.18, 0.18));
+  g.add(blob(0.55, SPAL.shrub, 0, 0.26, 0, 0.58)); // main
+  g.add(blob(0.4, SPAL.shrubDark, 0.38, 0.18, 0.16, 0.52)); // side dark
+  g.add(blob(0.38, SPAL.shrubLit, -0.33, 0.22, -0.18, 0.58)); // side lit
+  g.add(blob(0.34, SPAL.shrubDark, -0.55, 0.12, -0.24, 0.5)); // trailing shadow-side
+  g.add(blob(0.3, SPAL.shrubLit, 0.08, 0.5, -0.22, 0.62)); // top highlight
+  // Layered snow caps on every blob: a flat cap on the blob top + a smaller
+  // nested tuft — the deep-dust read (caps sit slightly proud of the foliage).
+  const caps: ReadonlyArray<readonly [number, number, number, number]> = [
+    [0, 0, 0.579, 0.3], // main
+    [0.38, 0.16, 0.388, 0.22], // side dark
+    [-0.33, -0.18, 0.44, 0.2], // side lit
+    [-0.55, -0.24, 0.29, 0.18], // trailing
+    [0.08, -0.22, 0.686, 0.17], // top highlight
+  ];
+  for (const [x, z, top, cr] of caps) {
+    g.add(blob(cr, SPAL.snowLit, x, top - 0.02, z, 0.32));
+    g.add(blob(cr * 0.55, SPAL.snowLit, x, top - 0.02 + cr * 0.32, z, 0.3));
+  }
+  // Exposed twig tips on the shadow side, poking through the snow.
+  const twig = (x: number, y: number, z: number, rx: number, rz: number): THREE.Mesh => {
+    const t = at(cyl(mat, 0.015, 0.03, 0.2, 4, SPAL.shrubDark), x, y, z);
+    t.rotation.set(rx, 0, rz);
+    return t;
+  };
+  g.add(twig(-0.52, 0.28, -0.24, 0.4, -0.45));
+  g.add(twig(-0.34, 0.36, -0.12, -0.35, 0.4));
+  g.add(twig(0.34, 0.26, 0.18, 0.5, 0.35));
   return g;
 }
 
-/** Thorn thicket: bare angular branches radiating low, warm danger hue. */
+/** Thorn thicket: 9 bare angular branches radiating low (warm danger hue),
+ *  each with a kinked twig, and snowLit spheres caught in the branch crotches. */
 function thornProto(): THREE.Group {
   const g = new THREE.Group();
   g.add(at(cyl(mat, 0.06, 0.1, 0.2, 6, SPAL.bark), 0, 0.1, 0));
-  // [yaw, outward tilt (rad), length, hex] — fixed asymmetric fan; per-instance
-  // yaw rotation at build time gives each thicket its own silhouette.
-  const branches: ReadonlyArray<readonly [number, number, number, string]> = [
-    [0.0, 0.5, 1.15, SPAL.thorn],
-    [0.9, 0.85, 0.95, SPAL.thornLit],
-    [1.8, 0.62, 1.25, SPAL.thorn],
-    [2.7, 0.95, 0.85, SPAL.thorn],
-    [3.6, 0.55, 1.1, SPAL.thornLit],
-    [4.5, 0.8, 1.0, SPAL.thorn],
-    [5.4, 0.42, 1.3, SPAL.thornLit],
+  // [yaw, outward tilt (rad), length, hex, twig bend (rad)] — a fixed
+  // asymmetric fan; per-instance yaw rotation gives each thicket its own
+  // silhouette. Twig bends alternate so no two branches kink alike.
+  const branches: ReadonlyArray<readonly [number, number, number, string, number]> = [
+    [0.0, 0.5, 1.15, SPAL.thorn, -0.7],
+    [0.9, 0.85, 0.95, SPAL.thornLit, -0.45],
+    [1.8, 0.62, 1.25, SPAL.thorn, 0.6],
+    [2.7, 0.95, 0.85, SPAL.thorn, -0.8],
+    [3.6, 0.55, 1.1, SPAL.thornLit, 0.5],
+    [4.5, 0.8, 1.0, SPAL.thorn, -0.55],
+    [5.4, 0.42, 1.3, SPAL.thornLit, 0.65],
+    [0.55, 0.68, 1.05, SPAL.thorn, -0.6],
+    [2.15, 0.5, 1.2, SPAL.thornLit, 0.45],
   ];
-  for (const [yaw, tilt, len, hex] of branches) {
+  for (const [yaw, tilt, len, hex, bend] of branches) {
     const pivot = new THREE.Group();
     pivot.rotation.set(0, yaw, 0);
     const arm = new THREE.Group();
@@ -121,14 +176,27 @@ function thornProto(): THREE.Group {
     arm.add(at(cyl(mat, 0.03, 0.08, len, 5, hex), 0, len / 2, 0));
     // One kinked twig near the tip — the angular "nasty" read.
     const twig = at(cyl(mat, 0.02, 0.05, len * 0.45, 4, hex), 0, len * 0.86, 0);
-    twig.rotation.x = -0.7;
+    twig.rotation.x = bend;
     arm.add(twig);
     pivot.add(arm);
     g.add(pivot);
   }
-  // A little caught snow at the branch bases.
-  g.add(at(sphere(mat, 0.09, 6, SPAL.snowLit), 0.14, 0.06, 0.1));
-  g.add(at(sphere(mat, 0.07, 6, SPAL.snowLit), -0.12, 0.05, -0.08));
+  // Snow caught in the branch crotches: tiny spheres where branches fork —
+  // two in twig crotches (matching branches 0 and 3), one at the base fan.
+  const forks: ReadonlyArray<readonly [number, number, number, number]> = [
+    [0.0, 0.5, 1.15, 0.8],
+    [2.7, 0.95, 0.85, 0.8],
+  ];
+  for (const [yaw, tilt, len, f] of forks) {
+    const pivot = new THREE.Group();
+    pivot.rotation.set(0, yaw, 0);
+    const arm = new THREE.Group();
+    arm.rotation.x = tilt;
+    arm.add(at(sphere(mat, 0.06, 6, SPAL.snowLit), 0, len * f, 0));
+    pivot.add(arm);
+    g.add(pivot);
+  }
+  g.add(at(sphere(mat, 0.07, 6, SPAL.snowLit), 0.13, 0.06, 0.09));
   return g;
 }
 
@@ -220,6 +288,7 @@ interface KindField {
   readonly py: Float32Array;
   readonly pz: Float32Array;
   readonly rot: Float32Array; // base yaw per instance
+  readonly lean: Float32Array; // base tilt per instance (pines only — rot.z)
   readonly scl: Float32Array; // base uniform scale per instance
   readonly band: Int32Array; // instance -> z band
   readonly bandStart: Int32Array; // band -> first instance (instances z-sorted)
@@ -280,6 +349,7 @@ export class PlantField {
       const py = new Float32Array(count);
       const pz = new Float32Array(count);
       const rot = new Float32Array(count);
+      const lean = new Float32Array(count);
       const scl = new Float32Array(count);
       const band = new Int32Array(count);
       let maxBand = 0;
@@ -292,6 +362,9 @@ export class PlantField {
         pz[i] = p.z;
         py[i] = slope.height(p.x, p.z) - sink[kind];
         rot[i] = next() * TAU;
+        // Pines lean slightly (deterministic rot.z, max ~0.06 rad) so no two
+        // stand bolt-upright; bushes/thorns stay level.
+        lean[i] = kind === 'pine' ? (next() * 2 - 1) * 0.06 : 0;
         scl[i] = scaleLo[kind] + next() * (scaleHi[kind] - scaleLo[kind]);
         const b = Math.floor(p.z / PLANT_BAND_M);
         band[i] = b;
@@ -314,6 +387,7 @@ export class PlantField {
         py,
         pz,
         rot,
+        lean,
         scl,
         band,
         bandStart,
@@ -333,7 +407,7 @@ export class PlantField {
     if (hide) {
       _m.makeScale(0, 0, 0);
     } else {
-      _e.set(jitter, f.rot[i] ?? 0, jitter * 0.7);
+      _e.set(jitter, f.rot[i] ?? 0, (f.lean[i] ?? 0) + jitter * 0.7);
       _m.makeRotationFromEuler(_e);
       const s = f.scl[i] ?? 1;
       _v.set(s, s * squashY, s);

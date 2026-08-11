@@ -107,6 +107,9 @@ export class DriveController {
   // external input latch (setInput) — debug/e2e; merged additively, NOT ramped
   private extSteer = 0;
 
+  // v2 JUMP: one-shot latch — true until the next tick consumes it
+  private jumpQueued = false;
+
   // the value that goes on the wire: merged raw steer, assist-EMA'd when on.
   // Also the skis/camera-roll visual (steerVisual()).
   private steerVis = 0;
@@ -161,6 +164,7 @@ export class DriveController {
     this.keyRamp = 0;
     this.touchRamp = 0;
     this.steerVis = 0;
+    this.jumpQueued = false;
     this.errX = 0;
     this.errZ = 0;
     this.errClamped = 0;
@@ -175,6 +179,16 @@ export class DriveController {
    *  clamped. */
   setInput(steer: number): void {
     this.extSteer = Number.isFinite(steer) ? clamp(steer, -1, 1) : 0;
+  }
+
+  /**
+   * v2 JUMP: one-shot latch — the NEXT produced input message carries
+   * `jump: true`, then the latch clears. Press = ONE edge; the sim cooldown
+   * owns cadence. Called by keyboard (Space / ArrowUp), the HUD JUMP button,
+   * and the debug surface (window.__splat.setJump).
+   */
+  setJump(): void {
+    this.jumpQueued = true;
   }
 
   /**
@@ -329,13 +343,16 @@ export class DriveController {
     // 4. ONE allocation per sim tick — the outbox retains the message until
     //    flush(), so it can never be a reused scratch object. The wire seq
     //    rides into the predictor so reconcile's ackSeq drops the right entries.
+    const jump = this.jumpQueued;
+    this.jumpQueued = false;
     const msg: SplatInputMsg = {
       t: 'splat_input',
       seq: ++this.seq,
       steer,
       dt: SIM_DT,
+      jump,
     };
-    this.pred.push({ seq: msg.seq, steer, dt: SIM_DT }); // applied NOW
+    this.pred.push({ seq: msg.seq, steer, dt: SIM_DT, jump }); // applied NOW
     if (this.outbox.length >= OUTBOX_CAP) this.outbox.shift(); // socket away: drop oldest
     this.outbox.push(msg);
   }
@@ -343,6 +360,7 @@ export class DriveController {
   private clearHeld(): void {
     this.keyLeft = false;
     this.keyRight = false;
+    this.jumpQueued = false; // blur-clearing the latch is safest — it'll be re-pressed
     this.touch.clear(); // a thumb can never stay latched across a focus loss
   }
 
@@ -360,6 +378,7 @@ export class DriveController {
     switch (e.code) {
       case 'ArrowLeft': case 'KeyA': this.keyLeft = true; break;
       case 'ArrowRight': case 'KeyD': this.keyRight = true; break;
+      case 'Space': case 'ArrowUp': this.setJump(); break;
       default: return; // not a game key — leave the event alone
     }
     e.preventDefault(); // game keys never scroll/navigate the page
