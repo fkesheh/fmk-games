@@ -5,8 +5,9 @@
 //
 // Terrain: h(x,z) = SUMMIT_LIFT - GRADE_BASE*z + the three frozen undulation
 // octaves (config.ts), phases from rng(seed). The octaves' worst-case downhill
-// gradient (0.057+0.057) stays under GRADE_BASE-GRADE_MIN = 0.13, so the
-// fall-line grade is >= ~0.096 everywhere by construction. gradeAt projects
+// gradient (0.057+0.057) stays under GRADE_BASE-GRADE_MIN = 0.18 (0.26-0.08),
+// so the fall-line grade is >= ~0.146 everywhere by construction (gauntlet:
+// the old 0.13/0.096 comment was stale pre-tune leftovers). gradeAt projects
 // the analytic gradient onto the heading (yaw 0 = +Z fall line) and clamps to
 // GRADE_MIN — the clamp is the contract safety net for near-traverse headings
 // (a true traverse IS flat; the clamp, not the undulation, owns that case).

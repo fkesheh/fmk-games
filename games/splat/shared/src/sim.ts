@@ -193,16 +193,20 @@ export function copySim(dst: SkierSim, src: Readonly<SkierSim>): void {
   dst.finishMs = src.finishMs;
 }
 
-/** v2 shared helper (CONTRACT §11.2): height ABOVE the terrain a skier is
- *  flying at, from the closed-form arc — 0 when grounded. The client adds it
- *  to slope.height(x, z) for the camera eye and skier rendering; the sim uses
- *  it for the landing test. Pure + deterministic; both peers compute the same
- *  number from the same fields. */
-export function airHeight(s: Readonly<SkierSim>): number {
+/** v2 shared helper (CONTRACT §11.2, gauntlet-corrected): the height ABOVE
+ *  THE CURRENT TERRAIN the skier is flying at — 0 when grounded. The skier's
+ *  world-space y is airStartY + arc (arc = airVy*t - 0.5*G_ACCEL*t*t) while
+ *  airborne; the terrain below is slope.height(x, z), so the visible air is
+ *  the difference, clamped at 0. The client adds it to slope.height(x, z)
+ *  for the camera eye and skier rendering; the sim's landing test uses the
+ *  same world frame (airStartY + arc <= slope.height). Pure + deterministic;
+ *  both peers compute the same number from the same fields. */
+export function airHeight(s: Readonly<SkierSim>, x: number, z: number, slope: SlopeDef): number {
   if (!s.airborne) return 0;
   const t = (s.simMs - s.airStartMs) / 1000;
-  const arc = s.airVy * t - 0.5 * G_ACCEL * t * t;
-  return arc > 0 ? arc : 0;
+  const worldY = s.airStartY + s.airVy * t - 0.5 * G_ACCEL * t * t;
+  const h = worldY - slope.height(x, z);
+  return h > 0 ? h : 0;
 }
 
 /**

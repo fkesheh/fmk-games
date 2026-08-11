@@ -178,7 +178,9 @@ sees a bump, not a cliff.
   each) parked in a ring ~450–520 m out, `fog:false`, tinted
   `skyHorizon`→`paper` with `snowShade` undersides — they must sit IN the
   haze, not pop. Static (no per-frame motion; the run is 40 s, drift would
-  cost the draw-call budget).
+  cost the draw-call budget). ALL puffs BAKE into one merged geometry per
+  material via `bake()` (gauntlet: no per-puff draw calls — the whole cloud
+  layer is ≤ 2 calls).
 - **Sun disc:** a small warm `sunWarm` disc at the SUN_DIR azimuth, low in
   the sky, ringed by the existing glow blob — the light reads directional
   from a real source.

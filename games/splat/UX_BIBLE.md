@@ -99,5 +99,10 @@ avoid those", and read the results screen without help.
   (predicted, local); landing → dip + thump + land burst same frame; remote
   jumps ≤ 150 ms via the snap's airborne flag. Nothing about jumping is ever
   a penalty state — no wobble, no shame.
+- **Cooldown-denied (gauntlet):** pressing JUMP while the 1.8 s cooldown
+  holds must still get an answer — a quiet denied thud (a low filtered
+  version of the land thud at ~0.5 gain) + the chip pulses once (150 ms
+  scale-down tween). A 4-year-old who presses twice sees the button answer,
+  never silence.
 - **Assist mode:** jump works identically; assist never auto-jumps (the
   player's own hands).

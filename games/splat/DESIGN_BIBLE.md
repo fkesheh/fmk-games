@@ -9,9 +9,11 @@ This document states design INTENT. Balance numbers live in
 
 ## Pillars
 
-1. **Two inputs, ever.** Left and right. Gravity is the throttle; steering IS
-   the speed control — point down the fall line to accelerate, carve across it
-   to scrub speed. No brake, no jump, no trick button (SPLAT D6, load-bearing).
+1. **Two inputs, ever — plus a JUMP (v2).** Left and right are the steering
+   verbs; gravity is the throttle; steering IS the speed control. The v2 JUMP
+   button (Space/↑ or the JUMP chip) is a tactical hop — never a trick, never
+   a stun, always a safe landing. (v1 said "no jump"; v2 adds it as a dodge
+   that clears plants only while airborne.)
 2. **Plants are the whole opponent.** The slope is planted with saplings,
    bushes and thorn thickets. Touching one slows you — never stops you, never
    crashes you. The race is won by the cleanest line through the green.
@@ -75,7 +77,7 @@ identical minus the reading — both are playing the same game.
 - **Assist mode** (per player, invisible to others): input smoothing, plant hit
   radius ×0.8, snare duration ×0.75, edge pushback ×1.4. Never announced.
 
-## Non-goals (v1)
+## Non-goals (v1/v2)
 
-Teams, items, jumps/tricks, paint/territory, ghosts, leaderboards, persistence,
-chat, bots. Multiplayer is humans in a room, 2–8.
+Teams, items, tricks, paint/territory, ghosts, leaderboards, persistence,
+chat, bots. (Jumps ARE in — v2.) Multiplayer is humans in a room, 2–8.

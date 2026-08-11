@@ -539,7 +539,9 @@ amendment wins for the v2 feature surface ONLY; everything else stands.
   anchored). `validateSlope` asserts the kicker placement laws (11.3).
 - **New sim fields:** `airborne`, `airStartMs`, `airVy`, `airStartY`,
   `lastKickerIx` on `SkierSim` (11.2). `copySim`/`makeSim`/`resetSim` cover
-  them. New pure helper `airHeight(s): number` (shared/sim.ts).
+  them. New pure helper `airHeight(s, x, z, slope): number` (shared/sim.ts —
+  height above the CURRENT terrain; import via the deep path
+  `@splat/shared/sim.js`).
 - **New seam methods** (additive only — §7a signatures stand):
   - `scene.setAirborne(on: boolean): void` — camera air pose (FOV/shake/pitch)
   - `scene.land(): void` — landing dip spring + soft flash (plantHit stays)
@@ -571,15 +573,21 @@ airStartY=0, lastKickerIx=-1`. `copySim` copies all five.
 **Arc (world-space, deterministic — both peers compute identically):**
 
 ```
-t     = (simMs - airStartMs) / 1000        // sim seconds since launch
-arcH  = airVy * t - 0.5 * G_ACCEL * t * t  // height ABOVE the launch point
-airHeight(s) = airborne ? max(0, arcH) : 0 // the shared visual helper
+t      = (simMs - airStartMs) / 1000         // sim seconds since launch
+arc    = airVy * t - 0.5 * G_ACCEL * t * t   // height ABOVE THE LAUNCH POINT
+worldY = airStartY + arc                     // the skier's world-space y
+airHeight(s, x, z, slope) = airborne ? max(0, worldY - slope.height(x, z)) : 0
 ```
 
-The skier's RENDERED height is `slope.height(x, z) + airHeight(s)` (the app
-computes it; the camera takes y already including air). LANDING is when the
-world-space arc returns to the terrain: `airStartY + arcH <= slope.height(x,z)`
-OR `t >= J_MAX_AIRTIME_S` (the no-stuck guarantee — landing is always eventual).
+(GAUNTLET-CORRECTED: the pre-gauntlet draft said `slope.height(x,z) +
+airHeight` with `airHeight` launch-relative — wrong on a descending piste,
+the skier rendered underground. The helper measures height above the CURRENT
+terrain; the RENDERED eye/skier y is `slope.height(x, z) + airHeight(...)`,
+and the landing test uses `worldY` directly. On a 15° slope the piste drops
+~0.26·v m/s under the flight — the tuning note in config.ts and the empirical
+verification in docs/splat-v2/prototype-v2.mts account for it: hop apex
+~1.5–2.5 m above the snow at race speed, kicker apex ~3–5 m, flights
+30–50 m, always land, always contained.)
 
 **stepSki, v2 order** (the exact insertion points into §6):
 
@@ -597,21 +605,26 @@ OR `t >= J_MAX_AIRTIME_S` (the no-stuck guarantee — landing is always eventual
 6. **Jump state machine** (runs at the END of the step, on the post-motion
    position — so launches use `prevZ < k.z <= s.z` exactly like gates):
    - If `s.airborne`:
-     - compute `t`, `arcH`; if `airStartY + arcH <= slope.height(s.x, s.z)`
-       or `t >= J_MAX_AIRTIME_S`: **LAND** — `airborne=false, airVy=0`,
+     - compute `t`, `worldY`; if `worldY <= slope.height(s.x, s.z)` or
+       `t >= J_MAX_AIRTIME_S`: **LAND** — `airborne=false, airVy=0`,
        `s.v = max(MIN_SPEED, s.v * J_LAND_SPEED_MUL)`. (A plant at the landing
        spot snare-checks NEXT step as grounded — one tick later, imperceptible.)
-   - Else (grounded) and `simMs - airStartMs >= J_COOLDOWN_MS`:
-     - **Kicker scan** (ascending z, from `lastKickerIx+1`, same loop shape as
-       gates): for the first kicker with `prevZ < k.z <= s.z`:
-       `lastKickerIx = ix` (consumed on ANY crossing — a ramp cleared mid-air
-       never re-launches you after landing); if `|s.x - k.x| <= k.halfWidth`:
-       **LAUNCH** — `airborne=true, airVy = J_KICKER_VY_BASE +
-       J_KICKER_VY_SPEED * s.v, airStartMs = simMs, airStartY =
-       slope.height(s.x, s.z)`; break.
-     - **Manual hop** (only if still grounded): if `opts.jump === true`:
-       **LAUNCH** with `airVy = J_HOP_VY` (same field writes). A hop and a
-       kicker on the same step: the kicker wins (checked first).
+   - **Kicker scan — runs EVERY step, airborne or grounded** (GAUNTLET-
+     CORRECTED): ascending z, from `lastKickerIx+1`, the same loop shape as
+     gates: for the first kicker with `prevZ < k.z <= s.z`: `lastKickerIx =
+     ix` (consumed on ANY crossing — a ramp cleared mid-air is consumed and
+     can never re-launch you after landing; a hop that carries you over a
+     kicker wastes it — timing is the skill); if GROUNDED AND `simMs -
+     airStartMs >= J_COOLDOWN_MS` AND `|s.x - k.x| <= k.halfWidth`: **LAUNCH**
+     — `airborne=true, airVy = J_KICKER_VY_BASE + J_KICKER_VY_SPEED * s.v,
+     airStartMs = simMs, airStartY = slope.height(s.x, s.z)`; break.
+   - **Manual hop** (only if still grounded AND off cooldown AND not launched
+     this step): if `opts.jump === true`: **LAUNCH** with `airVy =
+     J_HOP_VY` (same field writes). A hop and a kicker on the same step: the
+     kicker wins (checked first).
+   - **Cooldown-denied feedback** (UX_BIBLE §V2): a jump press while the
+     cooldown holds is a silent no-op in the sim; the CLIENT plays a quiet
+     denied thud + button pulse (the app reads the sim state).
 7. Finish (unchanged; crossing `finishZ` in the air finishes — fly across the
    line).
 
@@ -623,6 +636,13 @@ simMs, position, fields) and `slope.height` — the SAME code the client
 predicts with. `SkiPredictor.push`/`reconcile` replay the `jump` edge exactly
 like steer (the pending queue entry stores it). `SkiInput` and `SkiStepOpts`
 gain optional `jump?: boolean`.
+
+**Containment (gauntlet-verified empirically, docs/splat-v2/prototype-v2.mts):**
+max lateral displacement while airborne is bounded by the air-steer damping
+(0.35×) + the soft-edge curvature (which applies in air) — a full-lock skier
+who launches stays within ~3.5 m of the piste edge and always lands/finishes.
+The v2 4-year-old test (P1v2 unit + E2Ev2) re-verifies this on 20 seeds each
+run — it is a GATE, not an assertion.
 
 **The 4-year-old law, v2:** a full-lock skier who hits kickers launches and
 lands safely (scrub, damped steer, edges push back) — still finishes. Jumps
@@ -636,7 +656,9 @@ centreline the slalom gates use: `z = KICKER_Z0 + i*KICKER_SPACING +
 jitter(±KICKER_Z_JITTER)` (clamped inside the planted zone, clear of both
 clear zones), `x` = corridor centreline at that band ± `KICKER_X_JITTER` —
 so a corridor-following skier rides them and a full-lock skier may cross them
-(safe). `validateSlope` asserts, on every generated slope:
+(safe). `validateSlope` asserts, on every generated slope (GAUNTLET-CLARIFIED:
+centreline membership is guaranteed by construction in genSlope — the
+validator does NOT need to re-check it, only the four laws below):
 - kickers strictly ascending z; none in `START_CLEAR` or `FINISH_CLEAR`;
 - every kicker fully on-piste (`|x| + halfWidth <= width/2 - 1`);
 - no plant within `KICKER_PLANT_CLEAR` of a kicker's (x, z) — the launch and
@@ -688,7 +710,9 @@ implementer edits them.
   damping, `airHeight` helper shape.
 - P2v2 unit: kicker placement laws (11.3) on 20 seeds.
 - E2E v2: `setJump()` makes `state().sim.airborne` true then false; remotes
-  see the airborne flag; screenshots: jump mid-air, kicker close-up, landing,
-  plus the §9.6 set. Draw calls still < 80. Snapshot still ≤ 2 KB (the wire
-  grew one bool + one optional edge — assert the size budget still holds at
-  8 players).
+  see the airborne flag; **a full-lock skier with `startRace(seed)` finishes
+  on the generated slope WITH kickers present** (the v2 4-year-old gate —
+  assert `state().sim.finished` or hard-cap-with-progress); screenshots:
+  jump mid-air, kicker close-up, landing, plus the §9.6 set. Draw calls
+  still < 80. Snapshot still ≤ 2 KB (the wire grew one bool + one optional
+  edge — assert the size budget still holds at 8 players).
