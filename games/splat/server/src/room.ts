@@ -12,7 +12,10 @@
 //     (resolveSkiPair) — server-only, one fact about the bump;
 //   * plant hits are detected by diffing (lastPlantIx, lastPlantHitMs) between
 //     steps (the sim.ts header convention: a hit is the only writer of the
-//     pair) and broadcast as `splat_event plant_hit`; finishing is detected the
+//     pair) and broadcast as `splat_event plant_hit`; slalom gate passes are
+//     detected the same way on (lastGateIx, boostUntilMs) — an advance WITH a
+//     boostUntilMs change is a clean pass (`splat_event gate`), an advance
+//     alone is a miss and emits nothing; finishing is detected the
 //     same way on `finished` and broadcast as `splat_event finished`;
 //   * each snapshot echoes `you.lastProcessedSeq` + `you.sim` so the client can
 //     re-base its predictor and replay unacknowledged inputs.
@@ -505,7 +508,11 @@ export class SplatRoom implements GameRoomHandle {
    * PLANT-HIT DETECTION (sim.ts header convention): a hit is the only writer
    * of the (lastPlantIx, lastPlantHitMs) pair — a diff between steps means a
    * new hit, and the room emits `splat_event plant_hit` with the sim's fresh
-   * position. Finishing is detected the same way on `finished`.
+   * position. GATE DETECTION is the same pattern on (lastGateIx,
+   * boostUntilMs): an advance WITH a boostUntilMs change is a clean pass
+   * (`splat_event gate`); an advance alone is a miss and emits NOTHING (a
+   * missed gate is gone — no circling back). Finishing is detected the same
+   * way on `finished`.
    */
   private tickPlayer(p: Player, now: number): void {
     if (!p.connected) return; // ghost: frozen, never simulated as an active racer
@@ -532,6 +539,8 @@ export class SplatRoom implements GameRoomHandle {
         p.steer = inp.steer;
         const prevPlantIx = p.sim.lastPlantIx;
         const prevPlantHitMs = p.sim.lastPlantHitMs;
+        const prevGateIx = p.sim.lastGateIx;
+        const prevBoostUntilMs = p.sim.boostUntilMs;
         const prevFinished = p.sim.finished;
         stepSki(p.sim, inp.steer, inp.dt, slope, { assist: p.assist });
         p.simUsed += inp.dt;
@@ -540,6 +549,18 @@ export class SplatRoom implements GameRoomHandle {
             t: 'plant_hit',
             id: p.id,
             plantIx: p.sim.lastPlantIx,
+            x: p.sim.x,
+            z: p.sim.z,
+          });
+        }
+        // Gate diff (sim.ts header convention): lastGateIx advancing WITH a
+        // boostUntilMs change is a clean pass; advancing alone is a miss and
+        // emits nothing.
+        if (p.sim.lastGateIx !== prevGateIx && p.sim.boostUntilMs !== prevBoostUntilMs) {
+          this.broadcastEvent({
+            t: 'gate',
+            id: p.id,
+            gateIx: p.sim.lastGateIx,
             x: p.sim.x,
             z: p.sim.z,
           });

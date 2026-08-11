@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ASSIST_SNARE_MUL,
   COUNTDOWN_MS,
+  GATE_BOOST_MS,
   MAX_PLAYERS,
   MIN_PLAYERS,
   PLANT_SNARE_MS,
@@ -642,6 +643,84 @@ describe('SplatRoom plant hits + assist', () => {
     expect(JSON.stringify(ioOn.lastSnap('p1'))).not.toContain('assist');
     expect(JSON.stringify(ioOn.lastSnap('p2'))).not.toContain('assist');
     expect(ioOn.events('p2').every((e) => !JSON.stringify(e).includes('assist'))).toBe(true);
+    room.stop();
+  });
+});
+
+describe('SplatRoom slalom gates', () => {
+  it('emits splat_event gate on a clean pass, and NOTHING when the next gate is missed', () => {
+    const io = new FakeIO();
+    const { room, slope, drivers } = setupRace(io, ['p1', 'p2'], 42);
+    const d = drivers[0]!;
+    const gates = slope.gates;
+    expect(gates.length).toBeGreaterThanOrEqual(2); // setup guard: pass + miss targets
+
+    // ---- clean pass: pull away from the parked grid, then thread gate 0 ----
+    const g0 = gates[0]!;
+    for (let i = 0; i < 30; i++) {
+      d.send(room, 0); // straight down first: no resolveSkiPair contact with p2
+      tick();
+    }
+    let ev: Extract<SplatEvent, { t: 'gate' }> | null = null;
+    for (let i = 0; i < 2500 && ev === null; i++) {
+      const prevBoost = d.twin.boostUntilMs;
+      d.send(room, steerToward(d.twin, g0.x, g0.z));
+      if (d.twin.lastGateIx >= 0 && d.twin.boostUntilMs === prevBoost) {
+        throw new Error(`twin MISSED gate 0 at (${d.twin.x.toFixed(1)},${d.twin.z.toFixed(1)})`);
+      }
+      tick();
+      const hits = eventsOfKind(io, 'p1', 'gate');
+      if (hits.length > 0) ev = hits[0]!;
+    }
+    expect(ev, 'a gate event arrives').not.toBeNull();
+    const pass = ev as unknown as Extract<SplatEvent, { t: 'gate' }>;
+    expect(eventsOfKind(io, 'p1', 'gate').length).toBe(1); // exactly one
+    expect(pass.id).toBe('p1');
+    // the room detected the SAME pass the twin recorded (lastGateIx advanced
+    // AND boostUntilMs changed, atomically)
+    expect(d.twin.lastGateIx).toBe(0);
+    expect(pass.gateIx).toBe(0);
+    expect(Number.isFinite(pass.x)).toBe(true);
+    expect(Number.isFinite(pass.z)).toBe(true);
+    expect(Math.abs(pass.x - g0.x)).toBeLessThanOrEqual(g0.halfWidth + 1e-9);
+    expect(pass.z).toBeGreaterThanOrEqual(g0.z); // crossing step: prevZ < g.z <= newZ
+    expect(eventsOfKind(io, 'p2', 'gate').length).toBe(1); // broadcast to everyone
+
+    // the boost window applies in sim ms: exactly GATE_BOOST_MS past the sim
+    // clock (no further inputs are consumed, so the snapshot sits at the pass)
+    settle();
+    const simAtPass = io.lastSnap('p1').you.sim;
+    expect(simAtPass.lastGateIx).toBe(0);
+    expect(simAtPass.boostUntilMs - simAtPass.simMs).toBeCloseTo(GATE_BOOST_MS, 6);
+
+    // ---- miss: drive past the NEXT gate outside its opening ----------------
+    const g1 = gates[1]!;
+    const dir = g1.x >= 0 ? -1 : 1; // toward the piste centre: stays on-piste
+    const missX = g1.x + dir * (g1.halfWidth + 3);
+    const boostBefore = d.twin.boostUntilMs;
+    let crossed = false;
+    for (let i = 0; i < 2500 && !crossed; i++) {
+      d.send(room, steerToward(d.twin, missX, g1.z));
+      tick();
+      if (d.twin.lastGateIx >= 1) crossed = true;
+    }
+    expect(crossed, 'the twin reaches gate 1').toBe(true);
+    // the twin crossed it as a MISS (lastGateIx advanced, boost untouched)...
+    expect(d.twin.lastGateIx).toBe(1);
+    expect(d.twin.boostUntilMs).toBe(boostBefore);
+    // ...and the room emitted NOTHING for it — still exactly one gate event
+    expect(eventsOfKind(io, 'p1', 'gate').length).toBe(1);
+    expect(eventsOfKind(io, 'p2', 'gate').length).toBe(1);
+
+    // the skier keeps racing normally after the miss
+    drive(room, [d], 60);
+    settle();
+    const after = io.lastSnap('p1');
+    expect(after.phase).toBe('racing');
+    expect(after.you.sim.finished).toBe(false);
+    expect(after.you.sim.lastGateIx).toBe(1); // the miss is still consumed server-side
+    expect(after.you.sim.z).toBeGreaterThan(g1.z);
+    expect(eventsOfKind(io, 'p1', 'gate').length).toBe(1);
     room.stop();
   });
 });

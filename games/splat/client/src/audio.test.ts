@@ -26,6 +26,8 @@ describe('SplatAudio — headless no-op', () => {
       a.sfx('go', { distance: 30 });
       a.sfx('finish', { distance: -5 });
       a.sfx('sting', {});
+      a.sfx('whoosh');
+      a.sfx('whoosh', { distance: 45 });
     }).not.toThrow();
   });
 });
@@ -202,7 +204,9 @@ describe('SplatAudio — with a stubbed AudioContext (fake gesture)', () => {
         a.sfx('go');
         a.sfx('finish');
         a.sfx('sting');
+        a.sfx('whoosh');
         a.sfx('rustle', { distance: 30 });
+        a.sfx('whoosh', { distance: 30 }); // a distant rival's gate pass, attenuated
       }).not.toThrow();
       // one-shots actually scheduled nodes (rustle = 1 burst + 1 beep, etc.)
       expect(fake.sources.length + fake.oscillators).toBeGreaterThan(before);
@@ -218,6 +222,27 @@ describe('SplatAudio — with a stubbed AudioContext (fake gesture)', () => {
       const nodesBefore = fake.sources.length + fake.oscillators;
       expect(() => a.sfx('go')).not.toThrow();
       expect(fake.sources.length + fake.oscillators).toBe(nodesBefore);
+    } finally {
+      uninstallFakeContext();
+    }
+  });
+
+  it('whoosh: two layered noise bursts, both filters swept UP (airy, no thud)', () => {
+    installFakeContext();
+    try {
+      const a = new SplatAudio();
+      a.resume();
+      const fake = created(); // the context resume() constructed
+      a.sfx('whoosh');
+      // two burst layers -> two sources, no oscillators (a pass is all air)
+      expect(fake.sources.length).toBe(2);
+      expect(fake.oscillators).toBe(0);
+      // both bands end ABOVE their start (setValueAtTime then a ramp up):
+      // the inverse of rustle's falling band — the "clean pass" read
+      const finals = fake.filters.map((f) => f.frequency.value).sort((x, y) => x - y);
+      expect(finals).toEqual([3400, 5200]);
+      const types = fake.filters.map((f) => f.type).sort();
+      expect(types).toEqual(['bandpass', 'highpass']);
     } finally {
       uninstallFakeContext();
     }

@@ -160,15 +160,15 @@ all three splat packages. No implementer creates or edits these.
     phaseEndsAt; playerCount; minPlayers; canStart;
     you: { lastProcessedSeq; sim: SkierSim };
     players: SkierSnap[] }              // racers, INCLUDING the recipient
-| { t: 'splat_event'; ev: SplatEvent }  // plant_hit | finished | player_left
+| { t: 'splat_event'; ev: SplatEvent }  // plant_hit | gate | finished | player_left
 ```
 
 `SkierSnap` carries `slot` but NOT name/color/glyph — the client maps
-slot → identity from the roster (bandwidth law). `plantIx` ALWAYS indexes
-`SlopeDef.plants` (R2 precomputes the per-kind instance remap at build).
-Places are computed server-side each tick (finished by finishMs, racing by z,
-ties by slot). Wire objects are pooled and mutated in place, bound once per
-recipient (the kart pattern).
+slot → identity from the roster (bandwidth law). `plantIx`/`gateIx` ALWAYS
+index `SlopeDef.plants`/`SlopeDef.gates` (R2 precomputes the per-kind
+instance remap at build). Places are computed server-side each tick (finished
+by finishMs, racing by z, ties by slot). Wire objects are pooled and mutated
+in place, bound once per recipient (the kart pattern).
 
 ## §6 The sim (frozen semantics — body is P1's)
 
@@ -205,6 +205,16 @@ recipient (the kart pattern).
   acceleration grows quadratically with depth
   (× `ASSIST_EDGE_MUL` when assisting), curving a full-lock skier back
   inside. No wall, no stop.
+- **Slalom gates (server + prediction, same code):** `slope.gates` is
+  ascending-z. When the skier's z crosses gate `ix`'s z this step
+  (`prevZ < g.z ≤ newZ`), `ix > lastGateIx`, AND `|x - g.x| ≤ g.halfWidth`:
+  `v = min(v + GATE_BOOST_V, current cap)`, `boostUntilMs = simMs +
+  GATE_BOOST_MS`, `lastGateIx = ix`; the SERVER emits `gate { id, gateIx,
+  x, z }`. While `simMs < boostUntilMs` the speed cap is GATE_BOOST_MAX
+  instead of MAX_SPEED (the snare half-cap still wins if both apply: cap =
+  min(half-cap, boost-cap)). Crossing OUTSIDE the opening still advances
+  `lastGateIx` (a missed gate is gone — no circling back), grants nothing.
+  Gates never interact with plants' rearm/immunity.
 - **Skier-skier (server only, `resolveSkiPair`):** soft pairwise push apart,
   momentum kept, never a disable.
 - **Finish:** `z ≥ finishZ` → `finished = true`, `finishMs = simMs`, sim

@@ -19,12 +19,21 @@ export interface Plant {
   readonly kind: PlantKind;
 }
 
+/** A slalom flag checkpoint. Crossing its z within |x - gate.x| <= halfWidth
+ *  grants a speed boost (sim ms window); missing costs nothing. */
+export interface Gate {
+  readonly x: number;        // centreline of the opening
+  readonly z: number;
+  readonly halfWidth: number;
+}
+
 export interface SlopeDef {
   readonly seed: number;
   readonly length: number;
   readonly width: number;
   readonly finishZ: number;
   readonly plants: readonly Plant[];
+  readonly gates: readonly Gate[];   // ascending z, deterministic from seed
   /** Terrain height at (x,z). Analytic, deterministic. */
   height(x: number, z: number): number;
   /** Downhill grade along `heading` at (x,z). Always >= GRADE_MIN. */
@@ -65,6 +74,8 @@ export interface SkierSim {
   snareUntilMs: number;         // sim ms; max speed halved while simMs < this
   lastPlantIx: number;          // -1 = none (indexes SlopeDef.plants)
   lastPlantHitMs: number;       // sim ms; drives rearm + PLANT_IMMUNITY_MS
+  lastGateIx: number;           // -1 = none (indexes SlopeDef.gates)
+  boostUntilMs: number;         // sim ms; v cap = GATE_BOOST_MAX while simMs < this
   finished: boolean;
   finishMs: number;             // simMs at the moment of finishing, 0 while racing
 }
@@ -86,6 +97,8 @@ export interface SkierSnap {
 
 export type SplatEvent =
   | { readonly t: 'plant_hit'; readonly id: string; readonly plantIx: number;
+      readonly x: number; readonly z: number }
+  | { readonly t: 'gate'; readonly id: string; readonly gateIx: number;
       readonly x: number; readonly z: number }
   | { readonly t: 'finished'; readonly id: string; readonly place: number;
       readonly finishMs: number }

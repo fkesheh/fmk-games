@@ -53,8 +53,13 @@ identical minus the reading — both are playing the same game.
 
 ## Balance targets (config numbers are checkable against these)
 
-- **Run duration:** median descent 35–55 s at 8 players. Hard cap: results 45 s
-  after the first finisher, or 150 s total.
+- **Run duration:** median descent 35–55 s at 8 players (steeper v2 tuning:
+  ~15° base grade, terminal ≈ 22.6 m/s, clean run ≈ 40 s). Hard cap: results
+  45 s after the first finisher, or 150 s total.
+- **Slalom gates:** ~15 per run, ~50 m apart. Each pass grants +2.5 m/s and a
+  2.5 s raised cap — threading every gate saves roughly 3–5 s over a clean
+  gateless run. Missing a gate costs NOTHING (the no-fail law): gates are
+  pure upside, the adult's threading game layered on the plant-dodging.
 - **Plant cost:** one plant touch costs ~0.7–1.2 s of race time (speed scrub +
   snare window). Three clean seconds beats three plants every time.
 - **Density:** at full density a straight fall-line run hits 3–6 plants;

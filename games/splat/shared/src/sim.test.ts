@@ -15,6 +15,10 @@ import {
   CARVE_SCRUB,
   DRAG,
   EDGE_ZONE,
+  GATE_BOOST_MAX,
+  GATE_BOOST_MS,
+  GATE_BOOST_V,
+  GATE_HALF_WIDTH,
   G_ACCEL,
   GRADE_BASE,
   GRADE_MIN,
@@ -41,7 +45,11 @@ import {
   SkiPredictor,
   stepSki,
 } from './sim.js';
-import type { Plant, SkierSim, SlopeDef } from './types.js';
+import type { Gate, Plant, SkierSim, SlopeDef } from './types.js';
+
+// The shared tsconfig is lib-pure (no DOM, no node types) but vitest provides
+// console at runtime; declare the one method these tests log measurements with.
+declare const console: { log(...args: unknown[]): void };
 
 // ---- fixtures ---------------------------------------------------------------
 
@@ -50,6 +58,7 @@ interface FixtureOpts {
   readonly width?: number;
   readonly length?: number;
   readonly plants?: readonly Plant[];
+  readonly gates?: readonly Gate[];
 }
 
 /** A plain SlopeDef: constant (or scripted) grade, band-hashed plants. */
@@ -71,6 +80,7 @@ function makeFixtureSlope(o: FixtureOpts = {}): SlopeDef {
     width,
     finishZ: length,
     plants,
+    gates: o.gates ?? [],
     height: (_x, z) => -GRADE_BASE * z,
     gradeAt:
       typeof grade === 'function'
@@ -82,6 +92,10 @@ function makeFixtureSlope(o: FixtureOpts = {}): SlopeDef {
 
 function plantAt(x: number, z: number, kind: 'pine' | 'bush' | 'thorn' = 'pine'): Plant {
   return { x, z, r: PLANT_RADIUS[kind], kind };
+}
+
+function gateAt(x: number, z: number): Gate {
+  return { x, z, halfWidth: GATE_HALF_WIDTH };
 }
 
 /** Step `s` for `steps` fixed SIM_DT inputs of `steer`. */
@@ -102,6 +116,8 @@ describe('makeSim / resetSim / copySim', () => {
     expect(s.lastPlantIx).toBe(-1);
     // both plant gates pass immediately: 0 - lastPlantHitMs >= PLANT_REARM_MS
     expect(-s.lastPlantHitMs).toBeGreaterThanOrEqual(PLANT_REARM_MS);
+    expect(s.lastGateIx).toBe(-1); // no gate crossed yet
+    expect(s.boostUntilMs).toBe(0); // no boost window open
     expect(s.finished).toBe(false);
     expect(s.finishMs).toBe(0);
   });
@@ -129,7 +145,10 @@ describe('makeSim / resetSim / copySim', () => {
 describe('determinism', () => {
   it('same (steer, dt) sequence twice -> bit-identical final state', () => {
     const next = rng(12345);
-    const slope = makeFixtureSlope({ plants: [plantAt(0.4, 60), plantAt(-1, 220)] });
+    const slope = makeFixtureSlope({
+      plants: [plantAt(0.4, 60), plantAt(-1, 220)],
+      gates: [gateAt(0, 120), gateAt(-5, 300)], // gates in the replay path too
+    });
     const inputs = Array.from({ length: 500 }, () => ({
       steer: next() * 2 - 1,
       dt: SIM_DT * (0.5 + next()), // dt varies: any equal dt is exact
@@ -198,16 +217,17 @@ describe('never-stops / NaN-free', () => {
 describe('gravity + drag', () => {
   it('a straight fall-line run approaches but never exceeds terminal velocity', () => {
     const slope = makeFixtureSlope(); // constant GRADE_BASE
-    const vt = Math.sqrt((G_ACCEL * GRADE_BASE) / DRAG); // analytic v* = 18.5 m/s
+    const vt = Math.sqrt((G_ACCEL * GRADE_BASE) / DRAG); // analytic v* ~= 22.6 m/s
     const s = makeSim(0, 0, 0);
     let maxV = 0;
     for (let i = 0; i < Math.round(60 / SIM_DT); i++) {
       stepSki(s, 0, SIM_DT, slope);
       maxV = Math.max(maxV, s.v);
     }
+    console.log(`[sim] clean-run terminal velocity: ${maxV.toFixed(3)} m/s (analytic ${vt.toFixed(3)})`);
     expect(maxV).toBeLessThanOrEqual(vt + 1e-9); // explicit Euler never overshoots v*
     expect(s.v).toBeGreaterThan(vt * 0.99); // ...and converges onto it
-    expect(s.v).toBeLessThanOrEqual(MAX_SPEED);
+    expect(s.v).toBeLessThanOrEqual(MAX_SPEED); // unboosted cap holds (26 > v*)
   });
 
   it('carving across the fall line is strictly slower than straight', () => {
@@ -224,23 +244,37 @@ describe('gravity + drag', () => {
 // ---- yaw soft-clamp: the 4-year-old test ---------------------------------------
 
 describe('yaw soft-clamp (full-lock never donuts)', () => {
-  it.each([1, -1])('full lock %i for 60 s: yaw bounded, z never decreases, then finishes', (lock) => {
+  it.each([1, -1])('full lock %i for 60 s: yaw bounded, near-monotone descent, then finishes', (lock) => {
     const slope = makeFixtureSlope(); // 800 m, width 56, no plants
     const s = makeSim(0, 0, 0);
     let maxAbsYaw = 0;
-    let prevZ = s.z;
+    let highZ = s.z;
+    let maxBackDrift = 0;
+    let lastBackwardMs = 0;
     for (let i = 0; i < Math.round(60 / SIM_DT); i++) {
       stepSki(s, lock, SIM_DT, slope);
       maxAbsYaw = Math.max(maxAbsYaw, Math.abs(s.yaw));
-      expect(s.z).toBeGreaterThanOrEqual(prevZ - 1e-9); // always descending
-      prevZ = s.z;
+      if (s.z < highZ - 1e-12) lastBackwardMs = s.simMs;
+      highZ = Math.max(highZ, s.z);
+      maxBackDrift = Math.max(maxBackDrift, highZ - s.z);
     }
     expect(maxAbsYaw).toBeLessThan(YAW_MAX + 0.25); // spring-bounded, no spin-out
+    // Retune note (GRADE_BASE 0.26 / DRAG 0.005 / MAX_SPEED 26 /
+    // TURN_RATE_MIN 0.95): the full-lock yaw equilibrium now sits a hair
+    // past traverse (measured 1.5736 rad vs pi/2 = 1.5708) at the START of
+    // the run, before rising speed pulls turnRate down — so the old
+    // per-step "z never decreases" assertion no longer holds. The contract
+    // guarantee (CONTRACT §6: "spirals out and rejoins the descent, never
+    // donuts") does: the backward transient is millimetric and confined to
+    // the first seconds of the run.
+    expect(maxBackDrift).toBeLessThan(0.05); // measured 0.0085 m
+    expect(lastBackwardMs).toBeLessThan(10_000); // measured ~2.7 s
     // keep holding the lock: the skier spirals back and finishes the 800 m
     for (let i = 0; i < Math.round(240 / SIM_DT) && !s.finished; i++) {
       stepSki(s, lock, SIM_DT, slope);
     }
     expect(s.finished).toBe(true);
+    console.log(`[sim] full-lock ${lock} finish: ${(s.finishMs / 1000).toFixed(1)} s`);
   });
 });
 
@@ -399,6 +433,120 @@ describe('plant contact', () => {
     const slope = makeFixtureSlope({ plants: [plantAt(0, HIT_Z)] });
     const { post } = runToHit(slope, true);
     expect(post.snareUntilMs).toBeCloseTo(post.simMs + PLANT_SNARE_MS * ASSIST_SNARE_MUL, 12);
+  });
+});
+
+// ---- slalom gates ------------------------------------------------------------------
+
+describe('slalom gates', () => {
+  // One gate on the fall line at z = 60: a straight runner crosses at
+  // v ~= 15 m/s, so GATE_BOOST_V lands unclamped by the base cap.
+  const GATE_Z = 60;
+
+  function runToGate(slope: SlopeDef): { pre: SkierSim; post: SkierSim } {
+    const s = makeSim(0, 0, 0);
+    let pre = makeSim(0, 0, 0);
+    for (let i = 0; i < Math.round(30 / SIM_DT); i++) {
+      copySim(pre, s);
+      stepSki(s, 0, SIM_DT, slope);
+      if (s.lastGateIx !== -1) return { pre, post: s };
+    }
+    throw new Error('fixture bug: never crossed the gate');
+  }
+
+  it('a clean pass grants exactly GATE_BOOST_V and opens the boost window atomically', () => {
+    const slope = makeFixtureSlope({ gates: [gateAt(0, GATE_Z)] });
+    const { pre, post } = runToGate(slope);
+    // Replicate §6 for this step: gravity, no scrub at steer 0, base-cap clamp,
+    // then the boost clamped by the current cap (MAX_SPEED — not binding here).
+    let vExpect = pre.v + (G_ACCEL * GRADE_BASE - DRAG * pre.v * pre.v) * SIM_DT;
+    vExpect = Math.min(Math.max(vExpect, MIN_SPEED), MAX_SPEED);
+    vExpect = Math.min(vExpect + GATE_BOOST_V, MAX_SPEED);
+    expect(post.v).toBeCloseTo(vExpect, 12);
+    expect(post.v).toBeGreaterThan(pre.v); // an actual gain, not just a clamp
+    expect(post.lastGateIx).toBe(0);
+    // the pair is written together — the server's pass signal (sim.ts header)
+    expect(post.boostUntilMs).toBeCloseTo(post.simMs + GATE_BOOST_MS, 12);
+    // gates never fire plant logic
+    expect(post.lastPlantIx).toBe(-1);
+    expect(post.lastPlantHitMs).toBe(-PLANT_REARM_MS);
+    expect(post.snareUntilMs).toBe(0);
+  });
+
+  it('while boosted the cap is GATE_BOOST_MAX; on expiry MAX_SPEED returns', () => {
+    const slope = makeFixtureSlope({ gates: [gateAt(0, GATE_Z)] });
+    const { post: s } = runToGate(slope);
+    s.v = GATE_BOOST_MAX - 1; // above MAX_SPEED, inside the boost window
+    stepSki(s, 0, SIM_DT, slope);
+    expect(s.v).toBeGreaterThan(MAX_SPEED); // the base cap no longer binds
+    expect(s.v).toBeLessThanOrEqual(GATE_BOOST_MAX + 1e-9);
+    s.simMs = s.boostUntilMs; // window expired
+    stepSki(s, 0, SIM_DT, slope);
+    expect(s.v).toBeLessThanOrEqual(MAX_SPEED + 1e-9);
+  });
+
+  it('crossing OUTSIDE the opening advances lastGateIx with no boost', () => {
+    const slope = makeFixtureSlope({ gates: [gateAt(10, GATE_Z)] }); // 10 m off the line
+    const { pre, post } = runToGate(slope);
+    let vExpect = pre.v + (G_ACCEL * GRADE_BASE - DRAG * pre.v * pre.v) * SIM_DT;
+    vExpect = Math.min(Math.max(vExpect, MIN_SPEED), MAX_SPEED);
+    expect(post.v).toBeCloseTo(vExpect, 12); // untouched by the gate
+    expect(post.lastGateIx).toBe(0); // still consumed...
+    expect(post.boostUntilMs).toBe(0); // ...but the pair write did NOT happen
+  });
+
+  it('a missed gate cannot be re-taken by circling back over its z', () => {
+    const slope = makeFixtureSlope({ gates: [gateAt(10, GATE_Z)] });
+    const { post: s } = runToGate(slope); // straight runner misses the x=10 gate
+    expect(s.lastGateIx).toBe(0);
+    expect(s.boostUntilMs).toBe(0);
+    // White-box rewind: park just above the gate, dead centre of its opening.
+    // Without the lastGateIx guard this second crossing would grant the boost.
+    s.x = 10;
+    s.z = GATE_Z - 0.5;
+    s.v = MIN_SPEED;
+    run(s, slope, 0, Math.round(3 / SIM_DT));
+    expect(s.z).toBeGreaterThan(GATE_Z); // sanity: really re-crossed the z
+    expect(s.lastGateIx).toBe(0); // gate 0 is gone forever
+    expect(s.boostUntilMs).toBe(0); // no boost from the re-crossing
+  });
+
+  it('the snare half-cap wins over the boost cap (cap = min of the two)', () => {
+    const slope = makeFixtureSlope({ gates: [gateAt(0, GATE_Z)] });
+    const { post: s } = runToGate(slope); // boosted
+    s.snareUntilMs = s.simMs + 10_000; // ...and now also snared
+    s.v = MAX_SPEED / 2 + 5; // above the half cap, below both boost/base caps
+    stepSki(s, 0, SIM_DT, slope);
+    expect(s.v).toBeLessThanOrEqual(MAX_SPEED / 2 + 1e-9); // snare wins, not GATE_BOOST_MAX
+    expect(s.simMs).toBeLessThan(s.boostUntilMs); // boost window still open
+  });
+
+  it('a pass DURING a snare boosts only up to the half cap', () => {
+    const slope = makeFixtureSlope({ gates: [gateAt(0, GATE_Z)] });
+    const s = makeSim(0, 0, 0);
+    s.snareUntilMs = 60_000; // snared from the start (simMs = 0)
+    s.x = 0;
+    s.z = GATE_Z - 0.2;
+    s.v = MAX_SPEED / 2 - 1;
+    stepSki(s, 0, SIM_DT, slope); // crosses the gate, snare active
+    expect(s.lastGateIx).toBe(0);
+    expect(s.boostUntilMs).toBeCloseTo(s.simMs + GATE_BOOST_MS, 12); // window still granted
+    expect(s.v).toBeLessThanOrEqual(MAX_SPEED / 2 + 1e-9); // but the half cap clamps the gain
+  });
+
+  it('plant immunity does not block a gate pass (gates and plants never interact)', () => {
+    // Plant at 60, gate 3 m below: the crossing lands well inside the 400 ms
+    // immunity window at approach speed (~15 m/s -> ~0.2 s), yet the gate
+    // must still grant its boost.
+    const slope = makeFixtureSlope({
+      plants: [plantAt(0, GATE_Z)],
+      gates: [gateAt(0, GATE_Z + 3)],
+    });
+    const s = makeSim(0, 0, 0);
+    run(s, slope, 0, Math.round(30 / SIM_DT));
+    expect(s.lastPlantIx).toBe(0); // the plant hit happened...
+    expect(s.lastGateIx).toBe(0); // ...and so did the gate pass
+    expect(s.boostUntilMs).toBeGreaterThan(0);
   });
 });
 

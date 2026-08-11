@@ -13,7 +13,16 @@
 // The debug surface (games/splat/client/src/app.ts):
 //   state()     -> {phase ('menu' outside a room), seated, slot, place,
 //                   sim: {x,z,yaw,v,simMs,snareUntilMs,lastPlantIx,
-//                   lastPlantHitMs,finished,finishMs} | null,
+//                   lastPlantHitMs,lastGateIx,boostUntilMs,finished,
+//                   finishMs} | null,
+//                   (lastGateIx/boostUntilMs = the §6 slalom-gate fields:
+//                   crossing gate ix ALWAYS writes lastGateIx; a clean pass
+//                   additionally writes boostUntilMs = simMs + 2500 in the
+//                   same step, so a pass = lastGateIx advancing WITH
+//                   boostUntilMs changing, and boostUntilMs > 0 at any sample
+//                   proves a pass has happened. While boosted the speed cap
+//                   is 30, not MAX_SPEED 26 — so v > 26 is an independent,
+//                   sampling-race-prone boost signal.)
 //                   code, canStart}        (NO player count — the race-screen
 //                   census here is telemetry().remotes, the lobby's is the
 //                   .player-chip DOM list)
@@ -52,10 +61,12 @@
 //
 // SWIFTSHADER NOTE (CONTRACT §9.5): the client frame loop clamps dt
 // (MAX_FRAME_DT_MS 250, wire dt clamped to SIM_DT_MAX 1/15), so under software
-// GL the sim can run slower than wall clock. A clean 800m run is ~47 sim-s;
-// the wall budget below is generous (the server's own RACE_HARD_CAP_MS is
-// 150s wall, RACE_FIRST_FINISH_GRACE_MS 45s wall). The 4-YEAR-OLD TEST (B
-// holds full lock from GO, never changes it) therefore accepts finish OR
+// GL the sim can run slower than wall clock. After the speed retune a clean
+// 800m run is ~40 sim-s (terminal ~22.6 m/s at GRADE_BASE, was ~18.5); a
+// full-lock run lands ~86 sim-s on flat fixtures. The wall budget below is
+// generous (the server's own RACE_HARD_CAP_MS is 150s wall,
+// RACE_FIRST_FINISH_GRACE_MS 45s wall). The 4-YEAR-OLD TEST (B holds full
+// lock from GO, never changes it) therefore accepts finish OR
 // hard-cap-with-progress (z > 300 and still moving over the last 10s of
 // racing) and reports B's outcome honestly.
 //
@@ -685,6 +696,65 @@ async function main() {
   }, 30000, 'A mid-descent at speed (z > 80, v > 12)').catch(() => null);
   await shot(A, 'splat-descent.png');
 
+  // -- slalom gates: hold A on the fall line until a pass is observed ----------------------
+  // CONTRACT §6: slope.gates (~14, ascending z); crossing within the opening
+  // grants +2.5 m/s and a 2.5s raised cap (GATE_BOOST_MAX 30 vs MAX_SPEED 26);
+  // a miss costs nothing but still advances lastGateIx. Verified at authoring
+  // time against @splat/shared genSlope(42)+stepSki: the fall line from slot 0
+  // (x=-4.5) threads seed-42 gates ix 3 (z≈212) and ix 4 (z≈266) by ~16 sim-s,
+  // so A holds steer 0 here until a pass lands (or z=320, just past gate ix 5).
+  // This window must run BEFORE the steering-legs check: those locks displace
+  // A ~20 m off the corridor, where no seed-42 gate opening sits.
+  // Signals (strongest first): lastGateIx advancing WITH boostUntilMs changing
+  // (a threaded gate — boostUntilMs is written by passes only, so > 0 at any
+  // sample is race-free proof a pass happened); v > 26 as the independent
+  // fallback when the debug sim does not carry the gate fields (the boost cap
+  // is the only way past MAX_SPEED — but the v>26 window can be < 0.5 sim-s,
+  // so a slow poll can miss it).
+  let maxV = 0;
+  const gate = { fieldsLive: false, advances: 0, passes: 0, boostEver: false, boostVSeen: false, lastIx: -1, lastBoostMs: 0 };
+  const sampleGates = (sim) => {
+    if (sim === null) return;
+    maxV = Math.max(maxV, sim.v);
+    if (typeof sim.lastGateIx === 'number' && typeof sim.boostUntilMs === 'number') {
+      gate.fieldsLive = true;
+      if (sim.boostUntilMs > 0) gate.boostEver = true; // only a pass ever writes boostUntilMs
+      if (sim.lastGateIx > gate.lastIx) {
+        gate.advances += sim.lastGateIx - gate.lastIx; // crossings consumed, hit or miss
+        if (sim.boostUntilMs !== gate.lastBoostMs) gate.passes++; // boost written = threaded gate
+        gate.lastIx = sim.lastGateIx;
+        gate.lastBoostMs = sim.boostUntilMs;
+      }
+    }
+    if (sim.v > 26) gate.boostVSeen = true; // past MAX_SPEED: only the boost cap allows this
+  };
+  const gateWatchT0 = Date.now();
+  let gateWatchWhy = 'wall deadline';
+  while (Date.now() - gateWatchT0 < 120000) {
+    const sa = await splatState(A);
+    const sim = ownSim(sa);
+    if (sim !== null) {
+      sampleGates(sim);
+      if (gate.passes > 0 || gate.boostEver || gate.boostVSeen) {
+        gateWatchWhy = 'pass observed';
+        break;
+      }
+      if (sim.finished === true || sim.z >= 320) {
+        gateWatchWhy = sim.finished === true ? 'finished' : `z=${sim.z.toFixed(0)} (past gate ix 5, no pass seen)`;
+        break;
+      }
+    }
+    if (sa !== null && sa.phase === 'results') {
+      gateWatchWhy = 'results phase';
+      break;
+    }
+    await sleep(150);
+  }
+  console.log(
+    `gate watch: ${gateWatchWhy} — advances=${gate.advances} passes=${gate.passes} ` +
+      `boostEver=${gate.boostEver} v>26=${gate.boostVSeen} maxV=${maxV.toFixed(1)} fieldsLive=${gate.fieldsLive}`,
+  );
+
   // -- steering sign (frozen convention) --------------------------------------------------
   // setInput(-1) = full screen-RIGHT: yaw goes negative, x DECREASES.
   // setInput(+1) = full screen-LEFT: x increases. Each leg: hold the lock until
@@ -733,7 +803,6 @@ async function main() {
   let plantHits = 0;
   let lastPlantIx = -1;
   let vAtFirstHit = null;
-  let maxV = 0;
   let plantShotDone = false;
   let gateShotDone = false;
   let aFinishedSim = null;
@@ -747,7 +816,7 @@ async function main() {
     const simA = ownSim(sa);
     const simB = ownSim(sb);
     if (simA !== null) {
-      maxV = Math.max(maxV, simA.v);
+      sampleGates(simA); // maxV + slalom-gate signals keep accumulating to the finish
       if (simA.lastPlantIx !== lastPlantIx) {
         if (typeof simA.lastPlantIx === 'number' && simA.lastPlantIx >= 0) {
           plantHits++;
@@ -793,6 +862,30 @@ async function main() {
     aFinishedSim !== null
       ? `finishMs=${(aFinishedSim.finishMs / 1000).toFixed(1)}s sim, place=${aStateAfter?.place}, wall=${((aFinishAt - goAt) / 1000).toFixed(0)}s after GO`
       : 'A never finished inside the server hard cap (150s)',
+  );
+
+  // -- slalom gates + the speed retune (CONTRACT §6; signals gathered from GO on) --------
+  // What 10a proves when the gate fields are live: the seed-42 slope's gates
+  // are consumed by the shared sim on BOTH peers (server authoritative sim AND
+  // client prediction expose the same lastGateIx/boostUntilMs through the
+  // debug surface), A's fall line genuinely crossed gates (advances), and at
+  // least one crossing was INSIDE the opening (pass: boostUntilMs written —
+  // the +2.5 m/s and the raised 30 m/s cap ride the same field). It does NOT
+  // prove the server's splat_event{gate} broadcast (not on the debug surface)
+  // or the exact boost magnitude. Fallback when the fields are absent (client
+  // surface mid-flight): v > 26 — physically impossible without the boost cap.
+  const gatePassProven = gate.passes > 0 || gate.boostEver;
+  check(
+    '10a. slalom gates: A threads at least one seed-42 gate — a pass sets the boost (sim.lastGateIx advancing WITH boostUntilMs written)',
+    gate.fieldsLive ? gatePassProven : gate.boostVSeen,
+    gate.fieldsLive
+      ? `crossings=${gate.advances} passes=${gate.passes} boostUntilMs>0 seen=${gate.boostEver} v>26 seen=${gate.boostVSeen}`
+      : `debug sim carries NO lastGateIx/boostUntilMs (client gate surface mid-flight?) — fallback signal only: v>26 seen=${gate.boostVSeen}, maxV=${maxV.toFixed(1)} m/s`,
+  );
+  check(
+    "10b. speed retune: a clean section of A's run reaches v >= 20 m/s (impossible at the old ~18.5 m/s terminal)",
+    maxV >= 20,
+    `maxV over A's run=${maxV.toFixed(1)} m/s (terminal now ~22.6 at GRADE_BASE, cap 26, boost cap 30)`,
   );
 
   // -- results + the 4-YEAR-OLD TEST (CONTRACT §9.5) ---------------------------------------

@@ -20,6 +20,13 @@
 // band) is laid from gate to finish and every plant covering it is nudged
 // aside — the connected >= PLANT_CORRIDOR_M plant-free corridor exists by
 // CONSTRUCTION, so validateSlope's sweep/DP always passes on generated slopes.
+//
+// Slalom gates: GATE_COUNT flags, one per GATE_SPACING_M (z jitter +-
+// GATE_JITTER_M, seeded) from GATE_FIRST_Z to the finish clear zone. Each
+// gate's x starts on the woven corridor centreline (+- GATE_X_JITTER) and
+// snaps to the nearest plant-free centre position of its band — the same
+// free-interval machinery validateSlope sweeps — so a corridor-following
+// skier can thread every gate, and the whole opening stays on-piste.
 // ============================================================================
 
 import { rng, rngInt, rngRange } from '@platform/shared';
@@ -27,6 +34,10 @@ import {
   CORRIDOR_MAX_SHIFT_M,
   FINISH_CLEAR,
   FINISH_Z,
+  GATE_FIRST_Z,
+  GATE_HALF_WIDTH,
+  GATE_JITTER_M,
+  GATE_SPACING_M,
   GRADE_BASE,
   GRADE_MIN,
   PLANT_BAND_M,
@@ -50,7 +61,7 @@ import {
   UND_LONG_2_LEN,
   YAW_MAX,
 } from './config.js';
-import type { Plant, PlantKind, SlopeDef } from './types.js';
+import type { Gate, Plant, PlantKind, SlopeDef } from './types.js';
 
 const TAU = Math.PI * 2;
 const SUMMIT_LIFT = 6; // metres; keeps height(x, 0) a pleasant positive summit
@@ -66,6 +77,10 @@ const CORRIDOR_EPS = 0.05; // repair clearance margin beyond the bare minimum
 const WEAVE_MAX = 20; // corridor centreline lateral bound (m)
 const WEAVE_STEP = 3; // centreline max shift per band (< CORRIDOR_MAX_SHIFT_M)
 const BAND_COUNT = Math.ceil(FINISH_Z / PLANT_BAND_M);
+// Gates: ~14 per run, first after the learning zone, last clear of the sprint.
+const GATE_COUNT = Math.floor((FINISH_Z - FINISH_CLEAR - GATE_FIRST_Z) / GATE_SPACING_M);
+const GATE_X_JITTER = 6; // gates sit on/within ~6 m of the corridor centreline
+const GATE_X_MAX = HALF_W - 1 - GATE_HALF_WIDTH; // the whole opening stays on-piste
 
 /** Mutable while building; frozen into readonly Plant[] at the end. */
 interface MutablePlant {
@@ -75,7 +90,8 @@ interface MutablePlant {
   readonly kind: PlantKind;
 }
 
-interface Interval {
+/** A free x-range; exported so tests can read bandFreeIntervals results. */
+export interface Interval {
   lo: number;
   hi: number;
 }
@@ -184,16 +200,28 @@ function intersectIntervals(a: readonly Interval[], b: readonly Interval[]): Int
  * neighbouring bands count too (their discs cross the band boundary), matching
  * the sim's plantGrid(k-1..k+1) query window.
  */
-function bandFreeIntervals(s: SlopeDef, band: number, halfW: number): Interval[] {
+function gridFreeIntervals(
+  plantGrid: (zBand: number) => readonly Plant[],
+  band: number,
+  halfW: number,
+): Interval[] {
   let free: Interval[] = [{ lo: -halfW, hi: halfW }];
   for (let j = band - 1; j <= band + 1; j++) {
-    for (const p of s.plantGrid(j)) {
+    for (const p of plantGrid(j)) {
       const cov = p.r + CORRIDOR_HALF;
       free = subtractInterval(free, p.x - cov, p.x + cov);
       if (free.length === 0) return free;
     }
   }
   return free;
+}
+
+/**
+ * The corridor machinery over a built SlopeDef (validator + gate placement +
+ * the slope tests all read the same free intervals).
+ */
+export function bandFreeIntervals(s: SlopeDef, band: number, halfW: number): Interval[] {
+  return gridFreeIntervals(s.plantGrid, band, halfW);
 }
 
 export function genSlope(seed: number): SlopeDef {
@@ -278,6 +306,37 @@ export function genSlope(seed: number): SlopeDef {
   for (const [k, bucket] of grid) frozenGrid.set(k, Object.freeze(bucket));
   const EMPTY: readonly Plant[] = Object.freeze([]);
   const frozenPlants: readonly Plant[] = Object.freeze(plants);
+  const gridAt = (zBand: number): readonly Plant[] => frozenGrid.get(zBand) ?? EMPTY;
+
+  // --- Slalom gates: one per GATE_SPACING_M (+- GATE_JITTER_M) along the
+  // corridor. x aims at the centreline +- GATE_X_JITTER, then snaps to the
+  // nearest plant-free centre position of its band (the centreline itself is
+  // always free by construction, so the snap never travels far), clamped so
+  // the whole opening stays on the piste.
+  const gates: Gate[] = [];
+  for (let i = 0; i < GATE_COUNT; i++) {
+    const zJit = GATE_FIRST_Z + i * GATE_SPACING_M + rngRange(next, -GATE_JITTER_M, GATE_JITTER_M);
+    const z = Math.max(GATE_FIRST_Z, Math.min(ZONE_Z1, zJit));
+    const f = z / PLANT_BAND_M;
+    const k = Math.floor(f);
+    const c0 = centres[k] ?? 0;
+    const c1 = centres[k + 1] ?? c0;
+    const target = c0 + (c1 - c0) * (f - k) + rngRange(next, -GATE_X_JITTER, GATE_X_JITTER);
+    let x = Math.max(-GATE_X_MAX, Math.min(GATE_X_MAX, target)); // fallback (never hit)
+    let bestD = Infinity;
+    for (const iv of gridFreeIntervals(gridAt, Math.floor(z / PLANT_BAND_M), HALF_W)) {
+      const lo = Math.max(iv.lo, -GATE_X_MAX);
+      const hi = Math.min(iv.hi, GATE_X_MAX);
+      if (hi - lo <= 1e-9) continue;
+      const p = Math.max(lo, Math.min(hi, target));
+      const d = Math.abs(p - target);
+      if (d < bestD) {
+        bestD = d;
+        x = p;
+      }
+    }
+    gates.push({ x, z, halfWidth: GATE_HALF_WIDTH });
+  }
 
   return {
     seed,
@@ -285,9 +344,10 @@ export function genSlope(seed: number): SlopeDef {
     width: SLOPE_WIDTH,
     finishZ: FINISH_Z,
     plants: frozenPlants,
+    gates: Object.freeze(gates),
     height,
     gradeAt,
-    plantGrid: (zBand: number) => frozenGrid.get(zBand) ?? EMPTY,
+    plantGrid: gridAt,
   };
 }
 
@@ -357,6 +417,35 @@ export function validateSlope(s: SlopeDef): string[] {
       );
       break;
     }
+  }
+
+  // 4. Slalom gates: strictly ascending z, opening fully on the piste, none
+  //    in either clear zone, and the count within +/-2 of the spacing
+  //    expectation (jitter and the finish clear zone shift it a little).
+  let prevGateZ = -Infinity;
+  for (const g of s.gates) {
+    if (!(g.z > prevGateZ)) {
+      push(`gate at z=${g.z.toFixed(2)} is not strictly ascending (previous ${prevGateZ.toFixed(2)})`);
+    }
+    prevGateZ = g.z;
+    if (g.z < START_CLEAR) {
+      push(`gate at z=${g.z.toFixed(2)} violates START_CLEAR (${START_CLEAR} m)`);
+    }
+    if (g.z > s.finishZ - FINISH_CLEAR) {
+      push(`gate at z=${g.z.toFixed(2)} violates FINISH_CLEAR (${FINISH_CLEAR} m)`);
+    }
+    if (g.x - g.halfWidth < -halfW || g.x + g.halfWidth > halfW) {
+      push(
+        `gate at z=${g.z.toFixed(2)} x=${g.x.toFixed(2)} halfWidth=${g.halfWidth} ` +
+          `reaches off-piste (width ${s.width})`,
+      );
+    }
+  }
+  const expectedGates = Math.floor(
+    (s.finishZ - FINISH_CLEAR - GATE_FIRST_Z) / GATE_SPACING_M,
+  );
+  if (Math.abs(s.gates.length - expectedGates) > 2) {
+    push(`gate count ${s.gates.length} is outside +/-2 of the expected ${expectedGates}`);
   }
 
   return violations;

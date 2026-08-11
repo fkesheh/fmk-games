@@ -26,13 +26,28 @@
 // step's values and then emits `splat_event plant_hit { id, plantIx, x, z }`.
 // stepSki itself emits nothing — it is pure.
 //
+// GATE-CROSSING DETECTION (server convention, CONTRACT §6 — same pattern as
+// plant hits): crossing gate ix (prevZ < g.z <= newZ, ix > lastGateIx)
+// ALWAYS writes s.lastGateIx = ix — a miss included, so a missed gate can
+// never be re-taken by circling back. A CLEAN pass (|x - g.x| <= g.halfWidth)
+// additionally writes s.boostUntilMs in the SAME step: on a pass lastGateIx
+// and boostUntilMs change together atomically (the pass is the only writer
+// of boostUntilMs after makeSim/resetSim). The SERVER detects a pass between
+// steps by watching for lastGateIx to advance AND boostUntilMs to differ,
+// then emits `splat_event gate { id, gateIx, x, z }`; a lastGateIx advance
+// with an UNCHANGED boostUntilMs was a miss (no event). Gates never touch
+// plant rearm/immunity, and plants never touch the gate fields.
+//
 // Readings of §6 where the prose left latitude (verified numerically against
 // the 4-year-old test before freezing these bodies):
 // - YAW SOFT-CLAMP: beyond ±YAW_MAX a positional spring removes
 //   YAW_SPRING * (|yaw| - YAW_MAX) * dt per step toward the fall line
-//   ("YAW_SPRING rad/s² per rad" beyond the clamp). Equilibrium under full
-//   lock sits ~0.2 rad past YAW_MAX with cos(yaw) still > 0, so z never
-//   decreases and the edge band spirals the skier back downhill — no donut.
+//   ("YAW_SPRING rad/s² per rad" beyond the clamp). Full-lock equilibrium
+//   sits ~0.22 rad past YAW_MAX (measured 1.574 rad); under the retuned
+//   speed constants that is a hair past traverse at the START of a run, so
+//   a few mm of backward z drift over the first ~3 s is the frozen physics
+//   — then rising speed pulls turnRate down, the equilibrium drops back
+//   under pi/2, and the edge band spirals the skier downhill. No donut.
 // - SOFT EDGES: SkierSim carries no lateral-velocity field, so the "inward
 //   lateral acceleration, quadratic in depth" manifests as (a) centripetal
 //   curvature of the heading toward the fall line, rate = a_edge / v, and
@@ -60,6 +75,9 @@ import {
   DRAG,
   EDGE_PUSH,
   EDGE_ZONE,
+  GATE_BOOST_MAX,
+  GATE_BOOST_MS,
+  GATE_BOOST_V,
   G_ACCEL,
   MAX_SPEED,
   MIN_SPEED,
@@ -112,6 +130,8 @@ export function makeSim(x: number, z: number, yaw: number): SkierSim {
     snareUntilMs: 0,
     lastPlantIx: -1,
     lastPlantHitMs: -PLANT_REARM_MS,
+    lastGateIx: -1,
+    boostUntilMs: 0,
     finished: false,
     finishMs: 0,
   };
@@ -127,6 +147,8 @@ export function resetSim(s: SkierSim, x: number, z: number, yaw: number): void {
   s.snareUntilMs = 0;
   s.lastPlantIx = -1;
   s.lastPlantHitMs = -PLANT_REARM_MS;
+  s.lastGateIx = -1;
+  s.boostUntilMs = 0;
   s.finished = false;
   s.finishMs = 0;
 }
@@ -141,6 +163,8 @@ export function copySim(dst: SkierSim, src: Readonly<SkierSim>): void {
   dst.snareUntilMs = src.snareUntilMs;
   dst.lastPlantIx = src.lastPlantIx;
   dst.lastPlantHitMs = src.lastPlantHitMs;
+  dst.lastGateIx = src.lastGateIx;
+  dst.boostUntilMs = src.boostUntilMs;
   dst.finished = src.finished;
   dst.finishMs = src.finishMs;
 }
@@ -148,7 +172,8 @@ export function copySim(dst: SkierSim, src: Readonly<SkierSim>): void {
 /**
  * THE shared step — the one function both peers run per input. CONTRACT §6,
  * in order: sim clock, gravity along heading, steering, carve scrub, yaw
- * soft-clamp, motion, speed bounds, plant contact, soft edges, finish.
+ * soft-clamp, motion, speed bounds, plant contact, slalom gates, soft
+ * edges, finish.
  *
  * A FINISHED skier is frozen: the call is a no-op and the state is left
  * untouched (the input is still "consumed" by the caller, so server ack
@@ -194,11 +219,16 @@ export function stepSki(
   }
 
   // -- motion along heading (yaw 0 = +Z downhill) ----------------------------
+  const prevZ = s.z; // gate crossing detection needs the pre-step z
   s.x += Math.sin(s.yaw) * s.v * dt;
   s.z += Math.cos(s.yaw) * s.v * dt;
 
-  // -- bounds: MIN_SPEED <= v <= MAX_SPEED (halved while snared) -------------
-  const vMax = s.simMs < s.snareUntilMs ? MAX_SPEED / 2 : MAX_SPEED;
+  // -- bounds: MIN_SPEED <= v <= cap. The cap is the MIN of the applicable
+  //    ceilings: MAX_SPEED is the base; while boosted (simMs < boostUntilMs)
+  //    GATE_BOOST_MAX replaces it; while snared (simMs < snareUntilMs) the
+  //    half cap applies on top — the snare half-cap wins over the boost cap.
+  let vMax = s.simMs < s.boostUntilMs ? GATE_BOOST_MAX : MAX_SPEED;
+  if (s.simMs < s.snareUntilMs) vMax = Math.min(vMax, MAX_SPEED / 2);
   s.v = clamp(s.v, MIN_SPEED, vMax);
 
   // -- plant contact: spatial hash over bands k-1..k+1, circle test ---------
@@ -228,6 +258,22 @@ export function stepSki(
       break;
     }
     if (hit) break;
+  }
+
+  // -- slalom gates (CONTRACT §6, see the header for the server convention) --
+  // slope.gates is ascending z, so scan forward from lastGateIx+1 and stop at
+  // the first gate not crossed this step. EVERY crossed gate is consumed
+  // (lastGateIx = ix, hit or miss — no circling back); a clean pass grants
+  // the boost, writing lastGateIx and boostUntilMs together in this step.
+  for (let ix = s.lastGateIx + 1; ix < slope.gates.length; ix++) {
+    const g = slope.gates[ix];
+    if (g === undefined) break;
+    if (!(prevZ < g.z && g.z <= s.z)) break; // ascending z: nothing further crossed
+    if (Math.abs(s.x - g.x) <= g.halfWidth) {
+      s.v = Math.min(s.v + GATE_BOOST_V, vMax); // §6: clamped by the current cap
+      s.boostUntilMs = s.simMs + GATE_BOOST_MS;
+    }
+    s.lastGateIx = ix;
   }
 
   // -- soft edges: quadratic inward pushback past width/2 - EDGE_ZONE --------

@@ -4,6 +4,7 @@
 // Covers: determinism, the GRADE_MIN grade floor (analytic fall-line bound +
 // clamp behaviour), density ramp vs config, zero plants in both clear zones,
 // the connected-corridor guarantee (generated slopes + synthetic bad defs),
+// slalom gates (count/placement/corridor alignment + validator rejections),
 // plantGrid band membership + the k-1/k/k+1 query pattern, height-field
 // continuity/finiteness, and the stepSki full-lock integration suite (guarded:
 // skips until P1's sim.ts exists — see the bottom describe).
@@ -14,6 +15,9 @@ import {
   CORRIDOR_MAX_SHIFT_M,
   FINISH_CLEAR,
   FINISH_Z,
+  GATE_FIRST_Z,
+  GATE_HALF_WIDTH,
+  GATE_SPACING_M,
   GRADE_BASE,
   GRADE_MIN,
   PLANT_BAND_M,
@@ -33,8 +37,8 @@ import {
   UND_LONG_2_LEN,
   YAW_MAX,
 } from './config.js';
-import { genSlope, validateSlope } from './slope.js';
-import type { Plant, SkierSim, SlopeDef } from './types.js';
+import { bandFreeIntervals, genSlope, validateSlope } from './slope.js';
+import type { Gate, Plant, SkierSim, SlopeDef } from './types.js';
 
 // The shared tsconfig is lib-pure (no DOM, no node types) but vitest provides
 // console at runtime; declare the one method these tests log measurements with.
@@ -48,9 +52,19 @@ const ZONE_LEN = ZONE_Z1 - ZONE_Z0;
 const RAMP_LEN = PLANT_DENSITY_RAMP * ZONE_LEN;
 const BAND_COUNT = Math.ceil(FINISH_Z / PLANT_BAND_M);
 const SEEDS = Array.from({ length: 20 }, (_, i) => i + 1);
+const EXPECTED_GATES = Math.floor((FINISH_Z - FINISH_CLEAR - GATE_FIRST_Z) / GATE_SPACING_M);
+
+/** A validator-clean gate set for synthetic defs (exact count, on-piste). */
+function validGates(): Gate[] {
+  return Array.from({ length: EXPECTED_GATES }, (_, i) => ({
+    x: 0,
+    z: GATE_FIRST_Z + i * GATE_SPACING_M,
+    halfWidth: GATE_HALF_WIDTH,
+  }));
+}
 
 /** Synthetic SlopeDef for validator tests: flat analytic grade, given plants. */
-function syntheticDef(plants: Plant[]): SlopeDef {
+function syntheticDef(plants: Plant[], gates: Gate[] = validGates()): SlopeDef {
   const grid = new Map<number, Plant[]>();
   for (const p of plants) {
     const k = Math.floor(p.z / PLANT_BAND_M);
@@ -64,6 +78,7 @@ function syntheticDef(plants: Plant[]): SlopeDef {
     width: SLOPE_WIDTH,
     finishZ: FINISH_Z,
     plants,
+    gates,
     height: (_x, z) => -GRADE_BASE * z,
     gradeAt: () => GRADE_BASE,
     plantGrid: (k) => grid.get(k) ?? [],
@@ -258,6 +273,91 @@ describe('corridor (validateSlope)', () => {
     const violations = validateSlope(syntheticDef(plants));
     expect(violations.some((v) => v.includes('corridor'))).toBe(true);
     void CORRIDOR_MAX_SHIFT_M; // the invariant under test, kept visible
+  });
+});
+
+describe('slalom gates', () => {
+  it('generated slopes place ~14 gates: ascending z, on-piste, clear zones free', () => {
+    for (const seed of SEEDS) {
+      const s = genSlope(seed);
+      expect(
+        Math.abs(s.gates.length - EXPECTED_GATES),
+        `seed ${seed} gate count ${s.gates.length}`,
+      ).toBeLessThanOrEqual(2);
+      let prevZ = -Infinity;
+      for (const g of s.gates) {
+        expect(g.z, `seed ${seed}`).toBeGreaterThan(prevZ); // strictly ascending
+        prevZ = g.z;
+        expect(g.z).toBeGreaterThanOrEqual(GATE_FIRST_Z);
+        expect(g.z).toBeGreaterThanOrEqual(START_CLEAR); // never in the start clear zone
+        expect(g.z).toBeLessThanOrEqual(FINISH_Z - FINISH_CLEAR); // nor the finish sprint
+        expect(g.halfWidth).toBe(GATE_HALF_WIDTH);
+        expect(g.x - g.halfWidth).toBeGreaterThanOrEqual(-HALF_W); // opening on-piste
+        expect(g.x + g.halfWidth).toBeLessThanOrEqual(HALF_W);
+      }
+    }
+  });
+
+  it('gates are deterministic per seed (and differ across seeds)', () => {
+    expect(JSON.stringify(genSlope(7).gates)).toBe(JSON.stringify(genSlope(7).gates));
+    expect(JSON.stringify(genSlope(7).gates)).not.toBe(JSON.stringify(genSlope(8).gates));
+  });
+
+  it('every gate sits inside the corridor free interval at its band', () => {
+    // The same free-interval machinery validateSlope sweeps: a gate whose x
+    // has no PLANT_CORRIDOR_M-wide plant-free tube at its band could not be
+    // threaded by a corridor-following skier.
+    for (const seed of SEEDS) {
+      const s = genSlope(seed);
+      for (const g of s.gates) {
+        const band = Math.floor(g.z / PLANT_BAND_M);
+        const free = bandFreeIntervals(s, band, HALF_W);
+        const inside = free.some((iv) => g.x >= iv.lo - 1e-9 && g.x <= iv.hi + 1e-9);
+        expect(
+          inside,
+          `seed ${seed} gate z=${g.z.toFixed(1)} x=${g.x.toFixed(2)} outside ` +
+            `free intervals ${JSON.stringify(free)}`,
+        ).toBe(true);
+      }
+    }
+  });
+
+  it('validator rejects descending, off-piste, clear-zone, and miscounted gates', () => {
+    const descending = validGates();
+    descending[3] = { ...descending[3]!, z: descending[1]!.z }; // duplicate z: not ascending
+    expect(
+      validateSlope(syntheticDef([], descending)).some((v) => v.includes('ascending')),
+    ).toBe(true);
+
+    const offPiste = validGates();
+    offPiste[0] = { ...offPiste[0]!, x: HALF_W }; // opening edge past the piste
+    expect(
+      validateSlope(syntheticDef([], offPiste)).some((v) => v.includes('off-piste')),
+    ).toBe(true);
+
+    const inStartClear = validGates();
+    inStartClear[0] = { ...inStartClear[0]!, z: START_CLEAR - 1 };
+    expect(
+      validateSlope(syntheticDef([], inStartClear)).some((v) => v.includes('START_CLEAR')),
+    ).toBe(true);
+
+    const inFinishClear = validGates();
+    inFinishClear[EXPECTED_GATES - 1] = {
+      ...inFinishClear[EXPECTED_GATES - 1]!,
+      z: FINISH_Z - FINISH_CLEAR + 1,
+    };
+    expect(
+      validateSlope(syntheticDef([], inFinishClear)).some((v) => v.includes('FINISH_CLEAR')),
+    ).toBe(true);
+
+    expect(
+      validateSlope(syntheticDef([], validGates().slice(0, 4))).some((v) =>
+        v.includes('gate count'),
+      ),
+    ).toBe(true);
+
+    // ...and the untouched valid set is genuinely clean.
+    expect(validateSlope(syntheticDef([]))).toEqual([]);
   });
 });
 

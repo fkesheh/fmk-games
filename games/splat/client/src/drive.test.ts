@@ -48,6 +48,7 @@ function flatSlope(plants: readonly Plant[] = []): SlopeDef {
     width: 56,
     finishZ: 800,
     plants,
+    gates: [],
     height: (_x: number, z: number): number => -0.21 * z,
     gradeAt: (): number => 0.21,
     plantGrid: (zBand: number): readonly Plant[] =>

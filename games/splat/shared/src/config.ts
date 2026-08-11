@@ -30,35 +30,45 @@ export const SLOPE_WIDTH = 56;
 export const FINISH_Z = SLOPE_LENGTH;
 export const START_CLEAR = 25;           // no plants within this of the gate
 export const FINISH_CLEAR = 40;          // no plants in the sprint corridor
-export const GRADE_BASE = 0.21;          // ~12 deg mean downhill grade (rise/run)
+export const GRADE_BASE = 0.26;          // ~15 deg mean downhill grade (rise/run)
 export const GRADE_MIN = 0.08;           // never flatter than this anywhere (never stuck)
 export const EDGE_ZONE = 6;              // soft-edge band width at each side
 export const EDGE_PUSH = 14;             // inward accel scale (m/s^2 at full depth)
 
 // Terrain undulation octaves, frozen (gauntlet: balance-critical). h(x,z) =
 // -GRADE_BASE*z + sum of sines; worst-case downhill-directed gradient of the
-// undulations (0.057+0.057) stays under GRADE_BASE-GRADE_MIN = 0.13, so
+// undulations (0.057+0.057) stays under GRADE_BASE-GRADE_MIN = 0.18, so
 // gradeAt >= GRADE_MIN holds everywhere by construction.
 export const UND_LONG_1_AMP = 2.0;  export const UND_LONG_1_LEN = 220;
 export const UND_LONG_2_AMP = 1.0;  export const UND_LONG_2_LEN = 110;
 export const UND_LAT_AMP = 1.5;     export const UND_LAT_LEN = 140;
 
 // --- Skier physics (DESIGN_BIBLE balance targets) -----------------------------
-// Terminal velocity at GRADE_BASE: v* = sqrt(G*grade/DRAG) = sqrt(9.8*0.21/0.006)
-// = 18.5 m/s -> clean 800 m run ~= 47 s (target band 35-55 s).
+// Terminal velocity at GRADE_BASE: v* = sqrt(G*grade/DRAG) = sqrt(9.8*0.26/0.005)
+// = 22.6 m/s (~81 km/h) -> clean 800 m run ~= 40 s (target band 35-55 s).
 export const SKIER_RADIUS = 0.5;
 export const EYE_HEIGHT = 1.55;
 export const MIN_SPEED = 3;              // >0 everywhere: no stopped state
-export const MAX_SPEED = 22;             // ~79 km/h cap for steep undulation dips
+export const MAX_SPEED = 26;             // ~94 km/h cap for steep undulation dips
 export const G_ACCEL = 9.8;              // scaled by gradeAlong
-export const DRAG = 0.006;               // v^2 drag
+export const DRAG = 0.005;               // v^2 drag
 export const TURN_RATE_BASE = 1.9;       // rad/s at low speed
-export const TURN_RATE_MIN = 0.85;       // rad/s at MAX_SPEED (wider carve)
+export const TURN_RATE_MIN = 0.95;       // rad/s at MAX_SPEED (wider carve)
 export const YAW_MAX = 1.35;             // rad; soft yaw clamp (spring return)
 export const YAW_SPRING = 6;             // rad/s^2 per rad beyond YAW_MAX
 export const CARVE_SCRUB = 0.55;         // speed shed while turning
 export const STEER_RAMP_S = 0.18;        // CLIENT input ramp only — sim sees post-ramp steer
 export const SKIER_PUSH = 3.5;           // skier-skier soft nudge accel
+
+// --- Slalom gates (flag checkpoints — pure upside, DESIGN_BIBLE) ---------------
+// Crossing a gate's z within its opening boosts speed; missing costs NOTHING.
+export const GATE_SPACING_M = 50;        // one gate per ~50 m of descent
+export const GATE_JITTER_M = 8;          // z jitter per gate (seeded)
+export const GATE_HALF_WIDTH = 2.2;      // opening half-width (m)
+export const GATE_FIRST_Z = 60;          // first gate after the learning zone
+export const GATE_BOOST_MS = 2500;       // boost window (sim ms)
+export const GATE_BOOST_V = 2.5;         // instant speed granted on pass (m/s)
+export const GATE_BOOST_MAX = 30;        // speed cap while boosted (~108 km/h)
 
 // --- Plants (the opponent) ----------------------------------------------------
 // Density target: a straight fall-line run hits 3-6 plants (DESIGN_BIBLE).
@@ -101,5 +111,5 @@ export const START_PER_ROW = 4;
 export const INTERP_DELAY_MS = Math.round(1800 / SNAPSHOT_HZ);
 export const EXTRAPOLATE_MAX_MS = 250;
 export const BASE_FOV = 65;
-export const SPEED_FOV_MAX = 15;
+export const SPEED_FOV_MAX = 18;
 export const CAM_SHAKE_AMP = 0.004;

@@ -7,9 +7,11 @@
 //   carve — a SECOND continuous noise voice with a different filter character
 //           (higher, tighter bandpass — skis hissing on edge, not wind), gated
 //           per frame by C2's |steer| x v-scaled amount. Never retriggered.
-//   rustle/beep/go/finish/sting — one-shots: plant hit (leafy noise burst +
-//           soft thud), countdown beep, brighter/higher GO, a short fanfare
-//           arpeggio on the finish line, and a results sting.
+//   rustle/beep/go/finish/sting/whoosh — one-shots: plant hit (leafy noise
+//           burst + soft thud), countdown beep, brighter/higher GO, a short
+//           fanfare arpeggio on the finish line, a results sting, and the
+//           slalom-gate whoosh (a fast airy sweep UP — a clean pass has no
+//           thud, and the rising band is the inverse of rustle's falling one).
 // Both looped voices share the ONE seeded noise buffer (rng(0x5eed) —
 // Math.random is a contract violation) at detuned playbackRates so they never
 // phase-lock. All per-frame param moves go through setTargetAtTime (cheap,
@@ -22,7 +24,7 @@
 // ============================================================================
 import { rng } from '@platform/shared';
 
-export type SplatSfx = 'rustle' | 'beep' | 'go' | 'finish' | 'sting';
+export type SplatSfx = 'rustle' | 'beep' | 'go' | 'finish' | 'sting' | 'whoosh';
 
 /** Optional per-call sfx modifiers; distance is in meters. */
 export interface SplatSfxOpts {
@@ -222,6 +224,16 @@ export class SplatAudio {
           this.beep(ctx, master, { type: 'sine', f0: 523.25, t0: t0 + 0.02, dur: 0.5, peak: 0.2 }, dm);
           this.beep(ctx, master, { type: 'triangle', f0: 659.25, t0: t0 + 0.24, dur: 0.7, peak: 0.24 }, dm);
           break;
+        case 'whoosh': {
+          // gate pass: air ripping past the ears for a beat — a fast airy
+          // noise sweep UP through a wide band (the inverse of rustle's fall),
+          // plus a thin highpass shimmer on top. No body thud: a pass is
+          // clean. Distinct from the wind voice, which is continuous, lower
+          // and never sweeps this fast.
+          this.burst(ctx, nbuf, master, { type: 'bandpass', f0: 700, f1: 3400, q: 1.1, t0, dur: 0.24, peak: 0.3, attack: 0.03 }, dm);
+          this.burst(ctx, nbuf, master, { type: 'highpass', f0: 2600, f1: 5200, q: 0.7, t0: t0 + 0.02, dur: 0.16, peak: 0.12, attack: 0.02 }, dm);
+          break;
+        }
       }
     } catch {
       // audio must never crash the client (contract robustness rule)

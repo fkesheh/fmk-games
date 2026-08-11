@@ -68,6 +68,10 @@ third-line; the fall line pulls the eye downhill. Never cut to third person.
   hue — reads "nasty" at a glance; the one plant an adult respects.
 - **Start gate / finish gate:** two banner poles + a pennant string; finish
   gets `sunGold` flags and a lodge with chimney smoke beyond the line.
+- **Slalom gate (flag checkpoint):** two slim flexible poles (~1.8 m) with
+  small triangular pennants, alternating azure/ember by gate index (ski
+  slalom language). The opening must read as a doorway at 30 m against snow;
+  a passed gate gets a celebratory wobble, never a penalty state.
 - **Mountain dressing:** ridge-line rock outcrops (`rockLit/rock`), sparse
   mature pines OUTSIDE the piste edges, distant peak cards in `skyHorizon`
   haze. The piste itself is a readable corridor of clean snow bordered by

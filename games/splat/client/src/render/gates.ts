@@ -1,6 +1,7 @@
 // ============================================================================
 // SKI SPLAT — GATES + LODGE (task R1, CONTRACT §7). The start gate at z=0,
-// the FINISH GATE at slope.finishZ (sunGold pennants — THE goal read: at race
+// the SLALOM LINE (slope.gates — azure/ember flag checkpoints, alternating by
+// gate index), the FINISH GATE at slope.finishZ (sunGold pennants — THE goal read: at race
 // speed the gold string fading in through the morning haze is what every
 // skier steers toward), and the lodge with chimney smoke beyond the line.
 // STYLE_BIBLE model sheets: two banner poles + a pennant string per gate, and
@@ -11,7 +12,7 @@
 // mesh per SPAL colour.
 // ============================================================================
 import * as THREE from 'three';
-import { SPAL } from '@splat/shared';
+import { SKIER_COLORS, SPAL } from '@splat/shared';
 import type { SlopeDef } from '@splat/shared';
 import { at, bake, box, cone, cyl, mat, sphere } from '../contract/visual.js';
 
@@ -27,6 +28,9 @@ const FINISH_BULK = 1.9; // pole/flag bulk multiplier vs the start gate
 // ---- lodge ---------------------------------------------------------------------------
 const LODGE_X = 14; // beside the runout, NOT blocking it
 const LODGE_Z_PAD = 26; // this far beyond the finish line
+
+// ---- slalom gates (flag checkpoints, STYLE_BIBLE model sheet) --------------------------
+const SLALOM_POLE_H = 1.8; // slim flexible pole height (m)
 
 /**
  * A pennant string between two poles: a thin bark line plus a row of small
@@ -162,12 +166,43 @@ function buildLodge(g: THREE.Group, slope: SlopeDef): void {
 }
 
 /**
- * Start gate + finish gate + the lodge, baked into one group (one mesh per
- * SPAL colour). Positions are a pure function of the slope — no rng needed.
+ * The slalom line: every gate in slope.gates as two slim ~1.8 m poles with a
+ * small triangular pennant each, the whole doorway in the gate colour —
+ * SKIER_COLORS[0] azure on even gates, SKIER_COLORS[1] ember on odd (ski
+ * slalom language; the opening, 2 x GATE_HALF_WIDTH, must read as a doorway
+ * at 30 m against snow, and a fully coloured doorway does what bark poles
+ * could not). Pennants stream downhill (+z) like wind flags. bake() merges
+ * by material, so ~14 gates collapse into ONE mesh per colour — the entire
+ * line adds exactly 2 draw calls (azure + ember), inside the <= 3 budget.
+ * Deterministic: positions are a pure function of slope.gates.
+ */
+function buildSlalomGates(g: THREE.Group, slope: SlopeDef): void {
+  for (let i = 0; i < slope.gates.length; i++) {
+    const gate = slope.gates[i];
+    if (gate === undefined) continue;
+    const hex = SKIER_COLORS[i % 2] ?? SPAL.skyZenith;
+    for (let side = -1; side <= 1; side += 2) {
+      const x = gate.x + side * gate.halfWidth;
+      const base = slope.height(x, gate.z);
+      // slim pole, slight taper — the flexible slalom pole of the model sheet
+      g.add(at(cyl(mat, 0.022, 0.034, SLALOM_POLE_H, 5, hex), x, base + SLALOM_POLE_H / 2, gate.z));
+      // small triangular pennant near the top, pointing downhill
+      const p = cone(mat, 0.15, 0.42, 4, hex);
+      p.rotation.x = Math.PI / 2; // cone tip +y -> +z (downhill)
+      g.add(at(p, x, base + SLALOM_POLE_H - 0.3, gate.z + 0.21));
+    }
+  }
+}
+
+/**
+ * Start gate + slalom line + finish gate + the lodge, baked into one group
+ * (one mesh per SPAL colour). Positions are a pure function of the slope —
+ * no rng needed.
  */
 export function buildGates(slope: SlopeDef): THREE.Group {
   const g = new THREE.Group();
   buildStartGate(g, slope);
+  buildSlalomGates(g, slope);
   buildFinishGate(g, slope);
   buildLodge(g, slope);
   return bake(g);

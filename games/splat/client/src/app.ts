@@ -98,6 +98,7 @@ function parseSkierSim(v: unknown): SkierSim | null {
   if (!isObj(v)) return null;
   if (!num(v.x) || !num(v.z) || !num(v.yaw) || !num(v.v) || !num(v.simMs)) return null;
   if (!num(v.snareUntilMs) || !num(v.lastPlantIx) || !num(v.lastPlantHitMs)) return null;
+  if (!num(v.lastGateIx) || !num(v.boostUntilMs)) return null;
   if (!bool(v.finished) || !num(v.finishMs)) return null;
   return {
     x: v.x,
@@ -108,6 +109,8 @@ function parseSkierSim(v: unknown): SkierSim | null {
     snareUntilMs: v.snareUntilMs,
     lastPlantIx: v.lastPlantIx,
     lastPlantHitMs: v.lastPlantHitMs,
+    lastGateIx: v.lastGateIx,
+    boostUntilMs: v.boostUntilMs,
     finished: v.finished,
     finishMs: v.finishMs,
   };
@@ -137,6 +140,10 @@ function parseSplatEvent(v: unknown): SplatEvent | null {
     case 'plant_hit':
       return str(v.id) && num(v.plantIx) && num(v.x) && num(v.z)
         ? { t: 'plant_hit', id: v.id, plantIx: v.plantIx, x: v.x, z: v.z }
+        : null;
+    case 'gate':
+      return str(v.id) && num(v.gateIx) && num(v.x) && num(v.z)
+        ? { t: 'gate', id: v.id, gateIx: v.gateIx, x: v.x, z: v.z }
         : null;
     case 'finished':
       return str(v.id) && num(v.place) && num(v.finishMs)
@@ -529,6 +536,11 @@ export class SplatApp {
   // ---- presentation state --------------------------------------------------------------
   private lastCountdownBeep = 0; // countdown numeral dedupe (snapshot-driven, 20 Hz)
   private wasFinished = false; // own finish edge (event is primary; snapshot is the fallback)
+  // own gate-pass feedback (predicted in the frame loop; the splat_event is the
+  // deduped fallback — see onEvent 'gate' and the frame loop):
+  private prevGateIx = -1; // lastGateIx seen on the previous frame's drive.state()
+  private prevBoostUntilMs = 0; // its boostUntilMs — a clean pass moves BOTH (sim.ts header)
+  private ownGateFxIx = -1; // highest gateIx that already got pass feedback
   private lastFrame = 0;
 
   // ---- settings (localStorage; tablet tri-state) -----------------------------------------
@@ -1025,6 +1037,9 @@ export class SplatApp {
     this.corrections = 0;
     this.lastCountdownBeep = 0;
     this.wasFinished = false;
+    this.prevGateIx = -1;
+    this.prevBoostUntilMs = 0;
+    this.ownGateFxIx = -1;
     this.resetArmed = true; // first snapshot resets the predictor from you.sim
     // Record the rejoin pointer: welcome always precedes splat_joined, so
     // this.playerId is THIS socket's id — a reload/drop resumes from here.
@@ -1089,6 +1104,9 @@ export class SplatApp {
     this.audio.carve(0);
     this.lastCountdownBeep = 0;
     this.wasFinished = false;
+    this.prevGateIx = -1;
+    this.prevBoostUntilMs = 0;
+    this.ownGateFxIx = -1;
   }
 
   // ---- slope lifecycle ----------------------------------------------------------------
@@ -1162,6 +1180,12 @@ export class SplatApp {
         this.corrections += 1;
         if (corr > this.maxCorrectionM) this.maxCorrectionM = corr;
       }
+      // An authoritative rebase is NOT a pass: sync the gate trackers from the
+      // post-reconcile state so a mid-race rejoin (lastGateIx jumping forward)
+      // never fires phantom feedback — the server's gate event covers that one.
+      const rs = this.drive.state();
+      this.prevGateIx = rs.lastGateIx;
+      this.prevBoostUntilMs = rs.boostUntilMs;
     }
 
     const seen = new Set<string>();
@@ -1224,6 +1248,10 @@ export class SplatApp {
       this.corrections = 0;
       this.lastCountdownBeep = 0;
       this.wasFinished = false;
+      // gate trackers reset with the grid — gateIx counts from 0 again
+      this.prevGateIx = -1;
+      this.prevBoostUntilMs = 0;
+      this.ownGateFxIx = -1;
       if (!seedChanged && this.drive !== null) {
         // fixed-seed room (settings {seed}) rematch: same mountain, fresh grid
         this.drive.reset(sim.x, sim.z, sim.yaw);
@@ -1252,6 +1280,30 @@ export class SplatApp {
           const s = this.drive?.state();
           const dist = s !== undefined ? Math.hypot(ev.x - s.x, ev.z - s.z) : 0;
           this.audio.sfx('rustle', { distance: Math.round(dist) });
+        }
+        break;
+      }
+      case 'gate': {
+        if (ev.id === this.playerId) {
+          // Own passes are PREDICTED in the frame loop (the feedback fired the
+          // moment the predictor crossed). This authoritative event is only
+          // the fallback for when the frame loop wasn't watching (background
+          // tab, watchdog stepping) — deduped by gateIx so a pass the
+          // prediction already celebrated never fires twice.
+          if (ev.gateIx > this.ownGateFxIx) {
+            this.ownGateFxIx = ev.gateIx;
+            const y = this.slope?.height(ev.x, ev.z) ?? 0;
+            this.audio.sfx('whoosh');
+            this.fx?.burst('spray', ev.x, y + 0.15, ev.z);
+          }
+        } else {
+          // a rival threaded a gate: spray at the gate + an airy whoosh,
+          // attenuated by their distance from us (same curve as plant_hit)
+          const y = this.slope?.height(ev.x, ev.z) ?? 0;
+          this.fx?.burst('spray', ev.x, y + 0.15, ev.z);
+          const s = this.drive?.state();
+          const dist = s !== undefined ? Math.hypot(ev.x - s.x, ev.z - s.z) : 0;
+          this.audio.sfx('whoosh', { distance: Math.round(dist) });
         }
         break;
       }
@@ -1472,6 +1524,20 @@ export class SplatApp {
         const cy = slope.height(cx, cz);
         this.scene?.setCamera(cx, cy, cz, s.yaw, s.v, drive.steerVisual(), dt);
         this.skiers?.setOwnSkis(drive.steerVisual(), s.v, dt);
+        // Own gate pass, PREDICTED (sim.ts header convention): lastGateIx
+        // advancing WITH a boostUntilMs move = a clean pass; an advance alone
+        // is a miss and stays silent. Feedback fires here, the frame it
+        // happens — the splat_event for our own id is only the fallback,
+        // deduped by gateIx (ownGateFxIx). Scalars only; nothing allocated.
+        if (s.lastGateIx > this.prevGateIx) {
+          if (s.boostUntilMs !== this.prevBoostUntilMs && s.lastGateIx > this.ownGateFxIx) {
+            this.ownGateFxIx = s.lastGateIx;
+            this.audio.sfx('whoosh');
+            this.fx?.burst('spray', cx, cy + 0.15, cz); // snow kicked up at the skis
+          }
+        }
+        this.prevGateIx = s.lastGateIx;
+        this.prevBoostUntilMs = s.boostUntilMs;
         this.updateRemotes(slope, dt);
         this.plants?.update(dt, cz);
         this.fx?.update(dt, cx, cz);
@@ -1745,6 +1811,8 @@ export class SplatApp {
               snareUntilMs: s.snareUntilMs,
               lastPlantIx: s.lastPlantIx,
               lastPlantHitMs: s.lastPlantHitMs,
+              lastGateIx: s.lastGateIx,
+              boostUntilMs: s.boostUntilMs,
               finished: s.finished,
               finishMs: s.finishMs,
             }
