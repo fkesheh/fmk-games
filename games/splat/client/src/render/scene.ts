@@ -52,13 +52,23 @@ const CAM_FAR = 2400; // covers the horizon peak cards from anywhere on the run
 // ---- lights ----------------------------------------------------------------------
 const SUN_INTENSITY = 2.3; // the warm key carries the frame
 const HEMI_INTENSITY = 0.8; // morning fill — shadows stay blue but BRIGHT blue
-const SUN_DISTANCE = 120; // light sits at target + SUN_DIR x this
-const SHADOW_EXTENT = 55; // ortho shadow box half-size, follows the camera
+const SUN_DISTANCE = 120; // light sits at target + sunVec x this
+// F1 (round-1 fixes): the frozen contract sun sits at SUN_ELEV 0.24
+// (contract/visual.ts — read-only). The judges wanted LONG SOFT BLUE shadows
+// across the piste, so the scene lowers the LIGHT's own elevation to ~9.7°
+// (the brief's 0.16–0.18 band) while keeping the frozen SUN_DIR azimuth — the
+// painted terrain shading, the dome glow and the cast shadows still agree on
+// direction (see sunVec below). visual.ts is untouched.
+const SUN_ELEV_LOCAL = 0.17; // rad — long raking morning shadows
+const SHADOW_EXTENT = 70; // ortho shadow box half-size, follows the camera —
+                          // widened (was 55) so the forest walls land in the box
 const SHADOW_MAP_SIZE = 2048;
 
 // ---- post pass ----------------------------------------------------------------------
-const GRADE_ALPHA = 0.07; // warm sunGold lift, weighted to the ground half
-const VIGNETTE_ALPHA = 0.16; // cool ink corner darkening
+// F1: the warm/cool split reads harder — a stronger sunGold ground-half lift
+// and a deeper cool ink vignette (0.07 -> 0.10 / 0.16 -> 0.20).
+const GRADE_ALPHA = 0.10; // warm sunGold lift, weighted to the ground half
+const VIGNETTE_ALPHA = 0.20; // cool ink corner darkening
 const FLASH_S = 0.12; // plant-hit edge-flash decay (s)
 const FLASH_PEAK = 0.5; // peak edge alpha on a plant hit
 
@@ -182,7 +192,19 @@ export class SplatScene {
   private prevZ = 0;
 
   private readonly lookScratch = new THREE.Vector3();
-  private readonly sunVec = new THREE.Vector3(SUN_DIR[0], SUN_DIR[1], SUN_DIR[2]);
+  // Scene-local sun vector (F1): the frozen SUN_DIR AZIMUTH (so the painted
+  // terrain shading and the cast shadows agree) at the scene's own LOWER
+  // elevation (SUN_ELEV_LOCAL) so the raking shadows read long. The contract
+  // elevation in visual.ts is frozen, so the light re-derives its own vector
+  // once here — deterministic, never mutated.
+  private readonly sunVec = ((): THREE.Vector3 => {
+    const horiz = Math.hypot(SUN_DIR[0], SUN_DIR[2]);
+    const ce = Math.cos(SUN_ELEV_LOCAL);
+    const se = Math.sin(SUN_ELEV_LOCAL);
+    return horiz > 1e-9
+      ? new THREE.Vector3((SUN_DIR[0] / horiz) * ce, se, (SUN_DIR[2] / horiz) * ce)
+      : new THREE.Vector3(0, se, ce);
+  })();
   /** Live uniform object for the hit-flash quad — mutated, never replaced. */
   private readonly flashAlpha = { value: 0 };
 
@@ -244,7 +266,9 @@ export class SplatScene {
     sc.far = SUN_DISTANCE * 3;
     sc.updateProjectionMatrix();
     this.sun.shadow.bias = -0.00015;
-    this.sun.shadow.normalBias = 0.05; // the raking angle leans on this, kart-tuned
+    // F1: slightly larger normalBias (0.05 -> 0.08) — the long raking angle
+    // leans on it, killing acne on the low-angle shadow seams
+    this.sun.shadow.normalBias = 0.08;
     this.world.add(this.sun);
     this.world.add(this.sun.target);
 
@@ -527,9 +551,11 @@ export class SplatScene {
   }
 
   /**
-   * Aim the shadow-casting sun AT (tx,ty,tz) FROM SUN_DIR — the light rides
-   * the same vector the terrain vertex shading and the sky's warm blob use,
-   * so painted shading, real shadows and sky always agree.
+   * Aim the shadow-casting sun AT (tx,ty,tz) FROM the scene's sun vector — the
+   * light rides the same AZIMUTH the terrain vertex shading and the sky's warm
+   * blob use (the frozen SUN_DIR azimuth), at the scene's own lower elevation
+   * (SUN_ELEV_LOCAL), so painted shading, real shadows and sky always agree
+   * on direction while the shadows rake long across the piste.
    */
   private aimSun(tx: number, ty: number, tz: number): void {
     this.sun.position.set(
@@ -634,12 +660,18 @@ export class SplatScene {
     const colAttr = new THREE.BufferAttribute(new Float32Array(pos.count * 3), 3);
     geo.setAttribute('color', colAttr);
 
-    const horizon = new THREE.Color(SPAL.skyHorizon);
+    // F1: the horizon was called washed/banded — pull the rim a HAIR cooler
+    // (skyHorizon toward skyZenith, 6% — still pale, the fog still fuses into
+    // it) and deepen the zenith (skyZenith -> ink 0.22 -> 0.30). All SPAL
+    // lerps, no new hex.
+    const horizon = new THREE.Color(mix(SPAL.skyHorizon, SPAL.skyZenith, 0.06));
     const zenith = new THREE.Color(SPAL.skyZenith);
     // deeper top-of-frame blue: zenith pulled toward ink so the upper half of
     // the dome reads as SKY, not a washed-out extension of the snowfield
-    const zenithDeep = new THREE.Color(mix(SPAL.skyZenith, SPAL.ink, 0.22));
-    const below = new THREE.Color(SPAL.skyHorizon).lerp(new THREE.Color(SPAL.snowShade), 0.55);
+    const zenithDeep = new THREE.Color(mix(SPAL.skyZenith, SPAL.ink, 0.30));
+    // distant snow land below the horizon — starts from the cooled rim so the
+    // y=0 seam stays continuous, then sinks into snowShade
+    const below = horizon.clone().lerp(new THREE.Color(SPAL.snowShade), 0.55);
     const warmGlow = new THREE.Color(SPAL.sunWarm);
     const c = new THREE.Color();
     const dir = new THREE.Vector3();

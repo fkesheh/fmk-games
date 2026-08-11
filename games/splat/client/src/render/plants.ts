@@ -5,8 +5,8 @@
 //   pine  = 5 tiers (pineDark -> pine -> pineLit) on a stub bark trunk — the
 //           LOWEST tier sags outward (the weight-of-snow droop), every tier
 //           carries TWO snow caps (flat + a smaller nested mid-shoulder one)
-//           plus the apex tip and a base dust ring, and each instance leans
-//           slightly (deterministic rot.z) so no two pines stand upright;
+//           plus the apex tip and a base dust ring, and every instance leans
+//           slightly (deterministic rot.z) so no two plants stand bolt-upright;
 //   bush  = 5 squashed foliage blobs (shrub/shrubDark/shrubLit) incl. a
 //           trailing shadow-side blob + top highlight, layered snow caps on
 //           each, and bare shrubDark twig tips poking through the snow;
@@ -16,7 +16,14 @@
 // An InstancedMesh carries exactly one material, so each archetype is merged
 // into a single vertex-coloured geometry (all colours traced from SPAL) and
 // drawn with one shared vertexColors Lambert: 3 draw calls for every plant on
-// the mountain.
+// the mountain. Per-instance colour rides the SAME instanced draw: each plant
+// picks one of its kind's frozen SPAL entries (pine/pineDark/pineLit for
+// pines, the shrub tiers, the thorn tiers) via the seeded rng and the shared
+// Lambert multiplies a mix of that entry with snowLit-white (the contract's
+// "two SPAL entries" colour path) — so the green field is less uniform and no
+// two plants read identical. The snowLit dust caps stay PURE white under the
+// tint: a baked per-vertex `snowFlag` (1.0 on snowLit vertices) makes the
+// shader skip the instanceColor multiply for exactly those vertices.
 //
 // hitPlant(plantIx) squashes/shakes that one instance for ~0.4 s (plants are
 // NOT consumed — the sim re-arms them). update(dt, camZ) advances hit anims
@@ -46,6 +53,22 @@ const mat: MatFn = (hex: string) => {
 /** One material for every plant instance on the mountain (vertex colours). */
 const plantMat = new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true });
 
+// Per-instance SPAL tint (F3): keep the built-in vertex-colour × instance-colour
+// multiply for foliage, then mix BACK to the baked colour where snowFlag is set
+// — so snowLit dust stays bright white while each plant's green varies. GLSL3:
+// three's prefix `#define attribute in` converts the attribute declaration.
+plantMat.onBeforeCompile = (shader) => {
+  shader.vertexShader =
+    'attribute float snowFlag;\n' +
+    shader.vertexShader.replace(
+      '#include <color_vertex>',
+      `#include <color_vertex>
+      #ifdef USE_INSTANCING_COLOR
+        vColor.rgb = mix(vColor.rgb * instanceColor.rgb, vColor.rgb, snowFlag);
+      #endif`,
+    );
+};
+
 const KINDS: readonly PlantKind[] = ['pine', 'bush', 'thorn'];
 const CULL_M = 150; // contract: instances beyond 150 m scaled to zero
 const HIT_S = 0.4; // squash/shake duration (s)
@@ -56,6 +79,9 @@ const TAU = Math.PI * 2;
 const _e = new THREE.Euler();
 const _m = new THREE.Matrix4();
 const _v = new THREE.Vector3();
+// Scratch colours for the per-instance SPAL tint mix (build-time only).
+const _c1 = new THREE.Color();
+const _c2 = new THREE.Color();
 
 // ---------------------------------------------------------------------------
 // Archetype prototypes (feet at y=0, facing arbitrary — instanced yaw varies).
@@ -78,12 +104,12 @@ function pineProto(): THREE.Group {
   ];
   for (const [r, h, y, hex] of tiers) {
     g.add(at(cone(mat, r, h, 7, hex), 0, y + h / 2, 0));
-    // Flat snow dust cap on the tier's shoulder (radius matched to the cone's
-    // taper at that height, plus a lip).
-    g.add(at(cone(mat, r * 0.45 + 0.07, 0.1, 6, SPAL.snowLit), 0, y + h * 0.55, 0));
+    // Flat snow dust cap on the tier's shoulder — BIGGER lip and taller than R1
+    // so the caps read as deep powder even at a distance (F3).
+    g.add(at(cone(mat, r * 0.5 + 0.09, 0.12, 6, SPAL.snowLit), 0, y + h * 0.55, 0));
     // Nested cap at the tier's mid-shoulder: smaller and snugger against the
     // taper, so the snow reads DEEP on every tier.
-    g.add(at(cone(mat, r * 0.32 + 0.02, 0.06, 6, SPAL.snowLit), 0, y + h * 0.68, 0));
+    g.add(at(cone(mat, r * 0.38 + 0.04, 0.07, 6, SPAL.snowLit), 0, y + h * 0.68, 0));
   }
   // LOWEST tier: two drooping skirt cones — tilted ~0.25 rad outward and with
   // their bases dropped below the first upright tier, the weight-of-snow read.
@@ -98,14 +124,15 @@ function pineProto(): THREE.Group {
     const arm = new THREE.Group();
     arm.rotation.x = 0.25; // the droop: sag outward from the trunk
     arm.add(at(cone(mat, r, h, 7, hex), 0, h / 2, 0));
-    arm.add(at(cone(mat, r * 0.45 + 0.07, 0.1, 6, SPAL.snowLit), 0, h * 0.55, 0));
-    arm.add(at(cone(mat, r * 0.32 + 0.02, 0.06, 6, SPAL.snowLit), 0, h * 0.68, 0));
+    arm.add(at(cone(mat, r * 0.5 + 0.09, 0.12, 6, SPAL.snowLit), 0, h * 0.55, 0));
+    arm.add(at(cone(mat, r * 0.38 + 0.04, 0.07, 6, SPAL.snowLit), 0, h * 0.68, 0));
     pivot.add(arm);
     g.add(pivot);
   }
-  // Snow tip on the apex + a dust ring where the skirt meets the ground.
-  g.add(at(cone(mat, 0.07, 0.18, 5, SPAL.snowLit), 0, 1.66 + 0.48 - 0.02, 0));
-  g.add(at(cone(mat, 0.5, 0.09, 6, SPAL.snowLit), 0, 0.15, 0));
+  // Snow tip on the apex + a dust ring where the skirt meets the ground (both
+  // upsized so the crown and the base contact read at distance — F3).
+  g.add(at(cone(mat, 0.09, 0.22, 5, SPAL.snowLit), 0, 1.66 + 0.48 - 0.02, 0));
+  g.add(at(cone(mat, 0.6, 0.11, 6, SPAL.snowLit), 0, 0.15, 0));
   return g;
 }
 
@@ -127,15 +154,15 @@ function bushProto(): THREE.Group {
   // Layered snow caps on every blob: a flat cap on the blob top + a smaller
   // nested tuft — the deep-dust read (caps sit slightly proud of the foliage).
   const caps: ReadonlyArray<readonly [number, number, number, number]> = [
-    [0, 0, 0.579, 0.3], // main
-    [0.38, 0.16, 0.388, 0.22], // side dark
-    [-0.33, -0.18, 0.44, 0.2], // side lit
-    [-0.55, -0.24, 0.29, 0.18], // trailing
-    [0.08, -0.22, 0.686, 0.17], // top highlight
+    [0, 0, 0.579, 0.38], // main
+    [0.38, 0.16, 0.388, 0.28], // side dark
+    [-0.33, -0.18, 0.44, 0.26], // side lit
+    [-0.55, -0.24, 0.29, 0.23], // trailing
+    [0.08, -0.22, 0.686, 0.21], // top highlight
   ];
   for (const [x, z, top, cr] of caps) {
     g.add(blob(cr, SPAL.snowLit, x, top - 0.02, z, 0.32));
-    g.add(blob(cr * 0.55, SPAL.snowLit, x, top - 0.02 + cr * 0.32, z, 0.3));
+    g.add(blob(cr * 0.6, SPAL.snowLit, x, top - 0.02 + cr * 0.32, z, 0.3));
   }
   // Exposed twig tips on the shadow side, poking through the snow.
   const twig = (x: number, y: number, z: number, rx: number, rz: number): THREE.Mesh => {
@@ -192,11 +219,11 @@ function thornProto(): THREE.Group {
     pivot.rotation.set(0, yaw, 0);
     const arm = new THREE.Group();
     arm.rotation.x = tilt;
-    arm.add(at(sphere(mat, 0.06, 6, SPAL.snowLit), 0, len * f, 0));
+    arm.add(at(sphere(mat, 0.075, 6, SPAL.snowLit), 0, len * f, 0));
     pivot.add(arm);
     g.add(pivot);
   }
-  g.add(at(sphere(mat, 0.07, 6, SPAL.snowLit), 0.13, 0.06, 0.09));
+  g.add(at(sphere(mat, 0.085, 6, SPAL.snowLit), 0.13, 0.06, 0.09));
   return g;
 }
 
@@ -225,6 +252,7 @@ function mergeVertexColored(root: THREE.Group): THREE.BufferGeometry {
   const pos = new Float32Array(vCount * 3);
   const nor = new Float32Array(vCount * 3);
   const col = new Float32Array(vCount * 3);
+  const snow = new Float32Array(vCount); // 1.0 on snowLit-white vertices (F3 shader)
   const ind = new Uint32Array(iCount);
   let vOff = 0;
   let iOff = 0;
@@ -252,6 +280,7 @@ function mergeVertexColored(root: THREE.Group): THREE.BufferGeometry {
       col[(vOff + i) * 3] = color.r;
       col[(vOff + i) * 3 + 1] = color.g;
       col[(vOff + i) * 3 + 2] = color.b;
+      snow[vOff + i] = color.r >= 0.999 && color.g >= 0.999 && color.b >= 0.999 ? 1 : 0;
     }
     const idx = geo.getIndex();
     if (idx === null) {
@@ -267,6 +296,7 @@ function mergeVertexColored(root: THREE.Group): THREE.BufferGeometry {
   out.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   out.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
   out.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  out.setAttribute('snowFlag', new THREE.BufferAttribute(snow, 1));
   out.setIndex(new THREE.BufferAttribute(ind, 1));
   return out;
 }
@@ -288,7 +318,7 @@ interface KindField {
   readonly py: Float32Array;
   readonly pz: Float32Array;
   readonly rot: Float32Array; // base yaw per instance
-  readonly lean: Float32Array; // base tilt per instance (pines only — rot.z)
+  readonly lean: Float32Array; // base tilt per instance (rot.z, all kinds)
   readonly scl: Float32Array; // base uniform scale per instance
   readonly band: Int32Array; // instance -> z band
   readonly bandStart: Int32Array; // band -> first instance (instances z-sorted)
@@ -321,8 +351,25 @@ export class PlantField {
       thorn: thornProto,
     };
     const sink: Record<PlantKind, number> = { pine: 0.05, bush: 0.22, thorn: 0.06 };
-    const scaleLo: Record<PlantKind, number> = { pine: 0.65, bush: 0.7, thorn: 0.8 };
-    const scaleHi: Record<PlantKind, number> = { pine: 1.15, bush: 1.2, thorn: 1.25 };
+    // Wider scale ranges (F3): dwarf to oversized reads so the field never
+    // reads uniform — the sim's hit radii are untouched, so gameplay is exact.
+    const scaleLo: Record<PlantKind, number> = { pine: 0.55, bush: 0.6, thorn: 0.65 };
+    const scaleHi: Record<PlantKind, number> = { pine: 1.35, bush: 1.3, thorn: 1.4 };
+    // Per-kind rot.z lean amplitude (F3): every plant leans its own way.
+    const leanAmt: Record<PlantKind, number> = { pine: 0.09, bush: 0.14, thorn: 0.12 };
+    // Per-instance SPAL tint (F3): the frozen entries each kind may lean toward
+    // (weighted — the mid tone is most common), mixed with snowLit-white by a
+    // seeded strength so the hue/value jitter stays SLIGHT and never a new hex.
+    const tintSet: Record<PlantKind, readonly string[]> = {
+      pine: [SPAL.pine, SPAL.pineDark, SPAL.pineLit],
+      bush: [SPAL.shrub, SPAL.shrubDark, SPAL.shrubLit],
+      thorn: [SPAL.thorn, SPAL.thornLit],
+    };
+    const tintW: Record<PlantKind, readonly number[]> = {
+      pine: [0.45, 0.3, 0.25],
+      bush: [0.5, 0.25, 0.25],
+      thorn: [0.55, 0.45],
+    };
 
     for (let k = 0; k < KINDS.length; k++) {
       const kind = KINDS[k];
@@ -362,10 +409,29 @@ export class PlantField {
         pz[i] = p.z;
         py[i] = slope.height(p.x, p.z) - sink[kind];
         rot[i] = next() * TAU;
-        // Pines lean slightly (deterministic rot.z, max ~0.06 rad) so no two
-        // stand bolt-upright; bushes/thorns stay level.
-        lean[i] = kind === 'pine' ? (next() * 2 - 1) * 0.06 : 0;
+        // Every plant leans its own way (deterministic rot.z) — wind-bent pines,
+        // squat-drunk bushes, kicked thorns.
+        lean[i] = (next() * 2 - 1) * leanAmt[kind];
         scl[i] = scaleLo[kind] + next() * (scaleHi[kind] - scaleLo[kind]);
+        // Pick one of the kind's frozen SPAL entries (weighted via the seeded
+        // rng), then mix toward snowLit-white by a seeded strength so the jitter
+        // is slight; the snowFlag shader keeps the snowLit caps pure white.
+        {
+          const set = tintSet[kind];
+          const w = tintW[kind];
+          let u = next();
+          let pick = 0;
+          for (let j = 0; j < (set?.length ?? 1); j++) {
+            u -= w?.[j] ?? 0;
+            if (u <= 0) {
+              pick = j;
+              break;
+            }
+          }
+          const strength = 0.25 + next() * 0.2; // 0.25–0.45
+          const tint = _c1.set(set?.[pick] ?? SPAL.pine).lerp(_c2.set(SPAL.snowLit), 1 - strength);
+          mesh.setColorAt(i, tint);
+        }
         const b = Math.floor(p.z / PLANT_BAND_M);
         band[i] = b;
         if (b > maxBand) maxBand = b;
@@ -397,6 +463,7 @@ export class PlantField {
       };
       for (let i = 0; i < count; i++) this.compose(field, i, 1, 0, false);
       mesh.instanceMatrix.needsUpdate = true;
+      if (mesh.instanceColor !== null) mesh.instanceColor.needsUpdate = true;
       this.fields.push(field);
       world.add(mesh);
     }

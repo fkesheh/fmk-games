@@ -23,6 +23,14 @@
 //     the deeper powder), snow banks tucked against the piste edges (baked),
 //     angular-fractured outcrops + small debris, and a nearer foothill depth
 //     plane between the peak cards and the run.
+//   * F2 (density + midground): ~12 more angular outcrop clusters closer to
+//     the piste, 30 extra small debris, runout drift banks hugging the meadow,
+//     3-5 lone mature pines INSIDE the piste edge band (dressing, never
+//     colliders — every prop keeps |x| >= DRESSING_X_MIN, > 4 m off the
+//     corridor weave, and clear of the plants), and a broken near-foothill
+//     skyline (mixed jagged/round cards + peak boosts). All grounded at
+//     terrain height - sink; total visual instances stay <= 3k, draw calls
+//     stay < 80.
 // ============================================================================
 import * as THREE from 'three';
 import { rng, rngInt, rngRange } from '@platform/shared';
@@ -64,13 +72,28 @@ const BANK_CLUSTERS_MAX = 16;
 const BANK_SIZE_MIN = 3;
 const BANK_SIZE_MAX = 5;
 const BANK_CLEAR = 2.5; // a bank never covers a plant (visual dressing, no collisions)
-const BANK_MESH_CAP = 120; // source meshes before bake() — the brief's modest budget
+const BANK_MESH_CAP = 160; // source meshes before bake() — F2 adds runout drift
+                           // banks; the cap still bounds the baked merge budget
+const RUNOUT_BANK_CLUSTERS = 5; // F2: a few drift banks hugging the runout (edges only)
 
 // ---- ridge rocks ------------------------------------------------------------------
 const ROCK_CLUSTERS = 14;
 const ROCK_IN = 8; // outcrops start this far beyond the piste edge
 const ROCK_SPREAD = 16; // ...and scatter this much farther out
 const DEBRIS_COUNT = 20; // v2.2 small debris rocks near the piste edge
+// ---- F2 midground dressing (density round) ----------------------------------------------
+const ROCK_CLUSTERS_EDGE = 12; // ~10-14 more angular outcrops NEARER the piste
+const ROCK_EDGE_IN = 2; // the closer pass starts right at the skirt lip
+const ROCK_EDGE_SPREAD = 12; // ...and reaches only partway up the skirt wall
+const DEBRIS_COUNT_EDGE = 30; // extra scattered small debris (foreground scale)
+const DEBRIS_PLANT_CLEAR = 1.0; // a debris rock never covers a plant (tiny -> small margin)
+const DRESSING_X_MIN = 24.5; // corridor law: the weave centreline |c| <= 20 m, so |x| >=
+                             // 24.5 keeps EVERY dressing prop > 4 m off the skier's line
+                             // (F2: visual only, never inside the corridor or a plant)
+const EDGE_PINE_MIN = 3; // lone mature pines inside the piste edge band...
+const EDGE_PINE_MAX = 5; // ...3-5 per mountain, seeded
+const EDGE_PINE_CLEAR = 2.5; // a pine never crowds a gameplay plant (r + this)
+const EDGE_PINE_GATE_CLEAR = 6; // ...or crowds a slalom gate's doorway read
 
 // ---- horizon peak cards -------------------------------------------------------------
 const PEAK_COUNT = 16;
@@ -414,8 +437,8 @@ function buildForest(slope: SlopeDef, material: THREE.Material): THREE.Group {
  *  (mostly outside halfW - 2, a couple near the start). VISUAL ONLY — never
  *  inside the corridor and never covering a plant. Squashed snowShade
  *  half-spheres (scale y ~0.35) with a snowLit wind-scallop cap, clustered
- *  3-5 like the plants; ~12-16 clusters, <= 120 source meshes, then baked
- *  to two draw calls. */
+ *  3-5 like the plants; ~12-16 piste-edge clusters + F2 runout drift clusters,
+ *  <= BANK_MESH_CAP source meshes, then baked to two draw calls. */
 function buildSnowBanks(slope: SlopeDef): THREE.Group {
   const halfW = slope.width / 2;
   const next = rng(slope.seed ^ 0xb3a7);
@@ -455,67 +478,188 @@ function buildSnowBanks(slope: SlopeDef): THREE.Group {
       meshes++;
     }
   }
+  // F2: a few seeded drift banks hugging the RUNOUT — the flat meadow past the
+  // line stays empty unless we seed it. Tucked against the piste edges (|x| >= 25.5,
+  // so > 4 m off the corridor weave) and beyond the finish sprint (z > finishZ - 20
+  // — plant-free there by construction; the guard is kept anyway). Base =
+  // groundHeight - sink, so every mound sits ON the snow, never a floater.
+  for (let cIx = 0; cIx < RUNOUT_BANK_CLUSTERS && meshes < BANK_MESH_CAP; cIx++) {
+    const side = cIx % 2 === 0 ? -1 : 1;
+    const cz = rngRange(next, slope.finishZ - 20, slope.finishZ + 120);
+    const cx = side * rngRange(next, halfW - 2.5, halfW - 1);
+    if (Math.abs(cx) < DRESSING_X_MIN) continue; // corridor law
+    const n = rngInt(next, BANK_SIZE_MIN, BANK_SIZE_MAX);
+    for (let b = 0; b < n && meshes < BANK_MESH_CAP; b++) {
+      const bx = cx + rngRange(next, -2.5, 2.5);
+      const bz = cz + rngRange(next, -4, 4);
+      if (Math.abs(bx) < DRESSING_X_MIN) continue; // corridor law
+      if (!clearOfPlants(bx, bz)) continue; // dressing never covers a plant
+      const r = rngRange(next, 1.6, 3.6); // runout drifts read a touch broader
+      const baseY = groundHeight(slope, bx, bz);
+      const bank = sphere(mat, r, 6, SPAL.snowShade);
+      bank.scale.set(1, 0.35, 1);
+      bank.rotation.y = next() * TAU;
+      g.add(at(bank, bx, baseY - r * 0.3, bz));
+      meshes++;
+      const cap = sphere(mat, r * 1.12, 6, SPAL.snowLit);
+      cap.scale.set(1, 0.18, 1);
+      cap.rotation.y = next() * TAU;
+      g.add(at(cap, bx, baseY + r * 0.12, bz + r * 0.18));
+      meshes++;
+    }
+  }
   return bake(g);
 }
 
-/** Ridge-line rock outcrops on the rising skirt, snow-dusted, baked. v2.2:
- *  angular fracture — each boulder is 2-3 interlocking squashed masses in
- *  rockLit/rock (spheres and boxes so facets catch the low sun), with a
- *  snowLit snow skirt on the uphill face and a snowShade shadow crease at
- *  the base — plus ~20 small debris rocks near the piste edge for foreground
- *  scale. Still baked to a handful of draw calls. */
-function buildRocks(slope: SlopeDef): THREE.Group {
-  const halfW = slope.width / 2;
-  const next = rng(slope.seed ^ 0x9e37);
-  const g = new THREE.Group();
-  for (let cIx = 0; cIx < ROCK_CLUSTERS; cIx++) {
-    const side = cIx % 2 === 0 ? -1 : 1;
-    const cz = rngRange(next, 20, slope.finishZ + 80);
-    const cx = side * (halfW + ROCK_IN + rngRange(next, 0, ROCK_SPREAD));
-    const nBoulders = rngInt(next, 2, 5);
-    for (let b = 0; b < nBoulders; b++) {
-      const r = rngRange(next, 0.9, 3.2);
-      const bx = cx + rngRange(next, -4, 4);
-      const bz = cz + rngRange(next, -6, 6);
-      const baseY = groundHeight(slope, bx, bz);
-      const mainHex = next() < 0.5 ? SPAL.rock : SPAL.rockLit;
-      const chunkHex = mainHex === SPAL.rock ? SPAL.rockLit : SPAL.rock;
-      // main mass: squashed sphere or a box, tilted so facets catch the sun
-      const main =
-        next() < 0.6
-          ? sphere(mat, r, 5, mainHex)
-          : box(mat, r * 1.9, r * 1.15, r * 1.5, mainHex);
-      main.scale.set(1, rngRange(next, 0.55, 0.85), 1);
-      main.rotation.set(rngRange(next, -0.2, 0.2), next() * TAU, rngRange(next, -0.2, 0.2));
-      g.add(at(main, bx, baseY - r * 0.35, bz));
-      // fracture chunks: 1-2 interlocking smaller masses, the other rock tone
-      const nChunks = rngInt(next, 1, 2);
-      for (let f = 0; f < nChunks; f++) {
-        const fr = r * rngRange(next, 0.3, 0.55);
-        const chunk =
-          next() < 0.5
-            ? sphere(mat, fr, 5, chunkHex)
-            : box(mat, fr * 2, fr * 1.4, fr * 1.7, chunkHex);
-        chunk.rotation.set(rngRange(next, -1, 1), next() * TAU, rngRange(next, -1, 1));
-        g.add(at(chunk, bx + rngRange(next, -0.75, 0.75) * r, baseY - fr * 0.45 + rngRange(next, 0, r * 0.4), bz + rngRange(next, -0.3, 0.8) * r));
-      }
-      // snow skirt on the uphill face (toward -z): a larger flattened cap
-      const skirt = sphere(mat, r * 1.15, 5, SPAL.snowLit);
-      skirt.scale.set(1, 0.28, 1);
-      skirt.rotation.y = next() * TAU;
-      g.add(at(skirt, bx, baseY + r * 0.2, bz - r * 0.45));
-      // shadow crease at the base (downhill side reads as the snow contact)
-      const crease = sphere(mat, r * 1.05, 5, SPAL.snowShade);
-      crease.scale.set(1, 0.1, 1);
-      crease.rotation.y = next() * TAU;
-      g.add(at(crease, bx, baseY - r * 0.16, bz + r * 0.3));
-    }
-  }
-  // small debris rocks near the piste edge — foreground scale at speed
-  for (let d = 0; d < DEBRIS_COUNT; d++) {
+/** F2: 3-5 lone MATURE pines inside the piste edge band — midground dressing,
+ *  never colliders. The same fir archetype as the forest walls, scaled up.
+ *  Corridor law: the weave centreline |c| <= 20 m, so every pine keeps |x| >=
+ *  DRESSING_X_MIN (>= 24.5 m -> > 4 m off the skier's line) and >= plant.r +
+ *  EDGE_PINE_CLEAR from every gameplay plant (and >= 6 m from a slalom gate's
+ *  doorway so the tree never crowds the slalom read). Trunks sit FOREST_SINK
+ *  INTO the snow — grounded, never floating. One InstancedMesh, one draw. */
+function buildEdgePines(slope: SlopeDef, material: THREE.Material): THREE.Group | null {
+  const next = rng(slope.seed ^ 0x7c2e);
+  const n = rngInt(next, EDGE_PINE_MIN, EDGE_PINE_MAX);
+  const px: number[] = [];
+  const py: number[] = [];
+  const pz: number[] = [];
+  const rot: number[] = [];
+  const scl: number[] = [];
+  let guard = 0;
+  while (px.length < n && guard < 128) {
+    guard++;
     const side = next() < 0.5 ? -1 : 1;
-    const dz = rngRange(next, 8, slope.finishZ + 60);
-    const dx = side * rngRange(next, halfW - 10, halfW - 2.5);
+    const x = side * rngRange(next, slope.width / 2 - 3.5, slope.width / 2 - 1);
+    const z = rngRange(next, 40, slope.finishZ - 30);
+    if (Math.abs(x) < DRESSING_X_MIN) continue; // corridor law (> 4 m off the line)
+    let ok = true;
+    for (const pl of slope.plants) {
+      const dx = pl.x - x;
+      const dz = pl.z - z;
+      if (dx * dx + dz * dz < (pl.r + EDGE_PINE_CLEAR) * (pl.r + EDGE_PINE_CLEAR)) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      for (const gate of slope.gates) {
+        const dx = gate.x - x;
+        const dz = gate.z - z;
+        if (dx * dx + dz * dz < EDGE_PINE_GATE_CLEAR * EDGE_PINE_GATE_CLEAR) {
+          ok = false;
+          break;
+        }
+      }
+    }
+    if (!ok) continue; // plant + gate clearance
+    px.push(x);
+    pz.push(z);
+    py.push(groundHeight(slope, x, z) - FOREST_SINK); // sunk into the snow
+    rot.push(next() * TAU);
+    scl.push(rngRange(next, 0.9, 1.4)); // mature fir: ~4.7-7.3 m tall
+  }
+  if (px.length === 0) return null;
+  const mesh = new THREE.InstancedMesh(buildForestGeometry(), material, px.length);
+  const dummy = new THREE.Object3D();
+  for (let i = 0; i < px.length; i++) {
+    dummy.position.set(px[i] ?? 0, py[i] ?? 0, pz[i] ?? 0);
+    dummy.rotation.y = rot[i] ?? 0;
+    const s = scl[i] ?? 1;
+    dummy.scale.set(s, s, s);
+    dummy.updateMatrix();
+    mesh.setMatrixAt(i, dummy.matrix);
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  mesh.frustumCulled = false; // spans the run; the bounding sphere lies
+  const g = new THREE.Group();
+  g.add(mesh);
+  return g;
+}
+
+/** One angular rock outcrop cluster: 2-5 interlocking squashed boulders in
+ *  rockLit/rock (spheres and boxes so facets catch the low sun), each with
+ *  1-2 fracture chunks of the other tone, a snowLit snow skirt on the uphill
+ *  face and a snowShade shadow crease at the base — the STYLE_BIBLE angular
+ *  fracture read. Ground contact is base = groundHeight - sink (never a
+ *  floater); the skirt and crease are nudged INTO the snow, no z-fighting. */
+function scatterRockCluster(
+  next: () => number,
+  g: THREE.Group,
+  slope: SlopeDef,
+  cx: number,
+  cz: number,
+): void {
+  const nBoulders = rngInt(next, 2, 5);
+  for (let b = 0; b < nBoulders; b++) {
+    const r = rngRange(next, 0.9, 3.2);
+    const bx = cx + rngRange(next, -4, 4);
+    const bz = cz + rngRange(next, -6, 6);
+    const baseY = groundHeight(slope, bx, bz);
+    const mainHex = next() < 0.5 ? SPAL.rock : SPAL.rockLit;
+    const chunkHex = mainHex === SPAL.rock ? SPAL.rockLit : SPAL.rock;
+    // main mass: squashed sphere or a box, tilted so facets catch the sun
+    const main =
+      next() < 0.6
+        ? sphere(mat, r, 5, mainHex)
+        : box(mat, r * 1.9, r * 1.15, r * 1.5, mainHex);
+    main.scale.set(1, rngRange(next, 0.55, 0.85), 1);
+    main.rotation.set(rngRange(next, -0.2, 0.2), next() * TAU, rngRange(next, -0.2, 0.2));
+    g.add(at(main, bx, baseY - r * 0.35, bz));
+    // fracture chunks: 1-2 interlocking smaller masses, the other rock tone
+    const nChunks = rngInt(next, 1, 2);
+    for (let f = 0; f < nChunks; f++) {
+      const fr = r * rngRange(next, 0.3, 0.55);
+      const chunk =
+        next() < 0.5
+          ? sphere(mat, fr, 5, chunkHex)
+          : box(mat, fr * 2, fr * 1.4, fr * 1.7, chunkHex);
+      chunk.rotation.set(rngRange(next, -1, 1), next() * TAU, rngRange(next, -1, 1));
+      g.add(at(chunk, bx + rngRange(next, -0.75, 0.75) * r, baseY - fr * 0.45 + rngRange(next, 0, r * 0.4), bz + rngRange(next, -0.3, 0.8) * r));
+    }
+    // snow skirt on the uphill face (toward -z): a larger flattened cap —
+    // sunk (baseY + 0.2r with the 0.28 squash puts its belly below grade)
+    const skirt = sphere(mat, r * 1.15, 5, SPAL.snowLit);
+    skirt.scale.set(1, 0.28, 1);
+    skirt.rotation.y = next() * TAU;
+    g.add(at(skirt, bx, baseY + r * 0.2, bz - r * 0.45));
+    // shadow crease at the base (downhill side reads as the snow contact)
+    const crease = sphere(mat, r * 1.05, 5, SPAL.snowShade);
+    crease.scale.set(1, 0.1, 1);
+    crease.rotation.y = next() * TAU;
+    g.add(at(crease, bx, baseY - r * 0.16, bz + r * 0.3));
+  }
+}
+
+/** Small debris rocks near the piste edge — foreground scale at speed. Every
+ *  rock sits ON the terrain (base = groundHeight - sink) and keeps out of the
+ *  corridor (|x| >= DRESSING_X_MIN) and off the plants. */
+function scatterDebris(
+  next: () => number,
+  g: THREE.Group,
+  slope: SlopeDef,
+  count: number,
+  zLo: number,
+  zHi: number,
+): void {
+  for (let d = 0; d < count; d++) {
+    const side = next() < 0.5 ? -1 : 1;
+    const dz = rngRange(next, zLo, zHi);
+    const dx = side * rngRange(next, slope.width / 2 - 3.5, slope.width / 2 - 1);
+    if (Math.abs(dx) < DRESSING_X_MIN) continue; // corridor law
+    // plant clearance: a debris rock never sits on a gameplay plant
+    let ok = true;
+    for (const pl of slope.plants) {
+      const ddx = pl.x - dx;
+      const ddz = pl.z - dz;
+      if (ddx * ddx + ddz * ddz < (pl.r + DEBRIS_PLANT_CLEAR) * (pl.r + DEBRIS_PLANT_CLEAR)) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) continue;
     const dr = rngRange(next, 0.15, 0.3); // 0.3-0.6 m across
     const hex = next() < 0.5 ? SPAL.rock : SPAL.rockLit;
     const deb =
@@ -525,6 +669,41 @@ function buildRocks(slope: SlopeDef): THREE.Group {
     deb.rotation.set(rngRange(next, -0.7, 0.7), next() * TAU, rngRange(next, -0.7, 0.7));
     g.add(at(deb, dx, groundHeight(slope, dx, dz) - dr * 0.4, dz));
   }
+}
+
+/** Ridge-line + F2 midground rock outcrops on the rising skirt, snow-dusted,
+ *  baked to a handful of draw calls (rock / rockLit / snowLit / snowShade —
+ *  no new materials, so no new draw calls). Two cluster passes (ridge-line
+ *  far, midground near the piste) + two debris passes — all seeded, all off
+ *  the corridor, all grounded. */
+function buildRocks(slope: SlopeDef): THREE.Group {
+  const halfW = slope.width / 2;
+  const g = new THREE.Group();
+  // existing ridge-line pass: outcrops up the skirt wall (kept)
+  {
+    const next = rng(slope.seed ^ 0x9e37);
+    for (let cIx = 0; cIx < ROCK_CLUSTERS; cIx++) {
+      const side = cIx % 2 === 0 ? -1 : 1;
+      const cz = rngRange(next, 20, slope.finishZ + 80);
+      const cx = side * (halfW + ROCK_IN + rngRange(next, 0, ROCK_SPREAD));
+      scatterRockCluster(next, g, slope, cx, cz);
+    }
+  }
+  // F2: ~12 MORE angular outcrops NEARER the piste edge — midground interest
+  // at race speed, right at the tree line (halfW + 2 .. halfW + 14, on the
+  // skirt where the terrain rises out of the groomed corridor)
+  {
+    const next = rng(slope.seed ^ 0x7a1c);
+    for (let cIx = 0; cIx < ROCK_CLUSTERS_EDGE; cIx++) {
+      const side = cIx % 2 === 0 ? -1 : 1;
+      const cz = rngRange(next, 30, slope.finishZ + 60);
+      const cx = side * (halfW + ROCK_EDGE_IN + rngRange(next, 0, ROCK_EDGE_SPREAD));
+      scatterRockCluster(next, g, slope, cx, cz);
+    }
+  }
+  // small debris near the piste edge — foreground scale at speed (two passes)
+  scatterDebris(rng(slope.seed ^ 0x4d8b), g, slope, DEBRIS_COUNT, 8, slope.finishZ + 60);
+  scatterDebris(rng(slope.seed ^ 0x9f2e), g, slope, DEBRIS_COUNT_EDGE, 30, slope.finishZ + 100);
   return bake(g);
 }
 
@@ -532,7 +711,17 @@ function buildRocks(slope: SlopeDef): THREE.Group {
  *  fog:false with the haze BAKED into the vertex colours — FogExp2 would
  *  otherwise reduce them to invisible fog rectangles. §2.5-exempt geometry;
  *  every colour is a SPAL lerp toward skyHorizon. `round` swaps the jagged
- *  far-peak polyline for the lower, rounder foothill profile. */
+ *  far-peak polyline for the lower, rounder foothill profile; `opts` lets a
+ *  round ring mix in jagged cards and per-card height boosts (F2 skyline). */
+interface PeakRingOpts {
+  /** Share of cards that switch to the jagged polyline (round rings only). */
+  jaggedChance?: number;
+  /** Share of cards that get a peak boost (break the flat band). */
+  peakBoostChance?: number;
+  /** Max extra height a boosted card gains, as a fraction of its height. */
+  peakBoostMax?: number;
+}
+
 function buildPeakRing(
   slope: SlopeDef,
   salt: number,
@@ -548,6 +737,7 @@ function buildPeakRing(
   hazeBase: THREE.Color,
   hazeTop: THREE.Color,
   round: boolean,
+  opts?: PeakRingOpts,
 ): THREE.Mesh {
   const next = rng(slope.seed ^ salt);
 
@@ -569,24 +759,32 @@ function buildPeakRing(
     const lx = Math.cos(az);
     const lz = -Math.sin(az);
     const w = rngRange(next, wMin, wMax);
-    const h = rngRange(next, hMin, hMax);
+    let h = rngRange(next, hMin, hMax);
+    // F2: break the skyline — a share of cards rise clearly above their band
+    const boostChance = opts?.peakBoostChance;
+    if (boostChance !== undefined && next() < boostChance) {
+      h *= 1 + rngRange(next, 0, opts?.peakBoostMax ?? 0.4);
+    }
     const baseY = rngRange(next, baseYMin, baseYMax);
-    // silhouette polyline: base-left ... apex ... base-right
-    const shape: ReadonlyArray<readonly [number, number]> = round
+    // silhouette polyline: base-left ... apex ... base-right — a round ring
+    // may mix in jagged peaks so the near skyline never reads as one band
+    const jaggedChance = opts?.jaggedChance;
+    const jagged = !round || (jaggedChance !== undefined && next() < jaggedChance);
+    const shape: ReadonlyArray<readonly [number, number]> = jagged
       ? [
+          [-0.5, 0],
+          [-0.22, rngRange(next, 0.4, 0.62)],
+          [rngRange(next, -0.08, 0.08), 1],
+          [0.24, rngRange(next, 0.42, 0.66)],
+          [0.5, 0],
+        ]
+      : [
           [-0.5, 0],
           [-0.34, rngRange(next, 0.55, 0.72)],
           [-0.17, rngRange(next, 0.72, 0.86)],
           [rngRange(next, -0.05, 0.05), 1],
           [0.17, rngRange(next, 0.72, 0.86)],
           [0.34, rngRange(next, 0.55, 0.72)],
-          [0.5, 0],
-        ]
-      : [
-          [-0.5, 0],
-          [-0.22, rngRange(next, 0.4, 0.62)],
-          [rngRange(next, -0.08, 0.08), 1],
-          [0.24, rngRange(next, 0.42, 0.66)],
           [0.5, 0],
         ];
     const first = shape[0] ?? [-0.5, 0];
@@ -627,15 +825,18 @@ function buildPeakCards(slope: SlopeDef): THREE.Mesh {
 
 /** v2.2 nearer foothills: a second, rounder ridge at ~380-460 m, hazed only
  *  ~50% toward skyHorizon (the card colours mixed half with the full haze) so
- *  the world reads in three depth planes instead of two. Lower and rounder
- *  than the far peaks, fog:false like them. */
+ *  the world reads in three depth planes instead of two. F2: the skyline is
+ *  broken — a wider height band, ~40% of cards boosted 30-90% taller and
+ *  ~35% of the round cards swapped for jagged peaks, so the near ridge never
+ *  reads as one flat band. Lower than the far peaks, fog:false like them. */
 function buildFoothills(slope: SlopeDef): THREE.Mesh {
   const hazeBase = new THREE.Color(SPAL.snowShade).lerp(new THREE.Color(SPAL.skyHorizon), 0.5);
   const hazeTop = new THREE.Color(SPAL.snowLit).lerp(new THREE.Color(SPAL.skyHorizon), 0.5);
   return buildPeakRing(
     slope, 0x7e4d, FOOTHILL_COUNT,
-    380, 460, 150, 220, 70, 130, -125, -95,
+    380, 460, 150, 220, 60, 145, -135, -85,
     hazeBase, hazeTop, true,
+    { jaggedChance: 0.35, peakBoostChance: 0.4, peakBoostMax: 0.6 },
   );
 }
 
@@ -675,6 +876,8 @@ export function buildTerrain(slope: SlopeDef): THREE.Group {
   root.add(buildForest(slope, forestMaterial()));
   root.add(buildSnowBanks(slope));
   root.add(buildRocks(slope));
+  const edgePines = buildEdgePines(slope, forestMaterial());
+  if (edgePines) root.add(edgePines); // 3-5 lone mature pines in the edge band
   root.add(buildFoothills(slope));
   root.add(buildPeakCards(slope));
   return root;

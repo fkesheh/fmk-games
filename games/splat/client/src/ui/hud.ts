@@ -375,15 +375,23 @@ export class SplatHud {
     const top = RAIL_PAD;
     const bottom = RAIL_H - RAIL_PAD;
     ctx.clearRect(0, 0, RAIL_W, RAIL_H);
-    // the rail: start at top, finish at bottom
+    // the rail: start at top, finish at bottom. F4 weight: a subtle paper
+    // glow under a thin ink rail so the column reads against the bright sky.
     ctx.beginPath();
     ctx.moveTo(x, top);
     ctx.lineTo(x, bottom);
-    ctx.lineWidth = 3;
-    ctx.strokeStyle = rgba(SPAL.ink, 0.5);
+    ctx.lineWidth = 8;
+    ctx.strokeStyle = rgba(SPAL.paper, 0.3);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x, top);
+    ctx.lineTo(x, bottom);
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = rgba(SPAL.ink, 0.7);
     ctx.stroke();
     // one dot per racer in slot colour; sorted draw order = race order, you
-    // last (on top), larger with a white rim. Allocates only on a redraw.
+    // last (on top), larger, every dot paper-rimmed so it stays visible
+    // against the sky band. Allocates only on a redraw.
     const dots = [...s.racers].sort(raceOrder);
     for (const r of dots) {
       const isYou = r.slot === s.you.slot;
@@ -393,11 +401,9 @@ export class SplatHud {
       ctx.arc(x, y, isYou ? 7 : 5, 0, Math.PI * 2); // >= 10 px diameter dots
       ctx.fillStyle = s.colorFor(r.slot);
       ctx.fill();
-      if (isYou) {
-        ctx.lineWidth = 2;
-        ctx.strokeStyle = SPAL.snowLit;
-        ctx.stroke();
-      }
+      ctx.lineWidth = isYou ? 2 : 1.5;
+      ctx.strokeStyle = SPAL.snowLit;
+      ctx.stroke();
     }
   }
 

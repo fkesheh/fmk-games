@@ -25,8 +25,22 @@ const START_POLE_H = 3.2;
 
 // ---- finish gate ------------------------------------------------------------------
 const FINISH_POLE_X = 9; // wider, taller — the sprint corridor landmark
-const FINISH_POLE_H = 8.4; // ~2x the start gate — monumental, readable at 200 m
+const FINISH_POLE_H = 8.8; // ~2.75x the start gate — monumental, readable at 200 m (judge F5: slightly taller)
 const FINISH_BULK = 1.9; // pole/flag bulk multiplier vs the start gate
+// banner centre as a fraction of pole height — raised clear of the ground haze
+// band so the gold panel reads as a banner against the sky, not a ribbon lost
+// in the fog (judge F5)
+const FINISH_BANNER_Y = 0.66;
+// finish grounding (judge F5): small snowLit rocks hugging the pole feet + a
+// pair of tiny sunGold foot flags. All tucked at/outside the poles
+// (|x| >= FINISH_POLE_X), never inside the run corridor.
+const FINISH_ROCKS: ReadonlyArray<readonly [number, number, number]> = [
+  // [x, zOff, r] — zOff positive = downhill of the line
+  [-FINISH_POLE_X - 0.8, 0.25, 0.55],
+  [FINISH_POLE_X + 0.8, 0.25, 0.55],
+  [-FINISH_POLE_X - 1.7, -0.35, 0.4],
+];
+const FINISH_FOOT_FLAG_H = 1.05; // tiny bark pole height at each gate foot (m)
 
 // ---- lodge ---------------------------------------------------------------------------
 const LODGE_X = 14; // beside the runout, NOT blocking it
@@ -134,11 +148,40 @@ function buildFinishGate(g: THREE.Group, slope: SlopeDef): void {
   const yTop = slope.height(FINISH_POLE_X, z) + FINISH_POLE_H - 0.35;
   pennantString(g, -FINISH_POLE_X, FINISH_POLE_X, yTop, z, 0.42, 1.05, [SPAL.sunGold]);
   // banner panel between the poles, below the pennant string — wide and tall
-  // enough to read as a finish BANNER, not a ribbon
-  const yBanner = slope.height(0, z) + FINISH_POLE_H * 0.58;
+  // enough to read as a finish BANNER, not a ribbon; raised clear of the
+  // ground haze band (judge F5)
+  const yBanner = slope.height(0, z) + FINISH_POLE_H * FINISH_BANNER_Y;
   g.add(at(box(mat, FINISH_POLE_X * 1.5, 1.7, 0.1, SPAL.sunGold), 0, yBanner, z));
+  // grounding (judge F5): snowLit rocks + a pair of tiny sunGold foot flags
+  buildFinishGrounding(g, slope);
   // v2 festive pass: second pennant row + paper fringe + runout flag lines
   buildFinishFestive(g, slope);
+}
+
+/** Finish grounding (judge F5): three small snowLit rocks hugging the pole
+ *  feet (one nestled just outside each pole, one further out) plus a pair of
+ *  tiny sunGold pennant flags on short bark poles planted at the gate feet —
+ *  the gate reads PLANTED in the snow, never floating. Everything sits within
+ *  ~1.8 m of the poles (|x| >= FINISH_POLE_X), never inside the run corridor,
+ *  and merges into the existing snowLit/bark/sunGold bakes — zero new draw
+ *  calls. Deterministic: a pure function of slope.height, no rng. */
+function buildFinishGrounding(g: THREE.Group, slope: SlopeDef): void {
+  const z = slope.finishZ;
+  for (const [x, zOff, r] of FINISH_ROCKS) {
+    const base = slope.height(x, z + zOff);
+    // sunk ~1/3 into the snow so the rock reads grounded, never floating
+    g.add(at(sphere(mat, r, 5, SPAL.snowLit), x, base - r * 0.35, z + zOff));
+  }
+  // a pair of tiny sunGold foot flags, one at each pole, uphill of the line
+  for (let side = -1; side <= 1; side += 2) {
+    const fx = side * FINISH_POLE_X;
+    const fz = z - 0.45;
+    const fb = slope.height(fx, fz);
+    g.add(at(cyl(mat, 0.025, 0.035, FINISH_FOOT_FLAG_H, 5, SPAL.bark), fx, fb + FINISH_FOOT_FLAG_H / 2, fz));
+    const penn = cone(mat, 0.13, 0.3, 4, SPAL.sunGold);
+    penn.rotation.x = Math.PI / 2; // tip +z — downhill, like the runout pennants
+    g.add(at(penn, fx, fb + FINISH_FOOT_FLAG_H - 0.15, fz + 0.14));
+  }
 }
 
 /**
@@ -159,11 +202,12 @@ function buildLodge(g: THREE.Group, slope: SlopeDef): void {
   const roof = cone(mat, 4.9, 2.4, 4, SPAL.bark);
   roof.rotation.y = Math.PI / 4;
   g.add(at(roof, lx, base + 3.2 + 1.2, lz));
-  // deeper roof snow: the blanket is raised and widened to overhang the bark
-  // roof — the lodge is snug under its drifts (STYLE_BIBLE §V2.6)
+  // deeper roof snow: the blanket is raised a touch higher (judge F5) to
+  // crest over the ridge and widened to overhang the bark roof — the lodge
+  // is snug under its drifts (STYLE_BIBLE §V2.6)
   const roofSnow = cone(mat, 5.35, 1.25, 4, SPAL.snowLit);
   roofSnow.rotation.y = Math.PI / 4;
-  g.add(at(roofSnow, lx, base + 4.9, lz));
+  g.add(at(roofSnow, lx, base + 5.05, lz));
 
   // door + two warm windows on the face looking back at the finish (-z)
   g.add(at(box(mat, 1.1, 1.9, 0.15, SPAL.bark), lx - 1.2, base + 0.95, lz - 2.78));
@@ -334,7 +378,7 @@ function buildKickers(g: THREE.Group, slope: SlopeDef): void {
  */
 function buildFinishFestive(g: THREE.Group, slope: SlopeDef): void {
   const z = slope.finishZ;
-  const yBanner = slope.height(0, z) + FINISH_POLE_H * 0.58;
+  const yBanner = slope.height(0, z) + FINISH_POLE_H * FINISH_BANNER_Y;
 
   // second pennant row below the banner — sunGold alternating with the 8
   // skier colours, smaller pennants and a touch more spacing
