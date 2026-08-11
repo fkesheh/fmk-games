@@ -229,6 +229,11 @@ export class SplatHud {
     this.jumpGlyph = el('span', 'sh-jump-glyph');
     this.jumpGlyph.textContent = '↑';
     this.jumpBtn.appendChild(this.jumpGlyph);
+    // T3: a small HOP label under the arrow — the button is labelled by glyph
+    // AND word (UX law: never colour-only; a 4-year-old reads 'HOP').
+    const jumpLabel = el('span', 'sh-jump-label');
+    jumpLabel.textContent = 'HOP';
+    this.jumpBtn.appendChild(jumpLabel);
     this.jumpBtn.addEventListener('pointerdown', this.onJumpPointerDown);
     this.jumpBtn.addEventListener('click', this.onJumpClick);
     this.jumpBtn.addEventListener('pointercancel', this.onJumpCancel);

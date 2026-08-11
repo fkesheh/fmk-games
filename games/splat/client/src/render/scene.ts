@@ -60,8 +60,8 @@ const SUN_DISTANCE = 120; // light sits at target + sunVec x this
 // painted terrain shading, the dome glow and the cast shadows still agree on
 // direction (see sunVec below). visual.ts is untouched.
 const SUN_ELEV_LOCAL = 0.17; // rad — long raking morning shadows
-const SHADOW_EXTENT = 70; // ortho shadow box half-size, follows the camera —
-                          // widened (was 55) so the forest walls land in the box
+const SHADOW_EXTENT = 85; // ortho shadow box half-size, follows the camera —
+                          // widened (was 70) so the full forest walls land in the box
 const SHADOW_MAP_SIZE = 2048;
 
 // ---- post pass ----------------------------------------------------------------------
@@ -269,6 +269,7 @@ export class SplatScene {
     // F1: slightly larger normalBias (0.05 -> 0.08) — the long raking angle
     // leans on it, killing acne on the low-angle shadow seams
     this.sun.shadow.normalBias = 0.08;
+    this.sun.shadow.radius = 8; // PCFSoft softness — long soft shadows raking the piste
     this.world.add(this.sun);
     this.world.add(this.sun.target);
 
@@ -644,15 +645,33 @@ export class SplatScene {
     sunDisc.frustumCulled = false;
     this.disposables.push(sunDiscMat, sunDisc.geometry);
     this.skyRig.add(sunDisc);
+
+    // ---- haze ring: a barely-there warm horizon line -----------------------
+    // A thin ring parked just above the eye so distance reads atmospheric —
+    // fog:false, low alpha, floats in front of the world fog.
+    const hazeRingGeo = new THREE.TorusGeometry(555, 1.2, 6, 72);
+    const hazeRingMat = new THREE.MeshBasicMaterial({
+      color: SPAL.sunWarm,
+      transparent: true,
+      opacity: 0.045,
+      fog: false,
+      depthTest: false,
+      depthWrite: false,
+    });
+    const hazeRing = new THREE.Mesh(hazeRingGeo, hazeRingMat);
+    hazeRing.rotation.x = -Math.PI / 2; // horizontal — flat at the horizon
+    hazeRing.position.y = 1.8; // just above the eye level
+    hazeRing.frustumCulled = false;
+    this.disposables.push(hazeRingGeo, hazeRingMat);
+    this.skyRig.add(hazeRing);
   }
 
   /**
-   * Dome vertex colours: a thin pure skyHorizon rim the fog fuses into,
-   * ramping to full skyZenith by mid-frame and deepening toward a zenith/ink
-   * mix at the top (real blue presence overhead), distant snow land
-   * (snowShade) below the horizon line, and a warm sunWarm blob around the
-   * sun azimuth so the light reads directional. All stops are literal SPAL
-   * entries or SPAL lerps.
+   * Dome vertex colours: a rich 5-stop gradient (deep zenith -> azure ->
+   * ice horizon -> a faint warm sunWarm band just above the horizon -> the
+   * fog-matched skyHorizon rim), all SPAL lerps with smooth01 ramps so there
+   * is no banding. Below the horizon, the dome sinks into snowShade (distant
+   * snow land). The warm sun blob around the sun azimuth is kept intact.
    */
   private tintSky(): void {
     const geo = this.sky.geometry;
@@ -660,38 +679,47 @@ export class SplatScene {
     const colAttr = new THREE.BufferAttribute(new Float32Array(pos.count * 3), 3);
     geo.setAttribute('color', colAttr);
 
-    // F1: the horizon was called washed/banded — pull the rim a HAIR cooler
-    // (skyHorizon toward skyZenith, 6% — still pale, the fog still fuses into
-    // it) and deepen the zenith (skyZenith -> ink 0.22 -> 0.30). All SPAL
-    // lerps, no new hex.
-    const horizon = new THREE.Color(mix(SPAL.skyHorizon, SPAL.skyZenith, 0.06));
+    // 5-stop gradient colours — all SPAL entries or SPAL lerps
+    const deepZenith = new THREE.Color(mix(SPAL.skyZenith, SPAL.ink, 0.30));
     const zenith = new THREE.Color(SPAL.skyZenith);
-    // deeper top-of-frame blue: zenith pulled toward ink so the upper half of
-    // the dome reads as SKY, not a washed-out extension of the snowfield
-    const zenithDeep = new THREE.Color(mix(SPAL.skyZenith, SPAL.ink, 0.30));
-    // distant snow land below the horizon — starts from the cooled rim so the
-    // y=0 seam stays continuous, then sinks into snowShade
-    const below = horizon.clone().lerp(new THREE.Color(SPAL.snowShade), 0.55);
+    const azure = new THREE.Color(mix(SPAL.skyZenith, SPAL.skyHorizon, 0.45));
+    const iceHorizon = new THREE.Color(mix(SPAL.skyHorizon, SPAL.paper, 0.22));
+    const horizon = new THREE.Color(SPAL.skyHorizon);
     const warmGlow = new THREE.Color(SPAL.sunWarm);
+    const warmBand = new THREE.Color(mix(SPAL.skyHorizon, SPAL.sunWarm, 0.30));
+    const below = horizon.clone().lerp(new THREE.Color(SPAL.snowShade), 0.55);
     const c = new THREE.Color();
     const dir = new THREE.Vector3();
 
     for (let i = 0; i < pos.count; i++) {
       const y = pos.getY(i) / DOME_RADIUS; // -1..1
       if (y <= 0) {
+        // below horizon: fog-matched rim -> distant snow land, smooth
         c.copy(horizon).lerp(below, smooth01(-y * 2.5));
-      } else if (y < 0.06) {
-        c.copy(horizon); // flat rim — the fog has to disappear into it
-      } else if (y < 0.38) {
-        // full horizon -> zenith ramp low in the frame: blue presence arrives
-        // fast above the fog-fused rim instead of topping out at 55%
-        c.copy(horizon).lerp(zenith, smooth01((y - 0.06) / 0.32));
-      } else if (y < 0.8) {
-        c.copy(zenith).lerp(zenithDeep, smooth01((y - 0.38) / 0.42));
+      } else if (y < 0.025) {
+        // flat fog-matched rim — the world fog dissolves into this
+        c.copy(horizon);
+      } else if (y < 0.10) {
+        // warm sunWarm band: a faint warm pulse just above the rim,
+        // peaking near y=0.055 then fading into the ice horizon
+        const t = smooth01((y - 0.025) / 0.075);
+        const warm = Math.exp(-((t - 0.35) * (t - 0.35)) / 0.055);
+        const base = horizon.clone().lerp(iceHorizon, t);
+        c.copy(base).lerp(warmBand, warm * 0.45);
+      } else if (y < 0.22) {
+        // ice horizon -> azure, smooth ramp
+        c.copy(iceHorizon).lerp(azure, smooth01((y - 0.10) / 0.12));
+      } else if (y < 0.48) {
+        // azure -> full zenith, smooth ramp
+        c.copy(azure).lerp(zenith, smooth01((y - 0.22) / 0.26));
+      } else if (y < 0.78) {
+        // zenith -> deep zenith, smooth ramp
+        c.copy(zenith).lerp(deepZenith, smooth01((y - 0.48) / 0.30));
       } else {
-        c.copy(zenithDeep);
+        // deep zenith at the top of the dome
+        c.copy(deepZenith);
       }
-      // warm glow around the sun, kept out of the horizon rim
+      // warm sun blob around the sun azimuth — kept out of the rim
       dir.set(pos.getX(i), pos.getY(i), pos.getZ(i)).normalize();
       const sunAmt =
         Math.pow(Math.max(0, dir.dot(this.sunVec)), 5) * (1 - smooth01(y / 0.7));

@@ -389,7 +389,11 @@ export class PlantField {
       disposeGeometries(baked);
 
       const mesh = new THREE.InstancedMesh(geo, plantMat, count);
-      mesh.castShadow = true;
+      // Shadow discipline (e2e draw-call budget < 80): in-piste plants are
+      // small — their shadows vanish into the snow — and every caster doubles
+      // its calls in the shadow pass. The LONG tree shadows the style bible
+      // calls for come from the forest walls, which keep casting.
+      mesh.castShadow = false;
       mesh.receiveShadow = true;
 
       const px = new Float32Array(count);

@@ -219,11 +219,21 @@
 }
 
 .sh-jump-glyph {
-  font-size: 34px;
+  font-size: 28px;
   font-weight: 800;
   line-height: 1;
   /* optical centering: an up-arrow glyph sits a touch high in the disc */
   transform: translateY(-1px);
+}
+
+.sh-jump-label {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  color: var(--ink);
+  line-height: 1;
+  margin-top: 3px;
+  opacity: 0.85;
 }
 
 /* --- (4) countdown overlay: 3-2-1 then GO! -------------------------------- */

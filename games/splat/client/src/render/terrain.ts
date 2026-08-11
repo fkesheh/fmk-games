@@ -48,16 +48,30 @@ const SKIRT_RISE = 22; // mountain-wall lift at the outer skirt edge (m)
 const Z_BACK = 30; // terrain behind the start gate (the summit shoulder)
 const Z_RUNOUT = 140; // terrain past the finish (lodge meadow, fades into fog)
 const NORMAL_EPS = 0.6; // central-difference step for heightfield normals
+const AO_STENCIL = 2.5; // curvature stencil step for vertex AO (m)
+const AO_MAX = 0.12; // max AO blend into snowDeep (judge: "creases must read")
+const FOREST_EDGE_FADE = 5.5; // metres inside piste edge the forest shade fades over
 
 // ---- forest walls ---------------------------------------------------------------
 const FOREST_IN = 1.5; // trees keep this clear of the piste edge (m)
-const FOREST_DEPTH = 17; // forest band width (m)
-const FOREST_STEP = 2.2; // z-step between scatter rows
-const FOREST_MAX = 2200; // hard cap — total visual instances <= 3k with R2
+const FOREST_DEPTH = 24; // forest band width (m) — widened from 17 per judge
+const FOREST_CLUSTER_STEP = 3.5; // z-step between cluster rows
+const FOREST_CLUSTER_R_MIN = 3.0; // smallest cluster radius (m)
+const FOREST_CLUSTER_R_MAX = 9.0; // largest cluster radius (m)
+const FOREST_CLUSTER_TREES_MIN = 4; // trees per cluster
+const FOREST_CLUSTER_TREES_MAX = 14;
+const FOREST_MAX = 2800; // hard cap — raised toward 3k budget
 const FOREST_Z0 = -12;
 const FOREST_Z_PAD = 60; // trees continue past the finish into the runout
 const FOREST_SINK = 0.15; // trunks sit slightly INTO the snow
-const SPRUCE_SHARE = 0.3; // ~30% of instances are the wide spruce archetype
+const SPRUCE_SHARE = 0.28; // ~28% spruce (wide tiered)
+const ROUNDTREE_SHARE = 0.17; // ~17% round-topped snowy archetype (third species)
+
+// ---- v3 clutter (round 3 escalation) ---------------------------------------------------
+const EXTRA_DEBRIS_COUNT = 30; // additional small debris near piste edge
+const SCALLOP_BANK_CLUSTERS = 5; // wind-scallop bank clusters along the edges
+const MID_BOULDER_MIN = 4; // midground boulders inside piste edge...
+const MID_BOULDER_MAX = 6; // ...4-6 per mountain, visual only, off corridor
 
 // ---- v2.2 groomed piste ---------------------------------------------------------------
 const GROOM_BAND_FRAC = 0.18; // corduroy band half-width as a fraction of slope width
@@ -108,6 +122,13 @@ function smooth01(t: number): number {
   return x * x * (3 - 2 * x);
 }
 
+/** Box-Muller Gaussian sample N(0,1) from a seeded rng. */
+function gauss(next: () => number): number {
+  const u1 = Math.max(next(), 0.0001);
+  const u2 = next();
+  return Math.sqrt(-2 * Math.log(u1)) * Math.cos(TAU * u2);
+}
+
 /** Mountain-wall lift beyond the piste edges — analytic, deterministic. */
 function skirtLift(x: number, halfW: number): number {
   const d = Math.abs(x) - halfW;
@@ -126,6 +147,8 @@ const COL_LIT = new THREE.Color(SPAL.snowLit);
 const COL_BASE = new THREE.Color(SPAL.snow);
 const COL_SHADE = new THREE.Color(SPAL.snowShade);
 const COL_DEEP = new THREE.Color(SPAL.snowDeep);
+// Pre-baked height-gradient targets (reused across vertices — no allocation in loop)
+const COL_COOL = new THREE.Color(SPAL.snowLit).lerp(new THREE.Color(SPAL.skyHorizon), 0.06);
 
 function snowColor(
   out: THREE.Color,
@@ -134,6 +157,9 @@ function snowColor(
   x: number,
   bandHalf: number,
   corrPhase: number,
+  ao: number,
+  elevFrac: number,
+  halfW: number,
 ): void {
   // sun-facing -> snowLit, shadow side -> snowShade, through the snow base.
   // Remapped (not raw N·L): the Lambert term already applies N·L once more at
@@ -144,6 +170,20 @@ function snowColor(
   // steep rolls and the carved skirt bands sink toward snowDeep
   const deep = smooth01((steepness - 0.05) / 0.23) * 0.3;
   if (deep > 0) out.lerp(COL_DEEP, deep);
+
+  // ---- v3 vertex AO: curvature creases + forest-edge shade blended into snowDeep ----
+  // ao is already clamped [0,1] — concave creases and piste-edge proximity drive it.
+  // Blend toward snowDeep at up to AO_MAX strength so the creases read without
+  // darkening the whole piste.
+  if (ao > 0) out.lerp(COL_DEEP, ao * AO_MAX);
+
+  // ---- v3 height-based snow gradient: summit cooler/brighter, runout warmer ----
+  // elevFrac: 1 at summit, 0 at finish. Subtle ±2% value shift.
+  if (elevFrac > 0.5) {
+    out.lerp(COL_COOL, (elevFrac - 0.5) * 0.06);
+  } else {
+    out.lerp(COL_DEEP, (0.5 - elevFrac) * 0.05);
+  }
 
   // ---- v2.2 groomed piste: a seeded corduroy band down the fall line ----
   // Soft edge on the band's outer 15% so the corridor never reads as a hard
@@ -181,12 +221,29 @@ function buildSlopeMesh(slope: SlopeDef, material: THREE.Material): THREE.Mesh {
   const col = new Float32Array(count * 3);
   const c = new THREE.Color();
 
+  // two-pass: first pass writes positions + normals and records min/max height
+  // so the elevation gradient is properly normalized (summit=1 → runout=0).
+  let hMin = Infinity;
+  let hMax = -Infinity;
+  const heights: number[] = [];
+  for (let iz = 0; iz < nz; iz++) {
+    const z = z0 + ((z1 - z0) * iz) / SEG_Z;
+    for (let ix = 0; ix < nx; ix++) {
+      const x = x0 + ((x1 - x0) * ix) / SEG_X;
+      const h = groundHeight(slope, x, z);
+      heights.push(h);
+      if (h < hMin) hMin = h;
+      if (h > hMax) hMax = h;
+    }
+  }
+  const hRange = hMax - hMin || 1;
+
   for (let iz = 0; iz < nz; iz++) {
     const z = z0 + ((z1 - z0) * iz) / SEG_Z;
     for (let ix = 0; ix < nx; ix++) {
       const x = x0 + ((x1 - x0) * ix) / SEG_X;
       const i = iz * nx + ix;
-      const h = groundHeight(slope, x, z);
+      const h = heights[iz * nx + ix] ?? 0;
       pos[i * 3] = x;
       pos[i * 3 + 1] = h;
       pos[i * 3 + 2] = z;
@@ -206,8 +263,28 @@ function buildSlopeMesh(slope: SlopeDef, material: THREE.Material): THREE.Mesh {
       nor[i * 3 + 1] = nY;
       nor[i * 3 + 2] = nZ;
 
+      // ---- v3 vertex AO from heightfield curvature ----
+      // Laplacian (second derivative) via a wider stencil: concave creases
+      // (positive Laplacian) get AO, convex ridges (negative) stay bright.
+      const hL = groundHeight(slope, x - AO_STENCIL, z);
+      const hR = groundHeight(slope, x + AO_STENCIL, z);
+      const hB = groundHeight(slope, x, z - AO_STENCIL);
+      const hF = groundHeight(slope, x, z + AO_STENCIL);
+      const laplacian = (hL + hR + hB + hF - 4 * h) / (AO_STENCIL * AO_STENCIL);
+      // Normalize: typical crease curvature ~0.03-0.12 m/m²
+      const curvatureAO = smooth01(clamp01(laplacian / 0.08));
+
+      // ---- v3 forest-edge shade: piste edges near the trees carry soft shadow ----
+      const edgeGap = halfW - Math.abs(x);
+      const forestAO =
+        edgeGap > 0 ? smooth01(clamp01(edgeGap / FOREST_EDGE_FADE)) : 0;
+
+      // Combine: curvature drives the creases, forest-edge supplements near walls
+      const ao = clamp01(Math.max(curvatureAO, forestAO * 0.65));
+      const elevFrac = clamp01((h - hMin) / hRange); // 1 at summit, 0 at runout
+
       const sunDot = nX * SUN_DIR[0] + nY * SUN_DIR[1] + nZ * SUN_DIR[2];
-      snowColor(c, sunDot, 1 - nY, x, bandHalf, corrPhase);
+      snowColor(c, sunDot, 1 - nY, x, bandHalf, corrPhase, ao, elevFrac, halfW);
       col[i * 3] = c.r;
       col[i * 3 + 1] = c.g;
       col[i * 3 + 2] = c.b;
@@ -364,6 +441,36 @@ function buildSpruceGeometry(): THREE.BufferGeometry {
   return mergeVertexColored(baked);
 }
 
+/** Third archetype (ROUND-TOPPED SNOWY TREE, ~17% share): 3 overlapping
+ *  flattened cones/spheres with heavy snow caps, ~4.9 m tall before instance
+ *  scale — reads as a subalpine fir or snow-loaded deciduous at speed.
+ *  Wider, softer silhouette than the fir, squatter than the spruce. */
+function buildRoundTreeGeometry(): THREE.BufferGeometry {
+  const g = new THREE.Group();
+  // trunk: slightly thicker than the fir
+  g.add(at(cyl(mat, 0.15, 0.26, 1.1, 6, SPAL.bark), 0, 0.55, 0));
+  // three wide, flattened tiers (scale.y ~0.55) with heavy snow caps
+  const tiers: ReadonlyArray<readonly [number, number, number, string]> = [
+    // [radius, height, baseY, hex]
+    [1.8, 1.6, 0.65, SPAL.pineDark],
+    [1.35, 1.4, 1.55, SPAL.pine],
+    [0.85, 1.15, 2.4, SPAL.pineLit],
+  ];
+  for (const [r, h, baseY, hex] of tiers) {
+    const tier = cone(mat, r, h, 7, hex);
+    tier.scale.set(1, 0.55, 1); // flattened — the round-topped read
+    g.add(at(tier, 0, baseY + h * 0.55 * 0.5, 0));
+    // heavy snow cap: larger than the fir's caps, ~45% of tier height
+    const cap = cone(mat, r * 0.65, h * 0.45, 6, SPAL.snowLit);
+    cap.scale.set(1, 0.55, 1);
+    g.add(at(cap, 0, baseY + h * 0.55 * 0.82, 0));
+  }
+  // top sphere: a rounded snow dome — the soft crown
+  g.add(at(sphere(mat, 0.38, 6, SPAL.snowLit), 0, 2.4 + 1.15 * 0.55 + 0.08, 0));
+  const baked = bake(g);
+  return mergeVertexColored(baked);
+}
+
 /** Forest walls: TWO InstancedMeshes (fir + spruce), both sides, sparse ->
  *  dense downhill. Every draw — archetype pick, position, rotation and the
  *  per-axis scale jitter — comes from the seeded rng, in a fixed order. */
@@ -372,41 +479,65 @@ function buildForest(slope: SlopeDef, material: THREE.Material): THREE.Group {
   const next = rng(slope.seed ^ 0x5f3a);
   const z1 = slope.finishZ + FOREST_Z_PAD;
 
-  // scatter into plain arrays first so the InstancedMeshes are sized exactly
+  // ---- v3 clustered scatter: seeded Gaussian blobs instead of even rows ----
   const px: number[] = [];
   const py: number[] = [];
   const pz: number[] = [];
   const rot: number[] = [];
-  const arch: number[] = []; // 0 = fir, 1 = spruce
+  const arch: number[] = []; // 0 = fir, 1 = spruce, 2 = round-topped
   const sx: number[] = [];
   const sy: number[] = [];
   const sz: number[] = [];
+
+  // Helper: place one tree if within band and budget
+  const placeTree = (tx: number, tz: number): void => {
+    if (px.length >= FOREST_MAX) return;
+    // clamp x into the forest band, respecting piste clearance
+    const absX = Math.abs(tx);
+    const minX = halfW + FOREST_IN * 1.1;
+    const maxX = halfW + FOREST_IN + FOREST_DEPTH;
+    const clampedAbs = clamp01((absX - minX) / (maxX - minX)) * (maxX - minX) + minX;
+    const clampedX = Math.sign(tx) * clampedAbs;
+    if (clampedAbs < minX) return;
+    px.push(clampedX);
+    pz.push(tz);
+    py.push(groundHeight(slope, clampedX, tz) - FOREST_SINK);
+    rot.push(next() * TAU);
+    // archetype pick: fir=0 (55%), spruce=1 (28%), roundtree=2 (17%)
+    const r = next();
+    arch.push(r < ROUNDTREE_SHARE ? 2 : r < ROUNDTREE_SHARE + SPRUCE_SHARE ? 1 : 0);
+    const h = rngRange(next, 0.85, 1.65);
+    sy.push(h);
+    sx.push(h * rngRange(next, 0.85, 1.15));
+    sz.push(h * rngRange(next, 0.85, 1.15));
+  };
+
   for (let side = -1; side <= 1; side += 2) {
-    for (let z = FOREST_Z0; z < z1; z += FOREST_STEP) {
+    for (let zRow = FOREST_Z0; zRow < z1; zRow += FOREST_CLUSTER_STEP) {
+      if (px.length >= FOREST_MAX) break;
       // density ramp: open meadows near the gate, closing walls downhill
-      const lambda = 0.35 + 1.5 * smooth01((z - FOREST_Z0) / 220);
-      let n = Math.floor(lambda);
-      if (next() < lambda - n) n += 1;
-      for (let t = 0; t < n; t++) {
+      const density = 0.3 + 1.7 * smooth01((zRow - FOREST_Z0) / 200);
+      let nClusters = Math.floor(density);
+      if (next() < density - nClusters) nClusters += 1;
+      for (let c = 0; c < nClusters; c++) {
         if (px.length >= FOREST_MAX) break;
-        const x = side * (halfW + FOREST_IN + rngRange(next, 0, FOREST_DEPTH));
-        const zz = z + rngRange(next, -FOREST_STEP / 2, FOREST_STEP / 2);
-        px.push(x);
-        pz.push(zz);
-        py.push(groundHeight(slope, x, zz) - FOREST_SINK);
-        rot.push(next() * TAU);
-        arch.push(next() < SPRUCE_SHARE ? 1 : 0);
-        // per-axis jitter: girth (x/z) varies independently from height (y),
-        // so even same-archetype neighbours never read as clones
-        const h = rngRange(next, 0.85, 1.65);
-        sy.push(h);
-        sx.push(h * rngRange(next, 0.85, 1.15));
-        sz.push(h * rngRange(next, 0.85, 1.15));
+        // cluster center: jittered along x within the band, ±half-step along z
+        const cz = zRow + rngRange(next, -FOREST_CLUSTER_STEP * 0.4, FOREST_CLUSTER_STEP * 0.4);
+        const cx = side * (halfW + FOREST_IN + rngRange(next, 0, FOREST_DEPTH));
+        const clusterR = rngRange(next, FOREST_CLUSTER_R_MIN, FOREST_CLUSTER_R_MAX);
+        const nTrees = rngInt(next, FOREST_CLUSTER_TREES_MIN, FOREST_CLUSTER_TREES_MAX);
+        for (let t = 0; t < nTrees; t++) {
+          if (px.length >= FOREST_MAX) break;
+          // Gaussian jitter around cluster center — organic, not gridded
+          const tx = cx + gauss(next) * clusterR * 0.45;
+          const tz = cz + gauss(next) * clusterR * 0.5;
+          placeTree(tx, tz);
+        }
       }
     }
   }
 
-  const geos = [buildForestGeometry(), buildSpruceGeometry()];
+  const geos = [buildForestGeometry(), buildSpruceGeometry(), buildRoundTreeGeometry()];
   const group = new THREE.Group();
   const dummy = new THREE.Object3D();
   for (let a = 0; a < geos.length; a++) {
@@ -704,6 +835,88 @@ function buildRocks(slope: SlopeDef): THREE.Group {
   // small debris near the piste edge — foreground scale at speed (two passes)
   scatterDebris(rng(slope.seed ^ 0x4d8b), g, slope, DEBRIS_COUNT, 8, slope.finishZ + 60);
   scatterDebris(rng(slope.seed ^ 0x9f2e), g, slope, DEBRIS_COUNT_EDGE, 30, slope.finishZ + 100);
+  // v3 extra debris pass (~30 more rocks near the piste edge from fresh seed)
+  scatterDebris(rng(slope.seed ^ 0x1b4f), g, slope, EXTRA_DEBRIS_COUNT, 15, slope.finishZ + 90);
+  return bake(g);
+}
+
+/** v3 wind-scallop banks: elongated snow mounds with a steep scalloped face
+ *  (the windward side) and a softer lee tail. Tucked against both piste edges,
+ *  scattered sparsely down the course. Baked to a single group. */
+function buildScallopBanks(slope: SlopeDef): THREE.Group {
+  const halfW = slope.width / 2;
+  const next = rng(slope.seed ^ 0xd37a);
+  const g = new THREE.Group();
+  for (let cIx = 0; cIx < SCALLOP_BANK_CLUSTERS; cIx++) {
+    const side = cIx % 2 === 0 ? -1 : 1;
+    const cz = rngRange(next, 20, slope.finishZ + 70);
+    const cx = side * (halfW - 2.5 + rngRange(next, 0.5, 5));
+    if (Math.abs(cx) < halfW - 4 || Math.abs(cx) > halfW + 5) continue;
+    const baseY = groundHeight(slope, cx, cz);
+    // main mound: squashed sphere, elongated along z (the fall line)
+    const r = rngRange(next, 2.0, 4.5);
+    const mound = sphere(mat, r, 6, SPAL.snowShade);
+    mound.scale.set(1, 0.3, 1.6 + next() * 1.2); // elongated down-fall
+    mound.rotation.y = next() * TAU * 0.1;
+    g.add(at(mound, cx, baseY - r * 0.25, cz));
+    // windward scallop face: a snowLit wedge on the uphill side (-z)
+    const scallop = box(mat, r * 1.8, r * 0.55, r * 0.45, SPAL.snowLit);
+    scallop.rotation.set(-0.4, next() * 0.2, 0);
+    g.add(at(scallop, cx, baseY + r * 0.2, cz - r * 0.5));
+    // soft crest: snowLit dome on top
+    const crest = sphere(mat, r * 0.7, 5, SPAL.snowLit);
+    crest.scale.set(1, 0.2, 1.2);
+    g.add(at(crest, cx, baseY + r * 0.3, cz));
+  }
+  return bake(g);
+}
+
+/** v3 midground boulders INSIDE the piste near the edges — large angular
+ *  masses with snow skirts (visual only, always off the corridor). 4-6 per
+ *  mountain, seeded, grounded, never covering a plant. */
+function buildMidBoulders(slope: SlopeDef): THREE.Group {
+  const halfW = slope.width / 2;
+  const next = rng(slope.seed ^ 0x8e1a);
+  const g = new THREE.Group();
+  const n = rngInt(next, MID_BOULDER_MIN, MID_BOULDER_MAX);
+  let placed = 0;
+  let guard = 0;
+  while (placed < n && guard < 200) {
+    guard++;
+    const side = next() < 0.5 ? -1 : 1;
+    const dx = side * rngRange(next, DRESSING_X_MIN, halfW - 2);
+    const dz = rngRange(next, 30, slope.finishZ - 20);
+    // off the corridor — already enforced by DRESSING_X_MIN
+    // off the plants
+    let ok = true;
+    for (const pl of slope.plants) {
+      const ddx = pl.x - dx;
+      const ddz = pl.z - dz;
+      if (ddx * ddx + ddz * ddz < (pl.r + 3) * (pl.r + 3)) { ok = false; break; }
+    }
+    if (!ok) continue;
+    const r = rngRange(next, 1.6, 4.5);
+    const baseY = groundHeight(slope, dx, dz);
+    const hex = next() < 0.5 ? SPAL.rock : SPAL.rockLit;
+    const main =
+      next() < 0.6
+        ? sphere(mat, r, 5, hex)
+        : box(mat, r * 1.9, r * 1.15, r * 1.5, hex);
+    main.scale.set(1, rngRange(next, 0.5, 0.8), 1);
+    main.rotation.set(rngRange(next, -0.3, 0.3), next() * TAU, rngRange(next, -0.3, 0.3));
+    g.add(at(main, dx, baseY - r * 0.35, dz));
+    // snow skirt on uphill face
+    const skirt = sphere(mat, r * 1.12, 5, SPAL.snowLit);
+    skirt.scale.set(1, 0.25, 1);
+    skirt.rotation.y = next() * TAU;
+    g.add(at(skirt, dx, baseY + r * 0.18, dz - r * 0.4));
+    // shadow crease
+    const crease = sphere(mat, r * 1.02, 5, SPAL.snowShade);
+    crease.scale.set(1, 0.08, 1);
+    crease.rotation.y = next() * TAU;
+    g.add(at(crease, dx, baseY - r * 0.14, dz + r * 0.25));
+    placed++;
+  }
   return bake(g);
 }
 
@@ -872,13 +1085,32 @@ export function buildTerrain(slope: SlopeDef): THREE.Group {
   for (const m of peakCardMaterials) m.dispose();
   peakCardMaterials.length = 0;
   const root = new THREE.Group();
-  root.add(buildSlopeMesh(slope, terrainMaterial()));
-  root.add(buildForest(slope, forestMaterial()));
-  root.add(buildSnowBanks(slope));
-  root.add(buildRocks(slope));
+  const slopeMesh = buildSlopeMesh(slope, terrainMaterial());
+  const forest = buildForest(slope, forestMaterial());
+  const banks = buildSnowBanks(slope);
+  const rocks = buildRocks(slope);
+  const scallops = buildScallopBanks(slope);
+  const boulders = buildMidBoulders(slope);
+  root.add(slopeMesh);
+  root.add(forest);
+  root.add(banks);
+  root.add(rocks);
+  root.add(scallops);
+  root.add(boulders);
   const edgePines = buildEdgePines(slope, forestMaterial());
   if (edgePines) root.add(edgePines); // 3-5 lone mature pines in the edge band
   root.add(buildFoothills(slope));
   root.add(buildPeakCards(slope));
+  // DRAW-CALL DISCIPLINE (e2e budget < 80): the shadow pass re-draws every
+  // castShadow object once per light, so uncast the DECORATIVE dressing
+  // (banks/rocks/scallops/boulders/edge pines) — their shadows are lost in
+  // the snow and the piste keeps the long tree shadows from the real forest.
+  // The terrain mesh receives; the forest keeps casting.
+  for (const g of [banks, rocks, scallops, boulders, edgePines]) {
+    if (g === null) continue;
+    g.traverse((o) => {
+      if (o instanceof THREE.Mesh) o.castShadow = false;
+    });
+  }
   return root;
 }
