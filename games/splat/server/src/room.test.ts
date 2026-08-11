@@ -176,9 +176,9 @@ class Driver {
   }
 
   /** Queue one input on the room and advance the twin identically. */
-  send(room: SplatRoom, steer: number, dt: number = SIM_DT): void {
-    room.handleMessage(this.id, { t: 'splat_input', seq: ++this.seq, steer, dt });
-    stepSki(this.twin, steer, dt, this.slope, { assist: this.assist });
+  send(room: SplatRoom, steer: number, dt: number = SIM_DT, jump?: boolean): void {
+    room.handleMessage(this.id, { t: 'splat_input', seq: ++this.seq, steer, dt, ...(jump === true ? { jump: true } : {}) });
+    stepSki(this.twin, steer, dt, this.slope, { assist: this.assist, ...(jump === true ? { jump: true } : {}) });
   }
 }
 
@@ -721,6 +721,71 @@ describe('SplatRoom slalom gates', () => {
     expect(after.you.sim.lastGateIx).toBe(1); // the miss is still consumed server-side
     expect(after.you.sim.z).toBeGreaterThan(g1.z);
     expect(eventsOfKind(io, 'p1', 'gate').length).toBe(1);
+    room.stop();
+  });
+});
+
+describe('SplatRoom v2 jump passthrough', () => {
+  it('a jump input makes the skier airborne in the snapshot, then lands', () => {
+    const io = new FakeIO();
+    const { room, drivers } = setupRace(io, ['p1', 'p2'], 42);
+    const d = drivers[0]!;
+
+    // drive straight for a bit to get some speed
+    drive(room, [d], 30);
+    settle();
+
+    // pre-jump: grounded
+    expect(io.lastSnap('p1').you.sim.airborne).toBe(false);
+    expect(snapOf(io, 'p1').airborne).toBe(false);
+
+    // send ONE jump edge
+    d.send(room, 0, SIM_DT, true);
+    tick();
+    settle();
+
+    // the snapshot must show airborne after the jump
+    const airborne = io.lastSnap('p1');
+    expect(airborne.you.sim.airborne).toBe(true);
+    expect(snapOf(io, 'p1').airborne).toBe(true);
+    // airborne flag is in the wire — verify JSON includes it
+    expect(JSON.stringify(airborne)).toContain('"airborne"');
+
+    // let the hop arc finish (flight time ~2*J_HOP_VY/G_ACCEL ≈ 0.22s, ~7 ticks)
+    // drive forward until airborne clears
+    for (let i = 0; i < 60 && d.twin.airborne; i++) {
+      d.send(room, 0);
+      tick();
+    }
+    settle();
+
+    // post-landing: grounded again
+    const landed = io.lastSnap('p1');
+    expect(landed.you.sim.airborne).toBe(false);
+    expect(snapOf(io, 'p1').airborne).toBe(false);
+    room.stop();
+  });
+
+  it('snapshot stays <= 2KB at MAX_PLAYERS (8) racers with airborne + jump in every snap', () => {
+    const io = new FakeIO();
+    const ids = Array.from({ length: MAX_PLAYERS }, (_, i) => `p${i + 1}`);
+    const { room, drivers } = setupRace(io, ids, 42);
+
+    drive(room, drivers, 60); // mid-race state: places + real positions live
+    // send a jump edge on each player so airborne is in the wire for everyone
+    for (const d of drivers) d.send(room, 0, SIM_DT, true);
+    // consume the jump inputs (one tick per player) and let snapshots catch up
+    for (let i = 0; i < 5; i++) tick();
+    settle();
+
+    for (const id of ids) {
+      const snap = io.lastSnap(id);
+      const bytes = JSON.stringify(snap).length;
+      // verify airborne was broadcast (at least one player still in the air
+      // after the jump batch; a hop lasts ~7 ticks — most should be airborne)
+      expect(snap.players.some((p) => p.airborne)).toBe(true);
+      expect(bytes, `snapshot for ${id} fits the 2KB wire budget with airborne`).toBeLessThanOrEqual(2048);
+    }
     room.stop();
   });
 });

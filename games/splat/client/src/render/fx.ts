@@ -7,6 +7,9 @@
 //   puff     — plant-hit powder burst: slower billow, snowLit -> snowShade.
 //   confetti — finish pennant burst: sunGold + the 8 skier colours, light
 //              gravity, flutter on the way down.
+//   land     — touchdown powder ring + billow: the biggest burst in the game
+//              (snowLit -> snowShade, ring velocity, light gravity).
+//   launch   — takeoff-lip spray kick: fast, short, directional pop.
 //   sparkle  — subtle additive glint layer drifting near the camera (the
 //              "glittering snow" of the STYLE_BIBLE); wraps around (camX,camZ).
 //
@@ -23,12 +26,14 @@ import * as THREE from 'three';
 import { SKIER_COLORS, SPAL } from '@splat/shared';
 import { decoSeed, rng, rngInt, rngRange } from '@platform/shared';
 
-export type FxKind = 'spray' | 'puff' | 'confetti';
+export type FxKind = 'spray' | 'puff' | 'confetti' | 'land' | 'launch';
 
 // ---- pool sizes (capacities sum to exactly 512 — the §8 particle budget) ----
-const SPRAY_CAP = 176;
-const PUFF_CAP = 144;
-const CONFETTI_CAP = 192;
+const SPRAY_CAP = 120;
+const PUFF_CAP = 112;
+const CONFETTI_CAP = 160;
+const LAND_CAP = 72;
+const LAUNCH_CAP = 48;
 const SPARKLE_N = 128; // glint layer — not a gameplay pool, separate Points
 
 const PARK_Y = -10000; // dead-slot parking altitude
@@ -100,6 +105,38 @@ const RECIPES: Record<FxKind, FxRecipe> = {
     from: new THREE.Color(SPAL.sunGold),
     to: new THREE.Color(SPAL.sunGold),
     confettiColors: true,
+  },
+  land: {
+    count: 24,
+    lifeLo: 0.4,
+    lifeHi: 0.8,
+    outLo: 3.5, // ring velocity — high lateral, the touchdown read
+    outHi: 6.5,
+    upLo: 2.5,
+    upHi: 5.0,
+    grav: 5, // light — powder billows, then settles
+    drag: 1.0,
+    flutter: 0,
+    size: 0.2, // the weightiest grains in the game
+    from: new THREE.Color(SPAL.snowLit),
+    to: new THREE.Color(SPAL.snowShade),
+    confettiColors: false,
+  },
+  launch: {
+    count: 14,
+    lifeLo: 0.25,
+    lifeHi: 0.5,
+    outLo: 2,
+    outHi: 5,
+    upLo: 1.5, // slight up bias — the pop read at the lip
+    upHi: 3.5,
+    grav: 9, // heavy — kicks out and drops fast
+    drag: 0.8,
+    flutter: 0,
+    size: 0.1,
+    from: new THREE.Color(SPAL.snowLit),
+    to: new THREE.Color(SPAL.snowShade),
+    confettiColors: false,
   },
 };
 
@@ -203,8 +240,10 @@ export class SplatFx {
       spray: makePool(SPRAY_CAP, RECIPES.spray.size),
       puff: makePool(PUFF_CAP, RECIPES.puff.size),
       confetti: makePool(CONFETTI_CAP, RECIPES.confetti.size),
+      land: makePool(LAND_CAP, RECIPES.land.size),
+      launch: makePool(LAUNCH_CAP, RECIPES.launch.size),
     };
-    for (const kind of ['spray', 'puff', 'confetti'] as const) {
+    for (const kind of ['spray', 'puff', 'confetti', 'land', 'launch'] as const) {
       world.add(this.pools[kind].points);
     }
 
@@ -275,9 +314,9 @@ export class SplatFx {
   /** Advance every pool + the sparkle wrap. (camX, camZ) anchor the glints. */
   update(dt: number, camX: number, camZ: number): void {
     this.t += dt;
-    this.stepPool(this.pools.spray, RECIPES.spray, dt);
-    this.stepPool(this.pools.puff, RECIPES.puff, dt);
-    this.stepPool(this.pools.confetti, RECIPES.confetti, dt);
+    for (const kind of ['spray', 'puff', 'confetti', 'land', 'launch'] as const) {
+      this.stepPool(this.pools[kind], RECIPES[kind], dt);
+    }
 
     // Sparkle: wrap base offsets into the torus around the camera. The y band
     // follows the mean grade so glints stay near the snow down the whole run.
@@ -299,7 +338,7 @@ export class SplatFx {
 
   /** Retire every particle instantly (room leave / rematch). */
   clear(): void {
-    for (const kind of ['spray', 'puff', 'confetti'] as const) {
+    for (const kind of ['spray', 'puff', 'confetti', 'land', 'launch'] as const) {
       const pool = this.pools[kind];
       pool.life.fill(0);
       pool.live = 0;
@@ -310,7 +349,7 @@ export class SplatFx {
 
   /** Remove the Points from the world and free geometry + materials. */
   dispose(): void {
-    for (const kind of ['spray', 'puff', 'confetti'] as const) {
+    for (const kind of ['spray', 'puff', 'confetti', 'land', 'launch'] as const) {
       const pool = this.pools[kind];
       this.world.remove(pool.points);
       pool.points.geometry.dispose();

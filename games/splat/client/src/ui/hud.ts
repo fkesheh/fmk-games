@@ -43,6 +43,7 @@ const RAIL_W = 24;
 const RAIL_H = 140;
 const RAIL_DPR = 2; // 2x backing store
 const RAIL_PAD = 8;
+const PRESS_CLICK_WINDOW_MS = 500; // a click inside this after a pointerdown is the SAME press
 
 // ---- tiny DOM helpers (change-guarded) --------------------------------------
 function el(tag: string, cls: string): HTMLElement {
@@ -98,6 +99,8 @@ export class SplatHud {
   private readonly countOverlay: HTMLElement;
   private readonly finishedBanner: HTMLElement;
   private readonly resultsPanel: HTMLElement;
+  private readonly jumpBtn: HTMLButtonElement;
+  private readonly jumpGlyph: HTMLElement;
   private readonly hint: HTMLElement;
 
   // baselines for the change guards
@@ -111,12 +114,59 @@ export class SplatHud {
   private railSig = '';
   private resultsSig = '';
 
+  // v2 JUMP chip state (UX_BIBLE §V2): the wired seam + press-edge tracking.
+  private jumpFn: (() => void) | null = null;
+  /** performance.now() of the last pointerdown on the chip, or -1 once that
+   *  press was cancelled or its follow-up click consumed. */
+  private jumpPressAtMs = -1;
+
   // steer hint bookkeeping
   private hintVisible = false;
   private hintTimer = 0;
   private readonly onHintInput = (): void => {
     this.dismissHint();
   };
+
+  // ---- v2 JUMP chip edge handlers (UX_BIBLE §V2) ---------------------------
+  /**
+   * v2 seam (additive): the app wires this to drive.setJump(). Fires `fn`
+   * ONCE per press — a pointerdown edge (a held thumb never repeats; the
+   * sim's cooldown owns cadence) or a keyboard/AT click with no preceding
+   * pointer press. pointercancel / lostpointercapture / blur reset the
+   * tracked press so a cancelled press can never fire a second edge.
+   */
+  onJump(fn: () => void): void {
+    this.jumpFn = fn;
+  }
+
+  private readonly onJumpPointerDown = (ev: PointerEvent): void => {
+    ev.preventDefault(); // pointer presses never spawn a synthetic click
+    this.jumpPressAtMs = performance.now();
+    this.fireJump();
+  };
+
+  private readonly onJumpClick = (): void => {
+    if (this.jumpPressAtMs >= 0 && performance.now() - this.jumpPressAtMs < PRESS_CLICK_WINDOW_MS) {
+      // the click that follows a pointer press — its edge already fired
+      this.jumpPressAtMs = -1;
+      return;
+    }
+    this.fireJump(); // keyboard / assistive-tech activation (no pointer press)
+  };
+
+  private readonly onJumpCancel = (): void => {
+    // pointercancel / lostpointercapture: the press died mid-flight. Reset the
+    // tracked press so the NEXT press fires, but fire no edge here.
+    this.jumpPressAtMs = -1;
+  };
+
+  private readonly onJumpBlur = (): void => {
+    this.jumpPressAtMs = -1;
+  };
+
+  private fireJump(): void {
+    this.jumpFn?.();
+  }
 
   constructor(parent: HTMLElement) {
     this.root = el('div', 'splat-hud hidden');
@@ -168,13 +218,42 @@ export class SplatHud {
     this.resultsPanel = el('div', 'sh-results hidden');
     this.root.appendChild(this.resultsPanel);
 
-    // (7) first-run steer hint
+    // (6b) v2 JUMP chip — round, bottom-right ABOVE the touch zones: sunGold
+    // ring + ink arrow-up glyph on paper (STYLE_BIBLE §V2.8 — labelled by
+    // glyph, never colour alone). pointer-events: auto, because the HUD root
+    // is none (the steer zones live under it).
+    this.jumpBtn = document.createElement('button');
+    this.jumpBtn.type = 'button';
+    this.jumpBtn.className = 'sh-jump hidden';
+    this.jumpBtn.setAttribute('aria-label', 'Jump — hop');
+    this.jumpGlyph = el('span', 'sh-jump-glyph');
+    this.jumpGlyph.textContent = '↑';
+    this.jumpBtn.appendChild(this.jumpGlyph);
+    // T3: a small HOP label under the arrow — the button is labelled by glyph
+    // AND word (UX law: never colour-only; a 4-year-old reads 'HOP').
+    const jumpLabel = el('span', 'sh-jump-label');
+    jumpLabel.textContent = 'HOP';
+    this.jumpBtn.appendChild(jumpLabel);
+    this.jumpBtn.addEventListener('pointerdown', this.onJumpPointerDown);
+    this.jumpBtn.addEventListener('click', this.onJumpClick);
+    this.jumpBtn.addEventListener('pointercancel', this.onJumpCancel);
+    this.jumpBtn.addEventListener('lostpointercapture', this.onJumpCancel);
+    this.jumpBtn.addEventListener('blur', this.onJumpBlur);
+    this.root.appendChild(this.jumpBtn);
+
+    // (7) first-run steer + JUMP hint (UX_BIBLE §V2 adds the jump line to the
+    // same 3 s / once-per-localStorage / any-input-dismissible hint)
     this.hint = el('div', 'sh-hint hidden');
     this.hint.appendChild(el('div', 'sh-hint-thumb sh-hint-left'));
     this.hint.appendChild(el('div', 'sh-hint-thumb sh-hint-right'));
+    const hintText = el('div', 'sh-hint-text');
     const label = el('div', 'sh-hint-label');
     label.textContent = 'hold a side to steer';
-    this.hint.appendChild(label);
+    const jumpLine = el('div', 'sh-hint-jump');
+    jumpLine.textContent = 'SPACE / JUMP = hop — ramps send you flying!';
+    hintText.appendChild(label);
+    hintText.appendChild(jumpLine);
+    this.hint.appendChild(hintText);
     this.root.appendChild(this.hint);
 
     parent.appendChild(this.root);
@@ -222,6 +301,9 @@ export class SplatHud {
       }
     }
 
+    // ---- v2 JUMP chip -------------------------------------------------------
+    setHidden(this.jumpBtn, !racingUi);
+
     // ---- progress rail (redrawn at <= 4 Hz, and only when anything moved) ---
     setHidden(this.rail, !racingUi);
     if (racingUi && now - this.railLastDrawMs >= RAIL_MIN_INTERVAL_MS) {
@@ -251,9 +333,9 @@ export class SplatHud {
     if (resultsVisible) this.renderResults(s);
   }
 
-  /** First-run steer hint: translucent thumb outlines + one line of text,
-   *  dismissed by any pointer/key input or after 3 s, at most once per
-   *  localStorage (UX_BIBLE "First 60 seconds"). */
+  /** First-run steer + JUMP hint: translucent thumb outlines with two lines
+   *  of text, dismissed by any pointer/key input or after 3 s, at most once
+   *  per localStorage (UX_BIBLE "First 60 seconds" + §V2). */
   showSteerHint(): void {
     if (this.hintVisible) return;
     let seen = false;
@@ -298,15 +380,23 @@ export class SplatHud {
     const top = RAIL_PAD;
     const bottom = RAIL_H - RAIL_PAD;
     ctx.clearRect(0, 0, RAIL_W, RAIL_H);
-    // the rail: start at top, finish at bottom
+    // the rail: start at top, finish at bottom. F4 weight: a subtle paper
+    // glow under a thin ink rail so the column reads against the bright sky.
     ctx.beginPath();
     ctx.moveTo(x, top);
     ctx.lineTo(x, bottom);
-    ctx.lineWidth = 3;
-    ctx.strokeStyle = rgba(SPAL.ink, 0.5);
+    ctx.lineWidth = 8;
+    ctx.strokeStyle = rgba(SPAL.paper, 0.3);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x, top);
+    ctx.lineTo(x, bottom);
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = rgba(SPAL.ink, 0.7);
     ctx.stroke();
     // one dot per racer in slot colour; sorted draw order = race order, you
-    // last (on top), larger with a white rim. Allocates only on a redraw.
+    // last (on top), larger, every dot paper-rimmed so it stays visible
+    // against the sky band. Allocates only on a redraw.
     const dots = [...s.racers].sort(raceOrder);
     for (const r of dots) {
       const isYou = r.slot === s.you.slot;
@@ -316,11 +406,9 @@ export class SplatHud {
       ctx.arc(x, y, isYou ? 7 : 5, 0, Math.PI * 2); // >= 10 px diameter dots
       ctx.fillStyle = s.colorFor(r.slot);
       ctx.fill();
-      if (isYou) {
-        ctx.lineWidth = 2;
-        ctx.strokeStyle = SPAL.snowLit;
-        ctx.stroke();
-      }
+      ctx.lineWidth = isYou ? 2 : 1.5;
+      ctx.strokeStyle = SPAL.snowLit;
+      ctx.stroke();
     }
   }
 

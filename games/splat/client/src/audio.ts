@@ -7,11 +7,15 @@
 //   carve — a SECOND continuous noise voice with a different filter character
 //           (higher, tighter bandpass — skis hissing on edge, not wind), gated
 //           per frame by C2's |steer| x v-scaled amount. Never retriggered.
-//   rustle/beep/go/finish/sting/whoosh — one-shots: plant hit (leafy noise
-//           burst + soft thud), countdown beep, brighter/higher GO, a short
-//           fanfare arpeggio on the finish line, a results sting, and the
-//           slalom-gate whoosh (a fast airy sweep UP — a clean pass has no
-//           thud, and the rising band is the inverse of rustle's falling one).
+//   rustle/beep/go/finish/sting/whoosh/jump/land — one-shots: plant hit
+//           (leafy noise burst + soft thud), countdown beep, brighter/higher
+//           GO, a short fanfare arpeggio on the finish line, a results sting,
+//           the slalom-gate whoosh (a fast airy sweep UP — a clean pass has no
+//           thud, and the rising band is the inverse of rustle's falling one),
+//           and the v2 pair — jump (a quick rising whoosh + a small 300→700 Hz
+//           sine climb + a click-free launch pop: LIFT, shorter and tighter
+//           than the gate whoosh) and land (a soft low 120→60 Hz thump over a
+//           muffled lowpass powder puff: WEIGHT without violence).
 // Both looped voices share the ONE seeded noise buffer (rng(0x5eed) —
 // Math.random is a contract violation) at detuned playbackRates so they never
 // phase-lock. All per-frame param moves go through setTargetAtTime (cheap,
@@ -24,7 +28,7 @@
 // ============================================================================
 import { rng } from '@platform/shared';
 
-export type SplatSfx = 'rustle' | 'beep' | 'go' | 'finish' | 'sting' | 'whoosh';
+export type SplatSfx = 'rustle' | 'beep' | 'go' | 'finish' | 'sting' | 'whoosh' | 'jump' | 'land';
 
 /** Optional per-call sfx modifiers; distance is in meters. */
 export interface SplatSfxOpts {
@@ -232,6 +236,24 @@ export class SplatAudio {
           // and never sweeps this fast.
           this.burst(ctx, nbuf, master, { type: 'bandpass', f0: 700, f1: 3400, q: 1.1, t0, dur: 0.24, peak: 0.3, attack: 0.03 }, dm);
           this.burst(ctx, nbuf, master, { type: 'highpass', f0: 2600, f1: 5200, q: 0.7, t0: t0 + 0.02, dur: 0.16, peak: 0.12, attack: 0.02 }, dm);
+          break;
+        }
+        case 'jump': {
+          // launch: LIFT, not a pass — the gate whoosh's shorter, lower, tighter
+          // cousin. A fast airy noise sweep UP through a narrow band (0.12 s vs
+          // the gate's 0.24 s) + a small rising sine body (300→700 Hz) so the ear
+          // reads a climb, + a tiny click-free pop as you push off.
+          this.burst(ctx, nbuf, master, { type: 'bandpass', f0: 500, f1: 2400, q: 1.2, t0, dur: 0.12, peak: 0.22, attack: 0.008 }, dm);
+          this.beep(ctx, master, { type: 'sine', f0: 300, f1: 700, t0, dur: 0.12, peak: 0.16 }, dm);
+          this.beep(ctx, master, { type: 'sine', f0: 200, f1: 150, t0, dur: 0.04, peak: 0.1 }, dm);
+          break;
+        }
+        case 'land': {
+          // touchdown: WEIGHT without violence (the 4-year-old law) — a soft low
+          // sine 120→60 Hz with a short decay for the body, over a broad, quiet
+          // powder puff (lowpass 500→150 Hz) for the snow kicked up. No crash.
+          this.beep(ctx, master, { type: 'sine', f0: 120, f1: 60, t0, dur: 0.16, peak: 0.38 }, dm);
+          this.burst(ctx, nbuf, master, { type: 'lowpass', f0: 500, f1: 150, q: 0.8, t0, dur: 0.16, peak: 0.2, attack: 0.004 }, dm);
           break;
         }
       }

@@ -27,6 +27,18 @@ export interface Gate {
   readonly halfWidth: number;
 }
 
+/** A jump ramp (kicker): a sculpted snow ramp in the corridor. Riding over
+ *  it while grounded (and off cooldown) launches the skier — the arc is
+ *  determined by the sim (§6 v2); the mesh is a structure (render/gates.ts).
+ *  Crossing `z` within |x - kicker.x| <= halfWidth consumes the kicker
+ *  (lastKickerIx advances, airborne or not) — a ramp you cleared mid-air
+ *  never re-launches you after landing. */
+export interface Kicker {
+  readonly x: number;
+  readonly z: number;
+  readonly halfWidth: number; // lateral capture half-width (m)
+}
+
 export interface SlopeDef {
   readonly seed: number;
   readonly length: number;
@@ -34,6 +46,7 @@ export interface SlopeDef {
   readonly finishZ: number;
   readonly plants: readonly Plant[];
   readonly gates: readonly Gate[];   // ascending z, deterministic from seed
+  readonly kickers: readonly Kicker[]; // ascending z, deterministic from seed (v2)
   /** Terrain height at (x,z). Analytic, deterministic. */
   height(x: number, z: number): number;
   /** Downhill grade along `heading` at (x,z). Always >= GRADE_MIN. */
@@ -47,8 +60,12 @@ export interface SlopeDef {
 export interface SplatInputMsg {
   readonly t: 'splat_input';
   readonly seq: number;
-  readonly steer: number;   // -1..1, post-ramp, post-assist-EMA — THE ONLY input
+  readonly steer: number;   // -1..1, post-ramp, post-assist-EMA
   readonly dt: number;      // seconds of client sim time this input covers
+  /** v2 JUMP edge: true on the ONE input where a jump is requested (key /
+   *  touch press). The sim consumes the edge (hop, or kicker launch) and
+   *  never treats a held flag as repeated jumps. Omitted = false. */
+  readonly jump?: boolean;
 }
 
 export type SplatC2S =
@@ -76,6 +93,14 @@ export interface SkierSim {
   lastPlantHitMs: number;       // sim ms; drives rearm + PLANT_IMMUNITY_MS
   lastGateIx: number;           // -1 = none (indexes SlopeDef.gates)
   boostUntilMs: number;         // sim ms; v cap = GATE_BOOST_MAX while simMs < this
+  // ---- v2 JUMP fields (closed-form ballistic arc, see sim.ts §6) ----
+  airborne: boolean;            // true while in the air (no plant contact)
+  airStartMs: number;           // sim ms of launch — the arc clock (also the
+                                // cooldown clock: jumps re-enable at
+                                // airStartMs + J_COOLDOWN_MS)
+  airVy: number;                // m/s vertical velocity at launch (arc shape)
+  airStartY: number;            // world terrain height at the launch point (m)
+  lastKickerIx: number;         // -1 = none (indexes SlopeDef.kickers)
   finished: boolean;
   finishMs: number;             // simMs at the moment of finishing, 0 while racing
 }
@@ -90,6 +115,11 @@ export interface SkierSnap {
   yaw: number;
   v: number;
   steer: number;      // last known, for remote lean animation
+  airborne: boolean;  // v2 — remote air posing + landing FX (edge-derived)
+  /** v2 — air height ABOVE THE TERRAIN at snapshot time, server-computed via
+   *  sim.airHeight so the client renders a remote's arc WITHOUT a sim clock
+   *  on the wire (the gauntlet's missing-remote-height fatal, fully closed). */
+  airH: number;
   finished: boolean;
   finishMs: number;
   place: number;      // 1-based, computed server-side each tick

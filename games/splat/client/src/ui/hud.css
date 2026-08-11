@@ -85,7 +85,24 @@
   display: flex;
   align-items: baseline;
   gap: 8px;
-  text-shadow: 0 1px 6px rgba(var(--inkc), 0.55);
+  /* F4 badge: the skier colour stays on the numeral, but the chip gets a
+     paper ring + ink scrim wash + soft drop shadow so it reads as a badge
+     over bright snow, not a raw colour swatch. */
+  padding: 6px 12px 8px;
+  border-radius: 14px;
+  border: 2px solid color-mix(in srgb, var(--paper) 86%, transparent);
+  background: radial-gradient(
+    140% 170% at 30% 0%,
+    color-mix(in srgb, var(--ink) 64%, transparent),
+    color-mix(in srgb, var(--ink) 40%, transparent)
+  );
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--paper) 26%, transparent),
+    0 3px 8px rgba(var(--inkc), 0.4),
+    0 14px 30px rgba(var(--inkc), 0.45);
+  text-shadow:
+    0 0 8px color-mix(in srgb, var(--paper) 45%, transparent),
+    0 2px 5px rgba(var(--inkc), 0.65);
 }
 
 .sh-place-num {
@@ -114,20 +131,32 @@
   position: absolute;
   left: calc(14px + var(--safe-l));
   bottom: calc(14px + var(--safe-b));
-  padding: 6px 10px 8px;
-  border-radius: 10px;
-  background: rgba(var(--inkc), 0.35);
+  padding: 8px 12px 10px;
+  border-radius: 12px;
+  /* F4: stronger scrim wash (gradient, not flat) + hairline paper edge +
+     soft drop shadow so the chip reads over bright snow. */
+  background: linear-gradient(
+    165deg,
+    color-mix(in srgb, var(--ink) 60%, transparent),
+    color-mix(in srgb, var(--ink) 44%, transparent)
+  );
+  border: 1px solid color-mix(in srgb, var(--paper) 20%, transparent);
+  box-shadow:
+    0 2px 6px rgba(var(--inkc), 0.35),
+    0 12px 26px rgba(var(--inkc), 0.42);
 }
 
 .sh-speed-num {
   font-size: 20px; /* UX_BIBLE: >= 18 px */
   font-weight: 700;
   font-variant-numeric: tabular-nums;
+  text-shadow: 0 1px 5px rgba(var(--inkc), 0.65);
 }
 
 .sh-speed-unit {
   font-size: 12px;
   opacity: 0.8;
+  text-shadow: 0 1px 4px rgba(var(--inkc), 0.6);
 }
 
 .sh-speed-bar {
@@ -142,6 +171,69 @@
 .sh-speed-bar-fill {
   height: 100%;
   background: var(--sun-gold);
+}
+
+/* --- (6b) v2 JUMP chip: round, sunGold ring + ink arrow-up on paper ------- */
+.sh-jump {
+  position: absolute;
+  /* bottom-right, ABOVE the touch zone area — never inside a steering half */
+  right: calc(18px + var(--safe-r));
+  bottom: calc(24px + clamp(84px, 16vh, 140px) + 32px + var(--safe-b));
+  width: 72px; /* >= 64 px touch target (STYLE_BIBLE §V2.8) */
+  height: 72px;
+  border-radius: 50%;
+  border: 4px solid var(--sun-gold); /* F4: thicker sunGold ring */
+  background: var(--paper);
+  color: var(--ink);
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  /* the HUD root is pointer-events: none so it never blocks the steer zones;
+     the chip re-enables events for itself */
+  pointer-events: auto;
+  touch-action: none; /* no scroll / zoom / double-tap gestures start here */
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  /* F4: a soft paper halo ring lifts the disc off the snow; the drop shadow
+     then grounds it. */
+  box-shadow:
+    0 0 0 8px color-mix(in srgb, var(--paper) 42%, transparent),
+    0 4px 18px rgba(var(--inkc), 0.35);
+  transition:
+    transform 150ms ease,
+    border-color 150ms ease,
+    box-shadow 150ms ease;
+}
+
+.sh-jump:active {
+  /* a press always gets an answer: the chip pulses down and the sunGold ring
+     darkens (UX_BIBLE §V2, F4 pressed state) */
+  transform: scale(0.92);
+  border-color: color-mix(in srgb, var(--sun-gold) 55%, var(--ink));
+  box-shadow:
+    0 0 0 5px color-mix(in srgb, var(--paper) 26%, transparent),
+    0 2px 10px rgba(var(--inkc), 0.3);
+}
+
+.sh-jump-glyph {
+  font-size: 28px;
+  font-weight: 800;
+  line-height: 1;
+  /* optical centering: an up-arrow glyph sits a touch high in the disc */
+  transform: translateY(-1px);
+}
+
+.sh-jump-label {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  color: var(--ink);
+  line-height: 1;
+  margin-top: 3px;
+  opacity: 0.85;
 }
 
 /* --- (4) countdown overlay: 3-2-1 then GO! -------------------------------- */
@@ -268,14 +360,29 @@
   right: calc(18px + var(--safe-r));
 }
 
-.sh-hint-label {
+.sh-hint-text {
   position: absolute;
   left: 50%;
   /* above the bottom-corner thumbs, never inside them */
   bottom: calc(24px + clamp(84px, 16vh, 140px) + 40px + var(--safe-b));
   transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+.sh-hint-label {
   font-size: 16px;
   font-weight: 600;
   text-shadow: 0 1px 6px rgba(var(--inkc), 0.6);
   white-space: nowrap;
+}
+
+.sh-hint-jump {
+  /* the v2 line: sunGold, echoing the ringed JUMP chip it points at (§V2.8) */
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--sun-gold);
+  text-shadow: 0 1px 6px rgba(var(--inkc), 0.6);
 }

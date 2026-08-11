@@ -70,9 +70,55 @@ export const GATE_BOOST_MS = 2500;       // boost window (sim ms)
 export const GATE_BOOST_V = 2.5;         // instant speed granted on pass (m/s)
 export const GATE_BOOST_MAX = 30;        // speed cap while boosted (~108 km/h)
 
+// --- Jumps (v2) -------------------------------------------------------------------
+// ONE shared ballistic model: the skier flies a WORLD-SPACE arc
+//   worldY(t) = airStartY + airVy*t - 0.5*G_ACCEL*t^2,  t = (simMs-airStartMs)/1000
+// and lands when the arc returns to the (descending) terrain:
+//   airStartY + arc <= slope.height(x, z). Both peers compute identically.
+// TUNING NOTE (gauntlet-verified): the piste drops ~0.26*v m/s under the
+// flight, so the height ABOVE the snow at time t is
+//   h(t) = (airVy + grade*v)*t - 0.5*G_ACCEL*t^2  (approx)
+// — the terrain-drop term AMPLIFIES launch vy. These v2 numbers are tuned
+// for the world frame (empirically verified: hop apex ~1.5-2.5 m above the
+// snow at race speed, kicker apex ~3-5 m, flights 30-50 m, always land,
+// always contained; see docs/splat-v2/prototype-v2.mts).
+export const J_HOP_VY = 1.1;             // manual hop launch vy (m/s, world frame):
+                                         // a quick dodge — ~1.5-2.5 m of air at race
+                                         // speed, never a stun
+export const J_KICKER_VY_BASE = 1.8;     // kicker launch vy at zero speed (m/s)
+export const J_KICKER_VY_SPEED = 0.05;   // +vy per m/s of speed (fast = bigger air)
+export const J_AIR_STEER_MUL = 0.35;     // steering effectiveness while airborne
+                                         // (hold your line; correct on landing)
+export const J_AIR_CARVE_MUL = 0.3;      // carve-scrub multiplier while airborne
+export const J_COOLDOWN_MS = 1800;       // sim ms between launches (hops are a
+                                         // tactical tool, not a plant-immunity
+                                         // button — the DESIGN_BIBLE line stays
+                                         // the decision)
+export const J_LAND_SPEED_MUL = 0.97;    // landing scrub (never below MIN_SPEED)
+export const J_MAX_AIRTIME_S = 3.5;      // absolute airtime cap — landing is always
+                                         // eventual (the 4-year-old law: no stuck)
+
+// Kicker layout (seeded, corridor-anchored like the slalom gates).
+export const KICKER_COUNT = 9;           // jump ramps per run
+export const KICKER_HALF_WIDTH = 1.6;    // capture half-width (m)
+export const KICKER_Z0 = 90;             // first kicker after the learning zone
+export const KICKER_SPACING = 85;        // mean z spacing (m) — > max flight
+                                         // (~52 m at 26 m/s) so a fast skier never
+                                         // overshoots the next ramp (gauntlet)
+export const KICKER_Z_JITTER = 10;       // per-kicker z jitter (m, seeded)
+export const KICKER_X_JITTER = 3;        // lateral offset off the corridor centre (m)
+export const KICKER_PLANT_CLEAR = 2.2;   // no plant within this of a kicker (m)
+export const KICKER_HEIGHT = 0.85;       // ramp height (m) — visual + air feel
+                                         // (the sim launches from the arc, the
+                                         // ramp mesh is decoration)
+
 // --- Plants (the opponent) ----------------------------------------------------
 // Density target: a straight fall-line run hits 3-6 plants (DESIGN_BIBLE).
 // Contact corridor ~2.5 m wide x ~615 m full-density length x 0.004 = ~6 hits.
+// (Gauntlet note: GRADE_BASE - GRADE_MIN = 0.26 - 0.08 = 0.18, and the
+// worst-case downhill-directed undulation gradient is 0.057+0.057, so the
+// fall-line grade stays >= 0.26-0.114 = 0.146 on the fall line and >= GRADE_MIN
+// for any reachable heading.)
 export const PLANT_REARM_MS = 3000;      // per-plant rearm window (sim ms)
 export const PLANT_IMMUNITY_MS = 400;    // global post-hit immunity (cluster guard)
 export const PLANT_HIT_SPEED_MUL = 0.7;  // velocity kept on contact

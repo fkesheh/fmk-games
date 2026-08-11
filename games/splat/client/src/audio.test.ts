@@ -28,6 +28,10 @@ describe('SplatAudio — headless no-op', () => {
       a.sfx('sting', {});
       a.sfx('whoosh');
       a.sfx('whoosh', { distance: 45 });
+      a.sfx('jump');
+      a.sfx('jump', { distance: 30 });
+      a.sfx('land');
+      a.sfx('land', { distance: 30 });
     }).not.toThrow();
   });
 });
@@ -96,6 +100,7 @@ class FakeAudioContext {
   filters: { frequency: FakeParam; Q: FakeParam; type: string }[] = [];
   sources: { buffer: unknown; loop: boolean; playbackRate: FakeParam; started: number }[] = [];
   oscillators = 0;
+  oscList: { type: string; frequency: FakeParam }[] = [];
   resume(): Promise<void> { this.resumeCalls++; return Promise.resolve(); }
   createGain(): unknown {
     const g = fakeNode({ gain: fakeParam(1) });
@@ -128,10 +133,12 @@ class FakeAudioContext {
   }
   createOscillator(): unknown {
     this.oscillators++;
-    return fakeNode({
+    const o = fakeNode({
       type: 'sine', frequency: fakeParam(), detune: fakeParam(),
       start() { /* scheduled */ }, stop() { /* scheduled */ },
     });
+    this.oscList.push(o as { type: string; frequency: FakeParam });
+    return o;
   }
 }
 
@@ -205,8 +212,12 @@ describe('SplatAudio — with a stubbed AudioContext (fake gesture)', () => {
         a.sfx('finish');
         a.sfx('sting');
         a.sfx('whoosh');
+        a.sfx('jump');
+        a.sfx('land');
         a.sfx('rustle', { distance: 30 });
         a.sfx('whoosh', { distance: 30 }); // a distant rival's gate pass, attenuated
+        a.sfx('jump', { distance: 30 }); // a remote racer's pop, attenuated
+        a.sfx('land', { distance: 30 }); // a distant touchdown, attenuated
       }).not.toThrow();
       // one-shots actually scheduled nodes (rustle = 1 burst + 1 beep, etc.)
       expect(fake.sources.length + fake.oscillators).toBeGreaterThan(before);
@@ -243,6 +254,50 @@ describe('SplatAudio — with a stubbed AudioContext (fake gesture)', () => {
       expect(finals).toEqual([3400, 5200]);
       const types = fake.filters.map((f) => f.type).sort();
       expect(types).toEqual(['bandpass', 'highpass']);
+    } finally {
+      uninstallFakeContext();
+    }
+  });
+
+  it('jump: airy sweep UP + rising sine body + tiny pop — LIFT, not a pass', () => {
+    installFakeContext();
+    try {
+      const a = new SplatAudio();
+      a.resume();
+      const fake = created(); // the context resume() constructed
+      a.sfx('jump');
+      // one noise layer (the sweep) + two oscillator layers (sine body + pop)
+      expect(fake.sources.length).toBe(1);
+      expect(fake.oscillators).toBe(2);
+      // the noise band ends ABOVE its start: a climb, tighter than the gate
+      // whoosh (500→2400 vs 700→3400) — the distinct "lift" read
+      expect(fake.filters.map((f) => f.frequency.value)).toEqual([2400]);
+      expect(fake.filters[0]?.type).toBe('bandpass');
+      // sine body rises 300→700; the pop is a short low blip (200→150)
+      const oscFinals = fake.oscList.map((o) => o.frequency.value).sort((x, y) => x - y);
+      expect(oscFinals).toEqual([150, 700]);
+      expect(fake.oscList.every((o) => o.type === 'sine')).toBe(true);
+    } finally {
+      uninstallFakeContext();
+    }
+  });
+
+  it('land: soft low thump + muffled powder puff — weight, not violence', () => {
+    installFakeContext();
+    try {
+      const a = new SplatAudio();
+      a.resume();
+      const fake = created(); // the context resume() constructed
+      a.sfx('land');
+      // one low sine body (120→60) + one lowpass noise puff
+      expect(fake.oscillators).toBe(1);
+      expect(fake.sources.length).toBe(1);
+      // the thump FALLS to 60 Hz and the powder band falls to 150 Hz — the
+      // inverse of the rising whoosh: soft settling, never a crash
+      expect(fake.oscList.map((o) => o.frequency.value)).toEqual([60]);
+      const flt = fake.filters[0];
+      expect(flt?.type).toBe('lowpass');
+      expect(flt?.frequency.value).toBe(150);
     } finally {
       uninstallFakeContext();
     }

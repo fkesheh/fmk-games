@@ -31,6 +31,7 @@
 import {
   EXTRAPOLATE_MAX_MS,
   INTERP_DELAY_MS,
+  J_COOLDOWN_MS,
   MAX_PLAYERS,
   MAX_SPEED,
   MIN_PLAYERS,
@@ -39,6 +40,7 @@ import {
   SPAL,
 } from '@splat/shared';
 import { genSlope } from '@splat/shared/slope.js';
+import { airHeight } from '@splat/shared/sim.js';
 import type {
   Phase,
   RosterEntry,
@@ -111,6 +113,12 @@ function parseSkierSim(v: unknown): SkierSim | null {
     lastPlantHitMs: v.lastPlantHitMs,
     lastGateIx: v.lastGateIx,
     boostUntilMs: v.boostUntilMs,
+    // v2 jump fields: absent from a pre-v2 server decode as the grounded defaults
+    airborne: v.airborne === true,
+    airStartMs: num(v.airStartMs) ? v.airStartMs : -1,
+    airVy: num(v.airVy) ? v.airVy : 0,
+    airStartY: num(v.airStartY) ? v.airStartY : 0,
+    lastKickerIx: num(v.lastKickerIx) ? v.lastKickerIx : -1,
     finished: v.finished,
     finishMs: v.finishMs,
   };
@@ -128,6 +136,8 @@ function parseSkierSnap(v: unknown): SkierSnap | null {
     yaw: v.yaw,
     v: v.v,
     steer: v.steer,
+    airborne: v.airborne === true,
+    airH: num(v.airH) ? v.airH : 0,
     finished: v.finished,
     finishMs: v.finishMs,
     place: v.place,
@@ -277,6 +287,8 @@ interface RemoteSample {
   yaw: number;
   v: number;
   steer: number;
+  airborne: boolean; // v2 — interp'd pose flag (thresholded)
+  airH: number;      // v2 — air height above terrain (interp'd arc)
 }
 
 /** What gets drawn for a remote skier this frame. */
@@ -285,6 +297,8 @@ interface RemoteVisual {
   z: number;
   yaw: number;
   steer: number;
+  airborne: boolean;
+  airH: number;
 }
 
 // ---- frozen e2e/debug surface (window.__splat, CONTRACT §7 C2) --------------
@@ -303,6 +317,7 @@ interface SplatRemoteDebug {
   x: number; // last INTERPOLATED position (what is on screen)
   z: number;
   yaw: number;
+  airborne: boolean; // v2 — e2e remote-airborne visibility
   samples: number; // interpolation buffer depth
 }
 
@@ -315,6 +330,8 @@ interface SplatTelemetry {
   seq: number; // highest wire seq sent
   offsetMs: number; // serverNow = Date.now() + offsetMs
   seed: number;
+  /** v2 — live slope kickers (for the e2e's deterministic ramp ride + shot). */
+  kickers: ReadonlyArray<{ x: number; z: number }>;
 }
 
 interface SplatApi {
@@ -323,6 +340,7 @@ interface SplatApi {
   joinQuick(name: string): void;
   startRace(seed?: number): void;
   setInput(steer: number): void;
+  setJump(): void;
 }
 
 declare global {
@@ -450,7 +468,7 @@ function sampleBuffer(buf: RemoteSample[], renderTime: number): RemoteVisual | n
   if (lo < 0) {
     const first = buf[0];
     if (first === undefined) return null; // unreachable; satisfies noUncheckedIndexedAccess
-    return { x: first.x, z: first.z, yaw: first.yaw, steer: first.steer };
+    return { x: first.x, z: first.z, yaw: first.yaw, steer: first.steer, airborne: first.airborne, airH: first.airH };
   }
   const a = buf[lo];
   if (a === undefined) return null; // unreachable
@@ -463,12 +481,14 @@ function sampleBuffer(buf: RemoteSample[], renderTime: number): RemoteVisual | n
       z: a.z + Math.cos(a.yaw) * a.v * k,
       yaw: a.yaw,
       steer: a.steer,
+      airborne: a.airborne,
+      airH: a.airH,
     };
   }
   const dx = b.x - a.x;
   const dz = b.z - a.z;
   if (dx * dx + dz * dz > TELEPORT_SQ) {
-    return { x: b.x, z: b.z, yaw: b.yaw, steer: b.steer }; // teleport: snap
+    return { x: b.x, z: b.z, yaw: b.yaw, steer: b.steer, airborne: b.airborne, airH: b.airH }; // teleport: snap
   }
   const span = b.t - a.t;
   const t = span > 0 ? Math.min(1, Math.max(0, (renderTime - a.t) / span)) : 1;
@@ -477,6 +497,8 @@ function sampleBuffer(buf: RemoteSample[], renderTime: number): RemoteVisual | n
     z: a.z + dz * t,
     yaw: lerpAngle(a.yaw, b.yaw, t),
     steer: a.steer + (b.steer - a.steer) * t,
+    airborne: t < 0.5 ? a.airborne : b.airborne,
+    airH: a.airH + (b.airH - a.airH) * t,
   };
 }
 
@@ -541,6 +563,9 @@ export class SplatApp {
   private prevGateIx = -1; // lastGateIx seen on the previous frame's drive.state()
   private prevBoostUntilMs = 0; // its boostUntilMs — a clean pass moves BOTH (sim.ts header)
   private ownGateFxIx = -1; // highest gateIx that already got pass feedback
+  // v2 airborne edge dedup (CONTRACT §11.5 C2v2)
+  private prevAirborne = false;
+  private readonly prevRemoteAirborne = new Map<string, boolean>();
   private lastFrame = 0;
 
   // ---- settings (localStorage; tablet tri-state) -----------------------------------------
@@ -761,6 +786,15 @@ export class SplatApp {
       );
     }
     this.hud = new SplatHud(this.raceEl);
+    // v2: wire the JUMP button once — cooldown/airborne denied feedback
+    // reads the sim state; the edge routes through drive.setJump() (CONTRACT §11.5 C2v2)
+    this.hud.onJump(() => {
+      const s = this.drive?.state();
+      if (s && (s.airborne || s.simMs - s.airStartMs < J_COOLDOWN_MS)) {
+        this.audio.sfx('land'); // denied thud — jump press while airborne or on cooldown
+      }
+      this.drive?.setJump();
+    });
 
     // ---- listeners --------------------------------------------------------------
     window.addEventListener('resize', () => {
@@ -842,6 +876,7 @@ export class SplatApp {
       joinQuick: (name) => this.joinQuick(name),
       startRace: (seed?: number) => this.debugStartRace(seed),
       setInput: (steer) => this.drive?.setInput(steer),
+      setJump: () => this.drive?.setJump(),
     };
 
     this.syncTouchUi(); // layer + layout classes; a no-op on a desktop pointer
@@ -1040,6 +1075,8 @@ export class SplatApp {
     this.prevGateIx = -1;
     this.prevBoostUntilMs = 0;
     this.ownGateFxIx = -1;
+    this.prevAirborne = false;
+    this.prevRemoteAirborne.clear();
     this.resetArmed = true; // first snapshot resets the predictor from you.sim
     // Record the rejoin pointer: welcome always precedes splat_joined, so
     // this.playerId is THIS socket's id — a reload/drop resumes from here.
@@ -1107,6 +1144,8 @@ export class SplatApp {
     this.prevGateIx = -1;
     this.prevBoostUntilMs = 0;
     this.ownGateFxIx = -1;
+    this.prevAirborne = false;
+    this.prevRemoteAirborne.clear();
   }
 
   // ---- slope lifecycle ----------------------------------------------------------------
@@ -1201,7 +1240,23 @@ export class SplatApp {
       if (!this.roster.has(p.id)) rosterDirty = true; // a racer we cannot name yet
       this.ensureSkier(p.id, p.slot);
       this.pushRemote(p, snap.serverTime);
-    }
+        // Remote airborne edge detection (CONTRACT §11.5 C2v2). The POSE is
+        // driven every frame from the interp'd airborne (updateRemotes); here
+        // only the EVENT feedback fires on the edge — the landing burst + thud.
+        const prevRemote = this.prevRemoteAirborne.get(p.id) ?? false;
+        if (p.airborne && !prevRemote) {
+          // launch edge: quiet spray at the remote's feet (no thud — up is fun)
+        } else if (!p.airborne && prevRemote) {
+          const ry = this.slope?.height(p.x, p.z) ?? 0;
+          const rs = this.drive?.state();
+          const dist = rs !== undefined ? Math.hypot(p.x - rs.x, p.z - rs.z) : Infinity;
+          if (dist <= 80) {
+            this.fx?.burst('land', p.x, ry, p.z);
+          }
+          this.audio.sfx('land', { distance: Math.round(dist) });
+        }
+        this.prevRemoteAirborne.set(p.id, p.airborne);
+      }
     this.ownPlace = ownPlace;
     for (const id of [...this.players.keys()]) {
       if (!seen.has(id) && id !== this.playerId) {
@@ -1252,6 +1307,8 @@ export class SplatApp {
       this.prevGateIx = -1;
       this.prevBoostUntilMs = 0;
       this.ownGateFxIx = -1;
+      this.prevAirborne = false;
+      this.prevRemoteAirborne.clear();
       if (!seedChanged && this.drive !== null) {
         // fixed-seed room (settings {seed}) rematch: same mountain, fresh grid
         this.drive.reset(sim.x, sim.z, sim.yaw);
@@ -1522,8 +1579,26 @@ export class SplatApp {
         const cz = s.z + drive.errorZ(); // channel only (drive.ts header)
         // setCamera takes FEET height — R1 adds EYE_HEIGHT (+ dip) itself
         const cy = slope.height(cx, cz);
-        this.scene?.setCamera(cx, cy, cz, s.yaw, s.v, drive.steerVisual(), dt);
+        // Own air height — v2 airborne arc lifts the camera above the piste
+        const air = airHeight(s, cx, cz, slope);
+        this.scene?.setCamera(cx, cy + air, cz, s.yaw, s.v, drive.steerVisual(), dt);
         this.skiers?.setOwnSkis(drive.steerVisual(), s.v, dt);
+        // Own airborne edge detection (CONTRACT §11.2, §11.5 C2v2)
+        if (s.airborne && !this.prevAirborne) {
+          this.scene?.setAirborne(true);
+          this.skiers?.setOwnAirborne(true);
+          this.audio.sfx('jump');
+          this.fx?.burst('launch', cx, cy, cz);
+        } else if (!s.airborne && this.prevAirborne) {
+          this.scene?.land();
+          this.scene?.setAirborne(false);
+          this.skiers?.setOwnAirborne(false);
+          this.audio.sfx('land');
+          this.fx?.burst('land', cx, cy, cz);
+        }
+        this.prevAirborne = s.airborne;
+        // Drive airborne state every race frame — scene eases internally
+        this.scene?.setAirborne(s.airborne);
         // Own gate pass, PREDICTED (sim.ts header convention): lastGateIx
         // advancing WITH a boostUntilMs move = a clean pass; an advance alone
         // is a miss and stays silent. Feedback fires here, the frame it
@@ -1563,8 +1638,13 @@ export class SplatApp {
       const v = sampleBuffer(buf, renderTime);
       if (v === null) continue;
       this.visuals.set(id, v);
-      // y is never on the wire: a skier rides the terrain (their x,z are truth)
-      this.skiers?.update(id, v.x, slope.height(v.x, v.z), v.z, v.yaw, v.steer, dt);
+      // y = terrain + air: the arc is server-computed (snap.airH) so a remote
+      // mid-flight renders ABOVE the snow, not with its feet in it (gauntlet
+      // fatal #2, closed). The pose follows the interp'd airborne every frame
+      // (self-healing — a missed snapshot edge can't leave the pose stuck).
+      const ry = slope.height(v.x, v.z) + v.airH;
+      this.skiers?.update(id, v.x, ry, v.z, v.yaw, v.steer, dt);
+      this.skiers?.setRemoteAirborne(id, v.airborne);
     }
   }
 
@@ -1626,7 +1706,7 @@ export class SplatApp {
       buf = [];
       this.buffers.set(p.id, buf);
     }
-    const sample: RemoteSample = { t: time, x: p.x, z: p.z, yaw: p.yaw, v: p.v, steer: p.steer };
+    const sample: RemoteSample = { t: time, x: p.x, z: p.z, yaw: p.yaw, v: p.v, steer: p.steer, airborne: p.airborne, airH: p.airH };
     const last = buf[buf.length - 1];
     if (last !== undefined && time < last.t) return; // out-of-order: drop (the next snapshot self-heals)
     if (last !== undefined && time === last.t) buf[buf.length - 1] = sample; // duplicate tick: newest wins
@@ -1813,6 +1893,11 @@ export class SplatApp {
               lastPlantHitMs: s.lastPlantHitMs,
               lastGateIx: s.lastGateIx,
               boostUntilMs: s.boostUntilMs,
+              airborne: s.airborne,
+              airStartMs: s.airStartMs,
+              airVy: s.airVy,
+              airStartY: s.airStartY,
+              lastKickerIx: s.lastKickerIx,
               finished: s.finished,
               finishMs: s.finishMs,
             }
@@ -1832,6 +1917,7 @@ export class SplatApp {
         x: v?.x ?? p.x,
         z: v?.z ?? p.z,
         yaw: v?.yaw ?? p.yaw,
+        airborne: v?.airborne ?? false,
         samples: this.buffers.get(id)?.length ?? 0,
       });
     }
@@ -1844,6 +1930,7 @@ export class SplatApp {
       seq: this.lastSeqHigh,
       offsetMs: this.offset,
       seed: this.seed,
+      kickers: this.slope?.kickers.map((k) => ({ x: k.x, z: k.z })) ?? [],
     };
   }
 

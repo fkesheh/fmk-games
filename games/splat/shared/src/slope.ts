@@ -5,8 +5,9 @@
 //
 // Terrain: h(x,z) = SUMMIT_LIFT - GRADE_BASE*z + the three frozen undulation
 // octaves (config.ts), phases from rng(seed). The octaves' worst-case downhill
-// gradient (0.057+0.057) stays under GRADE_BASE-GRADE_MIN = 0.13, so the
-// fall-line grade is >= ~0.096 everywhere by construction. gradeAt projects
+// gradient (0.057+0.057) stays under GRADE_BASE-GRADE_MIN = 0.18 (0.26-0.08),
+// so the fall-line grade is >= ~0.146 everywhere by construction (gauntlet:
+// the old 0.13/0.096 comment was stale pre-tune leftovers). gradeAt projects
 // the analytic gradient onto the heading (yaw 0 = +Z fall line) and clamps to
 // GRADE_MIN — the clamp is the contract safety net for near-traverse headings
 // (a true traverse IS flat; the clamp, not the undulation, owns that case).
@@ -39,6 +40,13 @@ import {
   GATE_JITTER_M,
   GATE_SPACING_M,
   GRADE_BASE,
+  KICKER_COUNT,
+  KICKER_HALF_WIDTH,
+  KICKER_PLANT_CLEAR,
+  KICKER_SPACING,
+  KICKER_X_JITTER,
+  KICKER_Z0,
+  KICKER_Z_JITTER,
   GRADE_MIN,
   PLANT_BAND_M,
   PLANT_CLUSTER_MAX,
@@ -61,7 +69,7 @@ import {
   UND_LONG_2_LEN,
   YAW_MAX,
 } from './config.js';
-import type { Gate, Plant, PlantKind, SlopeDef } from './types.js';
+import type { Gate, Kicker, Plant, PlantKind, SlopeDef } from './types.js';
 
 const TAU = Math.PI * 2;
 const SUMMIT_LIFT = 6; // metres; keeps height(x, 0) a pleasant positive summit
@@ -81,6 +89,7 @@ const BAND_COUNT = Math.ceil(FINISH_Z / PLANT_BAND_M);
 const GATE_COUNT = Math.floor((FINISH_Z - FINISH_CLEAR - GATE_FIRST_Z) / GATE_SPACING_M);
 const GATE_X_JITTER = 6; // gates sit on/within ~6 m of the corridor centreline
 const GATE_X_MAX = HALF_W - 1 - GATE_HALF_WIDTH; // the whole opening stays on-piste
+const KICKER_X_MAX = HALF_W - 1 - KICKER_HALF_WIDTH; // kicker fully on-piste: |x|+halfWidth <= width/2-1
 
 /** Mutable while building; frozen into readonly Plant[] at the end. */
 interface MutablePlant {
@@ -345,6 +354,57 @@ export function genSlope(seed: number): SlopeDef {
     finishZ: FINISH_Z,
     plants: frozenPlants,
     gates: Object.freeze(gates),
+    // --- Kicker ramps (v2 §11.3): KICKER_COUNT ramps along the corridor
+    // centreline, strictly ascending z, on-piste, plant-clear. Same
+    // centreline + gridFreeIntervals machinery the slalom gates use.
+    kickers: (() => {
+      const out: Kicker[] = [];
+      let prevZ = -Infinity;
+      for (let i = 0; i < KICKER_COUNT; i++) {
+        const zJit =
+          KICKER_Z0 + i * KICKER_SPACING + rngRange(next, -KICKER_Z_JITTER, KICKER_Z_JITTER);
+        let z = Math.max(START_CLEAR, Math.min(ZONE_Z1, zJit));
+        if (z <= prevZ) z = Math.min(ZONE_Z1, prevZ + 0.01);
+        if (z > ZONE_Z1) break; // ran out of room (shouldn't happen)
+        prevZ = z;
+        const f = z / PLANT_BAND_M;
+        const k = Math.floor(f);
+        const c0 = centres[k] ?? 0;
+        const c1 = centres[k + 1] ?? c0;
+        const target =
+          c0 + (c1 - c0) * (f - k) + rngRange(next, -KICKER_X_JITTER, KICKER_X_JITTER);
+        // Build free intervals using KICKER_PLANT_CLEAR (not CORRIDOR_HALF)
+        // so the kicker centre is guaranteed plant-clear, not just corridor-clear.
+        const band = Math.floor(z / PLANT_BAND_M);
+        let free: Interval[] = [{ lo: -KICKER_X_MAX, hi: KICKER_X_MAX }];
+        for (let j = band - 1; j <= band + 1 && free.length > 0; j++) {
+          for (const p of gridAt(j)) {
+            free = subtractInterval(free, p.x - KICKER_PLANT_CLEAR, p.x + KICKER_PLANT_CLEAR);
+            if (free.length === 0) break;
+          }
+        }
+        let x: number;
+        if (free.length === 0) {
+          // Every position in [-KICKER_X_MAX, KICKER_X_MAX] is too close to a
+          // plant — should not happen because the corridor is wider than 2×
+          // KICKER_PLANT_CLEAR (3 m > 4.4 m? no — but the corridor repair
+          // pushes plants at least r+CORRIDOR_HALF away, so the centreline
+          // region has at least ~2.4 m clearance on each side). Fall back to
+          // the centreline clamp as a last resort.
+          x = Math.max(-KICKER_X_MAX, Math.min(KICKER_X_MAX, target));
+        } else {
+          let bestD = Infinity;
+          x = target; // will be overwritten
+          for (const iv of free) {
+            const p = Math.max(iv.lo, Math.min(iv.hi, target));
+            const d = Math.abs(p - target);
+            if (d < bestD) { bestD = d; x = p; }
+          }
+        }
+        out.push({ x, z, halfWidth: KICKER_HALF_WIDTH });
+      }
+      return Object.freeze(out) as readonly Kicker[];
+    })(),
     height,
     gradeAt,
     plantGrid: gridAt,
@@ -446,6 +506,53 @@ export function validateSlope(s: SlopeDef): string[] {
   );
   if (Math.abs(s.gates.length - expectedGates) > 2) {
     push(`gate count ${s.gates.length} is outside +/-2 of the expected ${expectedGates}`);
+  }
+
+  // 5. Kicker placement laws (v2 §11.3). Skip when the slope carries no
+  //    kickers (synthetic defs from tests are exempt unless they opt in).
+  if (s.kickers.length > 0) {
+    let prevKickerZ = -Infinity;
+    for (const k of s.kickers) {
+      if (!(k.z > prevKickerZ)) {
+        push(
+          `kicker at z=${k.z.toFixed(2)} is not strictly ascending ` +
+            `(previous ${prevKickerZ.toFixed(2)})`,
+        );
+      }
+      prevKickerZ = k.z;
+      if (k.z < START_CLEAR) {
+        push(`kicker at z=${k.z.toFixed(2)} violates START_CLEAR (${START_CLEAR} m)`);
+      }
+      if (k.z > s.finishZ - FINISH_CLEAR) {
+        push(`kicker at z=${k.z.toFixed(2)} violates FINISH_CLEAR (${FINISH_CLEAR} m)`);
+      }
+      if (Math.abs(k.x) + k.halfWidth > s.width / 2 - 1 + 1e-9) {
+        push(
+          `kicker at z=${k.z.toFixed(2)} x=${k.x.toFixed(2)} ` +
+            `halfWidth=${k.halfWidth} off-piste (width ${s.width})`,
+        );
+      }
+    }
+    if (Math.abs(s.kickers.length - KICKER_COUNT) > 1) {
+      push(
+        `kicker count ${s.kickers.length} outside ±1 of KICKER_COUNT ${KICKER_COUNT}`,
+      );
+    }
+    // No plant within KICKER_PLANT_CLEAR of a kicker (launch + landing must be readable).
+    const pc2 = KICKER_PLANT_CLEAR * KICKER_PLANT_CLEAR;
+    for (const k of s.kickers) {
+      for (const p of s.plants) {
+        const dx = k.x - p.x;
+        const dz = k.z - p.z;
+        if (dx * dx + dz * dz < pc2 - 1e-9) {
+          push(
+            `kicker at z=${k.z.toFixed(2)} x=${k.x.toFixed(2)} too close to plant ` +
+              `at z=${p.z.toFixed(2)} x=${p.x.toFixed(2)} (dist ${Math.sqrt(dx * dx + dz * dz).toFixed(2)} < ${KICKER_PLANT_CLEAR})`,
+          );
+          break; // one violation per kicker is enough
+        }
+      }
+    }
   }
 
   return violations;

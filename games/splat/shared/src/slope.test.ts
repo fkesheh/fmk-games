@@ -20,6 +20,9 @@ import {
   GATE_SPACING_M,
   GRADE_BASE,
   GRADE_MIN,
+  KICKER_COUNT,
+  KICKER_HALF_WIDTH,
+  KICKER_PLANT_CLEAR,
   PLANT_BAND_M,
   PLANT_CLUSTER_PCT,
   PLANT_DENSITY_FULL,
@@ -79,6 +82,7 @@ function syntheticDef(plants: Plant[], gates: Gate[] = validGates()): SlopeDef {
     finishZ: FINISH_Z,
     plants,
     gates,
+    kickers: [],
     height: (_x, z) => -GRADE_BASE * z,
     gradeAt: () => GRADE_BASE,
     plantGrid: (k) => grid.get(k) ?? [],
@@ -450,6 +454,138 @@ interface SlopeSimModule {
   stepSki(s: SkierSim, steer: number, dt: number, slope: SlopeDef): void;
 }
 const SIM_SPECIFIER: string = './sim.js'; // widened on purpose — see above
+
+// ---------------------------------------------------------------------------
+// Kicker placement tests (v2 §11.3)
+// ---------------------------------------------------------------------------
+describe('kicker placement (v2)', () => {
+  it('kickers are deterministic per seed', () => {
+    expect(JSON.stringify(genSlope(7).kickers)).toBe(JSON.stringify(genSlope(7).kickers));
+    expect(JSON.stringify(genSlope(7).kickers)).not.toBe(JSON.stringify(genSlope(8).kickers));
+  });
+
+  it('kicker count is KICKER_COUNT on every seed', () => {
+    for (const seed of SEEDS) {
+      expect(genSlope(seed).kickers.length, `seed ${seed}`).toBe(KICKER_COUNT);
+    }
+  });
+
+  it('kickers are strictly ascending and clear of both clear zones', () => {
+    for (const seed of SEEDS) {
+      const s = genSlope(seed);
+      let prevZ = -Infinity;
+      for (const k of s.kickers) {
+        expect(k.z, `seed ${seed}`).toBeGreaterThan(prevZ);
+        prevZ = k.z;
+        expect(k.z).toBeGreaterThanOrEqual(START_CLEAR);
+        expect(k.z).toBeLessThanOrEqual(FINISH_Z - FINISH_CLEAR);
+      }
+    }
+  });
+
+  it('every kicker is on-piste: |x| + halfWidth <= width/2 - 1', () => {
+    for (const seed of SEEDS) {
+      const s = genSlope(seed);
+      for (const k of s.kickers) {
+        expect(
+          Math.abs(k.x) + k.halfWidth,
+          `seed ${seed} kicker z=${k.z.toFixed(1)}`,
+        ).toBeLessThanOrEqual(HALF_W - 1 + 1e-9);
+        expect(k.halfWidth).toBe(KICKER_HALF_WIDTH);
+      }
+    }
+  });
+
+  it('every kicker sits inside a KICKER_PLANT_CLEAR-based free interval at its band', () => {
+    // Kickers are placed using KICKER_PLANT_CLEAR exclusion, not CORRIDOR_HALF.
+    // Replicate the same clearance check the generator uses.
+    for (const seed of SEEDS) {
+      const s = genSlope(seed);
+      for (const k of s.kickers) {
+        const band = Math.floor(k.z / PLANT_BAND_M);
+        // Build free intervals with the same KICKER_PLANT_CLEAR exclusion the
+        // generator uses (subtractInterval is not exported, so verify by
+        // checking no plant in bands k-1..k+1 is within KICKER_PLANT_CLEAR).
+        let tooClose = false;
+        const pc2 = KICKER_PLANT_CLEAR * KICKER_PLANT_CLEAR;
+        for (let j = band - 1; j <= band + 1 && !tooClose; j++) {
+          for (const p of s.plantGrid(j)) {
+            const dx = k.x - p.x;
+            const dz = k.z - p.z;
+            if (dx * dx + dz * dz < pc2 - 1e-9) {
+              tooClose = true;
+              break;
+            }
+          }
+        }
+        expect(
+          tooClose,
+          `seed ${seed} kicker z=${k.z.toFixed(1)} x=${k.x.toFixed(2)} ` +
+            `too close to a plant in bands ${band - 1}..${band + 1}`,
+        ).toBe(false);
+      }
+    }
+  });
+
+  it('no plant is within KICKER_PLANT_CLEAR of any kicker', () => {
+    const pc2 = KICKER_PLANT_CLEAR * KICKER_PLANT_CLEAR;
+    for (const seed of SEEDS) {
+      const s = genSlope(seed);
+      for (const k of s.kickers) {
+        for (const p of s.plants) {
+          const dx = k.x - p.x;
+          const dz = k.z - p.z;
+          const d2 = dx * dx + dz * dz;
+          expect(
+            d2,
+            `seed ${seed} kicker z=${k.z.toFixed(1)} x=${k.x.toFixed(2)} ` +
+              `too close to plant z=${p.z.toFixed(1)} x=${p.x.toFixed(2)} ` +
+              `(dist ${Math.sqrt(d2).toFixed(2)} < ${KICKER_PLANT_CLEAR})`,
+          ).toBeGreaterThanOrEqual(pc2 - 1e-9);
+        }
+      }
+    }
+  });
+
+  it('generated slopes pass all validators on 20 seeds (kickers present)', () => {
+    for (const seed of SEEDS) {
+      const v = validateSlope(genSlope(seed));
+      expect(v, `seed ${seed}: ${v.join('; ')}`).toEqual([]);
+    }
+  });
+
+  // Wave-2 integration: a skier steering toward successive kickers crosses
+  // every one (lastKickerIx advances through all of them).
+  it('a corridor-following skier crosses every kicker', async (ctx) => {
+    let sim: SlopeSimModule;
+    try {
+      sim = (await import(/* @vite-ignore */ SIM_SPECIFIER)) as SlopeSimModule;
+    } catch {
+      ctx.skip();
+      return;
+    }
+    for (const seed of SEEDS) {
+      const slope = genSlope(seed);
+      const skier = sim.makeSim(0, 0, 0);
+      let nextIx = 0;
+      for (let step = 0; step < 6000 && !skier.finished; step++) {
+        // Steer toward the next unconsumed kicker to stay on the centreline.
+        let steer = 0;
+        if (nextIx < slope.kickers.length) {
+          const t = slope.kickers[nextIx]!;
+          const dx = t.x - skier.x;
+          steer = Math.max(-1, Math.min(1, dx * 1.5));
+        }
+        sim.stepSki(skier, steer, SIM_DT, slope);
+        while (nextIx < slope.kickers.length && skier.lastKickerIx >= nextIx) {
+          nextIx = skier.lastKickerIx + 1;
+        }
+      }
+      expect(skier.lastKickerIx, `seed ${seed}`).toBe(slope.kickers.length - 1);
+      expect(skier.finished, `seed ${seed}`).toBe(true);
+    }
+  });
+});
 
 describe('stepSki full-lock integration (wave 2)', () => {
   it('full-lock both directions reaches the finish on 20 seeds', async (ctx) => {
