@@ -70,6 +70,37 @@ export const GATE_BOOST_MS = 2500;       // boost window (sim ms)
 export const GATE_BOOST_V = 2.5;         // instant speed granted on pass (m/s)
 export const GATE_BOOST_MAX = 30;        // speed cap while boosted (~108 km/h)
 
+// --- Jumps (v2) -------------------------------------------------------------------
+// One shared ballistic model: air height is the closed form
+//   airH(t) = airVy*t - 0.5*G_ACCEL*t^2,  t = (simMs - airStartMs)/1000
+// both peers compute identically from the sim fields (deterministic). Two
+// launch sources share the model: a MANUAL HOP (jump edge on the wire) and a
+// KICKER RAMP (crossing a kicker's z within halfWidth while grounded).
+export const J_HOP_VY = 4.2;             // manual hop vertical launch (m/s):
+                                         // ~0.9 m apex, ~0.86 s air, ~17 m at 20 m/s
+                                         // — a dodge, never a stun
+export const J_KICKER_VY_BASE = 5.0;     // kicker launch vy at zero speed (m/s)
+export const J_KICKER_VY_SPEED = 0.16;   // +vy per m/s of speed (fast = bigger air)
+export const J_AIR_STEER_MUL = 0.35;     // steering effectiveness while airborne
+                                         // (hold your line; correct on landing)
+export const J_AIR_CARVE_MUL = 0.3;      // carve-scrub multiplier while airborne
+export const J_COOLDOWN_MS = 1200;       // sim ms between launches (no bunny-hopping)
+export const J_LAND_SPEED_MUL = 0.98;    // tiny landing scrub (never below MIN_SPEED)
+export const J_MAX_AIRTIME_S = 3.5;      // absolute airtime cap — landing is always
+                                         // eventual (the 4-year-old law: no stuck)
+
+// Kicker layout (seeded, corridor-anchored like the slalom gates).
+export const KICKER_COUNT = 9;           // jump ramps per run
+export const KICKER_HALF_WIDTH = 1.6;    // capture half-width (m)
+export const KICKER_Z0 = 90;             // first kicker after the learning zone
+export const KICKER_SPACING = 75;        // mean z spacing (m)
+export const KICKER_Z_JITTER = 12;       // per-kicker z jitter (m, seeded)
+export const KICKER_X_JITTER = 3;        // lateral offset off the corridor centre (m)
+export const KICKER_PLANT_CLEAR = 2.2;   // no plant within this of a kicker (m)
+export const KICKER_HEIGHT = 0.85;       // ramp height (m) — visual + air feel
+                                         // (the sim launches from the arc, the
+                                         // ramp mesh is decoration)
+
 // --- Plants (the opponent) ----------------------------------------------------
 // Density target: a straight fall-line run hits 3-6 plants (DESIGN_BIBLE).
 // Contact corridor ~2.5 m wide x ~615 m full-density length x 0.004 = ~6 hits.

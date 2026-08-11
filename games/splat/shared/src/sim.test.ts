@@ -45,7 +45,7 @@ import {
   SkiPredictor,
   stepSki,
 } from './sim.js';
-import type { Gate, Plant, SkierSim, SlopeDef } from './types.js';
+import type { Gate, Kicker, Plant, SkierSim, SlopeDef } from './types.js';
 
 // The shared tsconfig is lib-pure (no DOM, no node types) but vitest provides
 // console at runtime; declare the one method these tests log measurements with.
@@ -59,6 +59,7 @@ interface FixtureOpts {
   readonly length?: number;
   readonly plants?: readonly Plant[];
   readonly gates?: readonly Gate[];
+  readonly kickers?: readonly Kicker[];
 }
 
 /** A plain SlopeDef: constant (or scripted) grade, band-hashed plants. */
@@ -81,6 +82,7 @@ function makeFixtureSlope(o: FixtureOpts = {}): SlopeDef {
     finishZ: length,
     plants,
     gates: o.gates ?? [],
+    kickers: o.kickers ?? [],
     height: (_x, z) => -GRADE_BASE * z,
     gradeAt:
       typeof grade === 'function'

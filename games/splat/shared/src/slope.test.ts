@@ -79,6 +79,7 @@ function syntheticDef(plants: Plant[], gates: Gate[] = validGates()): SlopeDef {
     finishZ: FINISH_Z,
     plants,
     gates,
+    kickers: [],
     height: (_x, z) => -GRADE_BASE * z,
     gradeAt: () => GRADE_BASE,
     plantGrid: (k) => grid.get(k) ?? [],

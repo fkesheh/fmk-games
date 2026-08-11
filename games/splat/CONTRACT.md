@@ -25,7 +25,7 @@ procedural slope per match; first-person descent; plants that slow on contact;
 race to a finish line; assist mode; keyboard + tablet touch; per-game PWA;
 synthesized audio.
 
-**Out (v1):** paint/territory (the old SPLAT), teams, items, jumps, tricks,
+**Out (v1):** paint/territory (the old SPLAT), teams, items, tricks,
 lifts, repeated runs, ghosts, leaderboards, persistence, chat, bots, day/night.
 
 ---
@@ -517,3 +517,178 @@ export class DriveController {
 
 DESIGN_BIBLE law > §1–§7 contract > budgets > prose > any task's judgement.
 On conflict, stop and report — never renegotiate with a sibling task.
+
+## §11 V2 AMENDMENT — JUMPS + GRAPHICS OVERHAUL (frozen with §1–§10)
+
+This amendment extends the frozen contract. Where it conflicts with §1–§10 the
+amendment wins for the v2 feature surface ONLY; everything else stands.
+
+### 11.1 What changed (v2 delta)
+
+- **Jumps are IN.** Two launch sources share ONE ballistic model: a MANUAL HOP
+  (jump edge on the wire) and a KICKER RAMP (seeded ramps in the corridor).
+  Air is pure upside — plants don't touch you mid-air, gates still boost, and
+  landing is always safe (tiny scrub, no wipeout, no stuck state — the
+  4-year-old law holds). Steering is damped in air (hold your line, correct on
+  landing) — the decision is when and where to jump, never a hazard.
+- **Wire:** `splat_input` gains an OPTIONAL `jump?: boolean` (edge: true on
+  exactly ONE input per press; the sim consumes the edge). `SkierSnap` gains
+  `airborne: boolean` (remote posing + landing FX; edge-derived, no new events
+  — the bandwidth law stands: no jump/land events on the wire).
+- **New slope entity:** `SlopeDef.kickers` (ascending z, seeded, corridor-
+  anchored). `validateSlope` asserts the kicker placement laws (11.3).
+- **New sim fields:** `airborne`, `airStartMs`, `airVy`, `airStartY`,
+  `lastKickerIx` on `SkierSim` (11.2). `copySim`/`makeSim`/`resetSim` cover
+  them. New pure helper `airHeight(s): number` (shared/sim.ts).
+- **New seam methods** (additive only — §7a signatures stand):
+  - `scene.setAirborne(on: boolean): void` — camera air pose (FOV/shake/pitch)
+  - `scene.land(): void` — landing dip spring + soft flash (plantHit stays)
+  - `skiers.setRemoteAirborne(id: string, on: boolean): void`
+  - `skiers.setOwnAirborne(on: boolean): void` — own-skis air tuck
+  - `drive.setJump(): void` — one-shot jump edge latch (Space/↑ handled inside)
+  - `hud.onJump(fn: () => void): void` — DOM JUMP button → drive.setJump()
+  - `fx` gains `FxKind` members `'land'` and `'launch'`; pool budget rebalanced,
+    still ≤ 512 live (§8)
+  - `audio` gains `SplatSfx` members `'jump'` and `'land'`
+- **Debug surface:** `window.__splat` gains `setJump()` (one-shot edge, like
+  setInput but fires once). E2E drives jumps through it.
+
+### 11.2 The jump sim (frozen semantics — body lands with P1v2)
+
+New `SkierSim` fields and their invariants:
+
+```
+airborne: boolean     // true from launch until the arc returns to the terrain
+airStartMs: number    // sim ms of launch; also the cooldown clock
+airVy: number         // m/s VERTICAL velocity at launch (arc shape); 0 grounded
+airStartY: number     // world-space terrain height at the launch position (m)
+lastKickerIx: number  // -1 = none; indexes SlopeDef.kickers (consumed-on-cross)
+```
+
+`makeSim`/`resetSim`: `airborne=false, airStartMs=-J_COOLDOWN_MS, airVy=0,
+airStartY=0, lastKickerIx=-1`. `copySim` copies all five.
+
+**Arc (world-space, deterministic — both peers compute identically):**
+
+```
+t     = (simMs - airStartMs) / 1000        // sim seconds since launch
+arcH  = airVy * t - 0.5 * G_ACCEL * t * t  // height ABOVE the launch point
+airHeight(s) = airborne ? max(0, arcH) : 0 // the shared visual helper
+```
+
+The skier's RENDERED height is `slope.height(x, z) + airHeight(s)` (the app
+computes it; the camera takes y already including air). LANDING is when the
+world-space arc returns to the terrain: `airStartY + arcH <= slope.height(x,z)`
+OR `t >= J_MAX_AIRTIME_S` (the no-stuck guarantee — landing is always eventual).
+
+**stepSki, v2 order** (the exact insertion points into §6):
+
+1. Clock, NaN guard, finished no-op (unchanged). Capture `prevZ`.
+2. Gravity along heading, steering, carve, yaw soft-clamp, motion, bounds —
+   **UNCHANGED**, except while `s.airborne` at this step's start:
+   - yaw rate is multiplied by `J_AIR_STEER_MUL`,
+   - carve scrub is multiplied by `J_AIR_CARVE_MUL`,
+   - the drag term is unchanged (v is roughly held; air is FAST).
+3. **Plant pass — SKIPPED while `s.airborne`** (the reward: fly over plants).
+   A skier grounded at this step's start takes the normal plant pass.
+4. Slalom gates — UNCHANGED, applies while airborne (fly through the flags).
+5. Soft edges — UNCHANGED (a skier who drifts off-piste in the air is pushed
+   back on landing, never trapped).
+6. **Jump state machine** (runs at the END of the step, on the post-motion
+   position — so launches use `prevZ < k.z <= s.z` exactly like gates):
+   - If `s.airborne`:
+     - compute `t`, `arcH`; if `airStartY + arcH <= slope.height(s.x, s.z)`
+       or `t >= J_MAX_AIRTIME_S`: **LAND** — `airborne=false, airVy=0`,
+       `s.v = max(MIN_SPEED, s.v * J_LAND_SPEED_MUL)`. (A plant at the landing
+       spot snare-checks NEXT step as grounded — one tick later, imperceptible.)
+   - Else (grounded) and `simMs - airStartMs >= J_COOLDOWN_MS`:
+     - **Kicker scan** (ascending z, from `lastKickerIx+1`, same loop shape as
+       gates): for the first kicker with `prevZ < k.z <= s.z`:
+       `lastKickerIx = ix` (consumed on ANY crossing — a ramp cleared mid-air
+       never re-launches you after landing); if `|s.x - k.x| <= k.halfWidth`:
+       **LAUNCH** — `airborne=true, airVy = J_KICKER_VY_BASE +
+       J_KICKER_VY_SPEED * s.v, airStartMs = simMs, airStartY =
+       slope.height(s.x, s.z)`; break.
+     - **Manual hop** (only if still grounded): if `opts.jump === true`:
+       **LAUNCH** with `airVy = J_HOP_VY` (same field writes). A hop and a
+       kicker on the same step: the kicker wins (checked first).
+7. Finish (unchanged; crossing `finishZ` in the air finishes — fly across the
+   line).
+
+**resolveSkiPair:** skip the pair if EITHER sim is airborne (no mid-air
+collision — you fly over other skiers).
+
+**Determinism:** everything above is a pure function of (steer, dt, jump,
+simMs, position, fields) and `slope.height` — the SAME code the client
+predicts with. `SkiPredictor.push`/`reconcile` replay the `jump` edge exactly
+like steer (the pending queue entry stores it). `SkiInput` and `SkiStepOpts`
+gain optional `jump?: boolean`.
+
+**The 4-year-old law, v2:** a full-lock skier who hits kickers launches and
+lands safely (scrub, damped steer, edges push back) — still finishes. Jumps
+can never wipe out, stall, or shame. `J_MAX_AIRTIME_S` + the cooldown bound
+every flight.
+
+### 11.3 Kicker placement (frozen — body lands with P2v2)
+
+`genSlope` lays `KICKER_COUNT` kickers along the same woven corridor
+centreline the slalom gates use: `z = KICKER_Z0 + i*KICKER_SPACING +
+jitter(±KICKER_Z_JITTER)` (clamped inside the planted zone, clear of both
+clear zones), `x` = corridor centreline at that band ± `KICKER_X_JITTER` —
+so a corridor-following skier rides them and a full-lock skier may cross them
+(safe). `validateSlope` asserts, on every generated slope:
+- kickers strictly ascending z; none in `START_CLEAR` or `FINISH_CLEAR`;
+- every kicker fully on-piste (`|x| + halfWidth <= width/2 - 1`);
+- no plant within `KICKER_PLANT_CLEAR` of a kicker's (x, z) — the launch and
+  landing zones stay readable;
+- count within ±1 of `KICKER_COUNT`.
+
+### 11.4 Graphics overhaul (v2 style bible — frozen art direction)
+
+The full per-asset brief lives in `STYLE_BIBLE.md` §V2. In one line per
+module: terrain gains groomed-piste + powder + snow banks + richer rocks +
+a nearer foothill layer; plants gain drooping pine tiers + layered snow +
+thorn crotch-snow; skiers gain jacket/backpack/visor detail + the AIR POSE;
+the scene gains low-poly clouds + a visible sun disc + air camera feel; gates
+gain kicker ramp meshes + a festive finish; fx gains land/launch bursts; HUD
+gains the JUMP button. All colors still trace to SPAL; meshes still come only
+from `contract/visual.ts` factories; draw calls stay < 80; particles ≤ 512.
+
+### 11.5 v2 ownership (additive to §7; no file is shared between two tasks)
+
+| Task | Files | Body |
+|---|---|---|
+| P1v2 | `shared/src/sim.ts`, `sim.test.ts` | jump state machine (11.2) + tests |
+| P2v2 | `shared/src/slope.ts`, `slope.test.ts` | kicker placement (11.3) + tests |
+| V1v2 | `server/src/room.ts`, `room.test.ts` | jump opts passthrough, `snap.airborne`, air-contact skip |
+| C1v2 | `client/src/drive.ts`, `drive.test.ts` | Space/↑ jump, `setJump()` latch, edge on the wire |
+| C2v2 | `client/src/app.ts` | air height for camera/skis, `setAirborne`/`land`, jump/land FX + audio, `setJump()` on `__splat`, hud button wiring |
+| C3v2 | `client/src/ui/hud.ts`, `hud.css` | JUMP button + hint (seam `onJump`) |
+| C4v2 | `client/src/audio.ts` | `jump`/`land` SFX |
+| R1v2 | `render/scene.ts` | `setAirborne`/`land`, clouds + sun disc, air camera feel |
+| R2v2 | `render/terrain.ts` | groomed piste, powder, banks, rocks, foothills |
+| R3v2 | `render/plants.ts` | pine/bush/thorn model-sheet upgrade |
+| R4v2 | `render/skiers.ts` | detail pass + air poses + own-skis tuck |
+| R5v2 | `render/gates.ts` | kicker meshes + finish/lodge upgrade |
+| R6v2 | `render/fx.ts` | `land`/`launch` bursts (≤512 budget) |
+| E2Ev2 | `scripts/e2e-splat.mjs` | jump assertions + new screenshots |
+
+Integration (wiring, gate fixes) is the orchestrator's, per §10 — it may edit
+any file outside the frozen contract files after fan-out. The frozen contract
+FILES (Layer 1, §1) are the orchestrator's own v2 edits in this amendment; no
+implementer edits them.
+
+### 11.6 v2 gates (additive to §9)
+
+- P1v2 unit: jump determinism (same inputs → bit-identical), hop + kicker
+  launch, air height arc shape, landing safety (never stuck; a skier launched
+  on 20 seeds always lands and finishes — the 4-year-old test v2), fly-over-
+  plants (a plant dead-centre under the arc never triggers while airborne),
+  cooldown (no double-launch), landing-on-plant snares next tick, air-steer
+  damping, `airHeight` helper shape.
+- P2v2 unit: kicker placement laws (11.3) on 20 seeds.
+- E2E v2: `setJump()` makes `state().sim.airborne` true then false; remotes
+  see the airborne flag; screenshots: jump mid-air, kicker close-up, landing,
+  plus the §9.6 set. Draw calls still < 80. Snapshot still ≤ 2 KB (the wire
+  grew one bool + one optional edge — assert the size budget still holds at
+  8 players).

@@ -79,6 +79,7 @@ import {
   GATE_BOOST_MS,
   GATE_BOOST_V,
   G_ACCEL,
+  J_COOLDOWN_MS,
   MAX_SPEED,
   MIN_SPEED,
   PENDING_INPUT_CAP,
@@ -101,11 +102,17 @@ import type { SkierSim, SlopeDef } from './types.js';
 export interface SkiInput {
   steer: number; // -1..1, post-ramp, post-assist-EMA
   dt: number;    // sim seconds this input covers
+  /** v2 JUMP edge: true on the ONE input where a jump is requested. The sim
+   *  consumes the edge (hop or kicker launch) and never treats a held flag as
+   *  repeated jumps. Omitted = false (CONTRACT §11.2). */
+  jump?: boolean;
 }
 
-/** stepSki options: assist changes plant radius, snare duration, edge push ONLY. */
+/** stepSki options: assist changes plant radius, snare duration, edge push
+ *  ONLY; jump is the v2 launch edge (CONTRACT §11.2). */
 export interface SkiStepOpts {
   assist?: boolean;
+  jump?: boolean;
 }
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -119,7 +126,9 @@ function turnRateAt(v: number): number {
 }
 
 /** Fresh skier at a grid slot. lastPlantHitMs starts one rearm window in the
- *  past so both plant gates (rearm AND immunity) pass at simMs = 0. */
+ *  past so both plant gates (rearm AND immunity) pass at simMs = 0; the jump
+ *  cooldown clock starts one cooldown window in the past so a hop is legal
+ *  immediately (CONTRACT §11.2). */
 export function makeSim(x: number, z: number, yaw: number): SkierSim {
   return {
     x,
@@ -132,6 +141,11 @@ export function makeSim(x: number, z: number, yaw: number): SkierSim {
     lastPlantHitMs: -PLANT_REARM_MS,
     lastGateIx: -1,
     boostUntilMs: 0,
+    airborne: false,
+    airStartMs: -J_COOLDOWN_MS,
+    airVy: 0,
+    airStartY: 0,
+    lastKickerIx: -1,
     finished: false,
     finishMs: 0,
   };
@@ -149,6 +163,11 @@ export function resetSim(s: SkierSim, x: number, z: number, yaw: number): void {
   s.lastPlantHitMs = -PLANT_REARM_MS;
   s.lastGateIx = -1;
   s.boostUntilMs = 0;
+  s.airborne = false;
+  s.airStartMs = -J_COOLDOWN_MS;
+  s.airVy = 0;
+  s.airStartY = 0;
+  s.lastKickerIx = -1;
   s.finished = false;
   s.finishMs = 0;
 }
@@ -165,8 +184,25 @@ export function copySim(dst: SkierSim, src: Readonly<SkierSim>): void {
   dst.lastPlantHitMs = src.lastPlantHitMs;
   dst.lastGateIx = src.lastGateIx;
   dst.boostUntilMs = src.boostUntilMs;
+  dst.airborne = src.airborne;
+  dst.airStartMs = src.airStartMs;
+  dst.airVy = src.airVy;
+  dst.airStartY = src.airStartY;
+  dst.lastKickerIx = src.lastKickerIx;
   dst.finished = src.finished;
   dst.finishMs = src.finishMs;
+}
+
+/** v2 shared helper (CONTRACT §11.2): height ABOVE the terrain a skier is
+ *  flying at, from the closed-form arc — 0 when grounded. The client adds it
+ *  to slope.height(x, z) for the camera eye and skier rendering; the sim uses
+ *  it for the landing test. Pure + deterministic; both peers compute the same
+ *  number from the same fields. */
+export function airHeight(s: Readonly<SkierSim>): number {
+  if (!s.airborne) return 0;
+  const t = (s.simMs - s.airStartMs) / 1000;
+  const arc = s.airVy * t - 0.5 * G_ACCEL * t * t;
+  return arc > 0 ? arc : 0;
 }
 
 /**

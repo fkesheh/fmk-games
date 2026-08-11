@@ -30,6 +30,8 @@ export function parseSplatC2S(raw: unknown): SplatC2S | null {
         seq,
         steer: clamp(steer, -1, 1),
         dt: clamp(dt, SIM_DT_MIN, SIM_DT_MAX),
+        // v2 jump edge: optional boolean; anything else (or omitted) = false
+        jump: m.jump === true,
       };
     }
     case 'splat_assist':

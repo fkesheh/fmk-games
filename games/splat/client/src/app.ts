@@ -111,6 +111,12 @@ function parseSkierSim(v: unknown): SkierSim | null {
     lastPlantHitMs: v.lastPlantHitMs,
     lastGateIx: v.lastGateIx,
     boostUntilMs: v.boostUntilMs,
+    // v2 jump fields: absent from a pre-v2 server decode as the grounded defaults
+    airborne: v.airborne === true,
+    airStartMs: num(v.airStartMs) ? v.airStartMs : -1,
+    airVy: num(v.airVy) ? v.airVy : 0,
+    airStartY: num(v.airStartY) ? v.airStartY : 0,
+    lastKickerIx: num(v.lastKickerIx) ? v.lastKickerIx : -1,
     finished: v.finished,
     finishMs: v.finishMs,
   };
@@ -128,6 +134,7 @@ function parseSkierSnap(v: unknown): SkierSnap | null {
     yaw: v.yaw,
     v: v.v,
     steer: v.steer,
+    airborne: v.airborne === true,
     finished: v.finished,
     finishMs: v.finishMs,
     place: v.place,
@@ -1813,6 +1820,11 @@ export class SplatApp {
               lastPlantHitMs: s.lastPlantHitMs,
               lastGateIx: s.lastGateIx,
               boostUntilMs: s.boostUntilMs,
+              airborne: s.airborne,
+              airStartMs: s.airStartMs,
+              airVy: s.airVy,
+              airStartY: s.airStartY,
+              lastKickerIx: s.lastKickerIx,
               finished: s.finished,
               finishMs: s.finishMs,
             }

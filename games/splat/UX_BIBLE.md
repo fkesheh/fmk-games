@@ -82,3 +82,22 @@ edges, "hold a side to steer" — dismissible by any input, never shown again
 A first-time player on an iPad, given no instructions, must be racing within
 3 taps, understand they steer by holding a side, feel a plant hit as "ouch,
 avoid those", and read the results screen without help.
+
+## §V2 — Jumps (frozen v2 amendment)
+
+- **Third control (additive):** JUMP. Desktop: Space or ↑ (a press = ONE hop
+  edge; holding never repeats — the cooldown owns cadence). Tablet: a round
+  JUMP chip, bottom-right above the touch zones, ≥ 64 px target, sunGold ring
+  + arrow glyph (affordance without text). Pressing it lifts ONE thumb off
+  steering — the zones are big and the hop is a dodge, so that is acceptable;
+  the chip must never sit under a resting thumb or inside either zone.
+- **Readability:** the chip is labelled by glyph, not colour (colour is never
+  the only encoding); a first-run hint line is added to the existing 3 s
+  steer hint: "SPACE / JUMP = hop — ramps send you flying!" (once per
+  localStorage, dismissible by any input).
+- **Feedback:** jump press → whoosh + launch spray + camera lift same frame
+  (predicted, local); landing → dip + thump + land burst same frame; remote
+  jumps ≤ 150 ms via the snap's airborne flag. Nothing about jumping is ever
+  a penalty state — no wobble, no shame.
+- **Assist mode:** jump works identically; assist never auto-jumps (the
+  player's own hands).

@@ -61,7 +61,7 @@ import {
   UND_LONG_2_LEN,
   YAW_MAX,
 } from './config.js';
-import type { Gate, Plant, PlantKind, SlopeDef } from './types.js';
+import type { Gate, Kicker, Plant, PlantKind, SlopeDef } from './types.js';
 
 const TAU = Math.PI * 2;
 const SUMMIT_LIFT = 6; // metres; keeps height(x, 0) a pleasant positive summit
@@ -345,6 +345,9 @@ export function genSlope(seed: number): SlopeDef {
     finishZ: FINISH_Z,
     plants: frozenPlants,
     gates: Object.freeze(gates),
+    // v2 kickers: the seeded ramp placement is task P2v2's body (CONTRACT
+    // §11.3); an empty list is a legal slope until then.
+    kickers: Object.freeze([]) as readonly Kicker[],
     height,
     gradeAt,
     plantGrid: gridAt,
