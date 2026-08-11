@@ -755,6 +755,126 @@ async function main() {
       `boostEver=${gate.boostEver} v>26=${gate.boostVSeen} maxV=${maxV.toFixed(1)} fieldsLive=${gate.fieldsLive}`,
   );
 
+  // -- v2 JUMPS: manual hop, remote visibility, kicker ride + the new shots ----------
+  // CONTRACT §11.6. The hop exercises the WHOLE wire: setJump -> splat_input
+  // {jump:true} -> server stepSki launch -> snap.airborne -> client predicted
+  // own sim. B's telemetry().remotes[].airborne proves the remote view carries
+  // it. Then A rides the seed-42 kickers (positions exposed on telemetry()) for
+  // the ramp shot + a real kicker launch.
+  await A.evaluate(() => window.__splat.setInput(0)); // back to the fall line
+  // Hop 1 — FAST sampling loop, NO screenshots (a blocking screenshot would
+  // outlast the ~1.3 s flight and starve B's airborne sampling): just assert
+  // the edge on A's wire sim and B's remote view.
+  let jumpAirSeen = false;
+  let jumpLanded = false;
+  let landedV = null;
+  let remoteSawAir = false;
+  await A.evaluate(() => window.__splat.setJump());
+  const hopT0 = Date.now();
+  while (Date.now() - hopT0 < 15000) {
+    const [sa, sb] = await Promise.all([splatState(A), splatTelemetry(B)]);
+    const sim = ownSim(sa);
+    if (sim !== null) {
+      if (sim.airborne && !jumpAirSeen) jumpAirSeen = true;
+      if (jumpAirSeen && !sim.airborne && !jumpLanded) {
+        jumpLanded = true;
+        landedV = sim.v;
+      }
+      if (jumpLanded) break;
+    }
+    if (sb !== null && Array.isArray(sb.remotes)) {
+      for (const r of sb.remotes) if (r.airborne === true) remoteSawAir = true;
+    }
+    await sleep(40);
+  }
+  check(
+    '9. v2 jumps: setJump() launches A airborne then lands with v > 0 (manual hop edge on the wire)',
+    jumpAirSeen && jumpLanded && landedV !== null && landedV > 0,
+    `airborne seen=${jumpAirSeen} landed=${jumpLanded} landedV=${landedV !== null ? landedV.toFixed(1) : '?'} m/s`,
+  );
+  check(
+    "9a. v2 jumps: B's remote interp view of A reports airborne during the hop (telemetry().remotes[].airborne)",
+    remoteSawAir === true,
+    remoteSawAir ? 'B saw A airborne' : 'B never sampled A airborne',
+  );
+  // Hop 2 — the SHOT hop: a fresh hop purely for splat-jump-air (mid-arc) and
+  // splat-landing (touchdown, the land burst). Blocking shots are fine here.
+  await A.evaluate(() => window.__splat.setJump());
+  const shotT0 = Date.now();
+  let airShot = false;
+  while (Date.now() - shotT0 < 12000) {
+    const sim = ownSim(await splatState(A));
+    if (sim !== null) {
+      if (sim.airborne && !airShot) {
+        airShot = true;
+        await shot(A, 'splat-jump-air.png'); // mid-arc: the air pose + spray
+      }
+      if (airShot && !sim.airborne) {
+        await shot(A, 'splat-landing.png'); // right at touchdown: the land burst
+        break;
+      }
+    }
+    await sleep(40);
+  }
+
+  // -- kicker ride: steer A to each upcoming ramp (positions on telemetry())
+  // and ride until a real launch fires (|x - ramp.x| <= halfWidth at the
+  // crossing). Retry across up to 4 ramps — full-lock-only steering can miss
+  // a narrow 1.6 m window. The ramp shot captures the launch moment.
+  const kickersList = await A.evaluate(() => {
+    const t = window.__splat?.telemetry?.();
+    const s = window.__splat?.state?.();
+    if (t === undefined || !Array.isArray(t.kickers) || t.kickers.length === 0) return [];
+    const z = s !== null && s !== undefined && typeof s.sim?.z === 'number' ? s.sim.z : 0;
+    return t.kickers.filter((k) => k.z > z + 8).sort((a, b) => a.z - b.z).slice(0, 2);
+  });
+  let kickerRidden = false;
+  let kickerLaunchVy = null;
+  let kickerShot = false;
+  const kickT0 = Date.now();
+  for (const ramp of kickersList) {
+    if (kickerLaunchVy !== null) break; // already flew one
+    let steering = 0;
+    let lastZ = -1e9;
+    const attemptT0 = Date.now();
+    while (Date.now() - attemptT0 < 15000 && Date.now() - kickT0 < 30000) {
+      const sa = await splatState(A);
+      const sim = ownSim(sa);
+      if (sim === null) break;
+      if (sim.finished || sim.z >= FINISH_Z - 20 || (sa !== null && sa.phase === 'results')) break;
+      if (sim.z > ramp.z + 10) break; // overshot this ramp; next one
+      // aim with a tight deadband, straighten 3 m before the lip
+      const err = ramp.x - sim.x;
+      const target = sim.z < ramp.z - 3 ? (err > 0.7 ? 1 : err < -0.7 ? -1 : 0) : 0;
+      if (target !== steering) {
+        steering = target;
+        await A.evaluate((st) => window.__splat.setInput(st), steering);
+      }
+      if (typeof sim.lastKickerIx === 'number' && sim.lastKickerIx >= 0) kickerRidden = true;
+      if (sim.airborne && sim.airVy > 1.8) {
+        kickerLaunchVy = sim.airVy; // a kicker launch, not a manual hop
+        if (!kickerShot) {
+          kickerShot = true;
+          await shot(A, 'splat-kicker.png'); // right at the launch — lip + spray
+        }
+        break;
+      }
+      if (sim.z < ramp.z && lastZ >= ramp.z) {
+        // crossed the ramp z without launching (lateral miss) — keep going
+      }
+      lastZ = sim.z;
+      await sleep(120);
+    }
+  }
+  await A.evaluate(() => window.__splat.setInput(0));
+  check(
+    '9b. v2 kickers: A crosses a seed-42 ramp on the live wire (sim.lastKickerIx advances on the server sim); a launch in the 1.6 m window is unit-tested',
+    kickersList.length > 0 && kickerRidden,
+    kickersList.length > 0
+      ? `ramps ahead=${kickersList.length}; ridden=${kickerRidden} launchVy=${kickerLaunchVy !== null ? `launched at ${kickerLaunchVy.toFixed(1)} m/s` : 'n/a (lateral miss — narrow window)'}`
+      : 'no kickers on the live slope telemetry',
+  );
+
   // -- steering sign (frozen convention) --------------------------------------------------
   // setInput(-1) = full screen-RIGHT: yaw goes negative, x DECREASES.
   // setInput(+1) = full screen-LEFT: x increases. Each leg: hold the lock until
@@ -790,6 +910,7 @@ async function main() {
     `lock -1: yaw=${legRight.yaw?.toFixed(2)} Δx=${legRight.dx?.toFixed(1)}m; ` +
       `lock +1: yaw=${legLeft.yaw?.toFixed(2)} Δx=${legLeft.dx?.toFixed(1)}m`,
   );
+
 
   // -- the run to the finish: plant hit, finish-gate shot, A's finish, B's 4yo watch ------
   // One poll loop over both pages until A's sim.finished (or the server's hard
@@ -851,14 +972,14 @@ async function main() {
   }
   const aFinishAt = Date.now();
   check(
-    '9. plant contact: the straight seed-42 run hits plants (state().sim.lastPlantIx >= 0)',
+    '10. plant contact: the straight seed-42 run hits plants (state().sim.lastPlantIx >= 0)',
     plantHits > 0,
     `hits=${plantHits} firstHitV=${vAtFirstHit !== null ? vAtFirstHit.toFixed(1) : '?'} m/s (clean-run maxV=${maxV.toFixed(1)})`,
   );
   const aStateAfter = await splatState(A);
   check(
-    '10. A finishes the 800m: finished flag set, place 1 for the first finisher',
-    aFinishedSim !== null && aStateAfter?.place === 1,
+    '11. A finishes the 800m: finished flag set (place 1-2 — the v2 jump battery can let B, who never stops, cross first)',
+    aFinishedSim !== null && (aStateAfter?.place === 1 || aStateAfter?.place === 2),
     aFinishedSim !== null
       ? `finishMs=${(aFinishedSim.finishMs / 1000).toFixed(1)}s sim, place=${aStateAfter?.place}, wall=${((aFinishAt - goAt) / 1000).toFixed(0)}s after GO`
       : 'A never finished inside the server hard cap (150s)',
@@ -876,14 +997,14 @@ async function main() {
   // surface mid-flight): v > 26 — physically impossible without the boost cap.
   const gatePassProven = gate.passes > 0 || gate.boostEver;
   check(
-    '10a. slalom gates: A threads at least one seed-42 gate — a pass sets the boost (sim.lastGateIx advancing WITH boostUntilMs written)',
+    '11a. slalom gates: A threads at least one seed-42 gate — a pass sets the boost (sim.lastGateIx advancing WITH boostUntilMs written)',
     gate.fieldsLive ? gatePassProven : gate.boostVSeen,
     gate.fieldsLive
       ? `crossings=${gate.advances} passes=${gate.passes} boostUntilMs>0 seen=${gate.boostEver} v>26 seen=${gate.boostVSeen}`
       : `debug sim carries NO lastGateIx/boostUntilMs (client gate surface mid-flight?) — fallback signal only: v>26 seen=${gate.boostVSeen}, maxV=${maxV.toFixed(1)} m/s`,
   );
   check(
-    "10b. speed retune: a clean section of A's run reaches v >= 20 m/s (impossible at the old ~18.5 m/s terminal)",
+    "11b. speed retune: a clean section of A's run reaches v >= 20 m/s (impossible at the old ~18.5 m/s terminal)",
     maxV >= 20,
     `maxV over A's run=${maxV.toFixed(1)} m/s (terminal now ~22.6 at GRADE_BASE, cap 26, boost cap 30)`,
   );
@@ -926,7 +1047,7 @@ async function main() {
       : `B did not finish before results (z=${bZFinal.toFixed(0)}m ${bZFinal > 300 ? '> 300' : '<= 300'}, ` +
         `${bStillMoving ? 'still moving' : 'NOT moving'} over the last 10s of racing, plantHits=${bPlantHits}) — hard-cap-with-progress under SwiftShader`;
   check(
-    '11. 4-year-old test: B holds full lock from GO, never changes it — finishes OR hard-cap-with-progress',
+    '12. 4-year-old test: B holds full lock from GO, never changes it — finishes OR hard-cap-with-progress',
     resultsAt !== null && fourYoOk,
     fourYoDetail,
   );
@@ -952,7 +1073,7 @@ async function main() {
       return pa === 2 && pb === 2 ? true : null;
     }, 15000, 'results panel with 2 rows on both pages').catch(() => false));
   check(
-    '12. results phase: both pages reach it and the results panel lists both players (DOM)',
+    '13. results phase: both pages reach it and the results panel lists both players (DOM)',
     resultsDomOk === true,
     resultsAt !== null ? `results entered ${((resultsAt - goAt) / 1000).toFixed(0)}s after GO` : 'never reached results',
   );
@@ -1030,7 +1151,7 @@ async function main() {
   const stayedLobby = holdPhases.size === 1 && holdPhases.has('lobby');
   const holdCanStart = holdEndA?.canStart === true && holdEndB?.canStart === true;
   check(
-    '13. lobby does not auto-start: MIN_PLAYERS seated and canStart true, the room is STILL in lobby after a 6s hold',
+    '14. lobby does not auto-start: MIN_PLAYERS seated and canStart true, the room is STILL in lobby after a 6s hold',
     holdMs >= AUTOSTART_HOLD_MS && stayedLobby && holdCanStart,
     `phases seen over ${(holdMs / 1000).toFixed(1)}s: [${[...holdPhases].join(', ')}]; ` +
       `canStart at the end A=${holdEndA?.canStart} B=${holdEndB?.canStart}`,
@@ -1054,7 +1175,7 @@ async function main() {
   const teleRematch = await splatTelemetry(A);
   const seed2 = teleRematch !== null && typeof teleRematch.seed === 'number' ? teleRematch.seed : -1;
   check(
-    '14. rematch without a seed gets a NEW slope seed (telemetry().seed !== 42, !== -1)',
+    '15. rematch without a seed gets a NEW slope seed (telemetry().seed !== 42, !== -1)',
     seed2 > 0 && seed2 !== FIXED_SEED,
     `race 1 seed=${FIXED_SEED} (settings override), room 2 seed=${seed2} (server rng)`,
   );
@@ -1081,7 +1202,7 @@ async function main() {
     'touch layer with 2 full-size zones visible on the iPad during racing',
   ).catch(() => false);
   check(
-    '15. touch zones: two thumb zones visible on the emulated iPad during racing',
+    '16. touch zones: two thumb zones visible on the emulated iPad during racing',
     touchVisible === true,
     touchVisible === true ? 'left/right halves up, racing phase' : 'touch layer never showed',
   );
@@ -1094,6 +1215,9 @@ async function main() {
     'splat-finish-gate.png',
     'splat-results.png',
     'splat-touch-ipad.png',
+    'splat-jump-air.png',
+    'splat-kicker.png',
+    'splat-landing.png',
   ];
   const shotSizes = SHOTS.map((n) => {
     try {
@@ -1104,13 +1228,13 @@ async function main() {
   });
   const shotsOk = shotSizes.every((s) => s.size > 30 * 1024);
   check(
-    '16. screenshots captured and non-trivial (>30KB each — not blank frames)',
+    '17. screenshots captured and non-trivial (>30KB each — not blank frames)',
     shotsOk,
     shotSizes.map((s) => `${s.n}=${(s.size / 1024).toFixed(0)}KB`).join(' '),
   );
 
   // -- error surface --------------------------------------------------------------------------
-  check('17. zero console/page/network errors on all pages', pageErrors.length === 0, `${pageErrors.length}`);
+  check('18. zero console/page/network errors on all pages', pageErrors.length === 0, `${pageErrors.length}`);
 }
 
 // ---- runner ---------------------------------------------------------------------------

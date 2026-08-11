@@ -76,7 +76,7 @@ import type {
   SplatJoined,
 } from '@splat/shared';
 import { genSlope } from '@splat/shared/slope';
-import { makeSim, resetSim, resolveSkiPair, stepSki } from '@splat/shared/sim';
+import { airHeight, makeSim, resetSim, resolveSkiPair, stepSki } from '@splat/shared/sim';
 import { rng, rngInt } from '@platform/shared';
 import type {
   GameRoomHandle,
@@ -121,6 +121,7 @@ interface SkierSnapWire {
   v: number;
   steer: number;
   airborne: boolean;
+  airH: number;       // v2 server-computed air height above terrain (render)
   finished: boolean;
   finishMs: number;
   place: number;
@@ -802,6 +803,7 @@ export class SplatRoom implements GameRoomHandle {
       v: sim.v,
       steer: 0,
       airborne: false,
+      airH: 0,
       finished: false,
       finishMs: 0,
       place: slot + 1,
@@ -914,6 +916,7 @@ export class SplatRoom implements GameRoomHandle {
       s.v = k.v;
       s.steer = p.steer;
       s.airborne = k.airborne;
+      s.airH = this.slope !== null ? airHeight(k, k.x, k.z, this.slope) : 0;
       s.finished = k.finished;
       s.finishMs = k.finishMs;
       s.place = p.place;

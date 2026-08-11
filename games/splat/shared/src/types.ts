@@ -116,6 +116,10 @@ export interface SkierSnap {
   v: number;
   steer: number;      // last known, for remote lean animation
   airborne: boolean;  // v2 — remote air posing + landing FX (edge-derived)
+  /** v2 — air height ABOVE THE TERRAIN at snapshot time, server-computed via
+   *  sim.airHeight so the client renders a remote's arc WITHOUT a sim clock
+   *  on the wire (the gauntlet's missing-remote-height fatal, fully closed). */
+  airH: number;
   finished: boolean;
   finishMs: number;
   place: number;      // 1-based, computed server-side each tick
