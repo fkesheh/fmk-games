@@ -636,28 +636,51 @@ describe('DriveController — v2 JUMP edge', () => {
   });
 
   it('the jump edge rides the predictor: airborne becomes true after a jump input', () => {
-    // DEPENDS ON P1v2: the predictor's push() must pass jump through to
-    // stepSki for airborne to flip. Until P1v2 merges its sim machine,
-    // this test asserts the predictor receives the jump flag — the airborne
-    // outcome is verified by the P1v2 unit suite and the E2Ev2 gate.
+    // The P1v2 dependency this test used to defer to HAS SHIPPED: push()
+    // passes the jump flag into the shared stepSki, so the predicted state is
+    // airborne on the SAME tick the edge goes out. The old body asserted only
+    // that a message was sent and parked the real claim in a dead
+    // `if (!s.airborne) { /* comment */ }` branch — vacuous, and the title
+    // promised airborne. Now it asserts airborne for real.
     const d = new DriveController(flatSlope());
     d.setJump();
     run(d, 1);
-    // The predictor was pushed with { jump: true }. If P1v2's sim is merged,
-    // state().airborne is true. If not, the predictor ignored jump and
-    // airborne stays false — the orchestrator integrates P1v2 first.
-    const s = d.state();
-    // We only assert the message was sent correctly; the sim integration
-    // is P1v2's domain.
     const sent = drain(d);
     expect(sent.length).toBe(1);
     expect(sent[0]?.jump).toBe(true);
-    // When P1v2 merges: expect(s.airborne).toBe(true);
-    // For now, document the dependency:
-    if (!s.airborne) {
-      // P1v2 sim not yet merged — this is expected; the orchestrator
-      // integrates the sim first. The wire edge is correct.
+    const s = d.state();
+    expect(s.airborne).toBe(true);
+    expect(s.airVy).toBeGreaterThan(0); // a real launch, not a flag flip
+    expect(s.airStartMs).toBe(s.simMs);
+  });
+
+  it('CONTRACT_V3 §12.1: the wire keeps carrying steer while airborne — never zeroed client-side', () => {
+    // §12.1 "Forbidden moves": do NOT stop sending steer on the wire while
+    // airborne and do NOT zero it in drive.ts. The SIM ignores it (air lock);
+    // suppressing it client-side would desync prediction from authority.
+    const d = new DriveController(flatSlope());
+    d.setInput(1);
+    run(d, 20); // let the ramp reach full lock before launching
+    drain(d);
+    d.setJump();
+    run(d, 1);
+    expect(d.state().airborne).toBe(true);
+    const launchMsg = drain(d);
+    expect(launchMsg.length).toBe(1);
+    expect(launchMsg[0]?.jump).toBe(true);
+    expect(Math.abs(launchMsg[0]?.steer ?? 0)).toBeGreaterThan(0.5);
+
+    // every tick of the flight still puts the held steer on the wire
+    let airTicks = 0;
+    while (d.state().airborne && airTicks < 200) {
+      run(d, 1);
+      const sent = drain(d);
+      expect(sent.length).toBe(1);
+      expect(Math.abs(sent[0]?.steer ?? 0)).toBeGreaterThan(0.5);
+      airTicks++;
     }
+    expect(airTicks).toBeGreaterThan(2); // there really was a flight
+    expect(d.state().airborne).toBe(false);
   });
 
   it('reset() clears the jump latch', () => {

@@ -37,11 +37,15 @@ export const EDGE_PUSH = 14;             // inward accel scale (m/s^2 at full de
 
 // Terrain undulation octaves, frozen (gauntlet: balance-critical). h(x,z) =
 // -GRADE_BASE*z + sum of sines; worst-case downhill-directed gradient of the
-// undulations (0.057+0.057) stays under GRADE_BASE-GRADE_MIN = 0.18, so
+// undulations (0.1485+0.0228 = 0.1714) stays under GRADE_BASE-GRADE_MIN =
+// 0.18 (frozen budget ceiling <= 0.171, per CONTRACT_V3 §12.2a), so
 // gradeAt >= GRADE_MIN holds everywhere by construction.
-export const UND_LONG_1_AMP = 2.0;  export const UND_LONG_1_LEN = 220;
-export const UND_LONG_2_AMP = 1.0;  export const UND_LONG_2_LEN = 110;
-export const UND_LAT_AMP = 1.5;     export const UND_LAT_LEN = 140;
+// CONTRACT_V3 §12.2a — amplitudes retuned (UND_LONG_1_AMP 2.0->5.2,
+// UND_LONG_2_AMP 1.0->0.4, UND_LAT_AMP 1.5->2.5). NOT a uniform scale: each
+// value was set independently against the grade-safety budget above.
+export const UND_LONG_1_AMP = 5.2;  export const UND_LONG_1_LEN = 220;
+export const UND_LONG_2_AMP = 0.4;  export const UND_LONG_2_LEN = 110;
+export const UND_LAT_AMP = 2.5;     export const UND_LAT_LEN = 140;
 
 // --- Skier physics (DESIGN_BIBLE balance targets) -----------------------------
 // Terminal velocity at GRADE_BASE: v* = sqrt(G*grade/DRAG) = sqrt(9.8*0.26/0.005)
@@ -87,9 +91,11 @@ export const J_HOP_VY = 1.1;             // manual hop launch vy (m/s, world fra
                                          // speed, never a stun
 export const J_KICKER_VY_BASE = 1.8;     // kicker launch vy at zero speed (m/s)
 export const J_KICKER_VY_SPEED = 0.05;   // +vy per m/s of speed (fast = bigger air)
-export const J_AIR_STEER_MUL = 0.35;     // steering effectiveness while airborne
+// CONTRACT_V3 §12.1 / §12.2 — air steering is DELIBERATELY REVERSED from the
+// v2 report: damped air steering is NOT "the skill". Zeroed, not tuned down.
+export const J_AIR_STEER_MUL = 0;        // steering effectiveness while airborne
                                          // (hold your line; correct on landing)
-export const J_AIR_CARVE_MUL = 0.3;      // carve-scrub multiplier while airborne
+export const J_AIR_CARVE_MUL = 0;        // carve-scrub multiplier while airborne
 export const J_COOLDOWN_MS = 1800;       // sim ms between launches (hops are a
                                          // tactical tool, not a plant-immunity
                                          // button — the DESIGN_BIBLE line stays
@@ -116,9 +122,12 @@ export const KICKER_HEIGHT = 0.85;       // ramp height (m) — visual + air fee
 // Density target: a straight fall-line run hits 3-6 plants (DESIGN_BIBLE).
 // Contact corridor ~2.5 m wide x ~615 m full-density length x 0.004 = ~6 hits.
 // (Gauntlet note: GRADE_BASE - GRADE_MIN = 0.26 - 0.08 = 0.18, and the
-// worst-case downhill-directed undulation gradient is 0.057+0.057, so the
-// fall-line grade stays >= 0.26-0.114 = 0.146 on the fall line and >= GRADE_MIN
-// for any reachable heading.)
+// worst-case downhill-directed undulation gradient is 0.1485+0.0228 = 0.1714
+// (see header above, CONTRACT_V3 §12.2a) — but that is a clamp-margin budget,
+// not a fall-line-grade floor: measured minimum unclamped fall-line grade
+// (finite-difference sampling, 20 seeds incl. 42, dz=0.5m over z=[0,800)) is
+// ~0.089, not 0.146. gradeAt's GRADE_MIN=0.08 clamp — not construction — is
+// what keeps the grade >= GRADE_MIN for any reachable heading.)
 export const PLANT_REARM_MS = 3000;      // per-plant rearm window (sim ms)
 export const PLANT_IMMUNITY_MS = 400;    // global post-hit immunity (cluster guard)
 export const PLANT_HIT_SPEED_MUL = 0.7;  // velocity kept on contact

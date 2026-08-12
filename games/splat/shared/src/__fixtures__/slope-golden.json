@@ -1,0 +1,185 @@
+{
+  "generatedOnHead": true,
+  "seeds": {
+    "1": {
+      "rngDigest": "226e1d31c0b0fde167ea44d4c7200e4ca5990ae1aa94ce223717ef3b082fa593",
+      "heightDigest": "101d345d93ed676908278d386303c97ee63462ff567b09e55f113d974fba056f",
+      "counts": {
+        "plants": 151,
+        "gates": 14,
+        "kickers": 9
+      }
+    },
+    "2": {
+      "rngDigest": "4a960ab9fba5f82e2fc8ef0e231493fa67160f0dc6e3e9bc6d7b8274a788bcf0",
+      "heightDigest": "eb725169beb71ef9c4037f4bfb318738b28f004fcb4dd6ba0c33cf2a70afde5c",
+      "counts": {
+        "plants": 190,
+        "gates": 14,
+        "kickers": 9
+      }
+    },
+    "3": {
+      "rngDigest": "472f87b5d9882acd2d24259d7ddbfd6fcd858ca3e6e4d8ab8c7222da90609728",
+      "heightDigest": "60a51e8fcf0bb0793e1b57ee02c95432a09f97b28745b2e634a42d9f0f118112",
+      "counts": {
+        "plants": 113,
+        "gates": 14,
+        "kickers": 9
+      }
+    },
+    "7": {
+      "rngDigest": "4041b63be695384f7f8d5d19d81f5865624a5fd145363c8118dd2c35dbbb6003",
+      "heightDigest": "c34aa5bc244225a847a89e01ba169445c1e1d1d5aaa2c6f0472d3ec7ca8de9eb",
+      "counts": {
+        "plants": 139,
+        "gates": 14,
+        "kickers": 9
+      }
+    },
+    "11": {
+      "rngDigest": "bfcf90cd83cc607e0fb65fdc7c79b75a7896a3fd906bfda3600898853ca9f1ab",
+      "heightDigest": "97100aacdf997e93ba1928f5b51b8a08e517736ed87448809d27390a9bacf7e8",
+      "counts": {
+        "plants": 160,
+        "gates": 14,
+        "kickers": 9
+      }
+    },
+    "13": {
+      "rngDigest": "42ec2843e8f06747491e6706991fa5fd80028ce159fafd022b446b6827c675e8",
+      "heightDigest": "ed09b28c26a4fb31d8e2df4cbdbdf2f57248c953a0db826306da19412473a60b",
+      "counts": {
+        "plants": 130,
+        "gates": 14,
+        "kickers": 9
+      }
+    },
+    "17": {
+      "rngDigest": "dc64032474356fbfa260fd581dd7b3709de8723cf74389315e4de61dc5d01cc6",
+      "heightDigest": "6a3a538b4d155f86b849d03fdd1aa65e719ca9430a6cbe5f7f20db192f1b4fc9",
+      "counts": {
+        "plants": 159,
+        "gates": 14,
+        "kickers": 9
+      }
+    },
+    "19": {
+      "rngDigest": "71e7daa46077bf0303340967f2482295f989f4e4f1f4c8724f65710aa7952a5f",
+      "heightDigest": "49167075048eaa3bd3d881645702e2dfd9cdf11b9a0a79886a5436ccaddddcd0",
+      "counts": {
+        "plants": 175,
+        "gates": 14,
+        "kickers": 9
+      }
+    },
+    "23": {
+      "rngDigest": "bc63facda704168e3fa897cfeb6d7e709bbfc369161b7b5a7fabdabbea092795",
+      "heightDigest": "27456bf842545cd9649a9b10337173efbc1db646447a982191c4d4835a980caf",
+      "counts": {
+        "plants": 139,
+        "gates": 14,
+        "kickers": 9
+      }
+    },
+    "29": {
+      "rngDigest": "2c022a443a9f990204f28d0346fe3590b1b0e829fe560dbe3a43b162737da25b",
+      "heightDigest": "1fdb503d7ebaa2140bd267170d254f72306f664158020ea969c2861645676cf4",
+      "counts": {
+        "plants": 126,
+        "gates": 14,
+        "kickers": 9
+      }
+    },
+    "31": {
+      "rngDigest": "13437f9579dae785165416510be57bbfc58ff96a0739fa33d6a5cc49b825cf7f",
+      "heightDigest": "ddba59cb2f9c11143b96bbb5bc0ef99d90adb221dbfbb5620ec3b10f34fa3ea0",
+      "counts": {
+        "plants": 131,
+        "gates": 14,
+        "kickers": 9
+      }
+    },
+    "37": {
+      "rngDigest": "a5fa757449f0e4a1a5ce0b986f951bddb89e125aa15a06bdf714878d61dc03ca",
+      "heightDigest": "c0ed187abef181291e13766bed4c15586786cdc35806a8870ae22557aa298dd6",
+      "counts": {
+        "plants": 138,
+        "gates": 14,
+        "kickers": 9
+      }
+    },
+    "41": {
+      "rngDigest": "06026747df14f5a229d2f83df7442eb91593d2b3740c38d86b7dc799379230fe",
+      "heightDigest": "a979f3a6bc189bf9a55a0324344db8dec7674b141bda8dc99c5c8c020e67b1ab",
+      "counts": {
+        "plants": 144,
+        "gates": 14,
+        "kickers": 9
+      }
+    },
+    "42": {
+      "rngDigest": "ae06c86dbb941edfe3ec5fb68376638efb1c85bb024fe9b068e445acfd61433b",
+      "heightDigest": "3173a27a293e63d9fda93558955b4599e24284bd3288ff8c1a64abc1d94eb3b2",
+      "counts": {
+        "plants": 135,
+        "gates": 14,
+        "kickers": 9
+      }
+    },
+    "43": {
+      "rngDigest": "c6992db786037471b20fe9420d0e13f09ceb05b48aea28aa40747657b282cb8e",
+      "heightDigest": "b975355de8d34f2889fccc954809ee25856a0588af15b4c179891c85d9ebdf63",
+      "counts": {
+        "plants": 182,
+        "gates": 14,
+        "kickers": 9
+      }
+    },
+    "47": {
+      "rngDigest": "96ca59f5787639eacf3cb4dbdf0b6d838091a4fec4e038eda66ca70ac32bb5c1",
+      "heightDigest": "2128781fd2878af224fa32a79e80f96f67a409bbb57637247b3e2c0696bf6b02",
+      "counts": {
+        "plants": 120,
+        "gates": 14,
+        "kickers": 9
+      }
+    },
+    "53": {
+      "rngDigest": "ca943d3fcd78588172879f06347327da32a94a3e0d25b278cebb685370a56753",
+      "heightDigest": "8a0c67ebb7d86d9fc9f89a82ec15e2d56071e45638ce5ba1473427aebde05d56",
+      "counts": {
+        "plants": 95,
+        "gates": 14,
+        "kickers": 9
+      }
+    },
+    "59": {
+      "rngDigest": "3b19190c0b0de2a0478aaf66efc17ec79e3948c5675aeebc36b3795298571bdb",
+      "heightDigest": "7c1ae7b485a5232366d0954c8790329de8e535c76a0f39a730258a5840c52b4d",
+      "counts": {
+        "plants": 177,
+        "gates": 14,
+        "kickers": 9
+      }
+    },
+    "61": {
+      "rngDigest": "a72e6ae6e520fbd91128160384417b948600955f62ad87983008592ace7a19cb",
+      "heightDigest": "34ebe0d88026417109acc9c6f257a0f3f368e5c42a2bec89da5b3bb8064493db",
+      "counts": {
+        "plants": 143,
+        "gates": 14,
+        "kickers": 9
+      }
+    },
+    "67": {
+      "rngDigest": "897227ada8614925b4b96df3743bc0f64ad5ddf82417564386871e24698c8026",
+      "heightDigest": "8ea8a83c246b22cd9563285fee1a87bec26e4774e14c2ca168203bbe75088efc",
+      "counts": {
+        "plants": 102,
+        "gates": 14,
+        "kickers": 9
+      }
+    }
+  }
+}
