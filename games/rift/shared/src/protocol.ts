@@ -31,6 +31,13 @@ export type RiftC2S =
   | { readonly t: 'rift_cast'; readonly slot: number; readonly x?: number; readonly z?: number; readonly target?: number }
   | { readonly t: 'rift_item'; readonly slot: number; readonly x?: number; readonly z?: number }
   | { readonly t: 'rift_buy'; readonly item: ItemId }
+  /** Sell the item in `slot` back for SELL_REFUND of its TOTAL gold cost
+   *  (item.ts sellValue). Gated exactly like `rift_buy`: alive, and inside your
+   *  own fountain radius — the shop gate, not a second one. */
+  | { readonly t: 'rift_sell'; readonly slot: number }
+  /** Discard the item in `slot` from ANYWHERE, alive, for no refund. The
+   *  escape hatch for a full inventory away from the fountain. */
+  | { readonly t: 'rift_drop'; readonly slot: number }
   | { readonly t: 'rift_skill'; readonly slot: number };
 
 // --- Server -> client ---------------------------------------------------------------
@@ -200,6 +207,16 @@ export function parseRiftC2S(raw: unknown): RiftC2S | null {
     }
     case 'rift_buy':
       return isItemId(m.item) ? { t: 'rift_buy', item: m.item } : null;
+    case 'rift_sell': {
+      // Same slot sanitisation as rift_item: integer, 0..INVENTORY_SLOTS-1.
+      // Anything else (float, negative, NaN, string, missing) is dropped.
+      const s = slot(m.slot, INVENTORY_SLOTS);
+      return s === null ? null : { t: 'rift_sell', slot: s };
+    }
+    case 'rift_drop': {
+      const s = slot(m.slot, INVENTORY_SLOTS);
+      return s === null ? null : { t: 'rift_drop', slot: s };
+    }
     case 'rift_skill': {
       const s = slot(m.slot, 4);
       return s === null ? null : { t: 'rift_skill', slot: s };

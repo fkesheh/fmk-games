@@ -20,21 +20,24 @@ import {
   DAY_PERIOD_S,
   dayPhase,
   HERO_LIST,
+  INVENTORY_SLOTS,
   isCampKind,
+  ITEMS,
   LOBBY_COUNTDOWN_MS,
   MATCH_END_MS,
   MAX_PLAYERS,
   MIN_PLAYERS,
   NEUTRAL_TEAM,
+  sellValue,
   STARTING_GOLD,
   TICK_RATE,
 } from '@rift/shared';
-import type { EntSnap, RiftEvent, RiftS2C, RosterEntry } from '@rift/shared';
+import type { EntSnap, ItemId, RiftEvent, RiftS2C, RosterEntry } from '@rift/shared';
 import type { PlayerId, RoomIO, Visibility } from '@platform/shared';
 import type { RoomDeps } from './ports.js';
 import { RiftRoom } from './room.js';
 import { riftModule } from './module.js';
-import type { BotBrain, BotPercept, CampPercept, World } from './sim/types.js';
+import type { BotBrain, BotPercept, CampPercept, Ent, World } from './sim/types.js';
 
 // ---- wire shapes ---------------------------------------------------------------
 
@@ -1391,5 +1394,449 @@ describe('robustness', () => {
     // drops to 0 with the seat bot-converted — NOT seats.length (4).
     expect(room.info().players).toBe(0);
     expect(tickBefore).toBe(3);
+  });
+});
+
+// ---- inventory economy: rift_sell / rift_drop, and tier-3 ultimates ------------------------
+//
+// Gates the two PRIVATE handlers `handleSell`/`handleDrop` (only reachable via
+// room.handleMessage) against the frozen behavioural spec: sell is the shop
+// run backwards (fountain-gated, refunds sellValue = 0.6 * TOTAL cost), drop
+// is the escape hatch for a full inventory away from the fountain (no gate,
+// no refund, no world pickup entity). Assertions read the LIVE World Ent
+// (worldOf(room).get(id)) rather than a snapshot: sell/drop mutate `gold` and
+// `items`/`itemCharges`/`itemCdUntilTick` synchronously inside handleMessage,
+// with no pump required — only the derived stats (maxHp, etc.) wait for the
+// next tick's stepUpkeep(), per the frozen contract.
+
+/** Boot a 1-human 2v2 room and lock it; heroes spawn at their own fountain,
+ *  so the hero is already "at the shop" once live. */
+function bootLive(): Harness {
+  const { room, io } = boot([['p1', 'Ada']]);
+  pressStartAndLock(room, 'p1');
+  pump(room, 2);
+  return { room, io };
+}
+
+/** The live (mutable) Ent behind p1's hero — NOT the frozen EntSnap. */
+function p1Ent(room: RiftRoom, io: FakeIO): Ent {
+  const id = heroEntByPid(latestSnap(io, 'p1'), 'p1').id;
+  const ent = worldOf(room).get(id);
+  if (ent === undefined) throw new Error('p1 hero ent missing from the live world');
+  return ent;
+}
+
+function occupiedSlots(ent: Ent): number {
+  return ent.items.filter((it) => it !== null && it !== undefined).length;
+}
+
+describe('economy: rift_sell', () => {
+  it('sells an occupied slot at the fountain: gold rises by exactly sellValue(id), slot clears', () => {
+    const { room, io } = bootLive();
+    const ent = p1Ent(room, io);
+    ent.gold = 5000;
+    room.handleMessage('p1', { t: 'rift_buy', item: 'plategirdle' });
+    const slot = ent.items.findIndex((it) => it === 'plategirdle');
+    expect(slot, 'setup: plategirdle must have been bought into a slot').toBeGreaterThanOrEqual(0);
+    const goldBeforeSell = ent.gold;
+
+    room.handleMessage('p1', { t: 'rift_sell', slot });
+
+    expect(ent.gold, 'sell must credit exactly sellValue(id)').toBe(goldBeforeSell + sellValue('plategirdle'));
+    expect(ent.items[slot], 'sold slot must clear to null').toBeNull();
+  });
+
+  it('refunds from the item TOTAL cost, not the recipe step: bladestone+fang sells for 420, not 180', () => {
+    // fang's recipe STEP (ITEMS.fang.cost) is 300, but its TOTAL cost
+    // (component bladestone 400 + step 300) is 700. sellValue must read
+    // floor(700 * 0.6) = 420 — never floor(300 * 0.6) = 180, which is what a
+    // handler that accidentally refunded off the top-level `cost` field
+    // (the buy-time price) instead of itemTotalCost would produce.
+    const { room, io } = bootLive();
+    const ent = p1Ent(room, io);
+    ent.gold = 5000;
+    room.handleMessage('p1', { t: 'rift_buy', item: 'bladestone' });
+    room.handleMessage('p1', { t: 'rift_buy', item: 'fang' }); // combines the bladestone -> fang
+    const slot = ent.items.findIndex((it) => it === 'fang');
+    expect(slot, 'setup: fang must have combined into a slot').toBeGreaterThanOrEqual(0);
+    const goldBeforeSell = ent.gold;
+
+    room.handleMessage('p1', { t: 'rift_sell', slot });
+
+    expect(sellValue('fang'), 'pin: the literal this test protects against silent re-pricing').toBe(420);
+    expect(ent.gold, 'fang refund must be 420 (0.6 * 700 total), never 180 (0.6 * 300 step)').toBe(
+      goldBeforeSell + 420,
+    );
+  });
+
+  it('no-ops away from the fountain: gold unchanged, item still held', () => {
+    const { room, io } = bootLive();
+    const ent = p1Ent(room, io);
+    ent.gold = 5000;
+    room.handleMessage('p1', { t: 'rift_buy', item: 'bladestone' });
+    const slot = ent.items.findIndex((it) => it === 'bladestone');
+    expect(slot, 'setup: bladestone must have been bought into a slot').toBeGreaterThanOrEqual(0);
+    ent.x += 60; // clearly outside FOUNTAIN_RADIUS (6m)
+    ent.z += 60;
+    const goldBefore = ent.gold;
+
+    room.handleMessage('p1', { t: 'rift_sell', slot });
+
+    expect(ent.gold, 'sell away from the fountain must not grant gold').toBe(goldBefore);
+    expect(ent.items[slot], 'sell away from the fountain must not clear the slot').toBe('bladestone');
+  });
+
+  it('no-ops while dead', () => {
+    const { room, io } = bootLive();
+    const ent = p1Ent(room, io);
+    ent.gold = 5000;
+    room.handleMessage('p1', { t: 'rift_buy', item: 'bladestone' });
+    const slot = ent.items.findIndex((it) => it === 'bladestone');
+    expect(slot, 'setup: bladestone must have been bought into a slot').toBeGreaterThanOrEqual(0);
+    ent.alive = false;
+    const goldBefore = ent.gold;
+
+    room.handleMessage('p1', { t: 'rift_sell', slot });
+
+    expect(ent.gold, 'sell while dead must not grant gold').toBe(goldBefore);
+    expect(ent.items[slot], 'sell while dead must not clear the slot').toBe('bladestone');
+  });
+
+  it('selling an empty slot grants no gold and changes nothing', () => {
+    const { room, io } = bootLive();
+    const ent = p1Ent(room, io);
+    ent.gold = 1234;
+    expect(ent.items[0], 'setup: slot 0 must start empty').toBeNull();
+
+    room.handleMessage('p1', { t: 'rift_sell', slot: 0 });
+
+    expect(ent.gold, 'selling an empty slot must not grant gold').toBe(1234);
+    expect(ent.items[0], 'selling an empty slot must not change the slot').toBeNull();
+  });
+
+  it('malformed/out-of-range slots reach handleMessage without throwing and change nothing', () => {
+    const { room, io } = bootLive();
+    const ent = p1Ent(room, io);
+    ent.gold = 5000;
+    room.handleMessage('p1', { t: 'rift_buy', item: 'bladestone' });
+    const slot = ent.items.findIndex((it) => it === 'bladestone');
+    expect(slot, 'setup: bladestone must have been bought into a slot').toBeGreaterThanOrEqual(0);
+    const goldBefore = ent.gold;
+    const itemsBefore = [...ent.items];
+    const bad: unknown[] = [
+      { t: 'rift_sell', slot: INVENTORY_SLOTS }, // one past the last valid index
+      { t: 'rift_sell', slot: -1 },
+      { t: 'rift_sell', slot: 1.5 },
+      { t: 'rift_sell', slot: '0' },
+      { t: 'rift_sell' }, // missing slot entirely
+    ];
+
+    for (const msg of bad) {
+      expect(() => room.handleMessage('p1', msg), `must never throw for ${JSON.stringify(msg)}`).not.toThrow();
+    }
+
+    expect(ent.gold, 'malformed rift_sell must never grant gold').toBe(goldBefore);
+    expect(ent.items, 'malformed rift_sell must never change inventory').toEqual(itemsBefore);
+  });
+
+  it('gate equivalence: sell is legal exactly where buying is legal (proves the two fountain predicates cannot silently drift apart)', () => {
+    // room.ts's handleSell reuses `this.atFountain`, documented as agreeing
+    // with the sim's own `atOwnFountain` "by construction" (same
+    // FOUNTAIN_RADIUS, same ancient anchor) rather than by a shared function
+    // call. This test is the OBSERVABLE proof of that claim: buy and sell
+    // must succeed/fail together at the same position, on every position.
+    const { room, io } = bootLive();
+    const ent = p1Ent(room, io);
+    ent.gold = 10000;
+
+    // at spawn (the fountain): both a buy and a sell succeed
+    room.handleMessage('p1', { t: 'rift_buy', item: 'bladestone' });
+    const slot1 = ent.items.findIndex((it) => it === 'bladestone');
+    expect(slot1, 'buy at spawn (fountain) must succeed').toBeGreaterThanOrEqual(0);
+    const goldAfterBuy = ent.gold;
+    room.handleMessage('p1', { t: 'rift_sell', slot: slot1 });
+    expect(ent.items[slot1], 'sell at spawn (fountain) must succeed').toBeNull();
+    expect(ent.gold, 'sell at spawn (fountain) must credit gold').toBe(goldAfterBuy + sellValue('bladestone'));
+
+    // move clearly outside FOUNTAIN_RADIUS (6m): both now no-op
+    room.handleMessage('p1', { t: 'rift_buy', item: 'bladestone' });
+    const slot2 = ent.items.findIndex((it) => it === 'bladestone');
+    expect(slot2, 'setup: re-buy for the away-from-fountain half').toBeGreaterThanOrEqual(0);
+    ent.x += 60;
+    ent.z += 60;
+    const goldBeforeAway = ent.gold;
+
+    room.handleMessage('p1', { t: 'rift_buy', item: 'wardstone' });
+    expect(ent.gold, 'buy away from the fountain must no-op (same gate as sell)').toBe(goldBeforeAway);
+    expect(ent.items.some((it) => it === 'wardstone'), 'buy away from the fountain must no-op').toBe(false);
+
+    room.handleMessage('p1', { t: 'rift_sell', slot: slot2 });
+    expect(ent.items[slot2], 'sell away from the fountain must no-op — same gate as buy').toBe('bladestone');
+    expect(ent.gold, 'sell away from the fountain must not credit gold').toBe(goldBeforeAway);
+  });
+
+  it('selling clears charges: buy a wardstone (2 charges), sell it, charges and cooldown both zero', () => {
+    const { room, io } = bootLive();
+    const ent = p1Ent(room, io);
+    ent.gold = 5000;
+    room.handleMessage('p1', { t: 'rift_buy', item: 'wardstone' });
+    const slot = ent.items.findIndex((it) => it === 'wardstone');
+    expect(slot, 'setup: wardstone must have been bought into a slot').toBeGreaterThanOrEqual(0);
+    expect(ent.itemCharges[slot], 'setup: a fresh wardstone carries 2 charges').toBe(2);
+
+    room.handleMessage('p1', { t: 'rift_sell', slot });
+
+    expect(ent.itemCharges[slot], 'sell must clear charges to 0').toBe(0);
+    expect(ent.itemCdUntilTick[slot], 'sell must clear the cooldown to 0').toBe(0);
+  });
+});
+
+describe('economy: rift_drop', () => {
+  it('works far from the fountain, where sell does not: slot clears, gold exactly unchanged', () => {
+    const { room, io } = bootLive();
+    const ent = p1Ent(room, io);
+    ent.gold = 5000;
+    room.handleMessage('p1', { t: 'rift_buy', item: 'bladestone' });
+    const slot = ent.items.findIndex((it) => it === 'bladestone');
+    expect(slot, 'setup: bladestone must have been bought into a slot').toBeGreaterThanOrEqual(0);
+    ent.x += 60; // clearly outside FOUNTAIN_RADIUS (6m) — where sell would no-op
+    ent.z += 60;
+    const goldBefore = ent.gold;
+
+    room.handleMessage('p1', { t: 'rift_drop', slot });
+
+    expect(ent.items[slot], 'drop must clear the slot even far from the fountain').toBeNull();
+    expect(ent.gold, 'drop must grant exactly zero gold — no refund').toBe(goldBefore);
+  });
+
+  it('destroys the item — no world pickup entity is created (pins the documented scope boundary)', () => {
+    // room.ts's handleDrop comment states spawning a reclaimable pickup
+    // entity is a separate, larger feature deliberately out of scope; this
+    // pins that a drop never creates any world entity as a side effect.
+    const { room, io } = bootLive();
+    const ent = p1Ent(room, io);
+    ent.gold = 5000;
+    room.handleMessage('p1', { t: 'rift_buy', item: 'bladestone' });
+    const slot = ent.items.findIndex((it) => it === 'bladestone');
+    expect(slot, 'setup: bladestone must have been bought into a slot').toBeGreaterThanOrEqual(0);
+    const countBefore = [...worldOf(room).all()].length;
+
+    room.handleMessage('p1', { t: 'rift_drop', slot });
+
+    const countAfter = [...worldOf(room).all()].length;
+    expect(countAfter, 'dropping an item must not create any world entity — destroyed, not spawned as a pickup').toBe(
+      countBefore,
+    );
+  });
+
+  it('no-ops while dead, and no-ops on an already-empty slot', () => {
+    const { room, io } = bootLive();
+    const ent = p1Ent(room, io);
+    ent.gold = 5000;
+    room.handleMessage('p1', { t: 'rift_buy', item: 'bladestone' });
+    const slot = ent.items.findIndex((it) => it === 'bladestone');
+    expect(slot, 'setup: bladestone must have been bought into a slot').toBeGreaterThanOrEqual(0);
+    ent.alive = false;
+
+    room.handleMessage('p1', { t: 'rift_drop', slot });
+    expect(ent.items[slot], 'drop while dead must not clear the slot').toBe('bladestone');
+
+    ent.alive = true;
+    const emptySlot = ent.items.findIndex((it) => it === null);
+    expect(emptySlot, 'setup: some slot must still be empty').toBeGreaterThanOrEqual(0);
+
+    room.handleMessage('p1', { t: 'rift_drop', slot: emptySlot });
+    expect(ent.items[emptySlot], 'dropping an already-empty slot stays null (a no-op, not an error)').toBeNull();
+  });
+});
+
+describe('economy: stat reconciliation after sell/drop', () => {
+  it('recomputes maxHp on the NEXT tick (stepUpkeep), and clamps hp down with it', () => {
+    // Stats are not recomputed inside handleSell/handleDrop — SimWorld.advance()
+    // runs stepUpkeep() every tick, which recomputes every mobile from its
+    // current `items` array and clamps hp/mana down when maxHp/maxMana shrink.
+    // Drop shares the exact same "no recompute here" code path (see room.ts's
+    // comment on handleDrop), so this single sell-side proof covers both.
+    const { room, io } = bootLive();
+    const ent = p1Ent(room, io);
+    ent.gold = 5000;
+    const maxHpBefore = ent.maxHp;
+
+    room.handleMessage('p1', { t: 'rift_buy', item: 'warmail' }); // +250 maxHp
+    pump(room, 1);
+    const slot = ent.items.findIndex((it) => it === 'warmail');
+    expect(slot, 'setup: warmail must have been bought into a slot').toBeGreaterThanOrEqual(0);
+    expect(ent.maxHp, "warmail's +250 maxHp must be applied by the next tick").toBe(maxHpBefore + 250);
+
+    ent.hp = ent.maxHp; // full hp while holding warmail
+    room.handleMessage('p1', { t: 'rift_sell', slot });
+    // NOT recomputed synchronously by the handler itself:
+    expect(ent.maxHp, 'maxHp must not change before the next tick pumps stepUpkeep').toBe(maxHpBefore + 250);
+
+    pump(room, 1);
+    expect(ent.maxHp, 'maxHp must return to its pre-purchase value after one pumped tick').toBe(maxHpBefore);
+    expect(ent.hp, 'hp must be clamped down to the shrunk maxHp, never left above it').toBeLessThanOrEqual(
+      ent.maxHp,
+    );
+  });
+});
+
+describe('economy: the full-inventory escape hatch (feature A)', () => {
+  it('rift_drop frees a slot so a follow-up buy succeeds where it previously no-oped', () => {
+    // Before this feature, a full 6-slot inventory was a terminal state: sell
+    // needs the fountain (not always reachable in time) and there was no
+    // other way to shed an item, so a bad build was permanent for the match.
+    const { room, io } = bootLive();
+    const ent = p1Ent(room, io);
+    ent.gold = 100_000;
+    const fillers: ItemId[] = ['bladestone', 'warmail', 'plategirdle', 'swiftboots', 'manacharm', 'blinkstone'];
+    expect(fillers, 'setup: exactly INVENTORY_SLOTS distinct, non-combining base items').toHaveLength(
+      INVENTORY_SLOTS,
+    );
+    for (const item of fillers) room.handleMessage('p1', { t: 'rift_buy', item });
+    expect(occupiedSlots(ent), 'setup: inventory must be completely full').toBe(INVENTORY_SLOTS);
+
+    const goldBeforeFailedBuy = ent.gold;
+    room.handleMessage('p1', { t: 'rift_buy', item: 'wardstone' });
+    expect(ent.gold, 'buy into a full inventory must no-op: no gold spent').toBe(goldBeforeFailedBuy);
+    expect(occupiedSlots(ent), 'buy into a full inventory must no-op: slot count unchanged').toBe(INVENTORY_SLOTS);
+
+    room.handleMessage('p1', { t: 'rift_drop', slot: 0 });
+    expect(occupiedSlots(ent), 'drop must free exactly one slot').toBe(INVENTORY_SLOTS - 1);
+
+    room.handleMessage('p1', { t: 'rift_buy', item: 'wardstone' });
+    expect(
+      ent.items.some((it) => it === 'wardstone'),
+      'the freed slot must now accept the buy that previously no-oped',
+    ).toBe(true);
+    expect(occupiedSlots(ent), 'inventory is full again once the buy succeeds').toBe(INVENTORY_SLOTS);
+  });
+});
+
+describe('tier-3 ultimates (feature B)', () => {
+  it('reaperedge: buys through the real door, frees a slot, and charges only the 900 step, not the 2400 total', () => {
+    const { room, io } = bootLive();
+    const ent = p1Ent(room, io);
+    ent.gold = 100_000;
+    room.handleMessage('p1', { t: 'rift_buy', item: 'bladestone' });
+    room.handleMessage('p1', { t: 'rift_buy', item: 'fang' }); // combines -> fang
+    room.handleMessage('p1', { t: 'rift_buy', item: 'bladestone' });
+    room.handleMessage('p1', { t: 'rift_buy', item: 'stormbow' }); // combines -> stormbow
+    const fangSlot = ent.items.findIndex((it) => it === 'fang');
+    const stormbowSlot = ent.items.findIndex((it) => it === 'stormbow');
+    expect(fangSlot, 'setup: fang must be held').toBeGreaterThanOrEqual(0);
+    expect(stormbowSlot, 'setup: stormbow must be held').toBeGreaterThanOrEqual(0);
+    const occupiedBefore = occupiedSlots(ent);
+    const goldBefore = ent.gold;
+
+    room.handleMessage('p1', { t: 'rift_buy', item: 'reaperedge' });
+
+    expect(ent.items.some((it) => it === 'fang'), 'the fang component must be consumed').toBe(false);
+    expect(ent.items.some((it) => it === 'stormbow'), 'the stormbow component must be consumed').toBe(false);
+    const slot = ent.items.findIndex((it) => it === 'reaperedge');
+    expect(slot, 'reaperedge must occupy a slot').toBeGreaterThanOrEqual(0);
+    expect(slot, 'reaperedge must land in the LOWEST slot its components freed').toBe(
+      Math.min(fangSlot, stormbowSlot),
+    );
+    expect(ent.gold, 'the recipe STEP (900) must be charged, never the 2400 total').toBe(goldBefore - 900);
+    expect(occupiedSlots(ent), 'fusing two held components into one ultimate must free exactly one slot').toBe(
+      occupiedBefore - 1,
+    );
+  });
+
+  it('no-ops without both components, even with plenty of gold at the fountain', () => {
+    const { room, io } = bootLive();
+    const ent = p1Ent(room, io);
+    ent.gold = 100_000;
+    room.handleMessage('p1', { t: 'rift_buy', item: 'bladestone' });
+    room.handleMessage('p1', { t: 'rift_buy', item: 'fang' }); // only fang held, no stormbow
+    expect(ent.items.some((it) => it === 'fang'), 'setup: fang held').toBe(true);
+    expect(ent.items.some((it) => it === 'stormbow'), 'setup: stormbow NOT held').toBe(false);
+    const goldBefore = ent.gold;
+    const itemsBefore = [...ent.items];
+
+    room.handleMessage('p1', { t: 'rift_buy', item: 'reaperedge' });
+
+    expect(ent.gold, 'missing the second component must not charge gold').toBe(goldBefore);
+    expect(ent.items, 'missing the second component must not change inventory').toEqual(itemsBefore);
+  });
+
+  it('no-ops with insufficient gold for the step, even with both components held at the fountain', () => {
+    const { room, io } = bootLive();
+    const ent = p1Ent(room, io);
+    ent.gold = 100_000;
+    room.handleMessage('p1', { t: 'rift_buy', item: 'bladestone' });
+    room.handleMessage('p1', { t: 'rift_buy', item: 'fang' });
+    room.handleMessage('p1', { t: 'rift_buy', item: 'bladestone' });
+    room.handleMessage('p1', { t: 'rift_buy', item: 'stormbow' });
+    expect(ent.items.some((it) => it === 'fang'), 'setup: fang held').toBe(true);
+    expect(ent.items.some((it) => it === 'stormbow'), 'setup: stormbow held').toBe(true);
+    ent.gold = ITEMS.reaperedge.cost - 1; // one gold short of the 900 step
+    const itemsBefore = [...ent.items];
+
+    room.handleMessage('p1', { t: 'rift_buy', item: 'reaperedge' });
+
+    expect(ent.gold, 'insufficient gold for the step must leave gold untouched (no partial charge)').toBe(
+      ITEMS.reaperedge.cost - 1,
+    );
+    expect(ent.items, 'insufficient gold for the step must leave the components untouched').toEqual(itemsBefore);
+  });
+
+  it('sells reaperedge for its full sellValue (1440) and frees the slot', () => {
+    const { room, io } = bootLive();
+    const ent = p1Ent(room, io);
+    ent.gold = 100_000;
+    room.handleMessage('p1', { t: 'rift_buy', item: 'bladestone' });
+    room.handleMessage('p1', { t: 'rift_buy', item: 'fang' });
+    room.handleMessage('p1', { t: 'rift_buy', item: 'bladestone' });
+    room.handleMessage('p1', { t: 'rift_buy', item: 'stormbow' });
+    room.handleMessage('p1', { t: 'rift_buy', item: 'reaperedge' });
+    const slot = ent.items.findIndex((it) => it === 'reaperedge');
+    expect(slot, 'setup: reaperedge must have been fused').toBeGreaterThanOrEqual(0);
+    expect(sellValue('reaperedge'), 'pin: the literal this test protects against silent re-pricing').toBe(1440);
+    const goldBefore = ent.gold;
+
+    room.handleMessage('p1', { t: 'rift_sell', slot });
+
+    expect(ent.gold, 'selling an ultimate must refund its full sellValue (0.6 * 2400 total)').toBe(
+      goldBefore + 1440,
+    );
+    expect(ent.items[slot], 'selling an ultimate must free its slot').toBeNull();
+  });
+
+  it('a second, different ultimate (aegiscolossus) end-to-end: buy then sell — not a single lucky path', () => {
+    const { room, io } = bootLive();
+    const ent = p1Ent(room, io);
+    ent.gold = 100_000;
+    room.handleMessage('p1', { t: 'rift_buy', item: 'warmail' });
+    room.handleMessage('p1', { t: 'rift_buy', item: 'aegisheart' }); // combines -> aegisheart
+    room.handleMessage('p1', { t: 'rift_buy', item: 'warmail' });
+    room.handleMessage('p1', { t: 'rift_buy', item: 'plategirdle' });
+    room.handleMessage('p1', { t: 'rift_buy', item: 'bulwarkplate' }); // combines -> bulwarkplate
+    const aegisheartSlot = ent.items.findIndex((it) => it === 'aegisheart');
+    const bulwarkplateSlot = ent.items.findIndex((it) => it === 'bulwarkplate');
+    expect(aegisheartSlot, 'setup: aegisheart must be held').toBeGreaterThanOrEqual(0);
+    expect(bulwarkplateSlot, 'setup: bulwarkplate must be held').toBeGreaterThanOrEqual(0);
+    const occupiedBefore = occupiedSlots(ent);
+    const goldBefore = ent.gold;
+
+    room.handleMessage('p1', { t: 'rift_buy', item: 'aegiscolossus' });
+
+    expect(ent.items.some((it) => it === 'aegisheart'), 'the aegisheart component must be consumed').toBe(false);
+    expect(ent.items.some((it) => it === 'bulwarkplate'), 'the bulwarkplate component must be consumed').toBe(
+      false,
+    );
+    const slot = ent.items.findIndex((it) => it === 'aegiscolossus');
+    expect(slot, 'aegiscolossus must land in the LOWEST slot its components freed').toBe(
+      Math.min(aegisheartSlot, bulwarkplateSlot),
+    );
+    expect(ent.gold, 'aegiscolossus must charge only its 900 step, never its 3000 total').toBe(goldBefore - 900);
+    expect(occupiedSlots(ent), 'fusing must free exactly one slot').toBe(occupiedBefore - 1);
+
+    expect(sellValue('aegiscolossus'), 'pin: the literal this test protects against silent re-pricing').toBe(1800);
+    const goldBeforeSell = ent.gold;
+    room.handleMessage('p1', { t: 'rift_sell', slot });
+    expect(ent.gold, 'selling aegiscolossus must refund its full sellValue').toBe(goldBeforeSell + 1800);
+    expect(ent.items[slot], 'selling aegiscolossus must free the slot').toBeNull();
   });
 });

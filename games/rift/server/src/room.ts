@@ -44,6 +44,7 @@ import {
   ROOM_ALPHABET,
   ROOM_CODE_LEN,
   ROOM_ID_LEN,
+  sellValue,
   STARTING_GOLD,
   STARTING_SKILL_POINTS,
   TICK_RATE,
@@ -431,6 +432,12 @@ export class RiftRoom implements GameRoomHandle {
         case 'rift_buy':
           this.handleBuy(seat, parsed.item);
           return;
+        case 'rift_sell':
+          this.handleSell(seat, parsed.slot);
+          return;
+        case 'rift_drop':
+          this.handleDrop(seat, parsed.slot);
+          return;
         case 'rift_skill':
           this.handleSkill(seat, parsed.slot);
           return;
@@ -794,6 +801,56 @@ export class RiftRoom implements GameRoomHandle {
     const ent = this.heroEnt(seat);
     if (ent === undefined || this.world === null) return;
     this.world.useItem(ent.id, slot, x, z);
+  }
+
+  // Sell and drop share the same slot-clearing shape but differ on gate: sell
+  // touches the economy (gold in), so it needs the fountain — it is the shop,
+  // run backwards. Drop's cost is total (the item is gone, no refund), so
+  // there is nothing to exploit by allowing it in the field, hence no gate.
+
+  private handleSell(seat: Seat, slot: number): void {
+    const ent = this.heroEnt(seat);
+    if (ent === undefined || this.world === null) return;
+    if (!ent.alive || ent.kind !== 'hero') return;
+    // Sell reuses the room's existing fountain predicate (this.atFountain)
+    // because the frozen World interface does not expose the sim's own
+    // atOwnFountain — the two agree by construction (same FOUNTAIN_RADIUS,
+    // same ancient anchor), so this is the shop's gate, not a new one.
+    if (!this.atFountain(seat.team, ent)) return;
+    if (!Number.isInteger(slot) || slot < 0 || slot >= INVENTORY_SLOTS) return;
+    const id = ent.items[slot];
+    if (id === null || id === undefined) return;
+    ent.gold += sellValue(id);
+    ent.items[slot] = null;
+    ent.itemCharges[slot] = 0;
+    ent.itemCdUntilTick[slot] = 0;
+    // No recomputeEnt call: SimWorld.advance() runs stepUpkeep() every tick,
+    // which recomputes every mobile's stats from its current items array
+    // (and clamps hp/mana down) as its last step. Handlers run between
+    // ticks and snapshots push only after tickOnce(), so no client can ever
+    // observe a stale, unrecomputed state — the slot write IS the state
+    // change; the next advance() reconciles the stats.
+  }
+
+  /** Drop destroys the item — no world pickup entity is created. Spawning a
+   *  droppable/reclaimable item entity is a much larger feature (a new
+   *  EntKind, snapshot wire shape, pickup radius, ownership/denial rules) and
+   *  is deliberately out of scope here; drop is the escape hatch for a full
+   *  inventory away from the fountain, and the lost gold is the price of
+   *  using it. */
+  private handleDrop(seat: Seat, slot: number): void {
+    const ent = this.heroEnt(seat);
+    if (ent === undefined || this.world === null) return;
+    if (!ent.alive || ent.kind !== 'hero') return;
+    if (!Number.isInteger(slot) || slot < 0 || slot >= INVENTORY_SLOTS) return;
+    const id = ent.items[slot];
+    if (id === null || id === undefined) return;
+    ent.items[slot] = null;
+    ent.itemCharges[slot] = 0;
+    ent.itemCdUntilTick[slot] = 0;
+    // No recomputeEnt call: see handleSell above — stepUpkeep() reconciles
+    // every mobile's stats on the very next advance(), before any snapshot
+    // can observe a stale value.
   }
 
   // --- events ----------------------------------------------------------------
