@@ -142,8 +142,24 @@ function spawnWaveLane(
 function stepWaves(w: SimWorld): void {
   if (w.tick < w.nextWaveTick) return;
   const waveNo = w.waveIndex + 1; // 1-based wave number
-  const growth = w.overtime ? SURGE_WAVE_GROWTH : WAVE_GROWTH;
-  const growthMult = Math.pow(1 + growth, w.waveIndex);
+  // Growth is piecewise, NOT a base-swap on the absolute wave index.
+  //
+  // This used to read `pow(1 + (overtime ? SURGE : WAVE), waveIndex)`, which
+  // applied the overtime surge RETROACTIVELY to every wave since minute zero.
+  // At OVERTIME_AT_S (11:00, wave 22) the multiplier jumped 1.52x -> 9.9x in a
+  // single wave — melee creeps went from 32 damage / 682 hp to 209 / 4470 — and
+  // kept compounding at 11% on the absolute index (65x by wave 40). Creeps
+  // simply started killing everyone at a fixed clock time in every match.
+  //
+  // The surge is meant to compound FROM the overtime boundary: normal growth up
+  // to it, then the faster rate on the waves elapsed since. This is continuous
+  // across the boundary (1.02^21 = 1.52 -> 1.02^22 * 1.11^0 = 1.55).
+  const otIndex = Math.ceil(OVERTIME_AT_S / WAVE_PERIOD_S);
+  const baseMult = Math.pow(1 + WAVE_GROWTH, Math.min(w.waveIndex, otIndex));
+  const surgeMult = w.overtime
+    ? Math.pow(1 + SURGE_WAVE_GROWTH, Math.max(0, w.waveIndex - otIndex))
+    : 1;
+  const growthMult = baseMult * surgeMult;
   let melee = WAVE_MELEE;
   if (w.overtime) {
     melee += Math.floor((w.tick * TICK_DT - OVERTIME_AT_S) / SURGE_EXTRA_MELEE_PERIOD_S);
