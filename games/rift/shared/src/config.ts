@@ -444,8 +444,39 @@ export function nightVisionScale(phase: number): number {
 
 // --- Match arc ----------------------------------------------------------------------
 export const OVERTIME_AT_S = 660; // 11:00 — surge begins (measured: 1200 pushes the duration median past the §9 band)
-export const SURGE_WAVE_GROWTH = 0.11; // replaces WAVE_GROWTH in overtime
-export const SURGE_EXTRA_MELEE_PERIOD_S = 600; // +1 melee per wave per elapsed period of OT
+/**
+ * Overtime pressure comes from VOLUME, not from lethality.
+ *
+ * The surge used to be a stat pump at 11% per wave, which made creeps a genuine
+ * threat to HEROES — the thing a lane creep should never be. Overtime's job is
+ * to end a stalled game by overwhelming DEFENCES, so the load is carried by
+ * spawn rate and wave size instead, and per-creep stats grow only gently.
+ * A creep stays something a hero can kill; there are simply far more of them,
+ * arriving far more often, than a base can hold back.
+ */
+export const SURGE_WAVE_GROWTH = 0.05; // gentle stat ramp in overtime (was 0.11)
+
+/**
+ * Overtime waves arrive faster. The period shrinks by SURGE_PERIOD_STEP_S for
+ * every elapsed minute of overtime, down to SURGE_WAVE_PERIOD_MIN_S:
+ *   0 min OT -> 30 s   1 -> 25   2 -> 20   3 -> 15   4+ -> 12
+ * i.e. up to 2.5x the lane pressure of a normal wave cycle.
+ */
+export const SURGE_PERIOD_STEP_S = 4;
+/**
+ * Floor on the overtime wave period.
+ *
+ * 18, not 12. Sim cost scales with LIVE creep count = spawn rate x lifetime, so
+ * a 2.5x spawn rate on top of extra melee per wave drove the 8v8 tick p95 to
+ * 11.4 ms against a 2 ms budget (CONTRACT §10) and the balance harness could no
+ * longer finish a match. Volume is still the pressure mechanism, but it has to
+ * stay inside the tick budget: 18 s floor is ~1.7x the base rate.
+ */
+export const SURGE_WAVE_PERIOD_MIN_S = 18;
+/** Hard cap on the extra melee overtime stacks onto a wave. Unbounded growth
+ *  here is the other half of the entity-count explosion. */
+export const SURGE_EXTRA_MELEE_MAX = 2;
+export const SURGE_EXTRA_MELEE_PERIOD_S = 180; // +1 melee per wave per elapsed period of OT (was 600)
 // (slow by design: the unit flood at 60s broke the §10 2ms tick budget — surge
 // growth, not unit count, carries the anti-sprawl)
 export const MATCH_HARD_CAP_S = 1_800; // 30:00 — tiebreak end

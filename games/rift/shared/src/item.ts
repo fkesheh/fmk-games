@@ -192,12 +192,20 @@ export const ITEMS: Record<ItemId, ItemDef> = {
   },
   wraithblade: {
     id: 'wraithblade', name: 'Wraithblade', icon: '🌑', cost: 1000,
-    stats: { damage: 22, maxHp: 400, moveSpeed: 0.5, lifesteal: 0.15 },
-    // A shorter-cooldown, longer blink than Blinkstone — the bruiser's
-    // in-and-out ultimate, paid for with a 2600g total instead of 650g.
-    active: { kind: 'dash', distance: 11, cooldown: 9 },
+    // NO DASH, deliberately. This carried an 11m/9s blink against Blinkstone's
+    // 8m/14s — 2.1x the displacement throughput — WITHOUT consuming Blinkstone.
+    // That left two bad outcomes and no third: hold both for ~19m of burst
+    // displacement on a ~5.5s combined cadence, or eat a 260g loss selling the
+    // Blinkstone you bought first. Every other ultimate either consumes the
+    // lower item (stormherald widens warhorn's aura) or competes on a different
+    // axis. Blinkstone is a tier-1 item whose ENTIRE purpose is the blink, and
+    // the tier rule (components must be tier-2) means it cannot be folded in
+    // here — so Wraithblade stays off that axis instead.
+    // Its identity is sustained mobility through raw movement speed, which
+    // stacks with a blink rather than replacing it.
+    stats: { damage: 22, maxHp: 400, moveSpeed: 0.75, lifesteal: 0.2, hpRegen: 5 },
     recipe: { components: ['fang', 'aegisheart'], cost: 1000 }, // 700 + 900 + 1000 = 2600
-    blurb: 'Active: blink 11m. 9s cooldown. +22 damage, +400 health, 15% lifesteal.',
+    blurb: '+22 damage, +400 health, +0.75 move speed, 20% lifesteal, +5 health regen.',
   },
 };
 

@@ -45,8 +45,11 @@ import {
   PASSIVE_GOLD_PER_S,
   SIEGE_EVERY_NTH_WAVE,
   SKILL_POINTS_PER_LEVEL,
+  SURGE_EXTRA_MELEE_MAX,
   SURGE_EXTRA_MELEE_PERIOD_S,
+  SURGE_PERIOD_STEP_S,
   SURGE_WAVE_GROWTH,
+  SURGE_WAVE_PERIOD_MIN_S,
   TICK_DT,
   TICK_RATE,
   WARD_RESTOCK_S,
@@ -162,7 +165,10 @@ function stepWaves(w: SimWorld): void {
   const growthMult = baseMult * surgeMult;
   let melee = WAVE_MELEE;
   if (w.overtime) {
-    melee += Math.floor((w.tick * TICK_DT - OVERTIME_AT_S) / SURGE_EXTRA_MELEE_PERIOD_S);
+    melee += Math.min(
+      SURGE_EXTRA_MELEE_MAX,
+      Math.floor((w.tick * TICK_DT - OVERTIME_AT_S) / SURGE_EXTRA_MELEE_PERIOD_S),
+    );
   }
   const siege = waveNo % SIEGE_EVERY_NTH_WAVE === 0 ? 1 : 0;
   for (let lane = 0; lane < w.map.lanes; lane++) {
@@ -171,7 +177,16 @@ function stepWaves(w: SimWorld): void {
     }
   }
   w.waveIndex += 1;
-  w.nextWaveTick += Math.round(WAVE_PERIOD_S * TICK_RATE);
+  // Overtime ends games by SENDING MORE, not by making each creep lethal:
+  // the wave period shrinks with elapsed overtime down to a floor.
+  const otSecs = w.overtime ? w.tick * TICK_DT - OVERTIME_AT_S : 0;
+  const period = w.overtime
+    ? Math.max(
+        SURGE_WAVE_PERIOD_MIN_S,
+        WAVE_PERIOD_S - Math.floor(otSecs / 60) * SURGE_PERIOD_STEP_S,
+      )
+    : WAVE_PERIOD_S;
+  w.nextWaveTick += Math.round(period * TICK_RATE);
 }
 
 /** HERO respawn only. A neutral camp creep also carries a `respawnAtTick`-shaped

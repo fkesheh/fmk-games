@@ -93,9 +93,9 @@ describe('ITEMS record', () => {
     const withActive = Object.values(ITEMS).filter((d) => d.active !== undefined);
     expect(
       withActive.length,
-      `expected exactly 5 active items (blinkstone/warhorn/wardstone/stormherald/wraithblade), found ` +
+      `expected exactly 4 active items (blinkstone/warhorn/wardstone/stormherald), found ` +
         `${withActive.length}: [${withActive.map((d) => d.id).join(', ')}]`,
-    ).toBe(5);
+    ).toBe(4);
 
     for (const def of withActive) {
       const active = def.active;
@@ -514,12 +514,22 @@ describe('sell economics', () => {
       expect(recipe, `${id}: tier-3 item must have a recipe`).toBeDefined();
       if (recipe === undefined) continue;
       const sell = sellValue(id);
-      const recipeStepThreshold = recipe.cost * SELL_REFUND;
+      // ASSERT THE ACTUAL INVARIANT, not a threshold anything would clear.
+      // This used to be `sell > recipe.cost * SELL_REFUND` while CLAIMING to
+      // prove the components' totals were included. It proved no such thing:
+      // for reaperedge that threshold is 540, so an implementation that counted
+      // only ONE of the two components (700 + 900 step = 1600 -> 960) sailed
+      // past it, as would one that counted half of one. The real property is
+      // that a fused item refunds at least the sum of what its components would
+      // have refunded, plus the refund on the fusion step itself.
+      const componentsRefund = recipe.components.reduce((acc, c) => acc + sellValue(c), 0);
+      const floor = componentsRefund + Math.floor(recipe.cost * SELL_REFUND);
       expect(
         sell,
-        `${id}: sellValue ${sell} must exceed 0.6 * recipe.cost (${recipeStepThreshold}) — ` +
-          `proving the fused components' totals are included in the refund, not just the fusion step`,
-      ).toBeGreaterThan(recipeStepThreshold);
+        `${id}: sellValue ${sell} must be >= the sum of its components' refunds ` +
+          `(${componentsRefund}) plus the refund on the fusion step ` +
+          `(${Math.floor(recipe.cost * SELL_REFUND)}) = ${floor}`,
+      ).toBeGreaterThanOrEqual(floor);
     }
   });
 });
