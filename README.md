@@ -1,6 +1,6 @@
 # STRICKEN (+ BANK + KART GP + WORDBOMB + ANCIENTS) — multiplayer game platform
 
-A browser multiplayer game platform with five games sharing one server:
+A browser multiplayer game platform with six games sharing one server:
 - **STRICKEN** (`/fps/`) — tactical FPS in the spirit of Counter-Strike
 - **BANK** (`/bank/`) — the classic push-your-luck dice party game (canonical Bank rules)
 - **KART GP** (`/kart/`) — multiplayer kart racing: drift physics, 3-lap races, one circuit
@@ -8,6 +8,9 @@ A browser multiplayer game platform with five games sharing one server:
   answer revealed at once
 - **ANCIENTS** (`/rift/`) — a mini MOBA: push lanes, last-hit for gold, raze towers, break
   the enemy Ancient. 2v2–8v8 with bot fill, fog of war, generated maps
+- **OUTPOST** (`/outpost/`) — co-op zombie wave-defense FPS: 1–16 survivors hold a fenced
+  compound around a watchtower on the RIDGELINE map against escalating waves of four zombie
+  kinds; the run ends the instant the last survivor goes down
 
 `/` is a launcher page; all games ride one WebSocket (`/ws`). Everything is
 procedural: no assets — flat-shaded low-poly 3D (FPS, KART), DOM/CSS 3D dice

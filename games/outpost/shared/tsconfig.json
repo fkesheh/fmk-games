@@ -1,0 +1,14 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "types": [],
+    "paths": {
+      "@fps/shared": ["../../fps/shared/src/index.ts"],
+      "@fps/shared/*": ["../../fps/shared/src/*"],
+      "@platform/shared": ["../../../platform/shared/src/index.ts"]
+    }
+  },
+  "include": ["src"]
+}

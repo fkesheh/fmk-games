@@ -8,6 +8,7 @@ import { kartModule } from '@kart/server';
 import type { GameModule } from '@platform/shared';
 import { riftModule } from '@rift/server';
 import { splatModule } from '@splat/server';
+import { outpostModule } from '@outpost/server';
 import { wordbombModule } from '@wordbomb/server';
 
 export const GAMES: GameModule[] = [
@@ -17,4 +18,5 @@ export const GAMES: GameModule[] = [
   wordbombModule,
   riftModule,
   splatModule,
+  outpostModule,
 ];
