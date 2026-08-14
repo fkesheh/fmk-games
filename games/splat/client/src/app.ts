@@ -55,6 +55,7 @@ import type {
 } from '@splat/shared';
 import { NET } from '@platform/shared';
 import type { LobbyC2S } from '@platform/shared';
+import * as THREE from 'three';
 import { DriveController } from './drive.js';
 import { SplatScene } from './render/scene.js';
 import { PlantField } from './render/plants.js';
@@ -270,6 +271,9 @@ const NAME_MAX_LEN = 16; // platform cleanName cap
 const CODE_MAX_LEN = 8;
 const TWO_PI = Math.PI * 2;
 const SEQ_SAVE_EVERY_MS = 2000; // localStorage is not a per-snapshot device
+const AIR_EASE = 8; // /s — carveAirVis approach rate; mirrors render/scene.ts's
+// airborneVis ease exactly (same constant), so the carve hiss fades on the
+// same clock as the camera/ski visuals instead of snapping.
 
 /** The rejoin pointer + input-seq watermark persisted across drops/reloads. */
 interface SplatSession {
@@ -332,6 +336,15 @@ interface SplatTelemetry {
   seed: number;
   /** v2 — live slope kickers (for the e2e's deterministic ramp ride + shot). */
   kickers: ReadonlyArray<{ x: number; z: number }>;
+  /** v3 — TOTAL live InstancedMesh instances in the world (§12.3e budget <= 3000).
+   *  Read by traversing the real scene graph, so it measures what is actually
+   *  submitted, not what a constructor was asked to build. */
+  instances: number;
+  /** v3 — of `instances`, the gameplay PlantField's share. */
+  plantInstances: number;
+  /** v3 — of `instances`, §V3.4's MountainDressing share. Zero here means the
+   *  dressing is not in the scene, whatever the unit tests say. */
+  dressInstances: number;
 }
 
 interface SplatApi {
@@ -346,6 +359,22 @@ interface SplatApi {
 declare global {
   interface Window {
     __splat?: SplatApi;
+  }
+}
+
+// ---- scene-graph instance accounting (§12.3e: instances <= 3000) --------------
+// The v3 fan-out shipped a whole dressing feature that unit-tested green while
+// being absent from the running scene. These tags make presence measurable from
+// the live scene graph, so telemetry() can never report a field that is not
+// actually there.
+const TAG_PLANTS = 'v3:plants';
+const TAG_DRESSING = 'v3:dressing';
+const TAG_TERRAIN = 'v3:terrain';
+
+/** Name every child added to `world` since `before` was snapshotted. */
+function tagNewChildren(world: THREE.Scene, before: ReadonlySet<THREE.Object3D>, tag: string): void {
+  for (const child of world.children) {
+    if (!before.has(child)) child.name = tag;
   }
 }
 
@@ -565,6 +594,7 @@ export class SplatApp {
   private ownGateFxIx = -1; // highest gateIx that already got pass feedback
   // v2 airborne edge dedup (CONTRACT §11.5 C2v2)
   private prevAirborne = false;
+  private carveAirVis = 0; // 0 grounded -> 1 airborne; eases the carve audio gate (see AIR_EASE)
   private readonly prevRemoteAirborne = new Map<string, boolean>();
   private lastFrame = 0;
 
@@ -1160,12 +1190,34 @@ export class SplatApp {
     this.seed = seed;
     const slope = genSlope(seed);
     this.slope = slope;
+    const oldPlants = this.plants;
     if (this.scene !== null) {
+      const world = this.scene.world;
+      // buildTerrain owns the terrain root, the gates AND the §V3.4
+      // MountainDressing (scene.ts: constructed here, disposed here on the next
+      // rebuild, distance-culled from setCamera). app.ts must NOT construct a
+      // second one — doing so double-instanced the whole dressing field (6
+      // InstancedMeshes / ~1800 instances instead of 3 / ~900) and blew the
+      // §12.3e instance budget. The children it adds straight into `world` are
+      // tagged below purely so telemetry() can prove, from the live scene
+      // graph, that the field is really there.
+      const beforeTerrain = new Set(world.children);
       this.scene.buildTerrain(slope); // idempotent, disposes the prior mountain
-      this.plants = new PlantField(this.scene.world, slope);
+      for (const child of world.children) {
+        if (beforeTerrain.has(child)) continue;
+        child.name = child instanceof THREE.InstancedMesh ? TAG_DRESSING : TAG_TERRAIN;
+      }
+      const beforePlants = new Set(world.children);
+      this.plants = new PlantField(world, slope);
+      tagNewChildren(world, beforePlants, TAG_PLANTS);
     } else {
       this.plants = null;
     }
+    // Dispose AFTER the replacement is built: PlantField owns its own
+    // InstancedMeshes/geometries, and dropping the reference without disposing
+    // leaked a whole mountain's worth of GPU buffers on every rematch
+    // (rebuildSlope runs on every snap.seed change).
+    oldPlants?.dispose();
     const old = this.drive;
     if (old !== null) old.dispose(); // keyboard/blur listeners
     this.seqOffset = Math.max(this.seqOffset, this.lastSeqHigh, this.lastAckWire);
@@ -1556,6 +1608,20 @@ export class SplatApp {
   private readonly frameBound = (now: number): void => this.frame(now);
 
   private frame(now: number): void {
+    try {
+      this.frameBody(now);
+    } catch (err) {
+      // One bad frame must never kill the render loop / white-screen the client
+      // — log and keep going so the next rAF still fires below. Logged at
+      // console.ERROR, not warn: the e2e harness only counts console.error, so
+      // a warn here would let a permanently-throwing frame ship as a green run
+      // (the exact class of silent failure this integration exists to close).
+      console.error('frame() threw; skipping this frame', err);
+    }
+    requestAnimationFrame(this.frameBound);
+  }
+
+  private frameBody(now: number): void {
     const dtMs = Math.min(MAX_FRAME_DT_MS, Math.max(0, now - this.lastFrame));
     this.lastFrame = now;
     const dt = dtMs / 1000;
@@ -1583,22 +1649,28 @@ export class SplatApp {
         const air = airHeight(s, cx, cz, slope);
         this.scene?.setCamera(cx, cy + air, cz, s.yaw, s.v, drive.steerVisual(), dt);
         this.skiers?.setOwnSkis(drive.steerVisual(), s.v, dt);
-        // Own airborne edge detection (CONTRACT §11.2, §11.5 C2v2)
+        // Own airborne edge detection (CONTRACT §11.2, §11.5 C2v2) — one-shot
+        // audio/fx triggers only; the state itself is driven unconditionally
+        // below so it can self-heal (see setOwnAirborne comment).
         if (s.airborne && !this.prevAirborne) {
-          this.scene?.setAirborne(true);
-          this.skiers?.setOwnAirborne(true);
           this.audio.sfx('jump');
           this.fx?.burst('launch', cx, cy, cz);
         } else if (!s.airborne && this.prevAirborne) {
           this.scene?.land();
-          this.scene?.setAirborne(false);
-          this.skiers?.setOwnAirborne(false);
           this.audio.sfx('land');
           this.fx?.burst('land', cx, cy, cz);
         }
         this.prevAirborne = s.airborne;
-        // Drive airborne state every race frame — scene eases internally
+        // Drive airborne state every race frame from the authoritative sim
+        // flag — both scene and skiers ease internally and no-op on a
+        // repeated value, so this is self-healing: a phase reset that clears
+        // prevAirborne without a matching edge (race end / rematch / respawn
+        // mid-flight — see the resets at onWelcome, onLeaveRoom and
+        // onPhaseChange) can no longer strand the rig in the air pose, since
+        // the very next race frame re-asserts the correct state directly
+        // rather than relying on an edge that could have been skipped.
         this.scene?.setAirborne(s.airborne);
+        this.skiers?.setOwnAirborne(s.airborne);
         // Own gate pass, PREDICTED (sim.ts header convention): lastGateIx
         // advancing WITH a boostUntilMs move = a clean pass; an advance alone
         // is a miss and stays silent. Feedback fires here, the frame it
@@ -1614,10 +1686,19 @@ export class SplatApp {
         this.prevGateIx = s.lastGateIx;
         this.prevBoostUntilMs = s.boostUntilMs;
         this.updateRemotes(slope, dt);
-        this.plants?.update(dt, cz);
+        this.plants?.update(dt, cz); // the §V3.4 dressing is culled by scene.setCamera
         this.fx?.update(dt, cx, cz);
         this.audio.wind(clamp01(s.v / MAX_SPEED));
-        this.audio.carve(clamp01(Math.abs(drive.steerVisual()) * (s.v / MAX_SPEED)));
+        // Carve hiss is a steer-driven effect like camera roll/shake/FOV and
+        // ski yaw/edge/flex, all of which gate on airborne — this one was
+        // missed, so it kept hissing in response to steering the sim ignores
+        // mid-flight (J_AIR_STEER_MUL/J_AIR_CARVE_MUL = 0). Eased via
+        // carveAirVis (same AIR_EASE clock as scene.ts's airborneVis) so it
+        // fades out over the jump rather than cutting abruptly.
+        this.carveAirVis += ((s.airborne ? 1 : 0) - this.carveAirVis) * (1 - Math.exp(-AIR_EASE * dt));
+        this.audio.carve(
+          clamp01(Math.abs(drive.steerVisual()) * (s.v / MAX_SPEED)) * (1 - this.carveAirVis),
+        );
       } else {
         this.audio.wind(0);
         this.audio.carve(0);
@@ -1629,7 +1710,6 @@ export class SplatApp {
       // idiom): shader compiles + first uploads into the hidden canvas.
       this.scene?.prewarm();
     }
-    requestAnimationFrame(this.frameBound);
   }
 
   private updateRemotes(slope: SlopeDef, dt: number): void {
@@ -1907,6 +1987,21 @@ export class SplatApp {
     };
   }
 
+  /** Walk the live scene graph and sum every InstancedMesh's instance count,
+   *  split out by the tags stamped in rebuildSlope. */
+  private sceneInstances(): { total: number; plants: number; dressing: number } {
+    let total = 0;
+    let plants = 0;
+    let dressing = 0;
+    this.scene?.world.traverse((o) => {
+      if (!(o instanceof THREE.InstancedMesh)) return;
+      total += o.count;
+      if (o.name === TAG_PLANTS) plants += o.count;
+      else if (o.name === TAG_DRESSING) dressing += o.count;
+    });
+    return { total, plants, dressing };
+  }
+
   private telemetrySnapshot(): SplatTelemetry {
     const remotes: SplatRemoteDebug[] = [];
     for (const [id, p] of this.players) {
@@ -1921,6 +2016,7 @@ export class SplatApp {
         samples: this.buffers.get(id)?.length ?? 0,
       });
     }
+    const inst = this.sceneInstances();
     return {
       drawCalls: this.scene?.drawCalls() ?? 0,
       remotes,
@@ -1931,6 +2027,9 @@ export class SplatApp {
       offsetMs: this.offset,
       seed: this.seed,
       kickers: this.slope?.kickers.map((k) => ({ x: k.x, z: k.z })) ?? [],
+      instances: inst.total,
+      plantInstances: inst.plants,
+      dressInstances: inst.dressing,
     };
   }
 

@@ -42,7 +42,9 @@
 // the 4-year-old test before freezing these bodies):
 // - YAW SOFT-CLAMP: beyond ±YAW_MAX a positional spring removes
 //   YAW_SPRING * (|yaw| - YAW_MAX) * dt per step toward the fall line
-//   ("YAW_SPRING rad/s² per rad" beyond the clamp). Full-lock equilibrium
+//   ("YAW_SPRING rad/s² per rad" beyond the clamp). SUSPENDED WHILE AIRBORNE
+//   (§12.1 rule 3) — it is self-centring, not safety, and the air lock freezes
+//   heading in flight. Grounded behaviour is untouched. Full-lock equilibrium
 //   sits ~0.22 rad past YAW_MAX (measured 1.574 rad); under the retuned
 //   speed constants that is a hair past traverse at the START of a run, so
 //   a few mm of backward z drift over the first ~3 s is the frozen physics
@@ -256,16 +258,27 @@ export function stepSki(
   const accel = G_ACCEL * slope.gradeAt(s.x, s.z, s.yaw) - DRAG * s.v * s.v;
   s.v += accel * dt;
 
-  // -- steering: yaw rate = steer * TURN_RATE(v); damped in air -------------
+  // -- steering: yaw rate = steer * TURN_RATE(v); scaled by J_AIR_STEER_MUL
+  //    in air — 0 under the §12.1 air lock, so player input cannot turn a
+  //    skier in flight (the wire still carries steer; the sim ignores it).
   s.yaw += st * turnRateAt(s.v) * (airborne ? J_AIR_STEER_MUL : 1) * dt;
 
-  // -- carving scrubs speed (damped in air) ---------------------------------
+  // -- carving scrubs speed (scaled by J_AIR_CARVE_MUL in air — 0 under the
+  //    §12.1 air lock) --------------------------------------------------------
   s.v *= 1 - (airborne ? J_AIR_CARVE_MUL : 1) * CARVE_SCRUB * Math.abs(st) * dt * (s.v / MAX_SPEED);
 
   // -- yaw soft-clamp: spring beyond ±YAW_MAX back toward the fall line -----
-  const absYaw = Math.abs(s.yaw);
-  if (absYaw > YAW_MAX) {
-    s.yaw -= Math.sign(s.yaw) * YAW_SPRING * (absYaw - YAW_MAX) * dt;
+  // AIR LOCK (§12.1 rule 3): SUSPENDED while airborne. This spring is passive
+  // self-centring, not a safety system — if it kept running in flight a skier
+  // who launched past ±YAW_MAX would have the heading quietly straightened out
+  // mid-air, which is exactly the "yaw at landing === yaw at launch" promise
+  // §12.1 freezes. Containment in air is NOT this term: it is the soft-edge
+  // yaw term below (§12.1 rule 4), which stays active airborne or not.
+  if (!airborne) {
+    const absYaw = Math.abs(s.yaw);
+    if (absYaw > YAW_MAX) {
+      s.yaw -= Math.sign(s.yaw) * YAW_SPRING * (absYaw - YAW_MAX) * dt;
+    }
   }
 
   // -- motion along heading (yaw 0 = +Z downhill) ----------------------------

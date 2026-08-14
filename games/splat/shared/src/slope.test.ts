@@ -6,8 +6,9 @@
 // the connected-corridor guarantee (generated slopes + synthetic bad defs),
 // slalom gates (count/placement/corridor alignment + validator rejections),
 // plantGrid band membership + the k-1/k/k+1 query pattern, height-field
-// continuity/finiteness, and the stepSki full-lock integration suite (guarded:
-// skips until P1's sim.ts exists — see the bottom describe).
+// continuity/finiteness. The stepSki full-lock integration suite (physics,
+// not visual) lives in sim.test.ts per CONTRACT_V3 §12.2 — moved out of this
+// file pre-fan-out so an air-lock regression cannot land in W1's visual gate.
 // ============================================================================
 
 import { describe, expect, it } from 'vitest';
@@ -28,7 +29,6 @@ import {
   PLANT_DENSITY_FULL,
   PLANT_DENSITY_RAMP,
   PLANT_DENSITY_START,
-  SIM_DT,
   SLOPE_LENGTH,
   SLOPE_WIDTH,
   START_CLEAR,
@@ -40,8 +40,15 @@ import {
   UND_LONG_2_LEN,
   YAW_MAX,
 } from './config.js';
-import { bandFreeIntervals, genSlope, validateSlope } from './slope.js';
-import type { Gate, Plant, SkierSim, SlopeDef } from './types.js';
+import {
+  GROOM_BAND_HALF_M,
+  GROOM_PHASE_SALT,
+  bandFreeIntervals,
+  buildTrackMask,
+  genSlope,
+  validateSlope,
+} from './slope.js';
+import type { Gate, Plant, SlopeDef } from './types.js';
 
 // The shared tsconfig is lib-pure (no DOM, no node types) but vitest provides
 // console at runtime; declare the one method these tests log measurements with.
@@ -128,9 +135,15 @@ describe('determinism', () => {
 
 describe('grade floor', () => {
   it('gradeAt >= GRADE_MIN on a 50x200 grid, 20 seeds, fall-line heading', () => {
-    // The analytic bound (config.ts): fall-line grade >= GRADE_BASE - 0.1142
-    // ~ 0.0958, so the GRADE_MIN clamp must NEVER fire at heading 0 — if it
-    // does, the undulation implementation is wrong, not the config.
+    // RE-DERIVED for CONTRACT_V3 §12.2a's raised amplitudes (UND_LONG_1_AMP
+    // 2.0->5.2, UND_LONG_2_AMP 1.0->0.4). The analytic bound (config.ts) is
+    // fall-line grade >= GRADE_BASE - (A1*TAU/L1 + A2*TAU/L2)
+    //   = 0.26 - (0.148512 + 0.022848) = 0.088640
+    // (it was 0.0958 against the old constants). Still strictly above
+    // GRADE_MIN 0.08, so the clamp must STILL never fire at heading 0 — if it
+    // does, the undulation implementation is wrong, not the config. The margin
+    // is now 0.0086, not 0.0158: this gate is the thing that would catch a
+    // future amplitude bump breaking §12.2a's <= 0.171 gradient budget.
     let trueMin = Infinity;
     for (const seed of SEEDS) {
       const s = genSlope(seed);
@@ -144,9 +157,12 @@ describe('grade floor', () => {
         }
       }
     }
-    // Measured across 20 seeds x 10k samples: trueMin sits ~0.096, comfortably
-    // above GRADE_MIN 0.08 (log kept as the report this gate was tuned against).
-    console.log(`[slope] min fall-line grade over 20 seeds: ${trueMin.toFixed(4)}`);
+    // RE-DERIVED (§12.2a): measured across 20 seeds x 10k samples, trueMin now
+    // sits at 0.08906 (was ~0.096), i.e. 0.0004 above the analytic floor of
+    // 0.08864 — the sampled grid all but reaches the worst case. The assertion
+    // bound GRADE_MIN + 0.005 = 0.085 is UNCHANGED and is still guaranteed by
+    // construction, not by sampling luck: the analytic floor 0.08864 > 0.085.
+    console.log(`[slope] min fall-line grade over 20 seeds: ${trueMin.toFixed(5)}`);
     expect(trueMin).toBeGreaterThan(GRADE_MIN + 0.005);
   });
 
@@ -190,16 +206,29 @@ describe('grade floor', () => {
         `|h|<=0.3: ${((100 * nearHits) / nearTotal).toFixed(3)}%, ` +
         `|h|<=0.6: ${((100 * coneHits) / coneTotal).toFixed(3)}%`,
     );
-    // Undulation correctness is proven at the fall line (previous test: true
-    // min 0.0964, clamp NEVER fires). Off the fall line the clamp engaging is
-    // geometry, not a bug: a 12-degree slope traversed at 34 degrees yields a
-    // baseline grade of 0.21*cos(0.6) = 0.174, which the lateral octave (max
-    // 0.067*sin) can legitimately pull under GRADE_MIN ~2.5% of the time, and
-    // a near-90-degree traverse is genuinely near-flat ~50% of the time. The
-    // clamp is the contract's safety net for exactly those headings. Asserted:
-    // rare in the shallow-carve band (<1%), small in the full carve cone (<5%).
-    expect(nearHits / nearTotal).toBeLessThan(0.01);
-    expect(coneHits / coneTotal).toBeLessThan(0.05);
+    // RE-DERIVED for CONTRACT_V3 §12.2a. Undulation correctness is proven at
+    // the fall line (previous test: true min 0.08906, clamp NEVER fires). Off
+    // the fall line the clamp engaging is geometry, not a bug — and §12.2a's
+    // re-allocation moves BOTH terms of that geometry the wrong way at once:
+    //
+    //   worst-case along-grade(h) = (GRADE_BASE - longGrad)*cos(h)
+    //                               - latGrad*|sin(h)|
+    //   longGrad: 0.1142 -> 0.171360   => fall-line headroom over GRADE_MIN
+    //                                     collapses 0.0158 -> 0.0086
+    //   latGrad (UND_LAT_AMP 1.5->2.5): 0.06732 -> 0.11220 (x1.67)
+    //
+    // So a heading only 0.3 rad off the fall line can now be pulled to
+    // 0.08864*cos(0.3) - 0.11220*sin(0.3) = 0.0515, well under GRADE_MIN, where
+    // before it could not reach it at all. The old budgets (<1% / <5%) were
+    // tuned to the old constants and are dead. Measured on the same fixed 20
+    // seeds x 21x81 grid: |h|<=0.3 -> 2.9644%, |h|<=0.6 -> 6.7409%. Budgets set
+    // ~18% above measurement — tight enough that a further amplitude bump trips
+    // them, loose enough to survive a re-tune inside the frozen budget.
+    // This is not a weakened assertion: it is the same invariant recomputed
+    // against the constants §12.2a froze (the clamp is the contract's safety
+    // net for near-traverse headings; only the traverse cone got wider).
+    expect(nearHits / nearTotal).toBeLessThan(0.035);
+    expect(coneHits / coneTotal).toBeLessThan(0.08);
   });
 });
 
@@ -442,19 +471,6 @@ describe('height field', () => {
   });
 });
 
-// ----------------------------------------------------------------------------
-// Wave-2 integration suite (CONTRACT §7: this suite's home is wave 2). It
-// exercises P1's stepSki against P2's generated slopes. sim.ts is P1's file
-// and does not exist yet, so the import is dynamic and widened (a literal
-// specifier would fail tsc --noEmit while the file is absent); a failed import
-// skips the suite gracefully instead of going red during wave 1.
-// ----------------------------------------------------------------------------
-interface SlopeSimModule {
-  makeSim(x: number, z: number, yaw: number): SkierSim;
-  stepSki(s: SkierSim, steer: number, dt: number, slope: SlopeDef): void;
-}
-const SIM_SPECIFIER: string = './sim.js'; // widened on purpose — see above
-
 // ---------------------------------------------------------------------------
 // Kicker placement tests (v2 §11.3)
 // ---------------------------------------------------------------------------
@@ -553,59 +569,368 @@ describe('kicker placement (v2)', () => {
       expect(v, `seed ${seed}: ${v.join('; ')}`).toEqual([]);
     }
   });
-
-  // Wave-2 integration: a skier steering toward successive kickers crosses
-  // every one (lastKickerIx advances through all of them).
-  it('a corridor-following skier crosses every kicker', async (ctx) => {
-    let sim: SlopeSimModule;
-    try {
-      sim = (await import(/* @vite-ignore */ SIM_SPECIFIER)) as SlopeSimModule;
-    } catch {
-      ctx.skip();
-      return;
-    }
-    for (const seed of SEEDS) {
-      const slope = genSlope(seed);
-      const skier = sim.makeSim(0, 0, 0);
-      let nextIx = 0;
-      for (let step = 0; step < 6000 && !skier.finished; step++) {
-        // Steer toward the next unconsumed kicker to stay on the centreline.
-        let steer = 0;
-        if (nextIx < slope.kickers.length) {
-          const t = slope.kickers[nextIx]!;
-          const dx = t.x - skier.x;
-          steer = Math.max(-1, Math.min(1, dx * 1.5));
-        }
-        sim.stepSki(skier, steer, SIM_DT, slope);
-        while (nextIx < slope.kickers.length && skier.lastKickerIx >= nextIx) {
-          nextIx = skier.lastKickerIx + 1;
-        }
-      }
-      expect(skier.lastKickerIx, `seed ${seed}`).toBe(slope.kickers.length - 1);
-      expect(skier.finished, `seed ${seed}`).toBe(true);
-    }
-  });
 });
 
-describe('stepSki full-lock integration (wave 2)', () => {
-  it('full-lock both directions reaches the finish on 20 seeds', async (ctx) => {
-    let sim: SlopeSimModule;
-    try {
-      sim = (await import(/* @vite-ignore */ SIM_SPECIFIER)) as SlopeSimModule;
-    } catch {
-      ctx.skip(); // P1's sim.ts has not landed yet; nothing to integrate.
-      return;
+// ---------------------------------------------------------------------------
+// Carve tracks — task W1, CONTRACT_V3 §12.3a/§12.3c, STYLE_BIBLE §V3.8
+//
+// buildTrackMask is purely visual, so the tests that matter most are not about
+// how it looks — they are the two ways it can silently wreck the game:
+//   (1) drawing from genSlope's RNG stream, which relocates every plant, gate
+//       and kicker on the mountain (§12.3c);
+//   (2) constructing its generator per call, which turns terrain's 33k-vertex
+//       loop into 33k generator builds (§12.3a — the reason the seam is a
+//       two-stage builder and not a bare trackMask(slope, x, z)).
+// Both have explicit gates below, alongside the §V3.8 shape assertions.
+// ---------------------------------------------------------------------------
+const TRACK_SEEDS = SEEDS;
+/** Terrain's vertex loop size (terrain.ts SEG_X+1 x SEG_Z+1) — the real load. */
+const TERRAIN_VERTS = 129 * 257;
+
+/** Strongest |mask| anywhere within `halfSpan` m of x=cx at altitude z. */
+function peakNear(
+  mask: (x: number, z: number) => number,
+  z: number,
+  cx: number,
+  halfSpan: number,
+): number {
+  let best = 0;
+  const steps = Math.round(halfSpan / 0.1);
+  for (let i = -steps; i <= steps; i++) {
+    const v = Math.abs(mask(cx + i * 0.1, z));
+    if (v > best) best = v;
+  }
+  return best;
+}
+
+describe('carve tracks (buildTrackMask, §V3.8)', () => {
+  it('exports the groom seam constants CONTRACT_V3 §12.3a froze for W2', () => {
+    // W2 imports these and deletes terrain.ts's local literals. They live in
+    // shared/ because the tracks must sit on exactly the band the terrain
+    // already draws, and shared/ cannot import from client/.
+    expect(GROOM_PHASE_SALT).toBe(0xc0a1); // was terrain.ts:209's inline literal
+    expect(GROOM_BAND_HALF_M).toBe(10.08); // was GROOM_BAND_FRAC 0.18 x width 56
+    expect(GROOM_BAND_HALF_M).toBeCloseTo(SLOPE_WIDTH * 0.18, 9);
+    // The band is a strict subset of the piste — never a reason to paint powder.
+    expect(GROOM_BAND_HALF_M).toBeLessThan(HALF_W);
+  });
+
+  it('§12.3c: builds on its OWN stream — genSlope geometry is untouched', () => {
+    // The whole point of §12.3c. If buildTrackMask ever consumed genSlope's
+    // sequential stream (or genSlope gained/lost/reordered a draw to feed it),
+    // every plant, gate and kicker would move and room.test.ts:590/613/650 plus
+    // e2e 9b/10/11a would break for reasons no one would connect to a visual
+    // task. Interleaving builds between generations must change nothing.
+    const before = genSlope(42);
+    const beforeJson = JSON.stringify({
+      plants: before.plants,
+      gates: before.gates,
+      kickers: before.kickers,
+    });
+    for (const seed of TRACK_SEEDS) {
+      const m = buildTrackMask(genSlope(seed));
+      m(0, 100); // and sampling must not disturb anything either
+      m(3.5, 401.25);
     }
-    for (const seed of SEEDS) {
-      const slope = genSlope(seed);
-      for (const steer of [-1, 1]) {
-        const skier = sim.makeSim(0, 0, 0);
-        // 6000 steps * SIM_DT = 200 s sim time >> RACE_HARD_CAP_MS territory.
-        for (let step = 0; step < 6000 && !skier.finished; step++) {
-          sim.stepSki(skier, steer, SIM_DT, slope);
-        }
-        expect(skier.finished, `seed ${seed} steer ${steer}`).toBe(true);
+    const after = genSlope(42);
+    expect(
+      JSON.stringify({ plants: after.plants, gates: after.gates, kickers: after.kickers }),
+    ).toBe(beforeJson);
+    // ...and the builder does not mutate the SlopeDef it was handed.
+    const s = genSlope(7);
+    const snapshot = JSON.stringify({ p: s.plants, g: s.gates, k: s.kickers, w: s.width });
+    const mask = buildTrackMask(s);
+    for (let i = 0; i < 200; i++) mask((i % 40) - 20, i * 4);
+    expect(JSON.stringify({ p: s.plants, g: s.gates, k: s.kickers, w: s.width })).toBe(snapshot);
+  });
+
+  it('is deterministic per seed, order-independent, and differs across seeds', () => {
+    const sample = (mask: (x: number, z: number) => number): string => {
+      const out: number[] = [];
+      for (let zi = 0; zi <= 120; zi++) {
+        for (let xi = -12; xi <= 12; xi++) out.push(mask(xi * 0.9, zi * 6.5));
+      }
+      return out.join(',');
+    };
+    const a = sample(buildTrackMask(genSlope(42)));
+    // Build an unrelated mask in between: no module-level state may leak.
+    buildTrackMask(genSlope(3));
+    const b = sample(buildTrackMask(genSlope(42)));
+    expect(b).toBe(a);
+    expect(sample(buildTrackMask(genSlope(43)))).not.toBe(a);
+
+    // The sampler is pure: re-reading a point after wandering elsewhere gives
+    // the identical value (it may not accumulate per-call state).
+    const m = buildTrackMask(genSlope(42));
+    const probe = m(2.4, 233.5);
+    for (let i = 0; i < 500; i++) m(i * 0.037 - 9, i * 1.6);
+    expect(m(2.4, 233.5)).toBe(probe);
+  });
+
+  it('§12.3a: the sampler carries no generator — 3x a terrain build stays cheap', () => {
+    // A smoke gate, not a benchmark, and the bound is measured rather than
+    // guessed. Both shapes were timed over these same 99,459 samples:
+    //   baked closure (what §12.3a froze)            ~15 ms
+    //   rng + 6-10 curves rebuilt per call (rev 2's  ~391 ms
+    //     bare trackMask(slope, x, z) shape)
+    // 200 ms sits between them: 13x headroom over the real cost so a loaded
+    // runner cannot flake it, and 2x under the regression it exists to catch.
+    const mask = buildTrackMask(genSlope(42));
+    const t0 = Date.now();
+    let acc = 0;
+    for (let pass = 0; pass < 3; pass++) {
+      for (let i = 0; i < 129; i++) {
+        for (let j = 0; j < 257; j++) acc += mask((i - 64) * 0.9, j * 3.5);
       }
     }
+    const ms = Date.now() - t0;
+    console.log(`[slope] trackMask: ${3 * TERRAIN_VERTS} samples in ${ms} ms`);
+    expect(Number.isFinite(acc)).toBe(true);
+    expect(ms).toBeLessThan(200);
+  });
+
+  it('stays in -1..+1 and is finite everywhere on and off the piste, 20 seeds', () => {
+    // Accumulate, then assert once. A per-sample expect() over this grid is
+    // ~500k matcher invocations and times the suite out under parallel load —
+    // the coverage is identical, the cost is not.
+    let lo = Infinity;
+    let hi = -Infinity;
+    let nonFinite = 0;
+    for (const seed of TRACK_SEEDS) {
+      const mask = buildTrackMask(genSlope(seed));
+      for (let zi = -5; zi <= 105; zi++) {
+        const z = zi * 8;
+        for (let xi = -56; xi <= 56; xi++) {
+          const v = mask(xi * 0.5, z);
+          if (!Number.isFinite(v)) nonFinite++;
+          if (v < lo) lo = v;
+          if (v > hi) hi = v;
+        }
+      }
+    }
+    console.log(`[slope] trackMask range over 20 seeds: ${lo.toFixed(4)} .. ${hi.toFixed(4)}`);
+    expect(nonFinite).toBe(0);
+    expect(lo).toBeGreaterThanOrEqual(-1);
+    expect(hi).toBeLessThanOrEqual(1);
+    // Both readings must actually occur: a trench-only mask would lose the
+    // §V3.8 spoil edge, a spoil-only one would lose the carve itself.
+    expect(lo).toBeLessThan(-0.5); // snowShade trenches exist
+    expect(hi).toBeGreaterThan(0.2); // snowLit spoil edges exist
+  });
+
+  it('§12.3b: lives on the groomed band only — exactly 0 outside it', () => {
+    // The groomed band is x = 0 +/- 10.08 and does NOT follow the plant-free
+    // weave. Anything outside is powder and must stay untouched, so W2 can use
+    // a zero return as a hard early-out.
+    let worst = 0;
+    let where = 'none';
+    const note = (v: number, seed: number, x: number, z: number): void => {
+      const a = v < 0 ? -v : v;
+      if (a > worst) {
+        worst = a;
+        where = `seed ${seed} x=${x.toFixed(2)} z=${z.toFixed(1)} -> ${v}`;
+      }
+    };
+    for (const seed of TRACK_SEEDS) {
+      const s = genSlope(seed);
+      const mask = buildTrackMask(s);
+      for (let zi = -5; zi <= 105; zi++) {
+        const z = zi * 8;
+        for (let xi = 0; xi <= 40; xi++) {
+          const x = GROOM_BAND_HALF_M + (xi * (HALF_W + 12 - GROOM_BAND_HALF_M)) / 40;
+          note(mask(x, z), seed, x, z);
+          note(mask(-x, z), seed, -x, z);
+        }
+      }
+      // ...and nothing exists far above the start gate or past the runout.
+      for (let xi = -20; xi <= 20; xi++) {
+        note(mask(xi * 0.5, -400), seed, xi * 0.5, -400);
+        note(mask(xi * 0.5, s.finishZ + 200), seed, xi * 0.5, s.finishZ + 200);
+      }
+    }
+    expect(worst, `off-band leak: ${where}`).toBe(0);
+  });
+
+  it('§V3.8: trenches are 1.6-2.2 m wide and never smear into a blanket', () => {
+    // Widened post-V3.8 (bugfix): the old 0.5-0.7 m trench (full-strength core
+    // 0.25-0.35 m) was narrower than the production mesh's vertex pitch
+    // (dx=0.875 m / dz~3.79 m in terrain.ts), so point-sampling it produced
+    // isolated single-vertex dots instead of a connected line (480/5911
+    // in-band vertices nonzero, ~40% of those fully isolated). >=1.6 m keeps a
+    // trench >= ~2x the tighter (x) pitch, so it always covers >=2 adjacent
+    // vertex columns.
+    // Measured across 5 seeds at 5 cm lateral resolution: p50 1.70 m, p90
+    // 3.15 m, 78% of contiguous trench runs <= 2.5 m. Runs longer than that
+    // are genuine crossings (two tracks overlapping), which §V3.8 asks for —
+    // but if the bulk of the piste became one wide trench, the carve read is
+    // gone and this gate catches it.
+    const runs: number[] = [];
+    for (const seed of [1, 5, 9, 13, 17]) {
+      const mask = buildTrackMask(genSlope(seed));
+      for (let zi = 0; zi <= 200; zi++) {
+        const z = zi * 4;
+        let run = 0;
+        for (let xi = -220; xi <= 220; xi++) {
+          if (mask(xi * 0.05, z) < -0.15) run += 0.05;
+          else {
+            if (run > 0) runs.push(run);
+            run = 0;
+          }
+        }
+        if (run > 0) runs.push(run);
+      }
+    }
+    runs.sort((a, b) => a - b);
+    const p = (q: number): number => runs[Math.min(runs.length - 1, Math.floor(runs.length * q))] ?? 0;
+    const narrow = runs.filter((r) => r <= 2.5).length / runs.length;
+    console.log(
+      `[slope] trackMask trench widths (n=${runs.length}): p50 ${p(0.5).toFixed(2)} m, ` +
+        `p90 ${p(0.9).toFixed(2)} m, max ${(runs[runs.length - 1] ?? 0).toFixed(2)} m, ` +
+        `${(100 * narrow).toFixed(1)}% <= 2.5 m`,
+    );
+    expect(runs.length).toBeGreaterThan(1000);
+    expect(p(0.5)).toBeGreaterThanOrEqual(1.2);
+    expect(p(0.5)).toBeLessThanOrEqual(2.4);
+    expect(narrow).toBeGreaterThan(0.7);
+    expect(runs[runs.length - 1] ?? 0).toBeLessThan(10);
+  });
+
+  it('§V3.8 bugfix: trenches cover >=2 adjacent vertex columns on the real terrain grid (no isolated speckle)', () => {
+    // Reproduces the reviewer's production-grid measurement (terrain.ts's
+    // SEG_X=128 over x=+/-56, SEG_Z=256 over z=-30..940) and asserts the
+    // regression it caught cannot recur: before the width fix, 190/480
+    // (~40%) of nonzero in-band vertices had all 4 grid-neighbours exactly
+    // zero — isolated dots, not lines.
+    const SEG_X = 128;
+    const SEG_Z = 256;
+    const x0 = -HALF_W - 28;
+    const x1 = HALF_W + 28;
+    const z0v = -30;
+    const z1v = FINISH_Z + 140;
+    const mask = buildTrackMask(genSlope(42));
+    const nx = SEG_X + 1;
+    const nz = SEG_Z + 1;
+    const grid: number[][] = [];
+    for (let iz = 0; iz < nz; iz++) {
+      const z = z0v + ((z1v - z0v) * iz) / SEG_Z;
+      const row: number[] = [];
+      for (let ix = 0; ix < nx; ix++) {
+        row.push(mask(x0 + ((x1 - x0) * ix) / SEG_X, z));
+      }
+      grid.push(row);
+    }
+    let inBand = 0;
+    let nonzero = 0;
+    let isolated = 0;
+    for (let iz = 0; iz < nz; iz++) {
+      for (let ix = 0; ix < nx; ix++) {
+        const x = x0 + ((x1 - x0) * ix) / SEG_X;
+        if (Math.abs(x) > GROOM_BAND_HALF_M) continue;
+        inBand++;
+        const v = grid[iz]?.[ix] ?? 0;
+        if (v === 0) continue;
+        nonzero++;
+        const neighbours = [
+          ix > 0 ? grid[iz]?.[ix - 1] : 0,
+          ix < nx - 1 ? grid[iz]?.[ix + 1] : 0,
+          iz > 0 ? grid[iz - 1]?.[ix] : 0,
+          iz < nz - 1 ? grid[iz + 1]?.[ix] : 0,
+        ];
+        if (neighbours.every((n) => (n ?? 0) === 0)) isolated++;
+      }
+    }
+    console.log(
+      `[slope] production-grid track vertices: inBand=${inBand} nonzero=${nonzero} isolated=${isolated}`,
+    );
+    expect(nonzero).toBeGreaterThan(0);
+    expect(isolated).toBe(0);
+  });
+
+  it('§V3.8: tracks are S-curves that cover part of the band, not all of it', () => {
+    for (const seed of TRACK_SEEDS) {
+      const mask = buildTrackMask(genSlope(seed));
+      let tracked = 0;
+      let total = 0;
+      let moved = 0;
+      for (let zi = 0; zi <= 200; zi++) {
+        const z = zi * 4;
+        for (let xi = -55; xi <= 55; xi++) {
+          const x = xi * 0.2;
+          const v = mask(x, z);
+          total++;
+          if (v !== 0) tracked++;
+          // An S-curve moves laterally with z; a straight rut would not.
+          if (Math.abs(mask(x, z + 6) - v) > 0.1) moved++;
+        }
+      }
+      const cov = tracked / total;
+      expect(cov, `seed ${seed} coverage`).toBeGreaterThan(0.03); // the piste is skied
+      expect(cov, `seed ${seed} coverage`).toBeLessThan(0.3); // ...not resurfaced
+      expect(moved / total, `seed ${seed} lateral motion`).toBeGreaterThan(0.05);
+    }
+  });
+
+  it('§V3.8: a few tracks run off a kicker lip and resume downhill of it', () => {
+    // Detect it the way a player would see it: strong tracks arriving at the
+    // ramp, nothing on the snow just past the lip.
+    let seedsWithGap = 0;
+    for (const seed of TRACK_SEEDS) {
+      const s = genSlope(seed);
+      const mask = buildTrackMask(s);
+      for (const k of s.kickers) {
+        if (peakNear(mask, k.z - 6, k.x, 6) > 0.4 && peakNear(mask, k.z + 3, k.x, 6) < 0.02) {
+          seedsWithGap++;
+          break;
+        }
+      }
+    }
+    console.log(`[slope] trackMask: ${seedsWithGap}/20 seeds show a kicker-lip gap`);
+    // Measured 12/20. "A few" is per-mountain, not per-seed, so the gate is a
+    // floor well under the measurement, not a fit to it.
+    expect(seedsWithGap).toBeGreaterThanOrEqual(4);
+  });
+
+  it('has no cliffs: the field is piecewise smooth at terrain vertex scale', () => {
+    // A discontinuity here shows up as a hard-edged seam in the vertex colours.
+    // An earlier draft stepped the spoil edge to full height at the trench wall
+    // and jumped 1.54 units across 5 cm; the bump profile removed it.
+    let maxDx = 0;
+    let maxDz = 0;
+    for (const seed of [2, 6, 42]) {
+      const mask = buildTrackMask(genSlope(seed));
+      for (let zi = 0; zi <= 300; zi++) {
+        const z = zi * 2.5;
+        for (let xi = -210; xi <= 210; xi++) {
+          const x = xi * 0.05;
+          const v = mask(x, z);
+          const dx = Math.abs(mask(x + 0.05, z) - v);
+          const dz = Math.abs(mask(x, z + 0.05) - v);
+          if (dx > maxDx) maxDx = dx;
+          if (dz > maxDz) maxDz = dz;
+        }
+      }
+    }
+    console.log(`[slope] trackMask max step over 5 cm: dx ${maxDx.toFixed(3)}, dz ${maxDz.toFixed(3)}`);
+    // Measured 0.94 / 0.58. The residual is two overlapping tracks' walls
+    // adding, not a discontinuity: a single trench wall spans ~0.6 per 5 cm.
+    expect(maxDx).toBeLessThan(1.2);
+    expect(maxDz).toBeLessThan(1.2);
+  });
+
+  it('works on a kicker-free synthetic slope (the gap logic is optional)', () => {
+    const s = syntheticDef([]);
+    expect(s.kickers.length).toBe(0);
+    const mask = buildTrackMask(s);
+    let nonZero = 0;
+    let bad = 0;
+    for (let zi = 0; zi <= 200; zi++) {
+      for (let xi = -100; xi <= 100; xi++) {
+        const v = mask(xi * 0.1, zi * 4);
+        if (!Number.isFinite(v) || v < -1 || v > 1) bad++;
+        if (v !== 0) nonZero++;
+      }
+    }
+    expect(bad).toBe(0);
+    expect(nonZero).toBeGreaterThan(0);
   });
 });

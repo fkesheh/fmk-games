@@ -43,7 +43,10 @@ import {
   SKIER_RADIUS,
   SLOPE_LENGTH,
   SLOPE_WIDTH,
+  TURN_RATE_BASE,
+  TURN_RATE_MIN,
   YAW_MAX,
+  YAW_SPRING,
 } from './config.js';
 import {
   airHeight,
@@ -1073,50 +1076,341 @@ describe('landing safety (the 4-year-old law)', () => {
   });
 });
 
-describe('air steering (damped control)', () => {
-  it('yaw rate in air is J_AIR_STEER_MUL of the grounded rate', () => {
-    const slope = makeFixtureSlope();
-    // grounded reference: full lock for several steps
-    const grounded = makeSim(0, 0, 0);
-    const yaw0 = grounded.yaw;
-    run(grounded, slope, 1, 10);
-    const groundedDelta = grounded.yaw - yaw0;
+// ===========================================================================
+// §12.4 AIR LOCK GATES (CONTRACT_V3 §12.1, rev 2 — FROZEN)
+//
+// THIS BLOCK REPLACES `describe('air steering (damped control)')`, which was
+// DELETED. That block's two assertions were one-sided upper bounds
+// (`< groundedDelta * J_AIR_STEER_MUL + 0.05` and `< groundedScrub + 0.01`)
+// and therefore passed VACUOUSLY once the multipliers went to zero: a green
+// test that tests nothing. Every gate below is an EQUALITY (or a measured
+// no-regression delta), never a one-sided bound that zero satisfies for free.
+//
+// §12.1 frozen semantics, restated so the assertions are readable:
+//   rule 1  (a) player steering        -> J_AIR_STEER_MUL = 0  (zero in air)
+//   rule 2  carve scrub                -> J_AIR_CARVE_MUL = 0  (zero in air)
+//   rule 3  (b) the ±YAW_MAX spring    -> SUSPENDED while airborne
+//   rule 4  (c) the soft-edge yaw term -> REMAINS ACTIVE; the ONLY writer of
+//                                          yaw in flight, and the containment
+//                                          mechanism.
+// §11 and the v2 report call damped air steering "the skill". §12.1
+// DELIBERATELY REVERSES that. Rev 2 wins; do not restore air steering.
+// ===========================================================================
 
-    // airborne: hop then full lock
-    const s = makeSim(0, 0, 0);
-    stepSki(s, 1, SIM_DT, slope, { jump: true });
-    const yawPre = s.yaw;
-    // take a few more air steps (still airborne, full steer)
-    for (let i = 0; i < 9 && s.airborne; i++) {
-      stepSki(s, 1, SIM_DT, slope);
+// HEAD BASELINE for §12.4 gate 5 — MEASURED, not invented.
+// Replaying the gate-5 scenario below against HEAD (5adc564: J_AIR_STEER_MUL
+// 0.35, J_AIR_CARVE_MUL 0.3, the ±YAW_MAX spring live in air) gives a max
+// off-piste excursion of 5.7415 m for BOTH signs. Under the air lock the same
+// scenario measures 4.5930 m (delta -1.1485 m).
+// §12.4 gate 5 is explicitly a NO-REGRESSION DELTA gate with a +0.15 m
+// tolerance — rev 2's `<= 3.5 m` absolute was withdrawn because it measured
+// 5.5-6.1 m and was red by construction. The 3.5 m bound belongs to the
+// MILDER mid-piste hop scenario in "the 4-year-old law v2" below, and is kept.
+const GATE5_HEAD_MAX_OFF_M = 5.7415;
+const GATE5_TOLERANCE_M = 0.15;
+
+/** The gate-5 / gate-2 flight helper: a hop launched from a chosen state,
+ *  driven with a fixed steer, returning a per-step snapshot trace. Snapshots
+ *  are plain copies — this is a test, not a hot path. */
+function flightTrace(
+  launch: Readonly<SkierSim>,
+  slope: SlopeDef,
+  steer: number,
+  maxSteps = 2000,
+): SkierSim[] {
+  const s = makeSim(0, 0, 0);
+  copySim(s, launch);
+  const trace: SkierSim[] = [];
+  let n = 0;
+  while (s.airborne && n < maxSteps) {
+    stepSki(s, steer, SIM_DT, slope);
+    trace.push({ ...s });
+    n++;
+  }
+  return trace;
+}
+
+describe('§12.4 air lock — the player may not steer in flight', () => {
+  // ---- §12.1 rules 1 + 2: the multipliers are ZERO, asserted as equalities --
+  it('rules 1 + 2: J_AIR_STEER_MUL and J_AIR_CARVE_MUL are exactly 0', () => {
+    expect(J_AIR_STEER_MUL).toBe(0);
+    expect(J_AIR_CARVE_MUL).toBe(0);
+  });
+
+  it('rule 2 behaviourally: in flight v is bit-identical under any steer, while grounded carving still scrubs', () => {
+    const slope = makeFixtureSlope();
+    // grounded reference — the scrub must STILL bite on the ground.
+    const straight = makeSim(0, 0, 0);
+    const carving = makeSim(0, 0, 0);
+    run(straight, slope, 0, 30);
+    run(carving, slope, 0, 30);
+    const vBefore = straight.v;
+    expect(carving.v).toBe(vBefore); // identical spin-up
+    stepSki(straight, 0, SIM_DT, slope);
+    stepSki(carving, 1, SIM_DT, slope);
+    expect(carving.v).toBeLessThan(straight.v); // grounded scrub is untouched
+
+    // airborne — the scrub is exactly zero, so v does not depend on steer.
+    const launch = makeSim(0, 0, 0);
+    run(launch, slope, 0, 30);
+    stepSki(launch, 0, SIM_DT, slope, { jump: true });
+    expect(launch.airborne).toBe(true);
+    const airStraight = makeSim(0, 0, 0);
+    const airCarving = makeSim(0, 0, 0);
+    copySim(airStraight, launch);
+    copySim(airCarving, launch);
+    stepSki(airStraight, 0, SIM_DT, slope);
+    stepSki(airCarving, 1, SIM_DT, slope);
+    expect(airCarving.v).toBe(airStraight.v); // EQUALITY, not "less severe"
+  });
+
+  // ---- gate 1: determinism, with airborne segments actually present --------
+  it('gate 1 — identical (steer, dt, jump) streams replay bit-identically at EVERY step, with airborne segments present', () => {
+    const next = rng(4242);
+    const slope = makeFixtureSlope({
+      plants: [plantAt(1.5, 80), plantAt(-1, 180)],
+      gates: [gateAt(0, 140)],
+      kickers: [kickerAt(0.5, 120, 2.5), kickerAt(-0.5, 250, 2.0)],
+    });
+    const inputs = Array.from({ length: 900 }, () => ({
+      steer: next() * 2 - 1,
+      dt: SIM_DT * (0.5 + next() * 0.5),
+      jump: next() > 0.9,
+    }));
+    const a = makeSim(0, 0, 0);
+    const b = makeSim(0, 0, 0);
+    let airSteps = 0;
+    for (const inp of inputs) {
+      const opts = inp.jump ? ({ jump: true } as const) : undefined;
+      if (a.airborne) airSteps++;
+      stepSki(a, inp.steer, inp.dt, slope, opts);
+      stepSki(b, inp.steer, inp.dt, slope, opts);
+      // per-step, not merely at the end: a divergence that cancels is still a fork
+      expect(b.yaw).toBe(a.yaw);
+      expect(b.x).toBe(a.x);
+      expect(b.z).toBe(a.z);
+      expect(b.v).toBe(a.v);
     }
-    const airDelta = s.yaw - yawPre;
-    // With same steer but faster v in air (less scrub), the raw rate is
-    // multiplied by J_AIR_STEER_MUL. The actual deltas may differ from the
-    // multiplication because v changes, but the ratio should be roughly
-    // J_AIR_STEER_MUL or less.
-    expect(Math.abs(airDelta)).toBeLessThan(Math.abs(groundedDelta) * J_AIR_STEER_MUL + 0.05);
+    // the whole point of the gate: the stream really did FLY
+    expect(airSteps).toBeGreaterThan(20);
+    expect(a).toStrictEqual(b);
   });
 
-  it('carve scrub is damped by J_AIR_CARVE_MUL in air', () => {
+  // ---- gate 2: the air lock is TOTAL, at every airborne step ---------------
+  it('gate 2 — from one launch state, steer 0 / +1 / -1 produce bit-identical airborne steps', () => {
     const slope = makeFixtureSlope();
-    // grounded: carve scrub rate
-    const grounded = makeSim(0, 0, 0);
-    run(grounded, slope, 0, 30); // build speed
-    const vBefore = grounded.v;
-    stepSki(grounded, 1, SIM_DT, slope); // one hard carve
-    const groundedScrub = 1 - grounded.v / vBefore;
+    const launch = makeSim(0, 0, 0.35);
+    launch.v = 18;
+    // the LAUNCH step is a grounded step (airborne is captured pre-step), so
+    // the shared launch state is taken AFTER it: from here on it is all flight.
+    stepSki(launch, 0, SIM_DT, slope, { jump: true });
+    expect(launch.airborne).toBe(true);
 
-    // airborne: hop then carve
-    const s = makeSim(0, 0, 0);
-    run(s, slope, 0, 30);
-    const vBeforeAir = s.v;
-    stepSki(s, 1, SIM_DT, slope, { jump: true });
-    // the launch step: carve scrub is damped AND steering is damped
-    const airScrub = 1 - s.v / vBeforeAir;
-    // Air scrub should be less severe than grounded scrub
-    expect(airScrub).toBeLessThan(groundedScrub + 0.01);
+    const zero = flightTrace(launch, slope, 0);
+    const right = flightTrace(launch, slope, 1);
+    const left = flightTrace(launch, slope, -1);
+
+    expect(zero.length).toBeGreaterThan(4); // a real arc, not one step
+    expect(zero[zero.length - 1]?.airborne).toBe(false); // it landed
+    // position, yaw AND velocity identical at EVERY airborne step — not just
+    // at landing (rev 1's landing-only form was satisfied by the config edit
+    // alone and never tested the sim change).
+    expect(right).toStrictEqual(zero);
+    expect(left).toStrictEqual(zero);
   });
+
+  // ---- gate 3: THE GATE THAT TESTS A2 -------------------------------------
+  // A2's only change is suspending the ±YAW_MAX spring, and that spring ONLY
+  // FIRES BEYOND YAW_MAX — below it A2 is a no-op and every other gate passes
+  // whether or not A2 was done at all. So this gate MUST launch with
+  // |yaw| > YAW_MAX.
+  //
+  // FALSIFIED against three builds by replaying THIS EXACT body (max |yaw
+  // drift| over the flight, both directions):
+  //   HEAD 5adc564 (no A1, no A2)              -> 0.0456 rad   RED
+  //   A1 only (multipliers 0, spring still on) -> 0.1087 rad   RED
+  //   A1 + A2 (working tree)                   -> 0.0000 rad   GREEN
+  // The middle row is the one that matters: gates 1, 2, 4, 5 and 6 ALL PASS on
+  // the A1-only build, so gate 3 is the ONLY gate in §12.4 that can detect a
+  // missing A2. That is precisely how rev 1 and rev 2 both shipped A2 ungated.
+  //
+  // Not a corner case: sim.ts:44-50 records the full-lock yaw equilibrium at
+  // ~1.574 rad, so every real full-lock launch is the |yaw| > YAW_MAX case.
+  it.each([1, -1])(
+    'gate 3 — heading is FROZEN: launched at |yaw| > YAW_MAX and clear of EDGE_ZONE, yaw at landing === yaw at launch (dir %i)',
+    (dir) => {
+      const slope = makeFixtureSlope();
+      const edgeStart = slope.width / 2 - EDGE_ZONE;
+      const s = makeSim(0, 0, dir * 1.45);
+      s.v = 12;
+      stepSki(s, dir, SIM_DT, slope, { jump: true });
+      expect(s.airborne).toBe(true);
+      const yawAtLaunch = s.yaw;
+      // the gate has teeth only if the spring would have fired
+      expect(Math.abs(yawAtLaunch)).toBeGreaterThan(YAW_MAX);
+
+      let airSteps = 0;
+      while (s.airborne && airSteps < 2000) {
+        stepSki(s, dir, SIM_DT, slope);
+        airSteps++;
+        // "heading is frozen" is only defined for a flight that never enters
+        // the edge zone (§12.1) — prove this flight never does.
+        expect(Math.abs(s.x)).toBeLessThan(edgeStart);
+        // bit-identical at EVERY airborne step, not merely at landing
+        expect(s.yaw).toBe(yawAtLaunch);
+      }
+      expect(s.airborne).toBe(false); // it landed
+      expect(airSteps).toBeGreaterThan(4);
+      expect(s.yaw).toBe(yawAtLaunch);
+    },
+  );
+
+  // ---- gate 4: control returns on the first grounded step ------------------
+  it('gate 4 — the first grounded step after landing steers by the FULL grounded rate', () => {
+    const slope = makeFixtureSlope();
+    const s = makeSim(0, 0, 0.2);
+    s.v = 16;
+    stepSki(s, 0, SIM_DT, slope, { jump: true });
+    let guard = 0;
+    while (s.airborne && guard < 2000) {
+      stepSki(s, 0, SIM_DT, slope);
+      guard++;
+    }
+    expect(s.airborne).toBe(false);
+    // construct the comparison so ONLY the steering term can move yaw:
+    // below YAW_MAX (no spring) and clear of the edge zone (no edge term).
+    expect(Math.abs(s.yaw)).toBeLessThan(YAW_MAX);
+    expect(Math.abs(s.x)).toBeLessThan(slope.width / 2 - EDGE_ZONE);
+    const yawLanded = s.yaw;
+    const vLanded = s.v;
+
+    const steered = makeSim(0, 0, 0);
+    const straight = makeSim(0, 0, 0);
+    copySim(steered, s);
+    copySim(straight, s);
+    stepSki(steered, 1, SIM_DT, slope);
+    stepSki(straight, 0, SIM_DT, slope);
+
+    expect(straight.yaw).toBe(yawLanded); // steer 0 grounded: yaw untouched
+    // the grounded rate is turnRateAt(v AFTER this step's gravity+drag) — the
+    // sim applies the clock and the accel before the steering term.
+    const vAfterAccel = vLanded + (G_ACCEL * GRADE_BASE - DRAG * vLanded * vLanded) * SIM_DT;
+    const t = Math.min(Math.max(vAfterAccel / MAX_SPEED, 0), 1);
+    const groundedRate = TURN_RATE_BASE + (TURN_RATE_MIN - TURN_RATE_BASE) * t;
+    expect(steered.yaw - yawLanded).toBeCloseTo(groundedRate * SIM_DT, 12);
+    // ...and it is a REAL turn, not an epsilon that a zeroed multiplier fakes
+    expect(steered.yaw - yawLanded).toBeGreaterThan(0.03);
+  });
+
+  // ---- gate 5: edge-zone flight — DELTA vs HEAD, not an absolute -----------
+  it.each([1, -1])(
+    'gate 5 — edge-zone flight (sign %i): yaw moves ONLY by the soft-edge term, and containment does not regress vs HEAD',
+    (sign) => {
+      const slope = makeFixtureSlope();
+      const edgeStart = slope.width / 2 - EDGE_ZONE;
+      const halfW = slope.width / 2;
+      const mkLaunch = (): SkierSim => {
+        const s = makeSim(sign * (edgeStart + 2), 0, sign * 0.9);
+        s.v = 20;
+        stepSki(s, sign, SIM_DT, slope, { jump: true });
+        return s;
+      };
+
+      // (i) the player contributes NOTHING even inside the edge zone: the
+      //     three steer holds give the same flight, bit for bit.
+      const launch = mkLaunch();
+      expect(launch.airborne).toBe(true);
+      const zero = flightTrace(launch, slope, 0);
+      const into = flightTrace(launch, slope, sign);
+      const away = flightTrace(launch, slope, -sign);
+      expect(zero.length).toBeGreaterThan(4);
+      expect(into).toStrictEqual(zero);
+      expect(away).toStrictEqual(zero);
+
+      // (ii) yaw is written in flight ONLY when the soft-edge term fires, and
+      //      it is always driven toward the fall line (a sign flip is the
+      //      deep-edge overshoot through zero, not an outward push).
+      let prev = launch;
+      let inEdgeSteps = 0;
+      for (const step of zero) {
+        if (Math.abs(step.x) > edgeStart) {
+          inEdgeSteps++;
+          const turnedIn =
+            step.yaw * prev.yaw < 0 || Math.abs(step.yaw) <= Math.abs(prev.yaw);
+          expect(turnedIn).toBe(true);
+        } else {
+          expect(step.yaw).toBe(prev.yaw); // outside the zone: no writer at all
+        }
+        prev = step;
+      }
+      // the scenario must actually ENGAGE the containment term, or (ii) is
+      // vacuous — this launch starts at x = ±24 with the zone opening at ±22.
+      expect(inEdgeSteps).toBe(zero.length);
+      // §12.1 rule 4: (c) REMAINS ACTIVE in flight. Air lock freezes the
+      // PLAYER out, it does not freeze the safety system — so this flight's
+      // yaw must have moved a lot, all of it from the soft edge.
+      const yawSwing = Math.abs(prev.yaw - launch.yaw);
+      expect(yawSwing).toBeGreaterThan(0.5);
+
+      // (iii) the DELTA gate: max excursion beyond the piste edge over a fixed
+      //       10 s of sim from launch, holding the stick INTO the edge.
+      const s = mkLaunch();
+      let maxOff = Math.abs(s.x) - halfW;
+      const steps = Math.round(10 / SIM_DT);
+      for (let i = 0; i < steps && !s.finished; i++) {
+        stepSki(s, sign, SIM_DT, slope);
+        const off = Math.abs(s.x) - halfW;
+        if (off > maxOff) maxOff = off;
+      }
+      console.log(
+        `[sim] §12.4 gate 5 sign=${sign}: max off-piste ${maxOff.toFixed(4)} m ` +
+          `(HEAD ${GATE5_HEAD_MAX_OFF_M} m, delta ${(maxOff - GATE5_HEAD_MAX_OFF_M).toFixed(4)} m)`,
+      );
+      expect(maxOff).toBeLessThanOrEqual(GATE5_HEAD_MAX_OFF_M + GATE5_TOLERANCE_M);
+      expect(s.airborne).toBe(false); // and it came down
+    },
+  );
+
+  // ---- gate 6: grounded is untouched --------------------------------------
+  it('gate 6 — the ±YAW_MAX spring still fires on the first GROUNDED step, at full strength', () => {
+    const slope = makeFixtureSlope();
+    const yaw0 = 1.5; // past YAW_MAX = 1.35
+    const s = makeSim(0, 0, yaw0);
+    s.v = 15;
+    expect(s.airborne).toBe(false);
+    stepSki(s, 0, SIM_DT, slope); // steer 0: the spring is the only yaw writer
+    // exact, not "roughly": measured bit-identical on HEAD and after A2
+    const expected = yaw0 - Math.sign(yaw0) * YAW_SPRING * (yaw0 - YAW_MAX) * SIM_DT;
+    expect(s.yaw).toBe(expected);
+    expect(s.yaw).toBeLessThan(yaw0); // and it really pulled toward the fall line
+  });
+
+  it.each([1, -1])(
+    'gate 6 — the full-lock GROUNDED yaw equilibrium is unchanged from HEAD (lock %i)',
+    (lock) => {
+      const slope = makeFixtureSlope();
+      const s = makeSim(0, 0, 0);
+      let maxAbsYaw = 0;
+      let yawAt3s = 0;
+      let yawAt10s = 0;
+      const n = Math.round(30 / SIM_DT);
+      for (let i = 0; i < n; i++) {
+        stepSki(s, lock, SIM_DT, slope);
+        maxAbsYaw = Math.max(maxAbsYaw, Math.abs(s.yaw));
+        if (i === Math.round(3 / SIM_DT) - 1) yawAt3s = s.yaw;
+        if (i === Math.round(10 / SIM_DT) - 1) yawAt10s = s.yaw;
+      }
+      // HEAD (5adc564) measurements, replayed against HEAD's own sim.ts +
+      // config.ts. A2 suspends the spring in AIR only; this run never leaves
+      // the ground, so every number below must be reproduced exactly.
+      expect(maxAbsYaw).toBeCloseTo(1.573617802609, 9);
+      expect(yawAt3s).toBeCloseTo(lock * 1.565591752844, 9);
+      expect(yawAt10s).toBeCloseTo(lock * 0.050568886512, 9);
+      // the spring is what bounds it — without it a full-lock skier donuts
+      expect(maxAbsYaw).toBeGreaterThan(YAW_MAX);
+      expect(maxAbsYaw).toBeLessThan(YAW_MAX + 0.25);
+    },
+  );
 });
 
 describe('resolveSkiPair — airborne skip', () => {
@@ -1257,4 +1551,78 @@ describe('the 4-year-old law v2 (genSlope + jumps)', () => {
     expect(maxOff).toBeLessThanOrEqual(3.5);
     expect(allLanded).toBe(true);
   }, 30_000);
+});
+
+// ===========================================================================
+// Relocated from slope.test.ts per CONTRACT_V3 §12.2's pre-fan-out repair
+// list: these are physics tests (they exercise stepSki's air-lock behaviour
+// across genSlope-generated slopes), and were sitting in W1's visual file.
+// The orchestrator moved both here, before fan-out, so an air-lock regression
+// cannot land in a visual implementer's gate. Bodies are verbatim from
+// slope.test.ts — dynamic import of sim.js is kept as-is (rather than
+// switched to the static makeSim/stepSki already imported above) so the
+// assertions stay byte-identical in transit.
+// ===========================================================================
+interface SlopeSimModule {
+  makeSim(x: number, z: number, yaw: number): SkierSim;
+  stepSki(s: SkierSim, steer: number, dt: number, slope: SlopeDef): void;
+}
+const SIM_SPECIFIER: string = './sim.js'; // widened on purpose — see slope.test.ts's prior history
+const SEEDS = Array.from({ length: 20 }, (_, i) => i + 1);
+
+describe('kicker placement (v2) — corridor-following integration', () => {
+  // Wave-2 integration: a skier steering toward successive kickers crosses
+  // every one (lastKickerIx advances through all of them).
+  it('a corridor-following skier crosses every kicker', async (ctx) => {
+    let sim: SlopeSimModule;
+    try {
+      sim = (await import(/* @vite-ignore */ SIM_SPECIFIER)) as SlopeSimModule;
+    } catch {
+      ctx.skip();
+      return;
+    }
+    for (const seed of SEEDS) {
+      const slope = genSlope(seed);
+      const skier = sim.makeSim(0, 0, 0);
+      let nextIx = 0;
+      for (let step = 0; step < 6000 && !skier.finished; step++) {
+        // Steer toward the next unconsumed kicker to stay on the centreline.
+        let steer = 0;
+        if (nextIx < slope.kickers.length) {
+          const t = slope.kickers[nextIx]!;
+          const dx = t.x - skier.x;
+          steer = Math.max(-1, Math.min(1, dx * 1.5));
+        }
+        sim.stepSki(skier, steer, SIM_DT, slope);
+        while (nextIx < slope.kickers.length && skier.lastKickerIx >= nextIx) {
+          nextIx = skier.lastKickerIx + 1;
+        }
+      }
+      expect(skier.lastKickerIx, `seed ${seed}`).toBe(slope.kickers.length - 1);
+      expect(skier.finished, `seed ${seed}`).toBe(true);
+    }
+  });
+});
+
+describe('stepSki full-lock integration (wave 2)', () => {
+  it('full-lock both directions reaches the finish on 20 seeds', async (ctx) => {
+    let sim: SlopeSimModule;
+    try {
+      sim = (await import(/* @vite-ignore */ SIM_SPECIFIER)) as SlopeSimModule;
+    } catch {
+      ctx.skip(); // P1's sim.ts has not landed yet; nothing to integrate.
+      return;
+    }
+    for (const seed of SEEDS) {
+      const slope = genSlope(seed);
+      for (const steer of [-1, 1]) {
+        const skier = sim.makeSim(0, 0, 0);
+        // 6000 steps * SIM_DT = 200 s sim time >> RACE_HARD_CAP_MS territory.
+        for (let step = 0; step < 6000 && !skier.finished; step++) {
+          sim.stepSki(skier, steer, SIM_DT, slope);
+        }
+        expect(skier.finished, `seed ${seed} steer ${steer}`).toBe(true);
+      }
+    }
+  });
 });

@@ -517,6 +517,36 @@ async function pressStart(page, label, timeoutMs = 20000) {
 }
 
 /** Ride the phase machine from a START to 'racing', noting whether 'countdown' was seen. */
+/**
+ * Record every phase TRANSITION in-page, on rAF, from the moment the client
+ * loads. The countdown is only ~3 s and is snapshot-carried (no wire event),
+ * so a CDP poll loop can miss it outright: if the observer's first round trip
+ * lands after 'racing' it never sees 'countdown' at all, and assertion 5 goes
+ * red while the transition it asserts was in fact perfectly correct (observed
+ * twice under machine load — phases read [racing] alone). An in-page recorder
+ * samples at frame rate with zero round-trip latency and keeps the full
+ * ordered history, so the evidence for assertion 5 no longer depends on how
+ * busy the host happens to be. Each page is its own browser here (launchOne),
+ * so it is always the foreground tab and rAF is never background-throttled.
+ */
+const installPhaseRecorder = (page) =>
+  page.evaluate(() => {
+    if (Array.isArray(window.__splatPhaseLog)) return; // already installed
+    window.__splatPhaseLog = [];
+    const tick = () => {
+      let ph = null;
+      try {
+        ph = window.__splat?.state()?.phase ?? null;
+      } catch {
+        ph = null;
+      }
+      const log = window.__splatPhaseLog;
+      if (typeof ph === 'string' && log[log.length - 1] !== ph) log.push(ph);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  });
+
 async function awaitRacing(page, label, timeoutMs = 30000) {
   const seen = new Set();
   const t0 = Date.now();
@@ -524,7 +554,21 @@ async function awaitRacing(page, label, timeoutMs = 30000) {
     const s = await splatState(page).catch(() => null);
     if (s !== null && typeof s.phase === 'string') {
       seen.add(s.phase);
-      if (s.phase === 'racing') return { sawCountdown: seen.has('countdown'), seen: [...seen] };
+      if (s.phase === 'racing') {
+        // Prefer the in-page transition log over what this poll loop happened
+        // to catch. Slice from the LAST 'lobby' so a rematch reports its own
+        // room's phases rather than inheriting the previous race's history.
+        const log = await page
+          .evaluate(() => (Array.isArray(window.__splatPhaseLog) ? window.__splatPhaseLog.slice() : []))
+          .catch(() => []);
+        const lobbyIx = log.lastIndexOf('lobby');
+        const tail = lobbyIx >= 0 ? log.slice(lobbyIx) : log;
+        const seenList = tail.length > 0 ? tail : [...seen];
+        return {
+          sawCountdown: seenList.includes('countdown') || seen.has('countdown'),
+          seen: seenList,
+        };
+      }
     }
     if (Date.now() - t0 > timeoutMs) throw new Error(`timeout waiting for ${label}: phase 'racing' (saw [${[...seen].join(', ')}])`);
     await sleep(120);
@@ -558,9 +602,11 @@ async function main() {
   // -- load the splat client on both pages ---------------------------------------------
   await A.goto(GAME_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await waitFor(() => A.evaluate(() => !!window.__splat), 15000, '__splat on A');
+  await installPhaseRecorder(A); // from load, so the 3s countdown cannot be missed
   check('1. splat client loads at /splat/ (window.__splat present)', true);
   await B.goto(GAME_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await waitFor(() => B.evaluate(() => !!window.__splat), 15000, '__splat on B');
+  await installPhaseRecorder(B);
 
   const surfaceMissing = await A.evaluate((names) => {
     const k = window.__splat;
@@ -583,6 +629,7 @@ async function main() {
   await C.emulate(KnownDevices['iPad landscape']);
   await C.goto(GAME_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await waitFor(() => C.evaluate(() => !!window.__splat), 15000, '__splat on C (iPad)');
+  await installPhaseRecorder(C);
   await setMenuInputs(C, 'Cici', null);
 
   // -- ROOM 1: private room with the fixed seed 42 -------------------------------------
@@ -676,7 +723,9 @@ async function main() {
       : 'timed out',
   );
 
-  // -- draw calls (CONTRACT §8: < 80 during racing) --------------------------------------
+  // -- draw calls (V3 §12.3e / §12.4 gate 8: < 100 during racing, raised from the
+  // v2 baseline of < 80 against a measured 76 — the same pinned number appears
+  // in §12.5 gate 2 so A4 and W2-W5 cannot diverge) -------------------------------------
   let maxDrawCalls = 0;
   for (let i = 0; i < 5; i++) {
     const t = await splatTelemetry(A);
@@ -684,8 +733,8 @@ async function main() {
     await sleep(400);
   }
   check(
-    '7. draw calls < 80 during racing (telemetry().drawCalls)',
-    maxDrawCalls > 0 && maxDrawCalls < 80,
+    '7. draw calls < 100 during racing (telemetry().drawCalls) — V3 §12.3e budget',
+    maxDrawCalls > 0 && maxDrawCalls < 100,
     `max sampled drawCalls=${maxDrawCalls}`,
   );
 
@@ -797,6 +846,113 @@ async function main() {
     remoteSawAir === true,
     remoteSawAir ? 'B saw A airborne' : 'B never sampled A airborne',
   );
+
+  // -- AIR LOCK (V3 §12.1): heading is frozen in flight — wire-level proof ------------
+  // setJump() launches A airborne; while airborne we actively alternate the
+  // real setInput() latch (+1/-1) every sample — the exact channel a player
+  // steers with — and prove the SHIPPED client+server sim ignores it: every
+  // sampled yaw while airborne is bit-identical, and yaw at landing === yaw
+  // at launch. A is settled near the fall line here (steer just re-latched
+  // to 0, and A has held ~0 since the slalom-gate window before hop 1), so x
+  // stays well inside the piste and the EDGE_ZONE safety curve (§12.1 term
+  // (c), which legitimately still touches yaw) cannot be the reason a flat
+  // yaw trace passes — see §12.1: "do not test for absolute yaw constancy on
+  // an edge-zone flight." This is the e2e counterpart to sim.test.ts's
+  // air-lock gates: it proves J_AIR_STEER_MUL / J_AIR_CARVE_MUL = 0 actually
+  // reaches the built client+server, not only the unit-tested sim module.
+  // Hop 1 just landed, so J_COOLDOWN_MS (1800 sim-ms since that launch, per
+  // sim.ts) may still be denying a fresh setJump() — SwiftShader's dt
+  // clamping (see the SWIFTSHADER NOTE above) makes the sim-ms/wall-ms ratio
+  // unpredictable, so instead of a blind sleep we RETRY setJump() every poll
+  // until it actually launches (a press while denied is a harmless no-op —
+  // it just plays the client's local "denied thud", nothing goes on the
+  // wire's jump edge).
+  await A.evaluate(() => window.__splat.setInput(0));
+  // Sample the flight INSIDE the page on requestAnimationFrame rather than by
+  // polling over CDP. A manual hop is ~0.73 s of AIRTIME (measured against the
+  // shared sim: J_HOP_VY = 1.1 m/s launched into terrain that keeps falling
+  // away), but one iteration of a CDP poll loop costs two round trips plus a
+  // sleep, and under SwiftShader the sim-ms/wall-ms ratio is unpredictable —
+  // the polled version observed as little as ONE airborne sample, which makes
+  // yawSpread trivially 0.0 and therefore proves nothing at all. The rAF
+  // sampler reads state() and RE-LATCHES the real ±1 setInput() on every
+  // frame the page actually renders, so the steer latch is genuinely fighting
+  // the sim for the whole flight. The gate below is unchanged: >= 2 airborne
+  // samples AND a bit-identical yaw across every one of them.
+  const airLock = await A.evaluate(
+    () =>
+      new Promise((resolve) => {
+        const yaws = [];
+        let xAtLaunch = null;
+        let yawLand = null;
+        let launched = false;
+        let toggle = 1;
+        let lastJumpTry = 0;
+        const t0 = Date.now();
+        const tick = () => {
+          if (Date.now() - t0 > 20000) {
+            resolve({ yaws, xAtLaunch, yawLand, frames: yaws.length, timedOut: true });
+            return;
+          }
+          let sim = null;
+          try {
+            sim = window.__splat?.state()?.sim ?? null;
+          } catch {
+            sim = null;
+          }
+          if (sim !== null && typeof sim.yaw === 'number') {
+            if (sim.airborne === true) {
+              launched = true;
+              yaws.push(sim.yaw);
+              if (xAtLaunch === null) xAtLaunch = sim.x;
+              toggle = -toggle; // actively try to steer EVERY frame — the sim must ignore it
+              window.__splat.setInput(toggle);
+            } else if (launched) {
+              yawLand = sim.yaw; // first grounded frame after the flight
+              resolve({ yaws, xAtLaunch, yawLand, frames: yaws.length, timedOut: false });
+              return;
+            } else if (Date.now() - lastJumpTry > 200) {
+              lastJumpTry = Date.now();
+              window.__splat.setJump(); // retry until J_COOLDOWN_MS clears
+            }
+          }
+          requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+      }),
+  );
+  await A.evaluate(() => window.__splat.setInput(0));
+  const airLockYaws = Array.isArray(airLock?.yaws) ? airLock.yaws : [];
+  const airLockXAtLaunch = airLock?.xAtLaunch ?? null;
+  const airLockYawLand = airLock?.yawLand ?? null;
+  const airLockSpread = airLockYaws.length > 0 ? Math.max(...airLockYaws) - Math.min(...airLockYaws) : null;
+  const airLockLandDelta =
+    airLockYawLand !== null && airLockYaws.length > 0 ? Math.abs(airLockYawLand - airLockYaws[0]) : null;
+  // airLockLandDelta is reported for diagnostics only and is NOT gated: it is
+  // read from the first GROUNDED poll sample after the flight, but the ±1
+  // steer latch set on the LAST airborne sample (line ~841) is only cleared
+  // AFTER this loop breaks. Between that latch and this "landing" sample,
+  // real grounded full-lock steering (sim.ts:264, un-gated once airborne
+  // flips false) runs for at least one uncontrolled poll interval (~30ms +
+  // IPC round trip) — a polled sample can never be tick-exact at the landing
+  // instant, so gating on landDelta < 1e-9 is red by construction regardless
+  // of whether the air lock holds. The air lock itself is already fully
+  // proven by yawSpread: every sampled yaw WHILE airborne is bit-identical
+  // despite actively alternating the real ±1 setInput() latch every sample —
+  // exactly J_AIR_STEER_MUL=0 / J_AIR_CARVE_MUL=0's contract (config.ts:90,92).
+  const airLockHeld =
+    airLockYaws.length >= 2 &&
+    airLockYawLand !== null &&
+    airLockSpread !== null &&
+    airLockSpread < 1e-9;
+  check(
+    '9c. air lock (V3 §12.1): alternating setInput(±1) on the real latch while airborne does not move yaw in flight (landDelta reported below, not gated — see comment)',
+    airLockHeld,
+    airLockYaws.length > 0
+      ? `airborne rAF samples=${airLockYaws.length} yawSpread=${airLockSpread?.toExponential(2)} landDelta=${airLockLandDelta?.toExponential(2)} (diagnostic only) launchX=${airLockXAtLaunch?.toFixed(1)} timedOut=${airLock?.timedOut}`
+      : `airborne segment never observed (timedOut=${airLock?.timedOut})`,
+  );
+
   // Hop 2 — the SHOT hop: a fresh hop purely for splat-jump-air (mid-arc) and
   // splat-landing (touchdown, the land burst). Blocking shots are fine here.
   await A.evaluate(() => window.__splat.setJump());
@@ -901,7 +1057,56 @@ async function main() {
   };
   const legRight = await steerLeg(-1, 0.3); // screen RIGHT: x must DECREASE
   const legLeft = await steerLeg(1, 0.3); // screen LEFT: x must INCREASE
-  await A.evaluate(() => window.__splat.setInput(0)); // back to the fall line
+  // "Back to the fall line" is NOT setInput(0). The frozen sim has NO yaw
+  // return inside the soft clamp, so simply dropping the latch leaves the +1
+  // leg's heading standing at the clamp equilibrium (~1.35 rad; 1.57 measured
+  // above). A skier held at that heading traverses straight across the piste
+  // and rides the EDGE_ZONE curve to the finish at x ~ +27 — OUTSIDE seed 42's
+  // entire plant field (every plant has |x| <= 26.8). Assertion 10 below would
+  // then be measuring an edge traverse while claiming to measure "the straight
+  // seed-42 run", and would read hits=0 no matter how many trees the course
+  // has. Counter-lock on rAF until yaw is genuinely back on the fall line.
+  const fallLine = await A.evaluate(
+    () =>
+      new Promise((resolve) => {
+        const t0 = Date.now();
+        let sign0 = 0;
+        const tick = () => {
+          let sim = null;
+          try {
+            sim = window.__splat?.state()?.sim ?? null;
+          } catch {
+            sim = null;
+          }
+          const timedOut = Date.now() - t0 > 8000;
+          if (sim === null || typeof sim.yaw !== 'number') {
+            if (timedOut) {
+              resolve({ yaw: null, x: null, z: null, timedOut: true });
+              return;
+            }
+            requestAnimationFrame(tick);
+            return;
+          }
+          if (sign0 === 0) sign0 = sim.yaw >= 0 ? 1 : -1;
+          // Release at the ZERO CROSSING, not on a tight deadband. state().yaw
+          // trails the sim by up to a snapshot period, and at full lock yaw
+          // moves about as far per snapshot as a tight band is wide — a
+          // bang-bang controller chasing |yaw| <= 0.03 just chatters around 0
+          // and never settles (observed: still swinging at 20 s, having
+          // overshot to -0.44). One crossing is unambiguous under lag and
+          // costs ~4 s of race clock instead of blowing the 150 s hard cap.
+          if (sim.yaw * sign0 <= 0.05 || timedOut) {
+            window.__splat.setInput(0);
+            resolve({ yaw: sim.yaw, x: sim.x, z: sim.z, timedOut });
+            return;
+          }
+          window.__splat.setInput(-sign0); // counter-lock back toward the fall line
+          requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+      }),
+  );
+  await A.evaluate(() => window.__splat.setInput(0)); // hold the fall line for the run
   const steerRightOk = legRight.committed === true && legRight.dx !== null && legRight.dx < -1;
   const steerLeftOk = legLeft.committed === true && legLeft.dx !== null && legLeft.dx > 1;
   check(
@@ -921,8 +1126,16 @@ async function main() {
   // +1s later an 18 m/s skier has left the plant far behind the first-person
   // camera), the finish-gate area shot late in the run, and a wall-timestamped
   // trail of B's z for the hard-cap-with-progress verdict.
+  // Seed the edge detector from A's CURRENT lastPlantIx, not from -1.
+  // sim.lastPlantIx is sticky: it holds the index of the last plant hit at ANY
+  // earlier point in the race (the drive leg, the hops, the kicker ride).
+  // Seeding at -1 makes the very first poll below see a "change" and score a
+  // hit that happened before this run began — assertion 10 could then go green
+  // on a stale contact while the straight run itself hit nothing. Only
+  // genuinely NEW contacts during this run may count.
+  const runEntry = ownSim(await splatState(A));
   let plantHits = 0;
-  let lastPlantIx = -1;
+  let lastPlantIx = typeof runEntry?.lastPlantIx === 'number' ? runEntry.lastPlantIx : -1;
   let vAtFirstHit = null;
   let plantShotDone = false;
   let gateShotDone = false;
@@ -974,7 +1187,10 @@ async function main() {
   check(
     '10. plant contact: the straight seed-42 run hits plants (state().sim.lastPlantIx >= 0)',
     plantHits > 0,
-    `hits=${plantHits} firstHitV=${vAtFirstHit !== null ? vAtFirstHit.toFixed(1) : '?'} m/s (clean-run maxV=${maxV.toFixed(1)})`,
+    `hits=${plantHits} firstHitV=${vAtFirstHit !== null ? vAtFirstHit.toFixed(1) : '?'} m/s ` +
+      `(clean-run maxV=${maxV.toFixed(1)}); run entered at ` +
+      `z=${runEntry?.z?.toFixed(0) ?? '?'} x=${runEntry?.x?.toFixed(1) ?? '?'} yaw=${runEntry?.yaw?.toFixed(3) ?? '?'} ` +
+      `(fall-line return: yaw=${fallLine?.yaw?.toFixed(3) ?? '?'} timedOut=${fallLine?.timedOut ?? '?'})`,
   );
   const aStateAfter = await splatState(A);
   check(
@@ -1051,6 +1267,23 @@ async function main() {
     resultsAt !== null && fourYoOk,
     fourYoDetail,
   );
+  // V3 §12.4 gate 8's E2E line reads verbatim: "setJump() -> airborne -> land;
+  // a full-lock run with kickers finishes; snapshot <= 2 KB at 8 players; draw
+  // calls < 100" (CONTRACT_V3.md §12.4.8). That is fully covered without a
+  // separate check: checks 9/9a prove setJump()->airborne->land on the wire
+  // (+ remote view), and check 12 above IS "a full-lock run with kickers
+  // finishes" — B runs the same raised-amplitude seed-42 terrain (kickers
+  // included) under genuine, permanent full-lock steering and finishes or
+  // makes hard-cap progress. There previously was a 12a here additionally
+  // requiring B ITSELF to go airborne off a kicker mid-run; that is not in
+  // the gate 8 text and is geometrically impossible for a full-lock skier —
+  // full-lock yaw sits at its ~1.57 rad equilibrium (sim.ts:44-50) and the
+  // skier leaves the corridor centreline within the first second, so it never
+  // re-enters a kicker's |x - k.x| <= KICKER_HALF_WIDTH (1.6 m) capture
+  // window. containment.test.ts's full-lock sweep measures this directly: 0
+  // launches across 20 seeds x 2 directions. That check was red by
+  // construction and has been removed; kicker liftoff itself is proven above
+  // by the corridor-following driver in check 9b (kickerRidden / kickerLaunchVy).
 
   // -- results screen: both pages, the panel shows BOTH players ---------------------------
   const resultsDomOk =
