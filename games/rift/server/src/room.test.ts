@@ -33,6 +33,7 @@ import {
   TICK_RATE,
 } from '@rift/shared';
 import type { EntSnap, ItemId, RiftEvent, RiftS2C, RosterEntry } from '@rift/shared';
+import { rng } from '@platform/shared';
 import type { PlayerId, RoomIO, Visibility } from '@platform/shared';
 import type { RoomDeps } from './ports.js';
 import { RiftRoom } from './room.js';
@@ -1429,6 +1430,44 @@ function p1Ent(room: RiftRoom, io: FakeIO): Ent {
 function occupiedSlots(ent: Ent): number {
   return ent.items.filter((it) => it !== null && it !== undefined).length;
 }
+
+describe('snapshot memory: the per-channel EntSnap pool is swept', () => {
+  it('pool never outgrows the live entity set over a long match', () => {
+    const io = new FakeIO();
+    const room = new RiftRoom('public', io, { teamSize: 4 }, { rand: rng(0xbed1) });
+    try {
+      room.start();
+      room.addPlayer('p1', 'Ada');
+      room.start();
+      room.handleMessage('p1', { t: 'rift_start' });
+      vi.advanceTimersToNextTimer();
+      const r = room as unknown as {
+        world: { all(): Iterable<{ id: number }> } | null;
+        channels: Map<string, { entPool: Map<number, unknown> }>;
+      };
+      let worstRatio = 0;
+      for (let t = 0; t < 8000 && room.info().phase === 'live'; t++) {
+        room.tickOnce();
+        if (t % 1000 !== 0) continue;
+        let live = 0;
+        for (const _e of r.world?.all() ?? []) live += 1;
+        const pool = [...r.channels.values()][0]?.entPool.size ?? 0;
+        if (live > 0) worstRatio = Math.max(worstRatio, pool / live);
+      }
+      // fillEnts memoises one EntSnap per entity id per channel and rift mints a
+      // fresh id for every creep of every wave, so without a sweep this grows
+      // without bound: measured 781 pooled against 94 live (8.3x) by tick 20000,
+      // retained for the whole match, per connected client. The sweep keeps it
+      // proportional to what is actually alive.
+      expect(
+        worstRatio,
+        `entPool grew to ${worstRatio.toFixed(1)}x the live entity count — the sweep is not running`,
+      ).toBeLessThan(2);
+    } finally {
+      room.stop();
+    }
+  });
+});
 
 describe('economy: rift_sell', () => {
   it('sells an occupied slot at the fountain: gold rises by exactly sellValue(id), slot clears', () => {
