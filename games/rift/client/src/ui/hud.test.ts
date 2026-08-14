@@ -669,6 +669,55 @@ describe('day/night vision readout (defect 14 — the ramp, not the flat multipl
   });
 });
 
+describe('the ult slot lights up once it is learned', () => {
+  const slotAt = (root: El, i: number): El =>
+    findAll(root, (e) => e.className.split(/\s+/).includes('ability-slot'))[i]!;
+  const cdAt = (root: El, i: number): El => findAll(root, (e) => e.className === 'ability-cd')[i]!;
+  const cls = (e: El): string[] => e.className.split(/\s+/);
+  const ult = (rank: number, level: number): Parameters<ReturnType<typeof createHud>['render']>[0] =>
+    state({
+      youSnap: you({
+        level,
+        abilities: [
+          { rank: 1, cdUntilTick: 0 },
+          { rank: 1, cdUntilTick: 0 },
+          { rank: 1, cdUntilTick: 0 },
+          { rank, cdUntilTick: 0 },
+        ],
+      }),
+    });
+
+  it('is ready at rank 1 below LV 10 — ULT_LEVEL_REQ is the level-up table, not a cast gate', () => {
+    // The server casts on `rank >= 1` alone. ULT_LEVEL_REQ[1] is 10, so reading
+    // it as a cast gate greyed the ult out for levels 6-9 despite it casting.
+    const { hud, root } = mk();
+    hud.render(ult(1, 6), ACTIONS);
+    const r = slotAt(root, 3);
+    expect(cls(r)).not.toContain('ability-slot--ult-locked');
+    expect(cls(r)).toContain('ability-slot--ready');
+    expect(r.style.opacity).not.toBe('0.35');
+    expect(cdAt(root, 3).textContent).not.toContain('LV');
+  });
+
+  it('is ready at max rank — ULT_LEVEL_REQ[2] is undefined, which locked it forever', () => {
+    const { hud, root } = mk();
+    hud.render(ult(2, 11), ACTIONS);
+    const r = slotAt(root, 3);
+    expect(cls(r)).not.toContain('ability-slot--ult-locked');
+    expect(cls(r)).toContain('ability-slot--ready');
+    expect(cdAt(root, 3).style.height).toBe('0.0%');
+  });
+
+  it('still shows the LV 6 plate while unlearned and out of reach', () => {
+    const { hud, root } = mk();
+    hud.render(ult(0, 5), ACTIONS);
+    const r = slotAt(root, 3);
+    expect(cls(r)).toContain('ability-slot--ult-locked');
+    expect(cls(r)).not.toContain('ability-slot--ready');
+    expect(cdAt(root, 3).textContent).toBe('LV 6');
+  });
+});
+
 // ---- per-frame DOM traffic --------------------------------------------------
 
 describe('per-frame DOM traffic (GRAPHICS_CONTRACT §5)', () => {

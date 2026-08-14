@@ -1374,7 +1374,17 @@ export function createHud(parent: HTMLElement): UiHandle {
           const cost = rankVal(ab.manaCost, Math.max(rank, 1));
           setText(dom.cost, ab.isPassive ? '—' : cost > 0 ? String(cost) : '');
           // greyed: ult before its level gate, unranked actives, not enough mana
-          const ultLocked = ab.ult && you.level < (ULT_LEVEL_REQ[rank] ?? Infinity);
+          // Castable == learned. The server gates a cast on `rank < 1` ALONE
+          // (sim/world.ts) — ULT_LEVEL_REQ is the *level-up* table, indexed by
+          // the CURRENT rank as "next rank - 1", and is only consulted by
+          // spendSkillPoint. Reading it as a cast gate locked the ult from the
+          // moment it was learned (rank 1 demands ULT_LEVEL_REQ[1] = LV 10) and
+          // then permanently at max rank (ULT_LEVEL_REQ[2] is undefined ->
+          // Infinity), so R greyed out on being learned and never lit up again
+          // even while the server was happily casting it. It is a lock only
+          // while the ult is still unranked and out of level reach.
+          const ultUnlockLv = ULT_LEVEL_REQ[0] ?? 0;
+          const ultLocked = ab.ult && rank === 0 && you.level < ultUnlockLv;
           // The sweep overlay has TWO jobs — the cooldown wipe and, on a
           // level-gated ult, a full-height 'LV n' plate — and it is resolved to
           // one value before it is written. It used to be written twice per
@@ -1400,7 +1410,7 @@ export function createHud(parent: HTMLElement): UiHandle {
           setText(
             dom.cd,
             ultLocked
-              ? `LV ${ULT_LEVEL_REQ[rank] ?? '?'}`
+              ? `LV ${String(ultUnlockLv)}`
               : remainingS > 0.05
                 ? fmtCooldown(remainingS)
                 : '',
