@@ -235,6 +235,29 @@ describe('wave progression', () => {
   }, 20000);
 });
 
+describe('the wave clock', () => {
+  it('lands the next wave on schedule with the previous one still alive', () => {
+    // The old machine advanced ONLY on `spawnQueue empty && aliveThreatCount
+    // === 0`, so a wave you could not clear stalled the run forever. Kill
+    // nothing and the clock must still bring wave 2.
+    const { room, io } = makeRoom(true);
+    room.addPlayer('p1', 'Alpha');
+    startAndReachWave1(room, io, 'p1');
+    room.handleMessage('p1', { t: 'debug', op: 'invuln', a: 1 });
+    advanceTicks(2);
+    expect(io.lastSnap('p1').wave).toBe(1);
+
+    // run out the period without killing a single zombie
+    advanceTicks(Math.ceil((WAVES.wavePeriodSec * 1000) / 34) + 4);
+
+    const snap = io.lastSnap('p1');
+    expect(snap.phase).toBe('wave');
+    expect(snap.wave).toBe(2);
+    expect(io.events('p1').some((ev) => ev.t === 'wave_start' && ev.wave === 2)).toBe(true);
+    room.stop();
+  }, 60000);
+});
+
 // ---- 4. dead survivors return at the next wave ------------------------------
 
 describe('return from death', () => {
