@@ -44,6 +44,7 @@ import {
   ROOM_ALPHABET,
   ROOM_CODE_LEN,
   ROOM_ID_LEN,
+  sellValue,
   STARTING_GOLD,
   STARTING_SKILL_POINTS,
   TICK_RATE,
@@ -220,6 +221,11 @@ interface Channel {
   readonly entPool: Map<EntId, EntSnap>;
 }
 
+/** How often dead EntSnap entries are evicted from the per-channel pools.
+ *  20 ticks/s * 10 s — often enough that a match never accumulates more than a
+ *  few seconds of corpses, rare enough that the sweep is unmeasurable. */
+const ENT_POOL_SWEEP_TICKS = TICK_RATE * 10;
+
 export class RiftRoom implements GameRoomHandle {
   readonly id: RoomId;
   readonly code: string | null;
@@ -242,6 +248,13 @@ export class RiftRoom implements GameRoomHandle {
   private lockedLanes = 0;
   private beginMsg: RiftBegin | null = null; // re-sent to live joiners
   private lastEndEv: RiftEvent | null = null; // re-sent to ended-phase joiners
+  /** Ticks until the next entPool sweep. See sweepEntPools(). */
+  private entPoolSweepIn = ENT_POOL_SWEEP_TICKS;
+  /** Reused across sweeps so the sweep itself allocates nothing per tick. */
+  private readonly liveIds = new Set<EntId>();
+  /** Reused per-channel scratch: ids to evict this sweep. */
+  private readonly evictScratch: EntId[] = [];
+
   /** Caller-owned vision sets, one per team, refilled every tick (T5 seam). */
   private readonly visSets: [Set<EntId>, Set<EntId>] = [new Set(), new Set()];
   /** Reused BotPercept.visible buffer — valid only during feedBot (T6 seam). */
@@ -430,6 +443,12 @@ export class RiftRoom implements GameRoomHandle {
           return;
         case 'rift_buy':
           this.handleBuy(seat, parsed.item);
+          return;
+        case 'rift_sell':
+          this.handleSell(seat, parsed.slot);
+          return;
+        case 'rift_drop':
+          this.handleDrop(seat, parsed.slot);
           return;
         case 'rift_skill':
           this.handleSkill(seat, parsed.slot);
@@ -796,6 +815,56 @@ export class RiftRoom implements GameRoomHandle {
     this.world.useItem(ent.id, slot, x, z);
   }
 
+  // Sell and drop share the same slot-clearing shape but differ on gate: sell
+  // touches the economy (gold in), so it needs the fountain — it is the shop,
+  // run backwards. Drop's cost is total (the item is gone, no refund), so
+  // there is nothing to exploit by allowing it in the field, hence no gate.
+
+  private handleSell(seat: Seat, slot: number): void {
+    const ent = this.heroEnt(seat);
+    if (ent === undefined || this.world === null) return;
+    if (!ent.alive || ent.kind !== 'hero') return;
+    // Sell reuses the room's existing fountain predicate (this.atFountain)
+    // because the frozen World interface does not expose the sim's own
+    // atOwnFountain — the two agree by construction (same FOUNTAIN_RADIUS,
+    // same ancient anchor), so this is the shop's gate, not a new one.
+    if (!this.atFountain(seat.team, ent)) return;
+    if (!Number.isInteger(slot) || slot < 0 || slot >= INVENTORY_SLOTS) return;
+    const id = ent.items[slot];
+    if (id === null || id === undefined) return;
+    ent.gold += sellValue(id);
+    ent.items[slot] = null;
+    ent.itemCharges[slot] = 0;
+    ent.itemCdUntilTick[slot] = 0;
+    // No recomputeEnt call: SimWorld.advance() runs stepUpkeep() every tick,
+    // which recomputes every mobile's stats from its current items array
+    // (and clamps hp/mana down) as its last step. Handlers run between
+    // ticks and snapshots push only after tickOnce(), so no client can ever
+    // observe a stale, unrecomputed state — the slot write IS the state
+    // change; the next advance() reconciles the stats.
+  }
+
+  /** Drop destroys the item — no world pickup entity is created. Spawning a
+   *  droppable/reclaimable item entity is a much larger feature (a new
+   *  EntKind, snapshot wire shape, pickup radius, ownership/denial rules) and
+   *  is deliberately out of scope here; drop is the escape hatch for a full
+   *  inventory away from the fountain, and the lost gold is the price of
+   *  using it. */
+  private handleDrop(seat: Seat, slot: number): void {
+    const ent = this.heroEnt(seat);
+    if (ent === undefined || this.world === null) return;
+    if (!ent.alive || ent.kind !== 'hero') return;
+    if (!Number.isInteger(slot) || slot < 0 || slot >= INVENTORY_SLOTS) return;
+    const id = ent.items[slot];
+    if (id === null || id === undefined) return;
+    ent.items[slot] = null;
+    ent.itemCharges[slot] = 0;
+    ent.itemCdUntilTick[slot] = 0;
+    // No recomputeEnt call: see handleSell above — stepUpkeep() reconciles
+    // every mobile's stats on the very next advance(), before any snapshot
+    // can observe a stale value.
+  }
+
   // --- events ----------------------------------------------------------------
 
   /** Does this player id name a seat in this room? The board is built from
@@ -956,6 +1025,11 @@ export class RiftRoom implements GameRoomHandle {
 
   private pushSnapshots(w: World): void {
     this.snapSeq += 1;
+    this.entPoolSweepIn -= 1;
+    if (this.entPoolSweepIn <= 0) {
+      this.entPoolSweepIn = ENT_POOL_SWEEP_TICKS;
+      this.sweepEntPools(w);
+    }
     const serverTime = Date.now(); // wall clock for clock sync; match time is ticks
     // ONE call per tick, shared by every channel. `w.tick` is the match tick,
     // the same argument sim/vision.ts passes, so the vision multiplier the sim
@@ -1072,6 +1146,34 @@ export class RiftRoom implements GameRoomHandle {
    * survives serialization unchanged, and a camp sitting in unexplored jungle
    * is simply absent from both teams' sets and therefore never sent.
    */
+  /**
+   * Evict dead entities from every channel's EntSnap pool.
+   *
+   * `fillEnts` memoises one EntSnap per entity id per channel so a snapshot
+   * costs no allocation — but nothing ever removed them, and rift mints a fresh
+   * id for every creep of every wave. Over a 20-30 minute match that is
+   * thousands of dead entries per connected client, retained until the room is
+   * destroyed. It never affected the wire (fillEnts only serialises entities in
+   * the vision set) — purely a memory leak, and it grew with match length.
+   *
+   * Swept on an interval rather than per tick: the cost is O(live + pooled) and
+   * there is no correctness need to reclaim an id the same tick it dies. A
+   * re-used pool entry is refilled field-by-field before it is sent, so an
+   * entry evicted early is simply rebuilt on demand.
+   */
+  private sweepEntPools(w: World): void {
+    this.liveIds.clear();
+    for (const e of w.all()) this.liveIds.add(e.id);
+    for (const ch of this.channels.values()) {
+      const evict = this.evictScratch;
+      evict.length = 0;
+      for (const id of ch.entPool.keys()) if (!this.liveIds.has(id)) evict.push(id);
+      for (const id of evict) ch.entPool.delete(id);
+    }
+    this.liveIds.clear();
+    this.evictScratch.length = 0;
+  }
+
   private fillEnts(ch: Channel, w: World): void {
     const out = ch.snap.ents;
     out.length = 0;

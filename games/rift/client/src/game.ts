@@ -997,7 +997,8 @@ export class Game {
   // ---- UiActions.send: game messages only (lobby messages go through the
   //      dedicated create/join methods, which also persist the name) -----------
   private sendGame(msg: RiftC2S): void {
-    if (msg.t === 'rift_buy') this.modules.audio.ui('buy');
+    if (msg.t === 'rift_buy' || msg.t === 'rift_sell') this.modules.audio.ui('buy');
+    else if (msg.t === 'rift_drop') this.modules.audio.ui('click');
     this.net.send(msg);
   }
 

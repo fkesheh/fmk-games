@@ -60,9 +60,14 @@ const ITEM_IDS = [
   'fang',
   'stormbow',
   'aegisheart',
+  'bulwarkplate',
   'blinkstone',
   'warhorn',
   'wardstone',
+  'reaperedge',
+  'aegiscolossus',
+  'stormherald',
+  'wraithblade',
 ] as const;
 
 describe('parseRiftC2S — valid messages round-trip', () => {
@@ -239,6 +244,182 @@ describe('parseRiftC2S — malformed input returns null, never throws', () => {
     for (const h of hostile) {
       expect(() => parseRiftC2S(h)).not.toThrow();
     }
+  });
+});
+
+describe('parseRiftC2S — rift_sell / rift_drop (inventory exit doors)', () => {
+  // rift_sell refunds 60% of the item's TOTAL gold cost and is gated to your
+  // own fountain radius + alive; rift_drop destroys the item from anywhere
+  // while alive, no refund. Both gates live in room.ts on the SERVER — the
+  // parser only sanitises the slot, exactly like rift_item's slot handling.
+  // Every case below drives parseRiftC2S; none of it round-trips a bare
+  // literal the way the file's header disdains.
+
+  it('rift_sell accepts every legal slot 0..INVENTORY_SLOTS-1 with no extra keys on the result', () => {
+    for (let slotIdx = 0; slotIdx < INVENTORY_SLOTS; slotIdx++) {
+      const msg = parseRiftC2S({ t: 'rift_sell', slot: slotIdx });
+      expect(msg, `rift_sell slot ${slotIdx} parsed to ${JSON.stringify(msg)}`).toEqual({
+        t: 'rift_sell',
+        slot: slotIdx,
+      });
+      if (msg === null) throw new Error(`expected rift_sell, got null for slot ${slotIdx}`);
+      expect(
+        Object.keys(msg).sort(),
+        `rift_sell output must carry exactly t and slot — got ${JSON.stringify(msg)}`,
+      ).toEqual(['slot', 't']);
+    }
+  });
+
+  it('rift_drop accepts every legal slot 0..INVENTORY_SLOTS-1 with no extra keys on the result', () => {
+    for (let slotIdx = 0; slotIdx < INVENTORY_SLOTS; slotIdx++) {
+      const msg = parseRiftC2S({ t: 'rift_drop', slot: slotIdx });
+      expect(msg, `rift_drop slot ${slotIdx} parsed to ${JSON.stringify(msg)}`).toEqual({
+        t: 'rift_drop',
+        slot: slotIdx,
+      });
+      if (msg === null) throw new Error(`expected rift_drop, got null for slot ${slotIdx}`);
+      expect(
+        Object.keys(msg).sort(),
+        `rift_drop output must carry exactly t and slot — got ${JSON.stringify(msg)}`,
+      ).toEqual(['slot', 't']);
+    }
+  });
+
+  it('rift_sell and rift_drop are never confused with each other', () => {
+    const sold = parseRiftC2S({ t: 'rift_sell', slot: 2 });
+    const dropped = parseRiftC2S({ t: 'rift_drop', slot: 2 });
+    expect(sold?.t, `rift_sell must parse with t:'rift_sell' — got ${JSON.stringify(sold)}`).toBe(
+      'rift_sell',
+    );
+    expect(
+      dropped?.t,
+      `rift_drop must parse with t:'rift_drop' — got ${JSON.stringify(dropped)}`,
+    ).toBe('rift_drop');
+    expect(sold, 'a sell and a drop of the same slot must not be equal payloads').not.toEqual(
+      dropped,
+    );
+  });
+
+  it('rift_sell and rift_drop reject out-of-range or wrong-typed slots, never throwing', () => {
+    // The bound comes from INVENTORY_SLOTS (imported), not a hard-coded 6, so
+    // this loop tracks config.ts if the inventory size ever changes.
+    const badSlotValues: readonly unknown[] = [
+      INVENTORY_SLOTS, // one past the top — the boundary itself is excluded
+      -1,
+      1.5,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      -0.0001,
+      '0', // string, not number
+      true,
+      null,
+      {}, // object
+      [], // array
+    ];
+    for (const t of ['rift_sell', 'rift_drop'] as const) {
+      for (const bad of badSlotValues) {
+        const payload = { t, slot: bad };
+        expect(
+          () => parseRiftC2S(payload),
+          `parseRiftC2S(${JSON.stringify(payload)}) must not throw`,
+        ).not.toThrow();
+        expect(
+          parseRiftC2S(payload),
+          `${t} with slot ${JSON.stringify(bad)} should be null, got ` +
+            JSON.stringify(parseRiftC2S(payload)),
+        ).toBeNull();
+      }
+      // slot present but explicitly undefined — distinct from the key being absent
+      const explicitUndefined = { t, slot: undefined };
+      expect(() => parseRiftC2S(explicitUndefined)).not.toThrow();
+      expect(
+        parseRiftC2S(explicitUndefined),
+        `${t} with slot: undefined should be null, got ` +
+          JSON.stringify(parseRiftC2S(explicitUndefined)),
+      ).toBeNull();
+      // slot key missing entirely
+      const missing = { t };
+      expect(() => parseRiftC2S(missing)).not.toThrow();
+      expect(
+        parseRiftC2S(missing),
+        `${t} with no slot key at all should be null, got ${JSON.stringify(parseRiftC2S(missing))}`,
+      ).toBeNull();
+    }
+  });
+
+  it('rift_sell and rift_drop with extra junk keys still parse, and the junk is not copied through', () => {
+    for (const t of ['rift_sell', 'rift_drop'] as const) {
+      const msg = parseRiftC2S({ t, slot: 1, junk: 'nope', extra: 42, x: 5 });
+      expect(msg, `${t} with junk keys parsed to ${JSON.stringify(msg)}`).toEqual({ t, slot: 1 });
+      if (msg === null) throw new Error(`expected ${t}, got null`);
+      expect(
+        Object.hasOwn(msg, 'junk') || Object.hasOwn(msg, 'extra') || Object.hasOwn(msg, 'x'),
+        `${t} output must not carry through junk keys — got ${JSON.stringify(msg)}`,
+      ).toBe(false);
+    }
+  });
+
+  it('a fuzz spread of malformed rift_sell/rift_drop payloads never throws and always yields null', () => {
+    const hostile: readonly unknown[] = [
+      { t: 'rift_sell', slot: { deep: true } },
+      { t: 'rift_sell', slot: [1] },
+      { t: 'rift_sell', slot: () => 1 },
+      { t: 'rift_sell', slot: Symbol('x') },
+      { t: 'rift_sell' },
+      { t: 'rift_drop', slot: { deep: true } },
+      { t: 'rift_drop', slot: [1] },
+      { t: 'rift_drop', slot: () => 1 },
+      { t: 'rift_drop', slot: Symbol('x') },
+      { t: 'rift_drop' },
+    ];
+    for (const h of hostile) {
+      expect(() => parseRiftC2S(h), `parseRiftC2S(${String(h)}) must not throw`).not.toThrow();
+      expect(
+        parseRiftC2S(h),
+        `parseRiftC2S(${String(h)}) should be null, got ${JSON.stringify(parseRiftC2S(h))}`,
+      ).toBeNull();
+    }
+  });
+
+  it('RiftC2S includes both rift_sell and rift_drop with slot:number — a COMPILE-TIME pin', () => {
+    // Typed literals assigned to RiftC2S: if either variant is ever dropped
+    // from the union, or its `slot` field's type changes, this fails to
+    // compile — the failure mode is a red `tsc`, not a red vitest.
+    const sell: RiftC2S = { t: 'rift_sell', slot: 0 };
+    const drop: RiftC2S = { t: 'rift_drop', slot: 0 };
+    // @ts-expect-error — rift_sell carries no refund field; the server computes it
+    const sellWithGold: RiftC2S = { t: 'rift_sell', slot: 0, gold: 100 };
+
+    // A narrowing switch over RiftC2S['t'] that must handle every variant,
+    // rift_sell/rift_drop included — the `never` in the default branch is
+    // the exhaustiveness pin: add a tenth C2S variant and forget a case here
+    // and `msg` in `default` stops being `never`, which fails to compile.
+    function narrow(msg: RiftC2S): string {
+      switch (msg.t) {
+        case 'rift_pick':
+        case 'rift_start':
+        case 'rift_order':
+        case 'rift_cast':
+        case 'rift_item':
+        case 'rift_buy':
+        case 'rift_skill':
+          return 'other';
+        case 'rift_sell':
+          return `sell:${msg.slot}`;
+        case 'rift_drop':
+          return `drop:${msg.slot}`;
+        default: {
+          const exhaustive: never = msg;
+          throw new Error(`unhandled RiftC2S variant: ${JSON.stringify(exhaustive)}`);
+        }
+      }
+    }
+
+    expect(narrow(sell), 'the switch must route rift_sell to its own case').toBe('sell:0');
+    expect(narrow(drop), 'the switch must route rift_drop to its own case').toBe('drop:0');
+    expect(sellWithGold.t, 'the @ts-expect-error literal above is still a valid rift_sell').toBe(
+      'rift_sell',
+    );
   });
 });
 
