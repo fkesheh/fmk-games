@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Asset Library</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <header>
+        <h1>ASSET LIBRARY</h1>
+        <span class="sub">trees · v1</span>
+      </header>
+      <nav id="asset-list"></nav>
+    </aside>
+    <main id="stage-wrap">
+      <div id="topbar">
+        <div class="crumbs" id="crumbs"></div>
+        <div class="controls">
+          <div class="seg" id="variation-ctl">
+            <button id="var-prev" title="previous variation">◀</button>
+            <span id="var-label"></span>
+            <button id="var-next" title="next variation">▶</button>
+          </div>
+          <div class="seg" id="lod-ctl"></div>
+          <label class="ctl wind">
+            <input type="checkbox" id="wind-toggle" checked />
+            wind
+            <input type="range" id="wind-strength" min="0" max="100" value="50" />
+          </label>
+          <label class="ctl"><input type="checkbox" id="wire-toggle" /> wire</label>
+          <label class="ctl"><input type="checkbox" id="spin-toggle" checked /> spin</label>
+        </div>
+      </div>
+      <div id="canvas-host"></div>
+      <div id="stats"></div>
+      <div id="notes"></div>
+    </main>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
