@@ -124,6 +124,10 @@ export interface Survivor {
   reloadUntil: number; // serverTime ms, 0 = not reloading
   nextShotAt: number; // serverTime ms
   bloom: number; // accumulated spread, degrees
+  /** Right-mouse held AND the held weapon actually has a scope. STRICKEN's
+   *  combat reads `scoped` to pick `scopedSpreadDeg` over the bloom cone; the
+   *  AWM is 8 deg hip vs 0.05 deg scoped, i.e. unusable without this. */
+  scoped: boolean;
   shotSeq: number; // monotonic; feeds shotSeed for deterministic spread
 
   // --- interaction ---

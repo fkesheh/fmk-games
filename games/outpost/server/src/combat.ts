@@ -97,7 +97,14 @@ export function resolveShot(ctx: SimContext, s: Survivor, def: WeaponDef): void 
   // Knife reaches exactly its falloff end; firearms get a generous flat cap —
   // SimContext carries no separate range budget for this to clamp against.
   const maxDist = def.id === 'knife' ? def.rangeEnd : 200;
-  const spread = Math.min(def.spreadDeg + s.bloom, def.maxSpreadDeg);
+  // Scoped fire ignores bloom entirely and uses the weapon's scoped cone —
+  // this is STRICKEN's rule (games/fps/server/src/combat.ts), which OUTPOST
+  // dropped: `scopedSpreadDeg` was never read, so the AWM fired a 8-9 deg cone
+  // scoped or not (~6 m wide at 40 m) and effectively could not hit anything.
+  const spread =
+    s.scoped && def.scopedSpreadDeg !== null
+      ? def.scopedSpreadDeg
+      : Math.min(def.spreadDeg + s.bloom, def.maxSpreadDeg);
   const seed = shotSeed(ctx.tick, s.shotSeq);
 
   // Tracer endpoint: the UNSPREAD aim ray against solids only, independent of

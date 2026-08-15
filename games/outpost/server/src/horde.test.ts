@@ -68,7 +68,7 @@ function makeSurvivor(id: PlayerId, overrides: Partial<Survivor> = {}): Survivor
     nextShotAt: 0,
     bloom: 0,
     shotSeq: 0,
-    interacting: false,
+    interacting: false, scoped: false,
     interactKind: 'none',
     interactTarget: -1,
     reviveTargetId: null,

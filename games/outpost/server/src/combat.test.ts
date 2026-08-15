@@ -86,7 +86,7 @@ function makeSurvivor(overrides: Partial<Survivor> = {}): Survivor {
     nextShotAt: 0,
     bloom: 0,
     shotSeq: 1,
-    interacting: false,
+    interacting: false, scoped: false,
     interactKind: 'none',
     interactTarget: -1,
     reviveTargetId: null,
@@ -123,6 +123,41 @@ describe('zombieTargets', () => {
 
     expect(result).toBe(out); // fills and returns the same array
     expect(out.map((t) => t.zid)).toEqual([0]);
+  });
+});
+
+describe('scoped fire uses scopedSpreadDeg (the AWM was unusable without it)', () => {
+  /** Fire the real sniper at a zombie 60 m down the -Z aim line, N times with
+   *  distinct shot seeds, and count how many shots connect. */
+  const hits = (scoped: boolean, shots = 40): number => {
+    let n = 0;
+    for (let i = 0; i < shots; i++) {
+      const z = makeZombie({ id: 0, hp: 1_000_000, maxHp: 1_000_000, body: makeBody(0, 0, -60) });
+      const { ctx, events } = makeCtx([z]);
+      resolveShot(ctx, makeSurvivor({ weapon: 'sniper', shotSeq: i + 1, scoped }), WEAPONS.sniper);
+      if (events.some(isHit)) n += 1;
+    }
+    return n;
+  };
+
+  it('scoped, the AWM lands every shot; unscoped its 8 deg cone lands almost none', () => {
+    // spreadDeg 8 vs scopedSpreadDeg 0.05. At 60 m that is a ~8.4 m cone
+    // against a ~5 cm one, on a 0.34 m radius target.
+    const unscopedHits = hits(false);
+    const scopedHits = hits(true);
+    expect(scopedHits).toBe(40);
+    expect(unscopedHits).toBeLessThan(4);
+  });
+
+  it('a weapon with no scope is unaffected by the flag', () => {
+    // scopedSpreadDeg is null on every non-sniper, so holding right mouse must
+    // not silently turn the AK into a laser.
+    const z = makeZombie({ id: 0, hp: 10_000, maxHp: 10_000, body: makeBody(0, 0, -5) });
+    const { ctx, events } = makeCtx([z]);
+    const s = makeSurvivor({ weapon: 'rifle', scoped: true, bloom: WEAPONS.rifle.maxSpreadDeg });
+    resolveShot(ctx, s, WEAPONS.rifle);
+    expect(WEAPONS.rifle.scopedSpreadDeg).toBeNull();
+    expect(events.some((e) => e.t === 'shot')).toBe(true);
   });
 });
 

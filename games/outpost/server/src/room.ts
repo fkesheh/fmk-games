@@ -32,6 +32,7 @@ import {
   HORDE,
   INPUT_CROUCH,
   INPUT_FIRE,
+  INPUT_ALT,
   INPUT_INTERACT,
   INPUT_JUMP,
   INPUT_WALK,
@@ -489,7 +490,7 @@ export class OutpostRoom implements GameRoomHandle {
       weapon: 'pistol',
       ammo: new Map([['pistol', defaultAmmo('pistol')]]),
       reloadUntil: 0, nextShotAt: 0, bloom: 0, shotSeq: 0,
-      interacting: false, interactKind: 'none', interactTarget: -1, reviveTargetId: null,
+      interacting: false, scoped: false, interactKind: 'none', interactTarget: -1, reviveTargetId: null,
       kills: 0, headshots: 0, damageDealt: 0, repairHp: 0, revivesGiven: 0, timesDowned: 0,
       inputQueue: [], lastProcessedSeq: 0, lastInputAt: now, prevButtons: 0, inputWindow: 0, inputWindowCount: 0,
     };
@@ -742,6 +743,9 @@ export class OutpostRoom implements GameRoomHandle {
     s.yaw = msg.yaw;
     s.pitch = msg.pitch;
     s.interacting = (msg.buttons & INPUT_INTERACT) !== 0;
+    // INPUT_ALT was defined as "right mouse / scope" and read by NOTHING on
+    // the server, so every sniper shot used the 8 deg hip cone.
+    s.scoped = (msg.buttons & INPUT_ALT) !== 0 && WEAPONS[s.weapon].zoomFov !== null;
     const fireDown = (msg.buttons & INPUT_FIRE) !== 0;
     const fireEdge = fireDown && (s.prevButtons & INPUT_FIRE) === 0;
     s.prevButtons = msg.buttons;
