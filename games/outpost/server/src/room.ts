@@ -32,6 +32,7 @@ import {
   HORDE,
   INPUT_CROUCH,
   INPUT_FIRE,
+  INPUT_ALT,
   INPUT_INTERACT,
   INPUT_JUMP,
   INPUT_WALK,
@@ -139,6 +140,7 @@ export class OutpostRoom implements GameRoomHandle {
 
   private readonly ctx: SimContext;
   private phaseEndsAt = 0; // ms; 0 outside intermission
+  private nextWaveAt = 0; // ms; the wave CLOCK — wave N+1 lands here regardless of clearing
   private wavePlayers = 0; // headcount frozen for the CURRENT wave's size + spawn rate
   private spawnQueue: ZombieKind[] = [];
   private spawnAccum = 0; // fractional zombies-per-tick accumulator
@@ -489,7 +491,7 @@ export class OutpostRoom implements GameRoomHandle {
       weapon: 'pistol',
       ammo: new Map([['pistol', defaultAmmo('pistol')]]),
       reloadUntil: 0, nextShotAt: 0, bloom: 0, shotSeq: 0,
-      interacting: false, interactKind: 'none', interactTarget: -1, reviveTargetId: null,
+      interacting: false, scoped: false, interactKind: 'none', interactTarget: -1, reviveTargetId: null,
       kills: 0, headshots: 0, damageDealt: 0, repairHp: 0, revivesGiven: 0, timesDowned: 0,
       inputQueue: [], lastProcessedSeq: 0, lastInputAt: now, prevButtons: 0, inputWindow: 0, inputWindowCount: 0,
     };
@@ -593,10 +595,15 @@ export class OutpostRoom implements GameRoomHandle {
     const ctx = this.ctx;
     if (ctx.phase === 'lobby' || ctx.phase === 'ended') return;
     if (ctx.phase === 'intermission') {
-      if (now >= this.phaseEndsAt) this.beginWave();
+      if (now >= this.phaseEndsAt) this.beginWave(now);
       return;
     }
-    // phase === 'wave'
+    // phase === 'wave'. The clock wins: the next wave lands on schedule even
+    // with the previous one still on its feet, so leftovers accumulate.
+    if (now >= this.nextWaveAt) {
+      this.beginWave(now);
+      return;
+    }
     if (this.spawnQueue.length === 0 && this.aliveThreatCount() === 0) {
       this.beginIntermission(now);
       return;
@@ -604,9 +611,10 @@ export class OutpostRoom implements GameRoomHandle {
     this.stepSpawnDrip();
   }
 
-  private beginWave(): void {
+  private beginWave(now: number): void {
     const ctx = this.ctx;
     ctx.wave += 1;
+    this.nextWaveAt = now + WAVES.wavePeriodSec * 1000;
     this.wavePlayers = this.playerCount();
     const count = waveSize(ctx.wave, this.wavePlayers);
     this.spawnQueue = waveComposition(ctx.wave, count, ctx.rand);
@@ -619,7 +627,7 @@ export class OutpostRoom implements GameRoomHandle {
   private beginIntermission(now: number): void {
     const ctx = this.ctx;
     ctx.phase = 'intermission';
-    this.phaseEndsAt = now + WAVES.intermissionSec * 1000;
+    this.phaseEndsAt = Math.min(now + WAVES.intermissionSec * 1000, this.nextWaveAt);
     this.returnDeadSurvivors(ctx.wave + 1, now);
     this.broadcastEvent({ t: 'wave_clear', wave: ctx.wave, intermissionEndsAt: this.phaseEndsAt });
   }
@@ -742,6 +750,9 @@ export class OutpostRoom implements GameRoomHandle {
     s.yaw = msg.yaw;
     s.pitch = msg.pitch;
     s.interacting = (msg.buttons & INPUT_INTERACT) !== 0;
+    // INPUT_ALT was defined as "right mouse / scope" and read by NOTHING on
+    // the server, so every sniper shot used the 8 deg hip cone.
+    s.scoped = (msg.buttons & INPUT_ALT) !== 0 && WEAPONS[s.weapon].zoomFov !== null;
     const fireDown = (msg.buttons & INPUT_FIRE) !== 0;
     const fireEdge = fireDown && (s.prevButtons & INPUT_FIRE) === 0;
     s.prevButtons = msg.buttons;

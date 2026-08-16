@@ -395,6 +395,12 @@ function checkGates(metrics, overlays, fileSize, hordeApplicable) {
   return fails;
 }
 
+// NOTE: createPrivate, NOT join. `join` -> quick_join, and the platform's
+// quick_join message carries no `settings` field at all, so the room is made
+// with debug DISABLED and every staging verb (teleport / spawnAt /
+// breachSegment / setInvulnerable) silently no-ops server-side. That is what
+// pinned all four shots at pos=[-2.0,8.0,-4.8] and staged "0 zombies within
+// 12m". createPrivate sends settings:{debug:true}.
 // ---- build + server -----------------------------------------------------------
 function buildAll() {
   console.log('build: npm run build');
@@ -748,7 +754,7 @@ async function main() {
   if (missing.length > 0) throw new Error(`window.__outpost is missing methods from OutpostDebugApi: ${missing.join(', ')}`);
   console.log(`window.__outpost surface verified (${DEBUG_SURFACE.length} methods)`);
 
-  await page.evaluate((name) => window.__outpost.join(name), 'CaptureJudge');
+  await page.evaluate((name) => window.__outpost.createPrivate(name), 'CaptureJudge');
   await waitFor(async () => {
     const s = await outpostState(page);
     return s !== null && s.joined === true ? true : null;

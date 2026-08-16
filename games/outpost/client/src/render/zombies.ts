@@ -528,8 +528,9 @@ function buildRig(spec: KindSpec, rand: () => number, eyeSize: number, variant: 
   // (brute, where the neck ends up buried and correctly invisible) is CARRIED
   // rather than floating.
   const neckBaseY = spec.torsoLen - chestH * 0.16;
-  const neckDY = spec.torsoLen + spec.headDropY - neckBaseY;
-  const neckDZ = spec.headPushZ;
+  const headLocal = headRestLocal(spec);
+  const neckDY = headLocal.y - neckBaseY;
+  const neckDZ = headLocal.z;
   const neckSpan = Math.max(Math.hypot(neckDY, neckDZ), spec.headRadius * 0.6);
   const neck = cyl(spec.neckRadius * 0.88, spec.neckRadius * 1.12, neckSpan + spec.headRadius * 0.7, 6, PALETTE.rotFlesh);
   at(neck, 0, neckBaseY + neckDY / 2, neckDZ / 2);
@@ -568,7 +569,7 @@ function buildRig(spec: KindSpec, rand: () => number, eyeSize: number, variant: 
   // Head POSITION, not just head rotation — see KindSpec.headDropY/headPushZ.
   // `applyGait` reasserts the y every frame (plus its walk bob) via
   // `headRestY()`; the z is a rest offset nothing animates.
-  const headPivot = newPivot(0, headRestY(spec), spec.headPushZ);
+  const headPivot = newPivot(0, headRestY(spec), headRestLocal(spec).z);
   headPivot.rotation.x = -spec.headLeanRest;
   headPivot.add(buildHead(spec, variant === 'hangingJaw'));
   const eyeParts = buildEyePair(spec, eyeSize);
@@ -601,11 +602,34 @@ function buildRig(spec: KindSpec, rand: () => number, eyeSize: number, variant: 
 // local per-zombie-id clock advanced by `dt` (see DEATH_COLLAPSE_SEC).
 // ---------------------------------------------------------------------------
 
-/** Rest height of the head pivot in torso-local space. Was a bare
- *  `spec.torsoLen` for every kind, which is why "head below the shoulder line"
- *  and "head thrust forward" were rotation-only approximations. */
+/** Where `headDropY`/`headPushZ` say the skull should END UP, relative to the
+ *  hips, once the torso has leaned. This is body space, which is how KindSpec
+ *  documents them ("BELOW the shoulder line", "forward past the chest"). */
+function headRestBody(spec: KindSpec): { y: number; z: number } {
+  return { y: spec.torsoLen + spec.headDropY, z: spec.headPushZ };
+}
+
+/** The same point expressed in TORSO-local space, which is where the head
+ *  pivot actually lives (it is a child of torsoPivot).
+ *
+ *  These two used to be conflated: the authored offset was written straight
+ *  into the torso-local pivot, and then `torsoPivot.rotation.x` leaned it
+ *  AGAIN. The lean therefore applied twice, and the shambler's authored
+ *  "0.62 up / 0.30 forward" rendered at 0.43 up / 0.54 forward — the skull
+ *  hanging 0.38 m clear of the front of its own chest at mid-torso height,
+ *  which is what "the zombie head is at the body front" was describing.
+ *
+ *  Pre-rotating by +torsoLeanRest cancels that: R(-lean) * local == authored. */
+function headRestLocal(spec: KindSpec): { y: number; z: number } {
+  const { y, z } = headRestBody(spec);
+  const c = Math.cos(spec.torsoLeanRest);
+  const sn = Math.sin(spec.torsoLeanRest);
+  return { y: y * c - z * sn, z: y * sn + z * c };
+}
+
+/** Rest height of the head pivot in torso-local space. */
 function headRestY(spec: KindSpec): number {
-  return spec.torsoLen + spec.headDropY;
+  return headRestLocal(spec).y;
 }
 
 function applyGait(rig: Rig, spec: KindSpec, state: ZombieState, gait: number): void {

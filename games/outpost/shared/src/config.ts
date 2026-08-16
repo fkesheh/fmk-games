@@ -194,6 +194,15 @@ export const WAVES = {
 
   /** Seconds between clearing a wave and the next one starting. */
   intermissionSec: 22,
+  /**
+   * Waves are on a CLOCK, not on clearing. Wave N+1 lands `wavePeriodSec`
+   * after wave N started whether or not you finished N, so a wave you cannot
+   * clear becomes accumulating pressure instead of a stalled run. Clearing
+   * early still buys the leftover time as an intermission — it just cannot
+   * postpone the next wave. `intermissionSec` is now only the OPENING lull
+   * and a ceiling on that earned breather.
+   */
+  wavePeriodSec: 60,
   /** Seconds after START before wave 1 spawns (lets everyone orient). */
   openingLullSec: 8,
   /**
