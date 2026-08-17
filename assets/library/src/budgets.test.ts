@@ -18,7 +18,7 @@ describe('budgets & determinism', () => {
             const [hMin, hMax] = asset.meta.heightRange;
             expect(h).toBeGreaterThanOrEqual(hMin * 0.9); // 10% sculpting tolerance
             expect(h).toBeLessThanOrEqual(hMax * 1.1);
-            expect(a.bbox.min.y).toBeGreaterThanOrEqual(-0.05); // grounded at origin
+            expect(a.bbox.min.y).toBeGreaterThanOrEqual(-0.6); // grounded (roots may dig in, never float)
             expect(a.root.children.length).toBe(1); // ONE mesh
 
             const b = asset.buildVariation(v.id, quality as Quality);

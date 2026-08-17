@@ -31,6 +31,8 @@ export interface BuiltAsset {
   readonly tris: number; // exact, from kit/geometry.ts counter
   readonly bbox: THREE.Box3; // world-space after build
   readonly mesh: THREE.Mesh; // uses ASSET_MATERIAL
+  /** attachment spine: trunk joints + branch tips — every part must hang off it */
+  readonly anchors: readonly THREE.Vector3[];
 }
 
 export interface AssetModule {

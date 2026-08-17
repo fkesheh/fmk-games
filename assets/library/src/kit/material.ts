@@ -35,6 +35,7 @@ export const ASSET_MATERIAL = new THREE.MeshLambertMaterial({
   color: 0xffffff,
   vertexColors: true,
   flatShading: true,
+  side: THREE.DoubleSide, // blades/fronds are ribbons — never backface-cull them
 });
 
 ASSET_MATERIAL.customProgramCacheKey = () => 'asset-wind-1';

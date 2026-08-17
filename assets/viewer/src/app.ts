@@ -38,6 +38,7 @@ function pushUrl(state: UrlState): void {
 }
 
 const state = readUrl();
+if (!state.ui) document.body.classList.add('bare'); // BEFORE sizing the stage
 
 const host = document.getElementById('canvas-host')!;
 const stage = new Stage(host);
@@ -193,7 +194,6 @@ spinToggle.addEventListener('change', () => stage.setAutoRotate(spinToggle.check
 // ---- boot ----
 currentAssetId = state.asset;
 currentVariation = resolveVariationId(state.asset, state.variation);
-if (!state.ui) document.body.classList.add('bare');
 
 // ready signal the capture script waits on
 
