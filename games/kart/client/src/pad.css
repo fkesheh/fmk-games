@@ -1,0 +1,315 @@
+/* ============================================================================
+   KART GP — PHONE PAD (/kart/pad/). Standalone touch controller page; pairs
+   with a seated player's kart via the QR the desktop renders (docs/PAD.md).
+   Landscape-first, full-viewport, no scrolling. Touch-safety per
+   TOUCH_PWA.md §3: touch-action none, no zoom/overscroll, safe-area insets.
+   ============================================================================ */
+
+/* COLOUR RULE (VISUAL_UPGRADE.md §0): hex literals live in the palette file;
+   this :root mirror is the stylesheet's sanctioned copy (same pattern as
+   style.css). The page floor --ink MUST byte-match pad.html's inline
+   pre-boot guard (seam rule 6). */
+:root {
+  --ink: #14171c;
+  --charcoal: #23282f;
+  --steel: #9aa3ad;
+  --steel-deep: #5a616a;
+  --hud-text: #e8e6df;
+  --gold: #d4af37;
+  --danger: #c0392b;
+  --kart-blue: #3d5a9b;
+  --kart-yellow: #c8912f;
+  --kart-teal: #2f8f8f;
+  --grass: #4a7a3d;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--ink);
+  color: var(--hud-text);
+  font-family:
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  /* TOUCH_PWA.md §3 — iOS Safari ignores user-scalable=no; these are the
+     defences that actually work. */
+  touch-action: none;
+  overscroll-behavior: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  /* fixed + hidden kills pull-to-refresh and rubber-band overscroll */
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+}
+
+#app {
+  height: 100dvh;
+}
+
+/* ---- status screen (connecting / errors / pad_left) ------------------------ */
+
+.status {
+  height: 100dvh;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 24px calc(env(safe-area-inset-right) + 24px) 24px calc(env(safe-area-inset-left) + 24px);
+  text-align: center;
+}
+
+.status-title {
+  font-size: clamp(22px, 5vmin, 34px);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.status-hint {
+  max-width: 34em;
+  color: var(--steel);
+  font-size: clamp(14px, 3vmin, 17px);
+  line-height: 1.45;
+}
+
+/* connecting / reconnecting: a quiet pulse so the page reads as alive */
+.status--busy .status-title {
+  animation: status-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes status-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* ---- controller screen ----------------------------------------------------- */
+
+.pad {
+  height: 100dvh;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding:
+    calc(env(safe-area-inset-top) + 8px)
+    calc(env(safe-area-inset-right) + 12px)
+    calc(env(safe-area-inset-bottom) + 10px)
+    calc(env(safe-area-inset-left) + 12px);
+}
+
+.pad-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 40px;
+}
+
+.pad-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--steel);
+}
+
+.pad-name b {
+  color: var(--hud-text);
+}
+
+/* small header buttons (tilt toggle, respawn) — deliberately NOT thumb
+   targets; the thumbs own the row below */
+.pad-chip {
+  appearance: none;
+  border: 1px solid var(--steel-deep);
+  border-radius: 999px;
+  background: var(--charcoal);
+  color: var(--steel);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  padding: 8px 14px;
+}
+
+.pad-chip.is-on {
+  border-color: var(--gold);
+  color: var(--gold);
+}
+
+.pad-chip--respawn.is-on {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.pad-note {
+  min-height: 16px;
+  font-size: 12px;
+  color: var(--steel);
+}
+
+.pad-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 14px;
+}
+
+/* LEFT — steering thumb zones (tablet-pad scheme: two zones, not a stick —
+   TOUCH_PWA.md §4.2.1) */
+.steer {
+  flex: 1.15;
+  display: flex;
+  gap: 12px;
+  min-width: 0;
+}
+
+.zone {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 18px;
+  border: 1px solid var(--steel-deep);
+  background: var(--charcoal);
+  color: var(--steel);
+  font-size: clamp(30px, 9vmin, 52px);
+}
+
+.zone.is-down {
+  background: var(--kart-blue);
+  border-color: var(--kart-blue);
+  color: var(--hud-text);
+}
+
+/* tilt mode: the zones stay visible (they are the fallback story) but dim */
+.pad--tilt .zone {
+  opacity: 0.35;
+}
+
+/* RIGHT — gas is the large primary target, lowest/outermost where the thumb
+   rests; nitro and drift are smaller and clear of the gas arc (§4.2.1).
+   No brake/reverse by design: stuck auto-respawn covers recovery. */
+.actions {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 1fr 1.4fr;
+  grid-template-rows: 1fr 1fr;
+  grid-template-areas:
+    'nitro gas'
+    'drift gas';
+  gap: 12px;
+}
+
+.btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 18px;
+  border: 1px solid var(--steel-deep);
+  background: var(--charcoal);
+  color: var(--steel);
+  font-size: clamp(15px, 4vmin, 22px);
+  font-weight: 800;
+  letter-spacing: 0.1em;
+}
+
+.btn--gas {
+  grid-area: gas;
+  font-size: clamp(20px, 6vmin, 32px);
+}
+
+.btn--gas.is-down {
+  background: var(--grass);
+  border-color: var(--grass);
+  color: var(--hud-text);
+}
+
+.btn--nitro {
+  grid-area: nitro;
+}
+
+.btn--nitro.is-down {
+  background: var(--kart-teal);
+  border-color: var(--kart-teal);
+  color: var(--hud-text);
+}
+
+.btn--drift {
+  grid-area: drift;
+}
+
+.btn--drift.is-down {
+  background: var(--kart-yellow);
+  border-color: var(--kart-yellow);
+  color: var(--ink);
+}
+
+/* live steering readout — the only feedback a tilt driver gets */
+.steer-meter {
+  position: relative;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--charcoal);
+  overflow: hidden;
+}
+
+.steer-dot {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  width: 14px;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--gold);
+  transform: translateX(-50%);
+}
+
+/* portrait: the layout is landscape-first; ask for a rotation instead of
+   squeezing thumb targets into a strip */
+.rotate-hint {
+  display: none;
+}
+
+@media (orientation: portrait) {
+  .rotate-hint {
+    position: fixed;
+    inset: 0;
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    background: var(--ink);
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-align: center;
+    padding: 24px;
+  }
+
+  .rotate-hint span {
+    color: var(--steel);
+    font-size: 14px;
+    font-weight: 400;
+  }
+}
