@@ -25,12 +25,23 @@ export const SNAG_META: AssetMeta = {
   heightRange: budgetFor('snag').height,
 };
 
-/** Splinter spike: thin 3-sided spike from a rim point, jagged by design. */
+/**
+ * Splinter spike: a 3-sided shard from a rim point, jagged by design.
+ *
+ * Sized to read as WOOD, not wire. At the old 9cm base tapering to 2.5cm over
+ * a 2.1u spike, the faces turned away from the sun rendered as ~1px black
+ * streaks — the "black hairlines" the art director rejected in round 3. The
+ * geometry was never degenerate (it passes the thinness gate); it was simply
+ * too narrow for a shaded face to read as a surface, so a lit shard and an
+ * unlit one looked like different objects. A 5-sided profile also keeps a
+ * shadowed face from occupying a third of the silhouette.
+ */
 function splinter(base: Vector3, dir: Vector3, len: number, r: number): BufferGeometry {
   const g = loft([
     { pos: base.clone(), radius: r },
-    { pos: base.clone().addScaledVector(dir, len), radius: 0.025 },
-  ], 3);
+    { pos: base.clone().addScaledVector(dir, len * 0.55), radius: r * 0.62 },
+    { pos: base.clone().addScaledVector(dir, len), radius: Math.max(0.075, r * 0.4) },
+  ], 5);
   return g;
 }
 
@@ -73,14 +84,21 @@ function snagTree(next: Next, quality: Quality, variationId: string): SpeciesRes
     const a = next() * Math.PI * 2;
     const r = chain.rings[Math.floor(t0 * (chain.rings.length - 1))]!.radius;
     const base = chain.at(t0);
-    const dirV = chain.dirAt(t0).multiplyScalar(0.9).add(
-      new Vector3(Math.cos(a) * 0.45, 0, Math.sin(a) * 0.45),
-    ).normalize();
+    // A crack is a GROOVE IN the bark, so it runs along the trunk and sits
+    // inside the surface. It used to be pushed 0.45 radially OUT and modelled
+    // 3.5cm thick, which produced a free-floating pencil-thin rod in the
+    // darkest tier — rendered, that is a 1px black line hanging in the air,
+    // and at hero there were exactly three of them: the "three perfectly
+    // straight black lines" the art director rejected in round 3. Hugging the
+    // spine and widening it turns the same intent into a readable shadow line.
+    const dirV = chain.dirAt(t0).normalize();
     const len = height * (0.16 + next() * 0.12);
+    const seat = base.clone().add(new Vector3(Math.cos(a) * r * 0.82, 0, Math.sin(a) * r * 0.82));
     const g = loft([
-      { pos: base.clone().add(new Vector3(Math.cos(a) * r * 0.92, 0, Math.sin(a) * r * 0.92)), radius: 0.035 },
-      { pos: base.clone().add(new Vector3(Math.cos(a) * r * 0.92, 0, Math.sin(a) * r * 0.92)).addScaledVector(dirV, len), radius: 0.022 },
-    ], 3);
+      { pos: seat.clone(), radius: 0.075 },
+      { pos: seat.clone().addScaledVector(dirV, len * 0.5), radius: 0.065 },
+      { pos: seat.clone().addScaledVector(dirV, len), radius: 0.05 },
+    ], 5);
     paint(g, lightning ? P.knotHole : P.deadwoodDeep, 0.4);
     parts.push({ geom: g });
     anchors.push(tipOf(base, dirV, len + 0.4));
@@ -99,7 +117,7 @@ function snagTree(next: Next, quality: Quality, variationId: string): SpeciesRes
       const baseR = chain.rings[chain.rings.length - 1]!.radius;
       const base = chain.top.clone().add(new Vector3(Math.cos(a) * baseR * 0.6, 0, Math.sin(a) * baseR * 0.6));
       const dirV = new Vector3(Math.cos(a) * 0.35, 1, Math.sin(a) * 0.35).normalize();
-      const sp = splinter(base, dirV, len, 0.09);
+      const sp = splinter(base, dirV, len, 0.17);
       paint(sp, lightning && near > 0.7 ? P.knotHole : P.deadwood, 0.55);
       parts.push({ geom: sp });
       anchors.push(tipOf(base, dirV, len));
@@ -131,7 +149,7 @@ function snagTree(next: Next, quality: Quality, variationId: string): SpeciesRes
         const sDir = dirV.clone().add(new Vector3(
           Math.cos(sa) * 0.5, 0.15 + next() * 0.2, Math.sin(sa) * 0.5,
         )).normalize();
-        const sp = splinter(tip, sDir, 0.3 + next() * 0.4, 0.08);
+        const sp = splinter(tip, sDir, 0.3 + next() * 0.4, 0.13);
         paint(sp, s % 2 ? P.deadwoodLit : P.deadwood, 0.5);
         parts.push({ geom: sp });
         anchors.push(tipOf(tip, sDir, 0.7));

@@ -11,6 +11,9 @@ import { TREE_PALETTE as P } from '../kit/palette';
 import type { AssetMeta, AssetModule, Quality } from '../types';
 import { budgetFor, growChain, makeSpecies, type SpeciesResult } from './_shared';
 
+/** Even rim samples per skirt; must out-resolve the lobe count (7 at hero). */
+const RIM_ANCHORS = 12;
+
 export const PINE_META: AssetMeta = {
   id: 'pine',
   category: 'tree',
@@ -110,6 +113,16 @@ function pineTree(next: Next, quality: Quality, variationId: string): SpeciesRes
     const sH = height * (0.26 - t * 0.1);
     const color = t > 0.66 ? P.pineLit : t > 0.28 ? P.pineBase : P.pineDark;
     const s = lobedSkirt(next, y, radius, sH, quality === 'hero' ? 7 : 5, sides, color);
+    // The rim IS this tier's attachment surface, and lobing swings it between
+    // roughly 0.8 and 1.25 of `radius`. It used to reach the spine only where
+    // tufts happened to sit — 5-8 JITTERED samples — so whole lobe PEAKS went
+    // unrecorded and attached skirt geometry read as detached debris. Sample it
+    // evenly, independently of the tufts. (No next() calls: the seed stream —
+    // and therefore every existing silhouette — is untouched.)
+    for (let a = 0; a < RIM_ANCHORS; a++) {
+      const r = s.rimAt(a / RIM_ANCHORS);
+      anchors.push(new Vector3(r.x, y, r.z));
+    }
     parts.push({ geom: s.geom });
     skirtGeoms.push(s.geom);
 

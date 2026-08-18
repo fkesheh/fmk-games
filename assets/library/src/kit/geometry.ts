@@ -162,19 +162,85 @@ export interface LoftRing {
  * dislocate at joints and read as stacked prisms. Ring basis is the fixed
  * horizontal pair (X, Z) — trunks curve gently, so rings stay near-level.
  */
-export function loft(rings: readonly LoftRing[], sides: number): THREE.BufferGeometry {
-  if (rings.length < 2) throw new Error('loft: need >= 2 rings');
+/** A loft ring closer than this to its predecessor contributes only slivers. */
+const MIN_RING_GAP = 0.02;
+/** A ring thinner than this collapses its cap to a hairline. */
+const MIN_RING_R = 0.03;
+
+export function loft(ringsIn: readonly LoftRing[], sides: number): THREE.BufferGeometry {
+  if (ringsIn.length < 2) throw new Error('loft: need >= 2 rings');
+  // Degenerate-geometry gate, applied HERE so every species inherits it (see
+  // degenerate.test.ts). Two failure modes, both of which rasterise to the 1px
+  // black hairlines the art director rejected in round 3:
+  //   - consecutive rings almost coincident -> a band of zero-height quads;
+  //   - a ring radius near zero -> a tip that is a line, not a spike.
+  // Collapsing the first and clamping the second costs nothing visible: the
+  // dropped rings were sub-2cm apart and the clamped tips sub-3cm wide.
+  const rings: LoftRing[] = [];
+  for (const ring of ringsIn) {
+    const r = Math.max(ring.radius, MIN_RING_R);
+    const prev = rings[rings.length - 1];
+    if (prev !== undefined && prev.pos.distanceTo(ring.pos) < MIN_RING_GAP) {
+      // keep the WIDER of the two so a taper never gains girth at its tip
+      if (r > prev.radius) rings[rings.length - 1] = { pos: prev.pos, radius: r };
+      continue;
+    }
+    rings.push({ pos: ring.pos, radius: r });
+  }
+  if (rings.length < 2) {
+    // everything collapsed into one ring: re-open it along its own axis so the
+    // caller still gets a solid, however small, rather than a flat disc
+    const only = rings[0] ?? ringsIn[0]!;
+    rings.length = 0;
+    rings.push({ pos: only.pos, radius: Math.max(only.radius, MIN_RING_R) });
+    rings.push({
+      pos: new THREE.Vector3(only.pos.x, only.pos.y + MIN_RING_GAP, only.pos.z),
+      radius: Math.max(only.radius, MIN_RING_R),
+    });
+  }
   const positions: number[] = [];
   const indices: number[] = [];
-  for (const ring of rings) {
+  // Each ring is laid out in the plane PERPENDICULAR to the local spine
+  // direction. Building every ring axis-aligned (the original behaviour) is
+  // correct only for a vertical trunk: a limb at 77 degrees off vertical came
+  // out as a SHEARED, near-collapsed sheet rather than a tube, and its faces
+  // ended up so close to coplanar that both the lambert term and the hemisphere
+  // term went to ~0 — the limb rendered as a flat black slab, and thinner ones
+  // as the 1px black "hairlines" the art director rejected in rounds 1-3. The
+  // colours were always right; the surface had no usable orientation.
+  // Handedness matters: the original axis-aligned ring ran (cos, 0, sin) about
+  // +Y, and reproducing that exactly for a vertical spine is what keeps every
+  // face winding — and therefore every outward normal — as authored. Getting it
+  // mirrored flips the normals inward and the whole trunk renders in shade.
+  const yRef = new THREE.Vector3(0, 1, 0);
+  const zRef = new THREE.Vector3(0, 0, 1); // fallback when the spine IS +/-Y
+  const dir = new THREE.Vector3();
+  const u = new THREE.Vector3();
+  const v2 = new THREE.Vector3();
+  for (let r = 0; r < rings.length; r++) {
+    const ring = rings[r]!;
+    const prev = rings[r - 1];
+    const next = rings[r + 1];
+    // central difference inside the run, one-sided at the ends
+    if (prev !== undefined && next !== undefined) dir.subVectors(next.pos, prev.pos);
+    else if (next !== undefined) dir.subVectors(next.pos, ring.pos);
+    else if (prev !== undefined) dir.subVectors(ring.pos, prev.pos);
+    else dir.copy(yRef);
+    if (dir.lengthSq() < 1e-12) dir.copy(yRef);
+    dir.normalize();
+    // dir x ref, then u x dir: for dir=+Y this yields u=(1,0,0), v=(0,0,1) —
+    // byte-identical to the old vertical layout.
+    u.crossVectors(dir, Math.abs(dir.y) > 0.99 ? zRef : yRef).normalize();
+    v2.crossVectors(u, dir); // unit: u and dir are orthonormal
     for (let i = 0; i < sides; i++) {
       const t = (i / sides) * Math.PI * 2;
-      const v = new THREE.Vector3(
-        ring.pos.x + Math.cos(t) * ring.radius,
-        ring.pos.y,
-        ring.pos.z + Math.sin(t) * ring.radius,
+      const ct = Math.cos(t) * ring.radius;
+      const st = Math.sin(t) * ring.radius;
+      positions.push(
+        ring.pos.x + u.x * ct + v2.x * st,
+        ring.pos.y + u.y * ct + v2.y * st,
+        ring.pos.z + u.z * ct + v2.z * st,
       );
-      positions.push(v.x, v.y, v.z);
     }
   }
   for (let r = 0; r < rings.length - 1; r++) {
@@ -378,7 +444,34 @@ export function mergeAll(parts: readonly Part[]): THREE.BufferGeometry {
   });
   const merged = mergeGeometries(prepared, false);
   if (!merged) throw new Error('mergeAll: incompatible attributes across parts');
+  groundWind(merged);
   return merged;
+}
+
+/**
+ * Fade `aBend` to nothing at the ground.
+ *
+ * Bend is authored per PART, against that part's own height — which is
+ * meaningful for a trunk rooted at 0 and meaningless for a limb whose base is
+ * 3u up and whose local "height" is its own 2u length. A drooping low limb
+ * therefore claimed trunk-top sway, and anything it dipped near the soil swayed
+ * with it. World position only exists after the merge, so this is the first
+ * point where the real invariant — geometry at the ground does not move — can
+ * be enforced at all. Only the bottom ~1u is touched; canopy bend is untouched,
+ * so the wind stays as lively as it was authored.
+ */
+function groundWind(g: THREE.BufferGeometry): void {
+  const pos = g.getAttribute('position');
+  const bend = g.getAttribute('aBend');
+  if (pos === undefined || bend === undefined) return;
+  let maxY = 0;
+  for (let i = 0; i < pos.count; i++) maxY = Math.max(maxY, pos.getY(i));
+  const fade = Math.min(0.9, Math.max(0.15, maxY * 0.12)); // short assets fade sooner
+  for (let i = 0; i < pos.count; i++) {
+    const t = Math.min(1, Math.max(0, pos.getY(i) / fade));
+    bend.setX(i, bend.getX(i) * (t * t * (3 - 2 * t))); // smoothstep
+  }
+  bend.needsUpdate = true;
 }
 
 /** transform helpers (chain via multiply) */
