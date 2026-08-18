@@ -11,6 +11,7 @@
   "dependencies": {
     "@kart/shared": "0.0.0",
     "@platform/shared": "0.0.0",
+    "qr-creator": "^1.0.0",
     "three": "0.185.1"
   },
   "devDependencies": {

@@ -124,6 +124,11 @@ export class DriveController {
 
   private acc = 0; // real time accumulated toward the next SIM_DT tick
   private seq = 0; // per-client monotonic, never reset within a connection
+  // PAD mode (docs/PAD.md): a phone holds the stick. This session emits NOTHING
+  // of its own and instead feeds the server's {t:'pad_input'} echoes to the
+  // predictor, so the local sim steps on exactly the inputs the server
+  // integrated — the same reconciliation contract, different input source.
+  private padBound = false;
   private driftVis = 0;
   private frozen = false; // pre-GO freeze: ticks are sent but never simulated
   private assistOn = false; // KIDS MODE — app-owned; reset()/blur never clear it
@@ -302,6 +307,28 @@ export class DriveController {
   }
 
   /**
+   * Enter/leave pad mode. The outbox is cleared on every transition: inputs
+   * queued under the old regime are stale intent, and the room resets its seq
+   * gate on both bind and unbind precisely so neither stream has to care what
+   * the other's counter reached.
+   */
+  setPadBound(bound: boolean): void {
+    if (bound === this.padBound) return;
+    this.padBound = bound;
+    this.outbox.length = 0;
+  }
+
+  padActive(): boolean {
+    return this.padBound;
+  }
+
+  /** A {t:'pad_input'} echo: the server accepted this, so predict on it. */
+  applyPadInput(msg: KartInputMsg): void {
+    if (!this.padBound) return; // an echo racing an unbind is not our intent any more
+    this.pred.push(msg);
+  }
+
+  /**
    * Hand every input produced since the last flush to `send` (which must
    * serialize synchronously — these objects are still owned by the predictor).
    * @returns how many inputs were sent.
@@ -411,8 +438,10 @@ export class DriveController {
     e.drift = this.keyDrift || this.ext.drift;
     const respawn = this.respawnPending;
     this.respawnPending = false;
-    const msg = this.emit(respawn);
-    this.pred.push(msg); // applied NOW — this is what keeps the local kart instant
+    if (!this.padBound) {
+      const msg = this.emit(respawn);
+      this.pred.push(msg); // applied NOW — this is what keeps the local kart instant
+    }
     // smoothed skid intensity for the renderer (deterministic per sim tick)
     const target = k.drifting ? 1 : 0;
     this.driftVis += (target - this.driftVis) * Math.min(1, DRIFT_VIS_RATE * SIM_DT);

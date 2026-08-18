@@ -45,6 +45,7 @@ const LOBBY_TAGS: ReadonlySet<string> = new Set([
   'create_public',
   'create_private',
   'join_private',
+  'join_as_pad',
   'leave',
   'ping',
 ]);
@@ -124,6 +125,9 @@ export class Lobby {
           break;
         case 'join_private':
           this.joinPrivate(sess, msg.name, msg.code, msg.resume, msg.sig);
+          break;
+        case 'join_as_pad':
+          this.joinAsPad(sess, msg.room, msg.token);
           break;
         case 'leave':
           this.leaveRoom(sess.id, true); // explicit leave: permanent removal
@@ -333,6 +337,50 @@ export class Lobby {
     }
     this.leaveRoom(sess.id);
     this.joinRoom(sess, found, name, resume, sig);
+  }
+
+  /**
+   * Pad (phone-as-controller) bind. `room` is a room REFERENCE that may be
+   * either a public roomId or a private join code — the pad page scanned a QR
+   * and cannot know which, so the lobby resolves both (see docs/PAD.md).
+   *
+   * A pad is NOT a player: no addPlayer, no seat, no room_full check, and
+   * emptySince is deliberately left alone so a lone pad cannot keep an empty
+   * room alive. The token is validated by the ROOM, not here — tokens are
+   * game-level state the room minted.
+   */
+  private joinAsPad(sess: Session, room: string, token: string): void {
+    const found = this.resolveRoomRef(room);
+    if (found === undefined) {
+      this.sendError(sess, 'no_room', 'no room with that id or code');
+      return;
+    }
+    if (found.addPad === undefined) {
+      this.sendError(sess, 'pad_unsupported', 'this game has no phone-controller mode');
+      return;
+    }
+    // A pad session must not stay seated in a previous room; drop any prior
+    // membership first (also covers a pad rescanning a second QR).
+    this.leaveRoom(sess.id);
+    if (!found.addPad(sess.id, token)) {
+      this.sendError(sess, 'pad_rejected', 'pairing token invalid, expired or already used');
+      return;
+    }
+    // Route this session's room-level messages to the room from here on. Note
+    // we do NOT clear tracked.emptySince: pads never keep a room alive.
+    this.sessionRoom.set(sess.id, found);
+  }
+
+  /** A pad's `room` field: public roomId first, then private join code (case-insensitive). */
+  private resolveRoomRef(ref: string): GameRoomHandle | undefined {
+    const byId = this.rooms.get(ref);
+    if (byId !== undefined) return byId.room;
+    const want = ref.toLowerCase();
+    for (const { room } of this.rooms.values()) {
+      const code = room.info().code;
+      if (code !== null && code.toLowerCase() === want) return room;
+    }
+    return undefined;
   }
 
   /** First public room of this game with space; when phase is set, only that phase. */
