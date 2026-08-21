@@ -121,6 +121,8 @@ export interface AcesDebug {
   warpTo(x: number, y: number): void;
   giveCrate(x?: number, y?: number): void;
   fastForward(ticks: number): void;
+  /** Pin camera zoom for hero captures (null restores speed-auto). */
+  zoomTo(z: number | null): void;
   muted(): boolean;
   /** e2e probing handles — read-only refs, nothing mutates game truth. */
   _internals: {
@@ -297,6 +299,8 @@ export function startAces(container: HTMLElement): AcesApp {
 
   // ---- camera rig -----------------------------------------------------------
   const camView: CameraView = { x: WORLD.W / 2, y: WORLD.H / 2, zoom: CAMERA.ZOOM_MAX };
+  /** Judge/capture zoom pin (STYLE_BIBLE §4 hero close-ups); null = speed-auto. */
+  let zoomOverride: number | null = null;
   let shakeAmp = 0;
   let speedFracCache = 0;
   let frameIdx = 0;
@@ -911,7 +915,7 @@ export function startAces(container: HTMLElement): AcesApp {
     const kp = 1 - Math.exp(-CAM_EASE_POS * dtS);
     camView.x += (tx - camView.x) * kp;
     camView.y += (ty - camView.y) * kp;
-    const zoomTarget = CAMERA.ZOOM_MAX + (CAMERA.ZOOM_MIN - CAMERA.ZOOM_MAX) * speedFracCache;
+    const zoomTarget = zoomOverride ?? CAMERA.ZOOM_MAX + (CAMERA.ZOOM_MIN - CAMERA.ZOOM_MAX) * speedFracCache;
     camView.zoom += (zoomTarget - camView.zoom) * (1 - Math.exp(-CAM_EASE_ZOOM * dtS));
 
     const tS = nowMs / 1000;
@@ -1092,6 +1096,10 @@ export function startAces(container: HTMLElement): AcesApp {
     },
     fastForward(ticks) {
       net.sendDebug('tick', ticks);
+    },
+    /** Judge/capture hook (STYLE_BIBLE §4): pin the camera zoom. null = auto. */
+    zoomTo(z: number | null) {
+      zoomOverride = z === null ? null : Math.max(0.5, Math.min(6, z));
     },
     muted() {
       toggleMute();
