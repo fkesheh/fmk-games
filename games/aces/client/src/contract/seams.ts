@@ -1,0 +1,164 @@
+// ============================================================================
+// ACES client seams — FROZEN Layer-1 interfaces.
+//
+// The import law makes app.ts the only composer and forbids siblings from
+// importing each other. These are therefore THE shapes through which they
+// meet: C_NET implements NetClient, C_FX implements EffectsApi (+ drawCrate),
+// C_AUDIO implements AudioApi, C_UI consumes HudModel, C_APP implements
+// nothing here but orchestrates all of it. No side may invent extra required
+// surface; optional extensions go in each module's own file.
+// ============================================================================
+
+import type {
+  CrateState,
+  GameEvent,
+  MatchPhase,
+  PlaneClassId,
+  ScoreRow,
+} from '@aces/shared/types';
+import type { DebugCmd, RoomSettings, TeamId } from '@aces/shared/config';
+import type { SnapPlane } from '@aces/shared/protocol';
+
+// ---- input -----------------------------------------------------------------------------
+
+/** Sampled by the net sender at TICK_RATE. Pure read; no side effects. */
+export interface InputSource {
+  readonly th: number; //   −0.3..1
+  readonly tr: number; //   −1..1
+  readonly fire: boolean;
+  readonly boost: boolean;
+}
+
+// ---- net --------------------------------------------------------------------------------
+
+export type JoinKind =
+  | { kind: 'quick' } //                    lobby quick_join (public room, bot fill)
+  | { kind: 'private'; settings: RoomSettings }; // create_private (e2e/debug/friends)
+
+export interface NetHandlers {
+  onWelcome(w: { id: string; seed: number; tickRate: number; snapRate: number; settings: Required<RoomSettings>; roster: ScoreRow[] }): void;
+  onSnapshot(fn: (snap: SnapshotView) => void): void;
+  onEvent(e: GameEvent): void;
+  onPhase(phase: MatchPhase, endsAtS: number, winner: TeamId | undefined): void;
+  onScore(board: ScoreRow[]): void;
+  onClose(): void;
+}
+
+/** Minimal view of a snapshot msg — see protocol.ts SnapshotMsg. */
+export interface SnapshotView {
+  tick: number;
+  phase: MatchPhase;
+  timeLeftS: number;
+  tickets: { royal: number; iron: number };
+  you: SnapPlane | undefined;
+  planes: SnapPlane[];
+  bullets: ReadonlyArray<{ id: number; team: TeamId; x: number; y: number; vx: number; vy: number }>;
+  crates: readonly CrateState[];
+  rttMs: number;
+}
+
+/** C_NET's product. App owns exactly one. */
+export interface NetClient {
+  connect(name: string, join: JoinKind, handlers: NetHandlers): Promise<void>;
+  sendInput(frame: { seq: number; th: number; tr: number; fire: boolean; boost: boolean }): void;
+  sendSpawn(cls: PlaneClassId): void;
+  /** Debug verbs — server ignores them unless the room was created with debug. */
+  sendDebug(cmd: DebugCmd, x?: number, y?: number): void;
+  close(): void;
+  rttMs(): number;
+}
+
+// ---- fx -----------------------------------------------------------------------------------
+
+export interface CameraView {
+  /** World coords of screen center. */
+  x: number;
+  y: number;
+  zoom: number;
+}
+
+/**
+ * C_FX's consumer API. All emit methods are fire-and-forget; the system
+ * owns pooling, lifetimes and its seeded rng. SHAKE magnitudes come from
+ * config.SHAKE (SMALL/MEDIUM/LARGE).
+ */
+export interface EffectsApi {
+  muzzleFlash(x: number, y: number, h: number): void;
+  /** Cosmetic local tracer fired optimistically at trigger-down (RULES 10). */
+  tracerStub(x: number, y: number, h: number): void;
+  hitSpark(x: number, y: number, angle: number): void;
+  explosion(x: number, y: number, size: 'small' | 'large', overWater: boolean): void;
+  /** Per-frame trail emitter hook for smoking/burning planes. */
+  trail(id: string, x: number, y: number, level: 'smoke' | 'fire' | null): void;
+  crateFx(kind: 'land' | 'pickup', x: number, y: number): void;
+  shake(mag: number): void;
+  update(dt: number): void;
+  draw(ctx: CanvasRenderingContext2D, cam: CameraView): void;
+}
+
+// ---- audio ------------------------------------------------------------------------------------
+
+export interface AudioApi {
+  unlock(): Promise<void>;
+  setMuted(muted: boolean): void;
+  /** Own-plane engine voice; called each frame with smoothed values. */
+  ownEngine(throttle: number, speedFrac: number, boosting: boolean): void;
+  shot(own: boolean, distU: number): void;
+  hitConfirm(): void; //    YOU landed a hit
+  hurt(): void; //          YOU took a hit
+  killConfirm(): void;
+  explosion(distU: number): void;
+  pickup(): void;
+  overheatJam(): void;
+  streak(n: number): void;
+  ui(kind: 'click' | 'spawn' | 'win' | 'lose'): void;
+  wind(speedFrac: number): void;
+}
+
+// ---- hud model ----------------------------------------------------------------------------------
+
+export interface KillFeedEntry {
+  id: number;
+  killerName: string;
+  victimName: string;
+  killerTeam: TeamId;
+  crash: boolean;
+  killerCls: PlaneClassId;
+  bornTick: number;
+}
+
+export interface Banner {
+  kind: 'ace' | 'legend' | 'suddendeath';
+  text: string;
+  bornTick: number;
+}
+
+/**
+ * Everything the HUD renders, assembled by C_APP from snapshots + events.
+ * C_UI holds NO network objects of its own — this is the whole world it sees.
+ * `tick` is the last-applied snapshot tick (drives killfeed/banner expiry).
+ */
+export interface HudModel {
+  tick: number;
+  phase: MatchPhase;
+  timeLeftS: number;
+  suddenDeath: boolean;
+  tickets: { royal: number; iron: number };
+  you: {
+    cls: PlaneClassId;
+    team: TeamId;
+    hp: number;
+    maxHp: number;
+    heat: number;
+    jammed: boolean;
+    boost: number;
+    throttle: number;
+    alive: boolean;
+    respawnT: number;
+    streak: number;
+  } | null; //            null while spectating pre-first-spawn
+  board: ScoreRow[];
+  feed: readonly KillFeedEntry[];
+  banners: readonly Banner[];
+  muted: boolean;
+}

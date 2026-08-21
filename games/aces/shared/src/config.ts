@@ -67,7 +67,8 @@ export const BULLET_HIT_R = 3; //        bullet radius for circle tests
 export const HEAT_MAX = 1;
 export const HEAT_RESUME = 0.35; //      jammed guns resume below this
 export const HEAT_COOL_IDLE = 0.45; //   per second while not firing
-export const HEAT_COOL_FIRING = 0.12; // per second while firing
+export const HEAT_COOL_FIRING = 0; //    ZERO while trigger held — D2's burst
+//                                        windows (5/6/4 s) are literal truth
 
 // ---- boost -----------------------------------------------------------------------
 export const BOOST_MAX = 100;
@@ -216,6 +217,28 @@ export const HEAT_WARN = 0.7; //   heat bar warns past this fraction
 // ---- fx pools (C_FX) ------------------------------------------------------------------------
 export const FX_POOL_MAX = 600;
 
+// ---- class-pick weights for bots (S_ROOM) ------------------------------------------------------
+export const BOT_CLASS_WEIGHTS = { scout: 0.3, fighter: 0.5, gunship: 0.2 } as const;
+
+// ---- camera-shake impulse magnitudes, u at zoom 1 (C_FX emits, C_APP consumes) ------------------
+export const SHAKE = { SMALL: 3, MEDIUM: 9, LARGE: 22 } as const;
+
+// ---- input bindings (C_APP owns mapping; C_UI help screen + e2e key-driver read this) ------------
+export const INPUT_KEYS = {
+  turnLeft: ['KeyA', 'ArrowLeft'],
+  turnRight: ['KeyD', 'ArrowRight'],
+  throttleUp: ['KeyW', 'ArrowUp'],
+  throttleDown: ['KeyS', 'ArrowDown'],
+  fire: ['Space'],
+  boost: ['ShiftLeft', 'ShiftRight'],
+  scoreboard: ['Tab'],
+  mute: ['KeyM'],
+  help: ['Escape'],
+} as const;
+
+// ---- stale-player policy (S_ROOM.stalePlayers) ----------------------------------------------------
+export const STALE_SECONDS = 30;
+
 // ---- bot roster names (S_ROOM fills seats in order) -------------------------------------------
 export const BOT_NAMES: readonly string[] = [
   'Lt. Kestrel',
@@ -236,5 +259,5 @@ export const BOT_NAMES: readonly string[] = [
  * Debug verbs accepted by parseC2S ONLY when the room was created with
  * settings.debug = true. Server-authoritative so e2e can drive real states.
  */
-export const DEBUG_CMDS = ['god', 'warp', 'crate'] as const;
+export const DEBUG_CMDS = ['god', 'warp', 'crate', 'tick'] as const;
 export type DebugCmd = (typeof DEBUG_CMDS)[number];

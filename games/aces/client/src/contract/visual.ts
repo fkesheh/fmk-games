@@ -164,7 +164,10 @@ export function makeGrainTiles(seed: number, n = 3): HTMLCanvasElement[] {
   return tiles;
 }
 
-/** Per-frame grain pass: ONE pattern fill. Pass a frame counter as tick. */
+/** Per-frame grain pass: ONE pattern fill. Pass a frame counter as tick.
+ *  Patterns are cached per context — no per-frame allocation. */
+const patternCache = new WeakMap<CanvasRenderingContext2D, Map<HTMLCanvasElement, CanvasPattern>>();
+
 export function drawGrain(
   ctx: CanvasRenderingContext2D,
   w: number,
@@ -175,8 +178,17 @@ export function drawGrain(
   if (tiles.length === 0) return;
   const tile = tiles[tick % tiles.length];
   if (!tile) return;
-  const pat = ctx.createPattern(tile, 'repeat');
-  if (!pat) return;
+  let cache = patternCache.get(ctx);
+  if (!cache) {
+    cache = new Map();
+    patternCache.set(ctx, cache);
+  }
+  let pat = cache.get(tile);
+  if (!pat) {
+    pat = ctx.createPattern(tile, 'repeat');
+    if (!pat) return;
+    cache.set(tile, pat);
+  }
   ctx.save();
   ctx.fillStyle = pat;
   ctx.fillRect(0, 0, w, h);

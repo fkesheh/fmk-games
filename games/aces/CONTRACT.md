@@ -67,6 +67,7 @@ games/aces/shared/src/maps.ts                     ← buildMap(seed) + isOpenWat
 games/aces/shared/src/index.ts                    ← barrel
 games/aces/shared/src/palette.ladder.test.ts      ← ΔE readability gate on APAL
 games/aces/client/src/contract/visual.ts          ← client visual vocabulary
+games/aces/client/src/contract/seams.ts           ← InputSource/HudModel/EffectsApi/AudioApi/NetClient
 ```
 
 ### Module ownership table (DISJOINT — no file appears twice)
@@ -79,16 +80,18 @@ games/aces/client/src/contract/visual.ts          ← client visual vocabulary
 | C_NET | `client/src/net.ts`, `client/src/prediction.ts`, `net.test.ts` | ws lifecycle, input sender @30 Hz, snapshot interp buffer (120 ms), own-plane prediction + reconcile |
 | C_APP | `client/src/app.ts`, `client/src/main.ts`, `client/index.html`, `client/src/style.css` | composition root: screens→match flow, rAF loop, camera rig (follow/lookahead/zoom/shake), layer compositing, `window.__ACES` debug surface |
 | C_WORLD | `client/src/render/world.ts`, `render/world.test.ts` | sea/islands/surf/cloud-shadow bake + animated overlays; exposes drawBelow/drawAbove (occluding cloud puffs live ABOVE planes) |
-| C_FX | `client/src/render/planes.ts`, `client/src/render/effects.ts`, `render/planes.test.ts` | vector airframes ×3 classes ×2 liveries ×damage states; bullets/tracers; pooled particles (smoke, fire, blast, debris, splash, muzzle, sparks); shake impulses API |
+| C_FX | `client/src/render/planes.ts`, `client/src/render/effects.ts`, `render/planes.test.ts` | vector airframes ×3 classes ×2 liveries ×damage states; **crate body + parachute** (`drawCrate` — crates are entities, rendered from CrateState); bullets/tracers; pooled particles; shake impulses API; implements EffectsApi |
 | C_UI | `client/src/ui/hud.ts`, `client/src/ui/screens.ts`, `ui/hud.test.ts` | HUD canvas overlay (crosshair, lead pip, edge arrows, hit markers, banners) + DOM (HP/heat/boost, tickets, clock, killfeed, scoreboard Tab, class picker, menus, end screen) |
 | C_AUDIO | `client/src/audio/audio.ts`, `audio.test.ts` | WebAudio synth: engine drone (throttle-pitched), MG rattle, hits, explosions (distance), crate chime, wind bed, UI blips, M-mute |
 | INTEG | root `package.json`, `vitest.config.ts`, `platform/server/src/registry.ts`, launcher entries in `platform/server/src/index.ts`, `scripts/e2e-aces.mjs`, package scaffolds/tsconfigs/vite configs | registration, gates, e2e harness |
 
 **Import law:** server imports `@platform/shared` + `@aces/shared` only.
-Client imports `@aces/shared` + its own tree. Cross-module imports inside the
-client happen only through the seams each section defines (app.ts composes;
-render modules never import ui; ui never imports render internals — it reads
-snapshots + an `HudModel` built by app).
+Client imports `@aces/shared` + its own tree. Cross-module client seams are
+FROZEN in `client/src/contract/seams.ts` — C_NET implements `NetClient`,
+C_FX implements `EffectsApi` (+ exports `drawCrate`), C_AUDIO implements
+`AudioApi`, C_UI consumes `HudModel`, C_APP builds the HudModel and drives
+everything; input mapping reads config.INPUT_KEYS. app.ts composes; render
+modules never import ui; ui never imports render internals.
 
 ## §3 Rules binding EVERY implementer (the RULES)
 
@@ -160,16 +163,20 @@ snapshots + an `HudModel` built by app).
   feed intents to World at TICK_RATE; echo applied seq back on that player's
   SnapPlane. Debug verbs (debug rooms only): `god` toggles that player's no-
   damage flag; `warp x y` teleports their plane; `crate x? y?` force-spawns a
-  supply crate (random open water when omitted) — all server-authoritative.
-- Spawn/respawn: `spawn` msg picks class (default fighter); spawn at own
-  airfield with SPAWN_PROTECT invuln; dead players get RESPAWN_SECONDS then
-  may spawn (picker waits indefinitely; bots auto-pick weighted
-  scout/fighter/gunship 30/50/20 from BOT_NAMES).
+  supply crate (random open water when omitted); `tick x N` advances the sim
+  N ticks in one message (CI/e2e fast-forward) — all server-authoritative.
+- Spawn rule (no ambiguity): joining during **lobby** seats you at the roster
+  with the countdown; at live transition EVERY seated human auto-spawns
+  fighter immediately (picker available from then on). Joining mid-live:
+  auto-spawn fighter instantly. After death: RESPAWN_SECONDS → picker waits
+  indefinitely (your last class pre-selected; bots pick by
+  BOT_CLASS_WEIGHTS).
+- Win check each ticket change and at time expiry (higher tickets; tie →
+  sudden death: phase stays live, HUD shows SUDDEN DEATH stamp, next kill
+  wins). stalePlayers(): ids with no applied input for > STALE_SECONDS.
 - Scoring: kills increment shooter's team tickets + personal stats; crash
-  (burn death) credits no killer but still costs the victim's team nothing —
-  tickets only move on credited kills. Win check each ticket change and at
-  time expiry (higher tickets; tie → sudden-death next kill wins, announce
-  via phase event `winner` undefined until decided).
+  (burn death) credits no killer and moves no ticket — tickets only move on
+  credited kills.
 - Snapshot assembly at SNAP_RATE from World state (see protocol.ts shape);
   events flushed immediately; scoreboard recomputed on kill and sent as
   `score` (rate-limited to 1/s during streak churn).
@@ -218,10 +225,13 @@ snapshots + an `HudModel` built by app).
 
 ### C_NET — net.ts / prediction.ts
 
-- Connect to `wss?://host/ws` derived from location (dev: same-origin proxy),
-  send `join`, resolve welcome; expose typed `on(msg)` subscription and
-  `send(obj)`.
-- Input sender: samples an `InputSource` (installed by app) at 30 Hz, sends
+- Join path (the platform owns seating): connect to `ws(s)://host/ws`, then
+  send the LOBBY envelope — `quick_join {name, game:'aces'}` for public
+  rooms, or `create_private {name, game:'aces', settings}` (debug rooms set
+  `settings.debug=true`). The room's own `welcome` arrives via addPlayer.
+  NEVER send room-level `{t:'join'}` as the first message — the lobby drops
+  it before a room exists. NetClient in seams.ts is the frozen surface.
+- Input sender: samples the app-installed InputSource at 30 Hz, sends
   `{t:'input', seq++…}`.
 - Interp buffer: snapshots appended; remote planes rendered at now−INTERP_MS,
   lerping x/y/h between bracketing snaps (h via shortest arc); bullets are
@@ -251,11 +261,13 @@ snapshots + an `HudModel` built by app).
   effects particles → world.drawAbove (clouds occlude) → HUD canvas overlay
   → grain tile + vignette canvas (both pre-baked). All wrapped per-subsystem
   try/catch (RULES 5).
-- `window.__ACES` debug surface (always present; harmless in prod): sends
-  server-authoritative `{t:'debug'}` verbs (god/warp/crate — see S_ROOM) and
-  exposes `{ state(): {phase,tickets,tick,you}, god(bool), warpTo(x,y),
-  giveCrate(x?,y?) }`. The e2e harness drives matches through these verbs;
-  nothing here mutates client-side game truth directly.
+- `window.__ACES` debug surface (always present; harmless in prod): drives
+  the frozen client path — `join({kind:'quick'}|{kind:'private',settings})`
+  (lobby envelopes via NetClient), `spawn(cls)`, `state()` →
+  {phase,tickets,timeLeftS,you,board}, `god()`, `warpTo(x,y)`, `giveCrate(x?,y?)`,
+  `fastForward(ticks)` (debug `tick` verb), `muted()`. The e2e harness creates
+  a private debug room and drives matches ONLY through this surface; nothing
+  mutates client-side game truth directly.
 
 ### C_WORLD — render/world.ts
 
@@ -277,7 +289,10 @@ snapshots + an `HudModel` built by app).
 
 ### C_FX — render/planes.ts / effects.ts
 
-- planes.ts: `drawPlane(ctx, snap: SnapPlane, opts)` — pure vector top-down
+- planes.ts: `drawPlane(ctx, snap: SnapPlane, opts)` AND `drawCrate(ctx,
+  crate: CrateState, t)` — crates are entities drawn from server state
+  (parachute while falling, canopy + ropes landed); everything else in
+  effects. — pure vector top-down
   airframes per STYLE_BIBLE §7 silhouette law (scout: stubby round-cowl
   biplane; fighter: equal-span twin-gun; gunship: wide triple-wing), correct
   markings (ROYAL deck-cream roundel ring on navy wings; IRON black bar-cross

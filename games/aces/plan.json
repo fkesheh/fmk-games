@@ -9,7 +9,8 @@
     "shared/src/physics.ts",
     "shared/src/maps.ts",
     "shared/src/index.ts",
-    "client/src/contract/visual.ts"
+    "client/src/contract/visual.ts",
+    "client/src/contract/seams.ts"
   ],
   "modules": {
     "S_ROOM": ["server/src/room.ts", "server/src/module.ts", "server/src/room.test.ts"],

@@ -153,8 +153,9 @@ paper slips that slide in and fade; scoreboard Tab = two-column flight
 roster with a hand-drawn MVP star; respawn class cards look like requisition
 forms (name, stat strips, big numeral hotkeys 1–3). Menu/end screens are
 full propaganda posters: big condensed type on paper, team-color accent bar,
-no photographs. Minimum 14 px type at 1080p; every state (menu/connecting/
-live/dead/end/disconnect) exists as a designed screen.
+no photographs. Minimum 14 px type at 1080p; every state exists as a designed
+screen — menu / connecting / LOBBY-COUNTDOWN (roster + "first patrol launches
+in N") / live / dead+class-picker / end / disconnect.
 
 ## §9 Hard bans
 

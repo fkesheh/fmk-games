@@ -101,6 +101,8 @@ export interface KillEvent {
   victimCls: PlaneClassId;
   crash: boolean; //    true when the victim died by burning/crash, not bullets
   streak: number; //    killer's new streak (for ACE/LEGEND banners)
+  x: number; //         wreck position — effects/audio anchor at death instant
+  y: number;
 }
 
 export interface HitEvent {

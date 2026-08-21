@@ -27,6 +27,8 @@ export interface SnapPlane {
   h: number;
   /** speed magnitude, u/s — enough for remote interpolation */
   sp: number;
+  vx: number; //        velocity components — prediction/interp seed, u/s
+  vy: number;
   hp: number;
   maxHp: number;
   heat: number;
@@ -66,6 +68,9 @@ export interface WelcomeMsg {
   roster: ScoreRow[];
 }
 
+/** Match-relative seconds remaining (same clock as snapshot timeLeftS) —
+ *  NOT epoch. Snapshots re-anchor it at SNAP_RATE; clients never extrapolate
+ *  past the next snapshot. */
 export type EventMsg = { t: 'event'; e: GameEvent };
 export type PhaseMsg = { t: 'phase'; phase: MatchPhase; endsAtS: number; winner?: TeamId };
 export type ScoreMsg = { t: 'score'; board: ScoreRow[] };
