@@ -117,6 +117,21 @@ export interface AudioApi {
 
 // ---- hud model ----------------------------------------------------------------------------------
 
+/** Live combat overlay data — recomputed by C_APP each frame alongside HudModel. */
+export interface OverlayModel {
+  alive: boolean;
+  heading: number;
+  speedFrac: number; //   speed / class speedMax
+  heat: number;
+  jammed: boolean;
+  /** Enemy planes in snapshot order, world-space (HUD projects for edge arrows). */
+  targets: ReadonlyArray<{ x: number; y: number; team: TeamId; cls: PlaneClassId; hpFrac: number }>;
+  cam: CameraView;
+  /** Snapshot ticks of the last own-hit-confirm / own-hurt (marker & arc flashes). */
+  hitConfirmTick: number;
+  hurtTick: number;
+}
+
 export interface KillFeedEntry {
   id: number;
   killerName: string;
@@ -162,3 +177,31 @@ export interface HudModel {
   banners: readonly Banner[];
   muted: boolean;
 }
+
+// ---- creator signatures (each module exports EXACTLY this factory) ------------------------------
+//
+// C_NET      createNet(): NetClient
+// C_FX       createEffects(seed: number): EffectsApi
+//            drawPlane(ctx, sp: SnapPlane, t): void   — world-space, planes.ts
+//            drawCrate(ctx, c: CrateState, t): void   — world-space, planes.ts
+// C_AUDIO    createAudio(): AudioApi
+// C_WORLD    createWorldRenderer(canvas, map): { drawBelow(ctx,cam,t); drawAbove(ctx,cam,t);
+//            resize(w,h) } — canvas is the main world canvas; bake happens lazily on first draw
+// C_UI       createHud(hudCanvas) → { update(m: HudModel, o: OverlayModel): void; destroy(): void }
+//            createScreens(root, hooks) → Screens (see below), DOM injected under root
+// C_APP      startAces(container: HTMLElement): AcesApp — AcesApp = { destroy(): void }
+//
+// export interface Screens {
+//   showMenu(prefName: string): void;
+//   showConnecting(): void;
+//   showLobby(countdownS: number | null, roster: ScoreRow[]): void; // null = no countdown running
+//   showMatchUI(): void;
+//   showDeath(respawnT: number, lastCls: PlaneClassId): void;
+//   showEnd(board: ScoreRow[], winner: TeamId | undefined): void;
+//   showDisconnected(retrying: boolean): void;
+//   hideAll(): void;
+// }
+//
+// Camera convention: C_APP applies the world transform (pan+zoom+DPR) before
+// calling render modules — they draw in WORLD units. HUD overlay + grain +
+// vignette draw in SCREEN space after the transform is reset.
