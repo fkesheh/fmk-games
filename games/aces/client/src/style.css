@@ -1,0 +1,13 @@
+/* BOOTSTRAP RESET — C_APP owns style.css and may extend freely.
+   House law: full-viewport canvas host, no scrollbars, no selection. */
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #e3c893; /* APAL.dawnLo mirror — see palette seam rule */
+}
+#app {
+  height: 100%;
+}
