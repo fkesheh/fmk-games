@@ -80,12 +80,16 @@ export interface EffectsApi {
   muzzleFlash(x: number, y: number, h: number): void;
   /** Cosmetic local tracer fired optimistically at trigger-down (RULES 10). */
   tracerStub(x: number, y: number, h: number): void;
+  /** Snapshot projectiles rendered as tracer rounds (world-space). */
+  drawProjectiles(ctx: CanvasRenderingContext2D, bullets: ReadonlyArray<{ x: number; y: number; vx: number; vy: number }>): void;
   hitSpark(x: number, y: number, angle: number): void;
   explosion(x: number, y: number, size: 'small' | 'large', overWater: boolean): void;
   /** Per-frame trail emitter hook for smoking/burning planes. */
   trail(id: string, x: number, y: number, level: 'smoke' | 'fire' | null): void;
   crateFx(kind: 'land' | 'pickup', x: number, y: number): void;
   shake(mag: number): void;
+  /** Accumulated shake magnitude since last call (app adds to camera); resets to 0. */
+  consumeShake(): number;
   update(dt: number): void;
   draw(ctx: CanvasRenderingContext2D, cam: CameraView): void;
 }
