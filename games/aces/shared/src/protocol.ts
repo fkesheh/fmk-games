@@ -167,7 +167,15 @@ export function parseC2S(msg: unknown, allowDebug = false): C2S | null {
       if (cmd === null) return null;
       if (m.x !== undefined && num(m.x) === null) return null;
       if (m.y !== undefined && num(m.y) === null) return null;
-      return { t: 'debug', cmd, x: num(m.x) ?? undefined, y: num(m.y) ?? undefined };
+      // exactOptionalPropertyTypes forbids assigning `undefined` into the
+      // optional wire fields — build the patch conditionally so absent
+      // coordinates stay ABSENT keys rather than explicit undefined.
+      const patch: { x?: number; y?: number } = {};
+      const x = num(m.x);
+      if (x !== null) patch.x = x;
+      const y = num(m.y);
+      if (y !== null) patch.y = y;
+      return { t: 'debug', cmd, ...patch };
     }
     default:
       return null;

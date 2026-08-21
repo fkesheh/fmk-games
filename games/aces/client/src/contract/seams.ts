@@ -9,14 +9,8 @@
 // surface; optional extensions go in each module's own file.
 // ============================================================================
 
-import type {
-  CrateState,
-  GameEvent,
-  MatchPhase,
-  PlaneClassId,
-  ScoreRow,
-} from '@aces/shared/types';
-import type { DebugCmd, RoomSettings, TeamId } from '@aces/shared/config';
+import type { CrateState, GameEvent, MatchPhase, ScoreRow } from '@aces/shared/types';
+import type { DebugCmd, PlaneClassId, RoomSettings, TeamId } from '@aces/shared/config';
 import type { SnapPlane } from '@aces/shared/protocol';
 
 // ---- input -----------------------------------------------------------------------------

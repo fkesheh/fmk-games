@@ -68,8 +68,8 @@ export function buildMap(seed: number = MAP_SEED): AcesMap {
   const fieldsRaw = [
     { team: 'royal' as TeamId, x: fieldW + 60, y: WORLD.H / 2, h: 0 },
     { team: 'iron' as TeamId, x: WORLD.W - fieldW - 60, y: WORLD.H / 2, h: Math.PI },
-  ];
-  const fields: readonly { team: TeamId; x: number; y: number; h: number }[] = fieldsRaw;
+  ] as const; // tuple (not array): literal indexing stays non-undefined under noUncheckedIndexedAccess
+  const fieldPts: readonly { team: TeamId; x: number; y: number; h: number }[] = fieldsRaw;
 
   // lane corridor: |y − H/2| < LANE keeps mid-map open for head-on passes
   const LANE = 340;
@@ -80,7 +80,7 @@ export function buildMap(seed: number = MAP_SEED): AcesMap {
     const y = 300 + rng() * (WORLD.H - 600);
     const r = 150 + rng() * 240;
     if (Math.abs(y - WORLD.H / 2) < LANE && x > 700 && x < WORLD.W - 700) continue;
-    const nearField = fields.some(
+    const nearField = fieldPts.some(
       (f) => Math.hypot(f.x - x, f.y - y) < r + fieldW + 120,
     );
     if (nearField) continue;
@@ -115,7 +115,6 @@ export function buildMap(seed: number = MAP_SEED): AcesMap {
   // Parked dressing crates flank each strip, deterministic from the seed.
   const fields: [Airfield, Airfield] = [
     {
-      team: 'royal',
       ...fieldsRaw[0],
       parkedCrates: [
         { x: fieldsRaw[0].x - 40, y: fieldsRaw[0].y - 150 },
@@ -123,7 +122,6 @@ export function buildMap(seed: number = MAP_SEED): AcesMap {
       ],
     },
     {
-      team: 'iron',
       ...fieldsRaw[1],
       parkedCrates: [
         { x: fieldsRaw[1].x + 40, y: fieldsRaw[1].y - 150 },

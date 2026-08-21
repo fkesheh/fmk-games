@@ -185,9 +185,10 @@ export function drawGrain(
   }
   let pat = cache.get(tile);
   if (!pat) {
-    pat = ctx.createPattern(tile, 'repeat');
-    if (!pat) return;
-    cache.set(tile, pat);
+    const made = ctx.createPattern(tile, 'repeat');
+    if (!made) return;
+    pat = made;
+    cache.set(tile, made);
   }
   ctx.save();
   ctx.fillStyle = pat;
