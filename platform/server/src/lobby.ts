@@ -15,6 +15,19 @@
 // module.createRoom (a throw => 'bad_settings' with the module's message);
 // room-level messages route as RAW objects to GameRoomHandle.handleMessage.
 // Never throws.
+//
+// v2 (specs/P4.md), all additive: an optional Store gives sessions ws auth
+// (`auth` -> sess.profileId -> auth_ok/auth_err) and a stats sink
+// (RoomIO.reportStats: clamp to STATS limits, write through store.addStats,
+// never throw into game threads). Pad pairing is platform-level: a player in
+// a room mints a single-use 6-char code (PADS.pairTtlMs TTL); any session can
+// spend it via `join_as_pad` to become a PAD session for that (room, owner).
+// Pads are NOT players — never added to rooms, invisible to RoomInfo counts,
+// exempt from stale sweeping by construction. Their only routed message is
+// `pad_input`, relayed RAW into the room under the pad session's id (+ echo
+// ack) at <= PADS.inputMaxHz; unbind on pad disconnect / owner leave /
+// room close always tells the owner {t:'pad_status', bound:false}.
+// The four new C2S tags are routed BEFORE the raw-passthrough default.
 // ============================================================================
 import type {
   C2S,
@@ -22,20 +35,48 @@ import type {
   GameRoomHandle,
   LobbyC2S,
   PlayerId,
+  ProfileRef,
   RoomId,
   RoomInfo,
   RoomIO,
   S2C,
+  StatsDelta,
   Visibility,
 } from '@platform/shared';
+import { CLAIM_ALPHABET, AUTH, PADS, STATS, rng, rngInt } from '@platform/shared';
 import type { Session } from './net.js';
 
 const MAX_ROOMS = 64; // platform-wide capacity guard
 const PUBLIC_REAP_MS = 30_000; // empty public rooms linger this long, then close
 
-interface TrackedRoom {
-  room: GameRoomHandle;
-  emptySince: number | null; // serverTime ms when the room last became empty
+/**
+ * The slice of the v2 Store the gateway actually needs (services/db.ts
+ * satisfies this structurally; tests substitute a spy without touching
+ * sqlite). null (the default, pre-v2 constructor arity) means profiles are
+ * unavailable: auth answers auth_err and reportStats is a no-op.
+ */
+export interface LobbyStore {
+  profileIdByToken(token: string): string | null;
+  profileById(id: string): { id: string; name: string } | null;
+  addStats(profileId: string, gameId: string, delta: Record<string, number>): void;
+}
+
+/**
+ * One minted pad pairing, keyed by its 6-char code. Single-use: consumed on
+ * successful bind, deleted once expired (lazy GC at use sites).
+ */
+interface PendingPadPairing {
+  roomId: RoomId;
+  owner: PlayerId;
+  expiresAt: number; // epoch ms
+}
+
+/** One live pad binding: padSessionId -> the room + owner player it feeds. */
+interface PadBinding {
+  roomId: RoomId;
+  owner: PlayerId;
+  windowStart: number; // epoch ms of the current input-rate window
+  windowCount: number; // pad_input frames admitted in the current window
 }
 
 const LOBBY_TAGS: ReadonlySet<string> = new Set([
@@ -47,11 +88,38 @@ const LOBBY_TAGS: ReadonlySet<string> = new Set([
   'join_private',
   'leave',
   'ping',
+  // ---- v2 (specs/P4.md): routed BEFORE the raw-passthrough default ----
+  'auth',
+  'pad_pair_request',
+  'join_as_pad',
+  'pad_input',
 ]);
 
 /** parseC2S emits a parsed LobbyC2S for lobby tags; anything else is a raw envelope. */
 function isLobbyMsg(msg: C2S): msg is LobbyC2S {
   return LOBBY_TAGS.has(msg.t);
+}
+
+/**
+ * Server-side non-gameplay randomness per the platform rule ("Math.random is
+ * a repo-wide violation"): ONE module-scope stream seeded rng(Date.now()), the
+ * wordbomb-module convention — two pairings minted in the same millisecond
+ * would otherwise draw identical code sequences.
+ */
+const rand: () => number = rng(Date.now());
+
+/** 6-char pairing code over CLAIM_ALPHABET (same shape as claim codes). */
+function mintPairCode(): string {
+  let out = '';
+  for (let i = 0; i < AUTH.claimCodeLen; i++) {
+    out += CLAIM_ALPHABET.charAt(rngInt(rand, 0, CLAIM_ALPHABET.length - 1));
+  }
+  return out;
+}
+
+interface TrackedRoom {
+  room: GameRoomHandle;
+  emptySince: number | null; // serverTime ms when the room last became empty
 }
 
 function isObj(v: unknown): v is Record<string, unknown> {
@@ -71,14 +139,22 @@ function playerLeftId(msg: unknown): PlayerId | null {
 
 export class Lobby {
   private readonly modules: readonly GameModule[];
+  private readonly store: LobbyStore | null;
   private readonly sessions = new Map<PlayerId, Session>(); // every session that ever spoke
   private readonly sessionRoom = new Map<PlayerId, GameRoomHandle>(); // <= 1 room per session
   private readonly rooms = new Map<RoomId, TrackedRoom>();
   private readonly kicked = new Set<PlayerId>(); // room-initiated drops awaiting socket close
+  /** Minted-but-unspent pad pairing codes. One code => one pending pairing. */
+  private readonly pendingPads = new Map<string, PendingPadPairing>();
+  /** Live pad bindings keyed by the PAD session's id (pads are never players). */
+  private readonly pads = new Map<PlayerId, PadBinding>();
 
   // Shared RoomIO for every room: resolves PlayerId -> Session and observes
   // player_left broadcasts to catch room-initiated removals. Unknown ids
-  // (bots have no session) get a send no-op and rttMs 0.
+  // (bots have no session) get a send no-op and rttMs 0. v2 members: profile
+  // lookups read the session's auth state; stats are clamped + written
+  // through the store inside try/catch (never throw into game threads);
+  // padOwner resolves a pad SESSION id to the player seat it drives.
   private readonly io: RoomIO = {
     send: (id, msg) => {
       const leftId = playerLeftId(msg);
@@ -91,10 +167,18 @@ export class Lobby {
       this.sessions.get(id)?.send(msg as S2C); // game S2C envelopes pass through untouched
     },
     rttMs: (id) => this.sessions.get(id)?.rttMs() ?? 0,
+    profileId: (id) => this.sessions.get(id)?.profileId ?? '',
+    reportStats: (playerId, delta) => this.reportStats(playerId, delta),
+    padOwner: (padSessionId) => this.pads.get(padSessionId)?.owner ?? null,
   };
 
-  constructor(modules: readonly GameModule[]) {
+  /**
+   * `store` is optional so every pre-v2 caller (`new Lobby([mod])`) stays
+   * valid: without it auth answers auth_err and reportStats no-ops.
+   */
+  constructor(modules: readonly GameModule[], store: LobbyStore | null = null) {
     this.modules = modules; // registry order matters: [0] is the default game
+    this.store = store;
   }
 
   handleMessage(sess: Session, msg: C2S): void {
@@ -130,6 +214,19 @@ export class Lobby {
           break;
         case 'ping':
           break; // answered at the transport layer (net.ts); never routed
+        // ---- v2 (specs/P4.md): routed before the raw-passthrough default ----
+        case 'auth':
+          this.authSession(sess, msg.token);
+          break;
+        case 'pad_pair_request':
+          this.padPairRequest(sess);
+          break;
+        case 'join_as_pad':
+          this.joinAsPad(sess, msg.room, msg.token);
+          break;
+        case 'pad_input':
+          this.padInput(sess.id, msg);
+          break;
       }
     } catch (err) {
       console.error('[lobby] handleMessage failed', err);
@@ -138,6 +235,10 @@ export class Lobby {
 
   handleDisconnect(sess: Session): void {
     try {
+      // If THIS session was a bound pad, its owner must hear the unbind
+      // (spec: pad disconnect => owner {t:'pad_status', bound:false}).
+      this.detachPad(sess.id, true);
+      // leaveRoom below also unbinds pads owned by this session (owner side).
       this.leaveRoom(sess.id);
       this.sessions.delete(sess.id);
       this.kicked.delete(sess.id);
@@ -172,6 +273,7 @@ export class Lobby {
           if (sess !== undefined) out.push(sess);
           this.sessionRoom.delete(id); // before removePlayer: lobby-initiated
           tracked.room.removePlayer(id);
+          this.unbindPadsForOwner(id, true); // stale owner loses its pads too
         }
         if (tracked.room.playerCount() > 0) {
           tracked.emptySince = null;
@@ -183,6 +285,7 @@ export class Lobby {
         if (expired) {
           tracked.room.stop();
           this.rooms.delete(roomId); // safe: Map iteration tolerates deleting current
+          this.unbindPadsForRoom(roomId); // a closed room takes its pads with it
           console.log(
             `[lobby] room ${roomId} closed (empty ${tracked.room.info().visibility}); ${this.rooms.size} open`,
           );
@@ -201,6 +304,8 @@ export class Lobby {
     this.sessionRoom.clear();
     this.sessions.clear();
     this.kicked.clear();
+    this.pendingPads.clear();
+    this.pads.clear();
   }
 
   // -------------------------------------------------------------------------
@@ -408,12 +513,16 @@ export class Lobby {
     if (room === undefined) return;
     this.sessionRoom.delete(id); // before removePlayer: lobby-initiated, not a kick
     room.removePlayer(id, permanent);
+    // The departing player's pads unbind with them; they are still connected
+    // here (leave != disconnect), so they DO hear bound:false.
+    this.unbindPadsForOwner(id, true);
     if (room.playerCount() > 0) return;
     const tracked = this.rooms.get(room.id);
     if (tracked === undefined) return;
     if (room.info().visibility === 'private') {
       room.stop(); // empty private rooms close immediately
       this.rooms.delete(room.id);
+      this.unbindPadsForRoom(room.id); // a closed room takes its pads with it
       console.log(`[lobby] room ${room.id} closed (empty private); ${this.rooms.size} open`);
     } else if (tracked.emptySince === null) {
       tracked.emptySince = Date.now(); // public rooms get a grace window
@@ -422,5 +531,213 @@ export class Lobby {
 
   private sendError(sess: Session, code: string, message: string): void {
     sess.send({ t: 'error', code, message });
+  }
+
+  // -------------------------------------------------------------------------
+  // v2 — session auth (specs/P4.md)
+  // -------------------------------------------------------------------------
+
+  /**
+   * `auth {token}`: resolve the bearer token through the store and bind the
+   * profile to this session. Idempotent by design — a second auth simply
+   * replaces the first (protocol.ts's contract). Any store failure degrades
+   * to auth_err: a broken DB must never take the ws path down with it.
+   */
+  private authSession(sess: Session, token: string): void {
+    const store = this.store;
+    if (store === null) {
+      sess.send({ t: 'auth_err', message: 'profiles unavailable on this server' });
+      return;
+    }
+    try {
+      const profileId = store.profileIdByToken(token);
+      if (profileId === null) {
+        sess.send({ t: 'auth_err', message: 'invalid or expired token' });
+        return;
+      }
+      const profile = store.profileById(profileId);
+      if (profile === null) {
+        sess.send({ t: 'auth_err', message: 'profile no longer exists' });
+        return;
+      }
+      sess.profileId = profile.id;
+      sess.send({ t: 'auth_ok', profileId: profile.id, name: profile.name });
+    } catch (err) {
+      console.error('[lobby] auth failed', err);
+      sess.send({ t: 'auth_err', message: 'authentication failed' });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // v2 — stats sink (RoomIO.reportStats)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Clamp to STATS limits (finite values only, |v| <= maxValue, at most
+   * maxKeysPerDelta keys) and write through to the store under the room's
+   * game id. Anonymous/unknown players and room-less ids no-op; nothing here
+   * may ever throw into a game thread.
+   */
+  private reportStats(playerId: PlayerId, delta: StatsDelta): void {
+    try {
+      const store = this.store;
+      if (store === null) return; // pre-v2 wiring: stats have nowhere to go
+      const profile = this.sessions.get(playerId)?.profileId ?? '';
+      if (profile === '') return; // anonymous (or bot): nothing to persist
+      const room = this.sessionRoom.get(playerId);
+      if (room === undefined) return; // game id comes from the player's own room
+      let kept = 0;
+      const clamped: Record<string, number> = {};
+      for (const key of Object.keys(delta)) {
+        if (kept >= STATS.maxKeysPerDelta) break;
+        const value = delta[key];
+        if (typeof value !== 'number' || !Number.isFinite(value)) continue;
+        clamped[key] = Math.max(-STATS.maxValue, Math.min(STATS.maxValue, value));
+        kept += 1;
+      }
+      if (kept === 0) return;
+      store.addStats(profile, room.info().game, clamped);
+    } catch (err) {
+      console.error('[lobby] reportStats failed', err);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // v2 — pad pairing + input relay (specs/P4.md)
+  // -------------------------------------------------------------------------
+
+  /** Drop expired pending pairings; called lazily wherever codes are minted or spent. */
+  private gcExpiredPairings(now: number): void {
+    if (this.pendingPads.size === 0) return;
+    for (const [code, pending] of this.pendingPads) {
+      if (pending.expiresAt <= now) this.pendingPads.delete(code); // safe mid-iteration
+    }
+  }
+
+  /**
+   * In-room player mints a single-use pairing code. The reply carries the
+   * code plus the exact /pad/ URL to open on the phone (game + room baked in,
+   * so the pad page can join without typing anything but the code).
+   */
+  private padPairRequest(sess: Session): void {
+    const room = this.sessionRoom.get(sess.id);
+    if (room === undefined) {
+      this.sendError(sess, 'no_room', 'join a room before pairing a pad');
+      return;
+    }
+    this.gcExpiredPairings(Date.now());
+    let code: string | null = null;
+    for (let attempt = 0; attempt < 16 && code === null; attempt++) {
+      const candidate = mintPairCode();
+      if (!this.pendingPads.has(candidate)) code = candidate; // collision ~impossible in 32^6
+    }
+    if (code === null) {
+      this.sendError(sess, 'pad_busy', 'could not allocate a pairing code, try again');
+      return;
+    }
+    this.pendingPads.set(code, {
+      roomId: room.id,
+      owner: sess.id,
+      expiresAt: Date.now() + PADS.pairTtlMs,
+    });
+    sess.send({
+      t: 'pad_pair',
+      room: room.id,
+      token: code,
+      urlPath: `/pad/?game=${room.info().game}&r=${room.id}`,
+    });
+  }
+
+  /**
+   * A pad device spends its code: bind this session to (room, owner). The
+   * code is consumed ONLY on success — wrong-room or gone-owner attempts
+   * leave it spendable where it belongs. Pads are never added to the room:
+   * no seat, no RoomInfo count, no stale sweep.
+   */
+  private joinAsPad(sess: Session, roomId: string, token: string): void {
+    const reject = (reason: string): void => sess.send({ t: 'pad_rejected', reason });
+    if (this.pads.has(sess.id)) {
+      reject('already_bound');
+      return;
+    }
+    const pending = this.pendingPads.get(token);
+    if (pending === undefined) {
+      reject('bad_code'); // unknown, already used, or expired-and-collected
+      return;
+    }
+    if (pending.expiresAt <= Date.now()) {
+      this.pendingPads.delete(token);
+      reject('expired_code');
+      return;
+    }
+    if (pending.roomId !== roomId) {
+      reject('room_mismatch'); // code stays valid for its own room
+      return;
+    }
+    const ownerRoom = this.sessionRoom.get(pending.owner);
+    if (ownerRoom === undefined || ownerRoom.id !== pending.roomId) {
+      this.pendingPads.delete(token);
+      reject('owner_gone'); // owner left the room between mint and bind
+      return;
+    }
+    this.pendingPads.delete(token); // single-use: consumed on successful bind
+    this.pads.set(sess.id, { roomId: pending.roomId, owner: pending.owner, windowStart: Date.now(), windowCount: 0 });
+    sess.send({ t: 'pad_joined' });
+    this.sessions.get(pending.owner)?.send({ t: 'pad_status', bound: true });
+    console.log(`[lobby] pad ${sess.id} paired to ${pending.owner} in room ${pending.roomId}`);
+  }
+
+  /**
+   * The ONLY message a pad session gets routed: relayed RAW into the room
+   * under the PAD session's own id (the game resolves the owning seat via
+   * RoomIO.padOwner), then acked for RTT estimation. Rate-capped at
+   * PADS.inputMaxHz per pad per second window — excess frames are dropped
+   * silently (no forward, no echo). Unbound pads are dropped too.
+   */
+  private padInput(padSessionId: PlayerId, msg: Extract<LobbyC2S, { t: 'pad_input' }>): void {
+    const binding = this.pads.get(padSessionId);
+    if (binding === undefined) return;
+    const tracked = this.rooms.get(binding.roomId);
+    if (tracked === undefined) return; // room closed under us (unbind races are synchronous)
+    const now = Date.now();
+    if (now - binding.windowStart >= 1000) {
+      binding.windowStart = now;
+      binding.windowCount = 0;
+    }
+    if (binding.windowCount >= PADS.inputMaxHz) return;
+    binding.windowCount += 1;
+    tracked.room.handleMessage(padSessionId, msg);
+    this.sessions.get(padSessionId)?.send({ t: 'pad_input_echo', seq: msg.seq });
+  }
+
+  /**
+   * Remove one pad binding. `notifyOwner` is false on paths where the owner
+   * is itself going away (its socket is closing / already told).
+   */
+  private detachPad(padSessionId: PlayerId, notifyOwner: boolean): void {
+    const binding = this.pads.get(padSessionId);
+    if (binding === undefined) return;
+    this.pads.delete(padSessionId);
+    if (!notifyOwner) return;
+    this.sessions.get(binding.owner)?.send({ t: 'pad_status', bound: false });
+  }
+
+  /** Unbind every pad owned by this player (owner left/was removed/disconnected). */
+  private unbindPadsForOwner(ownerId: PlayerId, notifyOwner: boolean): void {
+    for (const padId of [...this.pads.keys()]) {
+      const binding = this.pads.get(padId);
+      if (binding === undefined || binding.owner !== ownerId) continue;
+      this.detachPad(padId, false);
+    }
+    if (!notifyOwner) return;
+    this.sessions.get(ownerId)?.send({ t: 'pad_status', bound: false });
+  }
+
+  /** Unbind every pad feeding a closing room (empty reap, private close). */
+  private unbindPadsForRoom(roomId: RoomId): void {
+    for (const [padId, binding] of [...this.pads]) {
+      if (binding.roomId !== roomId) continue;
+      this.detachPad(padId, true);
+    }
   }
 }

@@ -13,7 +13,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { END_SECONDS, LOBBY_COUNTDOWN_S, MAP_SEED, MATCH_SECONDS, STALE_SECONDS, TICK_RATE } from '@aces/shared/config';
 import type { TeamId } from '@aces/shared/config';
-import type { S2C, SnapshotMsg } from '@aces/shared/protocol';
+import type { S2C, SnapPlane, SnapshotMsg } from '@aces/shared/protocol';
 import type { KillEvent } from '@aces/shared/types';
 import type { PlayerId, RoomIO } from '@platform/shared';
 import { AcesRoom } from './room.js';
@@ -103,19 +103,48 @@ function teamOf(log: readonly Sent[], id: PlayerId): TeamId {
  * after respawns.
  */
 function stageKill(room: AcesRoom, log: readonly Sent[], shooter: PlayerId, victimId?: PlayerId): void {
-  pump(room, shooter, 70); // > SPAWN_PROTECT_SECONDS for both sides
-  vi.advanceTimersByTime(80); // let the cadence deliver a post-protection snapshot
-  const snap = lastOf(snapsFor(log, shooter));
-  const victim =
-    snap?.planes.find((r) => (victimId ?? '?bot') === r.id || (victimId === undefined && r.bot && !r.dead));
-  const me = snap?.planes.find((r) => r.id === shooter && !r.dead);
-  if (snap === undefined || victim === undefined || me === undefined) {
-    throw new Error(`stageKill harness bug: missing snapshot rows (shooter=${shooter}, victim=${victimId})`);
+  /**
+   * Staging under LIVE bot brains is a pursuit problem, not a snapshot
+   * snapshot-and-hope: a wounded bot breaks off below FIRE_BELOW and can
+   * burn-crash outside any gun line (crash deaths credit nobody), and after
+   * one head-on pass the pursuer ends up astern of a rim-pinned shooter.
+   * So: re-place the shooter 40 u ASTERN OF THE BOT along the bot's own
+   * heading every ~30 ticks until a CREDITED kill by the shooter lands.
+   * `me.h` is set white-box — aligning a tail chase through tr inputs would
+   * need a full autopilot; the fixture's job is ballistics, not piloting.
+   */
+  const worldOf = () => (room as unknown as { world: AcesWorldView }).world;
+  const clampC = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
+  let seq = nextSeq();
+  for (let guard = 0; guard < 300; guard++) {
+    const w = worldOf();
+    const v =
+      w.planes.find((r) => r.id === (victimId ?? '\u0000none')) ??
+      w.planes.find((r) => r.bot && !r.dead);
+    const p = w.planes.find((r) => r.id === shooter);
+    if (v === undefined || p === undefined || v.dead || p.dead) {
+      if (p !== undefined && p.dead) room.handleMessage(shooter, { t: 'spawn', cls: 'fighter' });
+      pump(room, shooter, 10);
+      continue;
+    }
+    // tail placement + white-box aim + trigger
+    const px = clampC(v.x - Math.cos(v.h) * 40, 40, 3860);
+    const py = clampC(v.y - Math.sin(v.h) * 40, 40, 2960);
+    room.handleMessage(shooter, { t: 'debug', cmd: 'warp', x: px, y: py });
+    const meNow = worldOf().planes.find((r) => r.id === shooter);
+    if (meNow !== undefined) meNow.h = v.h;
+    room.handleMessage(shooter, { t: 'input', seq: seq++, th: 1, tr: 0, fire: true, boost: false });
+    room.handleMessage(shooter, { t: 'debug', cmd: 'tick', x: 30 });
+    const mine = creditedKills(log).find((k) => k.killer === shooter);
+    if (mine !== undefined) return; // witnessed: the staged gun line delivered
   }
-  const px = Math.min(3860, Math.max(40, victim.x - Math.cos(me.h) * 350));
-  const py = Math.min(2960, Math.max(40, victim.y - Math.sin(me.h) * 350));
-  room.handleMessage(shooter, { t: 'debug', cmd: 'warp', x: px, y: py });
-  room.handleMessage(shooter, { t: 'input', seq: nextSeq(), th: -0.3, tr: 0, fire: true, boost: false });
+  throw new Error(`stageKill: no credited kill within witness window (shooter=${shooter}, victim=${victimId})`);
+}
+
+/** White-box view used only by fixtures — mirrors World's live arrays. */
+interface AcesWorldView {
+  planes: Array<{ id: string; bot: boolean; dead: boolean; hp: number; x: number; y: number; h: number }>;
+  bullets: unknown[];
 }
 
 /** Debug 1v1: solo human + one bot, live. */
@@ -263,7 +292,13 @@ describe('scoring', () => {
   it('a credited kill moves the killer team ticket and ships a score msg', () => {
     const log: Sent[] = [];
     const room = makeDuel(log);
+    // Live bot brains hunt a passive human — god-mode keeps him alive so the
+    // first credited kill is deterministically his staged shot.
+    room.handleMessage('p1', { t: 'debug', cmd: 'god' });
     stageKill(room, log, 'p1');
+    // The kill may land inside stageKill's own witness window; move the wall
+    // clock so the 1/s-limited score broadcast deferral releases.
+    vi.advanceTimersByTime(1100);
 
     for (let i = 0; i < 80 && creditedKills(log).length === 0; i++) {
       pump(room, 'p1', 600);
@@ -273,7 +308,9 @@ describe('scoring', () => {
     }
     expect(creditedKills(log).length).toBeGreaterThanOrEqual(1);
     const myTeam = teamOf(log, 'p1');
-    expect(creditedKills(log)[0]?.killerTeam).toBe(myTeam);
+    const mine = creditedKills(log).filter((k) => k.killer === 'p1');
+    expect(mine.length).toBeGreaterThanOrEqual(1);
+    expect(mine[0]?.killerTeam).toBe(myTeam);
 
     vi.advanceTimersByTime(80);
     const tickets = lastOf(snapsFor(log, 'p1'))?.tickets;
@@ -295,6 +332,9 @@ describe('scoring', () => {
     const log: Sent[] = [];
     const room = makeDuel(log);
     const myTeam = teamOf(log, 'p1');
+    // Live bot brains will hunt a passive human — god-mode removes his death
+    // from the equation so the winner is fully determined by the staging.
+    room.handleMessage('p1', { t: 'debug', cmd: 'god' });
 
     for (let i = 0; i < 600 && sentOf(log, 'phase').every((p) => p.phase !== 'end'); i++) {
       if (i % 5 === 0) stageKill(room, log, 'p1'); // re-anchor after respawns

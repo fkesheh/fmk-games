@@ -113,6 +113,11 @@ export function stepPlane(p: PlaneState, input: InputFrame, dt: number): void {
   if (p.x > WORLD.W - m) p.vx -= (p.x - (WORLD.W - m)) * 8 * dt;
   if (p.y < m) p.vy += (m - p.y) * 8 * dt;
   if (p.y > WORLD.H - m) p.vy -= (p.y - (WORLD.H - m)) * 8 * dt;
+  // Hard clamp backstop: a plane pinned against the soft bound for thousands
+  // of ticks (debug fast-forward, AFK at the rim) can accumulate unbounded
+  // repel velocity and numerically blow up. Real play never sees this.
+  p.x = clamp(p.x, -m, WORLD.W + m);
+  p.y = clamp(p.y, -m, WORLD.H + m);
 
   // --- heat ----------------------------------------------------------------------------
   if (p.jammed) {

@@ -27,7 +27,8 @@
 //   truth and make the fallback explicit rather than assuming 'warmup'.
 // ============================================================================
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { GameModule, GameRoomHandle, PlayerId, RoomId, RoomIO, S2C } from '@platform/shared';
+import type { C2S, GameModule, GameRoomHandle, PlayerId, RoomId, RoomIO, S2C } from '@platform/shared';
+import { PADS, STATS } from '@platform/shared';
 import { Lobby } from './lobby.js';
 import type { Session } from './net.js';
 import { GAMES } from './registry.js';
@@ -466,5 +467,560 @@ describe('sig pass-through to GameRoomHandle.addPlayer', () => {
       'sig-joinpriv1',
       'sig-quickjoin1',
     ]);
+  });
+});
+
+// ============================================================================
+// v2 additions (specs/P4.md) — ws auth, pad pairing + input relay, the
+// RoomIO v2 members and their stats sink. Everything below is ADDITIVE;
+// every test above predates P4 and is the regression gate for it.
+//
+// Harness notes (v2)
+// ------------------
+// - SpyStore satisfies Lobby's STRUCTURAL store seam ({profileIdByToken,
+//   profileById, addStats}) without touching node:sqlite — exactly how the
+//   real services/db.ts Store plugs in through index.ts.
+// - makePadSpyModule captures what a real GameRoomHandle would swallow:
+//   handleMessage args (pad relay), addPlayer calls ("pads are NOT players"),
+//   and the RoomIO instance itself (so tests can call profileId/reportStats/
+//   padOwner the way a v2 game would).
+// - Messages go straight into Lobby.handleMessage as typed C2S literals,
+//   like every pre-v2 test here — net.ts's parseC2S is upstream of this seam.
+// ============================================================================
+
+/** 43-char base64url strings — the exact shape isValidToken accepts. */
+const TOKEN_A = 'a'.repeat(43);
+const TOKEN_B = 'b'.repeat(43);
+
+/**
+ * Minimal spy double for the platform Store. Records stats writes so tests
+ * can assert on the exact (profileId, gameId, delta) tuple the gateway wrote.
+ */
+class SpyStore {
+  readonly statsWrites: Array<{ profileId: string; gameId: string; delta: Record<string, number> }> = [];
+  private readonly profiles = new Map<string, { id: string; name: string }>();
+  private readonly tokens = new Map<string, string>();
+
+  seed(profileId: string, name: string, token: string): void {
+    this.profiles.set(profileId, { id: profileId, name });
+    this.tokens.set(token, profileId);
+  }
+
+  profileIdByToken(token: string): string | null {
+    return this.tokens.get(token) ?? null;
+  }
+
+  profileById(id: string): { id: string; name: string } | null {
+    return this.profiles.get(id) ?? null;
+  }
+
+  addStats(profileId: string, gameId: string, delta: Record<string, number>): void {
+    this.statsWrites.push({ profileId, gameId, delta });
+  }
+}
+
+type PadInputMsg = Extract<C2S, { t: 'pad_input' }>;
+
+/** One valid pad_input frame (values already inside wire limits). */
+function padFrame(seq: number): PadInputMsg {
+  return { t: 'pad_input', seq, lx: 0, ly: 0, rx: 0, ry: 0, buttons: 0 };
+}
+
+interface PadSpyModule {
+  mod: GameModule;
+  /** Every (playerId, msg) the room received via handleMessage. */
+  forwarded: Array<{ playerId: PlayerId; msg: unknown }>;
+  /** Every id handed to addPlayer — pads must never appear here. */
+  addedPlayers: PlayerId[];
+  roomIds: readonly RoomId[];
+  /** The RoomIO the module was created with (defined after first createRoom). */
+  io(): RoomIO;
+}
+
+/**
+ * The lobby always wires the OPTIONAL v2 members onto its shared RoomIO;
+ * this narrows them from `?`-optional to definite so tests can call them
+ * exactly the way a v2 game would.
+ */
+function v2io(io: RoomIO): Required<Pick<RoomIO, 'profileId' | 'reportStats' | 'padOwner'>> {
+  const { profileId, reportStats, padOwner } = io;
+  if (profileId === undefined || reportStats === undefined || padOwner === undefined) {
+    throw new Error('expected the lobby io bridge to carry all v2 members');
+  }
+  return { profileId, reportStats, padOwner };
+}
+
+/**
+ * A minimal real-plumbed module whose observable surface is everything the
+ * relay/stats tests need. Room ids are `${id}-room-N` (4–16 chars, so they
+ * pass parseC2S's join_as_pad room validation).
+ */
+function makePadSpyModule(id: string): PadSpyModule {
+  const forwarded: Array<{ playerId: PlayerId; msg: unknown }> = [];
+  const addedPlayers: PlayerId[] = [];
+  const roomIds: RoomId[] = [];
+  let created: RoomIO | null = null;
+  let count = 0;
+
+  const mod: GameModule = {
+    id,
+    name: id.toUpperCase(),
+    clientDist: '',
+    minPlayers: 1,
+    maxPlayers: 4,
+    createRoom(opts) {
+      created = opts.io;
+      const roomId: RoomId = `${id}-room-${roomIds.length}`;
+      roomIds.push(roomId);
+      const visibility = opts.visibility;
+      const room: GameRoomHandle = {
+        id: roomId,
+        info: () => ({
+          id: roomId,
+          code: null,
+          game: id,
+          label: '',
+          players: count,
+          maxPlayers: 4,
+          phase: 'warmup',
+          visibility,
+        }),
+        playerCount: () => count,
+        stalePlayers: () => [],
+        addPlayer(playerId) {
+          addedPlayers.push(playerId);
+          count += 1;
+          opts.io.send(playerId, { t: 'padspy_hello', roomId });
+        },
+        removePlayer() {
+          count = Math.max(0, count - 1);
+        },
+        handleMessage(playerId, msg) {
+          forwarded.push({ playerId, msg });
+        },
+        start() {},
+        stop() {},
+      };
+      return room;
+    },
+  };
+  return {
+    mod,
+    forwarded,
+    addedPlayers,
+    roomIds,
+    io(): RoomIO {
+      if (created === null) throw new Error('makePadSpyModule: createRoom has not run yet');
+      return created;
+    },
+  };
+}
+
+/** Ask for a pairing code as an in-room player and hand back the typed reply. */
+function requestPair(lobby: Lobby, owner: FakeSession): Extract<S2C, { t: 'pad_pair' }> {
+  lobby.handleMessage(asSession(owner), { t: 'pad_pair_request' });
+  const pair = owner.last('pad_pair');
+  if (pair === undefined) throw new Error('expected a pad_pair reply');
+  return pair;
+}
+
+/** A pad device spending `pair` (the join_as_pad hop of the pairing flow). */
+function joinAsPad(lobby: Lobby, pad: FakeSession, pair: { room: string; token: string }): void {
+  lobby.handleMessage(asSession(pad), { t: 'join_as_pad', room: pair.room, token: pair.token });
+}
+
+/** Count S2C messages of one tag a session received (echo counting etc.). */
+function countTag(sess: FakeSession, tag: S2C['t']): number {
+  return sess.all().filter((m) => m.t === tag).length;
+}
+
+/** Mint + bind in one step; throws unless BOTH sides saw success. */
+function pairAndBind(lobby: Lobby, owner: FakeSession, pad: FakeSession): void {
+  const pair = requestPair(lobby, owner);
+  joinAsPad(lobby, pad, pair);
+  if (pad.last('pad_joined') === undefined) throw new Error('pad was not bound (no pad_joined)');
+}
+
+// ---- v2 ws auth -------------------------------------------------------------
+
+describe('v2 ws auth (specs/P4.md)', () => {
+  let tracked: Lobby[] = [];
+
+  afterEach(() => {
+    for (const l of tracked) l.close();
+    tracked = [];
+  });
+
+  it('a valid token binds the profile: auth_ok carries its id + platform name', () => {
+    const store = new SpyStore();
+    store.seed('prof-ada', 'AdaPrime', TOKEN_A);
+    const lobby = new Lobby([RIFT], store);
+    tracked.push(lobby);
+
+    const s = new FakeSession('p1');
+    lobby.handleMessage(asSession(s), { t: 'auth', token: TOKEN_A });
+
+    expect(s.last('auth_ok')).toEqual({ t: 'auth_ok', profileId: 'prof-ada', name: 'AdaPrime' });
+    expect(s.last('auth_err')).toBeUndefined();
+  });
+
+  it('an unknown token answers auth_err with a message, binding nothing', () => {
+    const store = new SpyStore();
+    store.seed('prof-ada', 'AdaPrime', TOKEN_A);
+    const lobby = new Lobby([RIFT], store);
+    tracked.push(lobby);
+
+    const s = new FakeSession('p1');
+    lobby.handleMessage(asSession(s), { t: 'auth', token: TOKEN_B }); // right shape, nobody's token
+
+    const err = s.last('auth_err');
+    expect(err).toBeDefined();
+    expect(err?.message.length ?? 0).toBeGreaterThan(0);
+    expect(s.last('auth_ok')).toBeUndefined();
+  });
+
+  it('a second auth replaces the first (protocol: idempotent, latest wins)', () => {
+    const store = new SpyStore();
+    store.seed('prof-ada', 'AdaPrime', TOKEN_A);
+    store.seed('prof-bob', 'BobPrime', TOKEN_B);
+    const lobby = new Lobby([RIFT], store);
+    tracked.push(lobby);
+
+    const s = new FakeSession('p1');
+    lobby.handleMessage(asSession(s), { t: 'auth', token: TOKEN_A });
+    lobby.handleMessage(asSession(s), { t: 'auth', token: TOKEN_B });
+
+    expect(countTag(s, 'auth_ok')).toBe(2);
+    expect(s.last('auth_ok')?.profileId).toBe('prof-bob');
+  });
+
+  it('a pre-v2 lobby built WITHOUT a store still answers auth_err rather than throwing', () => {
+    const lobby = new Lobby([RIFT]); // legacy constructor arity, unchanged
+    tracked.push(lobby);
+
+    const s = new FakeSession('p1');
+    expect(() => lobby.handleMessage(asSession(s), { t: 'auth', token: TOKEN_A })).not.toThrow();
+    expect(s.last('auth_err')).toBeDefined();
+    expect(s.last('auth_ok')).toBeUndefined();
+  });
+});
+
+// ---- pad pairing ------------------------------------------------------------
+
+describe('pad pairing (specs/P4.md)', () => {
+  let tracked: Lobby[] = [];
+
+  afterEach(() => {
+    for (const l of tracked) l.close();
+    tracked = [];
+  });
+
+  it('in-room pad_pair_request mints a claim-shaped code + the /pad/?game&r=<room> URL (real rift room)', () => {
+    const lobby = new Lobby([RIFT]);
+    tracked.push(lobby);
+
+    const host = new FakeSession('host');
+    lobby.handleMessage(asSession(host), { t: 'quick_join', name: 'Host', game: 'rift' });
+    const roomId = riftRoomIdSeenBy(host);
+
+    const pair = requestPair(lobby, host);
+    expect(pair.room).toBe(roomId);
+    expect(pair.token).toMatch(/^[A-HJ-NP-Z2-9]{6}$/); // CLAIM_ALPHABET shape (isValidPairCode)
+    expect(pair.urlPath).toBe(`/pad/?game=rift&r=${roomId}`);
+  });
+
+  it('pad_pair_request outside any room is refused with an error, no token minted', () => {
+    const lobby = new Lobby([RIFT]);
+    tracked.push(lobby);
+
+    const loner = new FakeSession('loner');
+    lobby.handleMessage(asSession(loner), { t: 'pad_pair_request' });
+
+    expect(loner.last('pad_pair')).toBeUndefined();
+    expect(loner.last('error')?.code).toBe('no_room');
+  });
+
+  it('join_as_pad happy path binds pad↔(room,owner) — and pads are NOT players', () => {
+    const spy = makePadSpyModule('padspec');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+
+    const owner = new FakeSession('owner');
+    lobby.handleMessage(asSession(owner), { t: 'quick_join', name: 'Host', game: 'padspec' });
+    const pad = new FakeSession('phone-1');
+    pairAndBind(lobby, owner, pad);
+
+    expect(pad.last('pad_joined')).toBeDefined();
+    expect(owner.last('pad_status')).toEqual({ t: 'pad_status', bound: true });
+    // invisible to membership: no seat consumed, count unchanged
+    expect(spy.addedPlayers).toEqual(['owner']);
+    lobby.handleMessage(asSession(owner), { t: 'list_rooms' });
+    expect(owner.last('room_list')?.rooms[0]?.players).toBe(1);
+    // RoomIO.padOwner resolves the pad SESSION id to its owning seat
+    expect(v2io(spy.io()).padOwner('phone-1')).toBe('owner');
+  });
+
+  it('an unknown code is rejected (bad_code)', () => {
+    const spy = makePadSpyModule('padspec');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const owner = new FakeSession('owner');
+    lobby.handleMessage(asSession(owner), { t: 'quick_join', name: 'Host', game: 'padspec' });
+
+    const pad = new FakeSession('phone-1');
+    joinAsPad(lobby, pad, { room: spy.roomIds[0] ?? '', token: 'X9X9X9' });
+
+    expect(pad.last('pad_rejected')?.reason).toBe('bad_code');
+    expect(pad.last('pad_joined')).toBeUndefined();
+    expect(owner.last('pad_status')).toBeUndefined(); // owner never told bound:true
+  });
+
+  it('a consumed code cannot bind twice (single use)', () => {
+    const spy = makePadSpyModule('padspec');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const owner = new FakeSession('owner');
+    lobby.handleMessage(asSession(owner), { t: 'quick_join', name: 'Host', game: 'padspec' });
+
+    const first = requestPair(lobby, owner);
+    joinAsPad(lobby, new FakeSession('phone-1'), first); // spent here
+    expect(countTag(owner, 'pad_status')).toBe(1);
+
+    const second = new FakeSession('phone-2');
+    joinAsPad(lobby, second, first); // replayed token
+
+    expect(second.last('pad_rejected')?.reason).toBe('bad_code'); // already consumed
+    expect(second.last('pad_joined')).toBeUndefined();
+    expect(countTag(owner, 'pad_status')).toBe(1); // no second bound:true
+  });
+
+  it('a code past PADS.pairTtlMs is rejected (TTL)', () => {
+    vi.useFakeTimers();
+    try {
+      const spy = makePadSpyModule('padttl');
+      const lobby = new Lobby([spy.mod]);
+      tracked.push(lobby);
+      const owner = new FakeSession('owner');
+      lobby.handleMessage(asSession(owner), { t: 'quick_join', name: 'Host', game: 'padttl' });
+      const pair = requestPair(lobby, owner);
+
+      vi.advanceTimersByTime(PADS.pairTtlMs + 1);
+      const late = new FakeSession('phone-1');
+      joinAsPad(lobby, late, pair);
+
+      expect(late.last('pad_rejected')).toBeDefined();
+      expect(late.last('pad_joined')).toBeUndefined();
+      expect(owner.last('pad_status')).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a valid code aimed at the WRONG room is rejected without being consumed', () => {
+    const spy = makePadSpyModule('padspec');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const owner = new FakeSession('owner');
+    lobby.handleMessage(asSession(owner), { t: 'quick_join', name: 'Host', game: 'padspec' });
+    const pair = requestPair(lobby, owner);
+
+    const confused = new FakeSession('phone-x');
+    joinAsPad(lobby, confused, { room: 'not-this-room', token: pair.token });
+    expect(confused.last('pad_rejected')?.reason).toBe('room_mismatch');
+
+    // mismatch did NOT spend the single-use code: the right room still binds
+    const right = new FakeSession('phone-1');
+    joinAsPad(lobby, right, pair);
+    expect(right.last('pad_joined')).toBeDefined();
+  });
+
+  it('if the owner left between mint and bind, the code is dead (owner_gone)', () => {
+    const spy = makePadSpyModule('padspec');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const owner = new FakeSession('owner');
+    lobby.handleMessage(asSession(owner), { t: 'quick_join', name: 'Host', game: 'padspec' });
+    const pair = requestPair(lobby, owner);
+
+    lobby.handleMessage(asSession(owner), { t: 'leave' });
+    const pad = new FakeSession('phone-1');
+    joinAsPad(lobby, pad, pair);
+
+    expect(pad.last('pad_rejected')?.reason).toBe('owner_gone');
+    expect(pad.last('pad_joined')).toBeUndefined();
+  });
+});
+
+// ---- pad input relay ----------------------------------------------------------
+
+describe('pad input relay (specs/PADS.inputMaxHz)', () => {
+  let tracked: Lobby[] = [];
+
+  afterEach(() => {
+    for (const l of tracked) l.close();
+    tracked = [];
+  });
+
+  /** Owner in-room + one bound pad; returns the fixtures the tests poke at. */
+  function setupBound(): { lobby: Lobby; spy: PadSpyModule; owner: FakeSession; pad: FakeSession } {
+    const spy = makePadSpyModule('relay');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const owner = new FakeSession('owner');
+    lobby.handleMessage(asSession(owner), { t: 'quick_join', name: 'Host', game: 'relay' });
+    const pad = new FakeSession('phone-1');
+    pairAndBind(lobby, owner, pad);
+    return { lobby, spy, owner, pad };
+  }
+
+  it('bound pad_input reaches the room RAW under the PAD session id, then echoes seq', () => {
+    const { lobby, spy, pad } = setupBound();
+    const frame = { ...padFrame(7), lx: 0.5, ly: -0.5, buttons: 3 };
+
+    lobby.handleMessage(asSession(pad), frame);
+
+    expect(spy.forwarded).toEqual([{ playerId: 'phone-1', msg: frame }]);
+    expect(pad.last('pad_input_echo')).toEqual({ t: 'pad_input_echo', seq: 7 });
+  });
+
+  it('frames beyond PADS.inputMaxHz inside the window are dropped silently (no forward, no echo)', () => {
+    const { lobby, spy, pad } = setupBound();
+    for (let seq = 0; seq < PADS.inputMaxHz + 15; seq++) {
+      lobby.handleMessage(asSession(pad), padFrame(seq));
+    }
+
+    expect(spy.forwarded.length).toBe(PADS.inputMaxHz);
+    expect(countTag(pad, 'pad_input_echo')).toBe(PADS.inputMaxHz);
+    // the FIRST maxHz frames win, excess is what got cut
+    const lastForwarded = spy.forwarded[spy.forwarded.length - 1];
+    expect((lastForwarded?.msg as PadInputMsg | undefined)?.seq).toBe(PADS.inputMaxHz - 1);
+  });
+
+  it("an UNBOUND session's pad_input goes nowhere at all", () => {
+    const { lobby, spy } = setupBound();
+
+    const ghost = new FakeSession('ghost-pad');
+    lobby.handleMessage(asSession(ghost), padFrame(1));
+
+    expect(spy.forwarded).toEqual([]);
+    expect(ghost.last('pad_input_echo')).toBeUndefined();
+  });
+
+  it('pad disconnect unbinds: the owner hears bound:false and later frames are dropped', () => {
+    const { lobby, spy, owner, pad } = setupBound();
+
+    lobby.handleDisconnect(asSession(pad));
+
+    expect(owner.last('pad_status')).toEqual({ t: 'pad_status', bound: false });
+    lobby.handleMessage(asSession(pad), padFrame(99)); // zombie frames after close
+    expect(spy.forwarded).toEqual([]);
+  });
+
+  it('the OWNER leaving unbinds the pad and hears bound:false itself', () => {
+    const { lobby, spy, owner, pad } = setupBound();
+
+    lobby.handleMessage(asSession(owner), { t: 'leave' });
+
+    expect(owner.last('pad_status')).toEqual({ t: 'pad_status', bound: false });
+    expect(v2io(spy.io()).padOwner('phone-1')).toBeNull();
+    lobby.handleMessage(asSession(pad), padFrame(5));
+    expect(spy.forwarded).toEqual([]); // no longer routed anywhere
+  });
+});
+
+// ---- RoomIO v2 members ---------------------------------------------------------
+
+describe('RoomIO v2 members: profileId / reportStats / padOwner (specs/P4.md)', () => {
+  let tracked: Lobby[] = [];
+
+  afterEach(() => {
+    for (const l of tracked) l.close();
+    tracked = [];
+  });
+
+  function setupWith(store: SpyStore): { lobby: Lobby; spy: PadSpyModule; p1: FakeSession } {
+    const spy = makePadSpyModule('ioroom');
+    const lobby = new Lobby([spy.mod], store);
+    tracked.push(lobby);
+    const p1 = new FakeSession('p1');
+    lobby.handleMessage(asSession(p1), { t: 'quick_join', name: 'P1', game: 'ioroom' });
+    return { lobby, spy, p1 };
+  }
+
+  it('profileId: "" while anonymous, the bound profile once authed, "" for unknown ids', () => {
+    const store = new SpyStore();
+    store.seed('prof-1', 'AdaPrime', TOKEN_A);
+    const { lobby, spy, p1 } = setupWith(store);
+    const io = v2io(spy.io());
+
+    expect(io.profileId('p1')).toBe('');
+    lobby.handleMessage(asSession(p1), { t: 'auth', token: TOKEN_A });
+    expect(io.profileId('p1')).toBe('prof-1');
+    expect(io.profileId('bot-with-no-session')).toBe('');
+  });
+
+  it('reportStats clamps to STATS limits and writes through under (profileId, room gameId)', () => {
+    const store = new SpyStore();
+    store.seed('prof-1', 'AdaPrime', TOKEN_A);
+    const { lobby, spy, p1 } = setupWith(store);
+    lobby.handleMessage(asSession(p1), { t: 'auth', token: TOKEN_A });
+    const io = v2io(spy.io());
+
+    io.reportStats('p1', {
+      kills: 3,
+      huge: 5 * STATS.maxValue, // clamps down to +STATS.maxValue
+      neg: -7,
+      nan: Number.NaN, // dropped
+      inf: Infinity, // dropped
+    });
+
+    expect(store.statsWrites).toEqual([
+      { profileId: 'prof-1', gameId: 'ioroom', delta: { kills: 3, huge: STATS.maxValue, neg: -7 } },
+    ]);
+  });
+
+  it('anonymous players report nothing (no-op, no store write)', () => {
+    const store = new SpyStore();
+    const { spy } = setupWith(store);
+
+    v2io(spy.io()).reportStats('p1', { kills: 1 }); // p1 never authenticated
+
+    expect(store.statsWrites).toEqual([]);
+  });
+
+  it('at most STATS.maxKeysPerDelta keys survive one report', () => {
+    const store = new SpyStore();
+    store.seed('prof-1', 'AdaPrime', TOKEN_A);
+    const { lobby, spy, p1 } = setupWith(store);
+    lobby.handleMessage(asSession(p1), { t: 'auth', token: TOKEN_A });
+
+    const twentyKeys: Record<string, number> = {};
+    for (let i = 0; i < 20; i++) twentyKeys[`k${i}`] = 1;
+    v2io(spy.io()).reportStats('p1', twentyKeys);
+
+    expect(Object.keys(store.statsWrites[0]?.delta ?? {}).length).toBe(STATS.maxKeysPerDelta);
+  });
+
+  it('a THROWING store never propagates out of reportStats or auth (game threads stay alive)', () => {
+    const boom = {
+      profileIdByToken(): string | null {
+        throw new Error('db gone');
+      },
+      profileById(): { id: string; name: string } | null {
+        throw new Error('db gone');
+      },
+      addStats(): void {
+        throw new Error('db gone');
+      },
+    };
+    const spy = makePadSpyModule('boomgame');
+    const lobby = new Lobby([spy.mod], boom);
+    tracked.push(lobby);
+    const p1 = new FakeSession('p1');
+    lobby.handleMessage(asSession(p1), { t: 'quick_join', name: 'P1', game: 'boomgame' });
+
+    expect(() => v2io(spy.io()).reportStats('p1', { kills: 1 })).not.toThrow();
+    expect(() => lobby.handleMessage(asSession(p1), { t: 'auth', token: TOKEN_A })).not.toThrow();
+    expect(p1.last('auth_err')).toBeDefined();
   });
 });

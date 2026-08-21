@@ -8,6 +8,13 @@
 // lobby reaps empty rooms in the same poll), and shut down cleanly on
 // SIGTERM/SIGINT. A throwing hook must never kill the process: net.ts wraps
 // hook calls, the lobby wraps its bodies, and the sweep wraps its poll.
+//
+// v2 (specs/P4.md): a Store (sqlite file platform.db beside this package,
+// PLATFORM_DB env override, ':memory:' honored; open failure degrades to
+// in-memory with a loud log) backs both the REST surface — an HttpApi mounted
+// as net.start's FIRST-consulted api hook (/api/* + /pad) — and the lobby's
+// ws auth + stats sink. Everything below stays byte-for-byte the pre-v2
+// gateway otherwise.
 // ============================================================================
 import { existsSync } from 'node:fs';
 import path from 'node:path';
@@ -16,8 +23,22 @@ import { NetServer, probeDevServer, type Mount } from './net.js';
 import { Lobby } from './lobby.js';
 import { createPwaResolver, type PwaIdentity } from './pwa.js';
 import { GAMES } from './registry.js';
+import { Store } from './services/db.js';
+import { HttpApi } from './services/httpApi.js';
 
 const PORT = Number(process.env.PORT ?? 8080);
+
+/**
+ * Storage location for the v2 services. PLATFORM_DB overrides (deployments
+ * point it at a mounted volume); the literal ':memory:' is passed straight
+ * through (node:sqlite opens a real memory db — fully functional, nothing to
+ * persist). Default: platform.db in this package's root (gitignored), per
+ * docs/PLATFORM.md §6. A path that cannot be opened degrades INSIDE Store —
+ * the process never dies over persistence.
+ */
+const DB_PATH = process.env.PLATFORM_DB ?? path.join(import.meta.dirname, '..', 'platform.db');
+const store = new Store(DB_PATH);
+if (store.degraded) console.log('[platform] db degraded — running in-memory');
 
 /**
  * Mounts for the multi-game layout: one '/<id>/' prefix per registered
@@ -91,6 +112,8 @@ const LPAL = {
   wordbombTint: '#28303a', //  WPAL.slate    — WORDBOMB: dark-room slate
   riftAccent: '#d9b25f', //    APAL.gold     — ANCIENTS: ancient gold
   riftTint: '#2e3827', //      APAL.moss     — ANCIENTS: dusk moss
+  acesAccent: '#f0a03a', //    APAL.tracer    — ACES: tracer amber
+  acesTint: '#274e74', //      APAL.royalNavy — ACES: cobalt slate sky
   splatAccent: '#f2b72e', //   SPAL.sunGold  — SKI SPLAT: ski-race gold
   // SPAL has no dark entry suited to a card tint (SPAL.ink is the paint guard
   // itself), so this is skyZenith-derived: #2c5fb8 deepened into the other
@@ -142,6 +165,12 @@ const COPY: Record<string, GameCopy | undefined> = {
       'Push lanes, last-hit for gold, raze towers. Break their Ancient before they break yours — 2v2 to 8v8, bots fill the rest.',
     tags: ['2v2–8v8', 'Bot fill'],
   },
+  aces: {
+    genre: 'Dogfight arena',
+    blurb:
+      'WWI dawn patrol over a cold strait. Two squadrons, forward-firing twin guns, first to 25 kills — bots fill the flight.',
+    tags: ['1v1–4v4', 'Bot fill'],
+  },
   splat: {
     genre: 'Downhill ski racer',
     blurb:
@@ -173,6 +202,7 @@ const IDENTITY: Record<string, PwaIdentity | undefined> = {
   wordbomb: { accent: LPAL.wordbombAccent, tint: LPAL.wordbombTint },
   rift: { accent: LPAL.riftAccent, tint: LPAL.riftTint },
   splat: { accent: LPAL.splatAccent, tint: LPAL.splatTint },
+  aces: { accent: LPAL.acesAccent, tint: LPAL.acesTint },
 };
 const NEUTRAL_IDENTITY: PwaIdentity = {
   accent: LPAL.neutralAccent,
@@ -502,7 +532,8 @@ ${swScript}  </body>
 `;
 }
 
-const lobby = new Lobby(GAMES);
+const api = new HttpApi({ store, games: GAMES });
+const lobby = new Lobby(GAMES, store);
 const net = new NetServer({
   onMessage: (sess, msg) => lobby.handleMessage(sess, msg),
   onDisconnect: (sess) => lobby.handleDisconnect(sess),
@@ -535,7 +566,9 @@ resolveMounts(GAMES)
       launcherName: LAUNCHER_NAME,
       launcherShortName: LAUNCHER_SHORT_NAME,
     });
-    net.start(PORT, mounts, html, assets);
+    // api hook first (net.ts consults it before any static/proxy routing):
+    // true = the request lived under /api/* or /pad and is already answered.
+    net.start(PORT, mounts, html, assets, (req, res) => api.handle(req, res));
   })
   .catch((err: unknown) => {
     console.error('[server] startup failed', err);
@@ -560,6 +593,7 @@ function shutdown(signal: string): void {
   clearInterval(sweep);
   lobby.close(); // stop room tick intervals
   net.close(); // terminate sockets, close ws + http
+  store.close(); // flush + release the sqlite file (no-op in memory mode)
   setTimeout(() => process.exit(0), 200).unref(); // let close frames flush
 }
 

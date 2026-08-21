@@ -475,6 +475,23 @@ export function createNet(): NetClient {
       case 'snapshot': {
         const view = parseSnapshot(raw, rtt);
         if (view === null) return; // malformed frame: dropped, never fatal
+        // REGISTER-ON-FIRST-USE BRIDGE (C_APP integration, disclosed): the
+        // frozen seam types NetHandlers.onSnapshot as a REGISTRATION hook —
+        // the app hands back its consumer when we call it — yet nothing in
+        // this module ever invoked that registration nor assigned the private
+        // pump slot below, so every parsed snapshot died right here. Bridge:
+        // on the first view of a session (connect() resets the slot), ask the
+        // app's handlers to register; its synchronous fn(consumer) round-trip
+        // fills the slot before the very pump line runs, so even this first
+        // view is delivered.
+        if (snapshotFn === null && handlers !== null) {
+          handlers.onSnapshot((consumer) => {
+            // Registrar-relay: the app invokes us synchronously with its
+            // consumer. The seam's contextual typing names that argument
+            // "a snapshot" — the exact disguise documented in app.ts.
+            snapshotFn = consumer as unknown as (snap: SnapshotView) => void;
+          });
+        }
         snapshotFn?.(view);
         return;
       }

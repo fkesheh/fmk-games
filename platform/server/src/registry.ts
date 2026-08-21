@@ -2,6 +2,7 @@
 // COMPOSITION ROOT — the ONLY platform file that may import a game.
 // Register each game's GameModule here; net.ts and lobby.ts stay game-agnostic.
 // ============================================================================
+import { acesModule } from '@aces/server';
 import { bankModule } from '@bank/server';
 import { fpsModule } from '@fps/server';
 import { kartModule } from '@kart/server';
@@ -19,4 +20,5 @@ export const GAMES: GameModule[] = [
   riftModule,
   splatModule,
   outpostModule,
+  acesModule,
 ];

@@ -78,6 +78,9 @@ export class World {
    * next step, costing at most one tick of latency.
    */
   private readonly events: GameEvent[] = [];
+  /** Inter-step emissions (debug verbs); flushed at the head of the next step. */
+  private readonly parkedEvents: GameEvent[] = [];
+  private inStep = false;
   /**
    * Swept-hit scratch buffers (RULES 4: zero per-tick allocation). Before
    * stepBullets moves each bullet we snapshot its position; stepBullets splices
@@ -215,11 +218,18 @@ export class World {
 
   /**
    * Advance one fixed tick; returns this tick's events in emit order. The
-   * returned array is reused — consume it before the next step().
+   * returned array is reused — consume it before the next step(). Events
+   * emitted between steps (debug verbs) are parked and flushed here first.
    */
   step(dt: number): GameEvent[] {
     const ev = this.events;
     ev.length = 0;
+    this.inStep = true;
+    // Flush events emitted between ticks (debug verbs land here).
+    if (this.parkedEvents.length > 0) {
+      for (const e of this.parkedEvents) ev.push(e);
+      this.parkedEvents.length = 0;
+    }
 
     // -- 1. flight: every plane integrates its latest stored input ------------
     for (const p of this.planes) {
@@ -365,6 +375,7 @@ export class World {
     }
 
     this.tick++;
+    this.inStep = false;
     return ev;
   }
 
@@ -376,7 +387,13 @@ export class World {
 
   private placeCrate(x: number, y: number): void {
     this.crates.push({ id: this.nextCrateId++, x, y, phase: 'fall', t: CRATE_FALL_S });
-    this.events.push({ kind: 'crate', what: 'spawn', x, y });
+    // Debug verbs fire between steps — park there; in-step spawner flushes live.
+    (this.inStep ? this.events : this.parkedEvents).push({
+      kind: 'crate',
+      what: 'spawn',
+      x,
+      y,
+    });
   }
 
   /**

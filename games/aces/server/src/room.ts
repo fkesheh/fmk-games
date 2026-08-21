@@ -32,6 +32,7 @@
 // ============================================================================
 import {
   BOT_CLASS_WEIGHTS,
+  BOT_DIFFICULTY,
   BOT_NAMES,
   CLASSES,
   END_SECONDS,
@@ -64,6 +65,7 @@ import type {
 import type { GameEvent, InputFrame, KillEvent, MatchPhase, PlaneState, ScoreRow } from '@aces/shared/types';
 import type { GameRoomHandle, PlayerId, RoomId, RoomInfo, RoomIO, Visibility } from '@platform/shared';
 import { World } from './world.js';
+import { computeIntent, type BotMem } from './bots.js';
 
 // ---- derived clocks (single derivation point; seconds -> ticks) ------------
 const TICK_DT_S = 1 / TICK_RATE;
@@ -151,6 +153,8 @@ export class AcesRoom implements GameRoomHandle {
    * round is byte-reproducible given the same input sequence.
    */
   private readonly roundSeed = MAP_SEED;
+  /** INTEG wiring: persistent pilot memory per bot id (S_BOTS contract). */
+  private readonly botMems = new Map<PlayerId, BotMem>();
 
   private readonly seats = new Map<PlayerId, Seat>();
   private botSeq = 0;
@@ -393,6 +397,36 @@ export class AcesRoom implements GameRoomHandle {
    * the debug `tick` fast-forward verb, so CI advances the sim through the
    * SAME path the interval uses — there is no second code path to diverge.
    */
+  /**
+   * INTEG plug point (S_ROOM × S_BOTS seam): one computeIntent call per living
+   * bot per tick, feeding world.setInput. Memory persists across deaths within
+   * a round; a fresh round wipes it with everything else.
+   */
+  private driveBots(): void {
+    if (!this.settings.botFill || this.seats.size === 0) return;
+    const diff = BOT_DIFFICULTY[this.settings.difficulty];
+    const planes = this.world.planes;
+    const bullets = this.world.bullets;
+    for (const seat of this.seats.values()) {
+      if (!seat.bot || seat.botRng === null) continue;
+      const p = this.world.planes.find((q) => q.id === seat.id);
+      if (p === undefined || p.dead) continue;
+      let mem = this.botMems.get(seat.id);
+      if (mem === undefined) {
+        mem = { targetId: null, reactT: 0, weavePhase: (hashStr(seat.name) % 997) / 997 };
+        this.botMems.set(seat.id, mem);
+      }
+      const frame = computeIntent(
+        { self: p, others: planes, bullets, map: this.map },
+        diff,
+        seat.botRng,
+        mem,
+        TICK_DT_S,
+      );
+      this.world.setInput(p.id, frame);
+    }
+  }
+
   private simTick(): void {
     this.matchRemainTick--;
     if (this.matchRemainTick <= 0 && !this.suddenDeath) {
@@ -412,6 +446,7 @@ export class AcesRoom implements GameRoomHandle {
       }
     }
 
+    this.driveBots(); // INTEG: bot intents land BEFORE the step that consumes them
     const events = this.world.step(TICK_DT_S); // World returns its reused buffer — consume now
     this.processEvents(events);
     if (this.phase !== 'live') return; // that step's kill just ended the match
@@ -552,6 +587,10 @@ export class AcesRoom implements GameRoomHandle {
    */
   private goLive(): void {
     this.world = new World(this.map, this.settings, this.roundSeed);
+    this.botMems.clear();
+    for (const s of this.seats.values()) {
+      if (s.bot && s.botRng !== null) s.botRng = mulberry32((hashStr(s.name) + this.roundSeed) >>> 0);
+    }
     for (const s of this.seats.values()) {
       this.world.addPlayer(s.id, s.name, s.team, s.bot);
       s.kills = 0;

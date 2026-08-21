@@ -223,7 +223,7 @@ export class EffectsSystem implements EffectsApi {
     const step = Math.min(dt, 0.12); // hitch clamp: a tab-switch never teleports ink
     for (let i = 0; i < this.n; ) {
       if (this.dly[i]! > 0) {
-        this.dly[i] -= step; // anticipation: staged before its strike moment
+        this.dly[i] = this.dly[i]! - step; // anticipation: staged before its strike moment
         i++;
         continue;
       }
@@ -235,11 +235,11 @@ export class EffectsSystem implements EffectsApi {
       this.age[i] = age;
       const dr = DRAG[this.kind[i]!]! * step;
       const k = dr < 1 ? 1 - dr : 0;
-      this.vx[i] *= k;
-      this.vy[i] *= k;
-      this.px[i] += this.vx[i]! * step;
-      this.py[i] += this.vy[i]! * step;
-      this.rot[i] += this.vrt[i]! * step;
+      this.vx[i] = this.vx[i]! * k;
+      this.vy[i] = this.vy[i]! * k;
+      this.px[i] = this.px[i]! + this.vx[i]! * step;
+      this.py[i] = this.py[i]! + this.vy[i]! * step;
+      this.rot[i] = this.rot[i]! + this.vrt[i]! * step;
       i++;
     }
     this.advanceEmitters(step);
