@@ -163,6 +163,7 @@ export class Lobby {
         // the room kicked the player (fps: the speedhack guard). The lobby owns the socket.
         this.sessionRoom.delete(leftId);
         this.kicked.add(leftId);
+        this.unbindPadsForOwner(leftId, true); // kicked owners lose their pads too
       }
       this.sessions.get(id)?.send(msg as S2C); // game S2C envelopes pass through untouched
     },
@@ -238,8 +239,11 @@ export class Lobby {
       // If THIS session was a bound pad, its owner must hear the unbind
       // (spec: pad disconnect => owner {t:'pad_status', bound:false}).
       this.detachPad(sess.id, true);
-      // leaveRoom below also unbinds pads owned by this session (owner side).
+      // leaveRoom below also unbinds pads owned by this session; the explicit
+      // call after it is the safety net for removals that bypassed the
+      // session->room map (room kicks already deleted it).
       this.leaveRoom(sess.id);
+      this.unbindPadsForOwner(sess.id, false);
       this.sessions.delete(sess.id);
       this.kicked.delete(sess.id);
     } catch (err) {
@@ -606,7 +610,7 @@ export class Lobby {
   // v2 — pad pairing + input relay (specs/P4.md)
   // -------------------------------------------------------------------------
 
-  /** Drop expired pending pairings; called lazily wherever codes are minted or spent. */
+  /** Drop expired pending pairings; called lazily wherever a code is minted. */
   private gcExpiredPairings(now: number): void {
     if (this.pendingPads.size === 0) return;
     for (const [code, pending] of this.pendingPads) {

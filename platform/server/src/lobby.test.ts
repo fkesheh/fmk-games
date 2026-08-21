@@ -535,6 +535,8 @@ interface PadSpyModule {
   roomIds: readonly RoomId[];
   /** The RoomIO the module was created with (defined after first createRoom). */
   io(): RoomIO;
+  /** Simulate a room-initiated kick: the player_left broadcast the lobby watches for. */
+  kickFromRoom(playerId: PlayerId): void;
 }
 
 /**
@@ -612,6 +614,10 @@ function makePadSpyModule(id: string): PadSpyModule {
     io(): RoomIO {
       if (created === null) throw new Error('makePadSpyModule: createRoom has not run yet');
       return created;
+    },
+    kickFromRoom(playerId: PlayerId): void {
+      if (created === null) throw new Error('makePadSpyModule: createRoom has not run yet');
+      created.send(playerId, { t: 'event', ev: { t: 'player_left', id: playerId } });
     },
   };
 }
@@ -925,6 +931,16 @@ describe('pad input relay (specs/PADS.inputMaxHz)', () => {
     expect(v2io(spy.io()).padOwner('phone-1')).toBeNull();
     lobby.handleMessage(asSession(pad), padFrame(5));
     expect(spy.forwarded).toEqual([]); // no longer routed anywhere
+  });
+
+  it("a room-KICKED owner (player_left on the bridge) loses its pads immediately — it never hits leaveRoom's early return", () => {
+    const { lobby, spy, owner, pad } = setupBound();
+
+    spy.kickFromRoom('owner');
+
+    expect(owner.last('pad_status')).toEqual({ t: 'pad_status', bound: false });
+    lobby.handleMessage(asSession(pad), padFrame(11));
+    expect(spy.forwarded).toEqual([]);
   });
 });
 
