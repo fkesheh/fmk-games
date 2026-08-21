@@ -62,24 +62,46 @@ Luftrausers' single-mindedness; Sky Rogue's toy-soldier clarity.
 ## §3 Lighting recipe
 
 Single low sun from screen-west (fixed, never moves): warm `sunGlare` disc +
-haze band near the horizon edge of the map's west; every object gets its ONE
-highlight tone on the west-facing side, shadow tone east — implemented as
-static two-tone fills per shape (cheap, consistent). Cloud shadows drift on
-the sea as soft dark blobs (`seaDark`, alpha ≤0.25) — they sell altitude and
-time of day simultaneously. No dynamic light sources anywhere; explosions do
-NOT light the scene, they replace it for 3 frames (flash bloom).
+haze wash rendered as a WEST MAP-EDGE glow treatment inside the top-down view
+(there is no horizon line anywhere — this is a map-view air war); every
+object gets its ONE highlight tone on the west-facing side, shadow tone east
+— implemented as static two-tone fills per shape (cheap, consistent). Cloud
+shadows drift on the sea as soft dark blobs (`seaDark`, alpha ≤0.25) — they
+sell altitude and time of day simultaneously. No dynamic light sources
+anywhere; explosions do NOT light the scene, they replace it for 3 frames
+(flash bloom).
+
+### Color bindings (bible words → APAL keys — no guessing allowed)
+
+| bible word | APAL key(s) |
+|---|---|
+| clouds / cloud puffs | `paper` ↔ `dawnHi` mix, alpha ≤0.78 |
+| sun glint / sparkle core | `sunGlare` |
+| "white-hot" hit spark | `flash` |
+| smoke (light/heavy) | `smokeLt` / `smokeDk` |
+| fire | `fireCore` + `fireEdge` rim |
+| blast bloom | `blast` → `flash` core |
+| debris / ink chips | `debris`, outlines `ink` |
+| crate canopy (neutral) | `dope` with `wood` ropes |
+| gulls / vignette / grain | `ink` |
+| HUD paper chips | `paper` at alpha over `ink` type |
 
 ## §4 Camera & framing
 
-Top-down, slight chase: camera leads velocity by 0.35 s, zoom eases
-1.00→0.82 with speed. The horizon never appears — this is a map-view air war.
-Framing law for captures: at least two planes in frame when possible, cloud
-layer visibly overlapping something, no more than ~45% open empty water.
+Top-down, slight chase: camera leads velocity by CAMERA.LOOKAHEAD_S; zoom
+eases CAMERA.ZOOM_MAX (1.15, idle) → CAMERA.ZOOM_MIN (0.95, full throttle) —
+close enough that airframe silhouettes and marks read at rest, wide enough
+to keep context at speed. The horizon never appears. Framing law for
+captures: at least two planes in frame when possible, cloud layer visibly
+overlapping something, no more than ~45% open empty water. Hero close-ups
+for judging may zoom further via the debug surface.
 
 ## §5 Silhouette language (part budgets = distinct drawn shapes)
 
-Readability at gameplay zoom (~16 px fuselage length at zoom 1) is the whole
-test. Each airframe must be identifiable in pure black silhouette:
+Airframes are drawn 30–40 u long (scout smallest, gunship largest); at
+CAMERA.ZOOM_MAX that is ≈35–46 px on screen — silhouettes and marks must
+read there AND survive CAMERA.ZOOM_MIN at full throttle. Each airframe must
+be identifiable in pure black silhouette:
 
 - **SCOUT** — stubby equal-stagger biplane, round cowling, single-seat hump,
   high rudder. Reads: small + nose-heavy + busy tail. Budget 10–14 parts.
@@ -100,8 +122,9 @@ test. Each airframe must be identifiable in pure black silhouette:
 - Islands: 6 per map, each sand ring → scrub fill → 3–6 palm clusters →
   1–3 rock outcrops; palm clusters get seeded scale/rotation variation; no
   two adjacent palms identical (variation law: scale ±30%, rotation full).
-- Clouds above: two parallax layers of soft puffs (cream, alpha ~0.85);
-  coverage ≤35% of viewport; slow steady drift east.
+- Clouds above: two parallax layers of soft puffs (`paper`↔`dawnHi`, alpha
+  ≤0.78); coverage ≤35% of viewport; slow steady drift east; thinned over the
+  central corridor so head-on duels are never hidden.
 - Airfields: simple graded strip + team-marked wind square + 2 parked
   reserve crates; they are landmarks, not sets — keep them quiet.
 

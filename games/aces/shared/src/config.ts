@@ -3,11 +3,17 @@
 // Every tunable number in the game lives here. If a module needs a number the
 // config does not have, the task STOPS and reports — it does not invent one.
 //
-// Balance targets these numbers encode (see CONTRACT.md §Balance):
-//   - fighter-vs-fighter TTK on sustained aim ≈ 1.6 s
-//   - scout dies to a fighter burst ≈ 1.1 s; gunship soaks ≈ 2.6 s
-//   - a full heat bar is ~13 s of continuous fighter fire
-//   - first team to 25 kills lands around minute 5–7 at 4v4 bot fill
+// Balance targets these numbers encode (see CONTRACT.md §Balance — all
+// values DERIVED from this table, "perfect" = every bullet lands, "expected"
+// ≈ 50% of a burst connects):
+//   - max DPS: scout 72 · fighter 110 · gunship 120
+//   - continuous-fire window before jam (from cold): scout 5 s · fighter 6 s
+//     · gunship 4 s — burst discipline, not hold-to-win
+//   - TTK fighter-vs-fighter: 0.9 s perfect / ≈1.8 s expected
+//   - TTK fighter-vs-gunship: 1.5 s perfect / ≈3 s expected (gunship hp 170)
+//   - gunship deletes a fighter in 0.83 s perfect / ≈1.7 s expected — but
+//     only inside a 4 s window while flying the slowest, widest platform
+//   - first team to 25 kills lands around minute 5–8 at 4v4 bot fill
 // ============================================================================
 
 export const GAME_ID = 'aces';
@@ -115,7 +121,7 @@ export const CLASSES: Readonly<Record<PlaneClassId, ClassSpec>> = {
     speedMax: 250,
     accel: 220,
     turnRate: 3.7,
-    gun: { count: 2, dmg: 4, rateHz: 13, spreadDeg: 2.2, heatPerShot: 0.052, bulletSpeed: 820, muzzleX: [-10, 10] },
+    gun: { count: 2, dmg: 4, rateHz: 9, spreadDeg: 2.4, heatPerShot: 0.011, bulletSpeed: 840, muzzleX: [-10, 10] },
   },
   fighter: {
     id: 'fighter',
@@ -126,18 +132,18 @@ export const CLASSES: Readonly<Record<PlaneClassId, ClassSpec>> = {
     speedMax: 225,
     accel: 200,
     turnRate: 3.0,
-    gun: { count: 2, dmg: 6, rateHz: 11, spreadDeg: 2.0, heatPerShot: 0.06, bulletSpeed: 800, muzzleX: [-11, 11] },
+    gun: { count: 2, dmg: 5, rateHz: 11, spreadDeg: 2.0, heatPerShot: 0.0076, bulletSpeed: 800, muzzleX: [-11, 11] },
   },
   gunship: {
     id: 'gunship',
     name: 'GUNSHIP',
-    hp: 160,
+    hp: 170,
     radius: 20,
     speedMin: 90,
     speedMax: 190,
     accel: 170,
     turnRate: 2.2,
-    gun: { count: 4, dmg: 5, rateHz: 16, spreadDeg: 2.6, heatPerShot: 0.035, bulletSpeed: 760, muzzleX: [-16, -6, 6, 16] },
+    gun: { count: 4, dmg: 3, rateHz: 10, spreadDeg: 2.8, heatPerShot: 0.0062, bulletSpeed: 760, muzzleX: [-16, -6, 6, 16] },
   },
 };
 
@@ -168,6 +174,7 @@ export type RoomSettings = {
   readonly teamSize?: number; //   1..4, default DEFAULT_TEAM_SIZE
   readonly difficulty?: Difficulty; // default 'normal'
   readonly botFill?: boolean; //   default true
+  readonly debug?: boolean; //     e2e rooms only: enables {t:'debug'} verbs
 };
 
 // ---- damage states -----------------------------------------------------------------
@@ -176,3 +183,58 @@ export const SMOKE_BELOW = 0.5;
 /** Below this HP fraction a plane burns (fire trail + BURN_DPS). */
 export const FIRE_BELOW = 0.25;
 export const BURN_DPS = 2;
+
+// ---- camera feel (C_APP) ------------------------------------------------------------
+export const CAMERA = {
+  /** Seconds of velocity lookahead. */
+  LOOKAHEAD_S: 0.35,
+  ZOOM_MAX: 1.15, //   idle / slow — close enough for silhouettes to read
+  ZOOM_MIN: 0.95, //   full throttle
+} as const;
+
+// ---- net feel / prediction (C_NET) ----------------------------------------------------
+export const NET = {
+  RECONCILE_SNAP_U: 80, //   position error beyond this snaps instead of blends
+  RECONCILE_BLEND: 0.25, //  per-frame error blend fraction
+  BACKOFF_MS: [1000, 2000, 4000], // reconnect retries, then manual button
+} as const;
+
+// ---- bot brain constants (S_BOTS) ------------------------------------------------------
+export const BOT_AI = {
+  EVADE_HP_FRACTION: 0.35, //  below this, break off and evade
+  RELEASE_HEAT: 0.75, //       bots stop firing above this heat
+  RIM_MARGIN_U: 260, //        start biasing toward map center inside this rim
+  EVADE_THROTTLE: 0.4, //      cut throttle to tighten the defensive turn
+} as const;
+
+// ---- room flow (S_ROOM) ------------------------------------------------------------------
+export const LOBBY_COUNTDOWN_S = 5;
+
+// ---- UI thresholds (C_UI) -----------------------------------------------------------------
+export const HEAT_WARN = 0.7; //   heat bar warns past this fraction
+
+// ---- fx pools (C_FX) ------------------------------------------------------------------------
+export const FX_POOL_MAX = 600;
+
+// ---- bot roster names (S_ROOM fills seats in order) -------------------------------------------
+export const BOT_NAMES: readonly string[] = [
+  'Lt. Kestrel',
+  'Cpl. Voss',
+  'Sgt. Marlow',
+  'Fw. Adelheid',
+  'Lt. Okafor',
+  'Cpl. Brandt',
+  'Sgt. Whitlock',
+  'Fw. Roth',
+  'Lt. Dansey',
+  'Cpl. Iversen',
+  'Sgt. Okabe',
+  'Fw. Steiner',
+];
+
+/**
+ * Debug verbs accepted by parseC2S ONLY when the room was created with
+ * settings.debug = true. Server-authoritative so e2e can drive real states.
+ */
+export const DEBUG_CMDS = ['god', 'warp', 'crate'] as const;
+export type DebugCmd = (typeof DEBUG_CMDS)[number];

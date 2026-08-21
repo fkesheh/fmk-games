@@ -38,15 +38,18 @@ export const APAL = {
   prop: '#c7c2b4', //     spinning propeller blur arc
 
   // ---- team identity (the only saturated loud colors in the world) -------
-  royalNavy: '#31536b', // ROYAL AERO CORPS — cold cobalt slate
+  // royalNavy sits ≥ ΔE 30 from every sea tone (palette.ladder.test.ts
+  // enforces this) — a darker navy camouflaged against the strait in
+  // gauntlet review, which is why it is lighter and bluer than instinct.
+  royalNavy: '#274e74', // ROYAL AERO CORPS — cold cobalt slate
   royalDeck: '#cbbd93', // ROYAL secondary — deck cream
   ironRed: '#a83a28', //  IRON EMPIRE — signal crimson
   ironDeck: '#2e2a26', // IRON secondary — near-black iron
 
   // ---- ordnance & fx -----------------------------------------------------
-  tracer: '#f0b24a', //   tracer amber
+  tracer: '#f0a03a', //   tracer amber
   flash: '#ffe9ad', //    muzzle flash core
-  smokeLt: '#8d8574', //  light smoke
+  smokeLt: '#b0a78f', //  light smoke (warm paper-gray; must not blend into sea)
   smokeDk: '#55503f', //  heavy smoke / oil
   fireCore: '#f28d35', // fire orange
   fireEdge: '#c0431f', // fire red edge

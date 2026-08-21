@@ -172,13 +172,27 @@ export function stepBullets(bullets: BulletState[], dt: number): void {
   }
 }
 
-/** Circle-vs-circle bullet hit test against a live plane. */
-export function bulletHits(b: BulletState, p: PlaneState): boolean {
+/**
+ * Swept bullet-vs-plane test. The bullet moved from (bx0,by0) to (b.x,b.y)
+ * this tick; at closing speeds up to ~1,300 u/s a static point check tunnels
+ * clean through a nose-on target (the head-on pass IS the game's signature
+ * moment), so we test the SEGMENT against the hit circle instead.
+ * Friendly fire is off; dead planes are not hittable.
+ */
+export function bulletHits(b: BulletState, bx0: number, by0: number, p: PlaneState): boolean {
   if (p.dead || p.team === b.team) return false;
-  const r = CLASSES[p.cls].radius;
-  const dx = b.x - p.x;
-  const dy = b.y - p.y;
-  return dx * dx + dy * dy <= r * r;
+  const r = CLASSES[p.cls].radius + BULLET_HIT_R;
+  const dx = b.x - bx0;
+  const dy = b.y - by0;
+  const fx = bx0 - p.x;
+  const fy = by0 - p.y;
+  const a = dx * dx + dy * dy;
+  // Degenerate segment (zero-length) → plain point-in-circle.
+  if (a < 1e-9) return fx * fx + fy * fy <= r * r;
+  const t = clamp(-(fx * dx + fy * dy) / a, 0, 1);
+  const cx = fx + dx * t;
+  const cy = fy + dy * t;
+  return cx * cx + cy * cy <= r * r;
 }
 
 /**

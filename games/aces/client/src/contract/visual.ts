@@ -4,8 +4,12 @@
 // The shared drawing kit every render module imports. Exists so five
 // independent art agents produce ONE art-directed game: palette helpers that
 // refuse non-palette colors, one puff model for every soft mass, seeded
-// variation everywhere, and the grain pass that unifies the frame into a
-// printed page. See STYLE_BIBLE §2/§9.
+// variation everywhere, and the grain/vignette passes that unify the frame
+// into a printed page. See STYLE_BIBLE §2/§9.
+//
+// Perf law this file exists to make possible: NOTHING here allocates in the
+// per-frame path. Gradients are baked once into tiles/canvases at init;
+// per-frame calls are plain draws.
 // ============================================================================
 
 import { APAL, type ApalKey } from '@aces/shared/palette';
@@ -40,9 +44,9 @@ export function withAlpha(key: PalKey, alpha: number): string {
 
 function hex(h: string): [number, number, number] {
   return [
-    parseInt(h.slice(1, 3), 16)!,
-    parseInt(h.slice(3, 5), 16)!,
-    parseInt(h.slice(5, 7), 16)!,
+    Number.parseInt(h.slice(1, 3), 16),
+    Number.parseInt(h.slice(3, 5), 16),
+    Number.parseInt(h.slice(5, 7), 16),
   ];
 }
 
@@ -65,8 +69,9 @@ export function hashStr(s: string): number {
 
 // ---- draw primitives -------------------------------------------------------------
 
-/** Trace a closed polygon; caller sets fill/stroke and calls fill/stroke. */
+/** Trace a closed polygon; caller sets fill/stroke and calls fill()/stroke(). */
 export function poly(ctx: CanvasRenderingContext2D, pts: ReadonlyArray<[number, number]>): void {
+  if (pts.length === 0) return;
   ctx.beginPath();
   ctx.moveTo(pts[0]![0], pts[0]![1]);
   for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i]![0], pts[i]![1]);
@@ -74,9 +79,39 @@ export function poly(ctx: CanvasRenderingContext2D, pts: ReadonlyArray<[number, 
 }
 
 /**
+ * Trace an N-point star/burst (roundels, bar-crosses, hit markers, MVP star).
+ * Outer/inner radius ratio r2/r1 controls sharpness; caller fills/strokes.
+ */
+export function star(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  points: number,
+  r1: number,
+  r2: number,
+  rot = 0,
+): void {
+  ctx.beginPath();
+  for (let i = 0; i < points * 2; i++) {
+    const r = i % 2 === 0 ? r1 : r2;
+    const a = rot + (i * Math.PI) / points;
+    const px = x + Math.cos(a) * r;
+    const py = y + Math.sin(a) * r;
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+}
+
+/**
  * THE soft-mass model: one radial-gradient puff factory shared by clouds,
  * smoke, blast bloom and splashes (STYLE_BIBLE §2 — nothing else may create
- * gradients). Draws centered at x,y with radius r.
+ * gradients). Draw cost is one gradient + one fillRect — pool your puffs and
+ * keep counts bounded; do NOT call with fresh colors per frame when a cached
+ * string will do (hoist withAlpha/mixA results to module constants).
+ *
+ * Convention: pass colors through withAlpha() yourself — typical calls use a
+ * solid inner and a transparent outer (`withAlpha(k, 0)`).
  */
 export function softPuff(
   ctx: CanvasRenderingContext2D,
@@ -96,21 +131,82 @@ export function softPuff(
 /** Aircraft hairline ink outline (STYLE_BIBLE §2). Caller strokes after poly. */
 export const INK_STROKE = withAlpha('ink', 0.55);
 
-// ---- frame unification --------------------------------------------------------------
+// ---- frame unification (baked once, cheap forever) ----------------------------------
 
-/** Film-grain overlay pass, ≤0.05 alpha, deterministic per seed+t. */
-export function applyGrain(ctx: CanvasRenderingContext2D, w: number, h: number, seed: number): void {
-  const rng = makeRng(seed);
-  ctx.save();
-  ctx.globalAlpha = 0.05;
-  ctx.fillStyle = APAL.ink;
-  const step = 3;
-  for (let y = 0; y < h; y += step) {
-    for (let x = 0; x < w; x += step) {
-      if (rng() < 0.12) ctx.fillRect(x, y, 1, 1);
+const GRAIN_TILE = 256;
+
+/**
+ * Bake n film-grain tiles once at init. Each tile is seeded ink speckle on
+ * transparent ground; drawGrain() pattern-fills one per frame (cycled by
+ * frame index so the grain "boils" like film without any per-frame rng or
+ * allocation). This is the ONLY sanctioned way to draw grain.
+ */
+export function makeGrainTiles(seed: number, n = 3): HTMLCanvasElement[] {
+  const tiles: HTMLCanvasElement[] = [];
+  for (let k = 0; k < n; k++) {
+    const c = document.createElement('canvas');
+    c.width = GRAIN_TILE;
+    c.height = GRAIN_TILE;
+    const g = c.getContext('2d');
+    if (!g) continue;
+    const rng = makeRng(seed + k * 7919);
+    g.fillStyle = APAL.ink;
+    for (let y = 0; y < GRAIN_TILE; y++) {
+      for (let x = 0; x < GRAIN_TILE; x++) {
+        if (rng() < 0.06) {
+          g.globalAlpha = 0.05 + rng() * 0.05;
+          g.fillRect(x, y, 1, 1);
+        }
+      }
     }
+    tiles.push(c);
   }
+  return tiles;
+}
+
+/** Per-frame grain pass: ONE pattern fill. Pass a frame counter as tick. */
+export function drawGrain(
+  ctx: CanvasRenderingContext2D,
+  w: number,
+  h: number,
+  tiles: HTMLCanvasElement[],
+  tick: number,
+): void {
+  if (tiles.length === 0) return;
+  const tile = tiles[tick % tiles.length];
+  if (!tile) return;
+  const pat = ctx.createPattern(tile, 'repeat');
+  if (!pat) return;
+  ctx.save();
+  ctx.fillStyle = pat;
+  ctx.fillRect(0, 0, w, h);
   ctx.restore();
+}
+
+/**
+ * Bake a vignette once per resize (radial darkening toward APAL.ink corners).
+ * Returns an offscreen canvas sized (w,h); draw it last with drawImage.
+ * The ONLY sanctioned vignette primitive.
+ */
+export function makeVignette(w: number, h: number): HTMLCanvasElement | null {
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, w);
+  c.height = Math.max(1, h);
+  const g = c.getContext('2d');
+  if (!g) return null;
+  const grad = g.createRadialGradient(
+    w / 2,
+    h / 2,
+    Math.min(w, h) * 0.42,
+    w / 2,
+    h / 2,
+    Math.hypot(w, h) / 2,
+  );
+  grad.addColorStop(0, 'rgba(0,0,0,0)');
+  grad.addColorStop(1, withAlpha('ink', 0.34));
+  g.fillStyle = grad;
+  g.fillRect(0, 0, w, h);
+  return c;
 }
 
 // ---- canvas plumbing -------------------------------------------------------------------

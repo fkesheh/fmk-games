@@ -21,6 +21,8 @@ export interface Island {
   blob: readonly number[];
   /** Palm/scrub clusters: local offsets, u. */
   palms: ReadonlyArray<{ x: number; y: number; s: number }>;
+  /** Rock outcrops: local offsets + scale, u (STYLE_BIBLE §6 density law). */
+  rocks: ReadonlyArray<{ x: number; y: number; s: number }>;
 }
 
 export interface Airfield {
@@ -29,6 +31,8 @@ export interface Airfield {
   y: number;
   /** Runway heading, rad — spawn facing. */
   h: number;
+  /** Two parked reserve crates flanking the strip (dressing, not gameplay). */
+  parkedCrates: ReadonlyArray<{ x: number; y: number }>;
 }
 
 export interface AcesMap {
@@ -61,10 +65,11 @@ export function buildMap(seed: number = MAP_SEED): AcesMap {
   const islands: Island[] = [];
 
   const fieldW = 260; //   airfield clear radius each side must respect
-  const fields: [Airfield, Airfield] = [
-    { team: 'royal', x: fieldW + 60, y: WORLD.H / 2, h: 0 },
-    { team: 'iron', x: WORLD.W - fieldW - 60, y: WORLD.H / 2, h: Math.PI },
+  const fieldsRaw = [
+    { team: 'royal' as TeamId, x: fieldW + 60, y: WORLD.H / 2, h: 0 },
+    { team: 'iron' as TeamId, x: WORLD.W - fieldW - 60, y: WORLD.H / 2, h: Math.PI },
   ];
+  const fields: readonly { team: TeamId; x: number; y: number; h: number }[] = fieldsRaw;
 
   // lane corridor: |y − H/2| < LANE keeps mid-map open for head-on passes
   const LANE = 340;
@@ -87,7 +92,8 @@ export function buildMap(seed: number = MAP_SEED): AcesMap {
 
     // radial blob: 12 spokes, smooth-ish via averaging neighbors once
     const raw = Array.from({ length: 12 }, () => 0.72 + rng() * 0.55);
-    const blob = raw.map((_, i) => (raw[i]! + raw[(i + 11) % 12]! + raw[(i + 1) % 12]!) / 3);
+    const at = (i: number): number => raw[((i % 12) + 12) % 12] ?? 1;
+    const blob = raw.map((_, i) => (at(i) + at(i - 1) + at(i + 1)) / 3);
 
     const palmCount = 3 + Math.floor(rng() * 4);
     const palms = Array.from({ length: palmCount }, () => {
@@ -96,8 +102,35 @@ export function buildMap(seed: number = MAP_SEED): AcesMap {
       return { x: Math.cos(a) * rr, y: Math.sin(a) * rr, s: 0.8 + rng() * 0.7 };
     });
 
-    islands.push({ x, y, r, blob, palms });
+    const rockCount = 1 + Math.floor(rng() * 3);
+    const rocks = Array.from({ length: rockCount }, () => {
+      const a = rng() * Math.PI * 2;
+      const rr = r * (0.3 + rng() * 0.5);
+      return { x: Math.cos(a) * rr, y: Math.sin(a) * rr, s: 0.7 + rng() * 0.8 };
+    });
+
+    islands.push({ x, y, r, blob, palms, rocks });
   }
+
+  // Parked dressing crates flank each strip, deterministic from the seed.
+  const fields: [Airfield, Airfield] = [
+    {
+      team: 'royal',
+      ...fieldsRaw[0],
+      parkedCrates: [
+        { x: fieldsRaw[0].x - 40, y: fieldsRaw[0].y - 150 },
+        { x: fieldsRaw[0].x - 40, y: fieldsRaw[0].y + 150 },
+      ],
+    },
+    {
+      team: 'iron',
+      ...fieldsRaw[1],
+      parkedCrates: [
+        { x: fieldsRaw[1].x + 40, y: fieldsRaw[1].y - 150 },
+        { x: fieldsRaw[1].x + 40, y: fieldsRaw[1].y + 150 },
+      ],
+    },
+  ];
 
   return { seed, w: WORLD.W, h: WORLD.H, islands, fields };
 }

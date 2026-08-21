@@ -31,8 +31,9 @@ persistence/unlockables, chat, multiple maps, weather changes mid-match.
   head-on turning duels resolved by aim and nerve. Nothing may add a way to
   kill without flying toward the enemy.
 - **D2 — Forward-fire discipline.** Guns fire only along the fuselage. There
-  is no aiming independent of flying. Heat is the resource: ~13 s of
-  continuous fighter fire jams your guns — burst discipline is the skill.
+  is no aiming independent of flying. Heat is the resource: continuous-fire
+  windows before jam are scout 5 s / fighter 6 s / gunship 4 s from cold —
+  holding the trigger loses the duel. Burst discipline is the skill.
 - **D3 — Death costs seconds, not progress.** Respawn in 3.5 s with full HP
   and a class choice. No elimination, no spectate-prison longer than one
   respawn cycle.
@@ -64,6 +65,7 @@ games/aces/shared/src/protocol.ts                 ← C2S/S2C + parseC2S gate
 games/aces/shared/src/physics.ts                  ← stepPlane/fireVolley/aimLead…
 games/aces/shared/src/maps.ts                     ← buildMap(seed) + isOpenWater
 games/aces/shared/src/index.ts                    ← barrel
+games/aces/shared/src/palette.ladder.test.ts      ← ΔE readability gate on APAL
 games/aces/client/src/contract/visual.ts          ← client visual vocabulary
 ```
 
@@ -95,9 +97,12 @@ snapshots + an `HudModel` built by app).
 2. **No ad-hoc color.** Every hex traces to `APAL`. Derivations only via
    `visual.ts` helpers (`mixA`, `shadeA`) with palette endpoints, or alpha
    suffixes on palette constants.
-3. **No `Math.random()` anywhere under `games/aces/`.** Variation comes from
-   `mulberry32` with a fixed seed passed in (per-bot seeds = hash of bot id +
-   round seed; fx may use a dedicated seeded stream).
+3. **No `Math.random()` anywhere under `games/aces/`.** Gameplay and visual
+   variation come from `mulberry32` with a fixed seed passed in (per-bot
+   seeds = hash of bot id + round seed; fx uses a dedicated seeded stream).
+   Sole exception — identity & clocks: room/player id generation and
+   timestamps may use `crypto.randomUUID()`/`Date.now()` (uniqueness, not
+   variation).
 4. **No per-frame allocation in hot paths** (rAF render, sim step, particle
    update). Pool particles; reuse arrays; no object literals in loops that run
    60×/s. Snapshot/event objects are exempt (they cross the wire anyway).
@@ -106,18 +111,26 @@ snapshots + an `HudModel` built by app).
    of killing the loop. Guard AudioContext creation behind user gesture +
    feature test.
 6. **Window blur clears inputs.** Held keys/mouse state reset on blur/visibilitychange. Resize must not distort (canvas resizes to DPR-capped device pixels).
-7. **Strict TS.** No `any`, no non-null assertions outside test files, no
-   `!.` on possibly-absent data from the wire — narrow explicitly.
+7. **Strict TS.** No `any`. Non-null assertions only immediately after an
+   explicit guard that establishes the invariant (length check, early
+   return) — never to silence a real maybe. Wire data is narrowed, never
+   asserted.
 8. **Tests are part of done.** Each module ships vitest coverage of its pure
    logic (physics edge cases, parser rejects garbage, bot steering sanity,
-   interp math). House gates: `npm run typecheck && npm test && npm run build`
-   stay green repo-wide.
+   interp math). Composition roots (`app.ts`, `main.ts`, `index.html`) are
+   exempt from unit tests — the e2e suite is their coverage. House gates:
+   `npm run typecheck && npm test && npm run build` stay green repo-wide.
 9. **STYLE_BIBLE.md binds all visual work.** Contradictions stop-and-report.
-10. **Latency budget:** action → visible response ≤ 100 ms (muzzle flash same
-    frame as click; HUD bars interpolate, never snap).
-11. **Performance budget:** 60 fps at 8 players + ~120 live bullets + ~600
-    pooled particles on integrated graphics; frame ≤ 12 ms steady-state;
-    heap stable across a 5-minute soak (pools bounded).
+10. **Latency budget:** action → visible response ≤ 100 ms. Muzzle flash is
+    locally predicted: C_APP fires an immediate cosmetic flash + tracer stub
+    through C_FX's effects on trigger-down (client-owned, zero wire round
+    trip); server bullets arrive via snapshots and replace the stubs. HUD
+    bars interpolate, never snap.
+11. **Performance budget:** 60 fps at 8 players + ~120 live bullets + FX_POOL_MAX
+    particles on integrated graphics; frame ≤ 12 ms steady-state; heap stable
+    across a 5-minute soak (pools bounded, gradients baked once — visual.ts's
+    grain/vignette are pre-baked tiles/canvases, never per-frame rng or
+    gradient construction in the loop).
 12. **Load budget:** client bundle ≤ 350 KB gzipped; cold playable ≤ 3 s on
     localhost. No image/font assets — everything drawn or synthesized.
 
@@ -127,24 +140,31 @@ snapshots + an `HudModel` built by app).
 
 ### S_ROOM — room.ts (+ module.ts)
 
-- `class AcesRoom implements GameRoomHandle` mirroring the outpost/rift room
-  pattern (constructor `(visibility, io, code?, settings?)`; `handleMessage`
-  routes through `parseC2S`; unknown/null → ignore silently).
-- Phases: **lobby** (first human joins → countdown 5 s if ≥1 human, bots
-  already seated and visible on the roster) → **live** → **end** (END_SECONDS
-  scoreboard, winner banner) → auto-restart into fresh **live** with tickets
-  reset (same room, same seed). Phase transitions broadcast `phase` events.
+- `class AcesRoom implements GameRoomHandle` with constructor
+  `(visibility, io, settings?)` — exactly what `createRoom(opts)` receives
+  (`new AcesRoom(opts.visibility, opts.io, opts.settings)`). Room ids/codes
+  are the platform lobby's concern; the room never mints them. `handleMessage`
+  routes through `parseC2S(msg, this.settings.debug === true)`. Unknown/null →
+  ignore silently.
+- Phases: **lobby** (first human joins → LOBBY_COUNTDOWN_S countdown if ≥1
+  human, bots already seated and visible on the roster) → **live** → **end**
+  (END_SECONDS scoreboard, winner banner) → auto-restart into fresh **live**
+  with tickets reset (same room, same seed). Phase changes broadcast ONLY via
+  PhaseMsg (the authoritative channel — carries endsAtS/winner); the event
+  stream carries no phase events.
 - Bot fill: seats up to `teamSize*2` filled with named bots ("Lt. Kestrel",
   "Cpl. Voss", …) balanced across teams; humans joining take a bot's slot
   (bot despawns, human spawns fresh); humans leaving hand the plane back to a
   bot. `settings.botFill=false` leaves seats empty (roster shows vacancies).
 - Input handling: store latest InputFrame per player (drop stale seq);
   feed intents to World at TICK_RATE; echo applied seq back on that player's
-  SnapPlane.
+  SnapPlane. Debug verbs (debug rooms only): `god` toggles that player's no-
+  damage flag; `warp x y` teleports their plane; `crate x? y?` force-spawns a
+  supply crate (random open water when omitted) — all server-authoritative.
 - Spawn/respawn: `spawn` msg picks class (default fighter); spawn at own
   airfield with SPAWN_PROTECT invuln; dead players get RESPAWN_SECONDS then
-  may spawn (auto-spawn last class after 6 s idle in picker? NO — picker waits
-  indefinitely; bots auto-pick weighted scout/fighter/gunship 30/50/20).
+  may spawn (picker waits indefinitely; bots auto-pick weighted
+  scout/fighter/gunship 30/50/20 from BOT_NAMES).
 - Scoring: kills increment shooter's team tickets + personal stats; crash
   (burn death) credits no killer but still costs the victim's team nothing —
   tickets only move on credited kills. Win check each ticket change and at
@@ -164,12 +184,16 @@ snapshots + an `HudModel` built by app).
 - Order per tick: apply inputs via `stepPlane`; firing → `fireVolley` (spread
   jitter rolled here with the world's seeded rng — clients render tracers to
   actual bullet positions, they do NOT reproduce spread); `stepBullets`;
-  hit resolution (first-hit circle test per bullet vs enemy planes, nearest
-  plane wins ties): apply dmg, HitEvent (killed flag), on death → KillEvent
-  (crash=true when cause was burn), victim.dead=true + corpse timer handled
-  by room respawn queue (sim just marks dead); burn ticks FIRE_BELOW planes
-  BURN_DPS (death → crash kill event); crates: fall timers, pickup radius →
-  heal clamp maxHp, heat=0 jammed=false, boost=BOOST_MAX, CrateEvent; expire.
+  hit resolution using the SWEPT test (`bulletHits(b, prevX, prevY, p)` —
+  head-on passes close at >40 u/tick; static point checks tunnel through
+  noses), first enemy plane intersected along the segment wins: apply dmg,
+  HitEvent (killed flag); on death → KillEvent with `crash=false`; victim
+  .dead=true + respawn timer handled by room queue (sim just marks dead);
+  burn ticks FIRE_BELOW planes BURN_DPS (death → KillEvent with
+  `crash=true`, killer fields carry the VICTIM's own id/name/team so the
+  wire shape stays total — killfeed renders the crash variant when
+  crash=true); crates: fall timers, pickup radius → heal clamp maxHp,
+  heat=0 jammed=false, boost=BOOST_MAX, CrateEvent; expire.
 - Spawn placement helper `spawnAt(map, field, cls)` used by room.
 - Crate spawner lives HERE (interval, CRATES_MAX, isOpenWater placement,
   seeded rng) — room does not place crates.
@@ -180,11 +204,12 @@ snapshots + an `HudModel` built by app).
   bot's private stream).
 - Behavior: acquire nearest living enemy (reaction delay after target loss);
   steer toward `aimLead` intercept point; fire when angle-to-solution <
-  aimErrDeg and range < fireRangeU (burst: release when heat > 0.75); evade
-  when hp < 35%: hard turn perpendicular + boost pulse; rim avoidance when
-  within 260 u of bounds: bias turn toward map center; throttle: full unless
-  evading (cut to 0.4 to tighten turn); occasional personality weave
-  (sinuous offset by per-bot phase). Never fires while invulnerable.
+  aimErrDeg and range < fireRangeU (release above BOT_AI.RELEASE_HEAT);
+  evade below BOT_AI.EVADE_HP_FRACTION hp: hard turn perpendicular + boost
+  pulse + throttle cut to EVADE_THROTTLE; rim avoidance inside
+  BOT_AI.RIM_MARGIN_U: bias turn toward map center; full throttle otherwise.
+  Occasional personality weave (sinuous offset by per-bot phase). Never fires
+  while invulnerable.
 - Difficulty table from config; unit tests assert: leads a crossing target
   (intent turns toward intercept, not current pos), releases fire when
   jammed, avoids rim (steers center near bounds).
@@ -203,11 +228,14 @@ snapshots + an `HudModel` built by app).
   NOT interpolated — rendered straight from newest snapshot (fast enough at
   15 Hz with tracer smoothing in effects).
 - prediction.ts: local sim of OWN plane using shared `stepPlane` with pending
-  input history; on snapshot reconcile against `you`: if pos error > 80 u →
-  snap; else blend error down 25%/frame; replay unacked inputs. Own HP/heat/
-  boost read from server row (authoritative) but displayed smoothly.
-- Reconnect: on close → app shows connection-lost screen with auto-retry
-  backoff 1s/2s/4s (max 3) then manual button.
+  input history; on snapshot reconcile against `you`: if pos error >
+  NET.RECONCILE_SNAP_U → snap; else blend error down NET.RECONCILE_BLEND
+  per frame; replay unacked inputs. Own HP/heat/boost read from server row
+  (authoritative) but displayed smoothly.
+- Reconnect: on close → app shows connection-lost screen with auto-retry at
+  NET.BACKOFF_MS intervals, then a manual button. Rejoin/resume of the SAME
+  seat after a dropped socket is OUT OF SCOPE v1: a successful reconnect
+  mints a fresh seat (a bot has usually taken it); state that on the screen.
 
 ### C_APP — app.ts / main.ts
 
@@ -215,28 +243,36 @@ snapshots + an `HudModel` built by app).
   Esc toggles help/pause overlay (does NOT pause a multiplayer sim — label it
   "controls"). End screen on phase end; returns to live automatically.
 - Loop: `requestAnimationFrame`, accumulator stepping render-side logic at
-  60 Hz; camera: position eases toward own plane + velocity lookahead 0.35 s;
-  zoom 1.0→0.82 eased by speed fraction; shake impulses consumed from
-  effects API (own hits small, nearby blasts medium, own death large).
+  60 Hz; camera: position eases toward own plane + velocity lookahead
+  CAMERA.LOOKAHEAD_S; zoom eases CAMERA.ZOOM_MAX (idle) → CAMERA.ZOOM_MIN
+  (full throttle); shake impulses consumed from effects API (own hits small,
+  nearby blasts medium, own death large).
 - Compositing order: world.drawBelow → crates → tracers/bullets → planes →
-  effects particles → world.drawAbove (clouds occlude) → HUD canvas overlay.
-  All wrapped per-subsystem try/catch (RULES 5).
-- `window.__ACES` debug surface (always present; harmless in prod):
-  `{ state(): {phase,tickets,tick,you}, god(bool), timescale(n), warpTo(x,y),
-   giveCrate() , screenshotNote(): string }` — e2e drives through this.
+  effects particles → world.drawAbove (clouds occlude) → HUD canvas overlay
+  → grain tile + vignette canvas (both pre-baked). All wrapped per-subsystem
+  try/catch (RULES 5).
+- `window.__ACES` debug surface (always present; harmless in prod): sends
+  server-authoritative `{t:'debug'}` verbs (god/warp/crate — see S_ROOM) and
+  exposes `{ state(): {phase,tickets,tick,you}, god(bool), warpTo(x,y),
+  giveCrate(x?,y?) }`. The e2e harness drives matches through these verbs;
+  nothing here mutates client-side game truth directly.
 
 ### C_WORLD — render/world.ts
 
-- `initWorldRenderer(canvas, map)` bakes static layers to offscreen canvases
-  at map scale ÷ 2 (half-res bake, scaled on draw — perf budget): sea base
-  with subtle value mottling (seeded), islands (sand ring → scrub → canopy
-  palm clusters → rock outcrops), airfield strips with team markings.
+- `initWorldRenderer(canvas, map)` bakes static layers to offscreen TILES at
+  NATIVE render resolution (the map is cut into a fixed grid of bake tiles —
+  full-res crispness everywhere, bounded memory; half-res upscaling is
+  banned: a soft world under crisp planes reads amateur): sea base with
+  subtle value mottling (seeded), islands (sand ring → scrub → canopy palm
+  clusters → rock outcrops from Island.rocks), airfield strips with team
+  markings + parked dressing crates.
 - Animated overlays drawn per-frame cheaply: drifting cloud shadows on sea
   (soft dark blobs, slow), sun-glint band shimmer, surf rings pulsing around
   island rims.
 - `drawAbove(ctx, cam, t)`: 2 parallax cloud layers of soft cream puffs
-  (alpha ~0.85) drifting slowly; planes pass UNDER them — the occlusion is
-  the depth cue that sells "air". Clouds never cover >35% of viewport.
+  (alpha ≤0.78 so occlusion never hides gameplay — D4 outranks depth mood),
+  drifting slowly east; planes pass UNDER them. Clouds never cover >35% of
+  viewport and thin out over the central corridor.
 - All colors APAL; shapes from map data only (no second source of truth).
 
 ### C_FX — render/planes.ts / effects.ts
@@ -288,22 +324,29 @@ snapshots + an `HudModel` built by app).
 ### visual.ts (frozen client vocabulary)
 
 - `mixA(a,b,t)`, `shadeA(key,f)` (palette-key-typed helpers), `withAlpha(key,a)`
-- `poly(ctx, pts)`, `star(ctx,…)` for markings, `softPuff(ctx,x,y,r,color)`
-  radial-gradient puff factory (clouds/smoke/explosions share ONE puff model)
+- `poly(ctx, pts)`, `star(ctx,x,y,points,r1,r2,rot)` for roundels/bar-crosses/markers,
+  `softPuff(ctx,x,y,r,colorInner,colorOuter)` radial puff factory — clouds/smoke/
+  blast share ONE puff model; colors passed via withAlpha (solid inner, transparent outer)
+- `makeGrainTiles(seed,n)` + `drawGrain(ctx,w,h,tiles,tick)` — pre-baked film-grain
+  pattern fill (the ONLY sanctioned grain path; one fillRect per frame)
+- `makeVignette(w,h)` — baked vignette canvas, drawn last (the ONLY sanctioned vignette)
 - `makeRng(seed)` (re-export wrapper of mulberry32), `hashStr(s)` for per-bot/per-instance seeds
-- `applyGrain(ctx,w,h,seed)` film-grain overlay pass (subtle, 0.05 alpha cap)
-- DPR-aware canvas sizing helper `fitCanvas(canvas)` capping DPR at 2
+- `fitCanvas(canvas)` DPR-aware sizing capping DPR at 2
 
-## §6 Balance targets (checkable, from config numbers)
+## §6 Balance targets (all DERIVED from config.ts — the table there is law)
 
-- Fighter DPS on full hold ≈ 66 → TTK vs fighter ≈ 1.5 s; scout TTK ≈ 1.1 s;
-  gunship ≈ 2.4 s. Scout closes radius fastest; gunship wins head-ons, loses
-  turning fights. Boost converts to escape OR closure — drain 38/s punishes
-  spam (≈2.6 s full burn).
-- Tickets to 25 at 4v4 normal bots lands ≈ minute 5–7. Match never exceeds
-  8:00 + sudden death.
-- Crates: one heal flips a losing duel; spawn cadence keeps ≤2 alive so
-  map knowledge matters but camping doesn't.
+- Max DPS: scout 72 · fighter 110 · gunship 120. Continuous-fire windows to
+  jam: scout 5 s / fighter 6 s / gunship 4 s. TTK fighter-vs-fighter:
+  0.9 s perfect, ≈1.8 s at expected (≈50%) accuracy. Fighter kills a gunship
+  in ≈3 s expected; a gunship deletes a fighter in ≈1.7 s expected but must
+  do it inside its short window while flying the slowest platform — that
+  asymmetry is the class system.
+- Boost: full burn = 2.6 s of ×1.42; converts to escape OR closure; spam
+  punished by BOOST_DRAIN.
+- Tickets to 25 at 4v4 normal bots lands ≈ minute 5–8 (crashes credit no
+  ticket); time cap + sudden death backstop it.
+- Crates: one heal flips a losing duel; ≤2 alive keeps map knowledge mattering
+  without camping being profitable.
 
 ## §7 Done definition per module
 

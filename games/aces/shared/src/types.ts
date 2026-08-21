@@ -121,10 +121,9 @@ export interface CrateEvent {
   by?: string; //       pickup taker
 }
 
-export interface PhaseEvent {
-  kind: 'phase';
-  phase: MatchPhase;
-  winner?: TeamId; //   'end' only
-}
-
-export type GameEvent = KillEvent | HitEvent | CrateEvent | PhaseEvent;
+/**
+ * Phase changes ride the dedicated PhaseMsg channel (protocol.ts), never the
+ * event stream — PhaseMsg carries endsAtS/winner and is the single
+ * authority for HUD clocks and end screens.
+ */
+export type GameEvent = KillEvent | HitEvent | CrateEvent;
