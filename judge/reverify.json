@@ -1,0 +1,101 @@
+{
+  "findings": [
+    {
+      "severity": "major",
+      "file": "games/outpost/CONTRACT.md",
+      "issue": "The draw-call budget is unachievable with the technique the same document prescribes. CONTRACT.md:94 gates \"Draw calls | ≤ MAX_DRAW_CALLS (220) at 64 zombies | e2e telemetry().drawCalls\", but CONTRACT.md:50 specifies zombies as \"5 zombie meshes (~5 baked limb groups each)\" and kit.bakePart() returns ONE THREE.Mesh per limb group. With ZOMBIE_INTEREST_COUNT=60 visible zombies that is ~300 draw calls for bodies alone, plus 60 health bars (CONTRACT.md:50), plus players/viewmodel/fx/world — ~380-400 vs a 220 ceiling the e2e asserts. kit.instanced() is documented only as \"InstancedMesh for ~40 identical static props (rubble/crates)\" (kit.ts:192), so nothing in the frozen contract tells zombies.ts to instance. An implementer following the contract literally fails the gate at wave ~8 and needs a rewrite after freeze.",
+      "fix": "Amend CONTRACT.md render/zombies.ts row + kit.ts:192 doc BEFORE freeze: zombies must render as per-kind, per-limb-group InstancedMesh (5 kinds x ~5 groups = <=25 draw calls for the whole horde), health bars as ONE instanced batch, and state the arithmetic budget split (world <=40, horde <=25, players <=20, fx <=20, viewmodel <=10, HUD <=5). Alternatively raise MAX_DRAW_CALLS, but then PERF_TARGET_MS 16.7 is the next wall — instancing is the real fix."
+    },
+    {
+      "severity": "major",
+      "file": "games/outpost/CONTRACT.md",
+      "issue": "The bandwidth budget is contradicted by the snapshot shape the scoreboard fix introduced. CONTRACT.md:96 claims \"Downstream | ≤ 60 KB/s/client at 16 players | SEND_HZ=10 + position quantize (2dp) + zombie cull (ZOMBIE_INTEREST_COUNT=60)\". Actual JSON at 16 players: players[] 16 x ~175B = 2.8KB, zombies[] 60 x ~95B = 5.7KB, roster[] 16 x ~130B = 2.1KB (types.ts:239 \"roster: RosterEntry[]; // full board, per-recipient\", now 9 fields incl. the new `damage`), plus you/core/barricades/projectiles ~0.5KB => ~11KB per snapshot x SEND_HZ 10 = ~110 KB/s, ~1.8x the stated ceiling. platform/server/src/net.ts:241 constructs WebSocketServer without perMessageDeflate, so ws compression defaults OFF and cannot be assumed away.",
+      "fix": "Either (a) raise the stated budget to ~120 KB/s and say the roster is the reason, or (b) keep 60 KB/s and make it real in the frozen contract: enable perMessageDeflate on the platform WSS, and/or state that roster[] is sent full only on change and as an empty array otherwise (an empty array still satisfies the required field), and/or drop SEND_HZ to 6 for the roster path. Whatever is chosen must be written into the budget row — an unenforced, arithmetically-false budget is worse than no budget."
+    },
+    {
+      "severity": "major",
+      "file": "games/outpost/client/src/render/kit.ts",
+      "issue": "The re-worked kit still has no text/glyph path, yet three modules are required to render numerals. CONTRACT.md:53 gives render/effects.ts \"hit markers + floating damage numbers (world-space)\" and UX_BIBLE.md:21 gates them at \"damage number (≤30ms)\"; CONTRACT.md:50 gives zombies.ts \"health bars\". kit.ts exports only makeBox/makeCyl/makeCone/makeSphere/makeGround + mat/glowMat/unlitMat — unlitMat (kit.ts:61) sets only `color`, no `map`, and there is no sprite, quad, canvas-texture or label factory. kit.ts:2-3 states \"Every render/ module imports these factories; none may construct ad-hoc geometry or ad-hoc hex\", and RULE 1 says a missing shape means STOP. So effects.ts must either stall or violate the kit's exclusivity clause to draw a single damage number.",
+      "fix": "Add to kit.ts before freeze: `makeLabel(text: string, key: PaletteKey, size: number): THREE.Sprite` backed by a cached CanvasTexture atlas (digits 0-9 + '-' only, no external font — system-ui satisfies RULE 7), and `spriteMat(key)`; or explicitly move floating damage numbers + hit markers to a DOM overlay owned by ui/hud.ts and delete them from the effects.ts row. Health bars can stay geometry (thin makeBox) but say so."
+    },
+    {
+      "severity": "major",
+      "file": "games/outpost/shared/src/physics.ts",
+      "issue": "Brute knockback has a config shape and a wire event but no integrator path, so it cannot be applied or predicted. config.ts:104 has `knockback: 7`, types.ts:176 emits `{ t: 'knockback'; vx: number; vy: number; vz: number }`, and DESIGN_BIBLE.md:55 promises \"KNOCKS PLAYERS BACK (`knockback: 7`)\". But physics.ts:96 `MoveState` carries only `{x,y,z,vy,grounded}` — no horizontal velocity — and stepPlayer (physics.ts:132-135) recomputes x/z purely from move intent every step, discarding any impulse. YouSnap exposes only `vy` (types.ts:161) and CONTRACT.md:33 says sim.ts must \"replay knockback/gravity from `YouSnap.vy`\". Horizontal knockback is therefore erased on the very next tick on the server and unpredictable on the client; only the vertical component survives.",
+      "fix": "Before freeze add `vx`/`vz` to MoveState, apply and damp them inside stepPlayer (e.g. horizontal velocity decays by a KNOCKBACK_DAMP constant per second and is added to the intent delta), and add `vx`/`vz` to YouSnap so client prediction reconciles the same impulse. Otherwise set ZombieDef.knockback to a vertical-only impulse and rewrite DESIGN_BIBLE.md:55 to stop promising horizontal launch."
+    },
+    {
+      "severity": "major",
+      "file": "games/outpost/shared/src/config.ts",
+      "issue": "Two frozen constants both claim to govern revive distance. config.ts:42 `export const REVIVE_RANGE = 2.2; // how close the reviver must stand` and config.ts:48 `export const INTERACT_RANGE = 2.6; // revive / repair / rebuild / buy proximity`. combat.ts owns revive (CONTRACT.md:35) and will read REVIVE_RANGE; ui/hud.ts and economy.ts read INTERACT_RANGE for the prompt and the hold-E gate (CONTRACT.md:36,54). The result is a 0.4m band where the HUD offers the revive prompt and the server rejects the interact — the classic dual-source-of-truth split the contract exists to prevent.",
+      "fix": "Delete one. Either remove REVIVE_RANGE and let INTERACT_RANGE govern all hold-E interactions, or narrow the INTERACT_RANGE comment to \"repair / rebuild / buy\" and state in CONTRACT.md that revive alone uses REVIVE_RANGE."
+    },
+    {
+      "severity": "major",
+      "file": "games/outpost/shared/src/types.ts",
+      "issue": "The frozen debug surface cannot drive the tasks the rubric and the gate require. types.ts:259-281 OutpostDebugApi exposes only ready/phase/wave/start/buy/fireOnce/setLook/setMove/telemetry. judge/RUBRIC.md:40-41 requires driving \"buy an SMG and repair a barricade\", \"revive a teammate\", \"survive one wave\" through the debug API + synthetic input, and CONTRACT.md:154 requires the e2e to \"drive wave 1 → clear → intermission → buy → wave 2\". There is no interact/hold-E hook (INPUT_INTERACT is unreachable), no reload, no buy_ammo, no buy_perk, and `buy(weapon: WeaponId)` carries no station while C2S buy REQUIRES `station` (types.ts:57) and each station stocks only 2 of the 5 weapons (map.ts:127-132) — so the debug buy has to silently guess a station it may not be within INTERACT_RANGE of.",
+      "fix": "Before freeze extend OutpostDebugApi with `setButtons(mask: number): void` (or `interact(hold: boolean)`), `reload()`, `buyAmmo()`, `buyPerk(perk: PerkId)`, and document that `buy(weapon)` resolves to the nearest station that stocks that weapon and fails via `buy_result` when out of range. Otherwise cut the repair/revive tasks from RUBRIC.md:40-41 — they are unrunnable."
+    },
+    {
+      "severity": "major",
+      "file": "games/outpost/client/src/style.css",
+      "issue": "The style.css ownership fix is half-applied and self-contradictory. The header says \"OUTPOST — stylesheet FOUNDATION (FROZEN, orchestrator-owned)\" and then, four lines later, \"Agents may APPEND a section for their module but must NOT edit the :root block\" — a frozen file with an open write path for at least two concurrent agents. This directly violates CONTRACT.md:84 RULE 9 (\"A file is owned by exactly one module\"), and style.css appears in NO row of the Layer 2 ownership table (only ui/hud.css and ui/menus.css are assigned, CONTRACT.md:54-55) nor in the Layer 1 immutable list (CONTRACT.md:17-24), so the file the prior gauntlet flagged as ownerless still has no owner in the contract itself.",
+      "fix": "Delete the \"Agents may APPEND\" clause (hud.css and menus.css already exist as the per-module escape valve) and add style.css to CONTRACT.md Layer 1 as orchestrator-owned/immutable, so the ownership table is total and RULE 9 holds under fan-out."
+    },
+    {
+      "severity": "major",
+      "file": "games/outpost/shared/src/types.ts",
+      "issue": "Repair phase-gating contradicts the design and UX bibles, and rebuild has no distinct message. types.ts:60 declares `| { t: 'repair'; barricade: number } // rebuild a destroyed barricade (intermission only)` — one message, commented as rebuild-only and intermission-only. But config.ts:49 REPAIR_HP_PER_SEC is a continuous hold-E drain rate that only makes sense under pressure, config.ts:50 REBUILD_MS is separately \"intermission only\", YouSnap.interact distinguishes 'repair' from 'rebuild' (types.ts:155), UX_BIBLE.md:46 binds \"E interact (hold for revive/repair)\" as core in-wave input, and DESIGN_BIBLE.md:18-20 makes \"hold a breach (risk) vs repair (spend)\" the per-minute decision. Two implementers (economy.ts and ui/hud.ts) will resolve this opposite ways: one rejects repair during a wave, the other shows the prompt.",
+      "fix": "Rewrite the types.ts:60 comment to the actual rule: repair (barricade hp > 0) is accepted in ANY phase and drains BARRICADE_REPAIR_POINT per hp at REPAIR_HP_PER_SEC; rebuild (hp == 0) is the same message but is accepted only in `intermission`, costs BARRICADE_REBUILD_COST and takes REBUILD_MS — the server discriminates on barricade hp. State it once in CONTRACT.md economy.ts row too."
+    },
+    {
+      "severity": "major",
+      "file": "games/outpost/shared/src/config.ts",
+      "issue": "The regen fix does not actually remove the deliberate-self-down strategy it was added for. config.ts:44-45 give REGEN_DELAY_MS 6000 + REGEN_HP_PER_SEC 6 (so 10hp → 100hp costs ~21s of not being shot), while config.ts:39 keeps `SELF_REVIVE_MS = 3_000; // solo/last-alive downed: auto self-revive after this (no limit)` restoring REVIVE_HP 50 for free, unlimited. Going down deliberately is still strictly faster and cheaper than regenerating (3s for +40hp vs ~13s), and `downs` is a cosmetic stat (types.ts:75). The dominant strategy the prior fatal named survives.",
+      "fix": "Pick a real cost before freeze: e.g. SELF_REVIVE_MS 8000 with a per-wave cap (SELF_REVIVES_PER_WAVE = 1) and/or self-revive restoring 25hp instead of REVIVE_HP, and/or a points forfeit on down. Then assert the relationship in DESIGN_BIBLE.md's balance list so it is checkable."
+    },
+    {
+      "severity": "major",
+      "file": "games/outpost/shared/src/map.ts",
+      "issue": "Frozen map data places spawns and a station inside collidable props. playerSpawns iterate x,z over [-4.5,-2.5,2.5,4.5] (map.ts:144-147), while props include crates spanning (-5.5..-3.5, -5.5..-3.5), (3.5..5.5, 3.5..5.5), (-5.5..-3.5, 3.5..5.5), (3.5..5.5, -5.5..-3.5) (map.ts:84-87) — so 4 of the 16 spawns are strictly inside a collidable crate and resolveCircle's degenerate branch (physics.ts:75-84) teleports those players sideways on their first tick. `perkStation: { x: 0, z: 8 }` (map.ts:158) sits on the corner of the crate at (0..2, 7..9, height 1.5), so the 8-12 prim machine is half-buried in cover. map.ts:142 also claims spawns are \"cleared of the core's 1.9m collision radius\", but the core is not in collisionSolids() at all (map.ts:114-125) — the comment describes a solid that does not exist.",
+      "fix": "While shared/ is still editable: move the four corner spawns to a radius that misses the crates (e.g. x,z over [-8,-6.5,6.5,8] or shrink the four core crates to 1.2m), move perkStation to (0, 10) or move the crate at (0..2, 7..9), and correct the map.ts:142 comment (either add the core to collisionSolids as a solid of CORE_RADIUS, or say it is non-collidable). After freeze RULE 1 forbids any of these fixes."
+    },
+    {
+      "severity": "minor",
+      "file": "games/outpost/UX_BIBLE.md",
+      "issue": "UX_BIBLE.md:48 binds \"1–5 weapon switch\" but the economy fix capped carry at `MAX_WEAPONS = 2` (config.ts:79) and YouSnap documents \"stable slots for 1..MAX_WEAPONS hotkeys\" (types.ts:146). input.ts and ui/hud.ts will disagree on how many slots exist.",
+      "fix": "Change UX_BIBLE.md:48 to \"1–MAX_WEAPONS weapon switch (2 in v1)\" and state that keys above the carry limit are inert."
+    },
+    {
+      "severity": "minor",
+      "file": "games/outpost/UX_BIBLE.md",
+      "issue": "UX_BIBLE.md:6 makes the #1 HUD element \"live progress 'zombies 34/90'\", but the snapshot carries only `zombiesAlive` and `zombiesTotal` (types.ts:231-232). Kills-so-far is not derivable from those two (unspawned remainder is invisible), so hud.ts cannot render the metric as specified.",
+      "fix": "Restate the HUD line as \"zombies alive / wave total\" (alive/zombiesTotal), or add a `zombiesKilled` counter to the snapshot before freeze."
+    },
+    {
+      "severity": "minor",
+      "file": "games/outpost/shared/src/map.ts",
+      "issue": "`buy_ammo` carries `station: number` (types.ts:58) and CONTRACT.md:36 says purchases are \"station-validated\", but `ammoCrates: readonly { x, z }[]` (map.ts:54, 157) has no `id` field, unlike BuyStationDef (map.ts:39-45). Whether `station` on buy_ammo is an array index or an id is nowhere stated, and the two messages use the same field name for two different id spaces.",
+      "fix": "Give ammoCrates an explicit `id` (0,1) matching BuyStationDef's shape, or document in types.ts:58 that buy_ammo.station is the index into OUTPOST_MAP.ammoCrates."
+    },
+    {
+      "severity": "minor",
+      "file": "games/outpost/client/src/render/kit.ts",
+      "issue": "Two loose ends in the reworked kit. (a) kit.ts:61-63 `unlitMat` allocates a new MeshBasicMaterial on every call while the header (kit.ts:5) promises \"cached materials\" and RULE 4 bans per-frame allocation in hot paths — effects.ts calls it for tracers/muzzle at fire rate. (b) mat/glowMat caches are module-global (kit.ts:30-31) but RULE 13 requires every render module to `dispose()` on match reset; the standard three.js teardown (`traverse → material.dispose()`) would destroy shared cached materials and break the next match, and no rule forbids it.",
+      "fix": "Cache unlitMat by key like mat/glowMat, and add a line to CONTRACT.md RULES: \"kit-owned materials are shared and immortal — dispose() disposes geometries and removes objects only; never call dispose() on a material returned by mat/glowMat/unlitMat.\""
+    },
+    {
+      "severity": "minor",
+      "file": "games/outpost/CONTRACT.md",
+      "issue": "CONTRACT.md:83 RULE 8 bans non-null assertions (\"no `any`, no non-null assertions\"), but the frozen kit itself uses them twice: kit.ts:167 `matOf(group[0]!)` and kit.ts:189 `matOf(meshes[0]!)`. A grep-based gate over client/src will flag the frozen file it is not allowed to edit.",
+      "fix": "Replace both with a checked local (`const first = group[0]; if (!first) continue;`) — both files still typecheck clean under noUncheckedIndexedAccess — or scope RULE 8's grep gate to exclude render/kit.ts explicitly."
+    },
+    {
+      "severity": "minor",
+      "file": "games/outpost/DESIGN_BIBLE.md",
+      "issue": "DESIGN_BIBLE.md:29-30 states \"These numbers are DERIVED from `config.ts` and asserted by `waves.test.ts` / `economy.test.ts`; the bible and the config must never drift\", but the two newest balance levers are absent from the checkable list: out-of-combat regen (config.ts:43-45 REGEN_DELAY_MS / REGEN_HP_PER_SEC) and the wave timeout (config.ts:25 WAVE_TIMEOUT_MS, which also contradicts nothing but is invisible next to \"Waves ~45–75s each\" at DESIGN_BIBLE.md:24). economy.ts owns regen (CONTRACT.md:36) with no stated relationship to assert.",
+      "fix": "Add two bullets to the balance-as-relationships list: the regen relationship (time-to-full from 10hp vs the self-revive alternative) and the timeout relationship (WAVE_TIMEOUT_MS 120s is ~2x the 45–75s design wave, so it only fires on stuck zombies and pays no clear bonus)."
+    }
+  ],
+  "verdict": "FIX-FIRST"
+}
