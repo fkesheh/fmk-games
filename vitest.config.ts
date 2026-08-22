@@ -42,6 +42,10 @@ export default defineConfig({
       // skipped. Same defect that hid games/bank/shared and the kart client.
       'platform/server/src/**/*.test.ts',
       'platform/shared/src/**/*.test.ts',
+      // The ASSET LIBRARY workspace — added at its creation; without an
+      // include here its tests would silently never run (the exact defect
+      // documented above for bank/shared, the kart client, and platform).
+      'assets/library/src/**/*.test.ts',
     ],
   },
 });
