@@ -4,62 +4,91 @@
 // that a sibling could own (CONTRACT §2 import law: app composes, render
 // never imports ui, ui never imports render internals).
 //
-// OWNERS HERE: DOM canvases + their stacking, the rAF loop with its 1/60
-// accumulator, the camera rig (follow / lookahead / zoom / shake), input
-// mapping from INPUT_KEYS to seq-stamped InputFrames sent at TICK_RATE,
-// HudModel/OverlayModel assembly, killfeed/banner caches, screen-state flow,
-// the reconnect policy over NET.BACKOFF_MS, film-grain + vignette passes,
-// window.__ACES, and teardown.
+// 3D EDITION (GRAPHICS_3D.md §5): the render pipeline is the render3d layer.
+// OWNERS HERE: the GL canvas + hud canvas + vignette overlay stacking, the
+// rAF loop with its 1/60 accumulator, THE plane-model pool (per SnapPlane.id),
+// the camera feed into scene.rig (follow / orbitDeath / shake / zoom pin),
+// input mapping from INPUT_KEYS to seq-stamped InputFrames sent at TICK_RATE,
+// HudModel/OverlayModel assembly (cam.project backed by rig.project), the
+// killfeed/banner caches, screen-state flow, the reconnect policy over
+// NET.BACKOFF_MS, window.__ACES, and teardown.
+//
+// SCENE MOUNT LAW: AcesScene does not expose a scene getter, and none was
+// added — W1's own world.ts header documents the sanctioned mount:
+// `rig.getCam().parent` IS AcesSceneImpl's internal THREE.Scene (scene.ts
+// adds the camera to it in its constructor). world.group is added there and
+// effects3d.attach() receives that same scene; scene.render() therefore draws
+// everything with zero sealed-file edits. The one-sanctioned-getter exception
+// went UNUSED.
 //
 // FLOW (BUILD LAW): boot → showMenu(localStorage 'aces.name') → onPlay →
-// audio.unlock + showConnecting → net.connect → onWelcome (build map/renderer
+// audio.unlock + showConnecting → net.connect → onWelcome (buildMap + 3D world
 // LAZILY here, predictor.setClass('fighter')) → snapshots drive lobby/live/
 // end screens · auto first spawn 'fighter' when live · local RESPAWN_SECONDS
-// countdown while dead (the wire omits `you` while dead — room.ts deletes it
-// — so the timer is client-side) → picker via screens' own digit keys →
-// PhaseMsg end → showEnd → auto-restart resets round-local caches.
+// countdown while dead → picker via screens' own digit keys → PhaseMsg end →
+// showEnd → auto-restart resets round-local caches.
 //
-// LOOP: rAF accumulates real dt into fixed 1/60 steps for sim-side logic;
-// rendering happens once per frame in SCREEN→WORLD order: world.drawBelow →
-// crates → projectiles → remote planes (interp at now−INTERP_MS) → OWN plane
-// (predictor.state merged with server-authoritative fields — reconcile keeps
-// hp/heat/jammed/… verbatim, movement is predicted) → effects particles →
-// world.drawAbove (clouds occlude) → transform reset → HUD canvas model →
-// grain tile → vignette. Every subsystem is wrapped in guarded(): one throw
-// logs ONCE and skips that subsystem from then on — the loop itself cannot
-// be killed by a sibling (RULES 5).
+// LOOP (§5 order): rAF accumulates real dt into fixed 1/60 steps for sim-side
+// logic; rendering happens once per frame in: interp.sampleRemotes → rig
+// (follow while alive+spawned · orbitDeath from own death until respawn ·
+// consumeShake → rig.shake · zoomTo pin) → pooled plane models (position X=x /
+// Y=PLANE_Y+bob / Z=y, yaw −h, bank/pitch eased, damage/blink) → trails →
+// snapshot tracers → world.update → effects3d.update → scene.render → HUD
+// model (projections via rig.project). Every subsystem stays wrapped in
+// guarded(): one throw logs ONCE and skips that subsystem from then on.
 //
-// SHAKE SPLIT (deliberate): C_FX already emits impulses internally where it
-// draws the cause (hitSpark → SMALL per its header SHAKE LAW; explosion →
-// MEDIUM/LARGE by the `size` argument). C_APP therefore adds exactly ONE
-// impulse of its own — SHAKE.SMALL when YOU are hit (no C_FX path exists
-// there) — and chooses explosion SIZE by proximity so the internal mapping
-// yields "MEDIUM far / LARGE near-or-own-death": victim===me or blast within
-// DIST_REF_U (borrowed from C_AUDIO as the shared "in your face" radius)
-// ⇒ 'large', else 'small'. Adding app-side shake for explosions too would
-// double every impulse.
+// ATTITUDE LAW (§1): group.rotation.order = 'YZX' so yaw→pitch→bank compose
+// in body frame: rotation.y = −h (yawOf), rotation.z = pitch
+// (+0.06·throttle, boost −0.04), rotation.x = bank roll = −turnEcho·0.45rad
+// eased — the §1 formula applied to the axis that rolls around the fuselage
+// under three.js's Euler composition. SnapPlane carries no turn echo, so the
+// turn echo is DERIVED: heading delta between frames (shortest arc) over dt,
+// normalized by CLASSES.scout.turnRate (the fleet ceiling — config-derived,
+// nothing invented), clamped to ±1. Bank sign follows §1 literally.
+//
+// SHAKE SPLIT (unchanged from the 2D ruling): C_FX emits impulses internally
+// where it draws the cause (hitSpark → SMALL; explosion → MEDIUM/LARGE by
+// size); C_APP adds exactly ONE impulse of its own — SHAKE.SMALL when YOU are
+// hit — and picks explosion size by proximity (victim===me or blast within
+// DIST_REF_U ⇒ 'large'). consumeShake() feeds rig.shake each frame; the rig's
+// own SHAKE_GAIN rescales map-frame u into chase-frame jitter (documented by
+// W1).
 //
 // DOCUMENTED CHOICES / DEVIATIONS (task report mirrors these):
+//  · Film grain is OMITTED from the GL path (sanctioned v1 per task brief);
+//    the unified-print feel keeps its vignette as a CSS radial-gradient
+//    overlay div (.aces-vignette, ink-alpha mirror of APAL.ink per the
+//    style.css palette-mirror precedent), pointer-events none, stacked
+//    between the GL canvas and the HUD canvas.
+//  · OverlayModel still carries no own-plane position, so the HUD anchors
+//    gun-line/pip projections at CameraView.x/y — now the true chase-camera
+//    position rather than the old pan center. Documented in ui/hud.ts.
+//  · Respawn framing eases: the frozen AcesRig exposes no snap call, so
+//    snapCamera() only recenters the bookkeeping values (event-distance math)
+//    and the rig itself glides from the death orbit to the spawn strip.
+//  · Dead REMOTE rows emit trail(id, null) explicitly so no smoke emitter
+//    lingers over a wreck (the 2D loop merely skipped them).
 //  · Remote gun VOLLEY sounds are skipped entirely — the contract requires
 //    only explosions/hits; own guns are predicted locally (RULES 10).
 //  · Crate landing puffs are derived client-side from the snapshot diff
-//    fall→active (the wire has no distinct "landed" event).
+//    fall→active via CrateLandTracker (the wire has no distinct event).
 //  · After NET.BACKOFF_MS retries are exhausted the frozen Screens surface
-//    has no menu-return control (its disconnect layer carries only notes),
-//    so the app holds the manual-note screen; re-enlisting means reload.
+//    has no menu-return control, so the app holds the manual-note screen;
+//    re-enlisting means reload.
 //  · Respawn countdown is local because SnapPlane `you` is omitted while
 //    dead (server truth, room.ts sendSnapshots).
-//  · Throttle mapping uses physics.ts semantics directly: th=1 held-up,
-//    th=−0.3 held-down (airbrake), th=0 released (targets speedMin cruise).
-//    Any ramping would invent an unstated tunable.
+//  · Quality degrade is ONE-WAY: rolling frame average >20 ms after warmup
+//    drops DPR→1 + shadows off via scene.setQuality('low'); it never
+//    oscillates back within a session.
 // ============================================================================
 
+import type * as THREE from 'three';
 import {
-  CAMERA,
   CLASSES,
   FIRE_BELOW,
   INPUT_KEYS,
   NET,
+  PLANE_Y,
   RESPAWN_SECONDS,
   SHAKE,
   SNAP_RATE,
@@ -73,7 +102,8 @@ import {
 import type { PlaneClassId, RoomSettings, TeamId } from '@aces/shared/config.js';
 import { buildMap, isOpenWater } from '@aces/shared/maps.js';
 import type { AcesMap } from '@aces/shared/maps.js';
-import type { GameEvent, InputFrame, MatchPhase, ScoreRow } from '@aces/shared/types.js';
+import { angleDelta } from '@aces/shared/physics.js';
+import type { CratePhase, GameEvent, InputFrame, MatchPhase, ScoreRow } from '@aces/shared/types.js';
 import type { SnapPlane } from '@aces/shared/protocol.js';
 import type {
   Banner,
@@ -85,25 +115,22 @@ import type {
   OverlayModel,
   SnapshotView,
 } from './contract/seams.js';
+import { fitCanvas, hashStr } from './contract/visual.js';
 import { createNet, RemoteInterp } from './net.js';
 import { OwnPredictor } from './prediction.js';
-import { createWorldRenderer } from './render/world.js';
-import type { WorldRenderer } from './render/world.js';
-import { drawCrate, drawPlane } from './render/planes.js';
-import { createEffects } from './render/effects.js';
+import { createEffects3D } from './render3d/effects3d.js';
+import type { EffectsApi3D } from './render3d/effects3d.js';
+import { buildPlane } from './render3d/planeModels.js';
+import type { PlaneModel } from './render3d/planeModels.js';
+import { createScene, easeFactor, yawOf } from './render3d/scene.js';
+import type { AcesScene } from './render3d/scene.js';
+import { createWorld } from './render3d/world.js';
+import type { AcesWorld } from './render3d/world.js';
 import { createHud } from './ui/hud.js';
 import type { Hud } from './ui/hud.js';
 import { createScreens } from './ui/screens.js';
 import type { Screens } from './ui/screens.js';
 import { DIST_REF_U, createAudio, loadMuted, saveMuted } from './audio/audio.js';
-import {
-  PAL,
-  drawGrain,
-  fitCanvas,
-  hashStr,
-  makeGrainTiles,
-  makeVignette,
-} from './contract/visual.js';
 
 /** What startAces hands back to the boot shell (seams.ts creator note). */
 export interface AcesDebug {
@@ -121,7 +148,11 @@ export interface AcesDebug {
   warpTo(x: number, y: number): void;
   giveCrate(x?: number, y?: number): void;
   fastForward(ticks: number): void;
-  /** Pin camera zoom for hero captures (null restores speed-auto). */
+  /**
+   * Pin camera zoom for hero captures. GRAPHICS_3D §2 semantics: a
+   * CAM-DISTANCE multiplier pin (0.5–6, null = speed-auto) routed to
+   * rig.setZoomMult.
+   */
   zoomTo(z: number | null): void;
   muted(): boolean;
   /** e2e probing handles — read-only refs, nothing mutates game truth. */
@@ -143,9 +174,10 @@ export interface AcesApp {
   destroy(): void;
 }
 
-// ---- module-private tunables -------------------------------------------------
-// The frozen config carries gameplay numbers only; feel constants live beside
-// the code that uses them (house pattern: world.ts TILE_U, effects.ts FX).
+// ============================================================================
+// Pure pipeline helpers — exported for the headless gate (app.render.test.ts)
+// and shared by every drive site below. No DOM, no GL, deterministic.
+// ============================================================================
 
 /** Sim/render substep — CONTRACT §5 pins render-side logic at 60 Hz. */
 const STEP_S = 1 / 60;
@@ -153,25 +185,29 @@ const STEP_S = 1 / 60;
 const MAX_FRAME_S = 0.25;
 const MAX_STEPS_PER_FRAME = 5;
 
-/** Camera position ease rate, 1/s. Higher = tighter follow. Tuned so a full
- *  throttle turn keeps the nose comfortably inside the frame at ZOOM_MIN. */
-const CAM_EASE_POS = 6;
-/** Camera zoom ease rate, 1/s — slower than position so zoom breathes. */
-const CAM_EASE_ZOOM = 3.5;
+const TAU = Math.PI * 2;
 
-/** Shake decay, 1/s exponential; below SHAKE_CUTOFF_U the amp zeroes so the
- *  sines stop nudging sub-pixel values forever. */
-const SHAKE_DECAY_PER_S = 6.5;
-const SHAKE_CUTOFF_U = 0.05;
-/** Accumulation ceiling ≈ one LARGE + margin — stacked hits can't fling the
- *  camera off-map. */
-const SHAKE_MAX_U = SHAKE.LARGE * 1.25;
-/** Incommensurate sine frequencies for the shake offset: deterministic (no
- *  Math.random — RULES 3), allocation-free, and the Lissajous pair never
- *  repeats visibly inside a burst. */
-const SHAKE_FQ_A = 37.7;
-const SHAKE_FQ_B = 29.3;
-const SHAKE_Y_BIAS = 0.83; // vertical component slightly softer than horizontal
+/** §1 bob: planes cruise at PLANE_Y ±0.6u on sin(t·0.9 + phase). */
+const BOB_FREQ = 0.9;
+const BOB_AMP = 0.6;
+
+/** §1 attitude targets: roll = −turnInput·0.45rad · pitch +0.06·throttle,
+ *  boost −0.04 (dive). All five numbers are frozen-law citations. */
+const BANK_RAD = 0.45;
+const PITCH_PER_THROTTLE = 0.06;
+const PITCH_BOOST = -0.04;
+
+/** Bank/pitch approach rate, 1/s — mirrors scene.ts ROLL_RATE easing idiom. */
+const ATTITUDE_EASE_RATE = 6;
+
+/** Frames a pooled model may stay unseen before disposal (~10 s at 60 Hz):
+ *  roster churn from reconnects must not leak airframes forever. */
+const POOL_TTL_FRAMES = 600;
+
+/** Rolling-average frame time above which quality degrades once (§5). */
+const PERF_BUDGET_MS = 20;
+const PERF_EMA_ALPHA = 0.05;
+const PERF_WARMUP_FRAMES = 120;
 
 /** Nose offset ahead of center, u — mirrors fireVolley's muzzle placement in
  *  shared/physics.ts (single source: the volley itself). */
@@ -184,12 +220,10 @@ const FEED_MAX = 8;
 const BANNER_TTL_TICKS = SNAP_RATE * 4;
 const BANNER_MAX = 4;
 
-/** Auto-spawn resend cadence while the server has not yet confirmed a seat
- *  (spawn msg lost / join raced the live transition). Bounded self-healing. */
+/** Auto-spawn resend cadence while the server has not yet confirmed a seat. */
 const AUTO_SPAWN_RETRY_MS = 1000;
 
-/** localStorage keys. Name per task law; mute persistence lives in C_AUDIO
- *  (MUTED_KEY) and is reused through loadMuted/saveMuted — one store, one key. */
+/** localStorage keys. Name per task law; mute persistence lives in C_AUDIO. */
 const NAME_KEY = 'aces.name';
 const NAME_FALLBACK = 'PLAYER';
 
@@ -213,46 +247,199 @@ function clamp01(v: number): number {
   return v < 0 ? 0 : v > 1 ? 1 : v;
 }
 
+/**
+ * Shortest-arc heading delta prevH → h into (−π, π]. Shared-physics
+ * angleDelta already wraps; re-wrapped here so the helper stands alone.
+ */
+export function headingDeltaShortest(prevH: number, h: number): number {
+  return angleDelta(prevH, h);
+}
+
+/**
+ * Turn echo WITHOUT a wire echo: heading delta over dt normalized by the
+ * fleet's tightest turner (CLASSES.scout.turnRate — config-derived ceiling),
+ * clamped to ±1. dt ≤ 0 (first sighting / paused frame) echoes neutral 0.
+ */
+export function turnInputFromHeadingDelta(dh: number, dt: number): number {
+  if (!(dt > 0)) return 0;
+  const norm = dh / dt / CLASSES.scout.turnRate;
+  return norm < -1 ? -1 : norm > 1 ? 1 : norm;
+}
+
+/** §1 bank roll target: rotation.x = −turnInput·0.45rad (YZX order). */
+export function bankFromTurnInput(turnIn: number): number {
+  const t = turnIn < -1 ? -1 : turnIn > 1 ? 1 : turnIn;
+  return -BANK_RAD * t + 0; // `+ 0` normalises −0 → +0 (scene.ts yawOf idiom)
+}
+
+/** One-call form of the two helpers above (the per-frame path). */
+export function bankFromHeadingDelta(prevH: number, h: number, dt: number): number {
+  return bankFromTurnInput(turnInputFromHeadingDelta(headingDeltaShortest(prevH, h), dt));
+}
+
+/** §1 pitch target: +0.06rad·throttle, boost −0.04 (boost dive feel). */
+export function pitchAttitude(throttle: number, boosting: boolean): number {
+  return PITCH_PER_THROTTLE * throttle + (boosting ? PITCH_BOOST : 0);
+}
+
+/** §1 cruise-altitude bob: PLANE_Y + sin(t·0.9 + phase)·0.6. */
+export function planeBobY(tS: number, phase: number): number {
+  return PLANE_Y + Math.sin(tS * BOB_FREQ + phase) * BOB_AMP;
+}
+
+/** Deterministic per-id bob phase in [0, 2π) — seeded hash, never random. */
+export function bobPhaseFor(id: string): number {
+  return ((hashStr(id) % 1000) / 1000) * TAU;
+}
+
+export type DeathCamMode = 'follow' | 'orbit';
+
+/**
+ * Death-cam state machine (§2): any frame without a living own row latches
+ * ORBIT (rig.orbitDeath holds the last focus and slow-orbits the wreck);
+ * a living row again — respawn — returns FOLLOW. Memoryless by design: the
+ * caller's `flying` flag already encodes both edges (see updateCamera).
+ */
+export function deathCamNext(current: DeathCamMode, flying: boolean): DeathCamMode {
+  void current; // latch is memoryless — kept in the signature for call-site clarity
+  return flying ? 'follow' : 'orbit';
+}
+
+/**
+ * Trail level from the frozen damage thresholds (config SMOKE_BELOW /
+ * FIRE_BELOW): hp frac < FIRE_BELOW burns, else < SMOKE_BELOW smokes, else
+ * clean. maxHp ≤ 0 (wire noise) is clean, never a divide-by-zero.
+ */
+export function trailLevel(hp: number, maxHp: number): 'smoke' | 'fire' | null {
+  if (maxHp <= 0) return null;
+  const frac = hp / maxHp;
+  if (frac < FIRE_BELOW) return 'fire';
+  if (frac < SMOKE_BELOW) return 'smoke';
+  return null;
+}
+
+/** One pooled trail call — id/keying is the SERVER plane id, never an index. */
+export interface TrailCall {
+  id: string;
+  x: number;
+  y: number;
+  level: 'smoke' | 'fire' | null;
+}
+
+/** Minimal trail-source pose (SnapPlane rows satisfy this structurally). */
+interface TrailRow {
+  id: string;
+  x: number;
+  y: number;
+  hp: number;
+  maxHp: number;
+  dead: boolean;
+}
+
+/**
+ * Plan the per-frame trail hook calls: every non-own row keyed by its SERVER
+ * id (dead rows plan an explicit null so their emitter clears), then the own
+ * row from the merged predictor view (`own === null` while spectating plans
+ * nothing). Writes into pooled `out` records — zero steady-state allocation.
+ * RETURNS the live call count WITHOUT truncating `out`: the surplus records
+ * stay pooled in the array for future frames (the caller iterates i < count).
+ */
+export function planTrailCalls(
+  rows: ReadonlyArray<TrailRow>,
+  myId: string,
+  own: TrailRow | null,
+  out: TrailCall[],
+): number {
+  let n = 0;
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    if (r === undefined || r.id === myId) continue;
+    let rec = out[n];
+    if (rec === undefined) {
+      rec = { id: '', x: 0, y: 0, level: null };
+      out.push(rec);
+    }
+    rec.id = r.id;
+    rec.x = r.x;
+    rec.y = r.y;
+    rec.level = r.dead ? null : trailLevel(r.hp, r.maxHp);
+    n++;
+  }
+  if (own !== null) {
+    let rec = out[n];
+    if (rec === undefined) {
+      rec = { id: '', x: 0, y: 0, level: null };
+      out.push(rec);
+    }
+    rec.id = own.id;
+    rec.x = own.x;
+    rec.y = own.y;
+    rec.level = own.dead ? null : trailLevel(own.hp, own.maxHp);
+    n++;
+  }
+  return n;
+}
+
+/**
+ * Crate fall→active edge detector (the wire has no "landed" event): ids are
+ * armed while falling and CONSUMED exactly once when seen active afterwards.
+ */
+export class CrateLandTracker {
+  private readonly falling = new Set<number>();
+
+  /** Arms `id` while falling; consumes the arm on active. True exactly once. */
+  observe(id: number, phase: CratePhase): boolean {
+    if (phase === 'fall') {
+      this.falling.add(id);
+      return false;
+    }
+    return this.falling.delete(id);
+  }
+
+  /** Round reset / fresh seat — armed-but-unlanded crates are forgotten. */
+  clear(): void {
+    this.falling.clear();
+  }
+}
+
 // ============================================================================
 // The composition root
 // ============================================================================
 
 export function startAces(container: HTMLElement): AcesApp {
-  // ---- canvases (world below, hud above; CSS stacks them absolutely) -------
-  const worldCanvas = document.createElement('canvas');
-  worldCanvas.className = 'aces-cv aces-cv-world';
+  // ---- canvas stack (GRAPHICS_3D §5): webgl z1 · vignette z2 · hud z3 ------
+  // Screens DOM (z20/z30, owned by C_UI) always sits above; all three layers
+  // take pointer-events:none so menu buttons receive input.
+  const glCanvas = document.createElement('canvas');
+  glCanvas.className = 'aces-cv aces-cv-world';
+  const vignetteEl = document.createElement('div');
+  vignetteEl.className = 'aces-vignette';
+  vignetteEl.setAttribute('aria-hidden', 'true');
   const hudCanvas = document.createElement('canvas');
   hudCanvas.className = 'aces-cv aces-cv-hud';
-  container.appendChild(worldCanvas);
+  container.appendChild(glCanvas);
+  container.appendChild(vignetteEl);
   container.appendChild(hudCanvas);
-  const ctx0 = worldCanvas.getContext('2d');
-  if (ctx0 === null) throw new Error('aces: 2d canvas context unavailable');
-  const ctx: CanvasRenderingContext2D = ctx0; // non-null for the whole session
+
+  // ---- the 3D shell (created ONCE; world mounts lazily on welcome) ----------
+  const scene: AcesScene = createScene(glCanvas);
+  // Scene mount law (header): W1 adds its camera to the internal THREE.Scene,
+  // making getCam().parent the documented mount point for world + effects.
+  const camParent = scene.rig.getCam().parent;
+  if (camParent === null) throw new Error('aces/app: rig camera has no scene parent to mount into');
+  const threeScene = camParent as THREE.Scene;
 
   // ---- siblings -------------------------------------------------------------
   const audio = createAudio();
   let muted = loadMuted(); // persisted mute restored before any sound plays
   audio.setMuted(muted);
 
-  const effects = createEffects(hashStr('fx'));
+  const effects: EffectsApi3D = createEffects3D(hashStr('fx'));
+  effects.attach(threeScene); // idempotent; builds puff buckets on first call
+
   const net = createNet();
   const predictor = new OwnPredictor('fighter'); // class re-set at welcome
   const interp = new RemoteInterp();
-
-  // Pre-baked frame unification kit (RULES 11): grain tiles once, vignette
-  // rebuilt only when the backing-store size changes.
-  const grainTiles = makeGrainTiles(1917, 3);
-  let vignette: HTMLCanvasElement | null = null;
-  let vigW = -1;
-  let vigH = -1;
-
-  // World renderer is LAZY: buildMap(seed) needs the welcome's seed.
-  let map: AcesMap | undefined;
-  let worldRenderer: WorldRenderer | undefined;
-  let builtSeed = -1;
-  let wrW = -1;
-  let wrH = -1;
-  let wrDpr = -1;
 
   const hud = createHud(hudCanvas); // after hudCanvas exists (its ctx capture)
 
@@ -295,21 +482,167 @@ export function startAces(container: HTMLElement): AcesApp {
   const banners: Banner[] = [];
   let hitConfirmTick = 0;
   let hurtTick = 0;
-  const fallingCrates = new Set<number>(); // crate ids seen mid-drop (land fx)
+  const crateTracker = new CrateLandTracker();
 
-  // ---- camera rig -----------------------------------------------------------
-  const camView: CameraView = { x: WORLD.W / 2, y: WORLD.H / 2, zoom: CAMERA.ZOOM_MAX };
-  /** Judge/capture zoom pin (STYLE_BIBLE §4 hero close-ups); null = speed-auto. */
-  let zoomOverride: number | null = null;
-  let shakeAmp = 0;
-  let speedFracCache = 0;
+  // ---- 3D world (LAZY: buildMap(seed) needs the welcome's seed) --------------
+  let map: AcesMap | undefined;
+  let world: AcesWorld | undefined;
+  let builtSeed = -1;
+
+  // ---- plane-model pool (Map keyed by SnapPlane.id) --------------------------
+  interface PoolEntry {
+    model: PlaneModel;
+    cls: PlaneClassId;
+    team: TeamId;
+    phase: number;
+    lastH: number;
+    hasH: boolean;
+    bank: number;
+    pitch: number;
+    seenFrame: number;
+  }
+  const planePool = new Map<string, PoolEntry>();
   let frameIdx = 0;
 
+  function entryFor(id: string, cls: PlaneClassId, team: TeamId): PoolEntry {
+    const cur = planePool.get(id);
+    if (cur !== undefined && cur.cls === cls && cur.team === team) return cur;
+    if (cur !== undefined) {
+      threeScene.remove(cur.model.group);
+      cur.model.dispose(); // detaches; geometry kits are process-wide caches
+    }
+    const model = buildPlane(cls, team);
+    model.group.rotation.order = 'YZX'; // yaw→pitch→roll body-frame (header)
+    threeScene.add(model.group);
+    const entry: PoolEntry = {
+      model,
+      cls,
+      team,
+      phase: bobPhaseFor(id),
+      lastH: 0,
+      hasH: false,
+      bank: 0,
+      pitch: 0,
+      seenFrame: frameIdx,
+    };
+    planePool.set(id, entry);
+    return entry;
+  }
+
+  function clearPlanes(): void {
+    for (const entry of planePool.values()) {
+      threeScene.remove(entry.model.group);
+      entry.model.dispose();
+    }
+    planePool.clear();
+  }
+
+  /**
+   * Drive one pooled airframe from a server/predictor pose (§1 attitude law +
+   * §4 seam division: the APP owns transforms, the MODEL owns prop/surfaces/
+   * damage/blink). Zero allocation — scalars and cached transforms only.
+   */
+  function drivePlane(
+    entry: PoolEntry,
+    x: number,
+    y: number,
+    h: number,
+    throttle: number,
+    boosting: boolean,
+    hp: number,
+    maxHp: number,
+    invulnT: number,
+    dt: number,
+    tS: number,
+  ): void {
+    const dh = entry.hasH ? headingDeltaShortest(entry.lastH, h) : 0;
+    entry.lastH = h;
+    entry.hasH = true;
+    entry.seenFrame = frameIdx;
+    const turnIn = turnInputFromHeadingDelta(dh, dt);
+    const k = easeFactor(dt, ATTITUDE_EASE_RATE);
+    entry.bank += (bankFromTurnInput(turnIn) - entry.bank) * k;
+    entry.pitch += (pitchAttitude(throttle, boosting) - entry.pitch) * k;
+
+    const g = entry.model.group;
+    g.position.set(x, planeBobY(tS, entry.phase), y); // §1: X=x · Y=bob · Z=y
+    g.rotation.y = yawOf(h);
+    g.rotation.x = entry.bank;
+    g.rotation.z = entry.pitch;
+
+    entry.model.setControls(turnIn);
+    entry.model.setDamage(maxHp > 0 ? clamp01(1 - hp / maxHp) : 0);
+    entry.model.setBlink(invulnT > 0);
+    entry.model.setVisible(true);
+    entry.model.update(dt, tS);
+  }
+
+  function updatePlanes(dt: number, tS: number): void {
+    // Remotes (interp rows already exclude nobody — filter self/dead here).
+    for (let i = 0; i < remoteOut.length; i++) {
+      const row = remoteOut[i];
+      if (row === undefined || row.id === myId || row.dead) continue;
+      const entry = entryFor(row.id, row.cls, row.team);
+      drivePlane(entry, row.x, row.y, row.h, row.throttle, row.boosting, row.hp, row.maxHp, row.invulnT, dt, tS);
+    }
+    // OWN plane drawn the same way from the merged predictor view.
+    if (seenYouRow && !predictor.state.dead && myId !== '') {
+      fillScratchOwn();
+      const s = scratchOwn;
+      const entry = entryFor(myId, s.cls, s.team);
+      drivePlane(entry, s.x, s.y, s.h, s.throttle, s.boosting, s.hp, s.maxHp, s.invulnT, dt, tS);
+    }
+    // Hide stale entries; reap long-gone ids (reconnect churn).
+    planePool.forEach((entry, id) => {
+      if (entry.seenFrame !== frameIdx && entry.model.group.visible) entry.model.setVisible(false);
+      if (frameIdx - entry.seenFrame > POOL_TTL_FRAMES) {
+        threeScene.remove(entry.model.group);
+        entry.model.dispose();
+        planePool.delete(id);
+      }
+    });
+  }
+
+  // ---- camera feed ------------------------------------------------------------
+  let deathCam: DeathCamMode = 'follow';
+  /** Judge/capture distance-multiplier pin (§2 hero shots); null = default. */
+  let zoomOverride: number | null = null;
+  /** Reused velocity record for the rig — zero per-frame allocation. */
+  const velFeed: { x: number; y: number } = { x: 0, y: 0 };
+
+  function updateCamera(dt: number, tS: number): void {
+    const st = predictor.state;
+    const flying = seenYouRow && !st.dead && myId !== '';
+    deathCam = deathCamNext(deathCam, flying);
+
+    // ALL accumulated impulses (C_FX internal + the one app-side hurt kick)
+    // flow into the rig, whose SHAKE_GAIN rescales them for the chase frame.
+    const m = effects.consumeShake();
+    if (m > 0) scene.rig.shake(m);
+    scene.rig.setZoomMult(zoomOverride ?? 1);
+
+    if (flying) {
+      // st is the pos view (x/y); VELOCITY rides vx/vy — the rig's lookahead
+      // law needs true speed, not position. Identity §1 mapping (vx→VX, vy→VZ).
+      velFeed.x = st.vx;
+      velFeed.y = st.vy;
+      const entry = planePool.get(myId);
+      scene.rig.follow(st, velFeed, st.h, entry ? entry.bank : 0, entry ? entry.pitch : 0, dt);
+    } else if (deathCam === 'orbit' && everSpawned) {
+      // Orbit only AFTER a first life: §2 scopes the wreck orbit to own
+      // death, so pre-first-spawn spectating keeps the rig's initial
+      // map-center hold (the old 2D idle framing).
+      scene.rig.orbitDeath(tS);
+    }
+  }
+
   function snapCamera(): void {
+    // Bookkeeping-only since the frozen AcesRig exposes no snap: recenters
+    // the values event-distance math reads between frames. The rig itself
+    // eases from wherever it is (deviation documented in the header).
     camView.x = predictor.state.x;
     camView.y = predictor.state.y;
-    camView.zoom = CAMERA.ZOOM_MAX;
-    shakeAmp = 0;
+    camView.zoom = 1;
   }
 
   // ---- input ------------------------------------------------------------------
@@ -371,6 +704,8 @@ export function startAces(container: HTMLElement): AcesApp {
   };
   type TargetRow = { x: number; y: number; team: TeamId; cls: PlaneClassId; hpFrac: number };
   const targetsPool: TargetRow[] = [];
+  const trailOut: TrailCall[] = [];
+  const ownTrailScratch: TrailRow = { id: '', x: 0, y: 0, hp: 0, maxHp: 1, dead: false };
 
   const hmYou: NonNullable<HudModel['you']> = {
     cls: 'fighter', team: 'royal', hp: 0, maxHp: 1, heat: 0, jammed: false,
@@ -381,14 +716,28 @@ export function startAces(container: HTMLElement): AcesApp {
     tickets: { royal: 0, iron: 0 },
     you: null, board: [], feed: [], banners: [], muted,
   };
+
+  /**
+   * The frozen §2 CameraView seam, backed live by the rig: x/y track the true
+   * chase-camera position (written post-render), zoom mirrors the distance
+   * multiplier pin, project() delegates to rig.project (SHARED SCRATCH —
+   * consumers copy fields immediately, never stash the record).
+   */
+  const camView: CameraView = {
+    x: WORLD.W / 2,
+    y: WORLD.H / 2,
+    zoom: 1,
+    project(wx, wy, wz) {
+      return scene.rig.project(wx, wy, wz);
+    },
+  };
+
   const om: OverlayModel = {
     alive: false, heading: 0, speedFrac: 0, heat: 0, jammed: false,
     targets: targetsPool, cam: camView, hitConfirmTick: 0, hurtTick: 0,
   };
 
   // ---- per-subsystem exception guard (RULES 5) --------------------------------
-  // One throw logs ONCE and that subsystem is skipped for the rest of the
-  // session — a poisoned draw call must never white-screen nor spam console.
   const failed = new Set<string>();
   function guarded(key: string, fn: () => void): void {
     if (failed.has(key)) return;
@@ -413,12 +762,15 @@ export function startAces(container: HTMLElement): AcesApp {
       interp.push(snap);
       checkSuddenDeath();
 
-      // Crate landing puff: fall→active transition visible only in snapshots.
+      // Crate parity: pooled 3D models sync straight off the snapshot, and
+      // the fall→active edge fires the landing puff exactly once per crate.
+      effects.syncCrates(snap.crates);
       for (let i = 0; i < snap.crates.length; i++) {
         const c = snap.crates[i];
         if (c === undefined) continue;
-        if (c.phase === 'fall') fallingCrates.add(c.id);
-        else if (fallingCrates.delete(c.id)) effects.crateFx('land', c.x, c.y);
+        if (crateTracker.observe(c.id, c.phase)) {
+          effects.crateFx('land', { x: c.x, y: c.y });
+        }
       }
 
       // Own-row edges. reconcile() copies server-authoritative fields
@@ -433,7 +785,7 @@ export function startAces(container: HTMLElement): AcesApp {
         if (!hadRow) {
           seenYouRow = true;
           everSpawned = true;
-          snapCamera(); // first-ever row: jump the camera to the spawn strip
+          snapCamera(); // first-ever row: recenter bookkeeping at the spawn strip
         } else if (wasDead && !predictor.state.dead) {
           everSpawned = true;
           snapCamera(); // rebirth
@@ -444,9 +796,7 @@ export function startAces(container: HTMLElement): AcesApp {
       }
 
       // Auto first spawn: live + never spawned → ask for a fighter. Sent at
-      // ≤1 Hz until the server confirms a you-row (lost-msg self-healing);
-      // seats joined during LOBBY are auto-spawned server-side at the live
-      // transition, so this mostly covers mid-live joins.
+      // ≤1 Hz until the server confirms a you-row (lost-msg self-healing).
       if (!everSpawned && snap.phase === 'live') {
         const nowMs = performance.now();
         if (nowMs - lastSpawnTryMs >= AUTO_SPAWN_RETRY_MS) {
@@ -466,18 +816,25 @@ export function startAces(container: HTMLElement): AcesApp {
       boardVer++;
 
       // LAZY world build: identical seed → identical terrain (maps.ts law).
-      // A reconnect to a same-seed room reuses the baked renderer.
-      if (builtSeed !== w.seed || worldRenderer === undefined) {
+      // A reconnect to a same-seed room reuses the baked 3D world.
+      if (builtSeed !== w.seed || world === undefined) {
         builtSeed = w.seed;
         map = buildMap(w.seed);
-        worldRenderer = createWorldRenderer(worldCanvas, map);
-        wrW = -1; // force resize handoff on next frame
+        if (world !== undefined) {
+          threeScene.remove(world.group);
+          world.dispose();
+        }
+        world = createWorld(map);
+        threeScene.add(world.group);
       }
 
       predictor.setClass('fighter');
 
-      // Fresh seat (reconnect mints one — CONTRACT §5): wipe round-local UI
-      // state so stale feed/banners from the dropped session can't leak.
+      // Fresh seat (reconnect mints one — CONTRACT §5): wipe round-local
+      // state so stale feed/banners/airframes can't leak across sessions.
+      clearPlanes();
+      crateTracker.clear();
+      deathCam = 'follow';
       seenYouRow = false;
       everSpawned = false;
       deadRemainS = 0;
@@ -488,7 +845,6 @@ export function startAces(container: HTMLElement): AcesApp {
       endShown = false;
       matchUIShown = false;
       shownLobbySec = -2;
-      fallingCrates.clear();
       hitConfirmTick = 0;
       hurtTick = 0;
       snapCamera();
@@ -498,8 +854,7 @@ export function startAces(container: HTMLElement): AcesApp {
       if (destroyed) return;
       // FROZEN-SEAM REGISTRATION (seams.ts): the hook hands us the producer's
       // registrar; we hand back our consumer IMMEDIATELY — a synchronous
-      // round-trip, so even the very first parsed view (the event that
-      // triggers C_NET's register-on-first-use bridge) is delivered. The one
+      // round-trip, so even the very first parsed view is delivered. The one
       // narrow assertion below exists because the seam types the parameter as
       // the consumer itself while its real contract is registrar-shaped (see
       // header + report); the runtime callee simply captures what it receives,
@@ -595,7 +950,7 @@ export function startAces(container: HTMLElement): AcesApp {
       banners.length = 0;
       sdShown = false;
       deadRemainS = 0;
-      fallingCrates.clear();
+      crateTracker.clear();
       endShown = false;
     }
   }
@@ -692,7 +1047,7 @@ export function startAces(container: HTMLElement): AcesApp {
         // Size law (header "SHAKE SPLIT"): near blast / own death = large,
         // distant = small — C_FX maps these onto MEDIUM/LARGE impulses.
         const size = e.victim === myId || dist <= DIST_REF_U ? ('large' as const) : ('small' as const);
-        effects.explosion(e.x, e.y, size, overWater);
+        effects.explosion({ x: e.x, y: e.y }, size, overWater);
         audio.explosion(dist);
 
         if (myId !== '' && e.killer === myId) {
@@ -707,9 +1062,9 @@ export function startAces(container: HTMLElement): AcesApp {
       case 'hit': {
         if (myId !== '' && e.by === myId) {
           hitConfirmTick = snapTick;
-          // Spark backsplash cone points away from MY gunline.
-          const st = predictor.state;
-          effects.hitSpark(e.x, e.y, Math.atan2(e.y - st.y, e.x - st.x));
+          // Spark backsplash cone points away from MY gunline (C_FX 3D owns
+          // the cone orientation internally — its API takes just the point).
+          effects.hitSpark({ x: e.x, y: e.y });
           audio.hitConfirm();
         } else if (e.target === myId) {
           hurtTick = snapTick;
@@ -721,7 +1076,7 @@ export function startAces(container: HTMLElement): AcesApp {
       }
       case 'crate': {
         if (myId !== '' && e.what === 'pickup' && e.by === myId) {
-          effects.crateFx('pickup', e.x, e.y);
+          effects.crateFx('pickup', { x: e.x, y: e.y });
           audio.pickup();
         }
         break;
@@ -762,17 +1117,17 @@ export function startAces(container: HTMLElement): AcesApp {
 
     // Trigger rising edge → SAME-FRAME cosmetics (RULES 10, ≤100 ms budget):
     // flash + tracer stub + shot, gated like the server's fireVolley
-    // (dead/jammed/spawn-protected guns stay silent).
+    // (dead/jammed/spawn-protected guns stay silent). Event-edge object
+    // literals are allocation-exempt (RULES 4 wire/event shape).
     if (fire && !prevFireHeld && !st.dead && !st.jammed && st.invulnT <= 0) {
       const nx = st.x + Math.cos(st.h) * NOSE_U;
       const ny = st.y + Math.sin(st.h) * NOSE_U;
-      effects.muzzleFlash(nx, ny, st.h);
-      effects.tracerStub(nx, ny, st.h);
+      const nose: { x: number; y: number } = { x: nx, y: ny };
+      effects.muzzleFlash(nose, st.h);
+      effects.tracerStub(nose, st.h);
       audio.shot(true, 0);
     }
     prevFireHeld = fire;
-
-    effects.update(dt);
 
     if (due) {
       // Wire-crossing object — allocation-exempt (RULES 4). Shared BY
@@ -783,25 +1138,25 @@ export function startAces(container: HTMLElement): AcesApp {
     }
   }
 
-  // ---- trails ------------------------------------------------------------------------
-  function trailLevel(hp: number, maxHp: number): 'smoke' | 'fire' | null {
-    if (maxHp <= 0) return null;
-    const frac = hp / maxHp;
-    if (frac < FIRE_BELOW) return 'fire';
-    if (frac < SMOKE_BELOW) return 'smoke';
-    return null;
-  }
-
+  // ---- trails (server-id keyed; pooled plan, zero steady-state alloc) -----
   function emitTrails(): void {
     const st = predictor.state;
-    for (let i = 0; i < remoteOut.length; i++) {
-      const row = remoteOut[i];
-      if (row === undefined || row.id === myId || row.dead) continue;
-      effects.trail(row.id, row.x, row.y, trailLevel(row.hp, row.maxHp));
+    let n: number;
+    if (seenYouRow && myId !== '') {
+      ownTrailScratch.id = myId;
+      ownTrailScratch.x = st.x;
+      ownTrailScratch.y = st.y;
+      ownTrailScratch.hp = st.hp;
+      ownTrailScratch.maxHp = maxHpCache;
+      ownTrailScratch.dead = st.dead;
+      n = planTrailCalls(remoteOut, myId, ownTrailScratch, trailOut);
+    } else {
+      n = planTrailCalls(remoteOut, myId, null, trailOut);
     }
-    if (myId === '') return;
-    // Own emitter: level follows merged view; explicit null while dead clears.
-    effects.trail(myId, st.x, st.y, st.dead ? null : trailLevel(st.hp, maxHpCache));
+    for (let i = 0; i < n; i++) {
+      const tc = trailOut[i]!;
+      effects.trail(tc.id, tc, tc.level);
+    }
   }
 
   // ---- models -------------------------------------------------------------------------
@@ -892,110 +1247,59 @@ export function startAces(container: HTMLElement): AcesApp {
     targetsPool.length = ti;
   }
 
-  // ---- render pass ----------------------------------------------------------------------
+  // ---- render pass (§5 loop order) ------------------------------------------------------
   let lastMs = -1;
   let accS = 0;
+  let vpW = -1;
+  let vpH = -1;
+  let speedFracCache = 0;
+  let perfEmaMs = 16;
+  let qualityLow = false;
 
   function render(nowMs: number, dtS: number): void {
-    const fitted = fitCanvas(worldCanvas);
-    const wCss = fitted.w;
-    const hCss = fitted.h;
-    const cw = worldCanvas.width;
-    const ch = worldCanvas.height;
-    const dpr = cw / Math.max(1, wCss);
+    frameIdx++;
 
-    if (cw !== vigW || ch !== vigH) {
-      vigW = cw;
-      vigH = ch;
-      vignette = makeVignette(cw, ch); // device-pixel bake, drawn at identity
+    // Viewport handoff: CSS box × capped DPR is owned jointly by fitCanvas
+    // (backing store) and setViewport (renderer sizing + aspect).
+    const fitted = fitCanvas(glCanvas);
+    if (fitted.w !== vpW || fitted.h !== vpH) {
+      vpW = fitted.w;
+      vpH = fitted.h;
+      scene.setViewport(vpW, vpH);
     }
-
-    // --- camera rig ---
-    const st = predictor.state;
-    const spec = CLASSES[st.cls];
-    speedFracCache = clamp01(Math.hypot(st.vx, st.vy) / spec.speedMax);
-    const tx = st.x + st.vx * CAMERA.LOOKAHEAD_S;
-    const ty = st.y + st.vy * CAMERA.LOOKAHEAD_S;
-    const kp = 1 - Math.exp(-CAM_EASE_POS * dtS);
-    camView.x += (tx - camView.x) * kp;
-    camView.y += (ty - camView.y) * kp;
-    const zoomTarget = zoomOverride ?? CAMERA.ZOOM_MAX + (CAMERA.ZOOM_MIN - CAMERA.ZOOM_MAX) * speedFracCache;
-    camView.zoom += (zoomTarget - camView.zoom) * (1 - Math.exp(-CAM_EASE_ZOOM * dtS));
 
     const tS = nowMs / 1000;
-    shakeAmp = Math.min(SHAKE_MAX_U, shakeAmp + effects.consumeShake());
-    const shx = Math.sin(tS * SHAKE_FQ_A) * shakeAmp;
-    const shy = Math.cos(tS * SHAKE_FQ_B) * shakeAmp * SHAKE_Y_BIAS;
-    shakeAmp *= Math.exp(-SHAKE_DECAY_PER_S * dtS);
-    if (shakeAmp < SHAKE_CUTOFF_U) shakeAmp = 0;
 
-    // Clear + sea base under everything (drawBelow paints the live sea over
-    // this once built; pre-welcome the menus cover it anyway).
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.fillStyle = PAL.seaDeep;
-    ctx.fillRect(0, 0, cw, ch);
+    // Interpolated remotes FIRST — planes, trails and targets all read them.
+    interp.sampleRemotes(nowMs, remoteOut);
+    const st = predictor.state;
+    speedFracCache = clamp01(Math.hypot(st.vx, st.vy) / CLASSES[st.cls].speedMax);
+    const ownVisible = seenYouRow && !st.dead;
 
-    // World transform: pan + zoom + DPR-center math; shake rides the camera.
-    const z = camView.zoom;
-    ctx.setTransform(
-      dpr * z,
-      0,
-      0,
-      dpr * z,
-      dpr * (wCss / 2 - (camView.x + shx) * z),
-      dpr * (hCss / 2 - (camView.y + shy) * z),
-    );
+    guarded('camera', () => updateCamera(dtS, tS));
+    guarded('planes', () => updatePlanes(dtS, tS));
+    guarded('fx.trails', emitTrails);
 
-    const wr = worldRenderer;
-    if (wr !== undefined) {
-      if (wCss !== wrW || hCss !== wrH || dpr !== wrDpr) {
-        wrW = wCss;
-        wrH = hCss;
-        wrDpr = dpr;
-        wr.resize(wCss, hCss, dpr);
-      }
-      guarded('world.below', () => wr.drawBelow(ctx, camView, tS));
-    }
-
+    // Snapshot tracers BEFORE render (stateless instanced rebuild, §4).
     const snap = lastSnap;
     if (haveSnap && snap !== undefined) {
-      guarded('crates', () => {
-        for (let i = 0; i < snap.crates.length; i++) {
-          const c = snap.crates[i];
-          if (c !== undefined) drawCrate(ctx, c, tS);
-        }
-      });
-      guarded('projectiles', () => effects.drawProjectiles(ctx, snap.bullets));
+      guarded('fx.bullets', () => effects.drawProjectiles(snap.bullets));
     }
 
-    interp.sampleRemotes(nowMs, remoteOut); // pooled rows, no allocation
-    guarded('planes.remote', () => {
-      for (let i = 0; i < remoteOut.length; i++) {
-        const row = remoteOut[i];
-        if (row === undefined || row.id === myId || row.dead) continue;
-        drawPlane(ctx, row, tS);
-      }
-    });
+    guarded('world.anim', () => world?.update(tS, camView));
+    guarded('fx.update', () => effects.update(dtS, camView));
+    guarded('scene.render', () => scene.render(dtS, tS));
 
-    const ownVisible = seenYouRow && !predictor.state.dead;
-    if (ownVisible) {
-      fillScratchOwn();
-      guarded('planes.own', () => drawPlane(ctx, scratchOwn, tS));
-    }
+    // Post-render: the HUD's CameraView now reflects the TRUE chase-camera
+    // pose (server coords: X↔x, Z↔y) and the current zoom-pin multiplier.
+    const cpos = scene.rig.getCam().position;
+    camView.x = cpos.x;
+    camView.y = cpos.z;
+    camView.zoom = zoomOverride ?? 1;
 
-    guarded('fx.trails', emitTrails);
-    guarded('fx.draw', () => effects.draw(ctx, camView));
-    if (wr !== undefined) guarded('world.above', () => wr.drawAbove(ctx, camView, tS));
-
-    // --- screen space: HUD model → grain → vignette ---
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    // --- screen space: HUD model (projections ride rig.project) ---
     assembleModels();
     if (welcomed) guarded('hud', () => hud.update(hm, om));
-
-    guarded('grain', () => drawGrain(ctx, cw, ch, grainTiles, frameIdx));
-    frameIdx++;
-    const vg = vignette;
-    if (vg !== null) guarded('vignette', () => ctx.drawImage(vg, 0, 0));
 
     // Engine + wind follow the merged own view; idle-fade while dead/off-line.
     guarded('audio.frame', () => {
@@ -1019,6 +1323,7 @@ export function startAces(container: HTMLElement): AcesApp {
     let dtS = lastMs < 0 ? 0 : (nowMs - lastMs) / 1000;
     lastMs = nowMs;
     if (!(dtS > 0)) dtS = 0;
+    const rawMs = dtS * 1000;
     if (dtS > MAX_FRAME_S) dtS = MAX_FRAME_S;
 
     accS += dtS;
@@ -1039,6 +1344,16 @@ export function startAces(container: HTMLElement): AcesApp {
       guarded('frame', () => {
         throw err;
       });
+    }
+
+    // §5 graceful degrade: sustained slow frames drop DPR→1 + shadows off,
+    // exactly once (no oscillation within a session).
+    if (!qualityLow && welcomed && frameIdx > PERF_WARMUP_FRAMES) {
+      perfEmaMs += (rawMs - perfEmaMs) * PERF_EMA_ALPHA;
+      if (perfEmaMs > PERF_BUDGET_MS) {
+        qualityLow = true;
+        guarded('perf', () => scene.setQuality('low'));
+      }
     }
   }
 
@@ -1101,7 +1416,11 @@ export function startAces(container: HTMLElement): AcesApp {
     fastForward(ticks) {
       net.sendDebug('tick', ticks);
     },
-    /** Judge/capture hook (STYLE_BIBLE §4): pin the camera zoom. null = auto. */
+    /**
+     * Judge/capture hook (STYLE_BIBLE §4 + GRAPHICS_3D §2): pin the chase
+     * distance multiplier (0.5–6; null restores the default 1). Routed to
+     * rig.setZoomMult every frame; the rig re-clamps authoritatively.
+     */
     zoomTo(z: number | null) {
       zoomOverride = z === null ? null : Math.max(0.5, Math.min(6, z));
     },
@@ -1140,12 +1459,20 @@ export function startAces(container: HTMLElement): AcesApp {
       hud.destroy();
       screens.hideAll(); // frozen Screens exposes no destroy — hide is best-effort
       delete window.__ACES;
-      worldCanvas.remove();
+      // 3D teardown: pooled airframes, world subtree, FX pools, GL shell.
+      clearPlanes();
+      if (world !== undefined) {
+        threeScene.remove(world.group);
+        world.dispose();
+        world = undefined;
+      }
+      effects.dispose();
+      scene.dispose();
+      vignetteEl.remove();
+      glCanvas.remove();
       hudCanvas.remove();
       // audio/Screens own no teardown in the frozen seams; dropping refs lets
       // the GC reclaim them once their internal timers drain.
     },
   };
 }
-
-

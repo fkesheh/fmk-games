@@ -1,31 +1,37 @@
 // ============================================================================
 // ACES — C_UI hud.ts. In-match HUD: transparent canvas overlay + DOM chips.
 //
-// CANVAS OVERLAY (screen space — C_APP resets the world transform before the
-// HUD draws; see seams.ts camera convention):
-//   · gun crosshair anchored at screen CENTER offset along o.heading
-//     ASSUMPTION (documented per brief): OverlayModel carries no own-plane
-//     position, but the chase camera keeps the own plane at/near the screen
-//     center (CAMERA.LOOKAHEAD_S introduces a small offset we cannot compute
-//     from this seam). The crosshair therefore rides center + heading*lead.
+// CANVAS OVERLAY (screen space — every world anchor reaches the canvas ONLY
+// through OverlayModel.cam.project, the frozen GRAPHICS_3D §2 seam backed by
+// C_APP's rig):
+//   · gun crosshair anchored at the PROJECTION of a point CROSS_LEAD_U ahead
+//     of the gun line at cruise altitude. ASSUMPTION (carried from the 2D era,
+//     still true post-3D): OverlayModel carries no own-plane position, so the
+//     gun line is approximated AT CameraView.x/y — the chase camera keeps the
+//     own plane near screen center, so the projection lands there too.
 //   · amber lead pip toward the nearest target inside the front arc, using
-//     shared aimLead geometry. ASSUMPTION: OverlayModel.targets carries world
-//     position + class only (no velocity/heading), so the intercept is
-//     approximated with a ZERO target velocity — aimLead then reduces to the
-//     range-compensated convergence point on the target hull. The pip's job
-//     stays honest: it marks "your guns converge HERE now" without inventing
-//     target kinematics the frozen seam does not carry.
+//     shared aimLead geometry, drawn at the PROJECTED intercept point.
+//     ASSUMPTION: OverlayModel.targets carries world position + class only
+//     (no velocity/heading), so the intercept is approximated with a ZERO
+//     target velocity — aimLead then reduces to the range-compensated
+//     convergence point on the target hull. The pip's job stays honest: it
+//     marks "your guns converge HERE now" without inventing target kinematics
+//     the frozen seam does not carry.
 //   · heat bar under the crosshair — bar LENGTH plus a text state (GUNS /
 //     HEAT / JAMMED), warn hue only past HEAT_WARN (D4: never color alone).
 //   · hit-marker × flash while (m.tick − o.hitConfirmTick) is small.
 //   · directional hurt arcs while (m.tick − o.hurtTick) is small. The seam
 //     carries hurtTick but NO shooter bearing, so the arc is oriented toward
-//     the nearest living enemy — in a forward-fire duel the shooter is almost
-//     always the plane you are turning against. Documented approximation.
+//     the nearest living enemy — projected to screen and read as a bearing
+//     from screen center (the chase cam keeps the duel in front of you). The
+//     arc is skipped when nothing is airborne/projectable. Documented
+//     approximation.
 //   · offscreen enemy edge arrows: project o.targets through o.cam, clamp the
-//     ray from screen center onto an inset viewport box, draw arrow + team
+//     ray FROM SCREEN CENTER onto an inset viewport box, draw arrow + team
 //     badge (letter R/I AND distinct mark shape — D4 double encoding) + class
-//     glyph letter. Nearest 3 (CONTRACT §5 C_UI).
+//     glyph letter. Behind-camera projections mirror both axes; the flip is
+//     undone before clamping so arrows never point the wrong way. Nearest 3
+//     (CONTRACT §5 C_UI).
 //   · SUDDEN DEATH stamp centered while m.suddenDeath (the DOM clock hides;
 //     the stamp replaces it here on canvas).
 //
@@ -53,6 +59,7 @@ import {
   CLASSES,
   FIRE_BELOW,
   HEAT_WARN,
+  PLANE_Y,
   SNAP_RATE,
   TICKETS_TO_WIN,
 } from '@aces/shared/config.js';
@@ -60,7 +67,6 @@ import type { PlaneClassId, TeamId } from '@aces/shared/config.js';
 import { aimLead } from '@aces/shared/physics.js';
 import type {
   Banner,
-  CameraView,
   HudModel,
   KillFeedEntry,
   OverlayModel,
@@ -91,8 +97,12 @@ const HIT_TICKS = Math.max(2, Math.round(SNAP_RATE * 0.2));
 /** Directional hurt arcs: ~0.55 s worth of snapshot ticks. */
 const HURT_TICKS = Math.round(SNAP_RATE * 0.55);
 
-/** Crosshair lead distance ahead of the screen-center anchor, CSS px. */
-const CROSS_LEAD_PX = 58;
+/**
+ * Crosshair anchor rides this far ahead of the gun-line origin along the
+ * heading, world u at cruise altitude (v1 HUD layout knob — config carries
+ * no HUD numbers; projected to screen via cam.project).
+ */
+const CROSS_LEAD_U = 50;
 
 // Heat-cluster geometry (CSS px): a paper-chipped gun/heat readout under the
 // crosshair — chip backing keeps bar+label legible over open water/clouds.
@@ -153,17 +163,18 @@ export interface EdgeArrowOut {
 }
 
 /**
- * Project one world point through the camera and, if it lands OUTSIDE the
- * viewport inset by `margin`, pin it onto that inset box along the ray from
- * screen center and report true. Returns false when the point is on-screen
- * (no arrow needed) or the projection degenerates. Pure math; writes into
- * `out` so the 60 fps loop can reuse one scratch record (RULES 4).
+ * Clamp one ALREADY-PROJECTED screen point onto the viewport inset box along
+ * the ray from screen center, reporting true when an arrow is needed. Returns
+ * false when the point sits inside the inset (on-screen — no arrow) or the
+ * projection degenerates. Pure math; writes into `out` so the 60 fps loop can
+ * reuse one scratch record (RULES 4). GRAPHICS_3D §2: callers project world
+ * coords through cam.project FIRST — behind-camera projections mirror both
+ * axes, and the caller undoes that flip before handing the point here.
  */
 export function edgeArrowInto(
   out: EdgeArrowOut,
-  wx: number,
-  wy: number,
-  cam: CameraView,
+  sx: number,
+  sy: number,
   vw: number,
   vh: number,
   margin: number = EDGE_MARGIN_PX,
@@ -171,8 +182,6 @@ export function edgeArrowInto(
   if (!(vw > 2 && vh > 2)) return false;
   // Keep the clamp box sane on absurdly small viewports.
   const mg = Math.min(margin, Math.floor(Math.min(vw, vh) / 4));
-  const sx = (wx - cam.x) * cam.zoom + vw / 2;
-  const sy = (wy - cam.y) * cam.zoom + vh / 2;
   const x0 = mg;
   const y0 = mg;
   const x1 = vw - mg;
@@ -194,15 +203,14 @@ export function edgeArrowInto(
 
 /** Allocating wrapper of edgeArrowInto for tests and one-off callers. */
 export function edgeArrow(
-  wx: number,
-  wy: number,
-  cam: CameraView,
+  sx: number,
+  sy: number,
   vw: number,
   vh: number,
   margin: number = EDGE_MARGIN_PX,
 ): EdgeArrowOut | null {
   const out: EdgeArrowOut = { x: 0, y: 0, angle: 0 };
-  return edgeArrowInto(out, wx, wy, cam, vw, vh, margin) ? out : null;
+  return edgeArrowInto(out, sx, sy, vw, vh, margin) ? out : null;
 }
 
 /** A killfeed slip is dead once its age in snapshot ticks reaches the TTL. */
@@ -573,6 +581,22 @@ class AcesHud implements Hud {
   private readonly edge: EdgeArrowOut = { x: 0, y: 0, angle: 0 };
   private readonly nearIdx: number[] = [-1, -1, -1];
   private readonly nearD2: number[] = [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY];
+  /** Per-target projection cache — cam.project returns a SHARED record, so
+   *  each call is copied into these pooled columns before use (RULES 4). */
+  private projCap = 0;
+  private readonly projX: number[] = [];
+  private readonly projY: number[] = [];
+  private readonly projVis: boolean[] = [];
+
+  private ensureProj(n: number): void {
+    if (n <= this.projCap) return;
+    for (let i = this.projCap; i < n; i++) {
+      this.projX.push(0);
+      this.projY.push(0);
+      this.projVis.push(false);
+    }
+    this.projCap = n;
+  }
 
   private readonly onTabDown = (e: KeyboardEvent): void => {
     if (e.code !== 'Tab') return;
@@ -762,20 +786,27 @@ class AcesHud implements Hud {
     }
 
     const targets = o.targets;
+    this.ensureProj(targets.length);
+
+    // Single projection pass: cam.project hands back a SHARED record, so each
+    // result is copied into the pooled columns before the next call.
     for (let i = 0; i < targets.length; i++) {
       const t = targets[i];
       if (t === undefined) continue;
+      const p = o.cam.project(t.x, t.y);
+      this.projX[i] = p.sx;
+      this.projY[i] = p.sy;
+      this.projVis[i] = p.visible;
+
+      // Nearest-enemy bookkeeping (world-space distance) feeds the hurt-arc
+      // bearing and the nearest-3 arrow slots.
       const ddx = t.x - o.cam.x;
       const ddy = t.y - o.cam.y;
       const d2 = ddx * ddx + ddy * ddy;
-
-      // overall nearest (hurt-arc orientation)
       if (d2 < bestD2) {
         bestD2 = d2;
         bestIdx = i;
       }
-
-      // insertion into the ascending nearest-3 slots
       for (let k = 0; k < EDGE_ARROW_MAX; k++) {
         if (d2 < this.nearD2[k]!) {
           for (let j = EDGE_ARROW_MAX - 1; j > k; j--) {
@@ -796,7 +827,15 @@ class AcesHud implements Hud {
         if (idx < 0) continue;
         const t = targets[idx];
         if (t === undefined) continue;
-        if (edgeArrowInto(this.edge, t.x, t.y, o.cam, w, h)) {
+        let sx = this.projX[idx]!;
+        let sy = this.projY[idx]!;
+        // Behind-camera points project through the eye mirrored on both
+        // axes; undo the flip so the clamped ray leaves from the correct side.
+        if (!this.projVis[idx]!) {
+          sx = w - sx;
+          sy = h - sy;
+        }
+        if (edgeArrowInto(this.edge, sx, sy, w, h)) {
           drawEdgeArrow(ctx, this.edge.x, this.edge.y, this.edge.angle, t.team, t.cls);
         }
       }
@@ -811,10 +850,19 @@ class AcesHud implements Hud {
     // --- gun cluster: only meaningful while flying -------------------------
     if (!o.alive || m.you === null) return;
 
-    // ASSUMPTION (documented at file head): own plane ≈ screen center; the
-    // crosshair rides the heading vector out to a fixed lead distance.
-    const hx = w / 2 + Math.cos(o.heading) * CROSS_LEAD_PX;
-    const hy = h / 2 + Math.sin(o.heading) * CROSS_LEAD_PX;
+    // Crosshair anchor: the gun line rides CROSS_LEAD_U ahead of the camera
+    // origin (documented proxy for own-plane position) at cruise altitude,
+    // projected through the live rig. A second point farther along the same
+    // ray gives the on-screen travel bearing for the ring ticks.
+    const gunX = o.cam.x + Math.cos(o.heading) * CROSS_LEAD_U;
+    const gunY = o.cam.y + Math.sin(o.heading) * CROSS_LEAD_U;
+    const anchor = o.cam.project(gunX, gunY, PLANE_Y);
+    const hx = anchor.sx;
+    const hy = anchor.sy;
+    const farX = o.cam.x + Math.cos(o.heading) * (CROSS_LEAD_U * 3);
+    const farY = o.cam.y + Math.sin(o.heading) * (CROSS_LEAD_U * 3);
+    const farP = o.cam.project(farX, farY, PLANE_Y);
+    const tickBearing = anchor.visible && farP.visible ? Math.atan2(farP.sy - hy, farP.sx - hx) : 0;
 
     // crosshair ring + ticks — paper core under ink hairline so it reads on
     // both bright sky and dark sea without introducing new tones
@@ -828,7 +876,7 @@ class AcesHud implements Hud {
     ctx.strokeStyle = INK_STRONG;
     ctx.stroke();
     for (let q = 0; q < 4; q++) {
-      const a = o.heading + (q * Math.PI) / 2;
+      const a = tickBearing + (q * Math.PI) / 2;
       ctx.beginPath();
       ctx.moveTo(hx + Math.cos(a) * 12, hy + Math.sin(a) * 12);
       ctx.lineTo(hx + Math.cos(a) * 18, hy + Math.sin(a) * 18);
@@ -860,16 +908,18 @@ class AcesHud implements Hud {
       const projSpeed = CLASSES[m.you.cls].gun.bulletSpeed;
       // Zero-velocity intercept (see file-head assumption): aimLead with
       // tvx=tvy=0 collapses onto the target hull — the honest reading of the
-      // data the frozen OverlayModel actually carries.
+      // data the frozen OverlayModel actually carries. Drawn at its PROJECTED
+      // screen point; hidden while that point is behind the eye.
       const lead = aimLead(o.cam.x, o.cam.y, t.x, t.y, 0, 0, projSpeed);
-      const lx = (lead.x - o.cam.x) * o.cam.zoom + w / 2;
-      const ly = (lead.y - o.cam.y) * o.cam.zoom + h / 2;
-      star(ctx, lx, ly, 4, 7, 2.8, o.heading);
-      ctx.fillStyle = TRACER_FILL;
-      ctx.fill();
-      ctx.lineWidth = 1;
-      ctx.strokeStyle = INK_STRONG;
-      ctx.stroke();
+      const lp = o.cam.project(lead.x, lead.y, PLANE_Y);
+      if (lp.visible) {
+        star(ctx, lp.sx, lp.sy, 4, 7, 2.8, o.heading);
+        ctx.fillStyle = TRACER_FILL;
+        ctx.fill();
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = INK_STRONG;
+        ctx.stroke();
+      }
     }
 
     // --- heat cluster under crosshair: paper chip + bar LENGTH + strong-ink
@@ -930,11 +980,11 @@ class AcesHud implements Hud {
 
     // --- directional hurt arcs ----------------------------------------------
     // Seam gap (documented): hurtTick carries no bearing. Orient toward the
-    // nearest living enemy; skip entirely when nobody is airborne.
+    // nearest living enemy's PROJECTED screen position; skip entirely when
+    // nobody is airborne or nothing projects in front of the eye.
     const hurtAge = m.tick - o.hurtTick;
-    if (hurtAge >= 0 && hurtAge < HURT_TICKS && bestIdx >= 0) {
-      const t = targets[bestIdx]!;
-      const ang = Math.atan2(t.y - o.cam.y, t.x - o.cam.x);
+    if (hurtAge >= 0 && hurtAge < HURT_TICKS && bestIdx >= 0 && this.projVis[bestIdx]!) {
+      const ang = Math.atan2(this.projY[bestIdx]! - h / 2, this.projX[bestIdx]! - w / 2);
       ctx.save();
       ctx.globalAlpha = 0.85 * (1 - hurtAge / HURT_TICKS);
       ctx.lineWidth = 10;

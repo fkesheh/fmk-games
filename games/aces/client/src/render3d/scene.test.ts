@@ -19,6 +19,8 @@ import {
   CAM_DIST,
   CAM_HEIGHT,
   PLANE_Y,
+  LOOK_LIFT,
+  camPoseFor,
   clampZoom,
   createScene,
   easeFactor,
@@ -181,6 +183,94 @@ describe('camera law helpers (GRAPHICS_3D §2)', () => {
     expect(snapToGrid(16)).toBe(16);
     expect(snapToGrid(100, 8)).toBe(104);
     expect(snapToGrid(103, 8)).toBe(104);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// camPoseFor — THE corrected chase-cam law (§2, defect-2 pins). Forward is
+// derived from HEADING only; the chase sits BEHIND the nose; the look point
+// rides ALONG it; zoomMult scales distance ONLY.
+// ---------------------------------------------------------------------------
+describe('camPoseFor — corrected chase-cam law (GRAPHICS_3D §2)', () => {
+  const P = { x: 2100, y: 1500 };
+  const V = { x: 120, y: 0 };
+
+  it('pins LOOK_LIFT at the frozen 1.5u', () => {
+    expect(LOOK_LIFT).toBe(1.5);
+  });
+
+  it('h=0 (east): camera strictly WEST of the plane — behind the nose', () => {
+    const p = camPoseFor(P, 0, V, 1);
+    expect(p.camX).toBeLessThan(P.x);
+    expect(p.camX).toBeCloseTo(P.x - CAM_DIST, 12);
+    expect(p.camZ).toBeCloseTo(P.y, 12); // no lateral drift on a cardinal heading
+    expect(p.camY).toBe(PLANE_Y + CAM_HEIGHT);
+  });
+
+  it('h=π (west): camera strictly EAST of the plane — behind the flipped nose', () => {
+    const p = camPoseFor(P, Math.PI, { x: -120, y: 0 }, 1);
+    expect(p.camX).toBeGreaterThan(P.x);
+    expect(p.camX).toBeCloseTo(P.x + CAM_DIST, 12);
+    expect(p.camZ).toBeCloseTo(P.y, 12);
+  });
+
+  it('forward comes from heading law: cam − plane is −forward·dist for all h', () => {
+    const dist = CAM_DIST * clampZoom(1);
+    for (const h of [0, 0.7, Math.PI / 2, 2.4, Math.PI, -1.3, 5 * Math.PI]) {
+      const p = camPoseFor(P, h, { x: 40, y: -30 }, 1);
+      const f = forwardXZ(h); // (cos h, sin h) — the §1 composition with yawOf
+      expect(p.camX - P.x).toBeCloseTo(-f.x * dist, 12);
+      expect(p.camZ - P.y).toBeCloseTo(-f.z * dist, 12);
+      // and the model-side composition holds: RotY(yawOf(h))·(+X) === forward
+      expect(Math.cos(yawOf(h))).toBeCloseTo(f.x, 12);
+      expect(-Math.sin(yawOf(h))).toBeCloseTo(f.z, 12);
+    }
+  });
+
+  it('look point lies BETWEEN the plane and the forward horizon', () => {
+    for (const h of [0, 0.9, Math.PI / 2, Math.PI]) {
+      const f = forwardXZ(h);
+      const speed = Math.hypot(V.x, V.y);
+      const ahead = speed * 0.26; // CAMERA.LOOKAHEAD_S
+      const p = camPoseFor(P, h, V, 1);
+      // projection of (look − plane) onto forward is positive and < horizon
+      const along = (p.lookX - P.x) * f.x + (p.lookZ - P.y) * f.z;
+      expect(along).toBeGreaterThan(0); // strictly IN FRONT of the plane…
+      expect(along).toBeCloseTo(ahead, 12); // …and EXACTLY |vel|·LOOKAHEAD_S along it
+    }
+  });
+
+  it('idle frames (|vel|≈0) keep looking ALONG THE NOSE, not at velocity noise', () => {
+    const p = camPoseFor(P, Math.PI / 2, { x: 0, y: 0 }, 1);
+    expect(p.lookX).toBeCloseTo(P.x, 12);
+    expect(p.lookZ).toBeCloseTo(P.y, 12);
+    expect(p.lookY).toBe(PLANE_Y + LOOK_LIFT); // lifted off the airframe itself
+    // near-zero drift still looks essentially down the nose (+Z for h=π/2)
+    const drift = camPoseFor(P, Math.PI / 2, { x: 0.5, y: -0.5 }, 1);
+    expect(drift.lookZ - P.y).toBeGreaterThan(drift.lookX - P.x - 10);
+  });
+
+  it('zoomMult scales CHASE DISTANCE ONLY — look point untouched', () => {
+    const base = camPoseFor(P, 0.6, V, 1);
+    for (const z of [0.5, 1, 2, 3.2, 6]) {
+      const p = camPoseFor(P, 0.6, V, z);
+      expect(p.lookX).toBeCloseTo(base.lookX, 12);
+      expect(p.lookY).toBe(base.lookY);
+      expect(p.lookZ).toBeCloseTo(base.lookZ, 12);
+      const dx = p.camX - P.x;
+      const dz = p.camZ - P.y;
+      const dBase = Math.hypot(base.camX - P.x, base.camZ - P.y);
+      expect(Math.hypot(dx, dz)).toBeCloseTo(dBase * clampZoom(z), 10);
+      // direction unchanged: purely radial scaling about the plane
+      expect(dx * (base.camZ - P.y) - dz * (base.camX - P.x)).toBeCloseTo(0, 9);
+    }
+  });
+
+  it('re-clamps out-of-band zoom pins authoritatively (0.5–6) inside the pose', () => {
+    const wide = camPoseFor(P, 0, V, 42);
+    expect(wide.camX).toBeCloseTo(P.x - CAM_DIST * 6, 12);
+    const tight = camPoseFor(P, 0, V, 0.01);
+    expect(tight.camX).toBeCloseTo(P.x - CAM_DIST * 0.5, 12);
   });
 });
 

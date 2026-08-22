@@ -182,7 +182,9 @@ const VIEWPORT = (() => {
 })();
 
 async function launchPage(tag) {
-  const browser = await puppeteer.launch({
+  // 3D client: needs WebGL. Headless shell usually provides SwiftShader GL;
+  // if webgl is missing entirely, relaunch with explicit angle/swiftshader.
+  const mkOpts = (extra = []) => ({
     headless: 'shell',
     args: [
       `--window-size=${VIEWPORT.width},${VIEWPORT.height}`,
@@ -190,13 +192,31 @@ async function launchPage(tag) {
       '--disable-background-timer-throttling',
       '--disable-renderer-backgrounding',
       '--disable-backgrounding-occluded-windows',
+      '--enable-unsafe-swiftshader',
+      ...extra,
     ],
     protocolTimeout: 120000,
     dumpio: !!process.env.E2E_DUMPIO,
   });
-  browsers.push(browser);
-  const page = await browser.newPage();
+  let browser = await puppeteer.launch(mkOpts());
+  let page = await browser.newPage();
   await page.setViewport({ width: VIEWPORT.width, height: VIEWPORT.height });
+  const gl = await page.evaluate(() => {
+    try {
+      const c = document.createElement('canvas');
+      return !!(c.getContext('webgl2') || c.getContext('webgl'));
+    } catch {
+      return false;
+    }
+  });
+  if (!gl) {
+    console.log(`[${tag}] no webgl — relaunching on swiftshader`);
+    await browser.close();
+    browser = await puppeteer.launch(mkOpts(['--use-gl=angle', '--use-angle=swiftshader']));
+    page = await browser.newPage();
+    await page.setViewport({ width: VIEWPORT.width, height: VIEWPORT.height });
+  }
+  browsers.push(browser);
   trackErrors(page, tag);
   return page;
 }
@@ -222,7 +242,7 @@ async function main() {
   await waitForServer();
 
   const page = await launchPage('A');
-  await page.goto(GAME_URL, { waitUntil: 'networkidle2', timeout: 30000 });
+  await page.goto(GAME_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
   // 1. boots to menu, debug surface present
   await waitFor(async () => (await callAces(page, '!!window.__ACES')) === true, 15000, '__ACES surface');

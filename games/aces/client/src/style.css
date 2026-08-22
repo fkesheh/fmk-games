@@ -1,16 +1,19 @@
 /* ============================================================================
-   ACES — C_APP style.css. Shell-only: full-viewport reset + the two stacked
-   canvases the composition root creates inside #app (world below, HUD canvas
-   above). HUD DOM chips / screens layers are injected on document.body by
+   ACES — C_APP style.css (3D edition). Shell-only: full-viewport reset + the
+   stacked render layers the composition root creates inside #app: webgl
+   canvas below, the unified-print vignette overlay above it, HUD canvas on
+   top. HUD DOM chips / screens layers are injected on document.body by
    ui/hud.ts and ui/screens.ts with their own stylesheets — nothing here
    touches them.
 
-   House law: no scrollbars, no selection, resize never distorts (both
-   canvases are sized to their CSS box × DPR-capped backing store by
-   visual.fitCanvas, world from app.ts each frame; hud canvas by ui/hud.ts).
+   House law: no scrollbars, no selection, resize never distorts (canvases
+   sized to their CSS box × DPR-capped backing store; GL by visual.fitCanvas +
+   scene.setViewport each frame, hud canvas by ui/hud.ts).
 
-   The single hex below mirrors APAL.dawnLo (palette seam rule — CSS cannot
-   import TS; same precedent as the bootstrap reset this file replaces).
+   The hex mirrors below follow the palette-seam precedent (CSS cannot import
+   TS): ink = APAL.ink. GRAPHICS_3D.md §5: film grain is omitted from the GL
+   path (sanctioned v1); the unified-print vignette survives as a cheap,
+   phase-uniform CSS radial-gradient overlay.
    ========================================================================== */
 
 html,
@@ -28,7 +31,7 @@ body {
   height: auto;
 }
 
-/* Canvas stack: both fill the app box; pointer-events none so menu buttons
+/* Layer stack: all fill the app box; pointer-events none so menu buttons
    and screens layers (z-index 20/30, owned by C_UI) always receive input. */
 #app .aces-cv {
   position: absolute;
@@ -43,8 +46,23 @@ body {
   z-index: 1;
 }
 
-#app .aces-cv-hud {
+/* Unified-print vignette (GRAPHICS_3D §5 v1): transparent center melting to
+   ink at the corners — same shape as the retired 2D makeVignette pass
+   (~42% clear radius), now free of any per-frame canvas work. */
+#app .aces-vignette {
+  position: absolute;
+  inset: 0;
   z-index: 2;
+  pointer-events: none;
+  background: radial-gradient(
+    ellipse at center,
+    rgba(34, 31, 26, 0) 42%,
+    rgba(34, 31, 26, 0.34) 100%
+  ); /* APAL.ink mirror at the 2D pass's corner alpha */
+}
+
+#app .aces-cv-hud {
+  z-index: 3;
 }
 
 /* Boot-failure banner — readable ink on paper, palette-derived values only. */

@@ -42,7 +42,14 @@ import {
 
 // ---- fixtures -----------------------------------------------------------------
 
-const CAM: CameraView = { x: 0, y: 0, zoom: 1 };
+/**
+ * GRAPHICS_3D §2 seam repair: CameraView now REQUIRES project() (the frozen
+ * amendment), so these fixtures carry a stub. The edge-arrow suite below is
+ * pure post-projection clamp math — projection itself is pinned by
+ * render3d/scene.test.ts against the live rig.
+ */
+const CAM: CameraView = { x: 0, y: 0, zoom: 1, project: () => ({ sx: 0, sy: 0, visible: false }) };
+void CAM;
 
 function feedEntry(bornTick: number, over: Partial<KillFeedEntry> = {}): KillFeedEntry {
   return {
@@ -62,44 +69,44 @@ function banner(kind: Banner['kind'], bornTick: number): Banner {
 }
 
 // ---------------------------------------------------------------------------
-// 1 · Edge-arrow projection clamping (D4: where are enemies)
+// 1 · Edge-arrow clamping (D4: where are enemies) — pure POST-projection math
 // ---------------------------------------------------------------------------
 
-describe('edgeArrow — offscreen enemies pin to the correct viewport edge', () => {
+describe('edgeArrow — offscreen screen points pin to the correct viewport edge', () => {
   const VW = 800;
   const VH = 600;
 
-  it('returns null while the target is on-screen (no arrow needed)', () => {
-    expect(edgeArrow(100, 50, CAM, VW, VH)).toBeNull();
+  it('returns null while the point is on-screen inside the inset box', () => {
+    expect(edgeArrow(100, 50, VW, VH)).toBeNull();
     // hugging the inset box without crossing it still counts as visible
     // (screen (750,560) vs bounds x≤774, y≤574)
-    expect(edgeArrow(350, 260, CAM, VW, VH)).toBeNull();
+    expect(edgeArrow(350, 260, VW, VH)).toBeNull();
   });
 
-  it('pins a target far LEFT (behind the camera view) to the left edge pointing west', () => {
-    const a = edgeArrow(-5000, 10, CAM, VW, VH);
+  it('pins a point far LEFT to the left edge pointing west', () => {
+    const a = edgeArrow(-5000, 300, VW, VH); // vertically centered: the ray stays flat
     expect(a).not.toBeNull();
     expect(a!.x).toBeCloseTo(26, 6); // exactly the inset margin
     expect(Math.abs(a!.y - 300)).toBeLessThan(1); // vertical ray barely bends
     expect(a!.angle).toBeGreaterThan(Math.PI * 0.99); // points back (west)
   });
 
-  it('pins a target far RIGHT to the right edge pointing east', () => {
-    const a = edgeArrow(5000, 0, CAM, VW, VH)!;
+  it('pins a point far RIGHT to the right edge pointing east', () => {
+    const a = edgeArrow(5000, 300, VW, VH)!;
     expect(a.x).toBeCloseTo(VW - 26, 6);
     expect(a.y).toBeCloseTo(300, 6);
     expect(a.angle).toBeCloseTo(0, 6);
   });
 
-  it('pins a target far ABOVE to the top edge pointing north', () => {
-    const a = edgeArrow(0, -5000, CAM, VW, VH)!;
+  it('pins a point far ABOVE the top edge pointing north', () => {
+    const a = edgeArrow(400, -5000, VW, VH)!;
     expect(a.y).toBeCloseTo(26, 6);
     expect(a.x).toBeCloseTo(400, 6);
     expect(a.angle).toBeCloseTo(-Math.PI / 2, 6);
   });
 
   it('clamps a corner overshoot INSIDE the inset box on both axes', () => {
-    const a = edgeArrow(5000, -5000, CAM, VW, VH)!;
+    const a = edgeArrow(5000, -5000, VW, VH)!;
     expect(a.x).toBeGreaterThanOrEqual(26);
     expect(a.x).toBeLessThanOrEqual(VW - 26);
     expect(a.y).toBeGreaterThanOrEqual(26);
@@ -108,14 +115,11 @@ describe('edgeArrow — offscreen enemies pin to the correct viewport edge', () 
     expect(a.y).toBeCloseTo(26, 6);
   });
 
-  it('respects zoom when projecting (zoom 2 doubles screen offset)', () => {
-    const zoomed: CameraView = { x: 0, y: 0, zoom: 2 };
-    // world 200u × zoom 2 = 400px offset → outside the 774px bound? no —
-    // 400+400=800 > 774 ⇒ just offscreen; must pin to the east edge.
-    const a = edgeArrow(200, 0, zoomed, VW, VH)!;
-    expect(a.x).toBeCloseTo(VW - 26, 6);
-    // and a point that stays inside under zoom 2 stays unpinned
-    expect(edgeArrow(150, 0, zoomed, VW, VH)).toBeNull();
+  it('honors a custom inset margin (projection owns zoom now, not this helper)', () => {
+    const a = edgeArrow(5000, 300, VW, VH, 60)!;
+    expect(a.x).toBeCloseTo(VW - 60, 6);
+    // and a point that stays inside the wider inset stays unpinned
+    expect(edgeArrow(700, 300, VW, VH, 60)).toBeNull();
   });
 });
 

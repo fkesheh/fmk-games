@@ -45,7 +45,7 @@ async function main() {
   const page = await browser.newPage();
   await page.setViewport({ width: 1600, height: 1000 });
   page.on('pageerror', (e) => console.log('[pageerror]', e.message.slice(0, 200)));
-  await page.goto(URL_, { waitUntil: 'networkidle2', timeout: 30000 });
+  await page.goto(URL_, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
   const call = async (src) =>
     page.evaluate((s) => {
@@ -89,7 +89,7 @@ async function main() {
 
   // 4. hero close-ups: pin zoom, park next to a live enemy, snap each frame
   // of a short burst so prop blur/marks are crisp somewhere.
-  await call(`window.__ACES.zoomTo(3.2)`);
+  await call(`window.__ACES.zoomTo(0.55)`);
   for (const [i, name] of ['07-hero-a', '08-hero-b', '09-hero-c'].entries()) {
     const s = await state();
     // find nearest living enemy from internals and tailgate it

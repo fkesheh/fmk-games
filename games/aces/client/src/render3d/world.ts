@@ -15,8 +15,10 @@
 //              and dodecahedron rocks at the map's own offsets with ±30%
 //              scale / full-turn rotation variance (STYLE_BIBLE §6); one
 //              foam surf ring per rim pulsing via a shared material.
-//   AIRFIELDS  graded strip + team-coloured wind square on a wood pole +
-//              parked reserve crates — landmarks, not sets.
+//   AIRFIELDS  graded landfall (packed-sand deck top ~0.4u over sea, bodies
+//              sunk below the waterline, sand→wet-sand→foam skirt) + team-
+//              coloured wind square on a wood pole + parked reserve crates —
+//              landmarks, not sets.
 //   CLOUDS     40 puffTexture cross-quads tinted paper↔dawnHi (alpha ≤ 0.78),
 //              Y 26–34, drifting EAST and wrapping around the map bounds;
 //              thinned over the central corridor (keep ×0.62, size ×0.72,
@@ -28,9 +30,10 @@
 // arithmetic, shadow matrices are prebuilt and only re-translated, every
 // animated value is a number write to a cached material. All colors flow
 // through pal()/mixA()/shadeA(); all materials come from the frozen factory;
-// the only texture is THE shared puff model. Draw calls: ~99 steady state
-// (1 sea + 14 mottling + 6 glints + 24 island parts + 10 airfield + 3
-// instanced + ≤40 clouds + 1 shadow IM) — inside the ≤120 budget with room
+// the only texture is THE shared puff model. Draw calls: ~105 steady state
+// (1 sea + 14 mottling + 6 glints + 24 island parts + ~16 airfield landfall
+// (4 graded layers ×2 fields) + 3 instanced + ≤40 clouds + 1 shadow IM) —
+// inside the ≤120 budget with room
 // for W2/W3 planes, tracers and effects.
 //
 // DEVIATIONS (reported): the brief says "billboard Sprites" — THREE.Sprite
@@ -330,18 +333,45 @@ export function createWorld(map: AcesMap): AcesWorld {
     group.add(rocks);
   }
 
-  // ---- airfields: strip + team wind square + parked crates -----------------------
+  // ---- airfields: graded landfall + team wind square + parked crates ------------
 
+  // Airfield landfall law (integrator brief): the deck TOP sits ~0.4u above
+  // sea level and every body extends DOWNWARD below the waterline — no
+  // visible underside gap, so the strip reads as landfall, not a raft.
+  // Grading steps outward from the packed-sand deck through sand berm and
+  // wet fringe to a foam washline (APAL keys only, via pal/shadeA).
+  const DECK_TOP = 0.4;
+  const DECK_H = 6; //      thick enough that no underside shows in any shot
+  const BERM_TOP = 0.26;
+  const BERM_H = 3;
+  const FRINGE_TOP = 0.13;
+  const FRINGE_H = 2;
+  const FOAM_TOP = 0.06;
+  const FOAM_H = 1.4;
   const crateMat = matLambert(pal('wood'));
   const poleMat = matLambert(pal('wood'));
   for (const f of map.fields) {
-    const stripGeo = new THREE.BoxGeometry(500, 1.6, 58);
-    ownedGeos.push(stripGeo);
-    const strip = new THREE.Mesh(stripGeo, matLambert(shadeA('sand', -0.08)));
-    strip.position.set(f.x, 0.8, f.y);
-    strip.rotation.y = -f.h;
-    strip.receiveShadow = true;
-    group.add(strip);
+    const layers: ReadonlyArray<{
+      w: number;
+      d: number;
+      top: number;
+      h: number;
+      hex: string;
+    }> = [
+      { w: 500, d: 58, top: DECK_TOP, h: DECK_H, hex: shadeA('sand', -0.08) }, // packed deck
+      { w: 556, d: 108, top: BERM_TOP, h: BERM_H, hex: pal('sand') }, //         sand berm
+      { w: 610, d: 152, top: FRINGE_TOP, h: FRINGE_H, hex: shadeA('sand', -0.18) }, // wet fringe
+      { w: 650, d: 184, top: FOAM_TOP, h: FOAM_H, hex: pal('foam') }, //         foam washline
+    ];
+    for (const layer of layers) {
+      const geo = new THREE.BoxGeometry(layer.w, layer.h, layer.d);
+      ownedGeos.push(geo);
+      const mesh = new THREE.Mesh(geo, matLambert(layer.hex));
+      mesh.position.set(f.x, layer.top - layer.h / 2, f.y);
+      mesh.rotation.y = -f.h;
+      mesh.receiveShadow = true;
+      group.add(mesh);
+    }
 
     const cosH = Math.cos(f.h);
     const sinH = Math.sin(f.h);
@@ -351,7 +381,7 @@ export function createWorld(map: AcesMap): AcesWorld {
     const poleGeo = new THREE.CylinderGeometry(0.5, 0.5, 15, 5);
     ownedGeos.push(poleGeo);
     const pole = new THREE.Mesh(poleGeo, poleMat);
-    pole.position.set(px, 7.5, pz);
+    pole.position.set(px, DECK_TOP + 7.5, pz); // planted into the deck top
     pole.castShadow = true;
     group.add(pole);
 
@@ -359,7 +389,7 @@ export function createWorld(map: AcesMap): AcesWorld {
     ownedGeos.push(squareGeo);
     const teamKey = f.team === 'royal' ? pal('royalNavy') : pal('ironRed');
     const square = new THREE.Mesh(squareGeo, matBasic(teamKey));
-    square.position.set(px, 13.5, pz);
+    square.position.set(px, DECK_TOP + 13.1, pz);
     square.rotation.y = Math.atan2(-cosH, -sinH); // face the taking-off pilot's camera
     group.add(square);
 
@@ -367,7 +397,7 @@ export function createWorld(map: AcesMap): AcesWorld {
     ownedGeos.push(crateGeo);
     for (const c of f.parkedCrates) {
       const crate = new THREE.Mesh(crateGeo, crateMat);
-      crate.position.set(c.x, 5.5, c.y);
+      crate.position.set(c.x, DECK_TOP + 5.5, c.y); // resting on the deck top
       crate.castShadow = true;
       group.add(crate);
     }

@@ -9,9 +9,15 @@
 // The pure helpers below ARE that law in code; scene.test.ts pins them
 // headlessly and the rig itself drives nothing else.
 //
-// Camera law (§2): position eases toward plane − forward·CAM_DIST·zoomMult +
-// UP·CAM_HEIGHT while looking at plane + vel·LOOKAHEAD_S, with k =
-// 1 − exp(−8·dt). The gimbal stays LEVEL: it carries only a slight roll lag
+// Camera law (§2, integrator-corrected): forward comes FROM HEADING ONLY —
+// model faces +X under yaw −h ⇒ scene forward = (cos h, 0, sin h) — never
+// from velocity magnitude or direction. Position eases toward plane −
+// forward·CAM_DIST·zoomMult + UP·CAM_HEIGHT while looking at plane +
+// forward·(|vel|·LOOKAHEAD_S) + UP·LOOK_LIFT (idle frames keep looking along
+// the nose instead of drifting with velocity noise), with k =
+// 1 − exp(−8·dt). The whole pose is the exported PURE camPoseFor() below;
+// the rig merely eases toward it. The gimbal stays LEVEL: it carries only a
+// slight roll lag
 // (roll = bankZ·0.25, eased) plus a speed FOV (55→62 over the fleet speed
 // band). shake(m) accumulates impulse magnitude that decays exp(−7·dt) into
 // deterministic two-sine positional jitter applied POST-ease in render().
@@ -55,6 +61,9 @@ export const PLANE_Y = 12;
 export const CAM_DIST = 24;
 /** §2 chase height above the plane, u. */
 export const CAM_HEIGHT = 10;
+/** Chase look-point lift above cruise altitude, u — keeps framing stable
+ *  when |vel|≈0 collapses the lookahead onto the plane itself. */
+export const LOOK_LIFT = 1.5;
 
 // ---- feel constants (each cites its law; nothing ad-hoc) --------------------
 
@@ -140,6 +149,47 @@ export function yawOf(h: number): number {
  */
 export function forwardXZ(h: number): { x: number; z: number } {
   return { x: Math.cos(h), z: Math.sin(h) };
+}
+
+/** Chase-cam pose snapshot — camera position + look target in scene space. */
+export interface CamPose {
+  camX: number;
+  camY: number;
+  camZ: number;
+  lookX: number;
+  lookY: number;
+  lookZ: number;
+}
+
+/**
+ * THE chase-cam law as ONE pure function (§2, integrator-corrected). Forward
+ * is derived FROM HEADING ONLY (model faces +X under yaw −h ⇒ scene forward
+ * = (cos h, 0, sin h)) — never from velocity magnitude or direction. Camera
+ * = plane − forward·CAM_DIST·zoomMult + UP·CAM_HEIGHT; look =
+ * plane + forward·(|vel|·LOOKAHEAD_S) + UP·LOOK_LIFT, so idle frames (|vel|
+ * ≈0) keep looking ALONG THE NOSE instead of drifting with velocity noise.
+ * zoomMult scales CHASE DISTANCE ONLY (re-clamped 0.5–6). Pass `out` to
+ * reuse a pose record — the per-frame rig path allocates nothing.
+ */
+export function camPoseFor(
+  pos: { x: number; y: number },
+  h: number,
+  vel: { x: number; y: number },
+  zoomMult: number,
+  out?: CamPose,
+): CamPose {
+  const fx = Math.cos(h);
+  const fz = Math.sin(h);
+  const dist = CAM_DIST * clampZoom(zoomMult);
+  const ahead = Math.hypot(vel.x, vel.y) * CAMERA.LOOKAHEAD_S;
+  const p = out ?? { camX: 0, camY: 0, camZ: 0, lookX: 0, lookY: 0, lookZ: 0 };
+  p.camX = pos.x - fx * dist;
+  p.camY = PLANE_Y + CAM_HEIGHT;
+  p.camZ = pos.y - fz * dist;
+  p.lookX = pos.x + fx * ahead;
+  p.lookY = PLANE_Y + LOOK_LIFT;
+  p.lookZ = pos.y + fz * ahead;
+  return p;
 }
 
 /** Frame-rate-independent exponential-approach factor for rate/s. */
@@ -328,7 +378,7 @@ class AcesSceneImpl implements AcesScene {
 
   // Scratch — zero-per-frame-allocation law (STYLE_BIBLE §9).
   private readonly planeScratch = new THREE.Vector3();
-  private readonly fwdScratch = new THREE.Vector3();
+  private readonly poseScratch: CamPose = { camX: 0, camY: 0, camZ: 0, lookX: 0, lookY: 0, lookZ: 0 };
   private readonly desiredScratch = new THREE.Vector3();
   private readonly lookTgtScratch = new THREE.Vector3();
   private readonly pvScratch = new THREE.Vector3();
@@ -384,21 +434,17 @@ class AcesSceneImpl implements AcesScene {
     dt: number,
   ): void {
     const dtc = Math.max(0, Math.min(0.1, dt));
-    const fw = forwardXZ(heading);
-    this.fwdScratch.set(fw.x, 0, fw.z);
     this.planeScratch.set(pos.x, PLANE_Y, pos.y);
     this.lastFocus.copy(this.planeScratch);
 
-    // Look target: plane + vel·LOOKAHEAD_S (vx→VX, vy→VZ identity mapping).
-    this.lookTgtScratch.copy(this.planeScratch);
-    this.lookTgtScratch.x += vel.x * CAMERA.LOOKAHEAD_S;
-    this.lookTgtScratch.z += vel.y * CAMERA.LOOKAHEAD_S;
-
-    // Chase position: plane − forward·CAM_DIST·zoomMult + UP·CAM_HEIGHT.
-    this.desiredScratch
-      .copy(this.planeScratch)
-      .addScaledVector(this.fwdScratch, -CAM_DIST * this.zoomMult);
-    this.desiredScratch.y += CAM_HEIGHT;
+    // THE pose law via the exported pure function (out-param → zero alloc):
+    // forward FROM HEADING, chase behind it, lookahead ALONG it by true
+    // speed. vel MUST be true velocity (app feeds vx/vy) — feeding position
+    // here made the look point position-proportional and swung the gimbal
+    // around the plane (nose toward lens on west headings).
+    const pose = camPoseFor(pos, heading, vel, this.zoomMult, this.poseScratch);
+    this.desiredScratch.set(pose.camX, pose.camY, pose.camZ);
+    this.lookTgtScratch.set(pose.lookX, pose.lookY, pose.lookZ);
 
     if (!this.camReady) {
       this.camReady = true;
