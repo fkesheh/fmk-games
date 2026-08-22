@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Same touch-safety viewport as the game page (TOUCH_PWA.md §3):
+         viewport-fit=cover is required before env(safe-area-inset-*) reports
+         anything but 0; user-scalable=no is for Android only — the real iOS
+         defences are touch-action and overscroll-behavior in src/pad.css. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no"
+    />
+    <title>KART GP — Phone Controller</title>
+    <meta name="color-scheme" content="dark" />
+    <!-- No manifest / service worker / install tags here on purpose: this page
+         is opened from a pairing QR, never installed, and caching its document
+         would risk serving a stale controller against a new protocol. -->
+    <!-- Pre-boot paint guard only; the real stylesheet is src/pad.css. The
+         background MUST stay byte-equal to pad.css's page colour — KPAL.ink,
+         #14171c (VISUAL_UPGRADE.md §7 seam rule 6). No external assets/fonts. -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #14171c;
+        color-scheme: dark;
+      }
+    </style>
+    <link rel="stylesheet" href="/src/pad.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/pad.ts"></script>
+  </body>
+</html>

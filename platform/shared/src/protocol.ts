@@ -1,12 +1,13 @@
 // ============================================================================
 // PLATFORM PROTOCOL — lobby-level wire validation, game-agnostic. The lobby
-// parses + sanitizes the seven lobby messages; EVERYTHING else is only
+// parses + sanitizes the eight lobby messages; EVERYTHING else is only
 // envelope-checked ({t: string} object) and passed through RAW — the room's
 // game validates it with its own parser and silently drops invalid messages.
 // Invalid lobby input => null; never throw on wire data.
 // ============================================================================
 import { SIG_MAX, SIG_MIN } from './identity.js';
 import type { PlayerId, RoomInfo } from './module.js';
+import { PAD } from './pad.js';
 
 /** Transport liveness: ws protocol-level ping cadence, used by net.ts. */
 export const NET = {
@@ -23,6 +24,13 @@ export type LobbyC2S =
   | { t: 'create_public'; name: string; game?: string; settings?: Record<string, unknown>; resume?: PlayerId; sig?: string }
   | { t: 'create_private'; name: string; game?: string; settings?: Record<string, unknown>; resume?: PlayerId; sig?: string }
   | { t: 'join_private'; name: string; code: string; resume?: PlayerId; sig?: string }
+  /**
+   * Pad bind (phone-as-controller). NOT a seat join: the sender becomes a
+   * non-player session bound to the seated player that issued `token`. See
+   * pad.ts for the handshake; `room` is a public roomId or a private join
+   * code, bounded by PAD.roomRefMax, and `token` by PAD.tokenMax.
+   */
+  | { t: 'join_as_pad'; room: string; token: string }
   | { t: 'leave' }
   | { t: 'ping'; ts: number };
 
@@ -174,6 +182,11 @@ export function parseC2S(raw: unknown): C2S | null {
       if (sig !== undefined) msg.sig = sig;
       return msg;
     }
+    case 'join_as_pad':
+      // Platform-owned handshake: validated HERE, never passed through raw —
+      // the room only ever sees a bind attempt with bounded room ref + token.
+      if (!str(raw.room, PAD.roomRefMax) || !str(raw.token, PAD.tokenMax)) return null;
+      return { t: 'join_as_pad', room: raw.room, token: raw.token };
     case 'leave':
       return { t: 'leave' };
     case 'ping':

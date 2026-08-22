@@ -59,6 +59,9 @@ import type {
 import type { LobbyC2S, RoomInfo } from '@platform/shared';
 import { cleanName, clearSession, loadName, loadSession, loadSig, saveName, saveSession } from '@platform/shared';
 import { KartScene } from './render.js';
+import QrCreator from 'qr-creator';
+import { KART_PAD_PAGE_PATH, parseKartPadToPlayerS2C } from '@kart/shared';
+import type { KartPadToPlayerS2C } from '@kart/shared';
 import { DriveController, TouchPointers } from './drive.js';
 import type { TouchControl } from './drive.js';
 import { KartAudio } from './audio.js';
@@ -803,6 +806,11 @@ export class KartApp {
   private readonly raceEl: HTMLDivElement;
   private readonly canvas: HTMLCanvasElement;
   private readonly hudEl: HTMLDivElement;
+  // PAD (docs/PAD.md): pair a phone as this seat's controller.
+  private padBtn!: HTMLButtonElement;
+  private padQrEl!: HTMLDivElement;
+  private padQrCodeEl!: HTMLDivElement;
+  private padQrNoteEl!: HTMLDivElement;
   private readonly hudLeftEl: HTMLDivElement; // top-left chip stack (pos + lap; hosts the invite chip mid-race)
   private readonly placeNumEl: HTMLSpanElement; // big ordinal numeral ('2')
   private readonly placeSufEl: HTMLSpanElement; // ordinal suffix ('nd')
@@ -1106,6 +1114,15 @@ export class KartApp {
       if (this.canStart) this.send({ t: 'start' });
     });
     lobbyPanel.appendChild(this.startBtn);
+    // USE PHONE: asks the room for a single-use pairing token; the QR that
+    // answers is the phone's whole entry point (docs/PAD.md step 1-2).
+    this.padBtn = el('button', 'btn btn-small lobby-pad', 'USE PHONE');
+    this.padBtn.addEventListener('click', () => {
+      this.audio.resume();
+      this.padBtn.blur();
+      this.send({ t: 'pad_pair_request' } as unknown as KartC2S);
+    });
+    lobbyPanel.appendChild(this.padBtn);
     this.lobbyHintEl = el('div', 'lobby-hint', 'WASD / ARROWS to drive — SPACE to drift');
     lobbyPanel.appendChild(this.lobbyHintEl);
     this.lobbyEl.appendChild(lobbyPanel);
@@ -1119,6 +1136,24 @@ export class KartApp {
       `WASD/arrows drive · Space/Shift drift · N nitro ×${NITRO_CHARGES} · R respawn at last gate`,
     );
     this.raceEl.appendChild(this.hintEl);
+
+    // Pairing overlay: the QR itself plus the URL in text, because a phone on
+    // the same LAN cannot scan a code it cannot see from across the room.
+    this.padQrEl = el('div', 'pad-qr hidden');
+    const padPanel = el('div', 'pad-qr-panel');
+    padPanel.appendChild(el('div', 'pad-qr-title', 'SCAN TO USE YOUR PHONE'));
+    this.padQrCodeEl = el('div', 'pad-qr-code');
+    padPanel.appendChild(this.padQrCodeEl);
+    this.padQrNoteEl = el('div', 'pad-qr-note', '');
+    padPanel.appendChild(this.padQrNoteEl);
+    const padClose = el('button', 'btn btn-small', 'CLOSE');
+    padClose.addEventListener('click', () => {
+      padClose.blur();
+      this.padQrEl.classList.add('hidden');
+    });
+    padPanel.appendChild(padClose);
+    this.padQrEl.appendChild(padPanel);
+    this.raceEl.appendChild(this.padQrEl);
 
     this.countdownEl = el('div', 'countdown-overlay hidden');
     this.raceEl.appendChild(this.countdownEl);
@@ -1524,7 +1559,46 @@ export class KartApp {
       case 'race_event':
         this.onRaceEvent(msg.ev);
         break;
+      default: {
+        // Pad S2C rides the raw game envelope; the platform never parses it.
+        const pad = parseKartPadToPlayerS2C(msg);
+        if (pad !== null) this.onPadMessage(pad);
+        break;
+      }
     }
+  }
+
+  /** pad_pair / pad_status / pad_input — the seat's side of docs/PAD.md. */
+  private onPadMessage(msg: KartPadToPlayerS2C): void {
+    switch (msg.t) {
+      case 'pad_pair':
+        this.showPadQr(msg.room, msg.token, msg.expiresInMs);
+        break;
+      case 'pad_status':
+        // The predictor switches input source here: while bound this client
+        // emits nothing and predicts on the server's echoes instead.
+        this.drive.setPadBound(msg.bound);
+        if (msg.bound) this.padQrEl.classList.add('hidden');
+        this.padBtn.textContent = msg.bound ? 'PHONE CONNECTED' : 'USE PHONE';
+        this.setMsg(msg.bound ? 'phone connected — it drives now' : 'phone disconnected — keyboard restored');
+        break;
+      case 'pad_input':
+        this.drive.applyPadInput(msg.input);
+        break;
+    }
+  }
+
+  private showPadQr(room: string, token: string, expiresInMs: number): void {
+    const url = `${location.origin}${KART_PAD_PAGE_PATH}?room=${encodeURIComponent(room)}&token=${encodeURIComponent(token)}`;
+    this.padQrCodeEl.replaceChildren();
+    QrCreator.render(
+      { text: url, radius: 0.4, ecLevel: 'M', fill: '#0b0b0f', background: '#ffffff', size: 220 },
+      this.padQrCodeEl,
+    );
+    // location.origin is whatever THIS tab used: a phone on the LAN can only
+    // reach it if the desktop is open on the LAN address, not localhost.
+    this.padQrNoteEl.textContent = `${url}  ·  expires in ${String(Math.round(expiresInMs / 1000))}s`;
+    this.padQrEl.classList.remove('hidden');
   }
 
   /**

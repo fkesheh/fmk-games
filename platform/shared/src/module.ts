@@ -57,6 +57,22 @@ export interface GameRoomHandle {
    * its own protocol parser and silently drops invalid messages.
    */
   handleMessage(id: PlayerId, msg: unknown): void;
+  /**
+   * OPTIONAL pad (phone-as-controller) bind. Absent => the game has no pad
+   * mode and the lobby answers 'pad_unsupported' without knowing which games
+   * support pads. See @platform/shared pad.ts and docs/PAD.md.
+   *
+   * `id` is the PAD session's id (never a seat); `token` is the single-use
+   * pairing token this room minted for one of its seated players. The ROOM
+   * validates the token (tokens are game-level state) and returns false when
+   * it is unknown, expired or already consumed — the lobby forwards that as
+   * 'pad_rejected'. On true the lobby routes that session's room-level
+   * messages here, and a pad disconnect arrives as removePlayer(padId).
+   *
+   * Pads never occupy a seat: they must not appear in playerCount(),
+   * RoomInfo.players or stalePlayers(), and must never keep a room alive.
+   */
+  addPad?(id: PlayerId, token: string): boolean;
   start(): void; // idempotent
   stop(): void;
 }

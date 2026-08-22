@@ -110,7 +110,8 @@ import type {
   TrackDef,
   TrackId,
 } from '@kart/shared';
-import { rng, rngInt } from '@platform/shared';
+import { parseKartPadPlayerC2S } from '@kart/shared';
+import { PAD, rng, rngInt } from '@platform/shared';
 import type {
   GameRoomHandle,
   PlayerId,
@@ -125,6 +126,9 @@ type SnapshotMsg = Extract<KartS2C, { t: 'kart_snapshot' }>;
 const ROOM_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 const PRIVATE_CODE_LEN = 5; // A-Z0-9 join code, same convention as the other rooms
 let roomSeq = 0; // mixes into the rng seed so same-ms rooms still differ
+
+/** Pairing-token length; well under PAD.tokenMax (24). */
+const PAD_TOKEN_LEN = 8;
 
 function randomToken(next: () => number, len: number): string {
   let s = '';
@@ -280,6 +284,13 @@ export class KartRoom implements GameRoomHandle {
   // fire in the same tick — scoring is idempotent per round, not per call.
   private scoredRound = 0;
   private championId: PlayerId | null = null;
+  // ---- pad (phone-as-controller); see docs/PAD.md ----
+  // Pads are NOT seats: they never enter `players`, so playerCount(),
+  // stalePlayers() and RoomInfo.players ignore them for free.
+  private readonly padToPlayer = new Map<PlayerId, PlayerId>(); // padId -> seat it drives
+  private readonly playerToPad = new Map<PlayerId, PlayerId>(); // seat -> its pad (<=1)
+  private readonly pairTokens = new Map<string, { playerId: PlayerId; expiresAt: number }>();
+  private padTokenSeq = 0; // salts token generation so two mints in one ms differ
   private readonly entries = new Map<PlayerId, SeasonEntry>();
   private seasonSeq = 0; // next SeasonEntry.seq; reset only by startNewSeason
   private standingsDirty = true;
@@ -493,8 +504,21 @@ export class KartRoom implements GameRoomHandle {
    */
   removePlayer(id: PlayerId, permanent?: boolean): void {
     try {
+      // A pad is not a seat: its disconnect/leave just returns control.
+      if (this.padToPlayer.has(id)) {
+        this.unbindPad(id);
+        return;
+      }
       const p = this.players.get(id);
       if (p === undefined) return;
+      // The seat is leaving; its phone must stop driving something that is gone.
+      const pad = this.playerToPad.get(id);
+      if (pad !== undefined) {
+        this.padToPlayer.delete(pad);
+        this.playerToPad.delete(id);
+        this.io.send(pad, { t: 'pad_left', reason: 'player_left' });
+      }
+      this.dropPairTokensFor(id); // an unclaimed QR must not outlive the seat
       if (permanent === true) {
         // explicit leave (C2S 'leave'): the seat is gone for good.
         this.players.delete(id);
@@ -540,6 +564,17 @@ export class KartRoom implements GameRoomHandle {
    */
   handleMessage(id: PlayerId, msg: unknown): void {
     try {
+      // A bound PAD speaks AS the seat it drives (docs/PAD.md step 3).
+      const drives = this.padToPlayer.get(id);
+      if (drives !== undefined) {
+        this.handlePadMessage(drives, msg);
+        return;
+      }
+      // Seated player asking for a pairing QR.
+      if (parseKartPadPlayerC2S(msg) !== null) {
+        this.mintPairToken(id);
+        return;
+      }
       const parsed = parseKartC2S(msg);
       if (parsed === null) return;
       const p = this.players.get(id);
@@ -548,13 +583,15 @@ export class KartRoom implements GameRoomHandle {
       const now = Date.now();
       p.lastStateAt = now; // any valid message is liveness
       if (parsed.t === 'nitro') {
+        if (this.playerToPad.has(id)) return; // CONTROL TRANSFER: the phone has the stick
         this.tryNitro(p, now);
         return;
       }
       if (parsed.t === 'start') {
-        this.tryStart(now);
+        this.tryStart(now); // starting a race is the SEAT's call, pad or no pad
         return;
       }
+      if (this.playerToPad.has(id)) return; // CONTROL TRANSFER: pad input only
       if (parsed.seq <= p.lastQueuedSeq) return; // per-client monotonic: drop late dupes
       p.lastQueuedSeq = parsed.seq;
       if (p.inputQueue.length >= INPUT_QUEUE_CAP) p.inputQueue.shift(); // oldest dropped
@@ -562,6 +599,120 @@ export class KartRoom implements GameRoomHandle {
     } catch (err) {
       console.error('[kart] handleMessage failed', err);
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Pad (phone-as-controller) — docs/PAD.md. The platform owns only the join
+  // handshake (addPad below); everything here is kart-level protocol.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Bind a pad session to the seat that minted `token`. Called by the lobby;
+   * false => 'pad_rejected'. The token is consumed on the ATTEMPT (single-use),
+   * so a replayed QR cannot bind twice even if the first attempt fails later.
+   */
+  addPad(id: PlayerId, token: string): boolean {
+    try {
+      const now = Date.now();
+      this.purgePairTokens(now);
+      const entry = this.pairTokens.get(token);
+      if (entry === undefined) return false; // unknown, expired or already used
+      this.pairTokens.delete(token);
+      if (this.padToPlayer.has(id)) return false; // this session is already a pad
+      const p = this.players.get(entry.playerId);
+      if (p === undefined || !p.connected) return false; // the seat went away
+      // Replacement is ATOMIC from the seat's view: the old phone learns it was
+      // replaced, but the player never sees an intermediate bound:false flicker.
+      const old = this.playerToPad.get(entry.playerId);
+      if (old !== undefined) {
+        this.padToPlayer.delete(old);
+        this.io.send(old, { t: 'pad_left', reason: 'replaced' });
+      }
+      this.padToPlayer.set(id, entry.playerId);
+      this.playerToPad.set(entry.playerId, id);
+      this.resetSeqGate(p); // the pad's counter starts at 0
+      this.io.send(id, { t: 'pad_joined', name: p.name });
+      this.io.send(entry.playerId, { t: 'pad_status', bound: true });
+      return true;
+    } catch (err) {
+      console.error('[kart] addPad failed', err);
+      return false;
+    }
+  }
+
+  /** Input from a bound pad, applied to the seat it drives and echoed back to it. */
+  private handlePadMessage(playerId: PlayerId, msg: unknown): void {
+    const parsed = parseKartC2S(msg);
+    if (parsed === null) return;
+    const p = this.players.get(playerId);
+    if (p === undefined || !p.connected) return;
+    const now = Date.now();
+    // Pad input IS the seat's liveness. While bound the desktop stops emitting
+    // entirely (docs/PAD.md step 4), so without this stalePlayers() would time
+    // the player out mid-race for being idle and the platform would close a
+    // perfectly healthy socket.
+    p.lastStateAt = now;
+    if (parsed.t === 'nitro') {
+      this.tryNitro(p, now);
+      return;
+    }
+    if (parsed.t === 'start') return; // starting a race stays the seat's call
+    if (parsed.seq <= p.lastQueuedSeq) return;
+    p.lastQueuedSeq = parsed.seq;
+    if (p.inputQueue.length >= INPUT_QUEUE_CAP) p.inputQueue.shift();
+    p.inputQueue.push(parsed);
+    // Echo what was ACCEPTED (post-gate), so the desktop predictor steps on
+    // exactly the inputs the server will integrate — no more, no fewer.
+    this.io.send(playerId, { t: 'pad_input', input: parsed });
+  }
+
+  /** Mint a single-use pairing token for a seat and send it the QR payload. */
+  private mintPairToken(playerId: PlayerId): void {
+    const p = this.players.get(playerId);
+    if (p === undefined || !p.connected) return;
+    const now = Date.now();
+    this.purgePairTokens(now);
+    // A fresh request retires this seat's previous unconsumed tokens, so the
+    // QR on screen is always the only one that works.
+    this.dropPairTokensFor(playerId);
+    const next = rng((now ^ (this.padTokenSeq++ * 0x9e3779b9)) >>> 0);
+    const token = randomToken(next, PAD_TOKEN_LEN);
+    this.pairTokens.set(token, { playerId, expiresAt: now + PAD.tokenTtlMs });
+    this.io.send(playerId, {
+      t: 'pad_pair',
+      room: this.code ?? this.id, // private code when the room has one, else roomId
+      token,
+      expiresInMs: PAD.tokenTtlMs,
+    });
+  }
+
+  /** Pad gone (socket drop or explicit leave): the seat gets its stick back. */
+  private unbindPad(padId: PlayerId): void {
+    const playerId = this.padToPlayer.get(padId);
+    if (playerId === undefined) return;
+    this.padToPlayer.delete(padId);
+    this.playerToPad.delete(playerId);
+    const p = this.players.get(playerId);
+    if (p !== undefined) this.resetSeqGate(p); // the desktop's stream resumes
+    this.io.send(playerId, { t: 'pad_status', bound: false });
+  }
+
+  /**
+   * Either stream resumes from its OWN seq counter, which may run behind the
+   * one that just stopped; without clearing the gate the first stream to bind
+   * would silently swallow every input from the next one.
+   */
+  private resetSeqGate(p: Player): void {
+    p.lastQueuedSeq = -1;
+    p.inputQueue.length = 0;
+  }
+
+  private purgePairTokens(now: number): void {
+    for (const [tok, e] of this.pairTokens) if (e.expiresAt <= now) this.pairTokens.delete(tok);
+  }
+
+  private dropPairTokensFor(playerId: PlayerId): void {
+    for (const [tok, e] of this.pairTokens) if (e.playerId === playerId) this.pairTokens.delete(tok);
   }
 
   start(): void {
@@ -576,6 +727,11 @@ export class KartRoom implements GameRoomHandle {
 
   stop(): void {
     this.stopped = true;
+    // Pads outlive nothing: a stopped room holds no bindings and no unclaimed
+    // QR tokens (orphaned pad SOCKETS are not swept in v1 — docs/PAD.md).
+    this.padToPlayer.clear();
+    this.playerToPad.clear();
+    this.pairTokens.clear();
     if (this.simTimer !== null) {
       clearInterval(this.simTimer);
       this.simTimer = null;
