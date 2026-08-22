@@ -12,7 +12,7 @@ import type { GameModule, GameRoomHandle, RoomInfo, Visibility } from '@platform
 
 export const GAME_ID = 'ghostrun';
 export const GAME_NAME = 'GHOSTRUN';
-export const DEV_PORT = 5179;
+export const DEV_PORT = 5182;
 export const MIN_PLAYERS = 1;
 export const MAX_PLAYERS = 1;
 

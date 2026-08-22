@@ -184,6 +184,26 @@ export class HttpApi {
         if (parts.length === 2 && at(0) === 'auth' && at(1) === 'claim') {
           return handleClaim(this.store, body);
         }
+        // Mint a claim code for the AUTHENTICATED profile (docs/PLATFORM.md
+        // §4.1): Bearer token OR {token} body → {code}. Single use,
+        // AUTH.claimTtlMs. (Body form exists because the minting device may
+        // hold its token only in storage-bound SDK state; both shapes are
+        // contract-sanctioned.)
+        if (parts.length === 2 && at(0) === 'auth' && at(1) === 'link') {
+          const rec = body !== null && typeof body === 'object' ? (body as Record<string, unknown>) : {};
+          const bodyToken = typeof rec.token === 'string' ? rec.token : undefined;
+          const attempt = (authz: string | string[] | undefined) =>
+            this.withAuth(authz, (id) => {
+              try {
+                return { status: 200, json: { code: this.store.mintClaimCode(id) } };
+              } catch {
+                return { status: 500, json: { error: 'internal' } };
+              }
+            });
+          const viaHeader = attempt(authorization);
+          if (viaHeader.status !== 401 || bodyToken === undefined) return viaHeader;
+          return attempt(`Bearer ${bodyToken}`);
+        }
         break;
       }
       case 'PATCH': {

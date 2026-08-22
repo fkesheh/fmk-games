@@ -12,6 +12,7 @@ export default defineConfig({
       '@splat/shared': fileURLToPath(new URL('./games/splat/shared/src', import.meta.url)),
       '@outpost/shared': fileURLToPath(new URL('./games/outpost/shared/src', import.meta.url)),
       '@aces/shared': fileURLToPath(new URL('./games/aces/shared/src', import.meta.url)),
+      '@sumo/shared': fileURLToPath(new URL('./games/sumo/shared/src', import.meta.url)),
       '@platform/shared': fileURLToPath(new URL('./platform/shared/src', import.meta.url)),
     },
   },
@@ -51,6 +52,11 @@ export default defineConfig({
       // ORBIT (P9) — single-workspace showcase game; same pattern as
       // ghostrun: without an include here its tests would silently never run.
       'games/orbit/src/**/*.test.ts',
+      // SUMO (P10) — three nested workspaces under games/sumo/*; same
+      // documented defect as bank/shared and the kart client if omitted.
+      'games/sumo/shared/src/**/*.test.ts',
+      'games/sumo/server/src/**/*.test.ts',
+      'games/sumo/client/src/**/*.test.ts',
       // The PLATFORM had no include at all, so platform/server/src/lobby.test.ts —
       // the only coverage matchmaking has ever had — would have been silently
       // skipped. Same defect that hid games/bank/shared and the kart client.

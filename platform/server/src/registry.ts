@@ -11,6 +11,10 @@ import { riftModule } from '@rift/server';
 import { splatModule } from '@splat/server';
 import { outpostModule } from '@outpost/server';
 import { wordbombModule } from '@wordbomb/server';
+// PLATFORM v2 showcase games (@platform/sdk + @platform/engine clients)
+import { orbitModule } from '@orbit/game/module.server';
+import { sumoModule } from '@sumo/server';
+import { ghostrunModule } from '@ghostrun/game/module.server';
 
 export const GAMES: GameModule[] = [
   fpsModule,
@@ -21,4 +25,7 @@ export const GAMES: GameModule[] = [
   splatModule,
   outpostModule,
   acesModule,
+  orbitModule,
+  sumoModule,
+  ghostrunModule,
 ];

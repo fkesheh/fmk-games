@@ -1,0 +1,143 @@
+/* SUMO — space-arena knockout. Dark starfield backdrop, candy HUD. */
+:root {
+  --bg: #05070f;
+  --panel: rgba(13, 18, 30, 0.88);
+  --ink: #eef2ff;
+  --dim: #8b97b8;
+  --accent: #ffb300;
+  --red: #ff5d73;
+  --blue: #4fc3f7;
+  --lime: #aeea00;
+  --line: rgba(139, 151, 184, 0.25);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body { height: 100%; overflow: hidden; }
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+#app { position: fixed; inset: 0; }
+#cv { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+
+#boot {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 42px; font-weight: 800; letter-spacing: 0.35em; color: var(--dim);
+}
+#boot.gone { display: none; }
+
+.overlay {
+  position: absolute; inset: 0; z-index: 10;
+  display: flex; align-items: center; justify-content: center;
+}
+
+/* ---- menu ---- */
+.menu-panel {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+  padding: 28px 32px; width: min(92vw, 360px);
+  display: flex; flex-direction: column; gap: 12px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55);
+}
+.menu-title { font-size: 34px; font-weight: 800; letter-spacing: 0.3em; text-align: center; }
+.menu-sub { color: var(--dim); text-align: center; font-size: 13px; margin-bottom: 6px; }
+.menu-panel input {
+  background: rgba(255, 255, 255, 0.06); border: 1px solid var(--line); border-radius: 10px;
+  color: var(--ink); padding: 10px 12px; font-size: 15px; outline: none; width: 100%;
+}
+.menu-panel input:focus { border-color: var(--accent); }
+.btn {
+  border: 1px solid var(--line); border-radius: 10px; cursor: pointer;
+  background: rgba(255, 255, 255, 0.07); color: var(--ink);
+  padding: 11px 14px; font-size: 15px; font-weight: 700; width: 100%;
+}
+.btn:hover { background: rgba(255, 255, 255, 0.14); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #201502; }
+.btn.primary:hover { filter: brightness(1.08); }
+.btn-row { display: flex; gap: 8px; }
+.join-row { display: flex; gap: 8px; }
+.join-row input { flex: 1; text-transform: uppercase; }
+.hint { color: var(--dim); font-size: 12px; text-align: center; }
+.hidden { display: none !important; }
+
+/* ---- HUD ---- */
+#hud { position: absolute; inset: 0; z-index: 5; pointer-events: none; }
+.hud-top {
+  position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 14px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  padding: 8px 18px; font-weight: 700;
+}
+.hud-timer { font-size: 22px; font-variant-numeric: tabular-nums; min-width: 64px; text-align: center; }
+.hud-timer.warn { color: var(--red); }
+.hud-alive { color: var(--lime); font-size: 14px; white-space: nowrap; }
+.hud-round { color: var(--dim); font-size: 13px; white-space: nowrap; }
+
+.pips { position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%); display: flex; gap: 10px; }
+.pip {
+  width: 74px; height: 10px; border-radius: 6px; overflow: hidden;
+  background: rgba(255, 255, 255, 0.1); border: 1px solid var(--line); position: relative;
+}
+.pip > i { position: absolute; inset: 0; transform-origin: left; background: var(--accent); display: block; }
+.pip.jump > i { background: var(--blue); }
+.pip-label {
+  position: absolute; top: -16px; left: 50%; transform: translateX(-50%);
+  font-size: 10px; font-weight: 700; color: var(--dim); letter-spacing: 0.1em;
+}
+
+.banner {
+  position: absolute; top: 26%; left: 50%; transform: translate(-50%, 0) scale(0.9);
+  font-size: 54px; font-weight: 900; letter-spacing: 0.12em; text-align: center;
+  color: var(--ink); text-shadow: 0 4px 24px rgba(0, 0, 0, 0.7);
+  opacity: 0; transition: opacity 0.18s ease, transform 0.18s ease;
+}
+.banner.show { opacity: 1; transform: translate(-50%, 0) scale(1); }
+.banner .sub { display: block; font-size: 16px; font-weight: 600; color: var(--dim); letter-spacing: 0.05em; margin-top: 6px; }
+.banner.win { color: var(--lime); }
+.banner.lose { color: var(--red); }
+
+.feed { position: absolute; top: 14px; right: 14px; display: flex; flex-direction: column; gap: 6px; align-items: flex-end; }
+.feed-line {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 5px 10px; font-size: 12.5px; max-width: 46vw;
+  animation: feedin 0.15s ease;
+}
+.feed-line b { color: var(--accent); }
+@keyframes feedin { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; } }
+
+.board {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+  padding: 14px 20px; min-width: 280px;
+}
+.board h3 { font-size: 13px; color: var(--dim); letter-spacing: 0.2em; margin-bottom: 8px; text-align: center; }
+.board table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.board td { padding: 4px 8px; }
+.board tr.me td { color: var(--accent); font-weight: 700; }
+.board td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+
+.leave-btn {
+  position: absolute; top: 14px; left: 14px; pointer-events: auto;
+  border: 1px solid var(--line); background: var(--panel); color: var(--dim);
+  border-radius: 10px; padding: 7px 12px; font-size: 12px; font-weight: 700; cursor: pointer;
+}
+.leave-btn:hover { color: var(--ink); }
+
+.toast {
+  position: absolute; bottom: 64px; left: 50%; transform: translateX(-50%);
+  background: var(--panel); border: 1px solid var(--red); color: var(--ink);
+  border-radius: 10px; padding: 9px 16px; font-size: 13.5px; z-index: 40;
+  transition: opacity 0.25s ease; pointer-events: none;
+}
+
+.error-banner {
+  position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+  background: var(--red); color: #200; padding: 10px 18px; border-radius: 10px;
+  font-weight: 700; z-index: 999;
+}

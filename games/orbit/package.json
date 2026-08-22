@@ -18,5 +18,9 @@
     "@types/three": "0.185.1",
     "typescript": "7.0.2",
     "vite": "8.1.5"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./module.server": "./src/module.server.ts"
   }
 }

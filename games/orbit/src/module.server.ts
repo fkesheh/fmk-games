@@ -12,7 +12,7 @@ import type { GameModule, GameRoomHandle, RoomInfo, Visibility } from '@platform
 
 export const GAME_ID = 'orbit';
 export const GAME_NAME = 'ORBIT';
-export const DEV_PORT = 5178;
+export const DEV_PORT = 5181;
 export const MIN_PLAYERS = 1;
 export const MAX_PLAYERS = 1;
 
