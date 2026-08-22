@@ -189,9 +189,14 @@ export const BURN_DPS = 2;
 export const CAMERA = {
   /** Seconds of velocity lookahead. */
   LOOKAHEAD_S: 0.26,
-  ZOOM_MAX: 1.15, //   idle / slow — close enough for silhouettes to read
-  ZOOM_MIN: 1.14, //   full throttle
+  ZOOM_MAX: 1.15, //   zoomTo pin ceiling multiplier
+  /** Chase-cam geometry, u (GRAPHICS_3D.md §2). */
+  CAM_DIST: 24,
+  CAM_HEIGHT: 10,
 } as const;
+
+/** Cruise altitude above the sea, u (GRAPHICS_3D.md §1). */
+export const PLANE_Y = 12;
 
 // ---- net feel / prediction (C_NET) ----------------------------------------------------
 export const NET = {

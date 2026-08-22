@@ -9,7 +9,8 @@
 // ============================================================================
 
 import * as THREE from 'three';
-import { APAL, type PalKey } from '@aces/shared/palette';
+import { APAL } from '@aces/shared/palette';
+import type { PalKey } from '../contract/visual.js';
 import { softPuff } from '../contract/visual.js';
 
 const lambertCache = new Map<string, THREE.MeshLambertMaterial>();
@@ -24,11 +25,12 @@ export function matLambert(
   const key = `${color}|${flat}|${opts?.side ?? 0}`;
   let m = lambertCache.get(key);
   if (!m) {
-    m = new THREE.MeshLambertMaterial({
+    const base: THREE.MeshLambertMaterialParameters = {
       color: new THREE.Color(color),
       flatShading: flat,
-      side: opts?.side,
-    });
+    };
+    if (opts?.side !== undefined) base.side = opts.side;
+    m = new THREE.MeshLambertMaterial(base);
     lambertCache.set(key, m);
   }
   return m;
