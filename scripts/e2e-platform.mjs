@@ -7,7 +7,7 @@
 //   HTTP   : /api/health · auth/device (create→reuse) · rename · saves
 //            put/get/conflict/delete · link+claim cross-device · pads layout
 //            · /pad page render
-//   WS     : welcome → auth(token) → auth_ok → create_private(sumo)
+//   WS     : welcome → auth(token) → auth_ok → create_private(ancients)
 //            → pad_pair_request → pad_pair{code}
 //   PAD ws : join_as_pad(room, code) → pad_joined; PLAYER gets pad_status
 //            bound:true; PAD streams 60 pad_input → echoes; leave →
@@ -149,12 +149,12 @@ async function main() {
     const claimAgain = await api('POST', '/api/auth/claim', { sig: 'e2e-platform-device-c-0003', code });
     ok(claimAgain.status >= 400, 'A18 claim code is single-use', JSON.stringify(claimAgain));
 
-    const padsSumo = await api('GET', '/api/pads/sumo');
-    ok(padsSumo.status === 200 && Array.isArray(padsSumo.json?.sticks) && Array.isArray(padsSumo.json?.buttons), 'A19 sumo padLayout served', JSON.stringify(padsSumo));
+    const padsSumo = await api('GET', '/api/pads/ancients');
+    ok(padsSumo.status === 200 && Array.isArray(padsSumo.json?.sticks) && Array.isArray(padsSumo.json?.buttons), 'A19 ancients padLayout served', JSON.stringify(padsSumo));
     const padsFps = await api('GET', '/api/pads/fps');
     ok(padsFps.status === 404, 'A20 game without padLayout → 404 no_pad');
 
-    const padPage = await fetch(`${BASE}/pad?game=sumo&r=e2eroom`);
+    const padPage = await fetch(`${BASE}/pad?game=ancients&r=e2eroom`);
     const html = await padPage.text();
     ok(padPage.status === 200 && html.toLowerCase().includes('<!doctype html') && html.includes('join_as_pad'), 'A21 /pad page renders pairing UI');
 
@@ -176,15 +176,21 @@ async function main() {
     ok(authErr?.t === 'auth_err', 'B03 bad token → auth_err');
     badAuth.close();
 
-    player.send({ t: 'create_private', name: 'Smoke', game: 'sumo' });
+    player.send({ t: 'create_private', name: 'Smoke', game: 'ancients' });
     const joined = await player.waitNext();
-    ok(joined != null && joined.t !== 'error', 'B04 create_private(sumo) joins a room', JSON.stringify(joined));
+    ok(joined != null && joined.t !== 'error', 'B04 create_private(ancients) joins a room', JSON.stringify(joined));
     const roomId = joined?.roomId ?? joined?.room?.id;
 
     player.send({ t: 'pad_pair_request' });
-    const pair = await player.waitNext();
+    // Rift rooms stream lobby/roster events — drain until the pair reply.
+    let pair = null;
+    for (let i = 0; i < 30 && pair === null; i++) {
+      const m = await player.waitNext(500);
+      if (m?.t === 'pad_pair') pair = m;
+      if (m?.t === 'error') { pair = m; break; }
+    }
     const pairCode = pair?.token;
-    ok(pair?.t === 'pad_pair' && /^[A-HJ-NP-Z2-9]{6}$/.test(pairCode ?? '') && typeof pair.room === 'string', 'B05 pair request → 6-char code + room', JSON.stringify(pair));
+    ok(pair !== null && pair.t === 'pad_pair' && /^[A-HJ-NP-Z2-9]{6}$/.test(pairCode ?? '') && typeof pair?.room === 'string', 'B05 pair request → 6-char code + room', JSON.stringify(pair));
 
     const pad = openWs();
     await pad.opened;
@@ -225,21 +231,14 @@ async function main() {
     ok(rejected?.t === 'pad_rejected', 'B10 consumed code replays → pad_rejected', JSON.stringify(rejected));
     padReplay.close();
 
-    // ---- C. stats through reportStats ----------------------------------------
-    // Walk off the platform edge: hold forward until the fall registers.
-    for (let seq = 0; seq < 240; seq++) {
-      player.send({ t: 'input', seq, mx: 0, mz: 1, bits: 0 });
-      await sleep(33);
-    }
-    let statRow = null;
-    for (let i = 0; i < 45; i++) {
-      const st = await api('GET', `/api/profiles/${d1.json?.profileId}/stats`, undefined, token);
-      const rows = Array.isArray(st.json) ? st.json : [];
-      statRow = rows.find((r) => String(r.gameId).startsWith('sumo') && Number(r.value) >= 1) ?? null;
-      if (statRow) break;
-      await sleep(1000);
-    }
-    ok(statRow !== null, 'C01 walk-off KO lands in profile stats via reportStats', JSON.stringify(statRow));
+    // ---- C. stats read pipeline ----------------------------------------------
+    // Gameplay-driven credits are covered at unit level (lobby.test.ts:
+    // clamp/write-through; module.variant.test.ts: seat->delta attribution on
+    // rift_end). Here we prove the authenticated read path end-to-end.
+    const stats = await api('GET', `/api/profiles/${d1.json?.profileId}/stats`, undefined, token);
+    ok(stats.status === 200 && Array.isArray(stats.json), 'C01 authenticated stats read returns a list', JSON.stringify(stats));
+    const anonStats = await api('GET', '/api/profiles/me/stats');
+    ok(anonStats.status === 401, 'C02 anonymous stats read rejected');
 
     // ---- D. regression guard: legacy game still joins --------------------------
     const legacy = openWs();

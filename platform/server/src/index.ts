@@ -113,12 +113,6 @@ const LPAL = {
   riftAccent: '#d9b25f', //    APAL.gold     — ANCIENTS: ancient gold
   riftTint: '#2e3827', //      APAL.moss     — ANCIENTS: dusk moss
   acesAccent: '#f0a03a', //    APAL.tracer    — ACES: tracer amber
-  orbitAccent: '#45d8e0', //   ORBIT palette  — ORBIT: neon trail cyan
-  orbitTint: '#131a2e', //     ORBIT palette  — ORBIT: deep-space ink
-  sumoAccent: '#e05d5d', //    SUMO palette   — SUMO: candy-red capsule
-  sumoTint: '#3a4149', //      SUMO palette   — SUMO: slate platform
-  ghostrunAccent: '#4fd1c5', // GHOSTRUN pal  — GHOSTRUN: ghost teal
-  ghostrunTint: '#4a3a28', //   GHOSTRUN pal  — GHOSTRUN: dusk amber ground
   acesTint: '#274e74', //      APAL.royalNavy — ACES: cobalt slate sky
   splatAccent: '#f2b72e', //   SPAL.sunGold  — SKI SPLAT: ski-race gold
   // SPAL has no dark entry suited to a card tint (SPAL.ink is the paint guard
@@ -209,9 +203,6 @@ const IDENTITY: Record<string, PwaIdentity | undefined> = {
   rift: { accent: LPAL.riftAccent, tint: LPAL.riftTint },
   splat: { accent: LPAL.splatAccent, tint: LPAL.splatTint },
   aces: { accent: LPAL.acesAccent, tint: LPAL.acesTint },
-  orbit: { accent: LPAL.orbitAccent, tint: LPAL.orbitTint },
-  sumo: { accent: LPAL.sumoAccent, tint: LPAL.sumoTint },
-  ghostrun: { accent: LPAL.ghostrunAccent, tint: LPAL.ghostrunTint },
 };
 const NEUTRAL_IDENTITY: PwaIdentity = {
   accent: LPAL.neutralAccent,

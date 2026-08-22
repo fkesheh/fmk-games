@@ -533,7 +533,16 @@ function parseS2C(raw: unknown): NetMsg | null {
 }
 
 // ---- the handle -------------------------------------------------------------------
-export function createNet(hooks: NetHooks): NetHandle {
+export interface CreateNetOpts {
+  /**
+   * Platform v2: messages sent immediately after EVERY (re)open, before any
+   * game traffic — the SDK shell uses this for {t:'auth'} so rooms can
+   * attribute stats. Legacy callers omit it and stay anonymous.
+   */
+  readonly onOpenExtra?: () => readonly unknown[];
+}
+
+export function createNet(hooks: NetHooks, opts?: CreateNetOpts): NetHandle {
   let ws: WebSocket | null = null;
   let offset = 0; // serverNow = Date.now() + offset
   let backoffMs = RECONNECT_BASE_MS;
@@ -570,6 +579,18 @@ export function createNet(hooks: NetHooks): NetHandle {
       hooks.onClose();
       window.setTimeout(connect, backoffMs);
       backoffMs = Math.min(backoffMs * 2, RECONNECT_MAX_MS);
+    };
+    // Platform v2: fire the shell's auth payload right after every open —
+    // BEFORE the server could route anything that depends on it.
+    sock.onopen = () => {
+      const extra = opts?.onOpenExtra?.() ?? [];
+      for (const m of extra) {
+        try {
+          sock.send(JSON.stringify(m));
+        } catch {
+          break; // racing a close — drop the frame
+        }
+      }
     };
     sock.onerror = () => {
       // the close event follows and does the teardown

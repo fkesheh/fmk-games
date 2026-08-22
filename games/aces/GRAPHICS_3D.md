@@ -68,6 +68,8 @@ render3d/effects3d.ts    createEffects3D(seed) → EffectsApi3D {
                            drawProjectiles(list),          // instanced tracer boxes
                            hitSpark(p), explosion(p,size,overWater),
                            trail(id,p,level), crateFx(kind,p),
+                           syncCrates(crates),             // pooled crate models,
+                                                           // fall sway / landed bob
                            shake(m), consumeShake(),
                            attach(scene), update(dt,cam), dispose()
                          }

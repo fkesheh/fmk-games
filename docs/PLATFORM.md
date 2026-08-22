@@ -188,16 +188,17 @@ can't — no driver ships to clients).
 read-only deploy): in-memory shim, log loudly, platform keeps running — matches repo
 robustness rule. Backup = file copy (documented).
 
-## 7. Showcase games (built ONLY through sdk+engine — that's the proof)
+## 7. Showcase games (v2.1 revision)
+
+The three original showcases (ORBIT/SUMO/GHOSTRUN) were removed after review.
+The SDK proof is now a **port of ANCIENTS** itself:
 
 | Game | Mode | Proves |
 |---|---|---|
-| **ORBIT** `/orbit/` | solo score-attack dodge flier | engine loop/rig/pools, saves (resume+high score), physical pads, profile stat `orbit.best` |
-| **SUMO** `/sumo/` | 2–8p arena knockout, quick-join | rooms+lobby, 30Hz authoritative sim, reportStats wins/KOs, gamepad, pad page |
-| **GHOSTRUN** `/ghostrun/` | solo time-trial vs your saved ghost | saves-as-replay-blobs, engine, pads |
+| **ANCIENTS·SDK** `/ancients/` (`games/ancients/`) | same MOBA as legacy `/rift/`, registered separately via `riftModuleVariant()` | variant registration of a REAL game with zero legacy edits; SDK identity/auth shell (`{t:'auth'}` after every open); stats sink (`rift_end` → `ancients.kill/death/win`, pad orders → `ancients.pad_order`); phone-pad adapter (stick→click-to-move orders, buttons→casts) with its own unit suite |
 
-All three follow house style: flat-shaded low-poly, procedural, WebAudio synth,
-palette-driven. Each ships with unit tests + a headless e2e script.
+Legacy `/rift/` keeps running untouched and anonymous. The port reuses the
+rift client core through deep imports; only the shell (`main.ts`) is new.
 
 ## 8. Native app door (design note, not built)
 
@@ -240,3 +241,84 @@ stats visible) and one e2e per showcase game.
 4. **Leaderboards**: global top-N per game now (cheap off the stats table) or later?
 5. **Persistence scope**: single-file sqlite fine for launch? (Postgres migration path
    stays open; the db module hides it behind one interface.)
+
+---
+
+## 12. PROPOSAL v1 — player-hosted authority ("master + standby slaves") 🔶 DISCUSSION
+
+*Your question: instead of hosting the sim server-side, ship it to every player;
+one client becomes MASTER (authoritative), others run as STANDBY slaves; the
+server only decides who is master.* Short answer: **yes — viable and worth
+piloting**, with three honest corrections to the mental model.
+
+### 12.1 Correction 1 — you don't need WASM for this
+
+Every gameplay sim in this repo is already deterministic TypeScript running
+identically in Node and the browser (that is what makes STRICKEN's prediction
+and KART's shared physics work). A browser tab can host the authoritative tick
+loop today. WASM becomes interesting LATER, for three narrower reasons:
+
+1. one compiled artifact distributed to all clients (no JS-bundle drift),
+2. stronger float determinism guarantees across engines,
+3. perf headroom for bigger sims.
+
+So the plan compiles sims to WASM when they earn it — it is not the mechanism
+that makes player-hosting possible.
+
+### 12.2 Correction 2 — this moves CPU, not bandwidth (yet)
+
+Browsers cannot accept incoming connections. Peers cannot dial the master
+directly, so traffic still relays through the platform server in a star
+topology. What you save: all per-room tick loops, bot brains, physics and
+vision filtering leave the server. What you don't (yet): upstream bytes — the
+master's snapshot stream still flows through our relay. True P2P bandwidth
+relief requires WebRTC DataChannels (signaling we already have; TURN fallback
+for symmetric NATs is the real cost). Phase it separately.
+
+### 12.3 Correction 3 — the cheat surface changes shape
+
+Today the server sees everything and clients see filtered snapshots. With a
+player-hosted master, the master process holds FULL state — including what fog
+of war hides in ANCIENTS. Mitigations, in rising order of effort:
+
+- **Rotate masters per match** (a cheater gets one match, not a throne),
+- keep matchmaking, identity, economy and stats server-authoritative always,
+- host filters its own snapshots (it still *could* peek — accepted risk for a
+  casual platform; state it openly rather than pretend otherwise),
+- later: server-side spot-checks (impossible-state detection on relayed snaps).
+
+### 12.4 The protocol (what the server decides)
+
+```
+create_room(hostedAuthority=true)
+  lobby elects HOST: lowest rtt among capable sessions, tie → longest-lived
+  lobby → room: {t:'host_lease', leaseId, hostId, ttlMs}
+  host opens sim, streams snapshots THROUGH the relay tagged {leaseId}
+  standbys shadow-sim every input broadcast deterministically, ack ticks
+  every ttlMs/2: host renews {t:'host_renew', leaseId, tick}
+  lease lapses (2 missed renewals):
+    lobby promotes the standby whose lastAckTick >= lastKnownTick - N
+      (deterministic shadow ⇒ zero-gap promotion; else snapshot catch-up)
+    room: {t:'host_change', newHostId, resumeTick}
+  host leaves cleanly: same path. Server NEVER runs the sim in this mode.
+```
+
+Server-side additions stay small: lease table, renewal watchdog, promotion
+arbiter, input/snapshot relay tagging. All behind a per-game flag so legacy
+authoritative rooms are untouched.
+
+### 12.5 Phased plan
+
+| Phase | Deliverable |
+|---|---|
+| P0 | this design, agreed or amended by you |
+| P1 | lobby primitives: lease/renew/change messages + watchdog (unit-tested), no consumer yet |
+| P2 | ANCIENTS pilot: hostedAuthority room setting; host = elected client running @rift/server sim compiled for the browser; standbys shadow; server relays only |
+| P3 | WASM compile of the rift sim (single .wasm artifact served from /ancients/) |
+| P4 | optional WebRTC mesh for bandwidth offload |
+
+### 12.6 What stays central regardless
+
+Identity/profiles, saves, stats, matchmaking, room lifecycle, master election,
+relay, abuse limits. The platform shrinks from "game server" to "arena
+authority" — which is exactly the shape that also serves a future native app.

@@ -96,7 +96,14 @@ function checkedSceneCore(scene: SceneHandle): SceneCore {
   return core;
 }
 
-export function wire(root: HTMLElement): void {
+export interface WireOpts {
+  /** GameModule.id to join (platform v2 port: 'ancients'). Default 'rift'. */
+  readonly gameId?: string;
+  /** Post-open messages from the SDK shell ({t:'auth'}). */
+  readonly onOpenExtra?: () => readonly unknown[];
+}
+
+export function wire(root: HTMLElement, opts?: WireOpts): void {
   const scene = createScene(root);
   const core = checkedSceneCore(scene);
   // Ordering rule 2: the composer installs itself as the frame pass here.
@@ -148,7 +155,7 @@ export function wire(root: HTMLElement): void {
     menus: createMenus(root),
     audio: createAudio(),
     nameLabels: createNameLabels(root),
-  });
+  }, opts);
 
   game.probes = {
     // Both handles must exist AND both bakes must be finished. A module that

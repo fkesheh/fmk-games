@@ -6,13 +6,11 @@
   "workspaces": [
     "platform/*",
     "games/*/*",
-    "games/ghostrun",
-    "games/orbit",
     "assets/*"
   ],
   "scripts": {
-    "dev": "concurrently -n server,fps,bank,kart,wordbomb,rift,splat,outpost,aces,orbit,sumo,ghostrun \"npm run dev -w @platform/server\" \"npm run dev -w @fps/client\" \"npm run dev -w @bank/client\" \"npm run dev -w @kart/client\" \"npm run dev -w @wordbomb/client\" \"npm run dev -w @rift/client\" \"npm run dev -w @splat/client\" \"npm run dev -w @outpost/client\" \"npm run dev -w @aces/client\"",
-    "build": "npm run build -w @fps/client && npm run build -w @bank/client && npm run build -w @kart/client && npm run build -w @wordbomb/client && npm run build -w @rift/client && npm run build -w @splat/client && npm run build -w @outpost/client && npm run build -w @aces/client && npm run build -w @orbit/game && npm run build -w @sumo/client && npm run build -w @ghostrun/game && npm run build -w @platform/server",
+    "dev": "concurrently -n server,fps,bank,kart,wordbomb,rift,splat,outpost,aces,ancients \"npm run dev -w @platform/server\" \"npm run dev -w @fps/client\" \"npm run dev -w @bank/client\" \"npm run dev -w @kart/client\" \"npm run dev -w @wordbomb/client\" \"npm run dev -w @rift/client\" \"npm run dev -w @splat/client\" \"npm run dev -w @outpost/client\" \"npm run dev -w @aces/client\" \"npm run dev -w @ancients/client\"",
+    "build": "npm run build -w @fps/client && npm run build -w @bank/client && npm run build -w @kart/client && npm run build -w @wordbomb/client && npm run build -w @rift/client && npm run build -w @splat/client && npm run build -w @outpost/client && npm run build -w @aces/client && npm run build -w @ancients/client && npm run build -w @platform/server",
     "start": "npm run start -w @platform/server",
     "typecheck": "npm run typecheck --workspaces",
     "test": "vitest run",

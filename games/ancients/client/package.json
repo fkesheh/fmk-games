@@ -1,5 +1,5 @@
 {
-  "name": "@sumo/client",
+  "name": "@ancients/client",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -9,16 +9,15 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@platform/engine": "*",
-    "@platform/sdk": "*",
     "@platform/shared": "0.0.0",
-    "@sumo/shared": "0.0.0",
+    "@platform/sdk": "0.0.0",
+    "@rift/client": "0.0.0",
+    "@rift/shared": "0.0.0",
     "three": "0.185.1"
   },
   "devDependencies": {
     "@types/node": "26.1.1",
     "@types/three": "0.185.1",
-    "typescript": "7.0.2",
     "vite": "8.1.5"
   }
 }

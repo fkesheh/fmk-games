@@ -85,10 +85,14 @@ export class Profiles implements ProfileApi {
   private cachedMe: ProfileInfo | null = null;
 
   constructor(
-    private readonly net: SdkNet,
+    /**
+     * Optional: the ws facade, used only to hydrate `me()` from auth_ok pushes
+     * (client.ts wires that). Standalone REST-only use — the ANCIENTS port
+     * shell (games/ancients) — passes null and loses nothing.
+     */
+    private readonly net: SdkNet | null,
     private readonly opts: { readonly autoAuth?: boolean } = {},
   ) {
-    void net;
     void opts;
   }
 
