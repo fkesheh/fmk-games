@@ -64,11 +64,25 @@ export interface NetClient {
 
 // ---- fx -----------------------------------------------------------------------------------
 
+/** Screen-space projection result (HUD consumes; computed by C_APP's camera rig). */
+export interface ScreenPoint {
+  sx: number;
+  sy: number;
+  visible: boolean;
+}
+
+/**
+ * ACES 3D (GRAPHICS_3D.md §2): camera-rig view handed to render consumers.
+ * x/y = camera world position (server coords), zoom = CAM_DISTANCE multiplier
+ * (the __ACES.zoomTo pin, 1 = default chase distance). `project` maps server-
+ * world coordinates to screen pixels via the perspective camera — HUD uses
+ * this for crosshair, lead pip, target markers and edge arrows.
+ */
 export interface CameraView {
-  /** World coords of screen center. */
   x: number;
   y: number;
   zoom: number;
+  project(wx: number, wy: number, wz?: number): ScreenPoint;
 }
 
 /**
