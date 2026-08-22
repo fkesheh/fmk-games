@@ -6,6 +6,8 @@
   "workspaces": [
     "platform/*",
     "games/*/*",
+    "games/ghostrun",
+    "games/orbit",
     "assets/*"
   ],
   "scripts": {

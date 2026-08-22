@@ -44,6 +44,13 @@ export default defineConfig({
       'games/aces/shared/src/**/*.test.ts',
       'games/aces/server/src/**/*.test.ts',
       'games/aces/client/src/**/*.test.ts',
+      // GHOSTRUN (P11) — single-workspace showcase game; without an include
+      // here its tests would silently never run (same documented defect as
+      // bank/shared and the kart client).
+      'games/ghostrun/src/**/*.test.ts',
+      // ORBIT (P9) — single-workspace showcase game; same pattern as
+      // ghostrun: without an include here its tests would silently never run.
+      'games/orbit/src/**/*.test.ts',
       // The PLATFORM had no include at all, so platform/server/src/lobby.test.ts —
       // the only coverage matchmaking has ever had — would have been silently
       // skipped. Same defect that hid games/bank/shared and the kart client.

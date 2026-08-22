@@ -1,0 +1,325 @@
+/* ============================================================================
+   ORBIT — shell styles. Deep-space palette: ink #0b0e14 / neon cyan #35e0ff /
+   amber #ffb454 / magenta #ff4fd8 on the #0b0e14 pre-boot guard. All UI is
+   plain DOM over one canvas; no assets, CSS only.
+   ========================================================================== */
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #0b0e14;
+}
+
+#app {
+  position: fixed;
+  inset: 0;
+}
+
+#cv {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* pre-boot mark — replaced by main() once the world is up */
+#boot {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #35e0ff;
+  font: 700 22px/1 system-ui, -apple-system, "Segoe UI", sans-serif;
+  letter-spacing: 0.35em;
+  opacity: 0.55;
+  pointer-events: none;
+}
+#boot.gone {
+  display: none;
+}
+
+.ob-ui {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: #e8f4ff;
+}
+
+.hidden {
+  display: none !important;
+}
+
+/* ---- screens ---- */
+
+.ob-screen {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 16px;
+  background: radial-gradient(ellipse at 50% 40%, rgba(11, 14, 20, 0.05), rgba(7, 9, 13, 0.82));
+  pointer-events: auto;
+}
+.ob-screen.hidden {
+  display: none;
+}
+
+.ob-title {
+  margin: 0;
+  font-size: clamp(46px, 10vw, 92px);
+  font-weight: 800;
+  letter-spacing: 0.22em;
+  color: #35e0ff;
+  text-shadow:
+    0 0 18px rgba(53, 224, 255, 0.55),
+    0 4px 0 #0d3a48,
+    0 14px 44px rgba(53, 224, 255, 0.35);
+}
+.ob-title.small {
+  font-size: clamp(30px, 6vw, 54px);
+}
+.ob-title.magenta {
+  color: #ff4fd8;
+  text-shadow:
+    0 0 18px rgba(255, 79, 216, 0.5),
+    0 4px 0 #47123c,
+    0 14px 44px rgba(255, 79, 216, 0.3);
+}
+
+.ob-sub {
+  font-size: 15px;
+  letter-spacing: 0.08em;
+  color: #9fb8d8;
+}
+
+.ob-card {
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  flex-direction: column;
+  gap: 12px;
+  min-width: min(340px, 86vw);
+  padding: 22px 26px;
+  border: 1px solid rgba(53, 224, 255, 0.18);
+  border-radius: 14px;
+  background: rgba(10, 14, 22, 0.72);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55);
+}
+
+.ob-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 18px;
+  font-size: 14px;
+}
+.ob-row .k {
+  color: #8fa3c8;
+  letter-spacing: 0.06em;
+}
+.ob-row .v {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-weight: 700;
+}
+.ob-row .v.cyan {
+  color: #35e0ff;
+  text-shadow: 0 0 12px rgba(53, 224, 255, 0.45);
+}
+
+.ob-btn {
+  appearance: none;
+  border: 1px solid rgba(53, 224, 255, 0.65);
+  border-radius: 10px;
+  padding: 13px 18px;
+  font: 700 15px/1 system-ui, -apple-system, "Segoe UI", sans-serif;
+  letter-spacing: 0.14em;
+  color: #061019;
+  background: linear-gradient(180deg, #59e9ff, #1fc4ea);
+  cursor: pointer;
+  transition: transform 80ms ease, box-shadow 120ms ease;
+  box-shadow: 0 0 22px rgba(53, 224, 255, 0.35);
+}
+.ob-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 0 30px rgba(53, 224, 255, 0.55);
+}
+.ob-btn:active {
+  transform: translateY(1px);
+}
+.ob-btn.alt {
+  border-color: rgba(255, 79, 216, 0.65);
+  color: #190617;
+  background: linear-gradient(180deg, #ff77e2, #ef3ecb);
+  box-shadow: 0 0 22px rgba(255, 79, 216, 0.35);
+}
+.ob-btn.ghosty {
+  border-color: rgba(159, 184, 216, 0.4);
+  color: #cfe0f5;
+  background: transparent;
+  box-shadow: none;
+}
+
+.ob-banner {
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 180, 84, 0.45);
+  color: #ffb454;
+  font-size: 13px;
+  text-align: center;
+  background: rgba(58, 38, 10, 0.35);
+}
+
+.ob-hint {
+  max-width: 520px;
+  text-align: center;
+  font-size: 13px;
+  line-height: 1.75;
+  color: #7e93b4;
+}
+.ob-hint b {
+  color: #b9d4f2;
+}
+
+/* ---- HUD ---- */
+
+.ob-ui > .ob-score,
+.ob-combo,
+.ob-right,
+.ob-boostwrap,
+.ob-toast {
+  position: absolute;
+}
+
+.ob-score {
+  top: 14px;
+  left: 20px;
+  font: 800 clamp(28px, 5vw, 44px)/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: #eaffff;
+  text-shadow: 0 0 16px rgba(53, 224, 255, 0.5);
+}
+
+.ob-combo {
+  top: calc(18px + clamp(28px, 5vw, 44px));
+  left: 21px;
+  font: 700 14px/1 system-ui, -apple-system, "Segoe UI", sans-serif;
+  letter-spacing: 0.12em;
+  color: #ffb454;
+  opacity: 0;
+  transform: translateY(-4px);
+  transition: opacity 140ms ease, transform 140ms ease;
+  --combo: 1;
+}
+.ob-combo.show {
+  opacity: 1;
+  transform: translateY(0);
+  text-shadow: 0 0 calc(6px + var(--combo) * 1.6px) rgba(255, 180, 84, 0.8);
+}
+
+.ob-right {
+  top: 16px;
+  right: 20px;
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+}
+
+.ob-shield {
+  font-size: 20px;
+  color: #3d566e;
+  text-shadow: none;
+}
+.ob-shield.lit {
+  color: #35e0ff;
+  text-shadow: 0 0 14px rgba(53, 224, 255, 0.85);
+}
+
+.ob-speed {
+  font: 700 15px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: #9fb8d8;
+}
+
+.ob-boostwrap {
+  left: 50%;
+  bottom: 26px;
+  width: 180px;
+  height: 5px;
+  margin-left: -90px;
+  border-radius: 3px;
+  background: rgba(53, 224, 255, 0.14);
+  overflow: hidden;
+}
+.ob-boostfill {
+  height: 100%;
+  width: 100%;
+  border-radius: 3px;
+  background: rgba(53, 224, 255, 0.35);
+}
+.ob-boostfill.ready {
+  background: #35e0ff;
+  box-shadow: 0 0 12px rgba(53, 224, 255, 0.7);
+}
+
+.ob-toast {
+  left: 50%;
+  top: 24%;
+  transform: translateX(-50%) scale(0.94);
+  font: 800 clamp(16px, 3vw, 24px)/1 system-ui, sans-serif;
+  letter-spacing: 0.18em;
+  color: #35e0ff;
+  text-shadow: 0 0 20px rgba(53, 224, 255, 0.6);
+  opacity: 0;
+  transition: opacity 120ms ease, transform 120ms ease;
+  white-space: nowrap;
+}
+.ob-toast.show {
+  opacity: 1;
+  transform: translateX(-50%) scale(1);
+}
+.ob-toast.bad {
+  color: #ffb454;
+  text-shadow: 0 0 20px rgba(255, 180, 84, 0.6);
+}
+
+/* ---- game over ---- */
+
+.ob-final {
+  font: 800 clamp(44px, 9vw, 76px)/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  text-align: center;
+  color: #ffffff;
+  text-shadow: 0 0 24px rgba(255, 79, 216, 0.55);
+}
+
+.ob-delta {
+  text-align: center;
+  font: 700 15px/1 system-ui, sans-serif;
+  letter-spacing: 0.14em;
+}
+.ob-delta.pb {
+  color: #35e0ff;
+  text-shadow: 0 0 16px rgba(53, 224, 255, 0.6);
+}
+.ob-delta.slow {
+  color: #8fa3c8;
+}
+
+.ob-meta {
+  text-align: center;
+  font-size: 13px;
+  color: #7e93b4;
+}
+
+.ob-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+}
