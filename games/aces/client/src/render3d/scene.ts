@@ -487,7 +487,13 @@ class AcesSceneImpl implements AcesScene {
   }
 
   project(wx: number, wy: number, wz?: number): ScreenPoint {
-    this.pvScratch.set(wx, wy, wz ?? PLANE_Y);
+    // §2 seam contract: SERVER-world coords in, optional ALTITUDE third.
+    // Scene mapping per §1 law: X = wx · Z = wy · Y = wz ?? PLANE_Y. The
+    // original implementation fed (wx, wy, wz) straight into the scene
+    // vector — server-y became altitude and altitude became Z — so every
+    // three-arg HUD projection (crosshair / lead pip) landed kilometres
+    // off-screen while the two-arg edge arrows clamped garbage into view.
+    this.pvScratch.set(wx, wz ?? PLANE_Y, wy);
     this.camera.updateMatrixWorld();
     this.pvScratch.project(this.camera);
     const s = this.screenScratch;

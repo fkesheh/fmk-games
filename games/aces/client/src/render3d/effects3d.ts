@@ -25,8 +25,9 @@
 //          shrink-fade (opaque lambert, so fade = scale).
 //   RING   expanding flat rings at plane altitude / sea level — a small pool
 //          of dedicated meshes stepping through quantized-opacity materials.
-//   TRACER stateless InstancedMesh rebuilt straight from bullet data each
-//          drawProjectiles call (pool 256, GRAPHICS_3D §4).
+//   TRACER stateless instanced pair rebuilt straight from bullet data each
+//          drawProjectiles call — bright flash-amber core + dim tail segment,
+//          pool 256 each (GRAPHICS_3D §4).
 //
 // SHAKE LAW: hitSpark→SMALL · small blast→MEDIUM · large blast→LARGE;
 // accumulate + consume-and-reset, C_APP adds proximity context.
@@ -53,8 +54,9 @@ const TAU = Math.PI * 2;
 // ---- pools ------------------------------------------------------------------
 
 const TRACER_POOL = 256; //    §4: instanced tracer boxes
-const TRACER_LEN = 22; //      stretched-box length, u
-const STUB_LEN = 24; //        trigger-down cosmetic stub length
+const TRACER_CORE_LEN = 10; // bright core segment, u
+const TRACER_TAIL_LEN = 3; //  dim tail segment, u — total streak ≈13u
+const STUB_LEN = 13; //        trigger-down cosmetic stub matches the streak
 const STREAK_POOL = 64;
 const DEBRIS_POOL = 96;
 const RING_POOL = 10;
@@ -113,7 +115,13 @@ const COL = {
   glare: new THREE.Color(pal('sunGlare')),
   fireC: new THREE.Color(pal('fireCore')),
   fireE: new THREE.Color(pal('fireEdge')),
-  tracer: new THREE.Color(pal('tracer')),
+  /** Bright flash-amber tracer core — pal('flash') mixed toward pal('tracer'). */
+  tracerCore: new THREE.Color(mixA('flash', 'tracer', 0.42)),
+  /** Same tone shaded toward ink for the dim tail segment (F1 fade). */
+  tracerTail: new THREE.Color(mixA('flash', 'tracer', 0.42)).lerp(
+    new THREE.Color(pal('ink')),
+    0.45,
+  ),
   debHold: new THREE.Color(mixA('smokeDk', 'debris', 0.72)),
 };
 /** smokeLt→smokeDk mid-life ramp, quantized into 7 steps (house ladder). */
@@ -257,7 +265,8 @@ class EffectsSystem3D implements EffectsApi3D {
 
   // ---- scene objects (created headless-safe; textures join at attach) ------
   private readonly root = new THREE.Group();
-  private readonly tracers: THREE.InstancedMesh;
+  private readonly tracersCore: THREE.InstancedMesh;
+  private readonly tracersTail: THREE.InstancedMesh;
   private readonly streaks: THREE.InstancedMesh;
   private readonly shards: THREE.InstancedMesh;
   private readonly buckets: THREE.InstancedMesh[] = [];
@@ -276,9 +285,18 @@ class EffectsSystem3D implements EffectsApi3D {
     this.trng = makeRng((seed ^ 0x9e3779b9) >>> 0);
 
     const dyn = THREE.DynamicDrawUsage;
-    this.tracers = this.makeInstanced(
+    // F1: thin bright gunfire streaks — a flash-amber core (10u) stacked with
+    // a dim tail segment (3u), cross-sections ≤0.4u. Two instanced meshes so
+    // the fade is material-level (no per-instance color churn).
+    this.tracersCore = this.makeInstanced(
       new THREE.BoxGeometry(1, 1, 1),
-      matBasic(pal('tracer'), { transparent: true, opacity: 0.95, depthWrite: false }),
+      matBasic(mixA('flash', 'tracer', 0.42), { transparent: true, opacity: 0.98, depthWrite: false }),
+      TRACER_POOL,
+      dyn,
+    );
+    this.tracersTail = this.makeInstanced(
+      new THREE.BoxGeometry(1, 1, 1),
+      matBasic(pal('tracer'), { transparent: true, opacity: 0.45, depthWrite: false }),
       TRACER_POOL,
       dyn,
     );
@@ -294,7 +312,7 @@ class EffectsSystem3D implements EffectsApi3D {
       DEBRIS_POOL,
       dyn,
     );
-    this.root.add(this.tracers, this.streaks, this.shards);
+    this.root.add(this.tracersCore, this.tracersTail, this.streaks, this.shards);
 
     const ringGeo = new THREE.RingGeometry(0.86, 1, 40);
     ringGeo.rotateX(-Math.PI / 2); // lie flat at altitude / sea level
@@ -373,6 +391,11 @@ class EffectsSystem3D implements EffectsApi3D {
     ring.scale.setScalar(14);
     ring.name = 'pulse-ring';
     root.add(ring);
+    // F3: every crate body casts onto the sea (shadow law — traverse-set).
+    root.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      if (mesh.isMesh && mesh !== ring) mesh.castShadow = true;
+    });
     return { root, sway, canopy, ring, id: -1, gen: -1, falling: false, ph: 0, t: 0, x: 0, z: 0 };
   }
 
@@ -903,7 +926,8 @@ class EffectsSystem3D implements EffectsApi3D {
   drawProjectiles(list: ReadonlyArray<{ x: number; y: number; vx: number; vy: number }>): void {
     const count = Math.min(list.length, TRACER_POOL);
     this.tracerDrawn = count;
-    this.tracers.count = count;
+    this.tracersCore.count = count;
+    this.tracersTail.count = count;
     if (count === 0) return;
     for (let i = 0; i < count; i++) {
       const b = list[i]!;
@@ -911,13 +935,24 @@ class EffectsSystem3D implements EffectsApi3D {
       const ux = sp > 1 ? b.vx / sp : 1;
       const uz = sp > 1 ? b.vy / sp : 0;
       const yaw = Math.atan2(-uz, ux);
-      this.dummy.position.set(b.x - ux * (TRACER_LEN / 2), PLANE_Y, b.y - uz * (TRACER_LEN / 2));
+      // Bright core spans [head−10 .. head]; dim tail continues [head−13 ..
+      // head−10]. Both trail BEHIND the bullet, cross-section ≤0.4u (F1).
+      this.dummy.position.set(b.x - ux * (TRACER_CORE_LEN / 2), PLANE_Y, b.y - uz * (TRACER_CORE_LEN / 2));
       this.dummy.rotation.set(0, yaw, 0);
-      this.dummy.scale.set(TRACER_LEN, 0.55, 0.85);
+      this.dummy.scale.set(TRACER_CORE_LEN, 0.34, 0.4);
       this.dummy.updateMatrix();
-      this.tracers.setMatrixAt(i, this.dummy.matrix);
+      this.tracersCore.setMatrixAt(i, this.dummy.matrix);
+      this.dummy.position.set(
+        b.x - ux * (TRACER_CORE_LEN + TRACER_TAIL_LEN / 2),
+        PLANE_Y,
+        b.y - uz * (TRACER_CORE_LEN + TRACER_TAIL_LEN / 2),
+      );
+      this.dummy.scale.set(TRACER_TAIL_LEN, 0.22, 0.28);
+      this.dummy.updateMatrix();
+      this.tracersTail.setMatrixAt(i, this.dummy.matrix);
     }
-    this.tracers.instanceMatrix.needsUpdate = true;
+    this.tracersCore.instanceMatrix.needsUpdate = true;
+    this.tracersTail.instanceMatrix.needsUpdate = true;
   }
 
   // ---- attach / update / dispose ---------------------------------------------
@@ -1078,13 +1113,13 @@ class EffectsSystem3D implements EffectsApi3D {
       const L = this.ln[i]!;
       this.dummy.position.set(this.px[i]! - (dx * L) / 2, this.py[i]!, this.pz[i]! - (dz * L) / 2);
       this.dummy.rotation.set(0, -h, 0); // yaw −h maps local +X onto heading
-      const th = Math.max(0.14, 0.6 * (1 - prog * 0.75));
-      this.dummy.scale.set(L, th, th * 1.5);
+      const th = Math.max(0.12, 0.38 * (1 - prog * 0.75)); // ≤0.4u cross-section (F1)
+      this.dummy.scale.set(L, th, th * 1.05);
       this.dummy.updateMatrix();
       this.streaks.setMatrixAt(cur, this.dummy.matrix);
       this.streaks.setColorAt(
         cur,
-        this.sty[i] === V_FLASH ? COL.flash : this.sty[i] === V_TRACER ? COL.tracer : COL.blast,
+        this.sty[i] === V_FLASH ? COL.flash : this.sty[i] === V_TRACER ? COL.tracerCore : COL.blast,
       );
       cur++;
     }

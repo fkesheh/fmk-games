@@ -4,11 +4,11 @@
 // CANVAS OVERLAY (screen space — every world anchor reaches the canvas ONLY
 // through OverlayModel.cam.project, the frozen GRAPHICS_3D §2 seam backed by
 // C_APP's rig):
-//   · gun crosshair anchored at the PROJECTION of a point CROSS_LEAD_U ahead
-//     of the gun line at cruise altitude. ASSUMPTION (carried from the 2D era,
-//     still true post-3D): OverlayModel carries no own-plane position, so the
-//     gun line is approximated AT CameraView.x/y — the chase camera keeps the
-//     own plane near screen center, so the projection lands there too.
+//   · gun crosshair anchored at the PROJECTION of nose + forward·CROSS_LEAD_U
+//     at cruise altitude. ASSUMPTION (carried from the 2D era): OverlayModel
+//     carries no own-plane position, so the nose is reconstructed from
+//     CameraView.x/y — the §2 chase law puts the camera exactly CAM_DIST·zoom
+//     behind the plane along −forward (see the constant notes below).
 //   · amber lead pip toward the nearest target inside the front arc, using
 //     shared aimLead geometry, drawn at the PROJECTED intercept point.
 //     ASSUMPTION: OverlayModel.targets carries world position + class only
@@ -98,11 +98,18 @@ const HIT_TICKS = Math.max(2, Math.round(SNAP_RATE * 0.2));
 const HURT_TICKS = Math.round(SNAP_RATE * 0.55);
 
 /**
- * Crosshair anchor rides this far ahead of the gun-line origin along the
- * heading, world u at cruise altitude (v1 HUD layout knob — config carries
- * no HUD numbers; projected to screen via cam.project).
+ * Crosshair lead ahead of the NOSE along the heading, world u at cruise
+ * altitude (GRAPHICS_3D §5: "projected gun crosshair ahead of nose"). The
+ * OverlayModel seam carries no own-plane position, so the anchor rides the
+ * CameraView origin PLUS the chase-camera stand-in distance: the §2 law puts
+ * the cam exactly CAM_DIST·zoom BEHIND the plane along −forward, so
+ * cam + fwd·(CHASE_DIST_U·zoom + CROSS_LEAD_U) ≡ nose + fwd·CROSS_LEAD_U.
  */
-const CROSS_LEAD_U = 50;
+const CROSS_LEAD_U = 60;
+/** GRAPHICS_3D §2 frozen chase distance behind the plane, u. */
+const CHASE_DIST_U = 24;
+/** Lead pip range gate: nearest enemy inside this radius AND the front cone. */
+const PIP_MAX_RANGE_U = 500;
 
 // Heat-cluster geometry (CSS px): a paper-chipped gun/heat readout under the
 // crosshair — chip backing keeps bar+label legible over open water/clouds.
@@ -850,19 +857,23 @@ class AcesHud implements Hud {
     // --- gun cluster: only meaningful while flying -------------------------
     if (!o.alive || m.you === null) return;
 
-    // Crosshair anchor: the gun line rides CROSS_LEAD_U ahead of the camera
-    // origin (documented proxy for own-plane position) at cruise altitude,
-    // projected through the live rig. A second point farther along the same
-    // ray gives the on-screen travel bearing for the ring ticks.
-    const gunX = o.cam.x + Math.cos(o.heading) * CROSS_LEAD_U;
-    const gunY = o.cam.y + Math.sin(o.heading) * CROSS_LEAD_U;
+    // Crosshair anchor: nose + forward·CROSS_LEAD_U at cruise altitude (the
+    // chase-distance stand-in reconstructs the nose from CameraView.x/y — see
+    // CROSS_LEAD_U note). A second point farther along the same ray gives the
+    // on-screen travel bearing for the ring ticks. cam.project returns a
+    // SHARED scratch record — every field is copied out BEFORE the next call.
+    const chase = CHASE_DIST_U * (o.cam.zoom > 0 ? o.cam.zoom : 1);
+    const gunX = o.cam.x + Math.cos(o.heading) * (chase + CROSS_LEAD_U);
+    const gunY = o.cam.y + Math.sin(o.heading) * (chase + CROSS_LEAD_U);
     const anchor = o.cam.project(gunX, gunY, PLANE_Y);
     const hx = anchor.sx;
     const hy = anchor.sy;
-    const farX = o.cam.x + Math.cos(o.heading) * (CROSS_LEAD_U * 3);
-    const farY = o.cam.y + Math.sin(o.heading) * (CROSS_LEAD_U * 3);
+    const anchorVisible = anchor.visible;
+    const farX = o.cam.x + Math.cos(o.heading) * (chase + CROSS_LEAD_U * 3);
+    const farY = o.cam.y + Math.sin(o.heading) * (chase + CROSS_LEAD_U * 3);
     const farP = o.cam.project(farX, farY, PLANE_Y);
-    const tickBearing = anchor.visible && farP.visible ? Math.atan2(farP.sy - hy, farP.sx - hx) : 0;
+    const tickBearing =
+      anchorVisible && farP.visible ? Math.atan2(farP.sy - hy, farP.sx - hx) : 0;
 
     // crosshair ring + ticks — paper core under ink hairline so it reads on
     // both bright sky and dark sea without introducing new tones
@@ -884,7 +895,7 @@ class AcesHud implements Hud {
     }
     ctx.restore();
 
-    // --- lead pip: nearest target inside the front arc ----------------------
+    // --- lead pip: nearest target inside the front cone within 500u ---------
     let pipIdx = -1;
     let pipD2 = Number.POSITIVE_INFINITY;
     for (let i = 0; i < targets.length; i++) {
@@ -898,6 +909,7 @@ class AcesHud implements Hud {
       const dx = t.x - o.cam.x;
       const dy = t.y - o.cam.y;
       const d2 = dx * dx + dy * dy;
+      if (d2 > PIP_MAX_RANGE_U * PIP_MAX_RANGE_U) continue; // front-cone range gate
       if (d2 < pipD2) {
         pipD2 = d2;
         pipIdx = i;

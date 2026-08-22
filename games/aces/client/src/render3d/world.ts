@@ -19,20 +19,23 @@
 //              sunk below the waterline, sand→wet-sand→foam skirt) + team-
 //              coloured wind square on a wood pole + parked reserve crates —
 //              landmarks, not sets.
-//   CLOUDS     40 puffTexture cross-quads tinted paper↔dawnHi (alpha ≤ 0.78),
-//              Y 26–34, drifting EAST and wrapping around the map bounds;
-//              thinned over the central corridor (keep ×0.62, size ×0.72,
-//              alpha ×0.85 — mirrors render/world.ts's 2D laws). Their cloud
-//              shadows are ONE InstancedMesh of flat seaDark puffs (opacity
-//              0.22) offset east-south from each cloud, drifting with them.
+//   CLOUDS     TWO bands of puffTexture cross-quads (alpha ≤ 0.78) drifting
+//              EAST and wrapping around the map bounds, thinned over the
+//              central corridor (keep ×0.62, size ×0.72, alpha ×0.85 — mirrors
+//              render/world.ts's 2D laws): a reduced high deck Y 26–32
+//              (14 large puffs, paper↔dawnHi) and a LOW MIST band Y 7–12
+//              below cruise altitude (12 sparse flat seaDark↔paper wisps the
+//              player overflies — F4). Their cloud shadows are ONE
+//              InstancedMesh of flat seaDark puffs (opacity 0.22), offset
+//              east-south per band off each cloud, drifting with them.
 //
 // PERF LAW: update(tS, camPos) allocates NOTHING — positions wrap by
 // arithmetic, shadow matrices are prebuilt and only re-translated, every
 // animated value is a number write to a cached material. All colors flow
 // through pal()/mixA()/shadeA(); all materials come from the frozen factory;
-// the only texture is THE shared puff model. Draw calls: ~105 steady state
+// the only texture is THE shared puff model. Draw calls: ~90 steady state
 // (1 sea + 14 mottling + 6 glints + 24 island parts + ~16 airfield landfall
-// (4 graded layers ×2 fields) + 3 instanced + ≤40 clouds + 1 shadow IM) —
+// (4 graded layers ×2 fields) + 3 instanced + ≤26 clouds + 1 shadow IM) —
 // inside the ≤120 budget with room
 // for W2/W3 planes, tracers and effects.
 //
@@ -81,14 +84,18 @@ const SURF_Y = 0.35;
 const SURF_INNER = 1.1;
 const SURF_OUTER = 1.24;
 
-const CLOUD_TOTAL = 40;
-const CLOUD_FAR_COUNT = 16;
+const CLOUD_HIGH_COUNT = 14; //   reduced high deck — fewer, LARGER puffs (F4)
+const CLOUD_LOW_COUNT = 12; //    sparse low mist band BELOW cruise alt (F4)
 const CLOUD_MARGIN = 700;
 const CLOUD_ALPHA_MAX = 0.78; // STYLE_BIBLE §6 hard cap
-const CLOUD_ALPHA_MIN = 0.22;
+const CLOUD_ALPHA_MIN = 0.12;
 const SHADOW_OPACITY = 0.22; //  §6/§3 cap 0.25
-const SHADOW_OFF_X = 95; //      shadows fall EAST-SOUTH off low western sun
+/** Shadow offsets fall EAST-SOUTH off the low western sun; per-band because
+ *  the throw scales with cloud height (~height/tan(21°)). */
+const SHADOW_OFF_X = 95;
 const SHADOW_OFF_Z = 45;
+const MIST_OFF_X = 26;
+const MIST_OFF_Z = 13;
 const SHADOW_Y = 0.18;
 
 const FOAM_BASE = 0.3;
@@ -126,6 +133,9 @@ interface CloudRec {
   x0: number;
   z: number;
   speed: number;
+  /** Per-band shadow throw (east-south off the western sun). */
+  shOffX: number;
+  shOffZ: number;
 }
 
 /** Flat soft blob under a cloud — same texture, seaDark tint (§6). */
@@ -418,19 +428,49 @@ export function createWorld(map: AcesMap): AcesWorld {
     readonly aBase: number;
     readonly aSpan: number;
     readonly speed: number;
+    /** Puff quad scale multipliers — mist lies flat, high deck towers. */
+    readonly wMul: number;
+    readonly hMul: number;
+    /** paper↔X mix endpoints (APAL keys) expressed ACROSS puffs. */
+    readonly tintB: 'dawnHi' | 'seaDark';
+    readonly shOffX: number;
+    readonly shOffZ: number;
   }
-  // Two parallax-ish bands mirroring the 2D module's far/near layer laws.
+  // F4 TWO-BAND sky: the chase cam cruises at Y≈22 looking level/down, so the
+  // old single Y26–34 deck sat above every frame. High deck is REDUCED but
+  // larger; the new LOW MIST band (Y 7–12, below cruise altitude) gives the
+  // player soft seaDark/paper wisps to overfly. Both drift east; corridor
+  // thinning applies to both (mirrors the 2D module's layer laws).
   const specs: ReadonlyArray<CloudSpec> = [
-    { count: CLOUD_FAR_COUNT, yMin: 26, yMax: 29.5, rMin: 55, rMax: 105, aBase: 0.3, aSpan: 0.18, speed: 8 },
     {
-      count: CLOUD_TOTAL - CLOUD_FAR_COUNT,
-      yMin: 30,
-      yMax: 34,
-      rMin: 85,
-      rMax: 150,
-      aBase: 0.42,
+      count: CLOUD_HIGH_COUNT,
+      yMin: 26,
+      yMax: 32,
+      rMin: 95,
+      rMax: 170,
+      aBase: 0.34,
       aSpan: 0.2,
-      speed: 13,
+      speed: 11,
+      wMul: 2.6,
+      hMul: 1.7,
+      tintB: 'dawnHi',
+      shOffX: SHADOW_OFF_X,
+      shOffZ: SHADOW_OFF_Z,
+    },
+    {
+      count: CLOUD_LOW_COUNT,
+      yMin: 7,
+      yMax: 12,
+      rMin: 30,
+      rMax: 60,
+      aBase: 0.22,
+      aSpan: 0.14,
+      speed: 6,
+      wMul: 2.2,
+      hMul: 0.55,
+      tintB: 'seaDark',
+      shOffX: MIST_OFF_X,
+      shOffZ: MIST_OFF_Z,
     },
   ];
   for (const spec of specs) {
@@ -450,15 +490,22 @@ export function createWorld(map: AcesMap): AcesWorld {
         CLOUD_ALPHA_MIN,
         Math.min(CLOUD_ALPHA_MAX, (spec.aBase + rng() * spec.aSpan) * alphaCut),
       );
-      // paper ↔ dawnHi mixes expressed ACROSS puffs (kit law — no ad-hoc math)
-      const tint = mixA('paper', 'dawnHi', rng());
+      // paper ↔ dawnHi / seaDark mixes expressed ACROSS puffs (kit law)
+      const tint = mixA('paper', spec.tintB, rng());
       const m = withPuff(matBasic(tint, { transparent: true, opacity: alpha, depthWrite: false }));
       const mesh = new THREE.Mesh(puffGeo, m);
       mesh.position.set(x0, spec.yMin + rng() * (spec.yMax - spec.yMin), z);
-      mesh.scale.set(r * 2.6, r * 1.7, r * 2.6);
+      mesh.scale.set(r * spec.wMul, r * spec.hMul, r * spec.wMul);
       mesh.renderOrder = 6;
       group.add(mesh);
-      clouds.push({ mesh, x0, z, speed: spec.speed });
+      clouds.push({
+        mesh,
+        x0,
+        z,
+        speed: spec.speed,
+        shOffX: spec.shOffX,
+        shOffZ: spec.shOffZ,
+      });
       placed++;
     }
   }
@@ -474,7 +521,7 @@ export function createWorld(map: AcesMap): AcesWorld {
     for (let i = 0; i < clouds.length; i++) {
       const c = clouds[i] as CloudRec;
       const s = c.mesh.scale;
-      dummy.position.set(c.x0 + SHADOW_OFF_X, SHADOW_Y, c.z + SHADOW_OFF_Z);
+      dummy.position.set(c.x0 + c.shOffX, SHADOW_Y, c.z + c.shOffZ);
       dummy.rotation.set(0, 0, 0);
       dummy.scale.set(s.x * 1.15, 1, s.z * 1.15);
       dummy.updateMatrix();
@@ -502,7 +549,7 @@ export function createWorld(map: AcesMap): AcesWorld {
         const cx = wrapX(c.x0 + c.speed * tS);
         c.mesh.position.x = cx;
         const m = shadowBases[i] as THREE.Matrix4;
-        m.setPosition(cx + SHADOW_OFF_X, SHADOW_Y, c.z + SHADOW_OFF_Z);
+        m.setPosition(cx + c.shOffX, SHADOW_Y, c.z + c.shOffZ);
         if (shadowIM) shadowIM.setMatrixAt(i, m);
       }
       if (shadowIM) shadowIM.instanceMatrix.needsUpdate = true;

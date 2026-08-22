@@ -87,34 +87,50 @@ async function main() {
     await shot(name);
   }
 
-  // 4. hero close-ups: pin zoom, park next to a live enemy, snap each frame
-  // of a short burst so prop blur/marks are crisp somewhere.
+  // 4. hero close-ups: tail-chase staging — warp ASTERN of the nearest foe
+  // along ITS heading so both airframes fill the frame; wait out camera ease.
   await call(`window.__ACES.zoomTo(0.55)`);
-  for (const [i, name] of ['07-hero-a', '08-hero-b', '09-hero-c'].entries()) {
-    const s = await state();
-    // find nearest living enemy from internals and tailgate it
-    const pos = await call(`(() => {
-      const w = window.__ACES._internals;
-      const snap = w.latestSnap && w.latestSnap();
-      if (!snap) return null;
-      const foe = snap.planes.find(p => p.bot && !p.dead);
-      return foe ? { x: foe.x, y: foe.y } : null;
-    })()`);
-    if (pos && typeof pos.x === 'number') {
-      await call(`window.__ACES.warpTo(${pos.x - 70}, ${pos.y + 30})`);
+  for (const name of ['07-hero-a', '08-hero-b', '09-hero-c']) {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const alive = ((await state())?.you) === true;
+      if (!alive) { await call(`window.__ACES.spawn('fighter')`); await sleep(600); continue; }
+      const foe = await call(`(() => {
+        const snap = window.__ACES._internals.latestSnap && window.__ACES._internals.latestSnap();
+        if (!snap || !snap.planes) return null;
+        const f = snap.planes.find(p => p.bot && !p.dead);
+        return f ? { x: f.x, y: f.y, h: f.h } : null;
+      })()`);
+      if (!foe || typeof foe.x !== 'number') { await sleep(400); continue; }
+      const bx = Math.round(foe.x - Math.cos(foe.h) * 55);
+      const by = Math.round(foe.y - Math.sin(foe.h) * 55);
+      await call(`window.__ACES.warpTo(${bx}, ${by})`);
+      await sleep(750);                       // chase-cam ease settles after teleport
+      await call(`window.__ACES.fastForward(6)`);
+      await sleep(180);
+      break;
     }
-    await call(`window.__ACES.fastForward(25)`);
-    await sleep(120);
     await shot(name);
   }
   await call(`window.__ACES.zoomTo(null)`);
 
-  // 5. smoke/damage states: ungod, let the furball chew on us, snap HUD-heavy frames
-  await call(`window.__ACES.god()`); // toggle OFF
-  await call(`window.__ACES.fastForward(600)`);
-  await sleep(200);
+  // 5. smoke/damage state: gunship soak — short ungod'd bursts until visibly
+  // damaged but ALIVE, then god back ON and shoot the smoking trail frame.
+  await call(`window.__ACES.spawn('gunship')`);
+  await sleep(600);
+  for (let i = 0; i < 14; i++) {
+    await call(`window.__ACES.god()`);            // OFF
+    await call(`window.__ACES.fastForward(45)`);
+    await call(`window.__ACES.god()`);            // ON
+    const st = await call(`(() => {
+      const p = window.__ACES._internals.predictor;
+      return p ? { hp: p.state.hp, dead: p.state.dead } : null;
+    })()`);
+    if (st && !st.dead && st.hp <= 100 * 0.55) break;
+    if (st && st.dead) { await call(`window.__ACES.spawn('gunship')`); await sleep(700); }
+    await sleep(120);
+  }
+  await sleep(450);                               // let the smoke trail develop
   await shot('10-damage-hud');
-  await call(`window.__ACES.god()`); // back ON
 
   // 6. death → class picker: die deliberately (ungod + fast forward near foes)
   await call(`window.__ACES.god()`);

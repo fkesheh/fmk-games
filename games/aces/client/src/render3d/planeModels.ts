@@ -15,9 +15,11 @@
 //   GUNSHIP 21–22 (band 16–22): triple-wing stack, mid wing far forward,
 //          deep slab fuselage, twin rudders
 // Livery double-encoding: ROYAL royalNavy body + royalDeck ROUNDEL RING
-// (flat torus) mid-wing + deck-cream tailfin; IRON ironRed body + ironDeck
-// BAR-CROSS (two crossed slabs) mid-wing. Dope-linen lower wings, wood cowls/
-// struts, tire-dark guns/gear, prop = semi-transparent disc + 2 blades.
+// (flat torus) mid-wing + royalDeck tail fin; IRON ironRed body + ironDeck
+// BAR-CROSS (two crossed slabs) mid-wing + ironDeck tail fin over a paper
+// tailplane band. Marks are sized ×2 (ring outer ≈7u) so they read through
+// fog at chase distance (F2). Dope-linen lower wings, wood cowls/struts,
+// tire-dark guns/gear, prop = semi-transparent disc + 2 blades.
 //
 // PERF/ALLOC LAW: geometry kits are cached per dimension at first build
 // (bounded set; respawn churn reuses them), materials come from the FROZEN
@@ -57,6 +59,14 @@ const WOOD = matLambert(pal('wood'));
 const TIRE = matLambert(pal('tire'));
 /** ROYAL deck-cream tailfin tone (§5 livery third channel). */
 const ROYAL_TAIL = matLambert(shadeA('royalDeck', -0.15));
+/**
+ * F2 IRON tail assembly: ironDeck fin panels ride over a PAPER-toned
+ * tailplane — the bright "paper edge" band that lets near-black ironDeck read
+ * against the dark sea from behind. Single materials only: the frozen part
+ * bands (§5) leave IRON scout/gunship zero headroom, so the edge cannot be
+ * its own mesh (and multi-material arrays are not used anywhere on purpose).
+ */
+const PAPER_M = matLambert(pal('paper'));
 const PROP_DISC = matBasic(pal('prop'), { transparent: true, opacity: 0.35, depthWrite: false });
 const FIRE_GLOW = matBasic(pal('fireCore'), { transparent: true, opacity: 0.9, depthWrite: false });
 /** Quantized soot ladder — index = floor(damageFrac × 7); house idiom. */
@@ -177,11 +187,15 @@ function put(
   return m;
 }
 
-/** Team mark on a wing top surface. ROYAL ring · IRON crossed bars. */
+/** Team mark on a wing top surface, sized to read at chase distance (F2).
+ *  `r` is the OUTER radius/span: ROYAL ring outer ≈ r · IRON bar arms span r.
+ *  ROYAL ring · IRON crossed bars. */
 function addMark(parent: THREE.Object3D, team: TeamId, x: number, y: number, r: number): void {
   if (team === 'royal') {
     const g = cached(`roundel:${r}`, () => {
-      const t = new THREE.TorusGeometry(r, r * 0.17, 8, 22);
+      // torus outer = rr·(1+0.22) ⇒ rr = r/1.22 lands the outer edge on r
+      const rr = r / 1.22;
+      const t = new THREE.TorusGeometry(rr, rr * 0.22, 8, 24);
       t.rotateX(Math.PI / 2);
       return t;
     });
@@ -189,10 +203,9 @@ function addMark(parent: THREE.Object3D, team: TeamId, x: number, y: number, r: 
     ring.name = 'mark-roundel';
     ring.userData.mark = 'roundel';
   } else {
-    const arm = r * 2.3;
-    const w = r * 0.62;
-    const a = put(parent, boxGeo(arm, 0.14, w), MARK.iron, { x, y }); // spanwise bar
-    const b = put(parent, boxGeo(w, 0.14, arm), MARK.iron, { x, y }); // chordwise bar
+    const w = Math.max(2.2, r * 0.32); // slab width — reads at 24u+
+    const a = put(parent, boxGeo(r, 0.26, w), MARK.iron, { x, y }); // spanwise bar
+    const b = put(parent, boxGeo(w, 0.26, r), MARK.iron, { x, y }); // chordwise bar
     a.name = 'mark-cross-a';
     b.name = 'mark-cross-b';
     a.userData.mark = 'cross';
@@ -222,7 +235,9 @@ function addProp(
 
 /**
  * Tail group: elevator (tailplane) tilts around the tail root pivot; rudders
- * ride inside the group AND yaw on their own axis. ROYAL tails go deck-cream.
+ * ride inside the group AND yaw on their own axis. F2: the fin is the team
+ * read from BEHIND (the chase view) — a LOUD team-secondary panel ~1.6× the
+ * old rudder: ROYAL royalDeck · IRON ironDeck over a paper tailplane band.
  */
 function addTail(
   parent: THREE.Object3D,
@@ -246,15 +261,16 @@ function addTail(
   put(
     tail,
     wingGeo(o.planeChord, o.planeSpan, 0.35),
-    BODY[team],
+    team === 'royal' ? BODY[team] : PAPER_M, // IRON paper edge band (F2)
     { x: o.planeX - o.pivotX, y: o.planeY },
   );
-  const rudMat = team === 'royal' ? ROYAL_TAIL : BODY[team];
+  const finMat = team === 'royal' ? ROYAL_TAIL : MARK.iron;
+  const finH = o.rudH * 1.6;
   for (let i = 0; i < o.rudZ.length; i++) {
     const z = o.rudZ[i]!;
-    const rud = put(tail, boxGeo(o.rudH * 0.72, o.rudH, 0.32), rudMat, {
+    const rud = put(tail, boxGeo(finH * 0.62, finH, 0.32), finMat, {
       x: o.rudX - o.pivotX,
-      y: o.planeY + o.rudH * 0.42,
+      y: o.planeY + finH * 0.42,
       z,
     });
     rig.rudders.push(rud);
@@ -324,7 +340,7 @@ function buildScout(team: TeamId): Rig {
     rudH: 3.9, // HIGH rudder — busy-tail read
   });
   addProp(group, rig, 15.4, 3.6, 6.4, 26);
-  addMark(group, team, 4.6, 3.28, 3);
+  addMark(group, team, 4.6, 3.28, 6); // F2: ×2 — reads through fog at 24u
 
   addDamageFx(group, fx, rig, 8, -12);
   group.add(fx);
@@ -360,7 +376,7 @@ function buildFighter(team: TeamId): Rig {
     rudH: 3.3,
   });
   addProp(group, rig, 17.8, 3.4, 6.2, 23);
-  addMark(group, team, 4.8, 3.51, 3.4);
+  addMark(group, team, 4.8, 3.51, 6.8); // F2: ×2 — reads through fog at 24u
 
   addDamageFx(group, fx, rig, 9, -13);
   group.add(fx);
@@ -404,7 +420,7 @@ function buildGunship(team: TeamId): Rig {
   put(group, cylGeo(3, 3.6), WOOD, { x: 13.4 }); // armored cowl block
   addProp(group, rig, 16.6, 4.6, 8.4, 19);
   // Mark rides the forward mid wing per §5 ("roundel ring mid-wing").
-  addMark(mid, team, 0, 0.44, 3.8);
+  addMark(mid, team, 0, 0.44, 7.6); // F2: ×2 — reads through fog at 24u
 
   addDamageFx(group, fx, rig, 10, -14);
   group.add(fx);
@@ -554,12 +570,17 @@ class PlaneModelImpl implements PlaneModel {
 
 /** Build one deterministic airframe (no RNG anywhere in assembly). */
 export function buildPlane(cls: PlaneClassId, team: TeamId): PlaneModel {
-  switch (cls) {
-    case 'scout':
-      return new PlaneModelImpl(buildScout(team));
-    case 'fighter':
-      return new PlaneModelImpl(buildFighter(team));
-    default:
-      return new PlaneModelImpl(buildGunship(team));
-  }
+  const rig =
+    cls === 'scout'
+      ? buildScout(team)
+      : cls === 'fighter'
+        ? buildFighter(team)
+        : buildGunship(team);
+  // F3 shadow law: EVERY airframe mesh casts onto the sea — traverse-set once
+  // at build so no part can silently opt out (wings, fins, guns, prop disc).
+  rig.group.traverse((o) => {
+    const mesh = o as THREE.Mesh;
+    if (mesh.isMesh) mesh.castShadow = true;
+  });
+  return new PlaneModelImpl(rig);
 }
