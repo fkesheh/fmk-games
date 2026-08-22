@@ -89,7 +89,7 @@ anywhere; explosions do NOT light the scene, they replace it for 3 frames
 ## §4 Camera & framing
 
 Top-down, slight chase: camera leads velocity by CAMERA.LOOKAHEAD_S; zoom
-eases CAMERA.ZOOM_MAX (1.15, idle) → CAMERA.ZOOM_MIN (0.95, full throttle) —
+eases CAMERA.ZOOM_MAX (1.15, idle) → CAMERA.ZOOM_MIN (1.14, full throttle) —
 close enough that airframe silhouettes and marks read at rest, wide enough
 to keep context at speed. The horizon never appears. Framing law for
 captures: at least two planes in frame when possible, cloud layer visibly

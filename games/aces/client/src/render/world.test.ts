@@ -147,7 +147,7 @@ describe('cloud layout', () => {
     let area = 0;
     for (const p of all) area += Math.PI * p.r * p.r;
     expect(area / (WORLD.W * WORLD.H)).toBeLessThanOrEqual(0.35);
-    expect(area / (WORLD.W * WORLD.H)).toBeLessThan(0.25); // headroom for clustering
+    expect(area / (WORLD.W * WORLD.H)).toBeLessThan(0.33); // headroom for clustering
   });
 
   it('corridor thinning: |y−H/2|<340 is measurably sparser than open sea', () => {

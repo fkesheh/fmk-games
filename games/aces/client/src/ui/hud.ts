@@ -93,6 +93,21 @@ const HURT_TICKS = Math.round(SNAP_RATE * 0.55);
 
 /** Crosshair lead distance ahead of the screen-center anchor, CSS px. */
 const CROSS_LEAD_PX = 58;
+
+// Heat-cluster geometry (CSS px): a paper-chipped gun/heat readout under the
+// crosshair — chip backing keeps bar+label legible over open water/clouds.
+const HEAT_W = 112;
+const HEAT_H = 9;
+/** Gap between bar bottom and the label slot's top edge. */
+const HEAT_LABEL_GAP = 3;
+const HEAT_LABEL_H = 14;
+const CHIP_PAD_X = 9;
+const CHIP_PAD_T = 6;
+const CHIP_PAD_B = 6;
+/** Stamped JAMMED plate: fixed-size box (no per-frame measureText), tilt §8. */
+const JAM_W = 86;
+const JAM_H = 20;
+const JAM_ROT = -0.07;
 /** Half-width of the "front arc" a target must sit in to earn a lead pip. */
 const FRONT_ARC_RAD = 0.62;
 /** Inset of the edge-arrow clamp box from the viewport border, CSS px. */
@@ -272,9 +287,12 @@ export function formatKey(code: string): string {
   }
 }
 
-/** 'KeyA'+'ArrowLeft' → 'A / ←'. */
+/**
+ * 'KeyA'+'ArrowLeft' → 'A / ←'. Mirrored physical codes (ShiftLeft/ShiftRight
+ * → the same SHIFT stamp) dedupe so a binding never prints one label twice.
+ */
 export function formatKeys(codes: readonly string[]): string {
-  return codes.map(formatKey).join(' / ');
+  return Array.from(new Set(codes.map(formatKey))).join(' / ');
 }
 
 // ============================================================================
@@ -288,11 +306,13 @@ const FONT_COND = "'Arial Narrow', 'Helvetica Neue', Arial, sans-serif";
 const FONT_LABEL_14 = `700 14px ${FONT_TW}`;
 const FONT_STAMP = `900 46px ${FONT_COND}`;
 const FONT_BADGE = `900 14px ${FONT_COND}`;
+const FONT_JAM = `900 17px ${FONT_COND}`;
 
 const INK_STRONG = withAlpha('ink', 0.92);
-const INK_SOFT = withAlpha('ink', 0.6);
 const PAPER_FILL = withAlpha('paper', 0.85);
 const PAPER_EDGE = withAlpha('paper', 0.9);
+const HEAT_TRACK = withAlpha('ink', 0.16);
+const CHIP_EDGE = withAlpha('ink', 0.4);
 const TRACER_FILL = withAlpha('tracer', 0.95);
 const WARN_FILL = withAlpha('warn', 0.95);
 const OK_FILL = withAlpha('ok', 0.95);
@@ -491,7 +511,7 @@ const CSS = `
 .aces-banner.legend{border-color:var(--ac-warn);}
 
 /* muted tag */
-.aces-muted{right:16px;bottom:16px;padding:3px 10px;border:2px solid var(--ac-ink55);
+.aces-muted{position:absolute;right:16px;bottom:16px;padding:3px 10px;border:2px solid var(--ac-ink55);
   background:var(--ac-paper80);font-size:14px;font-weight:800;color:var(--ac-ink75);}
 .aces-muted.on{display:block;}
 
@@ -852,23 +872,46 @@ class AcesHud implements Hud {
       ctx.stroke();
     }
 
-    // --- heat bar under crosshair: LENGTH + TEXT carry the state (D4) -------
+    // --- heat cluster under crosshair: paper chip + bar LENGTH + strong-ink
+    //     text carry the state (D4); jammed swaps in a stamped warn plate ----
     const heat = clamp01(o.heat);
-    const bw = 78;
-    const bx = hx - bw / 2;
+    const bx = hx - HEAT_W / 2;
     const by = hy + 26;
-    ctx.fillStyle = withAlpha('ink', 0.16);
-    ctx.fillRect(bx, by, bw, 7);
-    ctx.fillStyle = o.jammed || heat > HEAT_WARN ? WARN_FILL : OK_FILL;
-    ctx.fillRect(bx, by, bw * heat, 7);
+    const chipW = HEAT_W + CHIP_PAD_X * 2;
+    const chipH = CHIP_PAD_T + HEAT_H + HEAT_LABEL_GAP + HEAT_LABEL_H + CHIP_PAD_B;
+    ctx.fillStyle = PAPER_FILL;
+    ctx.fillRect(hx - chipW / 2, by - CHIP_PAD_T, chipW, chipH);
     ctx.lineWidth = 1;
-    ctx.strokeStyle = INK_SOFT;
-    ctx.strokeRect(bx, by, bw, 7);
-    ctx.font = FONT_LABEL_14;
+    ctx.strokeStyle = CHIP_EDGE;
+    ctx.strokeRect(hx - chipW / 2 + 0.5, by - CHIP_PAD_T + 0.5, chipW - 1, chipH - 1);
+
+    ctx.fillStyle = HEAT_TRACK;
+    ctx.fillRect(bx, by, HEAT_W, HEAT_H);
+    ctx.fillStyle = o.jammed || heat > HEAT_WARN ? WARN_FILL : OK_FILL;
+    ctx.fillRect(bx, by, HEAT_W * heat, HEAT_H);
+    ctx.strokeStyle = INK_STRONG;
+    ctx.strokeRect(bx, by, HEAT_W, HEAT_H);
+
     ctx.textAlign = 'center';
-    ctx.textBaseline = 'top';
-    ctx.fillStyle = o.jammed ? WARN_FILL : INK_SOFT;
-    ctx.fillText(o.jammed ? 'JAMMED' : heat > HEAT_WARN ? 'HEAT' : 'GUNS', hx, by + 10);
+    if (o.jammed) {
+      // Stamped JAMMED plate — bigger type, warn ink, slight §8-stamp tilt.
+      ctx.save();
+      ctx.translate(hx, by + HEAT_H + HEAT_LABEL_GAP + HEAT_LABEL_H / 2);
+      ctx.rotate(JAM_ROT);
+      ctx.font = FONT_JAM;
+      ctx.textBaseline = 'middle';
+      ctx.strokeStyle = WARN_FILL;
+      ctx.fillStyle = WARN_FILL;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(-JAM_W / 2, -JAM_H / 2, JAM_W, JAM_H);
+      ctx.fillText('JAMMED', 0, 1);
+      ctx.restore();
+    } else {
+      ctx.font = FONT_LABEL_14;
+      ctx.textBaseline = 'top';
+      ctx.fillStyle = heat > HEAT_WARN ? WARN_FILL : INK_STRONG;
+      ctx.fillText(heat > HEAT_WARN ? 'HEAT' : 'GUNS', hx, by + HEAT_H + HEAT_LABEL_GAP);
+    }
 
     // --- hit marker × flash --------------------------------------------------
     const hitAge = m.tick - o.hitConfirmTick;

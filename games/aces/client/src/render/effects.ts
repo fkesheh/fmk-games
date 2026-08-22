@@ -64,6 +64,8 @@ const V_GLARE = 4;
 const V_FIRE = 5;
 const V_DEB = 6;
 const V_TRACER = 7;
+/** Solid flash-core strike disc (§3: the blast replaces the scene). */
+const V_CORE = 8;
 
 /**
  * Quantized alpha ladder over one palette key — the ONLY way visible strings
@@ -76,8 +78,10 @@ function ladder(key: ApalKey, maxA: number, n = 13): string[] {
 }
 
 const SMOKE_LT = ladder('smokeLt', 0.52);
-const SMOKE_DK = ladder('smokeDk', 0.6);
-const BLAST_LAD = ladder('blast', 0.95);
+// raised 0.78→0.85 (art round 2): late-mid trail life must sit at the dark
+// end of the smokeDk ladder instead of mid-gray.
+const SMOKE_DK = ladder('smokeDk', 0.85);
+const BLAST_LAD = ladder('blast', 1);
 const FLASH_LAD = ladder('flash', 1);
 const FOAM_LAD = ladder('foam', 0.85);
 const GLARE_LAD = ladder('sunGlare', 0.95);
@@ -93,6 +97,14 @@ const OUT_FOAM = withAlpha('foam', 0);
 const OUT_GLARE = withAlpha('sunGlare', 0);
 const OUT_FIRE = withAlpha('fireEdge', 0);
 const OUT_SMOKE = withAlpha('smokeDk', 0);
+/** Transparent rim for the late-life ink-smoke phase (V_SMOKE final third). */
+const OUT_DEB = withAlpha('debris', 0);
+/**
+ * Late-life trail puffs hold this debris-ladder tier floor (art round 2):
+ * tier ≥10 ⇒ alpha ≥0.767, i.e. the darkest existing ink-smoke tone kept
+ * ≥0.72 until the release sliver of life.
+ */
+const DEB_HOLD = 10;
 
 /** Per-second velocity drag by kind — debris tumbles down fast, smoke drifts. */
 const DRAG = new Float32Array([0, 0.8, 2.2, 0, 0, 2.6]);
@@ -296,7 +308,7 @@ export class EffectsSystem implements EffectsApi {
     }
   }
 
-  /** Growing gray-brown puff drifting EAST-downwind (§7), lt→dk as it ages. */
+  /** Growing gray-brown puff drifting EAST-downwind (§7), lt→dk→ink as it ages. */
   private spawnTrailSmoke(x: number, y: number, heavy: boolean): void {
     const r = this.trng();
     const r2 = this.trng();
@@ -311,11 +323,14 @@ export class EffectsSystem implements EffectsApi {
       0,
       1.1 + r * 0.5,
       2.2 + r2 * 1.4,
-      9 + r3 * 7,
+      // late puffs ≥1.6× spawn size: these targets give a ≥3.5× ratio.
+      13 + r3 * 8,
       0,
       0,
       0,
-      heavy ? 0.55 : 0.42,
+      // base alphas raised (art round 2) so the final phase holds the dark
+      // ink tier instead of washing to mid-gray at distance.
+      heavy ? 0.86 : 0.72,
     );
   }
 
@@ -357,7 +372,7 @@ export class EffectsSystem implements EffectsApi {
    * streak along heading that decays before server bullets replace it.
    */
   tracerStub(x: number, y: number, h: number): void {
-    this.spawn(FX.STREAK, V_TRACER, x, y, Math.cos(h) * 780, Math.sin(h) * 780, 0, 0.09, 0, 0, h, 0, 13, 0.95);
+    this.spawn(FX.STREAK, V_TRACER, x, y, Math.cos(h) * 780, Math.sin(h) * 780, 0, 0.09, 0, 0, h, 0, 24, 0.95);
   }
 
   /** White-hot spark tick + tiny ink chips where a bullet connected (§7). */
@@ -389,8 +404,9 @@ export class EffectsSystem implements EffectsApi {
   }
 
   /**
-   * Death blast (§7): strike = flash core then blast bloom just behind it
-   * (large adds an expanding blast ring); aftermath = tumbling ink debris
+   * Death blast (§7): strike = SOLID flash-core disc then flash bloom and
+   * blast bloom just behind it, plus an expanding complete shock ring (both
+   * sizes); aftermath = tumbling ink debris
    * shards (bible band 8–14) staggered by tiny delays, then a lingering dark
    * smoke column drifting east-downwind. Over water: foam splash ring + white
    * column + one sunGlare sparkle. Shake follows SHAKE.{MEDIUM,LARGE}.
@@ -399,10 +415,18 @@ export class EffectsSystem implements EffectsApi {
     const big = size === 'large';
     this.shake(big ? SHAKE.LARGE : SHAKE.MEDIUM);
 
-    // strike
+    // strike — §3 law: the blast REPLACES the scene for its first frames.
+    // A hard-edged flash-core disc lands first (drawn beneath the soft
+    // bloom), then flash bloom, then blast bloom just behind it; an
+    // expanding shock ring rides on top for both sizes.
+    this.spawn(FX.PUFF, V_CORE, x, y, 0, 0, 0, 0.06, big ? 16 : 12, big ? 16 : 12, 0, 0, 0, 1);
     this.spawn(FX.PUFF, V_FLASH, x, y, 0, 0, 0, big ? 0.2 : 0.15, big ? 10 : 6, big ? 46 : 28, 0, 0, 0, 1);
-    this.spawn(FX.PUFF, V_BLAST, x, y, 0, 0, 0.02, big ? 0.3 : 0.22, big ? 12 : 8, big ? 60 : 38, 0, 0, 0, 0.95);
-    if (big) this.spawn(FX.RING, V_BLAST, x, y, 0, 0, 0.05, 0.5, 12, 74, 0, 0, 0, 0.8);
+    this.spawn(FX.PUFF, V_BLAST, x, y, 0, 0, 0.02, big ? 0.3 : 0.22, big ? 12 : 8, big ? 60 : 38, 0, 0, 0, 1);
+    // expanding shock ring — BOTH sizes (art round 2: it was absent from every
+    // capture). Complete stroke circle born with the strike (~20u) dilating to
+    // 95u large / 70u small over ~0.35 s; len[] carries its spawn stroke width
+    // so the draw pass can taper 5→1.5 as the front runs out.
+    this.spawn(FX.RING, V_BLAST, x, y, 0, 0, 0.02, 0.35, 20, big ? 95 : 70, 0, 0, 5, 0.92);
 
     // debris — rng rolled BEFORE spawning so pool pressure can't skew rolls
     const shN = big ? 12 + ((this.rng() * 3) | 0) : 9 + ((this.rng() * 3) | 0); // 9–11 / 12–14
@@ -444,13 +468,14 @@ export class EffectsSystem implements EffectsApi {
         0,
         0,
         0,
-        0.5 + this.rng() * 0.15,
+        // lingering column shares the trail darkening law (art round 2).
+        0.68 + this.rng() * 0.16,
       );
     }
 
     // foam splash when the wreck hits open water
     if (overWater) {
-      this.spawn(FX.RING, V_FOAM, x, y, 0, 0, 0.04, 0.55, 6, 48, 0, 0, 0, 0.85);
+      this.spawn(FX.RING, V_FOAM, x, y, 0, 0, 0.04, 0.55, 6, 48, 0, 0, 2.6, 0.85);
       const colN = big ? 5 : 4;
       for (let i = 0; i < colN; i++) {
         const r = this.rng();
@@ -486,7 +511,7 @@ export class EffectsSystem implements EffectsApi {
       }
       return;
     }
-    this.spawn(FX.RING, V_FOAM, x, y, 0, 0, 0, 0.38, 4, 22, 0, 0, 0, 0.85);
+    this.spawn(FX.RING, V_FOAM, x, y, 0, 0, 0, 0.38, 4, 22, 0, 0, 2.2, 0.85);
     for (let i = 0; i < 9; i++) {
       const ang = (i / 9) * TAU + this.rng() * 0.4;
       const sp = 55 + this.rng() * 65;
@@ -549,11 +574,27 @@ export class EffectsSystem implements EffectsApi {
           if (a <= 0.02) break;
           const r = this.r0[i]! + (this.r1[i]! - this.r0[i]!) * prog;
           const idx = Math.min(12, Math.round(a * 12));
-          if (this.sty[i] === V_SMOKE) {
-            // growing smokeLt→smokeDk: discrete mid-life switch — quantized
-            // alphas are house idiom and the soft rim hides the pop.
-            const lad = prog < 0.45 ? SMOKE_LT : SMOKE_DK;
-            softPuff(ctx, x, y, r, lad[idx]!, OUT_SMOKE);
+          if (this.sty[i] === V_CORE) {
+            // §3 strike law: SOLID flash disc — flat ink, no soft rim, so the
+            // first frames of a blast read as a scene replacement, not fog.
+            ctx.fillStyle = FLASH_LAD[idx]!;
+            ctx.beginPath();
+            ctx.arc(x, y, r, 0, TAU);
+            ctx.fill();
+          } else if (this.sty[i] === V_SMOKE) {
+            if (this.al[i]! >= 0.6 && prog >= 0.58) {
+              // §7 round-2: damaged trails must stay DARK at distance — the
+              // final phase blends to the darkest existing ink-smoke tone
+              // (debris ladder) held at its high-alpha end (tier ≥10 ⇒
+              // α≥0.767 ≥ 0.72) until the last sliver releases down the
+              // ladder, so death stays a fade, not a pop.
+              const held = prog < 0.85;
+              softPuff(ctx, x, y, r, DEB_LAD[held ? Math.max(DEB_HOLD, idx) : idx]!, OUT_DEB);
+            } else {
+              // growing smokeLt→smokeDk: discrete mid-life switch — quantized
+              // alphas are house idiom and the soft rim hides the pop.
+              softPuff(ctx, x, y, r, (prog < 0.28 ? SMOKE_LT : SMOKE_DK)[idx]!, OUT_SMOKE);
+            }
           } else if (this.sty[i] === V_BLAST) {
             softPuff(ctx, x, y, r, BLAST_LAD[idx]!, OUT_BLAST);
           } else if (this.sty[i] === V_FLASH) {
@@ -625,11 +666,14 @@ export class EffectsSystem implements EffectsApi {
         }
         default: {
           // RING — expanding stroked circle (blast ring / foam splash).
+          // Complete arc every frame; the stroke tapers from its spawn width
+          // (len[]) to a 1.5 hairline as the front dilates (§7 round-2).
           const a = this.al[i]! * (1 - prog);
           if (a <= 0.02) break;
           const r = this.r0[i]! + (this.r1[i]! - this.r0[i]!) * prog;
           ctx.strokeStyle = (this.sty[i] === V_FOAM ? FOAM_LAD : BLAST_LAD)[Math.min(12, Math.round(a * 12))]!;
-          ctx.lineWidth = 2.5;
+          const w0 = this.len[i]!;
+          ctx.lineWidth = w0 + (1.5 - w0) * prog;
           ctx.beginPath();
           ctx.arc(x, y, r, 0, TAU);
           ctx.stroke();
@@ -646,7 +690,9 @@ export class EffectsSystem implements EffectsApi {
    * bullet picks from four precomputed styles (no per-frame string math).
    */
   drawProjectiles(ctx: CanvasRenderingContext2D, bullets: ReadonlyArray<{ x: number; y: number; vx: number; vy: number }>): void {
-    const LEN = [8, 10, 12, 14]; // tail length by speed bucket
+    const LEN = [20, 26, 32, 38]; // tail length by speed bucket — ≥ per-frame
+    // travel (~13 u) so consecutive-frame strokes join into one continuous
+    // amber contrail instead of disconnected dashes
     const HALO = [2, 3, 3, 4]; // halo alpha index into TRACER_LAD
     for (let i = 0; i < bullets.length; i++) {
       const b = bullets[i]!;
@@ -659,13 +705,13 @@ export class EffectsSystem implements EffectsApi {
       const tx = b.x - ux * L;
       const ty = b.y - uy * L;
       ctx.strokeStyle = TRACER_LAD[HALO[bk]!]!; // warm halo…
-      ctx.lineWidth = 3.4;
+      ctx.lineWidth = 5;
       ctx.beginPath();
       ctx.moveTo(tx, ty);
       ctx.lineTo(b.x, b.y);
       ctx.stroke();
       ctx.strokeStyle = TRACER_LAD[6]!; // …solid amber core
-      ctx.lineWidth = 1.5;
+      ctx.lineWidth = 2;
       ctx.beginPath();
       ctx.moveTo(tx, ty);
       ctx.lineTo(b.x, b.y);

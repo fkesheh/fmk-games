@@ -544,6 +544,10 @@ export function startAces(container: HTMLElement): AcesApp {
     }
     // AudioContext creation is gesture-gated; PLAY clicks are gestures.
     void audio.unlock().catch(() => undefined);
+    // Register the pilot name even for __ACES/debug joins that skip the menu
+    // path — screens captures prefName for roster/board "(YOU)" highlighting.
+    // Same-task swap into connecting, so only the connecting layer paints.
+    screens.showMenu(playerName);
     screens.showConnecting();
     return attemptConnect();
   }

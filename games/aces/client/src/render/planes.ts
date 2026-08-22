@@ -100,7 +100,7 @@ const CHUTE_SHADOW_OUT = withAlpha('seaDark', 0);
  * math, and the eye reads N discrete scorch stages instead of a smear.
  */
 const SOOT_LAD: string[] = [];
-for (let i = 0; i < 7; i++) SOOT_LAD.push(withAlpha('smokeDk', 0.14 + (i / 6) * 0.4));
+for (let i = 0; i < 7; i++) SOOT_LAD.push(withAlpha('smokeDk', 0.14 + (i / 6) * 0.66)); // cap 0.80 (art round 2)
 const SOOT_OUT = withAlpha('smokeDk', 0);
 
 /** Landed-crate foam pulse ring ladder (alpha oscillation, quantized). */
@@ -562,7 +562,7 @@ export function drawPlane(ctx: CanvasRenderingContext2D, sp: SnapPlane, t: numbe
   const dmg = 1 - sp.hp / sp.maxHp;
   if (dmg > 0.04) {
     const idx = Math.min(SOOT_LAD.length - 1, Math.floor(dmg * SOOT_LAD.length));
-    softPuff(ctx, art.sootX, 0, 2.5 + dmg * 6.5, SOOT_LAD[idx]!, SOOT_OUT);
+    softPuff(ctx, art.sootX, 0, 3.5 + dmg * 8, SOOT_LAD[idx]!, SOOT_OUT);
     if (dmg > 0.55) softPuff(ctx, art.scorchX, 0, 2 + dmg * 3, SOOT_LAD[idx]!, SOOT_OUT);
   }
 

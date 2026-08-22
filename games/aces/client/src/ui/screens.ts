@@ -16,9 +16,11 @@
 // IDENTITY GAP (documented, graceful): neither HudModel nor showEnd()'s
 // arguments carry the local player's id/name, so a literal "personal row"
 // marker has no authoritative source. This file captures the pilot name the
-// app itself hands to showMenu(prefName) and best-effort highlights the board
-// row whose name matches it (trim/case-insensitive). When the player never
-// passed through the menu (debug/e2e joins) nothing is highlighted.
+// app itself hands to showMenu(prefName) and best-effort highlights the
+// lobby-roster and end-board rows whose names match it (trim/case-insensitive,
+// tagged "(YOU)"). The stored name persists across showLobby/showEnd calls;
+// when no name was ever passed (menu skipped by debug/e2e joins) nothing is
+// highlighted.
 //
 // Discipline: layers are built ONCE; every show*() is change-guarded and list
 // rebuilds are signature-gated. Colors flow from APAL through PAL / withAlpha /
@@ -40,7 +42,17 @@ import {
 } from '@aces/shared/config.js';
 import type { PlaneClassId, TeamId } from '@aces/shared/config.js';
 import type { ScoreRow } from '@aces/shared/types.js';
-import { PAL, mixA, shadeA, withAlpha } from '../contract/visual.js';
+import {
+  INK_STROKE,
+  PAL,
+  makeRng,
+  mixA,
+  poly,
+  shadeA,
+  softPuff,
+  star,
+  withAlpha,
+} from '../contract/visual.js';
 import type { JoinKind } from '../contract/seams.js';
 
 // ============================================================================
@@ -62,11 +74,23 @@ export function lobbyLine(countdownS: number | null): string {
   return `FIRST PATROL LAUNCHES IN ${Math.max(0, Math.ceil(countdownS))}`;
 }
 
+/**
+ * True while the respawn clock still runs: the picker stays on screen but
+ * dimmed (.waiting) — D3 keeps death cheap, and an early pick is safe because
+ * the server queues one spawn (early sends are idempotent).
+ */
+export function pickerWaiting(respawnT: number): boolean {
+  return Number.isFinite(respawnT) && respawnT > 0;
+}
+
 /** Death-screen line: >0 s counts down, ≤0 s means the picker is open. */
 export function respawnLine(respawnT: number): string {
-  if (!Number.isFinite(respawnT) || respawnT <= 0) return 'CHOOSE YOUR AIRFRAME';
+  if (!pickerWaiting(respawnT)) return 'CHOOSE YOUR AIRFRAME';
   return `NEXT AIRFRAME IN ${respawnT.toFixed(1)}S`;
 }
+
+/** Disconnect-screen primary action label (the panel's reload-wired button). */
+export const RE_ENLIST_LABEL = 'RE-ENLIST';
 
 /** Disconnect note: auto-retry backoff while retrying, fresh-seat truth after. */
 export function disconnectNote(retrying: boolean): string {
@@ -141,8 +165,10 @@ function formatKey(code: string): string {
   }
 }
 
+/** Set-deduped exactly like hud.ts's exported formatKeys — ShiftLeft +
+ *  ShiftRight print one SHIFT stamp, not two (menu controls card). */
 function formatKeys(codes: readonly string[]): string {
-  return codes.map(formatKey).join(' / ');
+  return Array.from(new Set(codes.map(formatKey))).join(' / ');
 }
 
 export interface ControlRow {
@@ -197,10 +223,12 @@ const FONT_COND = "'Arial Narrow', 'Helvetica Neue', Arial, sans-serif";
 const CSS = `
 .aces-scr{position:fixed;inset:0;z-index:30;font-family:var(--ac-font-ui);color:var(--ac-ink);
   user-select:none;-webkit-user-select:none;}
-.aces-scr-layer{position:absolute;inset:0;display:none;}
+.aces-scr-layer{position:absolute;inset:0;display:none;pointer-events:none;}
 .aces-scr-layer.on{display:block;}
+.aces-scr-layer.on .aces-panel,.aces-scr-layer.on .aces-poster,.aces-scr-layer.on button{
+  pointer-events:auto;}
 .aces-l-menu{background:var(--ac-haze);}
-.aces-scr-scrim{position:absolute;inset:0;background:var(--ac-ink55);}
+.aces-scr-scrim{position:absolute;inset:0;background:var(--ac-ink30);}
 .aces-tw{font-family:var(--ac-font-tw);text-transform:uppercase;letter-spacing:.08em;}
 
 /* ---- poster frame --------------------------------------------------------- */
@@ -213,6 +241,9 @@ const CSS = `
 .aces-bar .r{background:var(--ac-royal);}
 .aces-bar .w{background:var(--ac-paper);flex:0 0 8px;}
 .aces-bar .i{background:var(--ac-iron);}
+/* §8 masthead art: dawn bands + scout silhouette, painted once at build */
+.aces-masthead{display:block;width:100%;height:auto;margin:0 auto 12px;
+  border:1px solid var(--ac-ink30);}
 .aces-mark{margin:0;font-family:var(--ac-font-cond);font-weight:900;line-height:.88;
   font-size:clamp(76px,15vw,132px);letter-spacing:.02em;color:var(--ac-ink);}
 .aces-sub{margin:10px 0 22px;font-size:14px;color:var(--ac-ink75);}
@@ -247,6 +278,7 @@ const CSS = `
 .aces-rosterhead{display:flex;align-items:center;gap:6px;font-size:15px;font-weight:900;
   letter-spacing:.14em;padding-bottom:6px;border-bottom:1px solid var(--ac-ink30);margin-bottom:4px;}
 .aces-rosterrow{display:flex;align-items:center;gap:8px;padding:3px 0;font-size:14px;font-weight:700;}
+.aces-rosterrow.aces-you{background:var(--ac-tracer28);box-shadow:inset 3px 0 0 var(--ac-ink);}
 .aces-glyph{font-size:14px;font-weight:800;color:var(--ac-inksoft);}
 .aces-bottag{font-size:14px;color:var(--ac-inksoft);border:1px solid var(--ac-ink30);padding:0 3px;}
 .aces-badge{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;
@@ -260,6 +292,17 @@ const CSS = `
   border:2px solid var(--ac-ink);border-radius:2px;box-shadow:0 4px 18px var(--ac-ink45);
   padding:26px 30px;text-align:center;}
 .aces-picker{display:flex;gap:14px;justify-content:center;flex-wrap:wrap;}
+/* Waiting recedes the requisition form but NEVER its hotkey numerals: dimming
+   via an ancestor opacity group would multiply through the tree and cap the
+   numerals at 45% no matter what they declare, so the card CONTENTS dim here
+   while .aces-cardkey stays full-strength ink — early picking is invited
+   exactly while this class is on (D3). */
+.aces-picker.waiting .aces-card{border-color:var(--ac-ink30);}
+.aces-picker.waiting .aces-cardname,
+.aces-picker.waiting .aces-strip,
+.aces-picker.waiting .aces-cardspec,
+.aces-picker.waiting .aces-lasttag{opacity:.45;}
+.aces-picker.waiting .aces-cardkey{opacity:1;color:var(--ac-ink);}
 .aces-card{width:196px;padding:14px 14px 12px;text-align:left;background:var(--ac-paper92);
   border:2px solid var(--ac-ink55);border-radius:2px;cursor:pointer;position:relative;}
 .aces-card:hover{border-color:var(--ac-ink);}
@@ -334,7 +377,6 @@ class AcesScreens implements Screens {
   // death
   private respawnLineEl!: HTMLElement;
   private pickerEl!: HTMLElement;
-  private pickerVisible = false;
   private lastPickedCls: PlaneClassId | null = null;
 
   // end
@@ -372,6 +414,7 @@ class AcesScreens implements Screens {
     const menu = L('menu');
     const poster = div('aces-poster');
     poster.appendChild(teamBar());
+    poster.appendChild(buildMasthead());
     const mark = div('aces-mark');
     mark.textContent = 'ACES';
     mark.setAttribute('role', 'heading');
@@ -407,7 +450,7 @@ class AcesScreens implements Screens {
     this.privateBtn = document.createElement('button');
     this.privateBtn.type = 'button';
     this.privateBtn.className = 'aces-btn secondary';
-    this.privateBtn.textContent = 'PRIVATE ROOM';
+    this.privateBtn.textContent = 'HOST A PRIVATE ROOM';
     this.privateBtn.addEventListener('click', () => this.playPrivate());
     poster.appendChild(this.privateBtn);
 
@@ -504,6 +547,12 @@ class AcesScreens implements Screens {
     xPanel.appendChild(
       textDiv('aces-note aces-tw', 'RETURN TO THE OPERATIONS ROOM AND ENLIST AGAIN'),
     );
+    const reup = document.createElement('button');
+    reup.type = 'button';
+    reup.className = 'aces-btn primary';
+    reup.textContent = RE_ENLIST_LABEL;
+    reup.addEventListener('click', () => location.reload());
+    xPanel.appendChild(reup);
     disc.appendChild(xPanel);
 
     // ---- HELP (Esc controls card — NOT a pause) ---------------------------------------------
@@ -600,7 +649,7 @@ class AcesScreens implements Screens {
     for (const r of roster) sig += `${r.id}:${r.team}:${r.name}:${r.bot}:${r.cls};`;
     if (sig !== this.rosterSig) {
       this.rosterSig = sig;
-      renderRoster(this.rosterBox, roster);
+      renderRoster(this.rosterBox, roster, this.prefName);
     }
   }
 
@@ -612,13 +661,10 @@ class AcesScreens implements Screens {
     this.setState('death');
     const line = respawnLine(respawnT);
     if (this.respawnLineEl.textContent !== line) this.respawnLineEl.textContent = line;
-    const visible = !(Number.isFinite(respawnT) && respawnT > 0);
-    setHidden(this.pickerEl, !visible);
-    this.pickerVisible = visible;
-    if (!visible) {
-      this.lastPickedCls = null; // re-preselect on the next opening
-      return;
-    }
+    // The requisition form owns the WHOLE death window (D3): dimmed while the
+    // clock runs, full-strength once it hits zero. Early picks are safe — the
+    // server queues one spawn, so a pre-zero send is idempotent.
+    setClass(this.pickerEl, 'waiting', pickerWaiting(respawnT));
     if (this.lastPickedCls !== lastCls) {
       this.lastPickedCls = lastCls;
       for (const child of Array.from(this.pickerEl.children)) {
@@ -645,7 +691,8 @@ class AcesScreens implements Screens {
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i]!;
       const tr = document.createElement('tr');
-      if (mine !== '' && r.name.trim().toLowerCase() === mine) tr.className = 'aces-you';
+      const you = mine !== '' && r.name.trim().toLowerCase() === mine;
+      if (you) tr.className = 'aces-you';
       const nameCell = document.createElement('td');
       if (i === 0) {
         const starEl = spanEl('aces-mvp');
@@ -653,7 +700,7 @@ class AcesScreens implements Screens {
         starEl.title = 'MVP';
         nameCell.appendChild(starEl);
       }
-      nameCell.appendChild(document.createTextNode(r.name));
+      nameCell.appendChild(document.createTextNode(you ? `${r.name} (YOU)` : r.name));
       if (r.bot) nameCell.appendChild(spanEl2('aces-bottag', 'BOT'));
       nameCell.insertBefore(badgeEl(r.team), nameCell.firstChild);
       tr.appendChild(nameCell);
@@ -722,7 +769,6 @@ class AcesScreens implements Screens {
     for (const [name, layer] of Object.entries(this.layers)) {
       setClass(layer, 'on', name === next);
     }
-    if (next !== 'death') this.pickerVisible = false;
   }
 
   private toggleHelp(): void {
@@ -763,7 +809,9 @@ class AcesScreens implements Screens {
       return;
     }
 
-    if (st === 'death' && this.pickerVisible && !this.helpOpen) {
+    // Digit hotkeys answer through the whole death window — the countdown is
+    // no longer a gate (server queues the spawn, so early picks are safe).
+    if (st === 'death' && !this.helpOpen) {
       const cls = spawnHotkey(e.code);
       if (cls !== null) this.hooks.onSpawn(cls);
     }
@@ -845,6 +893,146 @@ function teamBar(): HTMLElement {
   return bar;
 }
 
+// ---- menu masthead art (STYLE_BIBLE §8 propaganda poster) --------------------
+//
+// Painted ONCE at menu build onto an inline canvas between the accent bar and
+// the wordmark: a two-tone SCOUT silhouette (royalNavy body + deck-cream
+// roundel ring — the D4 team identity pair) banking across warm dawn bands,
+// sunGlare disc upper right under a softPuff halo, thin haze strips at the
+// horizon. Geometry mirrors render/planes.ts's SCOUT part table at ~3×
+// gameplay scale so poster and gameplay read as one printed page. Deterministic
+// by law: fixed-seed rng, no Math.random (§9).
+
+const MASTHEAD_W = 720;
+const MASTHEAD_H = 140;
+/** Gameplay-unit → px factor; the scout spans ~33u → ~99px of poster hero. */
+const MASTHEAD_SCALE = 3;
+/** Fixed seed — the same poster every boot. */
+const MASTHEAD_SEED = 19170401;
+
+function buildMasthead(): HTMLCanvasElement {
+  const c = document.createElement('canvas');
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  c.width = Math.round(MASTHEAD_W * dpr);
+  c.height = Math.round(MASTHEAD_H * dpr);
+  c.className = 'aces-masthead';
+  c.setAttribute('aria-hidden', 'true');
+  const ctx = c.getContext('2d');
+  if (ctx !== null) paintMasthead(ctx, dpr);
+  return c;
+}
+
+function paintMasthead(ctx: CanvasRenderingContext2D, dpr: number): void {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  // Dawn sky as FLAT horizontal stops (bible §2 — bands, not gradients).
+  const horizon = MASTHEAD_H * 0.56;
+  ctx.fillStyle = PAL.dawnHi;
+  ctx.fillRect(0, 0, MASTHEAD_W, horizon);
+  ctx.fillStyle = PAL.dawnLo;
+  ctx.fillRect(0, horizon, MASTHEAD_W, MASTHEAD_H - horizon);
+  ctx.fillStyle = shadeA('dawnLo', -0.07); // deep band anchoring the bottom edge
+  ctx.fillRect(0, MASTHEAD_H * 0.86, MASTHEAD_W, MASTHEAD_H * 0.14);
+
+  // Thin haze band strips drifting along the horizon (seeded jitter).
+  const rng = makeRng(MASTHEAD_SEED);
+  ctx.fillStyle = withAlpha('haze', 0.5);
+  for (let i = 0; i < 4; i++) {
+    ctx.fillRect(0, horizon - 14 + rng() * 26, MASTHEAD_W, 2 + rng() * 3);
+  }
+
+  // SunGlare disc upper right: softPuff halo, faint starburst rays, solid core.
+  const sx = MASTHEAD_W * 0.82;
+  const sy = MASTHEAD_H * 0.24;
+  const sr = 22;
+  softPuff(ctx, sx, sy, sr * 3.4, withAlpha('sunGlare', 0.9), withAlpha('sunGlare', 0));
+  star(ctx, sx, sy, 12, sr * 2.1, sr * 1.4, -Math.PI / 2);
+  ctx.fillStyle = withAlpha('sunGlare', 0.55);
+  ctx.fill();
+  ctx.fillStyle = PAL.sunGlare;
+  ctx.beginPath();
+  ctx.arc(sx, sy, sr, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Two-tone SCOUT banking toward the sun — planes.ts geometry × MASTHEAD_SCALE.
+  ctx.save();
+  ctx.translate(MASTHEAD_W * 0.42, MASTHEAD_H * 0.47);
+  ctx.rotate(-0.12);
+  ctx.scale(MASTHEAD_SCALE, MASTHEAD_SCALE);
+
+  ctx.fillStyle = PAL.royalNavy;
+  poly(ctx, [
+    [15, 2.6], [-14, 1.5], [-14, -1.5], [15, -2.6], // fuselage — stubby nose-heavy
+  ]);
+  ctx.fill();
+  poly(ctx, [
+    [4.8, 13], [0.2, 13], [0.2, -13], [4.8, -13], // upper wing (span 26)
+  ]);
+  ctx.fill();
+  poly(ctx, [
+    [6.6, 11.5], [2.4, 11.5], [2.4, -11.5], [6.6, -11.5], // lower wing
+  ]);
+  ctx.fill();
+  poly(ctx, [
+    [-10.5, 5.2], [-14.5, 4.2], [-14.5, -4.2], [-10.5, -5.2], // tailplane
+  ]);
+  ctx.fill();
+  poly(ctx, [
+    [-14.5, 1.1], [-17.2, 0.7], [-17.2, -0.7], [-14.5, -1.1], // HIGH rudder
+  ]);
+  ctx.fill();
+  ctx.fillStyle = PAL.wood;
+  poly(ctx, [
+    [5.4, 8.7], [3.4, 8.7], [3.4, 5.5], [5.4, 5.5], // interplane strut +
+  ]);
+  ctx.fill();
+  poly(ctx, [
+    [5.4, -5.5], [3.4, -5.5], [3.4, -8.7], [5.4, -8.7], // …interplane strut −
+  ]);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(12.8, 0, 3.3, 0, Math.PI * 2); // ROUND cowl — the scout's signature
+  ctx.fill();
+  ctx.fillStyle = PAL.dope;
+  ctx.beginPath();
+  ctx.arc(-1.5, 0, 2.5, 0, Math.PI * 2); // single-seat hump
+  ctx.fill();
+
+  // Hairline ink outline over every silhouette shape (§2) — lifts the print.
+  ctx.strokeStyle = INK_STROKE;
+  ctx.lineWidth = 0.8;
+  poly(ctx, [[15, 2.6], [-14, 1.5], [-14, -1.5], [15, -2.6]]);
+  ctx.stroke();
+  poly(ctx, [[4.8, 13], [0.2, 13], [0.2, -13], [4.8, -13]]);
+  ctx.stroke();
+  poly(ctx, [[6.6, 11.5], [2.4, 11.5], [2.4, -11.5], [6.6, -11.5]]);
+  ctx.stroke();
+  poly(ctx, [[-10.5, 5.2], [-14.5, 4.2], [-14.5, -4.2], [-10.5, -5.2]]);
+  ctx.stroke();
+  poly(ctx, [[-14.5, 1.1], [-17.2, 0.7], [-17.2, -0.7], [-14.5, -1.1]]);
+  ctx.stroke();
+
+  // ROYAL roundel ring on the wing — deck cream, mirrors planes.ts identity.
+  ctx.strokeStyle = PAL.royalDeck;
+  ctx.lineWidth = 1.9;
+  ctx.beginPath();
+  ctx.arc(2.5, 0, 3, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.fillStyle = PAL.royalDeck;
+  ctx.beginPath();
+  ctx.arc(2.5, 0, 3 * 0.42, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Static prop-blur arc (poster freeze-frame).
+  ctx.strokeStyle = withAlpha('prop', 0.8);
+  ctx.lineWidth = 1.6;
+  ctx.beginPath();
+  ctx.arc(15.9, 0, 3.6, -0.7, 1.4);
+  ctx.stroke();
+
+  ctx.restore();
+}
+
 function badgeEl(team: TeamId): HTMLElement {
   const b = spanEl(`aces-badge ${team === 'royal' ? 'r' : 'i'}`);
   b.textContent = team === 'royal' ? 'R' : 'I';
@@ -883,20 +1071,23 @@ function buildControls(): HTMLElement {
   return box;
 }
 
-function renderRoster(box: HTMLElement, roster: ScoreRow[]): void {
+function renderRoster(box: HTMLElement, roster: ScoreRow[], prefName: string): void {
   box.replaceChildren();
+  const mine = prefName.trim().toLowerCase();
   const royal = div('aces-rostercol');
   const iron = div('aces-rostercol');
   royal.appendChild(colHead('r', 'ROYAL'));
   iron.appendChild(colHead('i', 'IRON'));
   for (const r of roster) {
     const row = div('aces-rosterrow');
+    const you = mine !== '' && r.name.trim().toLowerCase() === mine;
+    if (you) row.classList.add('aces-you');
     row.appendChild(badgeEl(r.team));
     const g = spanEl('aces-glyph');
     g.textContent = r.cls.charAt(0).toUpperCase();
     g.setAttribute('aria-hidden', 'true');
     row.appendChild(g);
-    row.appendChild(spanEl2('', r.name));
+    row.appendChild(spanEl2('', you ? `${r.name} (YOU)` : r.name));
     if (r.bot) row.appendChild(spanEl2('aces-bottag', 'BOT'));
     (r.team === 'royal' ? royal : iron).appendChild(row);
   }

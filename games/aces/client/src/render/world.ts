@@ -168,7 +168,7 @@ export interface CloudStack {
 
 const CLOUD_MARGIN = 700;
 /** Deterministic global-coverage prune target (viewport law needs ≤0.35). */
-const COVERAGE_TARGET = 0.22;
+const COVERAGE_TARGET = 0.3;
 
 /**
  * Two parallax puff layers, deterministic from `seed` (production passes
@@ -180,7 +180,7 @@ export function buildCloudLayers(seed: number, mapW: number = WORLD.W, mapH: num
   const rng = makeRng(seed >>> 0);
   const far = buildLayer(rng, mapW, mapH, {
     cell: 560,
-    keep: 0.3,
+    keep: 0.4,
     rMin: 55,
     rMax: 105,
     aMin: 0.34,
@@ -190,7 +190,7 @@ export function buildCloudLayers(seed: number, mapW: number = WORLD.W, mapH: num
   });
   const near = buildLayer(rng, mapW, mapH, {
     cell: 640,
-    keep: 0.27,
+    keep: 0.36,
     rMin: 85,
     rMax: 150,
     aMin: 0.45,
@@ -226,7 +226,7 @@ function buildLayer(rng: () => number, mapW: number, mapH: number, spec: LayerSp
       const cx = x0 + (col + 0.5) * spec.cell;
       const cy = y0 + (row + 0.5) * spec.cell;
       const inCorridor = Math.abs(cy - mapH / 2) < CORRIDOR_HALF;
-      const keep = spec.keep * (inCorridor ? 0.42 : 1);
+      const keep = spec.keep * (inCorridor ? 0.62 : 1);
       if (rng() >= keep) continue;
       const rBase = spec.rMin + rng() * (spec.rMax - spec.rMin);
       const r = rBase * (inCorridor ? 0.72 : 1);
@@ -365,7 +365,7 @@ const GLINT_STYLES: string[] = [];
 const SURF_STYLES: string[] = [];
 const SHADOW_INNER = withAlpha('seaDark', 0.22);
 const SHADOW_OUTER = withAlpha('seaDark', 0);
-for (let i = 0; i < 10; i++) GLINT_STYLES.push(withAlpha('seaLit', 0.05 + (i / 9) * 0.17));
+for (let i = 0; i < 10; i++) GLINT_STYLES.push(withAlpha('seaLit', 0.05 + (i / 9) * 0.25));
 for (let i = 0; i < 12; i++) SURF_STYLES.push(withAlpha('foam', 0.25 + (i / 11) * 0.15));
 
 /** West map-edge sun treatment (STYLE_BIBLE §3) — softPuff glow column. */
@@ -421,15 +421,15 @@ export function createWorldRenderer(canvas: HTMLCanvasElement, map: AcesMap): Wo
   {
     const mrng = makeRng(hashStr(`sea:${map.seed}`));
     const tones = [
+      withAlpha('seaLit', 0.15),
+      withAlpha('seaDark', 0.18),
       withAlpha('seaLit', 0.1),
-      withAlpha('seaDark', 0.12),
-      withAlpha('seaLit', 0.06),
-      withAlpha('seaDark', 0.08),
+      withAlpha('seaDark', 0.13),
     ];
-    for (let k = 0; k < 72; k++) {
+    for (let k = 0; k < 120; k++) {
       const cx = -400 + mrng() * (map.w + 800);
       const cy = -400 + mrng() * (map.h + 800);
-      const rad = 220 + mrng() * 320;
+      const rad = 160 + mrng() * 260;
       const squash = 0.55 + mrng() * 0.45;
       const rot = mrng() * Math.PI * 2;
       const pts = irregularBlob(cx, cy, rad, squash, rot, 8 + Math.floor(mrng() * 4), mrng, 0.35);
@@ -447,13 +447,13 @@ export function createWorldRenderer(canvas: HTMLCanvasElement, map: AcesMap): Wo
     }
   }
 
-  // Sun-glint shimmer band, west third of the map (packed, culled per frame).
+  // Sun-glint shimmer band, west half of the map (packed, culled per frame).
   const glints: GlintStreak[] = [];
   {
     const grng = makeRng(hashStr(`glint:${map.seed}`));
     for (let k = 0; k < 110; k++) {
       glints.push({
-        x: 60 + grng() * (map.w / 3 - 60),
+        x: 60 + grng() * (map.w / 2 - 60),
         y: grng() * map.h,
         len: 24 + grng() * 60,
         ang: (grng() - 0.5) * 0.12,

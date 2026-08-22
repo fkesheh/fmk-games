@@ -34,6 +34,8 @@ import {
   disconnectNote,
   endBanner,
   lobbyLine,
+  pickerWaiting,
+  RE_ENLIST_LABEL,
   respawnLine,
   spawnHotkey,
 } from './screens.js';
@@ -293,7 +295,8 @@ describe('keyboard labels + controls listing derive FROM INPUT_KEYS', () => {
   it('pretty-prints modifier/arrow codes', () => {
     expect(formatKeys(['KeyA', 'ArrowLeft'])).toBe('A / ←');
     expect(formatKeys(['Space'])).toBe('SPACE');
-    expect(formatKeys(['ShiftLeft', 'ShiftRight'])).toBe('SHIFT / SHIFT');
+    // mirrored physical keys dedupe to ONE stamp (INPUT_KEYS.boost pair)
+    expect(formatKeys(['ShiftLeft', 'ShiftRight'])).toBe('SHIFT');
   });
 
   it('lists one row per binding family, all ≥14px-worthy non-empty text', () => {
@@ -340,5 +343,34 @@ describe('state lines derived from model/wire data', () => {
     expect(spawnHotkey('Numpad2')).toBe('fighter');
     expect(spawnHotkey('Digit3')).toBe('gunship');
     expect(spawnHotkey('KeyZ')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7 · Death interstitial — picker visible (dimmed) through the countdown (D3)
+// ---------------------------------------------------------------------------
+
+describe('pickerWaiting — requisition form stays up, dimmed, while the clock runs', () => {
+  it('flags .waiting for any positive respawn time and opens at zero', () => {
+    expect(pickerWaiting(3.5)).toBe(true); // RESPAWN_SECONDS window
+    expect(pickerWaiting(0.04)).toBe(true); // final fraction of a second
+    expect(pickerWaiting(0)).toBe(false);
+    expect(pickerWaiting(-1)).toBe(false);
+    expect(pickerWaiting(Number.NaN)).toBe(false); // defensive vs wire noise
+  });
+
+  it('pairs with the prompt line: waiting counts down, open invites the pick', () => {
+    expect(respawnLine(2.4)).toContain('NEXT AIRFRAME');
+    expect(respawnLine(0)).toContain('CHOOSE');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8 · Disconnect screen — always ships an explicit way back in (F4)
+// ---------------------------------------------------------------------------
+
+describe('disconnect actions — the dead-end screen carries a reload-wired RE-ENLIST', () => {
+  it('labels the primary action RE-ENLIST', () => {
+    expect(RE_ENLIST_LABEL).toBe('RE-ENLIST');
   });
 });

@@ -188,9 +188,9 @@ export const BURN_DPS = 2;
 // ---- camera feel (C_APP) ------------------------------------------------------------
 export const CAMERA = {
   /** Seconds of velocity lookahead. */
-  LOOKAHEAD_S: 0.35,
+  LOOKAHEAD_S: 0.26,
   ZOOM_MAX: 1.15, //   idle / slow — close enough for silhouettes to read
-  ZOOM_MIN: 0.95, //   full throttle
+  ZOOM_MIN: 1.14, //   full throttle
 } as const;
 
 // ---- net feel / prediction (C_NET) ----------------------------------------------------
