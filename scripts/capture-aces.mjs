@@ -114,7 +114,9 @@ async function main() {
   await call(`window.__ACES.zoomTo(null)`);
 
   // 5. smoke/damage state: gunship soak — short ungod'd bursts until visibly
-  // damaged but ALIVE, then god back ON and shoot the smoking trail frame.
+  // damaged but ALIVE (≤55% of the LIVE airframe's maxHp read off the latest
+  // snapshot's you-row — hardcoding fighter 100 never triggers on a 170hp
+  // gunship), then god back ON and shoot the smoking trail frame.
   await call(`window.__ACES.spawn('gunship')`);
   await sleep(600);
   for (let i = 0; i < 14; i++) {
@@ -123,9 +125,10 @@ async function main() {
     await call(`window.__ACES.god()`);            // ON
     const st = await call(`(() => {
       const p = window.__ACES._internals.predictor;
-      return p ? { hp: p.state.hp, dead: p.state.dead } : null;
+      const maxHp = window.__ACES._internals.latestSnap()?.you?.maxHp ?? 170;
+      return p ? { hp: p.state.hp, maxHp, dead: p.state.dead } : null;
     })()`);
-    if (st && !st.dead && st.hp <= 100 * 0.55) break;
+    if (st && !st.dead && st.hp <= (st.maxHp ?? 170) * 0.55) break;
     if (st && st.dead) { await call(`window.__ACES.spawn('gunship')`); await sleep(700); }
     await sleep(120);
   }

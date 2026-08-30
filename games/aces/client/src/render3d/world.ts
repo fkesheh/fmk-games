@@ -19,15 +19,24 @@
 //              sunk below the waterline, sand→wet-sand→foam skirt) + team-
 //              coloured wind square on a wood pole + parked reserve crates —
 //              landmarks, not sets.
-//   CLOUDS     TWO bands of puffTexture cross-quads (alpha ≤ 0.78) drifting
+//   CLOUDS     THREE bands of TWO-TONE puff masses (alpha ≤ 0.78) drifting
 //              EAST and wrapping around the map bounds, thinned over the
 //              central corridor (keep ×0.62, size ×0.72, alpha ×0.85 — mirrors
-//              render/world.ts's 2D laws): a reduced high deck Y 26–32
-//              (14 large puffs, paper↔dawnHi) and a LOW MIST band Y 7–12
-//              below cruise altitude (12 sparse flat seaDark↔paper wisps the
-//              player overflies — F4). Their cloud shadows are ONE
-//              InstancedMesh of flat seaDark puffs (opacity 0.22), offset
-//              east-south per band off each cloud, drifting with them.
+//              render/world.ts's 2D laws): a MID deck Y 16–24 just above
+//              cruise (7 large masses, visible over the nose — A3), the kept
+//              high deck Y 26–32 (7 large masses), and a LOW MIST band Y 7–12
+//              below cruise altitude (12 sparse flat wisps the player
+//              overflies — F4). F3 ANTI-CREAM LAW: every mass is a lit-top +
+//              shaded-underside object — an upper/outer cross-quad pair in a
+//              paper→seaDark ~0.18-family lit tint (cooler/grayer than the
+//              dawnHi sky) over a lower/rear pair in shadeA('haze',−0.35),
+//              plus a soft ink-tinted base rim quad on the heavier puffs —
+//              so at any chase angle a cloud reads as an OBJECT against the
+//              sky, never a cream smudge. Baked as per-cloud vertex-RGBA
+//              quads (one shared material, one draw call per mass). Their
+//              cloud shadows are ONE InstancedMesh of flat seaDark puffs
+//              (opacity 0.22), offset east-south per band off the ~35°
+//              western sun, drifting with them.
 //
 // PERF LAW: update(tS, camPos) allocates NOTHING — positions wrap by
 // arithmetic, shadow matrices are prebuilt and only re-translated, every
@@ -44,7 +53,11 @@
 // (factory law forbids constructing materials elsewhere), so clouds use
 // cross-quad meshes (two perpendicular quads, both windings) sampling the
 // SAME puffTexture: visible from any camera yaw, zero per-frame orientation
-// work, one geometry shared by all clouds.
+// work. F3 two-tone extension: the factory also has no vertex-colored
+// textured path, so — matching the effects3d.ts bucket precedent — the ONE
+// cloud material (map + vertexColors + transparent) is constructed here ONCE;
+// every color remains APAL-derived, baked into per-cloud vertex RGBA from
+// pal()/mixA()/shadeA() at build time (draw calls stay one per mass).
 // ============================================================================
 
 import * as THREE from 'three';
@@ -84,18 +97,32 @@ const SURF_Y = 0.35;
 const SURF_INNER = 1.1;
 const SURF_OUTER = 1.24;
 
-const CLOUD_HIGH_COUNT = 14; //   reduced high deck — fewer, LARGER puffs (F4)
-const CLOUD_LOW_COUNT = 12; //    sparse low mist band BELOW cruise alt (F4)
+const CLOUD_HIGH_COUNT = 7; //   kept high — Y 26–32 deck (F4/A3 split)
+const CLOUD_MID_COUNT = 7; //    A3: half the old high deck re-banded Y 16–24,
+                                // just above cruise — visible over the nose
+const CLOUD_LOW_COUNT = 12; //   sparse low mist band BELOW cruise alt (F4)
 const CLOUD_MARGIN = 700;
 const CLOUD_ALPHA_MAX = 0.78; // STYLE_BIBLE §6 hard cap
 const CLOUD_ALPHA_MIN = 0.12;
+// F3 two-tone anti-cream tunables — every value APAL-derived via helpers.
+const CLOUD_LIT_MIN = 0.12; //   lit tint = mixA('paper','seaDark', t), the
+const CLOUD_LIT_SPAN = 0.12; //  0.12–0.24 band centered on the ~0.18 cooler-
+                               // than-sky nudge the F3 brief names
+const CLOUD_MIST_LIT_MIN = 0.45; // mist stays seaDark-leaning (reads against
+const CLOUD_MIST_LIT_SPAN = 0.25; // sea below AND sky at the horizon)
+const CLOUD_SHADE = shadeA('haze', -0.35); // shaded underside (warm gray-blue)
+const CLOUD_HEAVY_ALPHA = 0.55; // puffs at/above this get the ink base rim
+const CLOUD_RIM_ALPHA = 0.55; //  ink rim softness relative to the cloud alpha
 const SHADOW_OPACITY = 0.22; //  §6/§3 cap 0.25
-/** Shadow offsets fall EAST-SOUTH off the low western sun; per-band because
- *  the throw scales with cloud height (~height/tan(21°)). */
-const SHADOW_OFF_X = 95;
-const SHADOW_OFF_Z = 45;
-const MIST_OFF_X = 26;
-const MIST_OFF_Z = 13;
+/** Shadow throws fall EAST-SOUTH off the ~35° western sun (scene.ts SUN_DIR),
+ *  scaled per band as ~height/tan(34°) and split along the sun's horizontal
+ *  direction (0.964 east, 0.265 south): high deck ≈43u, mid ≈30u, mist ≈14u. */
+const SHADOW_OFF_X = 42;
+const SHADOW_OFF_Z = 12;
+const MID_OFF_X = 29;
+const MID_OFF_Z = 8;
+const MIST_OFF_X = 14;
+const MIST_OFF_Z = 4;
 const SHADOW_Y = 0.18;
 
 const FOAM_BASE = 0.3;
@@ -103,28 +130,84 @@ const FOAM_AMP = 0.14;
 const FOAM_FREQ = 1.35;
 
 // ---------------------------------------------------------------------------
-// Cloud puff geometry: two unit quads crossing on the Y axis (XY plane +
-// ZY plane), each emitted with BOTH windings so FrontSide culling can never
-// hide a face from any camera yaw. ONE instance is shared by every cloud.
+// Cloud puff geometry (F3 anti-cream): each mass is ONE merged, vertex-RGBA
+// geometry of soft quads — a LIT upper/outer cross-quad pair (both windings,
+// visible from any camera yaw) and a SHADED lower/rear pair tucked beneath
+// it, plus a horizontal ink-tinted base rim quad on heavier puffs. Hard
+// two-tone break at the quad seam (flat-ink law — no gradient within a
+// shape); the shared puffTexture supplies the soft edges. All tints/alphas
+// are baked per cloud at build time from pal()/mixA()/shadeA(); alpha ≤ the
+// 0.78 cap rides the vertex.
 // ---------------------------------------------------------------------------
 
-function buildPuffGeometry(): THREE.BufferGeometry {
+/** Emit one soft quad (both windings, FrontSide-safe from any yaw) as six
+ *  vertices with the given RGBA baked into every vertex. Zero allocation at
+ *  frame time — build-time only. */
+function pushQuad(
+  pos: number[],
+  col: number[],
+  rgba: readonly [number, number, number, number],
+  v0: readonly [number, number, number],
+  v1: readonly [number, number, number],
+  v2: readonly [number, number, number],
+  v3: readonly [number, number, number],
+): void {
+  const [r, g, b, a] = rgba as [number, number, number, number];
+  const push = (v: readonly [number, number, number]): void => {
+    pos.push(v[0]!, v[1]!, v[2]!);
+    col.push(r, g, b, a);
+  };
+  push(v0);
+  push(v1);
+  push(v2);
+  push(v1);
+  push(v3);
+  push(v2);
+  push(v2);
+  push(v1);
+  push(v0);
+  push(v2);
+  push(v3);
+  push(v1);
+}
+
+/** Build one two-tone cloud mass geometry (unit footprint −0.5..0.5 in X/Z,
+ *  y −0.54..0.52; the mesh scale applies the band size). */
+function buildCloudGeometry(
+  litHex: string,
+  shadeHex: string,
+  alpha: number,
+  heavy: boolean,
+): THREE.BufferGeometry {
+  const lit = new THREE.Color(litHex);
+  const shade = new THREE.Color(shadeHex);
+  const rim = new THREE.Color(pal('ink'));
+  const litC: [number, number, number, number] = [lit.r, lit.g, lit.b, alpha];
+  const shadeC: [number, number, number, number] = [shade.r, shade.g, shade.b, alpha];
+  const rimC: [number, number, number, number] = [rim.r, rim.g, rim.b, alpha * CLOUD_RIM_ALPHA];
+  const pos: number[] = [];
+  const col: number[] = [];
+  // lit upper/outer cross pair (paper→seaDark family — cooler than the sky)
+  pushQuad(pos, col, litC, [-0.5, 0, 0], [0.5, 0, 0], [-0.5, 0.52, 0], [0.5, 0.52, 0]);
+  pushQuad(pos, col, litC, [0, 0, -0.5], [0, 0, 0.5], [0, 0.52, -0.5], [0, 0.52, 0.5]);
+  // shaded lower/rear cross pair (warm gray-blue underside)
+  pushQuad(pos, col, shadeC, [-0.4, -0.54, 0], [0.4, -0.54, 0], [-0.4, 0, 0], [0.4, 0, 0]);
+  pushQuad(pos, col, shadeC, [0, -0.54, -0.4], [0, -0.54, 0.4], [0, 0, -0.4], [0, 0, 0.4]);
+  // heavy puffs: soft ink-tinted rim quad at the base (horizontal, both sides)
+  if (heavy) {
+    pushQuad(
+      pos,
+      col,
+      rimC,
+      [-0.52, -0.44, -0.3],
+      [0.52, -0.44, -0.3],
+      [-0.52, -0.44, 0.3],
+      [0.52, -0.44, 0.3],
+    );
+  }
   const g = new THREE.BufferGeometry();
-  g.setAttribute(
-    'position',
-    new THREE.BufferAttribute(
-      new Float32Array([
-        -0.5, -0.5, 0, 0.5, -0.5, 0, -0.5, 0.5, 0, 0.5, 0.5, 0,
-        0, -0.5, -0.5, 0, -0.5, 0.5, 0, 0.5, -0.5, 0, 0.5, 0.5,
-      ]),
-      3,
-    ),
-  );
-  g.setAttribute(
-    'uv',
-    new THREE.BufferAttribute(new Float32Array([0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0, 0, 1, 1, 1]), 2),
-  );
-  g.setIndex([0, 1, 2, 1, 3, 2, 2, 1, 0, 2, 3, 1, 4, 5, 6, 5, 7, 6, 6, 5, 4, 6, 7, 5]);
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(col, 4));
   return g;
 }
 
@@ -413,10 +496,8 @@ export function createWorld(map: AcesMap): AcesWorld {
     }
   }
 
-  // ---- clouds: puff cross-quads + ONE instanced shadow layer ----------------------
+  // ---- clouds: two-tone vertex-colored masses + ONE instanced shadow layer -----
 
-  const puffGeo = buildPuffGeometry();
-  ownedGeos.push(puffGeo);
   const span = map.w + CLOUD_MARGIN * 2;
 
   interface CloudSpec {
@@ -431,29 +512,52 @@ export function createWorld(map: AcesMap): AcesWorld {
     /** Puff quad scale multipliers — mist lies flat, high deck towers. */
     readonly wMul: number;
     readonly hMul: number;
-    /** paper↔X mix endpoints (APAL keys) expressed ACROSS puffs. */
-    readonly tintB: 'dawnHi' | 'seaDark';
+    /** Lit tint = mixA('paper','seaDark', t) with t ∈ [litMin, litMin+litSpan]
+     *  drawn ACROSS puffs (kit law; F3 cooler/grayer-than-sky family). */
+    readonly litMin: number;
+    readonly litSpan: number;
     readonly shOffX: number;
     readonly shOffZ: number;
   }
-  // F4 TWO-BAND sky: the chase cam cruises at Y≈22 looking level/down, so the
-  // old single Y26–34 deck sat above every frame. High deck is REDUCED but
-  // larger; the new LOW MIST band (Y 7–12, below cruise altitude) gives the
-  // player soft seaDark/paper wisps to overfly. Both drift east; corridor
-  // thinning applies to both (mirrors the 2D module's layer laws).
+  // A3 THREE-BAND sky: the chase cam cruises at Y≈22 looking level/down. Half
+  // the old Y26–34 deck moved DOWN into a MID band (Y 16–24) that reads
+  // clearly over the nose; the rest stays high. Every puff grew ~1.5× and
+  // opacities push toward the 0.78 cap so the masses actually register. The
+  // LOW MIST band (Y 7–12, below cruise) stays for overflight wisps (F4).
+  // All bands drift east; corridor thinning applies to all three (mirrors the
+  // 2D module's layer laws).
+  const CLOUD_SIZE_MIN = 140; // ~1.5× the old 95u floor (A3)
+  const CLOUD_SIZE_MAX = 250; // ~1.5× the old 170u ceiling (A3)
   const specs: ReadonlyArray<CloudSpec> = [
+    {
+      count: CLOUD_MID_COUNT,
+      yMin: 16,
+      yMax: 24,
+      rMin: CLOUD_SIZE_MIN,
+      rMax: CLOUD_SIZE_MAX,
+      aBase: 0.55,
+      aSpan: 0.23,
+      speed: 11,
+      wMul: 2.6,
+      hMul: 1.7,
+      litMin: CLOUD_LIT_MIN,
+      litSpan: CLOUD_LIT_SPAN,
+      shOffX: MID_OFF_X,
+      shOffZ: MID_OFF_Z,
+    },
     {
       count: CLOUD_HIGH_COUNT,
       yMin: 26,
       yMax: 32,
-      rMin: 95,
-      rMax: 170,
-      aBase: 0.34,
-      aSpan: 0.2,
+      rMin: CLOUD_SIZE_MIN,
+      rMax: CLOUD_SIZE_MAX,
+      aBase: 0.5,
+      aSpan: 0.22,
       speed: 11,
       wMul: 2.6,
       hMul: 1.7,
-      tintB: 'dawnHi',
+      litMin: CLOUD_LIT_MIN,
+      litSpan: CLOUD_LIT_SPAN,
       shOffX: SHADOW_OFF_X,
       shOffZ: SHADOW_OFF_Z,
     },
@@ -468,11 +572,21 @@ export function createWorld(map: AcesMap): AcesWorld {
       speed: 6,
       wMul: 2.2,
       hMul: 0.55,
-      tintB: 'seaDark',
+      litMin: CLOUD_MIST_LIT_MIN,
+      litSpan: CLOUD_MIST_LIT_SPAN,
       shOffX: MIST_OFF_X,
       shOffZ: MIST_OFF_Z,
     },
   ];
+  // F3 two-tone clouds: ONE shared vertex-colored material (see header
+  // deviation); per-cloud tint/alpha live in the vertex RGBA, so the masses
+  // still vary across the kit while draw calls stay at one per mass.
+  const cloudMat = new THREE.MeshBasicMaterial({
+    map: puffTex,
+    vertexColors: true,
+    transparent: true,
+    depthWrite: false,
+  });
   for (const spec of specs) {
     let placed = 0;
     let tries = 0;
@@ -490,10 +604,13 @@ export function createWorld(map: AcesMap): AcesWorld {
         CLOUD_ALPHA_MIN,
         Math.min(CLOUD_ALPHA_MAX, (spec.aBase + rng() * spec.aSpan) * alphaCut),
       );
-      // paper ↔ dawnHi / seaDark mixes expressed ACROSS puffs (kit law)
-      const tint = mixA('paper', spec.tintB, rng());
-      const m = withPuff(matBasic(tint, { transparent: true, opacity: alpha, depthWrite: false }));
-      const mesh = new THREE.Mesh(puffGeo, m);
+      // F3: lit top in the paper→seaDark ~0.18 family (cooler/grayer than
+      // the dawnHi sky), shadeA('haze',−0.35) underside, ink base rim on the
+      // heavy puffs — a lit-top/shaded-underside OBJECT at any chase angle.
+      const lit = mixA('paper', 'seaDark', spec.litMin + rng() * spec.litSpan);
+      const geo = buildCloudGeometry(lit, CLOUD_SHADE, alpha, alpha >= CLOUD_HEAVY_ALPHA);
+      ownedGeos.push(geo);
+      const mesh = new THREE.Mesh(geo, cloudMat);
       mesh.position.set(x0, spec.yMin + rng() * (spec.yMax - spec.yMin), z);
       mesh.scale.set(r * spec.wMul, r * spec.hMul, r * spec.wMul);
       mesh.renderOrder = 6;
@@ -565,11 +682,13 @@ export function createWorld(map: AcesMap): AcesWorld {
     },
 
     dispose(): void {
-      // Geometries and textures are ours; materials stay in the frozen
-      // factory's global cache (shared with other modules — never disposed).
+      // Geometries and textures are ours; factory-cached materials stay in
+      // the frozen factory's global cache (shared with other modules — never
+      // disposed). The ONE direct cloud material is ours alone — freed here.
       for (const geo of ownedGeos) geo.dispose();
       for (const tex of ownedTexs) tex.dispose();
       if (shadowIM) shadowIM.dispose(); // frees the instanceMatrix attribute
+      cloudMat.dispose();
       ownedGeos.length = 0;
       ownedTexs.length = 0;
       clouds.length = 0;

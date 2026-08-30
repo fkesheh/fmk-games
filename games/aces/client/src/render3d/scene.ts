@@ -51,7 +51,7 @@
 import * as THREE from 'three';
 import { CAMERA, CLASSES, WORLD } from '@aces/shared/config.js';
 import type { ScreenPoint } from '../contract/seams.js';
-import { PAL, mixA } from '../contract/visual.js';
+import { PAL, mixA, shadeA } from '../contract/visual.js';
 
 // ---- contract-pinned numbers (see header deviations) ------------------------
 
@@ -98,9 +98,13 @@ const SHADOW_FAR = 2600;
 const SHADOW_BIAS = -0.00035;
 const SHADOW_NORMAL_BIAS = 1.5;
 
-/** Sun from WEST, low (~21° elevation), nudged north of west so cloud
- *  shadows fall east-south per the world brief. Never moves (STYLE_BIBLE §3). */
-const SUN_DIR = new THREE.Vector3(-0.9, 0.36, -0.25).normalize();
+/** Sun from WEST, ~35° elevation (asin(0.56/|v|) ≈ 34°), still nudged north
+ *  of west so shadows fall east-south per the world brief. Raised off the old
+ *  21° pin: at cruise altitude a 21° sun threw plane shadows ~31u away — out
+ *  of the read in every play frame — while ~35° lands them ~17u off the
+ *  airframe, visibly beneath/behind it, keeping the warm western light.
+ *  Never moves (STYLE_BIBLE §3). */
+const SUN_DIR = new THREE.Vector3(-0.8, 0.56, -0.22).normalize();
 
 const ORBIT_RATE = 0.4; //     death orbit, rad/s — "slow orbit around wreck"
 const ORBIT_RADIUS = 30; //    just outside CAM_DIST so the wreck stays framed
@@ -233,12 +237,44 @@ export function snapToGrid(v: number, grid: number = SHADOW_SNAP): number {
   return Math.round(v / grid) * grid;
 }
 
+/** Sun shadow-box placement for one rig focus point (scene XZ). */
+export interface ShadowPose {
+  px: number;
+  py: number;
+  pz: number;
+  tx: number;
+  ty: number;
+  tz: number;
+}
+
+/**
+ * THE shadow-frustum law as ONE pure function: the ~700u ortho box tracks the
+ * rig focus (snapped to the 4u texel-swim grid), with the sun parked
+ * SUN_DISTANCE away along SUN_DIR so the light never moves relative to the
+ * focus. Exported for the headless gates; the rig feeds it the eased look
+ * point each frame via an out-param (zero allocation).
+ */
+export function shadowFrustumFor(focusX: number, focusZ: number, out?: ShadowPose): ShadowPose {
+  const sx = snapToGrid(focusX);
+  const sz = snapToGrid(focusZ);
+  const p = out ?? { px: 0, py: 0, pz: 0, tx: 0, ty: 0, tz: 0 };
+  p.px = sx + SUN_DIR.x * SUN_DISTANCE;
+  p.py = SUN_DIR.y * SUN_DISTANCE;
+  p.pz = sz + SUN_DIR.z * SUN_DISTANCE;
+  p.tx = sx;
+  p.ty = 0;
+  p.tz = sz;
+  return p;
+}
+
 // ---------------------------------------------------------------------------
 // Sky backdrop — the sanctioned sky-band exception (GRAPHICS_3D §3): one
 // CanvasTexture vertical gradient, dawnHi top → fog-coloured horizon, painted
 // as HARD-ish stops (STYLE_BIBLE §2: "3–4 hard-ish stops, not smooth ramps").
-// The bottom stop equals the FogExp2 colour exactly, so fogged terrain meets
-// the backdrop with no seam.
+// The gimbal stays LEVEL by law, so the 3D horizon sits at screen-middle —
+// the gradient reaches the FogExp2 colour at v≈0.52 and HOLDS it below, so
+// fogged terrain meets the backdrop with no seam. Above that, three wide
+// translucent dawnLo/haze strips band the wash into readable dawn strata.
 // ---------------------------------------------------------------------------
 
 function buildSkyTexture(horizonHex: string): THREE.CanvasTexture {
@@ -250,12 +286,11 @@ function buildSkyTexture(horizonHex: string): THREE.CanvasTexture {
   const horizon = new THREE.Color(horizonHex); // == mixA('haze','dawnLo',0.5)
   const hi = new THREE.Color(PAL.dawnHi);
   const midA = '#' + hi.clone().lerp(horizon, 0.35).getHexString();
-  const midB = '#' + hi.clone().lerp(horizon, 0.78).getHexString();
   const stops: ReadonlyArray<readonly [number, string]> = [
     [0, '#' + hi.getHexString()],
-    [0.38, midA],
-    [0.66, midB],
-    [1, '#' + horizon.getHexString()], // MUST equal the fog colour
+    [0.3, midA],
+    [0.52, '#' + horizon.getHexString()], // reached AT the visible 3D horizon
+    [1, '#' + horizon.getHexString()], //  …and held (never visible below it)
   ];
   let y0 = 0;
   for (let i = 0; i < stops.length; i++) {
@@ -266,6 +301,24 @@ function buildSkyTexture(horizonHex: string): THREE.CanvasTexture {
     g.fillRect(0, y0, c.width, y1 - y0);
     y0 = y1;
   }
+  // Sky value ladder (F3): ONE subtle darker blue-gray band high in the dome
+  // gives the top a first rung, and three wide translucent dawnLo/haze strips
+  // (+0.08 alpha each over A3) deepen the horizon rungs — the uniform cream
+  // wash reads as a top→horizon ladder instead of a two-stop wash, without
+  // breaking the horizon melt (all bands stay above the fog-matched stop).
+  const strips: ReadonlyArray<readonly [number, number, string, number]> = [
+    [0.08, 0.24, shadeA('seaDark', 0.55), 0.1], // high-dome blue-gray rung (F3)
+    [0.545, 0.6, PAL.dawnLo, 0.46],
+    [0.635, 0.71, PAL.haze, 0.38],
+    [0.76, 0.86, PAL.dawnLo, 0.28],
+  ];
+  for (const s of strips) {
+    const [a, b, hex, alpha] = s as readonly [number, number, string, number];
+    g.globalAlpha = alpha;
+    g.fillStyle = hex;
+    g.fillRect(0, Math.round(a * c.height), c.width, Math.round((b - a) * c.height));
+  }
+  g.globalAlpha = 1;
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
   return tex;
@@ -383,6 +436,7 @@ class AcesSceneImpl implements AcesScene {
   private readonly lookTgtScratch = new THREE.Vector3();
   private readonly pvScratch = new THREE.Vector3();
   private readonly screenScratch: ScreenPoint = { sx: 0, sy: 0, visible: false };
+  private readonly shadowScratch: ShadowPose = { px: 0, py: 0, pz: 0, tx: 0, ty: 0, tz: 0 };
 
   constructor(canvas: HTMLCanvasElement) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
@@ -523,15 +577,11 @@ class AcesSceneImpl implements AcesScene {
     this.shakeAmp = shakeDecay(this.shakeAmp, dt);
     if (this.shakeAmp < SHAKE_CUTOFF) this.shakeAmp = 0;
 
-    // Shadow box follows the eased look point, snapped to the 4u grid.
-    const fx = snapToGrid(this.lookEased.x);
-    const fz = snapToGrid(this.lookEased.z);
-    this.sun.position.set(
-      fx + SUN_DIR.x * SUN_DISTANCE,
-      SUN_DIR.y * SUN_DISTANCE,
-      fz + SUN_DIR.z * SUN_DISTANCE,
-    );
-    this.sun.target.position.set(fx, 0, fz);
+    // Shadow box follows the eased look point via THE pure law (snapped to
+    // the 4u grid inside shadowFrustumFor — texel-swim guard).
+    const sp = shadowFrustumFor(this.lookEased.x, this.lookEased.z, this.shadowScratch);
+    this.sun.position.set(sp.px, sp.py, sp.pz);
+    this.sun.target.position.set(sp.tx, sp.ty, sp.tz);
     this.sun.target.updateMatrixWorld();
 
     // Camera = eased pose + post-ease deterministic jitter.

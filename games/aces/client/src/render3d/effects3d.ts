@@ -25,9 +25,12 @@
 //          shrink-fade (opaque lambert, so fade = scale).
 //   RING   expanding flat rings at plane altitude / sea level — a small pool
 //          of dedicated meshes stepping through quantized-opacity materials.
-//   TRACER stateless instanced pair rebuilt straight from bullet data each
-//          drawProjectiles call — bright flash-amber core + dim tail segment,
-//          pool 256 each (GRAPHICS_3D §4).
+//   TRACER stateless instanced quartet rebuilt straight from bullet data each
+//          drawProjectiles call — white-hot pal('flash') core + amber
+//          pal('tracer') tail pair with a stepped alpha fade along length,
+//          backed by a thin ink-dark halo stroke (pal('ink') @ 0.5 ≈
+//          withAlpha('ink',0.5)) behind the tail so the round carries a dark
+//          edge on bright sky (F2), pool 256 each (GRAPHICS_3D §4, A2/F2).
 //
 // SHAKE LAW: hitSpark→SMALL · small blast→MEDIUM · large blast→LARGE;
 // accumulate + consume-and-reset, C_APP adds proximity context.
@@ -54,8 +57,15 @@ const TAU = Math.PI * 2;
 // ---- pools ------------------------------------------------------------------
 
 const TRACER_POOL = 256; //    §4: instanced tracer boxes
-const TRACER_CORE_LEN = 10; // bright core segment, u
-const TRACER_TAIL_LEN = 3; //  dim tail segment, u — total streak ≈13u
+/** A2 two-tone streak, F2 punch-up: white-hot pal('flash') core → amber
+ *  pal('tracer') near tail → faded amber far tail (stepped alpha fade along
+ *  length) → thin ink halo stroke BEHIND the tail (dark edge on bright sky),
+ *  17.5u total — core cross-section ~0.5u (F2 overrides the old ≤0.4u cap for
+ *  the core only; tails stay thin). */
+const TRACER_CORE_LEN = 5; //  white-hot core segment, u
+const TRACER_NEAR_LEN = 4; //  amber near tail, u
+const TRACER_FAR_LEN = 4; //   amber far tail (faded), u
+const TRACER_HALO_LEN = 4.5; // ink-dark stroke trailing the amber tail, u
 const STUB_LEN = 13; //        trigger-down cosmetic stub matches the streak
 const STREAK_POOL = 64;
 const DEBRIS_POOL = 96;
@@ -87,6 +97,7 @@ const V_CORE = 5;
 const V_FIRE = 6;
 const V_TRACER = 7; // amber streak tint (STREAK kind)
 const V_DEB = 8; // debris ink family (SHARD kind)
+const V_WRECK = 9; // A2 kill-column smoke: dark smokeDk→ink ramp (PUFF kind)
 
 /** Kind/style indices as an introspection aid for tests (retired-2D FX mirror). */
 export const FX3 = {
@@ -101,6 +112,7 @@ export const FX3 = {
   V_GLARE,
   V_CORE,
   V_FIRE,
+  V_WRECK,
 } as const;
 
 /** Per-second velocity drag by kind. */
@@ -115,18 +127,19 @@ const COL = {
   glare: new THREE.Color(pal('sunGlare')),
   fireC: new THREE.Color(pal('fireCore')),
   fireE: new THREE.Color(pal('fireEdge')),
-  /** Bright flash-amber tracer core — pal('flash') mixed toward pal('tracer'). */
+  /** Bright flash-amber tracer tint for the STREAK stub (A2 mesh colors are
+   *  material-level: pal('flash') core + pal('tracer') tails). */
   tracerCore: new THREE.Color(mixA('flash', 'tracer', 0.42)),
-  /** Same tone shaded toward ink for the dim tail segment (F1 fade). */
-  tracerTail: new THREE.Color(mixA('flash', 'tracer', 0.42)).lerp(
-    new THREE.Color(pal('ink')),
-    0.45,
-  ),
   debHold: new THREE.Color(mixA('smokeDk', 'debris', 0.72)),
 };
 /** smokeLt→smokeDk mid-life ramp, quantized into 7 steps (house ladder). */
 const SMOKE_RAMP: readonly THREE.Color[] = Array.from({ length: 7 }, (_, i) =>
   new THREE.Color(mixA('smokeLt', 'smokeDk', i / 6)),
+);
+/** A2 kill-column ramp — starts DARK (smokeDk mixed toward ink) and deepens
+ *  to near-ink over life, so a freshly dead wreck reads as black smoke. */
+const WRECK_RAMP: readonly THREE.Color[] = Array.from({ length: 7 }, (_, i) =>
+  new THREE.Color(mixA('smokeDk', 'ink', 0.3 + (i / 6) * 0.7)),
 );
 /** Blast-ring / foam-ring opacity ladders — rings step through these. */
 function ringLadder(key: Parameters<typeof pal>[0]): readonly THREE.MeshBasicMaterial[] {
@@ -266,7 +279,9 @@ class EffectsSystem3D implements EffectsApi3D {
   // ---- scene objects (created headless-safe; textures join at attach) ------
   private readonly root = new THREE.Group();
   private readonly tracersCore: THREE.InstancedMesh;
-  private readonly tracersTail: THREE.InstancedMesh;
+  private readonly tracersNear: THREE.InstancedMesh;
+  private readonly tracersFar: THREE.InstancedMesh;
+  private readonly tracersHalo: THREE.InstancedMesh;
   private readonly streaks: THREE.InstancedMesh;
   private readonly shards: THREE.InstancedMesh;
   private readonly buckets: THREE.InstancedMesh[] = [];
@@ -285,21 +300,41 @@ class EffectsSystem3D implements EffectsApi3D {
     this.trng = makeRng((seed ^ 0x9e3779b9) >>> 0);
 
     const dyn = THREE.DynamicDrawUsage;
-    // F1: thin bright gunfire streaks — a flash-amber core (10u) stacked with
-    // a dim tail segment (3u), cross-sections ≤0.4u. Two instanced meshes so
-    // the fade is material-level (no per-instance color churn).
+    // F2 punch-up: the A2 two-tone gunfire streak with a fatter white-hot
+    // pal('flash') core (5u long, ~0.5u section) and a thin ink-dark halo
+    // stroke (pal('ink') @ opacity 0.5 — the withAlpha('ink',0.5) intent;
+    // THREE.Color drops hex-alpha so the alpha rides the material) trailing
+    // the amber tail, so a round carries a dark edge on bright sky. Four
+    // instanced meshes with pinned renderOrder: ink first, then the amber
+    // fade stack — the dark edge always sits UNDER the tail it backs.
+    this.tracersHalo = this.makeInstanced(
+      new THREE.BoxGeometry(1, 1, 1),
+      matBasic(pal('ink'), { transparent: true, opacity: 0.5, depthWrite: false }),
+      TRACER_POOL,
+      dyn,
+    );
+    this.tracersHalo.renderOrder = 0;
     this.tracersCore = this.makeInstanced(
       new THREE.BoxGeometry(1, 1, 1),
-      matBasic(mixA('flash', 'tracer', 0.42), { transparent: true, opacity: 0.98, depthWrite: false }),
+      matBasic(pal('flash'), { transparent: true, opacity: 0.98, depthWrite: false }),
       TRACER_POOL,
       dyn,
     );
-    this.tracersTail = this.makeInstanced(
+    this.tracersCore.renderOrder = 3;
+    this.tracersNear = this.makeInstanced(
       new THREE.BoxGeometry(1, 1, 1),
-      matBasic(pal('tracer'), { transparent: true, opacity: 0.45, depthWrite: false }),
+      matBasic(pal('tracer'), { transparent: true, opacity: 0.5, depthWrite: false }),
       TRACER_POOL,
       dyn,
     );
+    this.tracersNear.renderOrder = 2;
+    this.tracersFar = this.makeInstanced(
+      new THREE.BoxGeometry(1, 1, 1),
+      matBasic(pal('tracer'), { transparent: true, opacity: 0.2, depthWrite: false }),
+      TRACER_POOL,
+      dyn,
+    );
+    this.tracersFar.renderOrder = 1;
     this.streaks = this.makeInstanced(
       new THREE.BoxGeometry(1, 1, 1),
       matBasic(pal('tracer'), { transparent: true, opacity: 0.9, depthWrite: false }),
@@ -312,7 +347,14 @@ class EffectsSystem3D implements EffectsApi3D {
       DEBRIS_POOL,
       dyn,
     );
-    this.root.add(this.tracersCore, this.tracersTail, this.streaks, this.shards);
+    this.root.add(
+      this.tracersHalo,
+      this.tracersCore,
+      this.tracersNear,
+      this.tracersFar,
+      this.streaks,
+      this.shards,
+    );
 
     const ringGeo = new THREE.RingGeometry(0.86, 1, 40);
     ringGeo.rotateX(-Math.PI / 2); // lie flat at altitude / sea level
@@ -529,16 +571,19 @@ class EffectsSystem3D implements EffectsApi3D {
 
   /**
    * Death blast (§7): solid flash-core strike → flash + blast blooms → ONE
-   * expanding shock ring → tumbling debris batch → lingering east-drifting
-   * smoke column that darkens late-life. Over water: foam ring on the sea
-   * plane + white column + sun-glare sparkle. Shake MEDIUM/LARGE.
+   * expanding shock ring → tumbling debris batch → A2 KILL SIGNATURE: a
+   * 6–10s rising DARK (smokeDk→ink) east-drifting smoke column punctuated by
+   * glowing embers, so the wreck reads on screen for seconds after the
+   * 0.06s flash. Over water: foam ring on the sea plane + white column +
+   * sun-glare sparkle. Shake MEDIUM/LARGE.
    */
   explosion(p: P3, size: 'small' | 'large', overWater: boolean): void {
     const big = size === 'large';
     this.shake(big ? SHAKE.LARGE : SHAKE.MEDIUM);
 
-    // strike — the blast replaces the scene for its first frames (§3 law).
-    this.spawn(PUFF, V_CORE, p.x, PLANE_Y, p.y, 0, 0, 0, 0, 0.06, big ? 16 : 12, big ? 16 : 12, 0, 0, 0, 1);
+    // strike — the blast replaces the scene for its first frames (§3 law);
+    // core sprite scale ~1.4× (F2) so the strike frame itself reads.
+    this.spawn(PUFF, V_CORE, p.x, PLANE_Y, p.y, 0, 0, 0, 0, 0.06, big ? 22 : 17, big ? 22 : 17, 0, 0, 0, 1);
     this.spawn(PUFF, V_FLASH, p.x, PLANE_Y, p.y, 0, 2, 0, 0, big ? 0.2 : 0.15, big ? 10 : 6, big ? 46 : 28, 0, 0, 0, 1);
     this.spawn(PUFF, V_BLAST, p.x, PLANE_Y, p.y, 0, 3, 0, 0.02, big ? 0.3 : 0.22, big ? 12 : 8, big ? 60 : 38, 0, 0, 0, 1);
     // shock ring — born ~20u, dilating to 95/70u over 0.35 s (width taper is
@@ -570,26 +615,59 @@ class EffectsSystem3D implements EffectsApi3D {
       );
     }
 
-    // lingering column — delayed, growing, rising + east-drifting dark puffs
-    const smN = big ? 9 : 6;
+    // A2 KILL SIGNATURE, F2 upsized — a freshly dead wreck must READ for
+    // seconds from the chase cam: a rising DARK (smokeDk→ink) east-drifting
+    // smoke column whose puffs grow through an 18–30u radius band and climb
+    // ≥22u over life (a fat column, not a pancake), punctuated by 2–3 LARGE
+    // long-lived fireCore embers. All rolls precede the spawn batch
+    // (pool-pressure independence); staggered dly keeps the column alive
+    // without per-frame emitters.
+    const smN = big ? 12 : 9;
     for (let i = 0; i < smN; i++) {
+      const r = this.rng();
+      const r2 = this.rng();
+      const r3 = this.rng();
       this.spawn(
         PUFF,
-        V_SMOKE,
-        p.x + (this.rng() - 0.5) * 6,
-        PLANE_Y + this.rng() * 2,
-        p.y + (this.rng() - 0.5) * 6,
-        12 + this.rng() * 16,
-        6 + this.rng() * 9,
-        (this.rng() - 0.5) * 10,
-        0.08 + i * (big ? 0.07 : 0.09),
-        1.1 + this.rng() * 0.9,
-        3 + this.rng() * 3,
-        14 + this.rng() * 12,
+        V_WRECK,
+        p.x + (r - 0.5) * 7,
+        PLANE_Y + r2 * 3,
+        p.y + (r3 - 0.5) * 7,
+        9 + r2 * 14, // east drift (downwind §7)
+        22 + r3 * 8, // RISE ≥22u over life even under PUFF drag (F2)
+        (r - 0.5) * 12,
+        0.15 + i * (big ? 0.5 : 0.62), // last puff born ~5.7s / ~5.1s
+        2.6 + r * (big ? 1.6 : 1.2), // column ends ~8.5–10s big / ~6–9s small
+        16 + r * 4, // grow through the 18–30u band (F2)…
+        30 + r2 * 8, // …and past 30u late-life
         0,
         0,
         0,
-        0.68 + this.rng() * 0.16,
+        0.8 + r3 * 0.14,
+      );
+    }
+    const emN = big ? 3 : 2; // 2–3 embers, large + long-lived (F2)
+    for (let i = 0; i < emN; i++) {
+      const r = this.rng();
+      const r2 = this.rng();
+      const r3 = this.rng();
+      this.spawn(
+        PUFF,
+        V_FIRE,
+        p.x + (r - 0.5) * 5,
+        PLANE_Y + r2 * 3,
+        p.y + (r3 - 0.5) * 5,
+        (r - 0.5) * 10,
+        7 + r3 * 6,
+        (r2 - 0.5) * 10,
+        0.5 + i * (big ? 1.5 : 1.7), // punctuate the column ~0.5–3.9s
+        1.8 + r * 1.0, // last ember dies ~6–7s — kill reads ~6–8s with the column
+        4.5 + r2 * 1.5, // visible fireCore masses (F2), not 2u flickers
+        2.6,
+        0,
+        0,
+        0,
+        0.95,
       );
     }
 
@@ -927,7 +1005,9 @@ class EffectsSystem3D implements EffectsApi3D {
     const count = Math.min(list.length, TRACER_POOL);
     this.tracerDrawn = count;
     this.tracersCore.count = count;
-    this.tracersTail.count = count;
+    this.tracersNear.count = count;
+    this.tracersFar.count = count;
+    this.tracersHalo.count = count;
     if (count === 0) return;
     for (let i = 0; i < count; i++) {
       const b = list[i]!;
@@ -935,24 +1015,45 @@ class EffectsSystem3D implements EffectsApi3D {
       const ux = sp > 1 ? b.vx / sp : 1;
       const uz = sp > 1 ? b.vy / sp : 0;
       const yaw = Math.atan2(-uz, ux);
-      // Bright core spans [head−10 .. head]; dim tail continues [head−13 ..
-      // head−10]. Both trail BEHIND the bullet, cross-section ≤0.4u (F1).
+      // F2 punch-up, fading along length BEHIND the bullet: white-hot core
+      // spans [head−5 .. head] at a fat ~0.5u section, amber near tail
+      // [head−9 .. head−5] (0.5), faded amber far tail [head−13 .. head−9]
+      // (0.2), then the thin ink halo stroke [head−17.5 .. head−13] backing
+      // the tail — the dark edge that keeps the round readable on cream sky.
       this.dummy.position.set(b.x - ux * (TRACER_CORE_LEN / 2), PLANE_Y, b.y - uz * (TRACER_CORE_LEN / 2));
       this.dummy.rotation.set(0, yaw, 0);
-      this.dummy.scale.set(TRACER_CORE_LEN, 0.34, 0.4);
+      this.dummy.scale.set(TRACER_CORE_LEN, 0.5, 0.5);
       this.dummy.updateMatrix();
       this.tracersCore.setMatrixAt(i, this.dummy.matrix);
       this.dummy.position.set(
-        b.x - ux * (TRACER_CORE_LEN + TRACER_TAIL_LEN / 2),
+        b.x - ux * (TRACER_CORE_LEN + TRACER_NEAR_LEN / 2),
         PLANE_Y,
-        b.y - uz * (TRACER_CORE_LEN + TRACER_TAIL_LEN / 2),
+        b.y - uz * (TRACER_CORE_LEN + TRACER_NEAR_LEN / 2),
       );
-      this.dummy.scale.set(TRACER_TAIL_LEN, 0.22, 0.28);
+      this.dummy.scale.set(TRACER_NEAR_LEN, 0.3, 0.34);
       this.dummy.updateMatrix();
-      this.tracersTail.setMatrixAt(i, this.dummy.matrix);
+      this.tracersNear.setMatrixAt(i, this.dummy.matrix);
+      this.dummy.position.set(
+        b.x - ux * (TRACER_CORE_LEN + TRACER_NEAR_LEN + TRACER_FAR_LEN / 2),
+        PLANE_Y,
+        b.y - uz * (TRACER_CORE_LEN + TRACER_NEAR_LEN + TRACER_FAR_LEN / 2),
+      );
+      this.dummy.scale.set(TRACER_FAR_LEN, 0.22, 0.26);
+      this.dummy.updateMatrix();
+      this.tracersFar.setMatrixAt(i, this.dummy.matrix);
+      this.dummy.position.set(
+        b.x - ux * (TRACER_CORE_LEN + TRACER_NEAR_LEN + TRACER_FAR_LEN + TRACER_HALO_LEN / 2),
+        PLANE_Y,
+        b.y - uz * (TRACER_CORE_LEN + TRACER_NEAR_LEN + TRACER_FAR_LEN + TRACER_HALO_LEN / 2),
+      );
+      this.dummy.scale.set(TRACER_HALO_LEN, 0.24, 0.28);
+      this.dummy.updateMatrix();
+      this.tracersHalo.setMatrixAt(i, this.dummy.matrix);
     }
     this.tracersCore.instanceMatrix.needsUpdate = true;
-    this.tracersTail.instanceMatrix.needsUpdate = true;
+    this.tracersNear.instanceMatrix.needsUpdate = true;
+    this.tracersFar.instanceMatrix.needsUpdate = true;
+    this.tracersHalo.instanceMatrix.needsUpdate = true;
   }
 
   // ---- attach / update / dispose ---------------------------------------------
@@ -1079,6 +1180,13 @@ class EffectsSystem3D implements EffectsApi3D {
           const tier = Math.min(6, Math.round(prog * 1.6 * 6));
           this.col.copy(SMOKE_RAMP[tier]!);
         }
+        return;
+      }
+      case V_WRECK: {
+        // A2 kill column: born already DARK and deepening to near-ink — a
+        // dead wreck must not read as a friendly contrail.
+        const tier = Math.min(6, Math.round(prog * 6));
+        this.col.copy(WRECK_RAMP[tier]!);
         return;
       }
       case V_FIRE: {
