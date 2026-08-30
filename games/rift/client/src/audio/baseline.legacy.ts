@@ -30,10 +30,30 @@
 //  - No RiftEvent signals a creep last-hit; the cha-chime ships as the
 //    ui('buy') gold voice, which game.ts may also fire when it diffs a gold
 //    increase between snaps.
+//
+// AUDIO-LAB BASELINE COPY (T11, docs/rift-audio/AUDIO_CONTRACT.md): this file
+// is a copy of the original `ui/audio.ts`, patched ONLY to accept an injected
+// `BaseAudioContext`/destination instead of constructing its own live
+// `AudioContext`, so it can render deterministically through an
+// `OfflineAudioContext` for the blind A/B judge. No gain value, frequency,
+// envelope or node topology was changed — this is an honest "before" picture.
 // ============================================================================
 import { rng } from '@platform/shared';
 import type { RiftEvent } from '@rift/shared';
-import type { AudioHandle } from '../contract.js';
+
+// INTEGRATION NOTE (orchestrator, not a content change): this file no longer
+// imports `AudioHandle` from '../contract.js'. That name now re-exports the
+// widened `RiftAudioHandle` (Audio amendment carve-out 1), which this legacy
+// copy — by design — does not implement; it intentionally keeps the OLD
+// three-method surface it is A/B-compared against. `LegacyAudioHandle` below
+// is that old surface, declared locally so the type-checker sees exactly what
+// this file has always returned. No behaviour, gain, envelope, or topology
+// changed.
+interface LegacyAudioHandle {
+  event(ev: RiftEvent): void;
+  ui(kind: 'click' | 'buy' | 'error' | 'levelup'): void;
+  setPhase(p: 'menu' | 'live'): void;
+}
 
 // ---- tuning constants -------------------------------------------------------
 const MASTER_GAIN = 0.5;
@@ -86,7 +106,7 @@ interface WindRig {
 }
 
 interface RiftAudioInner {
-  ctx: AudioContext | null;
+  ctx: BaseAudioContext | null;
   master: GainNode | null;
   noiseBuf: AudioBuffer | null;
   wind: WindRig | null;
@@ -98,7 +118,7 @@ interface RiftAudioInner {
  *  sound can have through this seam. */
 const CAST_SLOT_HZ: readonly number[] = [320, 380, 452, 240];
 
-export function createAudio(): AudioHandle {
+export function createBaselineAudio(ctx: BaseAudioContext, dest: AudioNode): LegacyAudioHandle {
   const st: RiftAudioInner = {
     ctx: null,
     master: null,
@@ -111,16 +131,6 @@ export function createAudio(): AudioHandle {
    *  is ready to schedule (context exists and is running). */
   function ensure(): boolean {
     if (!st.ctx) {
-      const Ctor: typeof AudioContext | undefined =
-        window.AudioContext ??
-        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-      if (!Ctor) return false; // no WebAudio — engine stays a no-op
-      let ctx: AudioContext;
-      try {
-        ctx = new Ctor();
-      } catch {
-        return false; // construction can throw (policy, device) — stay silent
-      }
       const master = ctx.createGain();
       master.gain.value = MASTER_GAIN;
       const comp = ctx.createDynamicsCompressor();
@@ -130,7 +140,7 @@ export function createAudio(): AudioHandle {
       comp.attack.value = COMP_ATTACK_S;
       comp.release.value = COMP_RELEASE_S;
       master.connect(comp);
-      comp.connect(ctx.destination);
+      comp.connect(dest);
       // shared 1s white-noise buffer, seeded (determinism rule; every burst reuses it)
       const buf = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
       const data = buf.getChannelData(0);
@@ -140,15 +150,13 @@ export function createAudio(): AudioHandle {
       st.master = master;
       st.noiseBuf = buf;
     }
-    const ctx = st.ctx;
-    if (ctx.state === 'suspended') void ctx.resume();
-    return ctx.state === 'running';
+    return true;
   }
 
   // ---- synth primitives ------------------------------------------------------
 
   /** Oscillator with fast-attack / exponential-decay envelope into master. */
-  function beep(ctx: AudioContext, master: GainNode, o: BeepOpts): void {
+  function beep(ctx: BaseAudioContext, master: GainNode, o: BeepOpts): void {
     const osc = ctx.createOscillator();
     osc.type = o.type;
     osc.frequency.setValueAtTime(o.f0, o.t0);
@@ -169,7 +177,7 @@ export function createAudio(): AudioHandle {
   }
 
   /** Filtered noise burst (from the shared buffer) with the same envelope. */
-  function burst(ctx: AudioContext, nbuf: AudioBuffer, master: GainNode, o: BurstOpts): void {
+  function burst(ctx: BaseAudioContext, nbuf: AudioBuffer, master: GainNode, o: BurstOpts): void {
     const src = ctx.createBufferSource();
     src.buffer = nbuf;
     if (o.loop === true) src.loop = true;
@@ -196,7 +204,7 @@ export function createAudio(): AudioHandle {
 
   // ---- the ambient wind bed ---------------------------------------------------
 
-  function ensureWind(ctx: AudioContext, master: GainNode, nbuf: AudioBuffer): WindRig {
+  function ensureWind(ctx: BaseAudioContext, master: GainNode, nbuf: AudioBuffer): WindRig {
     const existing = st.wind;
     if (existing) return existing;
     const src = ctx.createBufferSource();
@@ -234,7 +242,6 @@ export function createAudio(): AudioHandle {
     const nbuf = st.noiseBuf;
     if (!ctx || !master || !nbuf) return;
     if (on) {
-      if (ctx.state !== 'running') return; // next call after the gesture opens it
       const rig = ensureWind(ctx, master, nbuf);
       if (st.windOn) return;
       st.windOn = true;
@@ -255,7 +262,7 @@ export function createAudio(): AudioHandle {
 
   // ---- one-shot voices --------------------------------------------------------
 
-  function castVoice(ctx: AudioContext, nbuf: AudioBuffer, master: GainNode, slot: number): void {
+  function castVoice(ctx: BaseAudioContext, nbuf: AudioBuffer, master: GainNode, slot: number): void {
     const t0 = ctx.currentTime;
     const root = CAST_SLOT_HZ[slot] ?? CAST_SLOT_HZ[0] ?? 320;
     // airy whoosh rising a fifth, with a grit tail — reads as a spell leaving the hand
@@ -265,7 +272,7 @@ export function createAudio(): AudioHandle {
     });
   }
 
-  function killSting(ctx: AudioContext, master: GainNode, firstBlood: boolean): void {
+  function killSting(ctx: BaseAudioContext, master: GainNode, firstBlood: boolean): void {
     const t0 = ctx.currentTime;
     const peak = firstBlood ? 0.34 : 0.26;
     // two falling fifths over a low hit — a skull, not a fanfare
@@ -278,7 +285,7 @@ export function createAudio(): AudioHandle {
     }
   }
 
-  function towerRumble(ctx: AudioContext, nbuf: AudioBuffer, master: GainNode, ancient: boolean): void {
+  function towerRumble(ctx: BaseAudioContext, nbuf: AudioBuffer, master: GainNode, ancient: boolean): void {
     const t0 = ctx.currentTime;
     const scale = ancient ? 1.35 : 1;
     // masonry collapse: low noise wall + sub drop, deeper for the Ancient
@@ -292,7 +299,7 @@ export function createAudio(): AudioHandle {
     });
   }
 
-  function surgeHorn(ctx: AudioContext, master: GainNode): void {
+  function surgeHorn(ctx: BaseAudioContext, master: GainNode): void {
     const t0 = ctx.currentTime;
     // stacked saw fifths swelling and holding — the overtime war-horn
     for (const [i, f] of [146.83, 220, 293.66].entries()) {
@@ -303,7 +310,7 @@ export function createAudio(): AudioHandle {
     beep(ctx, master, { type: 'sine', f0: 73.42, t0, dur: 1.6, peak: 0.3, attack: 0.2 });
   }
 
-  function endSting(ctx: AudioContext, master: GainNode, draw: boolean): void {
+  function endSting(ctx: BaseAudioContext, master: GainNode, draw: boolean): void {
     const t0 = ctx.currentTime;
     if (draw) {
       // unresolved: two notes a tritone apart, low and short

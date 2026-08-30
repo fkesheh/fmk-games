@@ -117,7 +117,7 @@ export const LIMIT_CEILING_DB = -2.0;
 export const TRUE_PEAK_GATE_DBTP = -1.0;
 
 /** Master gain at settings.master === 1. Leaves headroom for the sum of busses. */
-export const MASTER_TRIM_DB = -3;
+export const MASTER_TRIM_DB = -4.5;
 
 // ---------------------------------------------------------------------------
 // 3. Priority and ducking. SONIC_BIBLE §8.
@@ -483,14 +483,27 @@ export const SCENES: readonly SceneDef[] = [
     music: 3,
     ambience: 'field',
     preRollS: PRE_ROLL,
+    // RETIMED (audio-director ruling): the previous cluster (cast.hex.3 at 0.2s,
+    // ui.lastHit at 1.4s) put the chime 1.2s after the scene's only real 2-4kHz
+    // competitor. Independently re-measured from the rendered WAV via a general
+    // sliding-window scan (scripts/audio-render-rift.mjs's chime-cut-through gate):
+    // cast.hex.3's 2-4kHz energy peaks ~120ms after its own onset (~40dB at
+    // t=0.32s when fired at 0.2s) and decays to near-nothing (~21dB) by the time
+    // the old chime fired at 1.4s -- the "bed" the gate measured was a decayed
+    // valley, not the fight. Retimed so the whole cluster lands with cast.hex.3's
+    // 2-4kHz peak landing ~90ms before the chime (well inside the SONIC_BIBLE
+    // 120ms onset window the gate measures), so the chime is tested against the
+    // fight while it is actually loud. The die.creep -> ui.lastHit causal gap
+    // (creep dies, THEN the last-hit chime fires) is preserved at 50ms, unchanged
+    // from the original script.
     steps: [
-      { atSec: 0.2, id: 'cast.hex.3', opt: { x: 60, z: 58 } },
-      { atSec: 0.6, id: 'atk.hero.ranged', opt: { x: 52, z: 54 } },
-      { atSec: 0.9, id: 'hit.physical', opt: { x: 58, z: 57 } },
-      { atSec: 1.2, id: 'cast.reaver.0', opt: { x: 59, z: 59 } },
+      { atSec: 1.18, id: 'cast.hex.3', opt: { x: 60, z: 58 } },
+      { atSec: 1.24, id: 'atk.hero.ranged', opt: { x: 52, z: 54 } },
+      { atSec: 1.28, id: 'hit.physical', opt: { x: 58, z: 57 } },
+      { atSec: 1.31, id: 'cast.reaver.0', opt: { x: 59, z: 59 } },
       /** THE test: this chime must be unmistakably audible over everything above. */
-      { atSec: 1.35, id: 'die.creep', opt: { x: 57, z: 57 } },
-      { atSec: 1.4, id: 'ui.lastHit' },
+      { atSec: 1.34, id: 'die.creep', opt: { x: 57, z: 57 } },
+      { atSec: 1.39, id: 'ui.lastHit' },
       { atSec: 2.2, id: 'atk.tower', opt: { x: 68, z: 66 } },
     ],
   },

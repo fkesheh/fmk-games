@@ -16,6 +16,7 @@
     "test": "vitest run",
     "e2e:wordbomb": "node scripts/e2e-wordbomb.mjs",
     "e2e:rift": "node scripts/e2e-rift.mjs",
+    "audio:rift": "node scripts/audio-render-rift.mjs",
     "e2e:splat": "node scripts/e2e-splat.mjs",
     "e2e:outpost": "node scripts/e2e-outpost.mjs",
     "e2e:pad": "node scripts/e2e-pad.mjs",
