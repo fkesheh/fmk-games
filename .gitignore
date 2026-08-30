@@ -7,3 +7,6 @@ screenshots/*
 
 # splat v3 visual-judge captures: regenerate with scripts/capture-splat-v3.mjs (~50MB)
 docs/splat-v3/round-*/*.png
+platform.db
+platform/server/platform.db-shm
+platform/server/platform.db-wal

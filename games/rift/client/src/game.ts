@@ -219,9 +219,19 @@ function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
+/** Platform v2 port options (docs/PLATFORM.md §7). Legacy callers omit it. */
+export interface GameOpts {
+  /** GameModule.id to join ('rift' legacy default | 'ancients' v2 port). */
+  readonly gameId?: string;
+  /** Sent right after every socket open — SDK shell uses it for {t:'auth'}. */
+  readonly onOpenExtra?: () => readonly unknown[];
+}
+
 export class Game {
   private readonly modules: ClientModules;
   private readonly net: NetHandle;
+  /** GameModule.id this client joins ('rift' legacy | 'ancients' v2 port). */
+  private readonly gameId: string;
   private interp: InterpHandle = createInterp();
   private readonly input: InputHandle;
 
@@ -312,8 +322,12 @@ export class Game {
    *  the fallbacks below report. See {@link WireProbes}. */
   probes: WireProbes | null = null;
 
-  constructor(root: HTMLElement, modules: ClientModules) {
+  constructor(root: HTMLElement, modules: ClientModules, opts?: GameOpts) {
     this.modules = modules;
+    // Platform v2 (docs/PLATFORM.md §7): the ANCIENTS port registers the same
+    // rooms under a second id; every lobby verb must carry THAT id. Legacy
+    // callers omit opts and get 'rift' exactly as before.
+    this.gameId = opts?.gameId ?? 'rift';
     this.state.events = this.events;
 
     this.actions = {
@@ -332,6 +346,8 @@ export class Game {
     };
 
     this.net = createNet({
+      // Platform v2: the shell may inject {t:'auth'} after every (re)open.
+      ...(opts?.onOpenExtra !== undefined ? { onOpenExtra: opts.onOpenExtra } : {}),
       onMessage: (msg) => this.onMessage(msg),
       onClose: () => this.onSocketClose(),
     });
@@ -486,7 +502,7 @@ export class Game {
   private quickJoin(name: string): void {
     const clean = cleanName(name);
     saveName(clean);
-    this.net.send(this.withIdentity({ t: 'quick_join', name: clean, game: 'rift' }));
+    this.net.send(this.withIdentity({ t: 'quick_join', name: clean, game: this.gameId }));
   }
 
   private createPublic(name: string, settings?: RiftSettings): void {

@@ -11,6 +11,7 @@ export default defineConfig({
       '@rift/shared': fileURLToPath(new URL('./games/rift/shared/src', import.meta.url)),
       '@splat/shared': fileURLToPath(new URL('./games/splat/shared/src', import.meta.url)),
       '@outpost/shared': fileURLToPath(new URL('./games/outpost/shared/src', import.meta.url)),
+      '@aces/shared': fileURLToPath(new URL('./games/aces/shared/src', import.meta.url)),
       '@platform/shared': fileURLToPath(new URL('./platform/shared/src', import.meta.url)),
     },
   },
@@ -30,6 +31,7 @@ export default defineConfig({
       'games/wordbomb/server/src/**/*.test.ts',
       'games/rift/shared/src/**/*.test.ts',
       'games/rift/server/src/**/*.test.ts',
+      'games/rift/server/src/module.variant.test.ts',
       'games/rift/client/src/**/*.test.ts',
       'games/splat/shared/src/**/*.test.ts',
       'games/splat/server/src/**/*.test.ts',
@@ -37,11 +39,23 @@ export default defineConfig({
       'games/outpost/shared/src/**/*.test.ts',
       'games/outpost/server/src/**/*.test.ts',
       'games/outpost/client/src/**/*.test.ts',
+      // ACES — added at its creation; without an include here its tests would
+      // silently never run (the exact defect documented above for bank/shared,
+      // the kart client, and platform).
+      'games/aces/shared/src/**/*.test.ts',
+      'games/aces/server/src/**/*.test.ts',
+      'games/aces/client/src/**/*.test.ts',
+      // here its tests would silently never run (same documented defect as
+      // bank/shared and the kart client).
+      // documented defect as bank/shared and the kart client if omitted.
       // The PLATFORM had no include at all, so platform/server/src/lobby.test.ts —
       // the only coverage matchmaking has ever had — would have been silently
       // skipped. Same defect that hid games/bank/shared and the kart client.
       'platform/server/src/**/*.test.ts',
       'platform/shared/src/**/*.test.ts',
+      // PLATFORM v2 (docs/PLATFORM.md): sdk + engine coverage must actually run.
+      'platform/sdk/src/**/*.test.ts',
+      'platform/engine/src/**/*.test.ts',
       // The ASSET LIBRARY workspace — added at its creation; without an
       // include here its tests would silently never run (the exact defect
       // documented above for bank/shared, the kart client, and platform).

@@ -1,4 +1,4 @@
-# STRICKEN (+ BANK + KART GP + WORDBOMB + ANCIENTS) — multiplayer game platform
+# STRICKEN (+ BANK + KART GP + WORDBOMB + ANCIENTS + ACES) — multiplayer game platform
 
 A browser multiplayer game platform with six games sharing one server:
 - **STRICKEN** (`/fps/`) — tactical FPS in the spirit of Counter-Strike
@@ -11,6 +11,9 @@ A browser multiplayer game platform with six games sharing one server:
 - **OUTPOST** (`/outpost/`) — co-op zombie wave-defense FPS: 1–16 survivors hold a fenced
   compound around a watchtower on the RIDGELINE map against escalating waves of four zombie
   kinds; the run ends the instant the last survivor goes down
+- **ACES** (`/aces/`) — WWI dawn-patrol dogfight arena: ROYAL vs IRON, forward-firing twin
+  machine guns with heat/jam, boost, supply crates, three airframes (SCOUT/FIGHTER/GUNSHIP),
+  team deathmatch to 25 tickets, 1v1–4v4 with bot fill
 
 `/` is a launcher page; all games ride one WebSocket (`/ws`). Everything is
 procedural: no assets — flat-shaded low-poly 3D (FPS, KART), DOM/CSS 3D dice
@@ -54,6 +57,22 @@ rest). Round ends on a bust or when everyone's banked. 10 rounds, highest banked
 total wins. 30s turn timer (server auto-rolls), up to 8 players, private rooms
 with share codes, quick-join public rooms.
 
+## ACES — rules
+
+Two squadrons over a cold strait. Fly one of three airframes — SCOUT (fast, fragile),
+FIGHTER (the duelist), GUNSHIP (slow, wide, triple-wing bruiser) — with forward-firing
+machine guns only. Holding the trigger builds HEAT: scout jams after ~5 s of continuous
+fire, fighter ~6 s, gunship ~4 s; guns stay jammed until cooled past 35%. Boost is a
+2.6 s ×1.42 burst. Supply crates parachute in (heal +45, clear heat, refill boost).
+First squadron to 25 credited kills wins — burn-crashes credit nobody. Kills without
+dying earn ACE (3) and LEGEND (5) banners. Rooms are 1v1–4v4; bots fill empty seats and
+fly real pursuit/evade brains at easy/normal/hard aim tiers.
+
+## Controls (ACES)
+
+A / D turn · W / S throttle · SHIFT boost · SPACE fire guns · TAB (hold) scoreboard ·
+M mute · ESC controls card. On death: pick your next airframe with 1–3.
+
 ## Features
 
 - **Round-based team elimination** (T vs CT, up to 5v5): freeze-time buys → live round →
@@ -79,7 +98,7 @@ with share codes, quick-join public rooms.
 
 ```bash
 npm install
-npm run dev        # server :8080 · fps :5173 · bank :5174 · kart :5175 · wordbomb :5176 · rift :5177
+npm run dev        # server :8080 · fps :5173 · bank :5174 · kart :5175 · wordbomb :5176 · rift :5177 · aces :5180
 ```
 
 Production (single process serves both HTTP and WS):
