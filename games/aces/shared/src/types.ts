@@ -24,6 +24,8 @@ export interface PlaneState {
   h: number; //        facing heading, rad
 
   hp: number;
+  alt: number; //      altitude above the sea, u (0..ALT_MAX) — the 3rd combat axis
+  climb: number; //    current vertical speed, u/s (render pitch + bots read this)
   heat: number; //     0..HEAT_MAX; ≥max = jammed until ≤ HEAT_RESUME
   jammed: boolean;
   boost: number; //    BOOST_MAX..0 fuel
@@ -43,6 +45,7 @@ export interface BulletState {
   owner: string; //    plane id
   x: number;
   y: number;
+  alt: number; //      fired at the shooter's altitude; flies level
   vx: number; //       includes inherited plane velocity
   vy: number;
   t: number; //        seconds remaining
@@ -83,6 +86,7 @@ export interface InputFrame {
   readonly seq: number;
   readonly th: number;
   readonly tr: number;
+  readonly pit: number; //  −1 dive .. +1 climb (CONTRACT.md §8)
   readonly fire: boolean;
   readonly boost: boolean;
 }

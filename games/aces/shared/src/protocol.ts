@@ -31,6 +31,8 @@ export interface SnapPlane {
   vy: number;
   hp: number;
   maxHp: number;
+  alt: number; //       altitude, u — the vertical axis (CONTRACT.md §8)
+  climb: number; //     vertical speed for render pitch, u/s
   heat: number;
   jammed: boolean;
   boost: number;
@@ -89,6 +91,7 @@ export interface InputMsg {
   seq: number;
   th: number; //        −0.3..1
   tr: number; //        −1..1
+  pit: number; //       −1 dive .. +1 climb
   fire: boolean;
   boost: boolean;
 }
@@ -140,13 +143,15 @@ export function parseC2S(msg: unknown, allowDebug = false): C2S | null {
       const seq = num(m.seq);
       const th = num(m.th);
       const tr = num(m.tr);
-      if (seq === null || th === null || tr === null) return null;
+      const pit = num(m.pit);
+      if (seq === null || th === null || tr === null || pit === null) return null;
       if (typeof m.fire !== 'boolean' || typeof m.boost !== 'boolean') return null;
       return {
         t: 'input',
         seq,
         th: Math.max(-0.3, Math.min(1, th)),
         tr: Math.max(-1, Math.min(1, tr)),
+        pit: Math.max(-1, Math.min(1, pit)),
         fire: m.fire,
         boost: m.boost,
       };

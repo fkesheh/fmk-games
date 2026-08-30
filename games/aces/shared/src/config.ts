@@ -59,6 +59,17 @@ export const CRATE_LIFE_S = 25; //       active window once landed
 export const CRATE_PICKUP_R = 34;
 export const CRATE_HEAL = 45; //         also clears heat and refills boost
 
+// ---- altitude (CONTRACT.md §8 — the vertical combat axis) ---------------------------
+export const ALT = {
+  MAX: 90, //          u above the sea — hard ceiling
+  CRASH: 1.2, //       at or below this the sea takes the plane (crash kill)
+  CLIMB_MAX: 30, //    u/s at full deflection and speed
+  DIVE_MAX: 34, //     u/s down at full deflection
+  SPEED_CLIMB: 0.3, // climbing trades speed: speedMax × (1 − 0.3·pit)
+  SPEED_DIVE: 0.25, // diving buys it: speedMax × (1 + 0.25·|pit|), capped 1.3
+  HIT_TOL: 0.9, //     bullet hits vertically within radius × HIT_TOL
+} as const;
+
 // ---- bullets -------------------------------------------------------------------
 export const BULLET_TTL_S = 1.15;
 export const BULLET_HIT_R = 3; //        bullet radius for circle tests

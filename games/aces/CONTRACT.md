@@ -369,3 +369,34 @@ Each module: strict-typechecks, unit tests green, honors RULES, honors
 seams above, no TODO/stub left in owned files. Integration done when: gates
 green repo-wide, e2e script passes (join → live match vs bots → kill happens
 → scoreboard updates → zero console errors), captures judged to bar.
+
+
+---
+
+## §8 AMENDMENT — ALTITUDE (the vertical combat axis)
+
+Up and down are now real. Everything above still binds except where restated.
+
+- **State:** `PlaneState.alt` (0..ALT.MAX u above the sea) + `climb` (u/s, for
+  render pitch + bot reads). `InputFrame.pit` (−1 dive..+1 climb) rides every
+  input msg; `BulletState.alt` = shooter altitude at fire time, flies level.
+- **Flight law (shared/physics.ts is law):** climb/dive rate scales with speed
+  fraction (`pit × CLIMB_MAX/DIVE_MAX × speedFrac`); climbing trades speed
+  (`speedMax × (1 − 0.3·pit)`), diving buys it (× 1 + 0.25·|pit|, capped 1.3).
+  Hard ceiling ALT.MAX; the sea takes a plane at/below ALT.CRASH → crash kill
+  (existing crash flow: no ticket, killer fields = victim).
+- **Hit law:** bullets hit only within `radius × ALT.HIT_TOL` (0.9) of their
+  fired altitude — diving under fire escapes it; diving onto a target attacks
+  from outside its gun band until you level.
+- **Bots:** match target altitude within ±6u while pursuing (climb when he's
+  above, dive when below), dive-pulse while evading above 30u, and a
+  ground-avoid override (alt < 14 → climb bias) ranked with rim avoidance.
+- **Keys:** Q climb / E dive (INPUT_KEYS.climb/dive). HUD gains an altimeter
+  row in the Flight Record chip.
+- **3D mapping:** plane scene Y = `alt` (bob rides on top); pitch rotation.x =
+  `climb / CLIMB_MAX × 0.35` with rotation order 'YXZ' (yaw −h, then pitch,
+  then bank); camera follows altitude, look target adds `climb · LOOKAHEAD_S`.
+  Cloud bands (Y34–90) are now flight space — flying through them is the
+  speed-sensation cue.
+- **Bullets render at their own `alt`** — vertical tracer separation between
+  altitude bands is a legitimate read.

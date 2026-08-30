@@ -16,6 +16,7 @@
 // ============================================================================
 
 import {
+  ALT,
   BOOST_DRAIN,
   BOOST_MAX,
   BOOST_MULT,
@@ -82,10 +83,26 @@ export function stepPlane(p: PlaneState, input: InputFrame, dt: number): void {
   const turnAuthority = 1 - TURN_LOSS_AT_MAX * frac;
   p.h = wrapAngle(p.h + input.tr * spec.turnRate * turnAuthority * dt);
 
+  // --- vertical (CONTRACT.md §8): climb costs speed, dive buys it -------------------
+  const pit = clamp(input.pit, -1, 1);
+  const spdFrac = clamp(speed / spec.speedMax, 0, 1);
+  p.climb = pit * (pit >= 0 ? ALT.CLIMB_MAX : ALT.DIVE_MAX) * spdFrac;
+  p.alt += p.climb * dt;
+  if (p.alt > ALT.MAX) {
+    p.alt = ALT.MAX;
+    p.climb = Math.min(p.climb, 0);
+  } else if (p.alt < 0) {
+    p.alt = 0;
+    p.climb = Math.max(p.climb, 0);
+  }
+
   // --- thrust & drag along facing -------------------------------------------------
   const throttle = clamp(input.th, -0.3, 1);
   p.throttle = throttle;
-  const maxSpeed = spec.speedMax * mult;
+  const altSpeedMult = pit >= 0
+    ? 1 - ALT.SPEED_CLIMB * pit
+    : Math.min(1.3, 1 - ALT.SPEED_DIVE * pit);
+  const maxSpeed = spec.speedMax * mult * altSpeedMult;
   const minSpeed = spec.speedMin;
   const targetSpeed = minSpeed + (maxSpeed - minSpeed) * Math.max(0, throttle);
   let newSpeed = speed;
@@ -161,6 +178,7 @@ export function fireVolley(p: PlaneState, nextBulletId: () => number): BulletSta
       y: p.y + sin * 18 + cos * lat,
       vx: p.vx + cos * spec.gun.bulletSpeed,
       vy: p.vy + sin * spec.gun.bulletSpeed,
+      alt: p.alt,
       t: BULLET_TTL_S,
     });
   }
@@ -187,6 +205,10 @@ export function stepBullets(bullets: BulletState[], dt: number): void {
  */
 export function bulletHits(b: BulletState, bx0: number, by0: number, p: PlaneState): boolean {
   if (p.dead || p.team === b.team) return false;
+  // Vertical gate (CONTRACT.md §8): bullets fly level at their fired altitude —
+  // a plane only hittable within radius × HIT_TOL of that band. Diving under
+  // fire is a real escape; diving ONTO a target is a real attack.
+  if (Math.abs(b.alt - p.alt) > CLASSES[p.cls].radius * ALT.HIT_TOL) return false;
   const r = CLASSES[p.cls].radius + BULLET_HIT_R;
   const dx = b.x - bx0;
   const dy = b.y - by0;
