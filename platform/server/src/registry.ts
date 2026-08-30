@@ -14,6 +14,12 @@ import { riftModule } from '@rift/server';
 import { splatModule } from '@splat/server';
 import { outpostModule } from '@outpost/server';
 import { wordbombModule } from '@wordbomb/server';
+// ·SDK ports (docs/PLATFORM.md §7): same rooms under second ids
+import { bankSdkModule } from '@bank/server';
+import { wordbombSdkModule } from '@wordbomb/server';
+import { kartSdkModule } from '@kart/server';
+import { splatSdkModule } from '@splat/server';
+import { acesSdkModule } from '@aces/server';
 import { riftModuleVariant } from '@rift/server';
 
 export const GAMES: GameModule[] = [
@@ -33,6 +39,12 @@ export const GAMES: GameModule[] = [
     devPort: 5184,
     clientDist: resolveAncientsClientDist(),
   }),
+  // ·SDK ports (docs/PLATFORM.md §7): same rooms under second ids
+  bankSdkModule,
+  wordbombSdkModule,
+  kartSdkModule,
+  splatSdkModule,
+  acesSdkModule,
 ];
 
 // The variant's clientDist points at the PORT's own shell build (games/ancients/client/dist);

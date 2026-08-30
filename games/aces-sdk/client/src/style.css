@@ -1,0 +1,64 @@
+/* ============================================================================
+   ACES — C_APP style.css. Shell-only: full-viewport reset + the two stacked
+   canvases the composition root creates inside #app (world below, HUD canvas
+   above). HUD DOM chips / screens layers are injected on document.body by
+   ui/hud.ts and ui/screens.ts with their own stylesheets — nothing here
+   touches them.
+
+   House law: no scrollbars, no selection, resize never distorts (both
+   canvases are sized to their CSS box × DPR-capped backing store by
+   visual.fitCanvas, world from app.ts each frame; hud canvas by ui/hud.ts).
+
+   The single hex below mirrors APAL.dawnLo (palette seam rule — CSS cannot
+   import TS; same precedent as the bootstrap reset this file replaces).
+   ========================================================================== */
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #e3c893; /* APAL.dawnLo mirror */
+}
+
+#app {
+  position: fixed;
+  inset: 0;
+  height: auto;
+}
+
+/* Canvas stack: both fill the app box; pointer-events none so menu buttons
+   and screens layers (z-index 20/30, owned by C_UI) always receive input. */
+#app .aces-cv {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  pointer-events: none;
+}
+
+#app .aces-cv-world {
+  z-index: 1;
+}
+
+#app .aces-cv-hud {
+  z-index: 2;
+}
+
+/* Boot-failure banner — readable ink on paper, palette-derived values only. */
+.aces-boot-error {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 99;
+  padding: 14px 22px;
+  background: #ece0bf; /* APAL.paper mirror */
+  color: #221f1a; /*    APAL.ink mirror */
+  border: 2px solid #221f1a;
+  font-family: 'Courier New', ui-monospace, Menlo, monospace;
+  font-size: 16px;
+  letter-spacing: 0.04em;
+}

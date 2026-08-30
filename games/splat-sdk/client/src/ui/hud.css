@@ -1,0 +1,388 @@
+/* ==========================================================================
+   C3 — SKI SPLAT HUD styles (linked from index.html). STYLE LAW: colours
+   only via the SPAL custom properties that main.ts publishes at boot
+   (--snow-lit, --sun-gold, --ink, --paper, + the -rgb channel triples).
+   The single hex literal permitted in this file is the pre-boot --ink
+   fallback in :root below.
+   ========================================================================== */
+
+:root {
+  /* Pre-boot paint-guard fallback only; main.ts overwrites it with SPAL.ink
+     before the first frame. */
+  --ink: #10141c;
+}
+
+.splat-hud {
+  position: fixed;
+  inset: 0;
+  pointer-events: none; /* the touch steer zones live UNDER the HUD */
+  z-index: 20;
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  color: var(--paper);
+  /* Safe-area: 0px fallbacks only; C2's style.css publishes the real
+     env(safe-area-inset-*) values on these same custom properties. */
+  --safe-t: var(--safe-top, 0px);
+  --safe-r: var(--safe-right, 0px);
+  --safe-b: var(--safe-bottom, 0px);
+  --safe-l: var(--safe-left, 0px);
+  /* rgb channel triples for rgba() washes (main.ts mirrors these at boot,
+     before any HUD element exists — no literal fallback here). */
+  --inkc: var(--ink-rgb);
+  --paperc: var(--paper-rgb);
+}
+
+.splat-hud .hidden {
+  display: none !important;
+}
+
+/* --- scrim washes: contrast on snow without painting visible boxes ------- */
+.sh-scrim {
+  position: absolute;
+  pointer-events: none;
+}
+
+.sh-scrim-tl {
+  top: 0;
+  left: 0;
+  width: 42%;
+  height: 30%;
+  background: radial-gradient(
+    120% 120% at 0% 0%,
+    color-mix(in srgb, var(--ink) 58%, transparent),
+    transparent 72%
+  );
+}
+
+.sh-scrim-bl {
+  bottom: 0;
+  left: 0;
+  width: 36%;
+  height: 26%;
+  background: radial-gradient(
+    120% 120% at 0% 100%,
+    color-mix(in srgb, var(--ink) 52%, transparent),
+    transparent 72%
+  );
+}
+
+.sh-scrim-rail {
+  top: 0;
+  right: 0;
+  width: 14%;
+  height: 100%;
+  background: linear-gradient(
+    to left,
+    color-mix(in srgb, var(--ink) 42%, transparent),
+    transparent 75%
+  );
+}
+
+/* --- (1) place chip: the big ordinal, your slot colour, crown when 1st --- */
+.sh-place {
+  position: absolute;
+  top: calc(12px + var(--safe-t));
+  left: calc(14px + var(--safe-l));
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  /* F4 badge: the skier colour stays on the numeral, but the chip gets a
+     paper ring + ink scrim wash + soft drop shadow so it reads as a badge
+     over bright snow, not a raw colour swatch. */
+  padding: 6px 12px 8px;
+  border-radius: 14px;
+  border: 2px solid color-mix(in srgb, var(--paper) 86%, transparent);
+  background: radial-gradient(
+    140% 170% at 30% 0%,
+    color-mix(in srgb, var(--ink) 64%, transparent),
+    color-mix(in srgb, var(--ink) 40%, transparent)
+  );
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--paper) 26%, transparent),
+    0 3px 8px rgba(var(--inkc), 0.4),
+    0 14px 30px rgba(var(--inkc), 0.45);
+  text-shadow:
+    0 0 8px color-mix(in srgb, var(--paper) 45%, transparent),
+    0 2px 5px rgba(var(--inkc), 0.65);
+}
+
+.sh-place-num {
+  font-size: 34px; /* UX_BIBLE readability budget: >= 28 px at 1080p */
+  font-weight: 800;
+  line-height: 1;
+}
+
+.sh-crown {
+  font-size: 24px;
+  line-height: 1;
+}
+
+/* --- (2) progress rail, right edge --------------------------------------- */
+.sh-rail {
+  position: absolute;
+  right: calc(10px + var(--safe-r));
+  top: 50%;
+  transform: translateY(-50%);
+  width: 24px;
+  height: 140px;
+}
+
+/* --- (3) speed chip: reference data, not a focus -------------------------- */
+.sh-speed {
+  position: absolute;
+  left: calc(14px + var(--safe-l));
+  bottom: calc(14px + var(--safe-b));
+  padding: 8px 12px 10px;
+  border-radius: 12px;
+  /* F4: stronger scrim wash (gradient, not flat) + hairline paper edge +
+     soft drop shadow so the chip reads over bright snow. */
+  background: linear-gradient(
+    165deg,
+    color-mix(in srgb, var(--ink) 60%, transparent),
+    color-mix(in srgb, var(--ink) 44%, transparent)
+  );
+  border: 1px solid color-mix(in srgb, var(--paper) 20%, transparent);
+  box-shadow:
+    0 2px 6px rgba(var(--inkc), 0.35),
+    0 12px 26px rgba(var(--inkc), 0.42);
+}
+
+.sh-speed-num {
+  font-size: 20px; /* UX_BIBLE: >= 18 px */
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 1px 5px rgba(var(--inkc), 0.65);
+}
+
+.sh-speed-unit {
+  font-size: 12px;
+  opacity: 0.8;
+  text-shadow: 0 1px 4px rgba(var(--inkc), 0.6);
+}
+
+.sh-speed-bar {
+  margin-top: 4px;
+  width: 96px;
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(var(--paperc), 0.25);
+  overflow: hidden;
+}
+
+.sh-speed-bar-fill {
+  height: 100%;
+  background: var(--sun-gold);
+}
+
+/* --- (6b) v2 JUMP chip: round, sunGold ring + ink arrow-up on paper ------- */
+.sh-jump {
+  position: absolute;
+  /* bottom-right, ABOVE the touch zone area — never inside a steering half */
+  right: calc(18px + var(--safe-r));
+  bottom: calc(24px + clamp(84px, 16vh, 140px) + 32px + var(--safe-b));
+  width: 72px; /* >= 64 px touch target (STYLE_BIBLE §V2.8) */
+  height: 72px;
+  border-radius: 50%;
+  border: 4px solid var(--sun-gold); /* F4: thicker sunGold ring */
+  background: var(--paper);
+  color: var(--ink);
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  /* the HUD root is pointer-events: none so it never blocks the steer zones;
+     the chip re-enables events for itself */
+  pointer-events: auto;
+  touch-action: none; /* no scroll / zoom / double-tap gestures start here */
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  /* F4: a soft paper halo ring lifts the disc off the snow; the drop shadow
+     then grounds it. */
+  box-shadow:
+    0 0 0 8px color-mix(in srgb, var(--paper) 42%, transparent),
+    0 4px 18px rgba(var(--inkc), 0.35);
+  transition:
+    transform 150ms ease,
+    border-color 150ms ease,
+    box-shadow 150ms ease;
+}
+
+.sh-jump:active {
+  /* a press always gets an answer: the chip pulses down and the sunGold ring
+     darkens (UX_BIBLE §V2, F4 pressed state) */
+  transform: scale(0.92);
+  border-color: color-mix(in srgb, var(--sun-gold) 55%, var(--ink));
+  box-shadow:
+    0 0 0 5px color-mix(in srgb, var(--paper) 26%, transparent),
+    0 2px 10px rgba(var(--inkc), 0.3);
+}
+
+.sh-jump-glyph {
+  font-size: 28px;
+  font-weight: 800;
+  line-height: 1;
+  /* optical centering: an up-arrow glyph sits a touch high in the disc */
+  transform: translateY(-1px);
+}
+
+.sh-jump-label {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  color: var(--ink);
+  line-height: 1;
+  margin-top: 3px;
+  opacity: 0.85;
+}
+
+/* --- (4) countdown overlay: 3-2-1 then GO! -------------------------------- */
+.splat-hud .sh-countdown {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: clamp(72px, 18vw, 180px);
+  font-weight: 900;
+  color: var(--sun-gold);
+  text-shadow: 0 4px 24px rgba(var(--inkc), 0.6);
+}
+
+/* --- (5) finished banner: the race keeps running behind it ---------------- */
+.sh-finished {
+  position: absolute;
+  top: calc(18px + var(--safe-t));
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 8px 18px;
+  border-radius: 999px;
+  background: rgba(var(--paperc), 0.92);
+  color: var(--ink);
+  font-size: 18px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* --- (6) results panel: proportional time bars, crown on the winner ------- */
+.sh-results {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  min-width: min(420px, 86vw);
+  padding: 18px 20px;
+  border-radius: 16px;
+  background: rgba(var(--paperc), 0.94);
+  color: var(--ink);
+  box-shadow: 0 12px 40px rgba(var(--inkc), 0.45);
+}
+
+.sh-results-title {
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  opacity: 0.7;
+  margin-bottom: 10px;
+}
+
+.sh-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+}
+
+.sh-row-glyph {
+  width: 26px;
+  font-size: 20px;
+  text-align: center;
+  flex: none;
+}
+
+.sh-row-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 4px;
+  flex: none;
+}
+
+.sh-row-bar {
+  flex: 1;
+  height: 10px;
+  border-radius: 5px;
+  background: rgba(var(--inkc), 0.12);
+  overflow: hidden;
+}
+
+.sh-row-bar-fill {
+  height: 100%;
+  border-radius: 5px;
+}
+
+.sh-row-time {
+  font-size: 14px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.sh-row-crown {
+  font-size: 18px;
+  flex: none;
+}
+
+/* --- (7) first-run steer hint ---------------------------------------------- */
+.sh-hint {
+  position: absolute;
+  inset: 0;
+}
+
+.sh-hint-thumb {
+  position: absolute;
+  /* One "where to hold" lesson: the hint's outlines sit exactly where the
+     persistent touch-zone thumbs sit (style.css .touch-thumb) — the bottom
+     corners, the ergonomic rest position — same size, same insets. */
+  bottom: calc(24px + var(--safe-b));
+  width: clamp(56px, 9vw, 92px);
+  height: clamp(84px, 16vh, 140px);
+  border-radius: 24px;
+  border: 2px dashed rgba(var(--paperc), 0.7);
+  background: rgba(var(--paperc), 0.08);
+}
+
+.sh-hint-left {
+  left: calc(18px + var(--safe-l));
+}
+
+.sh-hint-right {
+  right: calc(18px + var(--safe-r));
+}
+
+.sh-hint-text {
+  position: absolute;
+  left: 50%;
+  /* above the bottom-corner thumbs, never inside them */
+  bottom: calc(24px + clamp(84px, 16vh, 140px) + 40px + var(--safe-b));
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+.sh-hint-label {
+  font-size: 16px;
+  font-weight: 600;
+  text-shadow: 0 1px 6px rgba(var(--inkc), 0.6);
+  white-space: nowrap;
+}
+
+.sh-hint-jump {
+  /* the v2 line: sunGold, echoing the ringed JUMP chip it points at (§V2.8) */
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--sun-gold);
+  text-shadow: 0 1px 6px rgba(var(--inkc), 0.6);
+}

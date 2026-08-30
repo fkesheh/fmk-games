@@ -1,0 +1,264 @@
+/* ============================================================================
+   C11 — app shell base styles. Deliberately minimal: C8 (HUD) and C9 (menus)
+   inject their own component styles into the #hud / #menu roots.
+
+   PALETTE -> CSS MIRROR (VISUAL_UPGRADE.md §0 "no ad-hoc hex"). Every custom
+   property below is written by main.ts from PALETTE at MODULE LOAD — before any
+   DOM is built and before any error path can run — so no rule in this file
+   carries a hex fallback. A hex fallback would be a second, silently diverging
+   source of truth; that is the bug this pass exists to remove.
+
+     --c11-ink        / --c11-ink-rgb       PALETTE.ink        page + shell base
+     --c11-shell                            PALETTE.charcoal   shell gradient lift
+     --c11-text       / --c11-text-rgb      PALETTE.hudText    body copy
+     --c11-accent     / --c11-accent-rgb    PALETTE.hudAccent  focus, selection
+     --c11-accent-lit                       PALETTE.tLit       accent highlight
+     --c11-danger                           PALETTE.danger     fatal banner
+     --c11-danger-deep                      PALETTE.blood      fatal banner floor
+
+   PRE-BOOT WINDOW (the boot splash). This stylesheet is a render-blocking <link>
+   in the built page, so it paints with the markup — but main.ts, which sets the
+   vars above, has not run yet. Any splash rule that names a --c11-* var alone is
+   therefore INVALID AT COMPUTED-VALUE TIME for exactly the window the splash
+   exists to cover: no shell background, an invisible progress bar, and a mark
+   whose colour falls back to the inherited default. So every rule that must
+   survive that window resolves through a var() fallback to a CSS SYSTEM COLOUR
+   (`canvas` / `canvastext`), which follows the `color-scheme: dark` declared
+   below and in index.html's guard. A system colour is not a colour literal: it
+   adds no second hex to diverge from PALETTE, and the palette value wins the
+   instant main.ts sets it. Alpha tints in this window use
+   `color-mix(in srgb, <base> N%, transparent)` rather than
+   `rgba(var(--c11-*-rgb), …)` for the same reason — the -rgb channel vars have
+   no system-colour equivalent, so a bare rgba() would vanish pre-boot. Rules
+   that can only ever run after main.ts (debug overlay, fatal banner, focus ring,
+   selection) keep the plain var()/rgba() form.
+
+   The ONLY colour literal in the whole app shell is the pre-boot paint guard in
+   index.html, which must stay equal to PALETTE.ink (seam rule 6).
+   ============================================================================ */
+
+/* ---- reset-ish base ------------------------------------------------------- */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--c11-ink, canvas);
+  color: var(--c11-text, canvastext);
+  /* system font stack — no webfonts (contract) */
+  font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Dark UA defaults: form controls, scrollbars and the pre-stylesheet text
+   colour all follow, so nothing flashes light-on-light during boot. */
+html {
+  color-scheme: dark;
+  scrollbar-color: color-mix(in srgb, var(--c11-text, canvastext) 28%, transparent) transparent;
+}
+
+/* ---- app shell ------------------------------------------------------------ */
+/* A soft centre lift instead of a dead flat field: the shell is what frames the
+   menus, and a single uncut value reads as unfinished (VISUAL_UPGRADE.md §1). */
+#app {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  background:
+    radial-gradient(128% 96% at 50% 36%, var(--c11-shell, canvas) 0%, var(--c11-ink, canvas) 64%),
+    var(--c11-ink, canvas);
+}
+
+#game {
+  display: block;
+  width: 100%;
+  height: 100%;
+  /* pre-lock affordance only; while pointer-locked the browser hides the cursor */
+  cursor: crosshair;
+}
+
+/* overlay roots, stacked above the canvas in DOM order (canvas, hud, menu) */
+#hud,
+#menu {
+  position: absolute;
+  inset: 0;
+}
+
+#hud {
+  pointer-events: none; /* HUD is read-only; clicks fall through to the canvas */
+}
+
+#menu {
+  pointer-events: auto;
+}
+
+/* ---- boot splash: the gap between first paint and a live scene -------------
+   Markup lives in index.html so it paints while the bundle is still arriving;
+   main.ts dismisses it once boot() has wired everything (or instantly on a
+   fatal error, so a failure never hides behind a spinner). ------------------ */
+.boot-splash {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  pointer-events: none;
+  background:
+    radial-gradient(128% 96% at 50% 42%, var(--c11-shell, canvas) 0%, var(--c11-ink, canvas) 64%),
+    var(--c11-ink, canvas);
+  transition: opacity 240ms ease-out;
+}
+
+.boot-splash.is-dismissed {
+  opacity: 0;
+}
+
+.boot-mark {
+  font-size: clamp(30px, 6vw, 56px);
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.42em;
+  text-indent: 0.42em; /* balances the trailing letter-space */
+  color: var(--c11-text, canvastext);
+  text-shadow: 0 2px 0 color-mix(in srgb, var(--c11-ink, canvas) 85%, transparent);
+}
+
+.boot-bar {
+  position: relative;
+  width: min(280px, 48vw);
+  height: 3px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--c11-text, canvastext) 14%, transparent);
+  box-shadow: inset 0 1px 2px color-mix(in srgb, var(--c11-ink, canvas) 60%, transparent);
+}
+
+.boot-bar-fill {
+  display: block;
+  width: 36%;
+  height: 100%;
+  border-radius: inherit;
+  /* pre-boot both stops resolve to `canvastext`, i.e. a plain light sweep — the
+     bar reads as a loading bar even before the accent hue exists. */
+  background: linear-gradient(
+    90deg,
+    var(--c11-accent, canvastext) 0%,
+    var(--c11-accent-lit, canvastext) 100%
+  );
+  box-shadow: 0 0 10px color-mix(in srgb, var(--c11-accent, canvastext) 55%, transparent);
+  animation: c11-boot-sweep 1.15s cubic-bezier(0.45, 0, 0.25, 1) infinite;
+}
+
+.boot-note {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.3em;
+  text-indent: 0.3em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--c11-text, canvastext) 55%, transparent);
+}
+
+@keyframes c11-boot-sweep {
+  from {
+    transform: translateX(-115%);
+  }
+  to {
+    transform: translateX(300%);
+  }
+}
+
+/* ---- ?debug overlay: mono, top-right, translucent -------------------------- */
+.debug-overlay {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 30;
+  padding: 7px 10px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+  white-space: pre;
+  color: var(--c11-text);
+  background: rgba(var(--c11-ink-rgb), 0.72);
+  border: 1px solid rgba(var(--c11-text-rgb), 0.18);
+  border-radius: 5px;
+  box-shadow: 0 2px 12px rgba(var(--c11-ink-rgb), 0.5);
+  backdrop-filter: blur(4px);
+  pointer-events: none;
+}
+
+/* ---- fatal error banner: never a silent white screen ----------------------- */
+.error-banner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 100;
+  padding: 10px 16px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-align: center;
+  color: var(--c11-text);
+  background: linear-gradient(180deg, var(--c11-danger) 0%, var(--c11-danger-deep) 100%);
+  border-bottom: 1px solid rgba(var(--c11-text-rgb), 0.26);
+  box-shadow: 0 6px 20px rgba(var(--c11-ink-rgb), 0.55);
+  animation: c11-banner-in 220ms ease-out both;
+}
+
+@keyframes c11-banner-in {
+  from {
+    opacity: 0;
+    transform: translateY(-100%);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ---- global interaction polish (menus are DOM; canvas unaffected) ---------- */
+::selection {
+  background: var(--c11-accent);
+  color: var(--c11-ink);
+}
+
+:focus-visible {
+  outline: 2px solid var(--c11-accent);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px rgba(var(--c11-accent-rgb), 0.22);
+}
+
+/* Mouse clicks must not leave a ring behind; keyboard focus must always show. */
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .boot-splash {
+    transition: none;
+  }
+
+  .boot-bar-fill {
+    width: 100%;
+    animation: none;
+  }
+
+  .error-banner {
+    animation: none;
+  }
+}

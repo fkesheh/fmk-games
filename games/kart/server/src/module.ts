@@ -57,3 +57,29 @@ export const kartModule: GameModule = {
     return new KartRoom(trackId, opts.visibility, opts.io, season);
   },
 };
+
+// ============================================================================
+// ·SDK PORT (docs/PLATFORM.md §7) — same rooms under a second id; the port's
+// own client lives at games/kart-sdk/client. Zero legacy edits.
+// ============================================================================
+import { variantOf } from '@platform/shared';
+import { existsSync as _es } from 'node:fs';
+import _p from 'node:path';
+
+function resolvePortDist_kart(): string {
+  const here = _p.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    _p.resolve(here, '../../kart-sdk/client/dist'),
+    _p.resolve(process.cwd(), 'games/kart-sdk/client/dist'),
+    _p.resolve(process.cwd(), '../games/kart-sdk/client/dist'),
+  ];
+  for (const dir of candidates) if (_es(_p.join(dir, 'index.html'))) return dir;
+  return candidates[0]!;
+}
+
+export const kartSdkModule = variantOf(kartModule, {
+  id: 'kart-sdk',
+  name: 'KART GP·SDK',
+  devPort: 5187,
+  clientDist: resolvePortDist_kart(),
+});

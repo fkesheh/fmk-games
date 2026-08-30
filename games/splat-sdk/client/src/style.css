@@ -1,0 +1,750 @@
+/* ============================================================================
+   SKI SPLAT client — alpine theme. EVERY colour traces to SPAL
+   (games/splat/shared/src/palette.ts) by name. Structure cloned from kart's
+   style.css (the repo's visual law).
+
+   COLOUR RULE: the `:root` block below is the ONE permitted place in this file
+   for hex literals, and it mirrors SPAL.ink EXACTLY — the pre-boot paint guard
+   (index.html's inline style is byte-equal). main.ts republishes every SPAL
+   entry as --<kebab> (+ -rgb channel triples) before the app boots, so every
+   other colour here is var(--x) or color-mix(in srgb, var(--x) N%, transparent)
+   — an alpha variant of a named palette entry, never a frozen rgba() triple.
+
+   SAFE AREA: the four --safe-* custom properties are declared once here and
+   consumed by ui/hud.css (C3) — a notch, a rounded corner and the home
+   indicator are cleared in one place.
+
+   Screens + menu/lobby chrome + the two-zone tablet layer live here; the 3D
+   scene is drawn by render/scene.ts (R1) onto its canvas and the in-race HUD
+   by ui/hud.css (C3). No external assets or fonts.
+   ============================================================================ */
+
+:root {
+  /* Pre-boot paint-guard fallback only; main.ts overwrites it with SPAL.ink
+     before the first frame. */
+  --ink: #10141c;
+  color-scheme: dark;
+
+  /* Safe-area insets as custom properties (hud.css reads these). 0 on desktop. */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+
+  /* ---- chip surface tokens: the kart scrim/chip system, SPAL-bound ----------
+     A lit paper top face falling to an ink bottom face, a snow-lit rim and a
+     cast shadow, so chrome sits ON the mountain rather than floating in it. */
+  --chip-face-top: color-mix(in srgb, var(--ink) 72%, transparent);
+  --chip-face-bot: color-mix(in srgb, var(--ink) 88%, transparent);
+  --chip-edge: color-mix(in srgb, var(--snow-shade) 30%, transparent);
+  --chip-rim: color-mix(in srgb, var(--paper) 16%, transparent);
+  --chip-floor: color-mix(in srgb, var(--ink) 60%, transparent);
+  --chip-cast: color-mix(in srgb, var(--ink) 48%, transparent);
+  --chip-radius: 10px;
+  --chip-blur: blur(7px);
+
+  /* ---- shared type shadows: HUD text must survive a white snowfield ---- */
+  --text-cast: 0 1px 0 color-mix(in srgb, var(--ink) 88%, transparent),
+    0 2px 10px color-mix(in srgb, var(--ink) 72%, transparent);
+  --text-cast-big: 0 2px 0 color-mix(in srgb, var(--ink) 92%, transparent),
+    0 5px 20px color-mix(in srgb, var(--ink) 78%, transparent);
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--ink);
+  color: var(--paper);
+  color-scheme: dark;
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+
+  /* ---- TOUCH SAFETY (UX_BIBLE "Accessibility") -------------------------------
+     iOS Safari IGNORES `user-scalable=no` in the viewport meta, so none of
+     this can be delegated to the page's <head>. These two properties are what
+     actually hold on a tablet:
+       overscroll-behavior: none  — no pull-to-refresh, no rubber-band bounce
+         revealing the page background when a thumb drags past the edge of a
+         steering half (the drag NEVER ends where the finger started).
+       touch-action: manipulation — kills double-tap-to-zoom and its 300ms
+         delay. The race screen and every control surface tighten to `none`
+         below; the MENU keeps manipulation so it stays scrollable. */
+  overscroll-behavior: none;
+  touch-action: manipulation;
+  -webkit-text-size-adjust: 100%; /* no reflow when an iPad is rotated */
+  -webkit-tap-highlight-color: transparent; /* no grey flash under a steering thumb */
+}
+
+#app {
+  height: 100%;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.error-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  padding: 10px 16px;
+  background: var(--thorn-lit);
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-align: center;
+  box-shadow: 0 4px 18px color-mix(in srgb, var(--ink) 70%, transparent);
+  z-index: 99;
+}
+
+/* ---- screens ----------------------------------------------------------------- */
+
+.screen {
+  height: 100%;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  overflow-y: auto;
+  overscroll-behavior: contain; /* a flick past the end of the menu never scrolls the page */
+}
+
+/* ---- menu -------------------------------------------------------------------- */
+/* The base lodge: an ink page lit by a cold sky pool behind the title and a
+   warm sun-gold ember underneath it — the mountain's two lights. */
+
+.menu {
+  position: relative;
+  justify-content: center;
+  gap: 14px;
+  padding: 32px 20px;
+  background:
+    radial-gradient(
+      120% 62% at 50% 8%,
+      color-mix(in srgb, var(--sky-zenith) 30%, transparent),
+      transparent 62%
+    ),
+    radial-gradient(
+      100% 80% at 50% 108%,
+      color-mix(in srgb, var(--sun-gold) 8%, transparent),
+      transparent 70%
+    );
+}
+
+.menu-title {
+  margin: 0;
+  font-size: clamp(44px, 10vw, 84px);
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  line-height: 1;
+  color: var(--snow-lit);
+  text-shadow:
+    0 2px 0 color-mix(in srgb, var(--ink) 90%, transparent),
+    0 6px 26px color-mix(in srgb, var(--sky-zenith) 55%, transparent);
+}
+
+.menu-sub {
+  margin: 0 0 8px;
+  color: var(--snow-shade);
+  font-style: italic;
+  letter-spacing: 0.08em;
+  text-align: center;
+}
+
+.menu-notice {
+  min-height: 18px;
+  padding: 6px 14px;
+  border: 1px solid var(--sun-gold);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--sun-gold) 10%, transparent);
+  color: var(--sun-gold);
+  font-size: 14px;
+  letter-spacing: 0.04em;
+}
+
+.menu-name,
+.menu-code-input {
+  box-sizing: border-box;
+  padding: 12px 14px;
+  border: 1px solid var(--chip-edge);
+  border-radius: 8px;
+  background: linear-gradient(180deg, var(--chip-face-top), var(--chip-face-bot));
+  box-shadow: inset 0 2px 6px color-mix(in srgb, var(--ink) 70%, transparent);
+  color: var(--paper);
+  font-size: 16px;
+  text-align: center;
+  letter-spacing: 0.06em;
+  outline: none;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.menu-name {
+  width: min(320px, 80vw);
+}
+
+.menu-name:focus,
+.menu-code-input:focus {
+  border-color: var(--sun-gold);
+  box-shadow:
+    inset 0 2px 6px color-mix(in srgb, var(--ink) 70%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--sun-gold) 22%, transparent);
+}
+
+.menu-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+}
+
+.menu-code {
+  display: flex;
+  gap: 10px;
+}
+
+.menu-code-input {
+  width: 120px;
+  text-transform: uppercase;
+}
+
+/* Settings chips: one pill idiom for every toggle (TABLET CONTROLS /
+   LEFT-HANDED / ASSIST). The whole label is the hit area. */
+.menu-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px 5px 9px;
+  border: 1px solid color-mix(in srgb, var(--snow-shade) 34%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ink) 62%, transparent);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--paper) 10%, transparent);
+  cursor: pointer;
+  user-select: none;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.menu-toggle:hover {
+  border-color: color-mix(in srgb, var(--sun-gold) 60%, transparent);
+  background: color-mix(in srgb, var(--ink) 82%, transparent);
+}
+
+.menu-toggle input[type='checkbox'] {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: var(--sun-gold);
+  cursor: pointer;
+}
+
+.menu-toggle:has(input:checked) {
+  border-color: var(--sun-gold);
+  background: color-mix(in srgb, var(--sun-gold) 12%, transparent);
+}
+
+.menu-toggle-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: var(--snow-shade);
+  transition: color 120ms ease;
+}
+
+.menu-toggle:has(input:checked) .menu-toggle-label {
+  color: var(--sun-gold);
+}
+
+/* the three settings ride one wrapping row under the join controls */
+.menu-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+}
+
+/* ---- buttons ----------------------------------------------------------------- */
+
+.btn {
+  padding: 12px 20px;
+  border: 1px solid var(--sun-gold);
+  border-radius: 8px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--sun-gold) 10%, transparent),
+    transparent
+  );
+  color: var(--sun-gold);
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, box-shadow 120ms ease;
+}
+
+.btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--sun-gold) 20%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--sun-gold) 16%, transparent);
+}
+
+.btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.btn-gold {
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--paper) 26%, var(--sun-gold)),
+    var(--sun-gold) 55%,
+    color-mix(in srgb, var(--ink) 16%, var(--sun-gold))
+  );
+  color: var(--ink);
+  border-color: var(--sun-gold);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--paper) 55%, transparent),
+    0 4px 14px color-mix(in srgb, var(--sun-gold) 24%, transparent);
+}
+
+.btn-gold:hover:not(:disabled) {
+  background: var(--paper);
+  border-color: var(--paper);
+  color: var(--ink);
+}
+
+.btn-small {
+  padding: 6px 12px;
+  font-size: 12px;
+}
+
+/* ---- race screen: canvas + overlays ------------------------------------------- */
+
+.race {
+  position: relative;
+  padding: 0;
+  overflow: hidden;
+  /* the race screen is a control surface end to end: no scroll, no pinch, no
+     zoom, no selection lasso started by a steering thumb */
+  touch-action: none;
+  overscroll-behavior: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none; /* no long-press callout under a held thumb */
+}
+
+.race-scene {
+  position: absolute;
+  inset: 0;
+}
+
+.race-scene canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none; /* a steering drag must never scroll or zoom the page */
+}
+
+/* ---- the two-zone tablet steering layer (UX_BIBLE "Input") --------------------
+   Left half = steer left, right half = steer right; both or neither = straight.
+   The layer covers the whole screen while racing — a thumb lands where it
+   lands, there is no target to miss. The zones are visuals + cached-rect hit
+   areas; the edge thumbs are the "where do I hold" hint. */
+
+.touch-layer {
+  position: absolute;
+  inset: 0;
+  /* over the canvas, under the lobby overlay (5) and the HUD (20, pointer-
+     transparent anyway) — a steering layer over the START button would strand
+     the room */
+  z-index: 3;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* UX_BIBLE §4.4 — invisible to keyboard players. `.tablet` is set from
+   (hover: none) and (pointer: coarse), or from the first real touch/pen
+   pointerdown, or from the explicit TABLET CONTROLS setting. Never from a UA. */
+.race:not(.tablet) .touch-layer {
+  display: none;
+}
+
+.touch-zone {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 50%;
+  /* the pressed wash is painted by .is-down below */
+  transition: background 90ms ease;
+}
+
+.touch-zone-left {
+  left: 0;
+}
+
+.touch-zone-right {
+  right: 0;
+}
+
+/* edge steering affordances: NO dashed debug rect — a soft ink wash pooling
+   in each bottom corner (the same scrim language as the HUD) with a large
+   chevron glyph pointing along the steer direction. The wash darkens the
+   bright snow just enough for the paper chevron to read; on dark tree cover
+   the chevron's own ink shadow keeps it legible. Safe-area insets clear the
+   home indicator and rounded corners. */
+.touch-thumb {
+  position: absolute;
+  bottom: calc(20px + var(--safe-bottom));
+  width: clamp(72px, 12vw, 120px);
+  height: clamp(96px, 18vh, 150px);
+  border-radius: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 90ms ease;
+}
+
+.touch-thumb::before {
+  font-size: clamp(40px, 7vw, 64px);
+  font-weight: 700;
+  line-height: 1;
+  padding-bottom: 0.12em; /* optical centre for the chevron glyphs */
+  color: color-mix(in srgb, var(--paper) 58%, transparent);
+  text-shadow:
+    0 1px 2px color-mix(in srgb, var(--ink) 55%, transparent),
+    0 2px 12px color-mix(in srgb, var(--ink) 40%, transparent);
+  transition: color 90ms ease, text-shadow 90ms ease;
+}
+
+.touch-thumb-left {
+  left: calc(14px + var(--safe-left));
+  background: radial-gradient(
+    130% 100% at 0% 100%,
+    color-mix(in srgb, var(--ink) 30%, transparent),
+    transparent 72%
+  );
+}
+
+.touch-thumb-right {
+  right: calc(14px + var(--safe-right));
+  background: radial-gradient(
+    130% 100% at 100% 100%,
+    color-mix(in srgb, var(--ink) 30%, transparent),
+    transparent 72%
+  );
+}
+
+.touch-thumb-left::before {
+  content: '‹';
+}
+
+.touch-thumb-right::before {
+  content: '›';
+}
+
+/* Pressed. Loud on purpose: a thumb COVERS its own hint, so "is my finger
+   still steering?" must be answerable from the rim glow alone at speed. */
+.touch-zone.is-down {
+  background: radial-gradient(
+    90% 70% at 50% 78%,
+    color-mix(in srgb, var(--sky-zenith) 22%, transparent),
+    transparent 75%
+  );
+}
+
+.touch-zone-left.is-down .touch-thumb-left {
+  background: radial-gradient(
+    130% 100% at 0% 100%,
+    color-mix(in srgb, var(--sun-gold) 26%, transparent),
+    color-mix(in srgb, var(--ink) 34%, transparent) 55%,
+    transparent 78%
+  );
+}
+
+.touch-zone-right.is-down .touch-thumb-right {
+  background: radial-gradient(
+    130% 100% at 100% 100%,
+    color-mix(in srgb, var(--sun-gold) 26%, transparent),
+    color-mix(in srgb, var(--ink) 34%, transparent) 55%,
+    transparent 78%
+  );
+}
+
+.touch-zone-left.is-down .touch-thumb-left::before,
+.touch-zone-right.is-down .touch-thumb-right::before {
+  color: var(--paper);
+  text-shadow:
+    0 1px 2px color-mix(in srgb, var(--ink) 65%, transparent),
+    0 0 22px color-mix(in srgb, var(--sun-gold) 65%, transparent);
+}
+
+/* Tablet: the bottom corners belong to the steering thumbs, so the speed
+   chip rides just above the thumb block (thumb gap + thumb height + a 12px
+   gap) instead of inside it. Desktop (no .tablet) keeps hud.css's normal
+   bottom-left placement; the lefty overrides below still swap its side, so
+   on a left-handed tablet it sits above the RIGHT thumb. The chip keeps its
+   own ink scrim (hud.css .sh-speed background) in both modes. */
+.race.tablet .splat-hud .sh-speed {
+  bottom: calc(
+    20px + clamp(96px, 18vh, 150px) + 12px + var(--safe-b, var(--safe-bottom))
+  );
+}
+
+/* ---- LEFT-HANDED: mirrors the HUD chip layout only ----------------------------
+   The steering halves are already symmetric (left half steers left for
+   everyone); what a left-handed player needs mirrored is the glanceable HUD:
+   place chip to the right, speed chip to the right, progress rail to the left.
+   hud.css (C3) owns the chips; these descendant overrides only swap sides. */
+.race.lefty .splat-hud .sh-place {
+  left: auto;
+  right: calc(14px + var(--safe-r, var(--safe-right)));
+}
+
+.race.lefty .splat-hud .sh-speed {
+  left: auto;
+  right: calc(14px + var(--safe-r, var(--safe-right)));
+}
+
+.race.lefty .splat-hud .sh-rail {
+  right: auto;
+  left: calc(10px + var(--safe-l, var(--safe-left)));
+}
+
+.race.lefty .splat-hud .sh-scrim-tl {
+  left: auto;
+  right: 0;
+  background: radial-gradient(
+    120% 120% at 100% 0%,
+    color-mix(in srgb, var(--ink) 58%, transparent),
+    transparent 72%
+  );
+}
+
+.race.lefty .splat-hud .sh-scrim-bl {
+  left: auto;
+  right: 0;
+  background: radial-gradient(
+    120% 120% at 100% 100%,
+    color-mix(in srgb, var(--ink) 52%, transparent),
+    transparent 72%
+  );
+}
+
+.race.lefty .splat-hud .sh-scrim-rail {
+  right: auto;
+  left: 0;
+  background: linear-gradient(
+    to right,
+    color-mix(in srgb, var(--ink) 42%, transparent),
+    transparent 75%
+  );
+}
+
+/* ---- lobby overlay (the roster) ------------------------------------------------ */
+
+.lobby-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(
+    100% 80% at 50% 50%,
+    color-mix(in srgb, var(--ink) 52%, transparent),
+    color-mix(in srgb, var(--ink) 78%, transparent)
+  );
+}
+
+.lobby-panel {
+  min-width: min(420px, 92vw);
+  max-width: min(760px, 94vw);
+  padding: 22px 26px;
+  border: 1px solid var(--sun-gold);
+  border-radius: 14px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--ink) 96%, transparent),
+    color-mix(in srgb, var(--ink) 94%, transparent)
+  );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--paper) 18%, transparent),
+    0 22px 60px color-mix(in srgb, var(--ink) 78%, transparent);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.lobby-title {
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: 0.4em;
+  color: var(--sun-gold);
+}
+
+/* the private-room invite code, big enough to read aloud across a room */
+.lobby-code {
+  padding: 6px 18px;
+  border: 1px solid color-mix(in srgb, var(--paper) 30%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--paper) 8%, transparent);
+  color: var(--paper);
+  font-size: clamp(24px, 5vw, 36px);
+  font-weight: 800;
+  letter-spacing: 0.3em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Wrapping rows, not a single column: 2 skiers read as a centred pair, a full
+   8-skier slope packs into two columns and still fits above START. */
+.lobby-players {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  max-height: min(44vh, 340px);
+  overflow-y: auto;
+}
+
+.lobby-status {
+  min-height: 20px;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: var(--paper);
+  text-align: center;
+}
+
+/* The explicit start control — nothing in SKI SPLAT auto-starts. Disabled
+   styling comes from `.btn:disabled`; the reason sits on `.lobby-status`. */
+.lobby-start {
+  min-width: 220px;
+  padding: 13px 28px;
+  font-size: 16px;
+  letter-spacing: 0.2em;
+}
+
+.lobby-leave {
+  margin-top: -4px;
+}
+
+.lobby-hint {
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  color: var(--snow-shade);
+}
+
+/* ---- player chips (roster list): swatch + glyph + name ------------------------ */
+
+.player-chip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+  width: 230px;
+  max-width: 100%;
+  padding: 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--snow-shade) 40%, transparent);
+  border-radius: 999px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--ink) 52%, transparent),
+    color-mix(in srgb, var(--ink) 72%, transparent)
+  );
+  font-size: 14px;
+}
+
+.player-chip.you {
+  border-color: var(--sun-gold);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--sun-gold) 14%, transparent),
+    color-mix(in srgb, var(--ink) 60%, transparent)
+  );
+}
+
+.player-color {
+  flex: 0 0 auto; /* the livery swatch never shrinks inside a packed chip */
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  box-shadow:
+    0 0 0 2px color-mix(in srgb, var(--ink) 80%, transparent),
+    inset 0 1px 0 color-mix(in srgb, var(--paper) 35%, transparent);
+}
+
+/* identity = colour + animal glyph + position, never colour alone (UX_BIBLE) */
+.player-glyph {
+  flex: 0 0 auto;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.player-name {
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0; /* a 16-char name must not push SLOT N out of a fixed-width chip */
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.player-you {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--sun-gold);
+  color: var(--ink);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+}
+
+.player-slot {
+  flex: 0 0 auto;
+  margin-left: auto;
+  white-space: nowrap;
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  color: var(--snow-shade);
+}
+
+/* ---- disconnect banner (rejoin path is automatic; the banner only reports) ---- */
+
+.net-banner {
+  position: fixed;
+  top: calc(10px + var(--safe-top));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 30;
+  padding: 8px 18px;
+  border: 1px solid var(--thorn-lit);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ink) 88%, transparent);
+  color: var(--thorn-lit);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+  box-shadow: 0 6px 22px color-mix(in srgb, var(--ink) 60%, transparent);
+}
+
+/* ---- motion preference ------------------------------------------------------------ */
+
+@media (prefers-reduced-motion: reduce) {
+  .menu-toggle,
+  .btn,
+  .menu-name,
+  .menu-code-input,
+  .touch-zone,
+  .touch-thumb,
+  .touch-thumb::before {
+    transition: none;
+  }
+}

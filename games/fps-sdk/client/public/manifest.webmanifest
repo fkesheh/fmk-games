@@ -1,0 +1,31 @@
+{
+  "name": "STRICKEN",
+  "short_name": "STRICKEN",
+  "id": "/fps/",
+  "start_url": "/fps/",
+  "scope": "/fps/",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#14171c",
+  "theme_color": "#14171c",
+  "icons": [
+    {
+      "src": "/fps/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/fps/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/fps/icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
