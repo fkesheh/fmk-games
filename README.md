@@ -11,7 +11,7 @@ A browser multiplayer game platform with six games sharing one server:
 - **OUTPOST** (`/outpost/`) — co-op zombie wave-defense FPS: 1–16 survivors hold a fenced
   compound around a watchtower on the RIDGELINE map against escalating waves of four zombie
   kinds; the run ends the instant the last survivor goes down
-- **ACES** (`/aces/`) — WWI dawn-patrol dogfight arena: ROYAL vs IRON, forward-firing twin
+- **ACES** (`/aces/`) — WWI dawn-patrol dogfight arena (three.js chase-cam 3D): ROYAL vs IRON, forward-firing twin
   machine guns with heat/jam, boost, supply crates, three airframes (SCOUT/FIGHTER/GUNSHIP),
   team deathmatch to 25 tickets, 1v1–4v4 with bot fill
 
