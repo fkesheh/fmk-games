@@ -113,6 +113,31 @@ async function main() {
   }
   await call(`window.__ACES.zoomTo(null)`);
 
+  // 4b. kill-watch burst: kills happen map-wide across the whole round, so
+  // fixed-position stills can never catch the FX. Park the chase cam at the
+  // furball centroid — the average of living bot positions off the latest
+  // snapshot — then burst 12 frames through ~24s of combat (fastForward(60)
+  // + sleep(200) between each); kills near the camera MUST land in some
+  // frames.
+  const centroid = await call(`(() => {
+    const snap = window.__ACES._internals.latestSnap && window.__ACES._internals.latestSnap();
+    if (!snap || !snap.planes) return null;
+    const bots = snap.planes.filter((p) => p.bot && !p.dead);
+    if (bots.length === 0) return null;
+    const sum = bots.reduce((a, p) => ({ x: a.x + p.x, y: a.y + p.y }), { x: 0, y: 0 });
+    return { x: Math.round(sum.x / bots.length), y: Math.round(sum.y / bots.length) };
+  })()`);
+  if (centroid && typeof centroid.x === 'number') {
+    await call(`window.__ACES.warpTo(${centroid.x}, ${centroid.y})`);
+    for (let i = 1; i <= 12; i++) {
+      await call(`window.__ACES.fastForward(60)`);
+      await sleep(200);
+      await shot(`14-killwatch-${String(i).padStart(2, '0')}`);
+    }
+  } else {
+    console.log('note: no living bots for kill-watch centroid; burst skipped');
+  }
+
   // 5. smoke/damage state: gunship soak — short ungod'd bursts until visibly
   // damaged but ALIVE (≤55% of the LIVE airframe's maxHp read off the latest
   // snapshot's you-row — hardcoding fighter 100 never triggers on a 170hp

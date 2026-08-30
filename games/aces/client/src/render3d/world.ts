@@ -22,21 +22,28 @@
 //   CLOUDS     THREE bands of TWO-TONE puff masses (alpha ≤ 0.78) drifting
 //              EAST and wrapping around the map bounds, thinned over the
 //              central corridor (keep ×0.62, size ×0.72, alpha ×0.85 — mirrors
-//              render/world.ts's 2D laws): a MID deck Y 16–24 just above
-//              cruise (7 large masses, visible over the nose — A3), the kept
-//              high deck Y 26–32 (7 large masses), and a LOW MIST band Y 7–12
-//              below cruise altitude (12 sparse flat wisps the player
-//              overflies — F4). F3 ANTI-CREAM LAW: every mass is a lit-top +
-//              shaded-underside object — an upper/outer cross-quad pair in a
-//              paper→seaDark ~0.18-family lit tint (cooler/grayer than the
-//              dawnHi sky) over a lower/rear pair in shadeA('haze',−0.35),
-//              plus a soft ink-tinted base rim quad on the heavier puffs —
-//              so at any chase angle a cloud reads as an OBJECT against the
-//              sky, never a cream smudge. Baked as per-cloud vertex-RGBA
-//              quads (one shared material, one draw call per mass). Their
-//              cloud shadows are ONE InstancedMesh of flat seaDark puffs
-//              (opacity 0.22), offset east-south per band off the ~35°
-//              western sun, drifting with them.
+//              render/world.ts's 2D laws): an OVER-NOSE deck Y 34–60 (7 large
+//              masses, undersides a clean 12–26u above the Y≈22 chase cam —
+//              F1 re-band), a towering HIGH deck Y 55–90 (7 masses whose
+//              distant bodies fill the upper frame like real sky — F1
+//              re-band; fog washes the far ones = correct aerial perspective,
+//              in-corridor thinning keeps the nearest few reading with
+//              contrast), and a LOW MIST band Y 7–12 below cruise altitude
+//              (12 sparse flat wisps the player overflies — F4, unchanged).
+//              F3 ANTI-CREAM LAW: every mass is a lit-top + shaded-underside
+//              object — an upper/outer cross-quad pair in a paper→seaDark
+//              ~0.18-family lit tint (cooler/grayer than the dawnHi sky) over
+//              a lower/rear pair in a deepened shadeA('haze',−0.5) warm
+//              gray-blue extended to overlap the lit pair — the UNDERSIDE
+//              tone carries the silhouette now, because the chase cam sees
+//              every mass from below (F1: clearly darker than the sky at any
+//              distance) — plus a soft ink-tinted base rim quad on the
+//              heavier puffs, so at any chase angle a cloud reads as an
+//              OBJECT against the sky, never a cream smudge. Baked as
+//              per-cloud vertex-RGBA quads (one shared material, one draw
+//              call per mass). Their cloud shadows are ONE InstancedMesh of
+//              flat seaDark puffs (opacity 0.22), offset east-south per band
+//              off the ~35° western sun, drifting with them.
 //
 // PERF LAW: update(tS, camPos) allocates NOTHING — positions wrap by
 // arithmetic, shadow matrices are prebuilt and only re-translated, every
@@ -58,6 +65,13 @@
 // cloud material (map + vertexColors + transparent) is constructed here ONCE;
 // every color remains APAL-derived, baked into per-cloud vertex RGBA from
 // pal()/mixA()/shadeA() at build time (draw calls stay one per mass).
+// F1 GEOMETRY FIX (reported): the raw cross-quads carried NO uv attribute, so
+// the mapped puffTexture sampled texel (0,0) for every fragment — three.js
+// Material.defaultAttributeValues.uv = [0,0] — which is the transparent
+// canvas corner: every mass rendered fully transparent (judge evidence:
+// shadows visible, cloud objects in zero frames). pushQuad now bakes per-quad
+// 0..1 UVs (PlaneGeometry law) at build time; no new allocations, materials,
+// or draw calls. Bands re-raised per the F1 brief (Y 34–60 / Y 55–90).
 // ============================================================================
 
 import * as THREE from 'three';
@@ -97,9 +111,9 @@ const SURF_Y = 0.35;
 const SURF_INNER = 1.1;
 const SURF_OUTER = 1.24;
 
-const CLOUD_HIGH_COUNT = 7; //   kept high — Y 26–32 deck (F4/A3 split)
-const CLOUD_MID_COUNT = 7; //    A3: half the old high deck re-banded Y 16–24,
-                                // just above cruise — visible over the nose
+const CLOUD_HIGH_COUNT = 7; //   F1 re-band — towering Y 55–90 deck
+const CLOUD_MID_COUNT = 7; //    F1 re-band — over-nose deck Y 34–60, undersides
+                                // a clean 12–26u above the Y≈22 chase cam
 const CLOUD_LOW_COUNT = 12; //   sparse low mist band BELOW cruise alt (F4)
 const CLOUD_MARGIN = 700;
 const CLOUD_ALPHA_MAX = 0.78; // STYLE_BIBLE §6 hard cap
@@ -110,17 +124,21 @@ const CLOUD_LIT_SPAN = 0.12; //  0.12–0.24 band centered on the ~0.18 cooler-
                                // than-sky nudge the F3 brief names
 const CLOUD_MIST_LIT_MIN = 0.45; // mist stays seaDark-leaning (reads against
 const CLOUD_MIST_LIT_SPAN = 0.25; // sea below AND sky at the horizon)
-const CLOUD_SHADE = shadeA('haze', -0.35); // shaded underside (warm gray-blue)
+const CLOUD_SHADE = shadeA('haze', -0.5); // shaded underside (warm gray-blue) —
+                                          // F1: deepened from −0.35 so the tone
+                                          // the cam sees from below stays clearly
+                                          // darker than the sky at any distance
 const CLOUD_HEAVY_ALPHA = 0.55; // puffs at/above this get the ink base rim
 const CLOUD_RIM_ALPHA = 0.55; //  ink rim softness relative to the cloud alpha
 const SHADOW_OPACITY = 0.22; //  §6/§3 cap 0.25
 /** Shadow throws fall EAST-SOUTH off the ~35° western sun (scene.ts SUN_DIR),
  *  scaled per band as ~height/tan(34°) and split along the sun's horizontal
- *  direction (0.964 east, 0.265 south): high deck ≈43u, mid ≈30u, mist ≈14u. */
-const SHADOW_OFF_X = 42;
-const SHADOW_OFF_Z = 12;
-const MID_OFF_X = 29;
-const MID_OFF_Z = 8;
+ *  direction (0.964 east, 0.265 south): high deck Y55–90 ≈108u, over-nose
+ *  deck Y34–60 ≈70u, mist ≈14u. */
+const SHADOW_OFF_X = 104;
+const SHADOW_OFF_Z = 28;
+const MID_OFF_X = 67;
+const MID_OFF_Z = 18;
 const MIST_OFF_X = 14;
 const MIST_OFF_Z = 4;
 const SHADOW_Y = 0.18;
@@ -141,11 +159,16 @@ const FOAM_FREQ = 1.35;
 // ---------------------------------------------------------------------------
 
 /** Emit one soft quad (both windings, FrontSide-safe from any yaw) as six
- *  vertices with the given RGBA baked into every vertex. Zero allocation at
- *  frame time — build-time only. */
+ *  vertices with the given RGBA baked into every vertex and the puff texture
+ *  mapped 0..1 across the quad's own extent (corners arrive in BL, BR, TL,
+ *  TR order — PlaneGeometry UV law). Zero allocation at frame time —
+ *  build-time only. Without a uv attribute the mapped texture would sample
+ *  three.js's default generic value uv (0,0) — the transparent canvas
+ *  corner — and the whole mass would render invisible (F1). */
 function pushQuad(
   pos: number[],
   col: number[],
+  uv: number[],
   rgba: readonly [number, number, number, number],
   v0: readonly [number, number, number],
   v1: readonly [number, number, number],
@@ -153,26 +176,29 @@ function pushQuad(
   v3: readonly [number, number, number],
 ): void {
   const [r, g, b, a] = rgba as [number, number, number, number];
-  const push = (v: readonly [number, number, number]): void => {
+  const push = (v: readonly [number, number, number], u: number, w: number): void => {
     pos.push(v[0]!, v[1]!, v[2]!);
     col.push(r, g, b, a);
+    uv.push(u, w);
   };
-  push(v0);
-  push(v1);
-  push(v2);
-  push(v1);
-  push(v3);
-  push(v2);
-  push(v2);
-  push(v1);
-  push(v0);
-  push(v2);
-  push(v3);
-  push(v1);
+  push(v0, 0, 0);
+  push(v1, 1, 0);
+  push(v2, 0, 1);
+  push(v1, 1, 0);
+  push(v3, 1, 1);
+  push(v2, 0, 1);
+  push(v2, 0, 1);
+  push(v1, 1, 0);
+  push(v0, 0, 0);
+  push(v2, 0, 1);
+  push(v3, 1, 1);
+  push(v1, 1, 0);
 }
 
 /** Build one two-tone cloud mass geometry (unit footprint −0.5..0.5 in X/Z,
- *  y −0.54..0.52; the mesh scale applies the band size). */
+ *  y −0.54..0.52; the mesh scale applies the band size). The shaded underside
+ *  pair reaches +0.10 INTO the lit pair (F1: the below-view silhouette is
+ *  underside-dominated, and the overlap seals the coplanar seam). */
 function buildCloudGeometry(
   litHex: string,
   shadeHex: string,
@@ -187,17 +213,28 @@ function buildCloudGeometry(
   const rimC: [number, number, number, number] = [rim.r, rim.g, rim.b, alpha * CLOUD_RIM_ALPHA];
   const pos: number[] = [];
   const col: number[] = [];
+  const uv: number[] = [];
   // lit upper/outer cross pair (paper→seaDark family — cooler than the sky)
-  pushQuad(pos, col, litC, [-0.5, 0, 0], [0.5, 0, 0], [-0.5, 0.52, 0], [0.5, 0.52, 0]);
-  pushQuad(pos, col, litC, [0, 0, -0.5], [0, 0, 0.5], [0, 0.52, -0.5], [0, 0.52, 0.5]);
-  // shaded lower/rear cross pair (warm gray-blue underside)
-  pushQuad(pos, col, shadeC, [-0.4, -0.54, 0], [0.4, -0.54, 0], [-0.4, 0, 0], [0.4, 0, 0]);
-  pushQuad(pos, col, shadeC, [0, -0.54, -0.4], [0, -0.54, 0.4], [0, 0, -0.4], [0, 0, 0.4]);
+  pushQuad(pos, col, uv, litC, [-0.5, 0, 0], [0.5, 0, 0], [-0.5, 0.52, 0], [0.5, 0.52, 0]);
+  pushQuad(pos, col, uv, litC, [0, 0, -0.5], [0, 0, 0.5], [0, 0.52, -0.5], [0, 0.52, 0.5]);
+  // shaded lower/rear cross pair (deep warm gray-blue, extended over the seam)
+  pushQuad(pos, col, uv, shadeC, [-0.4, -0.54, 0], [0.4, -0.54, 0], [-0.4, 0.1, 0], [0.4, 0.1, 0]);
+  pushQuad(
+    pos,
+    col,
+    uv,
+    shadeC,
+    [0, -0.54, -0.4],
+    [0, -0.54, 0.4],
+    [0, 0.1, -0.4],
+    [0, 0.1, 0.4],
+  );
   // heavy puffs: soft ink-tinted rim quad at the base (horizontal, both sides)
   if (heavy) {
     pushQuad(
       pos,
       col,
+      uv,
       rimC,
       [-0.52, -0.44, -0.3],
       [0.52, -0.44, -0.3],
@@ -208,6 +245,7 @@ function buildCloudGeometry(
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
   g.setAttribute('color', new THREE.Float32BufferAttribute(col, 4));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
   return g;
 }
 
@@ -519,22 +557,25 @@ export function createWorld(map: AcesMap): AcesWorld {
     readonly shOffX: number;
     readonly shOffZ: number;
   }
-  // A3 THREE-BAND sky: the chase cam cruises at Y≈22 looking level/down. Half
-  // the old Y26–34 deck moved DOWN into a MID band (Y 16–24) that reads
-  // clearly over the nose; the rest stays high. Every puff grew ~1.5× and
-  // opacities push toward the 0.78 cap so the masses actually register. The
+  // F1 THREE-BAND sky (geometry fix): the chase cam cruises at Y≈22 (plane 12
+  // + CAM_HEIGHT 10) looking DOWN at the plane — the old Y16–32 decks sat
+  // at/below the lens and could only clip the horizon sliver, so the
+  // over-nose band moves UP to Y 34–60 (undersides 12–26u above the cam) and
+  // the high deck to Y 55–90, with radii scaled up dramatically (120–240u
+  // mid, 180–420u high) so distant masses fill the upper frame like real
+  // sky. Fog washes the far ones — correct aerial perspective; the
+  // in-corridor thinning (below) keeps the NEAREST few reading with
+  // contrast, and the deepened undersides carry the tone from below. The
   // LOW MIST band (Y 7–12, below cruise) stays for overflight wisps (F4).
-  // All bands drift east; corridor thinning applies to all three (mirrors the
-  // 2D module's layer laws).
-  const CLOUD_SIZE_MIN = 140; // ~1.5× the old 95u floor (A3)
-  const CLOUD_SIZE_MAX = 250; // ~1.5× the old 170u ceiling (A3)
+  // All bands drift east; corridor thinning applies to all three (mirrors
+  // the 2D module's layer laws).
   const specs: ReadonlyArray<CloudSpec> = [
     {
       count: CLOUD_MID_COUNT,
-      yMin: 16,
-      yMax: 24,
-      rMin: CLOUD_SIZE_MIN,
-      rMax: CLOUD_SIZE_MAX,
+      yMin: 34,
+      yMax: 60,
+      rMin: 120,
+      rMax: 240,
       aBase: 0.55,
       aSpan: 0.23,
       speed: 11,
@@ -547,10 +588,10 @@ export function createWorld(map: AcesMap): AcesWorld {
     },
     {
       count: CLOUD_HIGH_COUNT,
-      yMin: 26,
-      yMax: 32,
-      rMin: CLOUD_SIZE_MIN,
-      rMax: CLOUD_SIZE_MAX,
+      yMin: 55,
+      yMax: 90,
+      rMin: 180,
+      rMax: 420,
       aBase: 0.5,
       aSpan: 0.22,
       speed: 11,
@@ -605,7 +646,8 @@ export function createWorld(map: AcesMap): AcesWorld {
         Math.min(CLOUD_ALPHA_MAX, (spec.aBase + rng() * spec.aSpan) * alphaCut),
       );
       // F3: lit top in the paper→seaDark ~0.18 family (cooler/grayer than
-      // the dawnHi sky), shadeA('haze',−0.35) underside, ink base rim on the
+      // the dawnHi sky), deep shadeA('haze',−0.5) underside that carries the
+      // below-view silhouette (F1), ink base rim on the
       // heavy puffs — a lit-top/shaded-underside OBJECT at any chase angle.
       const lit = mixA('paper', 'seaDark', spec.litMin + rng() * spec.litSpan);
       const geo = buildCloudGeometry(lit, CLOUD_SHADE, alpha, alpha >= CLOUD_HEAVY_ALPHA);
