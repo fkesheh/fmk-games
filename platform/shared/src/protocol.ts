@@ -8,6 +8,8 @@
 import { SIG_MAX, SIG_MIN } from './identity.js';
 import type { PlayerId, RoomInfo } from './module.js';
 import { PAD } from './pad.js';
+import { cleanPadFrame, isValidToken } from './services.js';
+import { RTC } from './limits.js';
 
 /** Transport liveness: ws protocol-level ping cadence, used by net.ts. */
 export const NET = {
@@ -32,7 +34,30 @@ export type LobbyC2S =
    */
   | { t: 'join_as_pad'; room: string; token: string }
   | { t: 'leave' }
-  | { t: 'ping'; ts: number };
+  | { t: 'ping'; ts: number }
+  // ---- v2 (docs/PLATFORM.md §5) — parsed + handled by the platform ----
+  /** Bind this session to a profile. Idempotent; second auth replaces the first. */
+  | { t: 'auth'; token: string }
+  /**
+   * v2 normalized-frame channel (ancients-style games): pads that speak the
+   * GENERIC /pad page emit this instead of game-native inputs. Relay rules:
+   * lobby parses/clamps, forwards RAW into the room under the pad session's
+   * id, and echoes {t:'pad_input_echo'} for RTT. Games adapt via
+   * RoomIO.padOwner. (Kart-style native pads send their own game messages
+   * after docs/PAD.md and never touch this tag.)
+   */
+  | { t: 'pad_input'; seq: number; lx: number; ly: number; rx: number; ry: number; buttons: number }
+  /**
+   * v2 P2P (docs/PLATFORM.md §12): WebRTC rendezvous. SDP offers/answers +
+   * ICE candidates ride the existing ws ONCE per connection setup; after the
+   * DataChannel opens the data plane never touches the server again. `data`
+   * is an opaque JSON blob forwarded verbatim to `to` IF that session sits
+   * in the SAME room (the lobby never inspects contents).
+   */
+  | { t: 'rtc_signal'; to: PlayerId; data: unknown };
+// NOTE: {t:'pad_pair_request'} is deliberately NOT lobby-parsed — docs/PAD.md
+// freezes it as raw pass-through reaching the ROOM, which mints tokens and
+// replies {t:'pad_pair'} itself (kart natively; ancients via its wrapper).
 
 /** Sanitize a resume token (a previous session's playerId), or undefined. */
 export function cleanResume(v: unknown): PlayerId | undefined | null {
@@ -66,7 +91,22 @@ export type LobbyS2C =
   | { t: 'welcome'; playerId: PlayerId }
   | { t: 'room_list'; rooms: RoomInfo[] }
   | { t: 'pong'; ts: number; serverTime: number }
-  | { t: 'error'; code: string; message: string };
+  | { t: 'error'; code: string; message: string }
+  // ---- v2 (docs/PLATFORM.md §5) ----
+  /** Session is authenticated. */
+  | { t: 'auth_ok'; profileId: PlayerId; name: string }
+  /** auth failed (bad/expired token). */
+  | { t: 'auth_err'; message: string }
+  /** Room-minted pair reply (docs/PAD.md §Lifecycle 1): single-use token. */
+  | { t: 'pad_pair'; room: string; token: string; expiresInMs: number }
+  /** To the pairing player: a pad bound/unbound from their seat. */
+  | { t: 'pad_status'; bound: boolean }
+  /** To the pad device: binding accepted. */
+  | { t: 'pad_joined'; name?: string } | { t: 'pad_left'; reason: string }
+  /** Ack to the pad for RTT estimation (v2 normalized-frame channel only). */
+  | { t: 'pad_input_echo'; seq: number }
+  /** Relayed WebRTC signal (same-room peers only; server is content-blind). */
+  | { t: 'rtc_signal'; from: PlayerId; data: unknown };
 
 /** Lobby messages plus whatever a game room pushes through RoomIO.send. */
 export type S2C = LobbyS2C | RawEnvelope;
@@ -192,6 +232,36 @@ export function parseC2S(raw: unknown): C2S | null {
     case 'ping':
       if (!num(raw.ts)) return null;
       return { t: 'ping', ts: raw.ts };
+    // ---- v2 ----
+    case 'auth':
+      if (!isValidToken(raw.token)) return null;
+      return { t: 'auth', token: raw.token };
+    case 'rtc_signal': {
+      if (typeof raw.to !== 'string' || raw.to.length < 4 || raw.to.length > 24) return null;
+      if (!isObj(raw.data)) return null;
+      let size = 0;
+      try {
+        size = JSON.stringify(raw.data).length;
+      } catch {
+        return null; // unserializable (circular…) — drop
+      }
+      if (size > RTC.maxSignalBytes) return null;
+      return { t: 'rtc_signal', to: raw.to, data: raw.data };
+    }
+    case 'pad_input': {
+      if (!num(raw.seq) || raw.seq < 0 || raw.seq > 0xffffffff) return null;
+      const frame = cleanPadFrame({ lx: raw.lx, ly: raw.ly, rx: raw.rx, ry: raw.ry, buttons: raw.buttons });
+      if (frame === null) return null;
+      return {
+        t: 'pad_input',
+        seq: Math.trunc(raw.seq),
+        lx: frame.lx,
+        ly: frame.ly,
+        rx: frame.rx,
+        ry: frame.ry,
+        buttons: frame.buttons,
+      };
+    }
     default:
       // envelope-checked pass-through: routed RAW to the session's room
       return raw as RawEnvelope;

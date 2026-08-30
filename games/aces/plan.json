@@ -1,0 +1,36 @@
+{
+  "contract": [
+    "CONTRACT.md",
+    "STYLE_BIBLE.md",
+    "shared/src/types.ts",
+    "shared/src/config.ts",
+    "shared/src/palette.ts",
+    "shared/src/protocol.ts",
+    "shared/src/physics.ts",
+    "shared/src/maps.ts",
+    "shared/src/index.ts",
+    "client/src/contract/visual.ts",
+    "client/src/contract/seams.ts"
+  ],
+  "modules": {
+    "S_ROOM": ["server/src/room.ts", "server/src/module.ts", "server/src/room.test.ts"],
+    "S_SIM": ["server/src/world.ts", "server/src/world.test.ts"],
+    "S_BOTS": ["server/src/bots.ts", "server/src/bots.test.ts"],
+    "C_NET": ["client/src/net.ts", "client/src/prediction.ts", "client/src/net.test.ts"],
+    "C_APP": ["client/src/app.ts", "client/src/main.ts", "client/index.html", "client/src/style.css"],
+    "C_WORLD": ["client/src/render/world.ts", "client/src/render/world.test.ts"],
+    "C_FX": ["client/src/render/planes.ts", "client/src/render/effects.ts", "client/src/render/planes.test.ts"],
+    "C_UI": ["client/src/ui/hud.ts", "client/src/ui/screens.ts", "client/src/ui/hud.test.ts"],
+    "C_AUDIO": ["client/src/audio/audio.ts", "client/src/audio/audio.test.ts"],
+    "INTEG": [
+      "../../package.json",
+      "../../vitest.config.ts",
+      "../../platform/server/src/registry.ts",
+      "../../platform/server/src/index.ts",
+      "../../scripts/e2e-aces.mjs"
+    ]
+  },
+  "integrator": "INTEG",
+  "typecheck_cmd": "npm run typecheck -w @aces/shared -w @aces/server -w @aces/client",
+  "root": "games/aces"
+}

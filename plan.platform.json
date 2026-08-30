@@ -1,0 +1,73 @@
+{
+  "contract": [
+    "docs/PLATFORM.md",
+    "docs/STRUCTURE.md",
+    "platform/shared/src/module.ts",
+    "platform/shared/src/protocol.ts",
+    "platform/shared/src/services.ts",
+    "platform/shared/src/limits.ts",
+    "platform/engine/src/types.ts",
+    "platform/sdk/src/types.ts"
+  ],
+  "modules": {
+    "P2_SRV_DB": [
+      "platform/server/src/services/db.ts",
+      "platform/server/src/services/db.test.ts"
+    ],
+    "P3_SRV_API": [
+      "platform/server/src/services/auth.ts",
+      "platform/server/src/services/profiles.ts",
+      "platform/server/src/services/saves.ts",
+      "platform/server/src/services/httpApi.ts",
+      "platform/server/src/services/httpApi.test.ts"
+    ],
+    "P4_SRV_GATEWAY": [
+      "platform/server/src/net.ts",
+      "platform/server/src/lobby.ts",
+      "platform/server/src/index.ts",
+      "platform/server/src/lobby.test.ts"
+    ],
+    "P5_ENGINE": [
+      "platform/engine/src/loop.ts",
+      "platform/engine/src/rig.ts",
+      "platform/engine/src/prims.ts",
+      "platform/engine/src/pools.ts",
+      "platform/engine/src/cameras.ts",
+      "platform/engine/src/debugHud.ts",
+      "platform/engine/src/loop.test.ts"
+    ],
+    "P6_SDK_CORE": [
+      "platform/sdk/src/net.ts",
+      "platform/sdk/src/rooms.ts",
+      "platform/sdk/src/profile.ts",
+      "platform/sdk/src/saves.ts",
+      "platform/sdk/src/client.ts",
+      "platform/sdk/src/saves.test.ts"
+    ],
+    "P7_SDK_INPUT_AUDIO": [
+      "platform/sdk/src/input.ts",
+      "platform/sdk/src/audio.ts",
+      "platform/sdk/src/padQr.ts",
+      "platform/sdk/src/input.test.ts"
+    ],
+    "P8_PAD_PAGE": [
+      "platform/server/src/padPage.ts"
+    ],
+    "P9_ORBIT": ["games/orbit/**"],
+    "P10_SUMO": ["games/sumo/**"],
+    "P11_GHOSTRUN": ["games/ghostrun/**"],
+    "INT": [
+      "platform/server/src/registry.ts",
+      "platform/engine/src/index.ts",
+      "platform/sdk/src/index.ts",
+      "package.json",
+      "scripts/e2e-platform.mjs",
+      "scripts/e2e-orbit.mjs",
+      "scripts/e2e-sumo.mjs",
+      "scripts/e2e-ghostrun.mjs"
+    ]
+  },
+  "integrator": "INT",
+  "typecheck_cmd": "npm run typecheck -w @platform/shared -w @platform/engine -w @platform/sdk -w @platform/server",
+  "root": "."
+}

@@ -2,16 +2,35 @@
 // FROZEN PLATFORM CONTRACT — how a game plugs into the platform.
 // See docs/STRUCTURE.md. Platform code never imports from games/*; games
 // implement GameModule and register in platform/server/src/registry.ts.
+//
+// v2 amendment (docs/PLATFORM.md §5): OPTIONAL members only — profileId,
+// reportStats, padOwner on RoomIO; padLayout on GameModule. Pre-v2 games are
+// untouched and remain contract-compliant by ignoring them.
 // ============================================================================
+
+import type { PadLayout, StatsDelta } from './services.js';
 
 export type PlayerId = string;
 export type RoomId = string;
 export type Visibility = 'public' | 'private';
+/** Server-side profile id; empty string when anonymous/unavailable. */
+export type ProfileRef = string;
 
 /** What the platform offers a game room. */
 export interface RoomIO {
   send(id: PlayerId, msg: unknown): void; // no-op for unknown ids (bots have no session)
   rttMs(id: PlayerId): number; // 0 for unknown ids
+  /**
+   * v2: the authenticated profile behind a connected player, or '' when the
+   * session is anonymous / the id is unknown (bots). Never throws.
+   */
+  profileId?(id: PlayerId): ProfileRef;
+  /**
+   * v2: fire-and-forget stat counters for persistence. Keys are game-defined;
+   * values are clamped finite numbers (see limits.ts STATS). No-op when the
+   * player is anonymous or unknown.
+   */
+  reportStats?(playerId: PlayerId, delta: StatsDelta): void;
 }
 
 /** Game-agnostic room description shown in the lobby list. */
@@ -101,4 +120,11 @@ export interface GameModule {
   }): GameRoomHandle;
   // throws Error(message) on invalid settings — the lobby forwards it as
   // { t: 'error', code: 'bad_settings', message }
+  /**
+   * v2: declaring a pad layout opts the game into phone-as-gamepad. The
+   * platform serves it at GET /api/pads/:game, renders /pad/?game=<id> from
+   * it, and relays `{t:'pad_input', …}` messages from bound pad sessions into
+   * this game's rooms (resolve seats via RoomIO.padOwner).
+   */
+  readonly padLayout?: PadLayout;
 }

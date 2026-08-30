@@ -11,7 +11,10 @@
 // payload passes parseC2S or is dropped silently (never throw on wire data);
 // app-level 'ping' is answered here (transport concern, never reaches hooks);
 // a throwing hook must never kill the process. rtt comes from ws
-// protocol-level ping/pong.
+// protocol-level ping/pong. v2 (specs/P4.md): start() takes ONE optional
+// trailing `api` hook — consulted FIRST for every http request (true = fully
+// handled, e.g. /api/* + /pad), before any static/proxy routing; a throwing
+// api hook is contained exactly like every other hook.
 // ============================================================================
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
@@ -28,7 +31,7 @@ import path from 'node:path';
 import type { Duplex } from 'node:stream';
 import { WebSocket, WebSocketServer, type RawData } from 'ws';
 import { NET, encodeS2C, parseC2S } from '@platform/shared';
-import type { C2S, PlayerId, S2C } from '@platform/shared';
+import type { C2S, PlayerId, ProfileRef, S2C } from '@platform/shared';
 
 // ---- static content types (spec: html/js/css/json/png/ico) ----
 const MIME_TYPES: Record<string, string> = {
@@ -71,6 +74,12 @@ const MAX_MISSED_PONGS = 2;
 
 export class Session {
   readonly id: PlayerId;
+  /**
+   * v2: the authenticated profile behind this connection; '' until a ws
+   * `auth` succeeds. Mutable on purpose — identity belongs to the lobby,
+   * transport only carries it (RoomIO.profileId reads it from here).
+   */
+  profileId: ProfileRef = '';
   private readonly ws: WebSocket;
   private pingSentAt = 0;
   private missedPongs = 0;
@@ -223,13 +232,31 @@ export class NetServer {
     this.hooks = hooks;
   }
 
+  /**
+   * `assets` resolves generated PWA assets before game mounts (null = none).
+   * `api` (v2, optional trailing param — all pre-existing callers stay valid)
+   * is consulted FIRST for every request: true = the response is fully owned
+   * (/api/* + /pad), false falls through to the routing below. A throwing api
+   * hook is contained like every other hook: logged + 500, never a crash.
+   */
   start(
     port: number,
     mounts: readonly Mount[],
     launcherHtml: string,
     assets: AssetResolver | null = null,
+    api?: (req: IncomingMessage, res: ServerResponse) => boolean,
   ): void {
     const http = createServer((req, res) => {
+      if (api !== undefined) {
+        try {
+          if (api(req, res)) return;
+        } catch (err) {
+          console.error('[net] api hook threw', err);
+          if (!res.headersSent) res.writeHead(500);
+          res.end('Internal Server Error');
+          return;
+        }
+      }
       serveHttp(req, res, mounts, launcherHtml, assets).catch((err: unknown) => {
         console.error('[net] http error', err);
         if (!res.headersSent) res.writeHead(500);

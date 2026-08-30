@@ -1,0 +1,23 @@
+{
+  "name": "@ancients/client",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@platform/shared": "0.0.0",
+    "@platform/sdk": "0.0.0",
+    "@rift/client": "0.0.0",
+    "@rift/shared": "0.0.0",
+    "three": "0.185.1"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.1",
+    "@types/three": "0.185.1",
+    "vite": "8.1.5"
+  }
+}
