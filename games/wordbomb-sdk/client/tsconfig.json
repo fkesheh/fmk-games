@@ -1,0 +1,39 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "types": [
+      "node"
+    ],
+    "paths": {
+      "@wordbomb/shared": [
+        "../shared/src/index.ts"
+      ],
+      "@wordbomb/shared/*": [
+        "../shared/src/*"
+      ],
+      "@platform/shared": [
+        "../../../platform/shared/src/index.ts"
+      ],
+      "@platform/sdk": [
+        "../../../platform/sdk/src/index.ts"
+      ],
+      "@platform/sdk/*": [
+        "../../../platform/sdk/src/*"
+      ],
+      "@platform/engine": [
+        "../../../platform/engine/src/index.ts"
+      ]
+    }
+  },
+  "include": [
+    "src",
+    "vite.config.ts"
+  ]
+}

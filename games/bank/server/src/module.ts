@@ -75,3 +75,29 @@ export const bankModule: GameModule = {
     return new BankRoom(opts.visibility, opts.io, resolveSettings(opts.settings));
   },
 };
+
+// ============================================================================
+// ·SDK PORT (docs/PLATFORM.md §7) — same rooms under a second id; the port's
+// own client lives at games/bank-sdk/client. Zero legacy edits.
+// ============================================================================
+import { variantOf } from '@platform/shared';
+import { existsSync as _es } from 'node:fs';
+import _p from 'node:path';
+
+function resolvePortDist_bank(): string {
+  const here = _p.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    _p.resolve(here, '../../bank-sdk/client/dist'),
+    _p.resolve(process.cwd(), 'games/bank-sdk/client/dist'),
+    _p.resolve(process.cwd(), '../games/bank-sdk/client/dist'),
+  ];
+  for (const dir of candidates) if (_es(_p.join(dir, 'index.html'))) return dir;
+  return candidates[0]!;
+}
+
+export const bankSdkModule = variantOf(bankModule, {
+  id: 'bank-sdk',
+  name: 'BANK·SDK',
+  devPort: 5185,
+  clientDist: resolvePortDist_bank(),
+});

@@ -63,3 +63,29 @@ export const acesModule: GameModule = {
     return new AcesRoom(opts.visibility, opts.io, opts.settings);
   },
 };
+
+// ============================================================================
+// ·SDK PORT (docs/PLATFORM.md §7) — same rooms under a second id; the port's
+// own client lives at games/aces-sdk/client. Zero legacy edits.
+// ============================================================================
+import { variantOf } from '@platform/shared';
+import { existsSync as _es } from 'node:fs';
+import _p from 'node:path';
+
+function resolvePortDist_aces(): string {
+  const here = _p.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    _p.resolve(here, '../../aces-sdk/client/dist'),
+    _p.resolve(process.cwd(), 'games/aces-sdk/client/dist'),
+    _p.resolve(process.cwd(), '../games/aces-sdk/client/dist'),
+  ];
+  for (const dir of candidates) if (_es(_p.join(dir, 'index.html'))) return dir;
+  return candidates[0]!;
+}
+
+export const acesSdkModule = variantOf(acesModule, {
+  id: 'aces-sdk',
+  name: 'ACES·SDK',
+  devPort: 5189,
+  clientDist: resolvePortDist_aces(),
+});

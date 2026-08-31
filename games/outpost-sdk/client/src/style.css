@@ -1,0 +1,210 @@
+/* ============================================================================
+   cl-main — OUTPOST app shell. SHELL ONLY: page, canvas, boot splash, error
+   banner. ui-hud and ui-menus inject their own <style> for the HUD and menu
+   layers (CONTRACT.md) — nothing in this file styles #hud/#menu CONTENT, only
+   their outer positioning against the canvas.
+
+   PALETTE -> CSS MIRROR (STYLE_BIBLE "no ad-hoc hex"). Every custom property
+   below is written by main.ts from PALETTE at MODULE LOAD — before any DOM is
+   built and before any error path can run — so no rule in this file carries a
+   hex fallback. A hex fallback would be a second, silently diverging source of
+   truth; that is exactly what this mirror exists to prevent.
+
+     --outpost-ink        / --outpost-ink-rgb       PALETTE.ink        page + shell base
+     --outpost-shell                                PALETTE.charcoal   shell gradient lift
+     --outpost-text       / --outpost-text-rgb      PALETTE.hudText    body copy
+     --outpost-accent     / --outpost-accent-rgb    PALETTE.hudAccent  focus, selection, boot mark
+     --outpost-accent-lit                           PALETTE.hazardAmberLit  accent highlight
+     --outpost-danger                               PALETTE.danger     fatal banner
+     --outpost-danger-deep                          PALETTE.blood      fatal banner floor
+
+   PRE-BOOT WINDOW. This stylesheet is a render-blocking <link> in the built
+   page and paints with the markup — before main.ts (which sets the vars above)
+   has run. index.html's own inline <style> already paints the page background
+   for that very first frame (its one deliberate colour literal, guarded there
+   so it never depends on this file). Every rule below that must also survive
+   that window resolves through a var() fallback to a CSS SYSTEM COLOUR
+   (`canvas` / `canvastext`, following `color-scheme: dark`) rather than a
+   second hex literal, so nothing here adds a value able to diverge from
+   PALETTE — the palette value wins the instant main.ts sets it. The -rgb
+   channel vars have no system-colour equivalent, so their rgba()/box-shadow
+   uses carry a literal numeric fallback computed from the same PALETTE values
+   main.ts writes (see the values inline below) rather than going blank.
+   ============================================================================ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--outpost-ink, canvas);
+  color: var(--outpost-text, canvastext);
+  /* system font stack — no webfonts */
+  font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Dark UA defaults: form controls, scrollbars and the pre-stylesheet text
+   colour all follow, so nothing flashes light-on-light during boot. */
+html {
+  color-scheme: dark;
+  scrollbar-color: color-mix(in srgb, var(--outpost-text, canvastext) 28%, transparent) transparent;
+}
+
+/* ---- app shell -------------------------------------------------------------
+   A soft centre lift instead of a dead flat field: the shell frames the menus
+   and the boot splash both. */
+#app {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  background:
+    radial-gradient(128% 96% at 50% 36%, var(--outpost-shell, canvas) 0%, var(--outpost-ink, canvas) 64%),
+    var(--outpost-ink, canvas);
+}
+
+#game {
+  display: block;
+  width: 100%;
+  height: 100%;
+  /* pre-lock affordance only; while pointer-locked the browser hides the cursor */
+  cursor: crosshair;
+}
+
+/* overlay roots, stacked above the canvas in DOM order (canvas, hud, menu) */
+#hud,
+#menu {
+  position: absolute;
+  inset: 0;
+}
+
+#hud {
+  pointer-events: none; /* HUD is read-only; explicit controls opt back in (UX_BIBLE) */
+}
+
+#menu {
+  /* none, NOT auto — same pattern as #hud above: the container spans the whole
+     viewport, so pointer-events:auto here swallows every click before it can
+     reach the canvas. The canvas then never acquires pointer lock, so the mouse
+     never attaches AND the input controller never owns the keyboard, which
+     presents as "the game is running but my mouse and keys do nothing" even
+     when only a small centred card is visible. Panels and buttons opt back in
+     (see .op-panel/.op-onboard/button in menus.ts). */
+  pointer-events: none;
+}
+
+/* ---- boot splash: the gap between first paint and a live scene -------------
+   Markup lives in index.html so it paints while the bundle is still arriving;
+   main.ts dismisses it once boot() has wired everything (or instantly on a
+   fatal error, so a failure never hides behind a loading splash). ----------- */
+.boot-splash {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  pointer-events: none;
+  background:
+    radial-gradient(128% 96% at 50% 42%, var(--outpost-shell, canvas) 0%, var(--outpost-ink, canvas) 64%),
+    var(--outpost-ink, canvas);
+  transition: opacity 240ms ease-out;
+}
+
+.boot-splash.is-dismissed {
+  opacity: 0;
+}
+
+.boot-mark {
+  font-size: clamp(28px, 6vw, 52px);
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.4em;
+  text-indent: 0.4em; /* balances the trailing letter-space */
+  color: var(--outpost-text, canvastext);
+  text-shadow: 0 2px 0 color-mix(in srgb, var(--outpost-ink, canvas) 85%, transparent);
+}
+
+.boot-sub {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.32em;
+  text-indent: 0.32em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--outpost-accent, canvastext) 82%, transparent);
+}
+
+/* ---- fatal error surface: never a silent blank canvas ----------------------
+   PALETTE.ink = #14171c -> rgb(20, 23, 28); PALETTE.hudText = #e8e6df ->
+   rgb(232, 230, 223); PALETTE.hudAccent = #c8912f -> rgb(200, 145, 47). These
+   three numeric fallbacks are the only non-var numbers in this file and exist
+   solely because rgba()'s channel argument has no CSS system-colour
+   equivalent to fall back to pre-boot; main.ts's computed --outpost-*-rgb
+   values override them the instant it runs. */
+.error-banner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 100;
+  padding: 10px 16px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-align: center;
+  color: var(--outpost-text, canvastext);
+  background: linear-gradient(180deg, var(--outpost-danger, canvastext) 0%, var(--outpost-danger-deep, canvastext) 100%);
+  border-bottom: 1px solid rgba(var(--outpost-text-rgb, 232, 230, 223), 0.26);
+  box-shadow: 0 6px 20px rgba(var(--outpost-ink-rgb, 20, 23, 28), 0.55);
+  animation: outpost-banner-in 220ms ease-out both;
+}
+
+@keyframes outpost-banner-in {
+  from {
+    opacity: 0;
+    transform: translateY(-100%);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ---- global interaction polish (menus are DOM; canvas unaffected) ---------- */
+::selection {
+  background: var(--outpost-accent, canvastext);
+  color: var(--outpost-ink, canvas);
+}
+
+:focus-visible {
+  outline: 2px solid var(--outpost-accent, canvastext);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px rgba(var(--outpost-accent-rgb, 200, 145, 47), 0.22);
+}
+
+/* Mouse clicks must not leave a ring behind; keyboard focus must always show. */
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .boot-splash {
+    transition: none;
+  }
+
+  .error-banner {
+    animation: none;
+  }
+}

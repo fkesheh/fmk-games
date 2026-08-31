@@ -76,3 +76,29 @@ export const splatModule: GameModule = {
     return new SplatRoom(opts.visibility, opts.io, seed);
   },
 };
+
+// ============================================================================
+// ·SDK PORT (docs/PLATFORM.md §7) — same rooms under a second id; the port's
+// own client lives at games/splat-sdk/client. Zero legacy edits.
+// ============================================================================
+import { variantOf } from '@platform/shared';
+import { existsSync as _es } from 'node:fs';
+import _p from 'node:path';
+
+function resolvePortDist_splat(): string {
+  const here = _p.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    _p.resolve(here, '../../splat-sdk/client/dist'),
+    _p.resolve(process.cwd(), 'games/splat-sdk/client/dist'),
+    _p.resolve(process.cwd(), '../games/splat-sdk/client/dist'),
+  ];
+  for (const dir of candidates) if (_es(_p.join(dir, 'index.html'))) return dir;
+  return candidates[0]!;
+}
+
+export const splatSdkModule = variantOf(splatModule, {
+  id: 'splat-sdk',
+  name: 'SPLAT·SDK',
+  devPort: 5188,
+  clientDist: resolvePortDist_splat(),
+});

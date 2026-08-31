@@ -1,0 +1,1817 @@
+/* ============================================================================
+   BANK client — the casino room.
+
+   VISUAL_UPGRADE.md §5: "a real casino table you would sit down at — warm felt,
+   weighty gold, chips with heft." The old sheet floated a rounded rect on flat
+   near-black and left the bottom ~35 % of the viewport dead. This one:
+
+     · fills the viewport via the `table-stage` grid (§8 reserved class),
+     · wraps the felt in a real wood/leather rail with a lit top bevel, an inner
+       felt gradient, a stitched edge and a grounded drop shadow,
+     · scales the player rail up and marks the current turn with FOUR cues
+       (caret, lift, weight, ring) so meaning is never carried by colour alone,
+     · gives the event log a panel, per-kind accents and entry motion.
+
+   COLOUR RULE (VISUAL_UPGRADE.md §0 + seam rule 7): the `:root` block below is
+   the ONE permitted place for hex in this game outside `games/bank/shared/src/
+   palette.ts`. Every value here mirrors BPAL exactly and is kept in sync with
+   main.ts's runtime mirror (BPAL_CSS_VARS). Everywhere else in this file colour
+   is `var(--…)` or a `color-mix()` of palette vars — never a literal. Dice
+   internals (`bd3d-*`) are styled by dice.ts and are deliberately absent here.
+   No external assets or fonts.
+   ============================================================================ */
+
+:root {
+  /* ---- BPAL mirror — room ---- */
+  --ink: #0e130f;
+  --ink-lit: #161d18;
+  --ink-deep: #070a08;
+  /* ---- BPAL mirror — felt ---- */
+  --felt-light: #2a7a55;
+  --felt: #1d5c3f;
+  --felt-dark: #123c2a;
+  --felt-deep: #0b2618;
+  /* ---- BPAL mirror — rail ---- */
+  --rail-lit: #6b4a2c;
+  --rail: #4a3220;
+  --rail-deep: #2a1c11;
+  /* ---- BPAL mirror — gold ---- */
+  --gold-bright: #f0d488;
+  --gold: #d8b45a;
+  --gold-deep: #9c7c2e;
+  /* ---- BPAL mirror — type ---- */
+  --cream: #f3ead2;
+  --cream-dim: #b8ab8a;
+  --cream-faint: #7d7460;
+  /* ---- BPAL mirror — dice (consumed by dice.ts) ---- */
+  --dice-face: #f6f1e2;
+  --dice-face-shade: #d9d2be;
+  --dice-bevel: #fbf8ee;
+  --dice-pip: #1a1a18;
+  --dice-pip-deep: #000000;
+  /* ---- BPAL mirror — semantic states ---- */
+  --danger: #c0392b;
+  --bank: #5fae7f;
+  --warn: #d8923a;
+
+  /* ---- derived surfaces (palette-only, no literals) ---- */
+  --shadow-hard: color-mix(in srgb, var(--ink-deep) 82%, transparent);
+  --shadow-soft: color-mix(in srgb, var(--ink-deep) 46%, transparent);
+  --gold-hair: color-mix(in srgb, var(--gold) 34%, transparent);
+  --gold-wash: color-mix(in srgb, var(--gold) 13%, transparent);
+  --panel: color-mix(in srgb, var(--ink-lit) 88%, var(--felt-deep));
+  --field: color-mix(in srgb, var(--felt-deep) 55%, var(--ink));
+  --felt-surface: radial-gradient(
+    ellipse 118% 94% at 50% 34%,
+    var(--felt-light) 0%,
+    var(--felt) 44%,
+    var(--felt-dark) 80%,
+    var(--felt-deep) 100%
+  );
+  --rail-wood: linear-gradient(
+    176deg,
+    var(--rail-lit) 0%,
+    var(--rail) 38%,
+    var(--rail-deep) 100%
+  );
+
+  /* ---- layout tokens ----
+     `--top-bar-h` is the ONE number the stage height is derived from: the table
+     screen is `top bar + stage` and nothing else, so the stage can claim
+     `calc(100dvh - var(--top-bar-h))` exactly and no pixel is left over to
+     become a void. `.table-top` is pinned to the same token — if one changes
+     the other must, which is why they share it. */
+  --top-bar-h: clamp(46px, 6vh, 60px);
+  --stage-w: min(1440px, 97vw);
+  --felt-w: min(1120px, 100%);
+  --log-w: clamp(238px, 21vw, 326px);
+  /* Portrait / narrow: the log collapses to a strip UNDER the felt. This is a
+     hard ceiling, not a preference — the strip is the only thing between the
+     felt and the bottom of the stage, so a strip that is allowed to grow with
+     its content is a strip that eats the felt. Sized so that even at 360x640
+     (the smallest supported viewport) `felt min-content + rail + actions +
+     strip` still fits inside the stage. The list scrolls inside it. */
+  --log-strip-h: clamp(76px, 15vh, 180px);
+  /* The rail now seats up to MAX_PLAYERS = 20. It wraps (3 rows on a desktop,
+     ~10 on a phone), and an UNCAPPED wrapping block in an `auto` grid row buys
+     its height straight out of the felt's `1fr` row — the exact failure mode
+     the stage grid was built to prevent, just arriving from a new direction.
+     So the rail is capped here and scrolls internally, the same contract the
+     log strip already runs under: bounded from above, shrinkable from below,
+     height independent of how many people are seated. */
+  --rail-max-h: clamp(104px, 28vh, 265px);
+  --serif: Georgia, 'Times New Roman', serif;
+
+  color-scheme: dark;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  color: var(--cream);
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+}
+
+/* The room, not a black void: a low warm pool of light under the table and a
+   cool ink falloff to the corners. Fixed so it never scrolls with content. */
+body {
+  /* the table screen is sized to the viewport; a horizontal scrollbar there is
+     always a layout bug, never content */
+  overflow-x: hidden;
+  background:
+    radial-gradient(ellipse 90% 70% at 50% 44%, var(--ink-lit) 0%, var(--ink) 58%, var(--ink-deep) 100%)
+    fixed;
+}
+
+#app {
+  height: 100%;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.error-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  padding: 10px 16px;
+  background: var(--danger);
+  color: var(--cream);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-align: center;
+  box-shadow: 0 6px 18px var(--shadow-hard);
+  z-index: 99;
+}
+
+/* ---- screens ----------------------------------------------------------------- */
+
+.screen {
+  height: 100%;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  overflow-y: auto;
+}
+
+/* ---- menu -------------------------------------------------------------------- */
+
+.menu {
+  justify-content: center;
+  gap: 14px;
+  padding: 32px 20px;
+}
+
+.menu-title {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: clamp(56px, 12vw, 96px);
+  letter-spacing: 0.18em;
+  color: var(--gold);
+  text-shadow:
+    0 2px 0 var(--gold-deep),
+    0 3px 0 var(--rail-deep),
+    0 8px 30px color-mix(in srgb, var(--gold) 28%, transparent);
+}
+
+.menu-sub {
+  margin: 0 0 8px;
+  color: var(--cream-dim);
+  font-style: italic;
+  letter-spacing: 0.08em;
+}
+
+.menu-notice {
+  min-height: 18px;
+  padding: 7px 16px;
+  border: 1px solid var(--gold-deep);
+  border-radius: 999px;
+  background: var(--gold-wash);
+  color: var(--gold-bright);
+  font-size: 14px;
+}
+
+.menu-name,
+.menu-code-input {
+  box-sizing: border-box;
+  padding: 12px 14px;
+  border: 1px solid var(--gold-deep);
+  border-radius: 10px;
+  background: var(--field);
+  box-shadow: inset 0 2px 6px var(--shadow-soft);
+  color: var(--cream);
+  font-size: 16px;
+  text-align: center;
+  letter-spacing: 0.06em;
+  outline: none;
+}
+
+.menu-name {
+  width: min(320px, 80vw);
+}
+
+.menu-name:focus,
+.menu-code-input:focus {
+  border-color: var(--gold);
+  box-shadow:
+    inset 0 2px 6px var(--shadow-soft),
+    0 0 0 3px var(--gold-wash);
+}
+
+/* ---- variant picker (§8: was 100 % inline-styled; real rules live here) ------- */
+
+.menu-options {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 12px;
+  font-size: 14px;
+  color: var(--cream-dim);
+}
+
+.menu-options label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border: 1px solid color-mix(in srgb, var(--gold-deep) 55%, transparent);
+  border-radius: 999px;
+  background: var(--field);
+  cursor: pointer;
+  transition: border-color 120ms ease, color 120ms ease;
+}
+
+.menu-options label:hover {
+  border-color: var(--gold-deep);
+  color: var(--cream);
+}
+
+.menu-options input[type='checkbox'] {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--gold);
+  cursor: pointer;
+}
+
+.menu-options select {
+  padding: 9px 14px;
+  border: 1px solid var(--gold-deep);
+  border-radius: 999px;
+  background: var(--field);
+  color: var(--cream);
+  font-family: inherit;
+  font-size: 14px;
+  letter-spacing: 0.04em;
+  outline: none;
+  cursor: pointer;
+}
+
+.menu-options select:focus {
+  border-color: var(--gold);
+  box-shadow: 0 0 0 3px var(--gold-wash);
+}
+
+.menu-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+}
+
+.menu-code {
+  display: flex;
+  gap: 10px;
+}
+
+.menu-code-input {
+  width: 120px;
+  text-transform: uppercase;
+}
+
+.menu-rooms-title {
+  margin: 18px 0 0;
+  font-size: 13px;
+  letter-spacing: 0.3em;
+  color: var(--gold-deep);
+}
+
+.menu-rooms {
+  width: min(440px, 92vw);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.room-empty {
+  text-align: center;
+  color: var(--cream-dim);
+  font-size: 14px;
+  font-style: italic;
+}
+
+.room-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 9px 14px;
+  border: 1px solid color-mix(in srgb, var(--gold) 24%, transparent);
+  border-radius: 10px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--felt) 30%, transparent),
+    color-mix(in srgb, var(--felt-deep) 34%, transparent)
+  );
+  font-size: 14px;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.room-row:hover {
+  border-color: color-mix(in srgb, var(--gold) 58%, transparent);
+}
+
+.room-title {
+  color: var(--gold-bright);
+  font-weight: 600;
+}
+
+.room-label {
+  color: var(--cream-dim);
+  font-style: italic;
+}
+
+.room-meta {
+  margin-left: auto;
+  color: var(--cream-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- buttons ----------------------------------------------------------------- */
+
+.btn {
+  padding: 12px 20px;
+  border: 1px solid var(--gold-deep);
+  border-radius: 10px;
+  background: linear-gradient(180deg, var(--gold-wash), transparent);
+  color: var(--gold-bright);
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, box-shadow 120ms ease,
+    transform 120ms ease, border-color 120ms ease;
+}
+
+.btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--gold) 18%, transparent);
+  border-color: var(--gold);
+}
+
+.btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.btn-gold {
+  background: linear-gradient(180deg, var(--gold-bright) 0%, var(--gold) 52%, var(--gold-deep) 100%);
+  color: var(--ink);
+  border-color: var(--gold);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--cream) 55%, transparent),
+    0 4px 14px var(--shadow-soft);
+}
+
+.btn-gold:hover:not(:disabled) {
+  background: linear-gradient(180deg, var(--gold-bright) 0%, var(--gold-bright) 46%, var(--gold) 100%);
+}
+
+.btn-small {
+  padding: 6px 12px;
+  font-size: 12px;
+  border-radius: 999px;
+}
+
+/* ---- table screen ------------------------------------------------------------ */
+
+/*  THE COMPOSITION FIX (VISUAL_UPGRADE.md §5, first row of the table).
+
+    The old sheet let the table screen be a scrolling flex column: the felt
+    stacked into the top two thirds and the bottom ~35 % of the viewport was
+    black nothing. The screen is now EXACTLY two bands —
+
+        .table-top   fixed  var(--top-bar-h)
+        .table-stage         calc(100dvh - var(--top-bar-h))
+
+    — so there is no leftover height for a void to occupy. The stage is a grid:
+    a dominant main column (felt on a `1fr` row, with the player rail and the
+    action buttons pinned tight beneath it on `auto` rows) and a side column
+    holding the log at full stage height. Below 900 px, or in portrait, it
+    collapses to one column with the log as a short strip underneath. */
+.table {
+  position: relative;
+  height: 100dvh;
+  max-height: 100dvh;
+  justify-content: flex-start;
+  align-items: center;
+  padding: 0 clamp(10px, 1.6vw, 22px);
+  gap: 0;
+  /* the two bands are sized to the viewport; nothing may scroll the screen */
+  overflow: hidden;
+}
+
+.table-top {
+  flex: 0 0 var(--top-bar-h);
+  box-sizing: border-box;
+  height: var(--top-bar-h);
+  width: var(--stage-w);
+  max-width: 100%;
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid color-mix(in srgb, var(--gold) 16%, transparent);
+}
+
+.table-top > * {
+  flex: 0 0 auto;
+}
+
+/*  Narrow: the top bar needs two rows. It is re-budgeted rather than allowed to
+    wrap freely, because `--top-bar-h` is what the stage height is subtracted
+    from — a top bar that grows without telling the token would push the bottom
+    of the stage off-screen. */
+@media (max-width: 780px) {
+  .table {
+    --top-bar-h: 86px;
+  }
+
+  .table-top {
+    flex-wrap: wrap;
+    justify-content: center;
+    align-content: center;
+    row-gap: 6px;
+  }
+}
+
+.table-stage {
+  /* containing block for `.table-banner`, so the end-of-round overlay centres
+     over the play area and leaves the top bar legible */
+  position: relative;
+  box-sizing: border-box;
+  width: var(--stage-w);
+  max-width: 100%;
+  height: calc(100dvh - var(--top-bar-h));
+  min-height: 0;
+  padding: clamp(8px, 1.5vh, 20px) 0 clamp(10px, 1.8vh, 24px);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  /*  ROW PRIORITY — the felt wins, the log yields.
+      Row 1 (`.stage-main`) is `minmax(min-content, 1fr)`, NOT `minmax(0, 1fr)`:
+      a 0-floor row lets an `auto` sibling row take whatever it likes and squeeze
+      the main column to a sliver, which is exactly how the felt used to end up
+      301 px tall at 430x880 (and 155 px at 360x640) with its own `overflow:
+      hidden` slicing the POT caption in half. The `min-content` floor makes the
+      felt's own content the row's hard minimum, so the log can never buy height
+      from it. Row 2 is `minmax(0, auto)` and is capped by `--log-strip-h`, so
+      the strip is bounded from above and shrinkable from below — it scrolls
+      internally (`.log-panel .event-log`) instead of growing. */
+  grid-template-rows: minmax(min-content, 1fr) minmax(0, auto);
+  align-items: stretch;
+  justify-items: stretch;
+  gap: clamp(9px, 1.5vh, 18px);
+}
+
+/*  Transitional guard: until the rail and the actions live inside `.stage-main`
+    they are siblings of the stage, and a stage that claimed the full remaining
+    height would push them off-screen. In that shape the stage flexes instead —
+    same composition, one band shorter. */
+.table:not(:has(.stage-main)) .table-stage {
+  height: auto;
+  flex: 1 1 auto;
+}
+
+.table > .player-rail {
+  flex: 0 0 auto;
+  margin-top: clamp(4px, 0.8vh, 10px);
+}
+
+.table > .table-actions {
+  flex: 0 0 auto;
+  margin: clamp(8px, 1.2vh, 15px) 0 clamp(10px, 1.8vh, 22px);
+}
+
+/* Fallback for a build where `table-stage` is absent entirely. */
+.table:not(:has(.table-stage)) {
+  justify-content: space-evenly;
+  padding-bottom: clamp(12px, 2.4vh, 26px);
+}
+
+/*  MAIN COLUMN — felt takes the `1fr` row and therefore every pixel the rail and
+    the buttons do not need. That is what makes the felt the dominant object on
+    the page rather than a card floating on a background, and it is also what
+    removes the orphan gap: rail and actions are grid rows immediately under the
+    felt, separated by one small gap and nothing else. */
+.stage-main {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  /*  same priority rule one level down: the felt row's floor is the felt's own
+      min-content, so the queue, the rail and the buttons can never crush it.
+      Four tracks: felt · turn-queue · player-rail · actions. The queue is one
+      line and the rail is capped (`--rail-max-h`), so rows 2–4 are bounded no
+      matter how many of the 20 seats are filled. A build without the queue
+      simply leaves track 2 at zero height. */
+  grid-template-rows: minmax(min-content, 1fr) auto auto auto;
+  align-items: stretch;
+  justify-items: center;
+  gap: clamp(6px, 1.1vh, 14px);
+}
+
+.stage-main > .felt,
+.stage-main > .felt-rail {
+  width: 100%;
+  max-width: var(--felt-w);
+  justify-self: center;
+}
+
+/*  Inside a stage the fixed `clamp(240px, 34vh, 420px)` floor is wrong in both
+    directions: too tall to fit a 360x640 stage, and (as `0`) no floor at all.
+    `min-content` is the adaptive version — the felt is never shorter than the
+    pot column it has to draw, and never taller than it needs to be. This is
+    what makes `overflow: hidden` below a corner-clip for the gradient rather
+    than a guillotine for the type. */
+.table-stage .felt {
+  min-height: min-content;
+}
+
+.table-stage .felt-rail {
+  /* the rail's floor comes from the felt inside it, not from a number here */
+  min-height: 0;
+}
+
+/*  SIDE COLUMN — the log panel fills its column height; the list scrolls inside
+    it (see `.log-panel .event-log`) so the panel never grows past the stage. */
+.stage-side {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.stage-side > .log-panel {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/*  Narrow / portrait: one column. The log becomes a short strip under the main
+    column so the felt keeps the lion's share of the height. `--log-strip-h` is
+    a ceiling AND the strip is allowed to shrink below it (`min-height: 0`), so
+    a log with 6 entries and a log with 60 occupy exactly the same band and the
+    felt's height is independent of how long the round has been running. */
+.table-stage > .stage-side,
+.table-stage:not(:has(> .stage-main)) > .log-panel {
+  max-height: var(--log-strip-h);
+  min-height: 0;
+}
+
+@media (min-width: 900px) and (orientation: landscape) {
+  .table-stage:has(> .stage-side),
+  .table-stage:not(:has(> .stage-main)):has(> .log-panel) {
+    grid-template-columns: minmax(0, 1fr) var(--log-w);
+    /*  Deliberately `minmax(0, 1fr)` and NOT the `min-content` floor row 1 uses
+        in the stacked layout. Here the single row spans BOTH columns, so a
+        min-content floor would be floored by the LOG's min-content as well —
+        i.e. by the full unscrolled height of every entry — and a long log would
+        stretch the row to ~1500 px and blow the felt and the buttons clean off
+        a 900 px stage. In this layout the felt is not competing with the log for
+        height at all (they are side by side), so the floor is not needed: the
+        felt's own floor lives on `.stage-main`'s internal row. */
+    grid-template-rows: minmax(0, 1fr);
+    column-gap: clamp(14px, 1.8vw, 30px);
+  }
+
+  .table-stage > .stage-main,
+  .table-stage:not(:has(> .stage-main)) > :not(.log-panel) {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .table-stage > .stage-side,
+  .table-stage:not(:has(> .stage-main)) > .log-panel {
+    grid-column: 2;
+    grid-row: 1;
+    max-height: none;
+    align-self: stretch;
+  }
+}
+
+.table-round {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.24em;
+  color: var(--gold);
+  text-shadow: 0 1px 0 var(--ink-deep);
+}
+
+/* §8 inline-style hazard: variant + invite chips get real rules here. */
+.table-variant {
+  padding: 5px 14px;
+  border: 1px solid var(--gold-deep);
+  border-radius: 999px;
+  background: var(--gold-wash);
+  color: var(--gold-bright);
+  font-size: 12px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.table-invite {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  /* the banner overlay sits at z-index 10 — the invite chip stays above it and
+     stays clickable (was an inline style; it is load-bearing behaviour). */
+  position: relative;
+  z-index: 20;
+  pointer-events: auto;
+}
+
+.table-invite-code {
+  padding: 5px 14px;
+  border: 1px solid var(--gold-deep);
+  border-radius: 999px;
+  background: var(--field);
+  color: var(--gold-bright);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- the felt + its rail ------------------------------------------------------ */
+
+/*  Standalone `.felt` carries its own rail through a border-box gradient border,
+    so the table reads correctly whether or not a `.felt-rail` wrapper exists. */
+.felt {
+  position: relative;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: var(--felt-w);
+  min-height: clamp(240px, 34vh, 420px);
+  padding: clamp(18px, 3vh, 36px) clamp(18px, 3vw, 34px) clamp(16px, 2.6vh, 30px);
+  border: clamp(10px, 1.5vh, 16px) solid transparent;
+  border-radius: 34px;
+  background:
+    var(--felt-surface) padding-box,
+    var(--rail-wood) border-box;
+  box-shadow:
+    /* felt sinking into the rail */
+    inset 0 0 70px var(--shadow-soft),
+    inset 0 8px 18px var(--shadow-hard),
+    /* rail top bevel + underside */
+    0 1px 0 color-mix(in srgb, var(--rail-lit) 70%, transparent),
+    0 2px 0 var(--rail-deep),
+    /* grounded contact shadow — the table sits on the floor, it does not float */
+    0 30px 60px -22px var(--shadow-hard),
+    0 6px 16px -6px var(--shadow-hard);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  /* the felt now owns most of the stage, so the pot column breathes across it
+     instead of clustering into a small block in the middle of a big table */
+  gap: clamp(6px, 2.2vh, 28px);
+  /* defensive: the felt's height comes from its grid row, so on a viewport too
+     short for the pot column the type is clipped by the felt rather than drawn
+     across the wooden rail */
+  overflow: hidden;
+}
+
+.felt > * {
+  position: relative;
+  z-index: 2;
+}
+
+/*  A `felt-rail` wrapper, when B2 emits one, becomes the wood/leather ring and
+    the felt drops its own border so the two never double up. */
+.felt-rail {
+  position: relative;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: var(--felt-w);
+  /* flex, so the felt inside stretches to the rail's full height and the rail
+     in turn stretches to its grid row — the felt is never a fixed-size card */
+  display: flex;
+  padding: clamp(11px, 1.7vh, 20px);
+  border-radius: 48px;
+  background: var(--rail-wood);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--rail-lit) 85%, transparent),
+    inset 0 -2px 0 var(--rail-deep),
+    inset 0 0 0 1px color-mix(in srgb, var(--gold-deep) 30%, transparent),
+    0 34px 66px -24px var(--shadow-hard),
+    0 8px 20px -8px var(--shadow-hard);
+}
+
+/* engraved gold hairline around the rail ring */
+.felt-rail::after {
+  content: '';
+  position: absolute;
+  inset: clamp(5px, 0.8vh, 9px);
+  border-radius: 40px;
+  border: 1px solid color-mix(in srgb, var(--gold-deep) 46%, transparent);
+  pointer-events: none;
+}
+
+.felt-rail > .felt {
+  flex: 1 1 auto;
+  max-width: none;
+  min-width: 0;
+  border: 0;
+  border-radius: 32px;
+  background: var(--felt-surface);
+  box-shadow:
+    inset 0 0 80px var(--shadow-soft),
+    inset 0 10px 22px var(--shadow-hard),
+    inset 0 -4px 12px var(--shadow-soft);
+}
+
+/*  Decorative felt layers. B2 may emit them as empty elements (the intended
+    use) or as content wrappers — `:empty` keeps both behaviours correct. */
+.felt-inner,
+.felt-stitch {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: inherit;
+}
+
+/*  As a content wrapper it fills the felt and centres the pot column in it. Its
+    floor is `min-content`, NOT 0: a 0 floor let the flex box be squeezed below
+    the height of the column it contains, and because the column is centred the
+    overflow spilled out of BOTH ends of an `overflow: hidden` felt at once —
+    the POT caption sheared off the top while the timer bar sheared off the
+    bottom. With a min-content floor the wrapper reports its true height up
+    through the felt to the grid row, which is where the space is actually
+    negotiated. */
+.felt > .felt-inner:not(:empty) {
+  flex: 1 1 auto;
+  min-height: min-content;
+  justify-content: center;
+}
+
+/*  Every item in the pot column keeps its own height. Flex items default to
+    shrinkable, and the timer bar (an 8 px box whose only child is height: 100 %)
+    has a content-based minimum of 0 — so under pressure it silently flattened
+    to a 0 px line and the bar disappeared. Nothing in this column should ever
+    pay for a shortage of height; the grid row above pays instead. */
+.felt-inner > *,
+.felt > .pot-label,
+.felt > .pot-value,
+.felt > .pot-flash,
+.felt > .dice-area,
+.felt > .timer-bar {
+  flex: 0 0 auto;
+}
+
+.felt > .felt-inner:empty {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: auto;
+  border-radius: inherit;
+  background: radial-gradient(
+    ellipse 62% 52% at 50% 40%,
+    color-mix(in srgb, var(--felt-light) 60%, transparent) 0%,
+    transparent 68%
+  );
+  pointer-events: none;
+}
+
+/* stitched edge line — dashed gold thread with a shadow groove behind it */
+.felt > .felt-stitch:empty,
+.felt:not(:has(.felt-stitch))::before {
+  content: '';
+  position: absolute;
+  inset: clamp(9px, 1.4vh, 15px);
+  z-index: 1;
+  width: auto;
+  border-radius: 22px;
+  border: 2px dashed color-mix(in srgb, var(--gold) 34%, transparent);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--felt-deep) 55%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--felt-deep) 40%, transparent);
+  pointer-events: none;
+}
+
+.pot-label {
+  font-size: 13px;
+  letter-spacing: 0.5em;
+  text-indent: 0.5em;
+  color: var(--gold-bright);
+  opacity: 0.8;
+}
+
+.pot-value {
+  font-family: var(--serif);
+  font-size: clamp(46px, 11.5vh, 116px);
+  font-weight: 700;
+  line-height: 1;
+  color: var(--gold-bright);
+  text-shadow:
+    0 2px 0 var(--gold-deep),
+    0 3px 1px var(--felt-deep),
+    0 0 34px color-mix(in srgb, var(--gold-bright) 34%, transparent);
+  font-variant-numeric: tabular-nums;
+}
+
+.pot-flash {
+  min-height: 22px;
+  font-size: clamp(16px, 2.2vh, 20px);
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: var(--cream);
+  text-shadow: 0 0 14px color-mix(in srgb, var(--cream) 55%, transparent);
+}
+
+/* the roll zone: a slightly worn patch of felt the dice land on. Dice internals
+   (bd3d-*) are owned by dice.ts and are not styled here. */
+.dice-area {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 18px;
+  min-height: clamp(80px, 14vh, 146px);
+  width: min(400px, 88%);
+  margin: clamp(2px, 1vh, 12px) 0;
+  border-radius: 999px;
+  background: radial-gradient(
+    ellipse 70% 62% at 50% 58%,
+    color-mix(in srgb, var(--felt-deep) 42%, transparent) 0%,
+    transparent 72%
+  );
+}
+
+.timer-bar {
+  width: min(420px, 84%);
+  height: 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--felt-deep) 78%, transparent);
+  box-shadow:
+    inset 0 1px 3px var(--shadow-hard),
+    0 1px 0 color-mix(in srgb, var(--felt-light) 26%, transparent);
+  overflow: hidden;
+}
+
+/* width is written by JS every 100 ms — never set it beyond this initial value */
+.timer-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: inherit;
+  background: linear-gradient(180deg, var(--gold-bright), var(--gold) 55%, var(--gold-deep));
+  box-shadow: 0 0 12px color-mix(in srgb, var(--gold) 45%, transparent);
+  transition: width 100ms linear, background 200ms ease;
+}
+
+.timer-fill.low {
+  background: linear-gradient(180deg, var(--warn), var(--danger) 70%);
+  box-shadow: 0 0 14px color-mix(in srgb, var(--danger) 55%, transparent);
+  animation: timer-urgent 640ms ease-in-out infinite;
+}
+
+@keyframes timer-urgent {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
+/*  PORTRAIT / SHORT-LANDSCAPE RE-BUDGET.
+    In portrait the felt gets roughly half the stage height instead of ~78 %, so
+    the pot column is re-costed to fit inside it — smaller numerals, tighter
+    gaps, a shallower roll zone. Every declaration here is a plain single-class
+    selector, exactly as specific as the base rule it is meant to beat, so this
+    block MUST stay physically below `.pot-value` / `.pot-flash` / `.dice-area`
+    or the cascade hands the win to the base rule on source order and the whole
+    re-budget silently does nothing. (It used to sit above them and did exactly
+    that: at 430x880 `.pot-value` was still rendering at 11.5vh.) Keep it last.
+    Because the felt's grid row is floored at its own `min-content`, this block
+    is what sets that floor — it is the difference between a felt that asks for
+    300 px on a phone and one that asks for 500 px it cannot have. */
+@media (orientation: portrait), (max-height: 640px) {
+  .felt {
+    gap: clamp(4px, 1.2vh, 15px);
+    padding: clamp(14px, 2.2vh, 26px) clamp(14px, 3vw, 30px) clamp(12px, 2vh, 22px);
+  }
+
+  .pot-label {
+    font-size: 12px;
+    letter-spacing: 0.42em;
+    text-indent: 0.42em;
+  }
+
+  .pot-value {
+    font-size: clamp(38px, 8vh, 88px);
+  }
+
+  .pot-flash {
+    min-height: 16px;
+    font-size: clamp(13px, 1.8vh, 18px);
+  }
+
+  .dice-area {
+    min-height: clamp(70px, 10vh, 112px);
+    margin: 0;
+  }
+
+  .timer-bar {
+    width: min(420px, 92%);
+  }
+}
+
+/*  Short LANDSCAPE (a 900x500 laptop, a phone turned sideways) is caught by the
+    `max-height: 640px` arm above, but it is not the case that arm is budgeting
+    for: here the log is a side COLUMN, not a strip under the felt, so the felt
+    still owns ~70 % of the stage and the phone-sized numerals it just inherited
+    leave a third of the table empty. Give the height back. Must stay below the
+    block above — same specificity, source order decides. */
+@media (min-width: 900px) and (orientation: landscape) and (max-height: 640px) {
+  .pot-label {
+    font-size: 13px;
+    letter-spacing: 0.5em;
+    text-indent: 0.5em;
+  }
+
+  .pot-value {
+    font-size: clamp(44px, 11vh, 92px);
+  }
+
+  .pot-flash {
+    min-height: 18px;
+  }
+}
+
+/* ---- turn queue ------------------------------------------------------------------
+
+   A 20-seat table is ~9 rolls per round (the bust-7 sets the length, not the
+   seat count), so most players never roll in a given round and can sit ~20
+   turns between their own actions. The rules are not changing, so the queue's
+   whole job is ORIENTATION: name the roller, the next three, and the waiting
+   player's own distance from the front. It reads as a dealer's call line above
+   the rail — a thin brass-hairline plaque, deliberately quieter in value than
+   the felt and the pot so it never competes with them.
+
+   One line tall, so the felt loses ~34 px and keeps its dominance.            */
+
+.turn-queue {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  max-width: 100%;
+  padding: 6px 14px;
+  box-sizing: border-box;
+  border: 1px solid var(--gold-hair);
+  border-radius: 999px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--ink-lit) 82%, var(--felt-deep)),
+    color-mix(in srgb, var(--ink) 88%, var(--felt-deep))
+  );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--gold) 16%, transparent),
+    0 4px 12px -6px var(--shadow-hard);
+  font-size: 13px;
+  line-height: 1.2;
+}
+
+.turn-queue-label {
+  flex: 0 0 auto;
+  color: var(--gold-deep);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.24em;
+  text-indent: 0.24em;
+  text-transform: uppercase;
+}
+
+.turn-queue-list {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+  list-style: none;
+}
+
+.turn-queue-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  max-width: 11ch;
+  padding: 3px 9px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  color: var(--cream-dim);
+}
+
+/*  Rotation arrow BETWEEN entries (not on them), so the strip reads as an order
+    rather than as a row of tags. Decorative, hence a pseudo-element. */
+.turn-queue-item + .turn-queue-item::before {
+  content: '›';
+  margin-left: -4px;
+  color: var(--cream-faint);
+  font-size: 13px;
+}
+
+/*  The roller. Same accessibility rule as the rail (§5): never colour alone —
+    the 'NOW' ordinal (text), the filled plaque (background) and the heavier
+    type each carry the state independently. */
+.turn-queue-item.now {
+  border-color: color-mix(in srgb, var(--gold) 44%, transparent);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--gold) 20%, transparent),
+    color-mix(in srgb, var(--gold-deep) 10%, transparent)
+  );
+  color: var(--cream);
+  font-weight: 700;
+}
+
+.turn-queue-item.you .turn-queue-name {
+  color: var(--gold-bright);
+  text-decoration: underline;
+  text-decoration-color: var(--gold-hair);
+  text-underline-offset: 3px;
+}
+
+/*  Ordinal: 'NOW', then 2 / 3 / 4, then the '+N' tail. Tabular so the plaques
+    do not jitter as the rotation advances. */
+.turn-queue-pos {
+  flex: 0 0 auto;
+  color: var(--gold);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  font-variant-numeric: tabular-nums;
+}
+
+.turn-queue-item.now .turn-queue-pos {
+  color: var(--gold-bright);
+}
+
+.turn-queue-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/*  '+14 more seats behind these four' — the cue that makes a deep table read as
+    deep instead of as a four-player game. */
+.turn-queue-more {
+  color: var(--cream-faint);
+  font-style: italic;
+}
+
+/*  The waiting player's own distance from the front: 'YOU IN 14'. This is the
+    single most useful string on the strip for the 16 people who will not roll
+    this round, so it gets the right-hand anchor and a rule to separate it. */
+.turn-queue-eta {
+  flex: 0 0 auto;
+  padding-left: 12px;
+  border-left: 1px solid var(--gold-hair);
+  color: var(--cream-dim);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  font-variant-numeric: tabular-nums;
+}
+
+/* your turn, or you are next: promote it to gold so it catches the eye */
+.turn-queue-eta.soon {
+  color: var(--gold-bright);
+  text-shadow: 0 0 10px color-mix(in srgb, var(--gold-bright) 40%, transparent);
+}
+
+/* ---- player rail --------------------------------------------------------------- */
+
+.player-rail {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: stretch;
+  /* rows pack from the top, so a partially-scrolled rail never floats its rows */
+  align-content: flex-start;
+  gap: 10px;
+  /*  20 seats. See `--rail-max-h`: bounded height + internal scroll, so the
+      felt's share of the stage is the same with 2 players and with 20.
+      The padding is not cosmetic — `.player-chip.current` lifts 4 px and paints
+      a 5 px ring, and an `overflow` container with no padding would slice both
+      off. `overflow-x: hidden` keeps the page itself free of a horizontal
+      scrollbar at 360 px, which is a layout bug there, never content. */
+  /* offsetParent for the chips, so game.ts's keep-the-roller-visible scroll
+     measures against the rail and not against `.table-stage` */
+  position: relative;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: var(--felt-w);
+  max-height: var(--rail-max-h);
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 10px 6px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--gold-deep) transparent;
+}
+
+/*  `.scrolls` is set by game.ts only when the rail actually overflows (it can
+    still do so on a phone, where 32 chips are ~11 rows). A hard cut at the cap
+    reads as a clipping BUG; a short fade at the bottom edge reads as "there is
+    more below". Deliberately short (18 px) so it never obscures a whole chip —
+    the roller is scrolled into view separately. */
+.player-rail.scrolls {
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 18px), transparent 100%);
+}
+
+.player-chip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  border: 1px solid color-mix(in srgb, var(--gold) 26%, transparent);
+  border-radius: 999px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--felt) 46%, var(--ink-lit)),
+    color-mix(in srgb, var(--felt-deep) 62%, var(--ink))
+  );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--felt-light) 30%, transparent),
+    0 4px 12px -4px var(--shadow-hard);
+  font-size: 15px;
+  transition: box-shadow 150ms ease, border-color 150ms ease, transform 150ms ease,
+    background 150ms ease;
+}
+
+/*  CURRENT TURN — four independent cues, none of them colour alone (§5):
+    a leading caret (shape), a lift (position), heavier type (weight), a ring. */
+.player-chip.current {
+  border-color: var(--gold);
+  border-width: 2px;
+  padding: 9px 15px;
+  transform: translateY(-4px);
+  font-weight: 700;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--gold) 40%, transparent),
+    0 0 0 2px color-mix(in srgb, var(--gold) 28%, transparent),
+    0 10px 22px -8px var(--shadow-hard);
+  animation: turn-ring 1.6s ease-in-out infinite;
+}
+
+.player-chip.current::before {
+  content: '▶';
+  font-size: 11px;
+  line-height: 1;
+  color: var(--gold-bright);
+  text-shadow: 0 0 8px color-mix(in srgb, var(--gold-bright) 60%, transparent);
+}
+
+@keyframes turn-ring {
+  0%,
+  100% {
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, var(--gold) 40%, transparent),
+      0 0 0 2px color-mix(in srgb, var(--gold) 28%, transparent),
+      0 10px 22px -8px var(--shadow-hard);
+  }
+  50% {
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, var(--gold) 40%, transparent),
+      0 0 0 5px color-mix(in srgb, var(--gold) 14%, transparent),
+      0 10px 22px -8px var(--shadow-hard);
+  }
+}
+
+.player-chip.you {
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--gold) 20%, var(--ink-lit)),
+    color-mix(in srgb, var(--felt-deep) 60%, var(--ink))
+  );
+}
+
+.player-chip.offline {
+  opacity: 0.4;
+  filter: saturate(0.4);
+  border-style: dashed;
+}
+
+/* round seat marker; carries the player's initial when B2 supplies one */
+.player-avatar {
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  border: 1px solid color-mix(in srgb, var(--gold-deep) 60%, transparent);
+  background: linear-gradient(160deg, var(--rail-lit), var(--rail) 55%, var(--rail-deep));
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--gold) 26%, transparent),
+    0 2px 5px -2px var(--shadow-hard);
+  color: var(--gold-bright);
+  font-size: 13px;
+  font-weight: 800;
+  text-transform: uppercase;
+  overflow: hidden;
+}
+
+.player-name {
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.player-you {
+  padding: 2px 7px;
+  border-radius: 5px;
+  background: linear-gradient(180deg, var(--gold-bright), var(--gold));
+  color: var(--ink);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+}
+
+.player-score {
+  color: var(--gold-bright);
+  font-family: var(--serif);
+  font-size: 19px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  text-shadow: 0 1px 0 var(--ink-deep);
+}
+
+/* banked tick — colour PLUS a glyph and a filled disc, never colour alone */
+.player-banked {
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  border: 1px solid transparent;
+  font-size: 12px;
+  color: transparent;
+}
+
+.player-banked.on {
+  border-color: color-mix(in srgb, var(--bank) 70%, transparent);
+  background: color-mix(in srgb, var(--bank) 24%, transparent);
+  color: var(--bank);
+  font-weight: 800;
+}
+
+/* short status word (TURN / BANKED / OUT) — a bordered pill, so state survives
+   greyscale and colour-blind viewing */
+.player-state {
+  padding: 2px 8px;
+  border: 1px solid color-mix(in srgb, var(--cream-faint) 70%, transparent);
+  border-radius: 999px;
+  color: var(--cream-dim);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.player-chip.current .player-state {
+  border-color: var(--gold);
+  background: var(--gold-wash);
+  color: var(--gold-bright);
+}
+
+.player-chip:has(.player-banked.on) .player-state {
+  border-color: color-mix(in srgb, var(--bank) 65%, transparent);
+  color: var(--bank);
+}
+
+/* a stack of chips standing in for the banked total; works empty (drawn) or as
+   a container of per-chip children */
+.chip-stack {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 16px;
+  border-radius: 4px;
+  background: repeating-linear-gradient(
+    180deg,
+    var(--gold) 0 3px,
+    var(--gold-deep) 3px 5px
+  );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--gold-bright) 70%, transparent),
+    0 2px 4px -2px var(--shadow-hard);
+}
+
+.chip-stack:not(:empty) {
+  width: auto;
+  height: auto;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 1px;
+  background: none;
+  box-shadow: none;
+}
+
+.chip-stack:not(:empty) > * {
+  width: 22px;
+  height: 4px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, var(--gold-bright), var(--gold) 50%, var(--gold-deep));
+}
+
+/* ---- dense rail (13+ seats) -------------------------------------------------------
+
+   MAX_PLAYERS is 32. At full chip size that is ~150 px x 32 = five wrapped rows
+   on a 1120 px felt and eleven on a 430 px phone — a wall of chips, not a rail.
+   Past `DENSE_SEATS` (game.ts) the rail switches to this compact form, which
+   fits 32 seats into ~4 rows at 1600x900 with no scrolling at all.
+
+   What is dropped is only REDUNDANT signal: the per-chip prose ('IN' /
+   'BANKED' / 'AWAY') and the decorative chip stack. Every state still carries a
+   non-colour cue without them (VISUAL_UPGRADE §5) — current keeps its caret,
+   lift, ring and weight; banked keeps the ✓ glyph; offline keeps the dashed
+   border. The prose is KEPT on the current chip, the one seat where it earns
+   its width. Score and name — the two things you actually scan a rail for —
+   are untouched.                                                              */
+
+.player-rail.dense {
+  gap: 7px;
+}
+
+/*  Row PITCH is what decides whether 32 seats fit: at ~6 chips per row a 32-seat
+    rail is six rows, so every pixel of chip height costs six. 4 px of vertical
+    padding on a 20 px avatar gives a 30 px chip and a 36 px pitch, which lands
+    the whole rail inside `--rail-max-h` at 1600x900. Horizontal padding is left
+    generous — it costs nothing in height and keeps the chips from looking
+    starved. */
+.player-rail.dense .player-chip {
+  gap: 7px;
+  padding: 4px 11px;
+  font-size: 13px;
+}
+
+.player-rail.dense .player-chip.current {
+  padding: 3px 10px; /* 2 px border compensation, as in the base rule */
+  transform: translateY(-2px); /* a smaller lift: the rows are tighter here */
+}
+
+.player-rail.dense .player-avatar {
+  width: 20px;
+  height: 20px;
+  font-size: 10px;
+}
+
+/*  16-char names are legal; unbounded they defeat the whole point of the dense
+    row. Truncate with an ellipsis and keep the full name in the queue strip and
+    the log. */
+.player-rail.dense .player-name {
+  max-width: 9ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.player-rail.dense .player-you {
+  padding: 1px 5px;
+  font-size: 9px;
+}
+
+.player-rail.dense .chip-stack,
+.player-rail.dense .player-state {
+  display: none;
+}
+
+/* the one seat where the word is worth its width */
+.player-rail.dense .player-chip.current .player-state {
+  display: inline-block;
+}
+
+/* ---- narrow / short: give height back to the felt ---------------------------------
+
+   Must sit AFTER the queue and rail base rules — same specificity, source order
+   decides the winner. (The portrait block up by `.felt` is above them, so
+   putting these there would silently do nothing; that exact trap is documented
+   at the top of that block.)                                                   */
+
+@media (orientation: portrait), (max-height: 640px) {
+  .turn-queue {
+    gap: 4px 9px;
+    padding: 5px 11px;
+    font-size: 12px;
+  }
+
+  /* the ETA is the line a waiting player needs; 'UP NEXT' is the line they can
+     infer from the plaques themselves. Drop the label, keep the ETA. */
+  .turn-queue-label {
+    display: none;
+  }
+
+  /*  ONE LINE, always. Left to wrap, four name plaques plus the ETA take three
+      lines at 360 px — 74 px of a 554 px stage, taken from the felt and from
+      the log strip (which had collapsed to a 19 px sliver). Nowrap + an
+      internal horizontal scroll pins the height at one line and keeps the ETA
+      anchored on the right, where it is the part that must never scroll away.
+      The scroll is INSIDE the strip; the page itself still never scrolls
+      sideways, which is the actual responsive contract. */
+  .turn-queue {
+    flex-wrap: nowrap;
+    overflow: hidden;
+  }
+
+  .turn-queue-list {
+    flex: 1 1 auto;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .turn-queue-list::-webkit-scrollbar {
+    display: none;
+  }
+
+  .turn-queue-item {
+    flex: 0 0 auto;
+    max-width: 8ch;
+    padding: 2px 7px;
+  }
+
+  .turn-queue-eta {
+    padding-left: 9px;
+    font-size: 9px;
+    letter-spacing: 0.1em;
+  }
+
+  .player-rail {
+    max-height: clamp(92px, 19vh, 175px);
+    padding: 8px 4px;
+  }
+
+  /*  32 seats on a 410 px column. At the desktop dense width only TWO chips fit
+      per row, which turns the rail into a 16-row column that is 90 % scrolled
+      out of view. Trading name length for a third column halves the row count,
+      and the truncated name is not the load-bearing signal here: the initial in
+      the avatar and the position in the queue strip both survive intact, and
+      the full name is one tap away in the log. */
+  .player-rail.dense {
+    gap: 6px;
+  }
+
+  .player-rail.dense .player-chip {
+    gap: 5px;
+    padding: 3px 7px;
+    font-size: 12px;
+  }
+
+  .player-rail.dense .player-chip.current {
+    padding: 2px 6px;
+  }
+
+  .player-rail.dense .player-avatar {
+    width: 18px;
+    height: 18px;
+    font-size: 9px;
+  }
+
+  .player-rail.dense .player-name {
+    max-width: 6ch;
+  }
+}
+
+/* ---- actions ------------------------------------------------------------------ */
+
+.table-actions {
+  display: flex;
+  justify-content: center;
+  gap: 16px;
+}
+
+/*  START — lobby-only. Sized like ROLL because it plays the same role there:
+    the one thing to press. `btn-gold` already carries the treatment; this only
+    matches the scale so the actions row does not change height between the
+    lobby and the table. */
+.btn-start {
+  padding: clamp(13px, 2vh, 18px) clamp(26px, 4vw, 44px);
+  font-size: clamp(16px, 2.2vh, 20px);
+}
+
+/*  A disabled START still carries an instruction ("NEED 2 PLAYERS"), not a
+    dead control — the generic `.btn:disabled` rule (opacity: 0.35) would sink
+    that label into unreadable mush on top of the already-low-contrast
+    ink-on-gold `.btn-gold` fill. This keeps full opacity and swaps the fill
+    for the `--warn` semantic tone (waiting-on-a-condition, not an error, and
+    not the gold "press me" invitation) with a `--cream` label for contrast.
+    No hover/pulse: it must read as informative, not interactive. */
+.btn-start:disabled {
+  opacity: 1;
+  cursor: default;
+  background: color-mix(in srgb, var(--warn) 16%, var(--ink-lit));
+  border-color: color-mix(in srgb, var(--warn) 55%, transparent);
+  color: color-mix(in srgb, var(--warn) 35%, var(--cream));
+  box-shadow: none;
+}
+
+.btn-roll {
+  padding: clamp(13px, 2vh, 18px) clamp(32px, 5vw, 52px);
+  font-size: clamp(17px, 2.4vh, 21px);
+  border-color: var(--gold);
+  background: linear-gradient(180deg, var(--gold-bright) 0%, var(--gold) 52%, var(--gold-deep) 100%);
+  color: var(--ink);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--cream) 60%, transparent),
+    0 8px 18px -8px var(--shadow-hard);
+}
+
+.btn-roll.pulse {
+  animation: roll-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes roll-pulse {
+  0%,
+  100% {
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, var(--cream) 60%, transparent),
+      0 0 0 0 color-mix(in srgb, var(--gold-bright) 70%, transparent);
+  }
+  50% {
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, var(--cream) 60%, transparent),
+      0 0 26px 9px color-mix(in srgb, var(--gold-bright) 30%, transparent);
+  }
+}
+
+.btn-bank {
+  padding: clamp(13px, 2vh, 18px) clamp(32px, 5vw, 52px);
+  font-size: clamp(17px, 2.4vh, 21px);
+}
+
+.btn-bank:not(:disabled) {
+  border-color: color-mix(in srgb, var(--bank) 65%, transparent);
+  color: color-mix(in srgb, var(--bank) 75%, var(--cream));
+}
+
+.btn-bank:not(:disabled):hover {
+  background: color-mix(in srgb, var(--bank) 18%, transparent);
+  border-color: var(--bank);
+}
+
+/* ---- event log ----------------------------------------------------------------- */
+
+/*  The log used to be loose text on the page background. It now has a home: a
+    raised panel with a titled header, an inner shadow and per-kind accents. */
+.log-panel {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  /* fills its column; the list inside it scrolls (`.log-panel .event-log`) so
+     the panel is never the thing that grows */
+  height: 100%;
+  min-height: 108px;
+  padding: 12px 14px 14px;
+  border: 1px solid color-mix(in srgb, var(--gold) 18%, transparent);
+  border-radius: 14px;
+  background: linear-gradient(180deg, var(--panel), color-mix(in srgb, var(--ink) 88%, var(--felt-deep)));
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--cream) 8%, transparent),
+    0 14px 30px -18px var(--shadow-hard);
+}
+
+.log-title {
+  margin: 0 0 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid color-mix(in srgb, var(--gold) 20%, transparent);
+  color: var(--gold-deep);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.34em;
+  text-transform: uppercase;
+}
+
+/*  Standalone (no `log-panel` wrapper yet) the log still gets a surface of its
+    own; inside a panel it is pure content and the panel supplies the surround. */
+.event-log {
+  box-sizing: border-box;
+  min-height: 108px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-y: auto;
+  padding: 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--gold) 14%, transparent);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--ink-lit) 75%, transparent);
+  font-size: 13px;
+  color: var(--cream-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.log-panel .event-log {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+}
+
+.log-line {
+  padding: 4px 10px;
+  border-left: 3px solid color-mix(in srgb, var(--cream-faint) 45%, transparent);
+  border-radius: 0 6px 6px 0;
+  background: color-mix(in srgb, var(--ink-deep) 30%, transparent);
+}
+
+.log-line:first-child {
+  color: var(--cream);
+  background: color-mix(in srgb, var(--ink-deep) 55%, transparent);
+  animation: log-in 260ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes log-in {
+  from {
+    opacity: 0;
+    transform: translateY(-7px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* per-event-type accents: a coloured rule AND a distinct leading glyph */
+.log-kind-roll {
+  border-left-color: var(--gold);
+}
+
+.log-kind-bank {
+  border-left-color: var(--bank);
+  color: color-mix(in srgb, var(--bank) 55%, var(--cream));
+}
+
+.log-kind-bust {
+  border-left-color: var(--danger);
+  color: color-mix(in srgb, var(--danger) 45%, var(--cream));
+  font-weight: 700;
+}
+
+.log-kind-join {
+  border-left-color: var(--cream-faint);
+  color: var(--cream-faint);
+  font-style: italic;
+}
+
+.log-kind-roll::before,
+.log-kind-bank::before,
+.log-kind-bust::before,
+.log-kind-join::before {
+  margin-right: 7px;
+  font-weight: 800;
+}
+
+.log-kind-roll::before {
+  content: '⚄';
+  color: var(--gold);
+}
+
+.log-kind-bank::before {
+  content: '✓';
+  color: var(--bank);
+}
+
+.log-kind-bust::before {
+  content: '✗';
+  color: var(--danger);
+}
+
+.log-kind-join::before {
+  content: '+';
+  color: var(--cream-faint);
+}
+
+/* ---- banner -------------------------------------------------------------------- */
+
+.table-banner {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 20px;
+  background: radial-gradient(
+    ellipse 70% 60% at 50% 50%,
+    color-mix(in srgb, var(--ink) 62%, transparent) 0%,
+    color-mix(in srgb, var(--ink-deep) 88%, transparent) 100%
+  );
+  backdrop-filter: blur(2px);
+  font-family: var(--serif);
+  font-size: clamp(34px, 7vw, 64px);
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-align: center;
+  color: var(--cream);
+  text-shadow: 0 4px 24px var(--shadow-hard);
+  pointer-events: none;
+  z-index: 10;
+}
+
+.table-banner.banner-win {
+  color: var(--gold-bright);
+  text-shadow:
+    0 2px 0 var(--gold-deep),
+    0 0 44px color-mix(in srgb, var(--gold-bright) 45%, transparent);
+}
+
+.table-banner.banner-lose {
+  color: color-mix(in srgb, var(--cream) 55%, var(--danger));
+  text-shadow:
+    0 2px 0 var(--ink-deep),
+    0 0 40px color-mix(in srgb, var(--danger) 42%, transparent);
+}
+
+/*  The lobby is a state players SIT IN and interact with — read the roster,
+    press START — not a transient result they glance past. Full-stage
+    scrim+blur is right for `roundEnd`/`matchEnd` (brief, non-interactive) but
+    wrong here: it dims the START button and blurs the seated chips to
+    illegibility. `.banner-lobby` swaps the full-bleed treatment for a
+    compact plate that floats over the felt, leaving the rest of the table —
+    button, rail, log — crisp and at full contrast. */
+/*  40%, not 50%: the plate is centred on `.table-stage`, which spans the felt
+    PLUS the rail and the actions row. At 1600x900 the felt is tall enough that
+    either value lands inside it, but at 360x640 the felt is short and 50% put
+    the plate straight over the first player chip — hiding who is seated, which
+    is the one thing the lobby has to show. 40% keeps it inside the felt at
+    every viewport tested (1600x900, 430x880, 360x640). */
+.table-banner.banner-lobby {
+  inset: auto;
+  top: 40%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: min(88%, 720px);
+  padding: clamp(14px, 2.4vw, 28px) clamp(18px, 3.6vw, 40px);
+  background: color-mix(in srgb, var(--ink-deep) 78%, transparent);
+  backdrop-filter: none;
+  border-radius: 14px;
+  border: 1px solid color-mix(in srgb, var(--gold) 38%, transparent);
+  box-shadow: 0 12px 40px var(--shadow-hard);
+  font-size: clamp(20px, 3.2vw, 38px);
+}
+
+.banner-sub {
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  font-size: clamp(12px, 1.8vw, 17px);
+  font-weight: 700;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  color: var(--cream-dim);
+  text-shadow: none;
+}
+
+/* ---- motion preference ---------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .btn-roll.pulse,
+  .player-chip.current,
+  .timer-fill.low,
+  .log-line:first-child {
+    animation: none;
+  }
+
+  .log-line,
+  .player-chip,
+  .btn {
+    transition: none;
+  }
+}

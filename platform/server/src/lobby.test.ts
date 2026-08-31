@@ -942,7 +942,7 @@ describe('P2P signaling relay (docs/PLATFORM.md §12 P1)', () => {
     for (let i = 0; i < RTC.maxSignalsPerSec + 5; i++) {
       lobby.handleMessage(asSession(a), { t: 'rtc_signal', to: 'peer-b', data: { i } });
     }
-    const echoes = b.msgs.filter((m) => m.t === 'rtc_signal').length;
+    const echoes = b.all().filter((m) => m.t === 'rtc_signal').length;
     expect(echoes).toBe(RTC.maxSignalsPerSec);
   });
 
