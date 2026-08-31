@@ -46,6 +46,13 @@
 //  · pitchX is accepted per the frozen signature but intentionally unused by
 //    the camera — the gimbal law keeps the rig level ("slight roll lag"
 //    only); pitch belongs to planeModels (W2). bankZ drives the roll lag.
+//
+// §8 ALTITUDE AMENDMENT (client): follow()/camPoseFor ride the plane's REAL
+// altitude (trailing `alt` param, default cruise PLANE_Y — every pre-§8 call
+// shape is bit-identical), CAM_HEIGHT stays relative to it, and the look
+// point adds climb·LOOKAHEAD_S vertically so climbs/dives read into the
+// gimbal. project()'s wz is the ALTITUDE (default cruise); HUD call sites
+// pass each row's real alt.
 // ============================================================================
 
 import * as THREE from 'three';
@@ -166,12 +173,14 @@ export interface CamPose {
 }
 
 /**
- * THE chase-cam law as ONE pure function (§2, integrator-corrected). Forward
- * is derived FROM HEADING ONLY (model faces +X under yaw −h ⇒ scene forward
- * = (cos h, 0, sin h)) — never from velocity magnitude or direction. Camera
- * = plane − forward·CAM_DIST·zoomMult + UP·CAM_HEIGHT; look =
- * plane + forward·(|vel|·LOOKAHEAD_S) + UP·LOOK_LIFT, so idle frames (|vel|
- * ≈0) keep looking ALONG THE NOSE instead of drifting with velocity noise.
+ * THE chase-cam law as ONE pure function (§2, integrator-corrected; §8
+ * altitude amendment). Forward is derived FROM HEADING ONLY (model faces +X
+ * under yaw −h ⇒ scene forward = (cos h, 0, sin h)) — never from velocity
+ * magnitude or direction. Camera = plane − forward·CAM_DIST·zoomMult + UP·CAM_HEIGHT;
+ * look = plane + forward·(|vel|·LOOKAHEAD_S) + UP·LOOK_LIFT + UP·(climb·LOOKAHEAD_S),
+ * so idle frames (|vel| ≈0) keep looking ALONG THE NOSE and climbs/dives look
+ * slightly INTO the vertical motion (§8). The whole pose rides the plane's REAL
+ * altitude `alt` (default cruise PLANE_Y): CAM_HEIGHT stays relative to it.
  * zoomMult scales CHASE DISTANCE ONLY (re-clamped 0.5–6). Pass `out` to
  * reuse a pose record — the per-frame rig path allocates nothing.
  */
@@ -181,6 +190,8 @@ export function camPoseFor(
   vel: { x: number; y: number },
   zoomMult: number,
   out?: CamPose,
+  alt: number = PLANE_Y,
+  climb: number = 0,
 ): CamPose {
   const fx = Math.cos(h);
   const fz = Math.sin(h);
@@ -188,10 +199,10 @@ export function camPoseFor(
   const ahead = Math.hypot(vel.x, vel.y) * CAMERA.LOOKAHEAD_S;
   const p = out ?? { camX: 0, camY: 0, camZ: 0, lookX: 0, lookY: 0, lookZ: 0 };
   p.camX = pos.x - fx * dist;
-  p.camY = PLANE_Y + CAM_HEIGHT;
+  p.camY = alt + CAM_HEIGHT;
   p.camZ = pos.y - fz * dist;
   p.lookX = pos.x + fx * ahead;
-  p.lookY = PLANE_Y + LOOK_LIFT;
+  p.lookY = alt + LOOK_LIFT + climb * CAMERA.LOOKAHEAD_S;
   p.lookZ = pos.y + fz * ahead;
   return p;
 }
@@ -336,6 +347,10 @@ export interface AcesRig {
     bankZ: number,
     pitchX: number,
     dt: number,
+    /** Plane altitude, u (§8) — the rig tracks the plane at its REAL height. */
+    alt?: number,
+    /** Vertical speed, u/s (§8) — look point adds climb·LOOKAHEAD_S vertically. */
+    climb?: number,
   ): void;
   /** Slow orbit around the last focus after own death; t = absolute time. */
   orbitDeath(t: number): void;
@@ -375,9 +390,11 @@ class RigImpl implements AcesRig {
     bankZ: number,
     pitchX: number,
     dt: number,
+    alt: number = PLANE_Y,
+    climb: number = 0,
   ): void {
     void pitchX; // see header deviation: gimbal stays level by law
-    this.host.follow(pos, vel, heading, bankZ, dt);
+    this.host.follow(pos, vel, heading, bankZ, dt, alt, climb);
   }
 
   orbitDeath(t: number): void {
@@ -486,17 +503,21 @@ class AcesSceneImpl implements AcesScene {
     heading: number,
     bankZ: number,
     dt: number,
+    alt: number,
+    climb: number,
   ): void {
     const dtc = Math.max(0, Math.min(0.1, dt));
-    this.planeScratch.set(pos.x, PLANE_Y, pos.y);
+    this.planeScratch.set(pos.x, alt, pos.y);
     this.lastFocus.copy(this.planeScratch);
 
     // THE pose law via the exported pure function (out-param → zero alloc):
     // forward FROM HEADING, chase behind it, lookahead ALONG it by true
-    // speed. vel MUST be true velocity (app feeds vx/vy) — feeding position
-    // here made the look point position-proportional and swung the gimbal
-    // around the plane (nose toward lens on west headings).
-    const pose = camPoseFor(pos, heading, vel, this.zoomMult, this.poseScratch);
+    // speed; §8 — the whole pose rides the plane's real ALTITUDE and the
+    // look point adds climb·LOOKAHEAD_S vertically. vel MUST be true
+    // velocity (app feeds vx/vy) — feeding position here made the look
+    // point position-proportional and swung the gimbal around the plane
+    // (nose toward lens on west headings).
+    const pose = camPoseFor(pos, heading, vel, this.zoomMult, this.poseScratch, alt, climb);
     this.desiredScratch.set(pose.camX, pose.camY, pose.camZ);
     this.lookTgtScratch.set(pose.lookX, pose.lookY, pose.lookZ);
 
@@ -541,12 +562,14 @@ class AcesSceneImpl implements AcesScene {
   }
 
   project(wx: number, wy: number, wz?: number): ScreenPoint {
-    // §2 seam contract: SERVER-world coords in, optional ALTITUDE third.
-    // Scene mapping per §1 law: X = wx · Z = wy · Y = wz ?? PLANE_Y. The
-    // original implementation fed (wx, wy, wz) straight into the scene
-    // vector — server-y became altitude and altitude became Z — so every
-    // three-arg HUD projection (crosshair / lead pip) landed kilometres
-    // off-screen while the two-arg edge arrows clamped garbage into view.
+    // §2 seam contract + §8 law: SERVER-world coords in, optional ALTITUDE
+    // third — wz is the target's ALTITUDE in u (call sites pass each row's
+    // real alt; the default is cruise PLANE_Y). Scene mapping per §1 law:
+    // X = wx · Z = wy · Y = wz ?? PLANE_Y. The original implementation fed
+    // (wx, wy, wz) straight into the scene vector — server-y became altitude
+    // and altitude became Z — so every three-arg HUD projection (crosshair /
+    // lead pip) landed kilometres off-screen while the two-arg edge arrows
+    // clamped garbage into view.
     this.pvScratch.set(wx, wz ?? PLANE_Y, wy);
     this.camera.updateMatrixWorld();
     this.pvScratch.project(this.camera);

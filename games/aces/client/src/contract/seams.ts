@@ -19,6 +19,7 @@ import type { SnapPlane } from '@aces/shared/protocol';
 export interface InputSource {
   readonly th: number; //   −0.3..1
   readonly tr: number; //   −1..1
+  readonly pit: number; //  −1 dive .. +1 climb (CONTRACT.md §8)
   readonly fire: boolean;
   readonly boost: boolean;
 }
@@ -136,8 +137,9 @@ export interface OverlayModel {
   speedFrac: number; //   speed / class speedMax
   heat: number;
   jammed: boolean;
-  /** Enemy planes in snapshot order, world-space (HUD projects for edge arrows). */
-  targets: ReadonlyArray<{ x: number; y: number; team: TeamId; cls: PlaneClassId; hpFrac: number }>;
+  /** Enemy planes in snapshot order, world-space (HUD projects for edge arrows).
+   *  `alt` is each target's real altitude, u — projections must ride it (§8). */
+  targets: ReadonlyArray<{ x: number; y: number; alt: number; team: TeamId; cls: PlaneClassId; hpFrac: number }>;
   cam: CameraView;
   /** Snapshot ticks of the last own-hit-confirm / own-hurt (marker & arc flashes). */
   hitConfirmTick: number;
@@ -176,6 +178,7 @@ export interface HudModel {
     team: TeamId;
     hp: number;
     maxHp: number;
+    alt: number; //      altitude above the sea, u (0..ALT.MAX) — altimeter row (§8)
     heat: number;
     jammed: boolean;
     boost: number;

@@ -108,6 +108,7 @@ function parseSnapPlane(v: unknown): SnapPlane | null {
   if (
     !num(v.x) || !num(v.y) || !num(v.h) || !num(v.sp) ||
     !num(v.vx) || !num(v.vy) || !num(v.hp) || !num(v.maxHp) ||
+    !num(v.alt) || !num(v.climb) ||
     !num(v.heat) || !num(v.boost) || !num(v.throttle) ||
     !num(v.invulnT) || !num(v.streak) || !num(v.seq)
   ) {
@@ -116,7 +117,7 @@ function parseSnapPlane(v: unknown): SnapPlane | null {
   return {
     id: v.id, name: v.name, team, cls, bot: v.bot,
     x: v.x, y: v.y, h: v.h, sp: v.sp, vx: v.vx, vy: v.vy,
-    hp: v.hp, maxHp: v.maxHp, heat: v.heat, jammed: v.jammed,
+    hp: v.hp, maxHp: v.maxHp, alt: v.alt, climb: v.climb, heat: v.heat, jammed: v.jammed,
     boost: v.boost, boosting: v.boosting, throttle: v.throttle,
     invulnT: v.invulnT, dead: v.dead, streak: v.streak, seq: v.seq,
   };
@@ -366,6 +367,8 @@ export class RemoteInterp {
         copyInto(slot, row);
         slot.x = prev.x + (row.x - prev.x) * alpha;
         slot.y = prev.y + (row.y - prev.y) * alpha;
+        slot.alt = prev.alt + (row.alt - prev.alt) * alpha;
+        slot.climb = row.climb;
         // Shortest arc: delta in (−π, π], scaled, re-wrapped into [0, 2π).
         slot.h = wrapAngle(prev.h + angleDelta(prev.h, row.h) * alpha);
       }
@@ -381,7 +384,7 @@ export class RemoteInterp {
       s = {
         id: src.id, name: '', team: src.team, cls: src.cls, bot: false,
         x: 0, y: 0, h: 0, sp: 0, vx: 0, vy: 0,
-        hp: 0, maxHp: 1, heat: 0, jammed: false,
+        hp: 0, maxHp: 1, alt: 0, climb: 0, heat: 0, jammed: false,
         boost: 0, boosting: false, throttle: 0,
         invulnT: 0, dead: false, streak: 0, seq: 0,
       };
@@ -412,6 +415,8 @@ function copyInto(dst: SnapPlane, src: SnapPlane): void {
   dst.vy = src.vy;
   dst.hp = src.hp;
   dst.maxHp = src.maxHp;
+  dst.alt = src.alt; // §8
+  dst.climb = src.climb;
   dst.heat = src.heat;
   dst.jammed = src.jammed;
   dst.boost = src.boost;
@@ -590,9 +595,9 @@ export function createNet(): NetClient {
       });
     },
 
-    sendInput(frame: { seq: number; th: number; tr: number; fire: boolean; boost: boolean }): void {
+    sendInput(frame: { seq: number; th: number; tr: number; pit: number; fire: boolean; boost: boolean }): void {
       // Called by the app at TICK_RATE (30 Hz) — ownership ruling in header.
-      sendRaw({ t: 'input', seq: frame.seq, th: frame.th, tr: frame.tr, fire: frame.fire, boost: frame.boost });
+      sendRaw({ t: 'input', seq: frame.seq, th: frame.th, tr: frame.tr, pit: frame.pit, fire: frame.fire, boost: frame.boost });
     },
 
     sendSpawn(cls: PlaneClassId): void {

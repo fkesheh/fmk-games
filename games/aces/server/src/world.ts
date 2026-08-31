@@ -24,9 +24,11 @@
 // ============================================================================
 
 import {
+  ALT,
   BOOST_MAX,
   BURN_DPS,
   CLASSES,
+  PLANE_Y,
   CRATES_MAX,
   CRATE_FALL_S,
   CRATE_HEAL,
@@ -48,7 +50,7 @@ export interface WorldStats {
 }
 
 /** Input applied when a plane has sent nothing yet — hands off, cruise throttle. */
-const NEUTRAL_INPUT: InputFrame = { seq: 0, th: 0, tr: 0, fire: false, boost: false };
+const NEUTRAL_INPUT: InputFrame = { seq: 0, th: 0, tr: 0, pit: 0, fire: false, boost: false };
 
 const DEG2RAD = Math.PI / 180;
 
@@ -123,6 +125,8 @@ export class World {
       vx: 0,
       vy: 0,
       h: Math.atan2(this.map.h / 2 - field.y, this.map.w / 2 - field.x),
+      alt: PLANE_Y, // cruise altitude — the seat starts parked at cruise height (§8)
+      climb: 0,
       hp: CLASSES.fighter.hp,
       heat: 0,
       jammed: false,
@@ -165,7 +169,7 @@ export class World {
    * streak is intentionally untouched — only dying resets it, and spawn()
    * only ever follows a death or a fresh seat (both already 0).
    */
-  spawn(id: string, cls: PlaneClassId): void {
+  spawn(id: string, cls: PlaneClassId, altOverride?: number): void {
     const p = this.planeById(id);
     if (!p) return;
     const field = p.team === 'royal' ? this.map.fields[0] : this.map.fields[1];
@@ -176,6 +180,8 @@ export class World {
     p.h = Math.atan2(this.map.h / 2 - field.y, this.map.w / 2 - field.x);
     p.vx = Math.cos(p.h) * spec.speedMin;
     p.vy = Math.sin(p.h) * spec.speedMin;
+    p.alt = altOverride ?? PLANE_Y; // humans cruise; bots take off in their patrol band (§8)
+    p.climb = 0;
     p.hp = spec.hp;
     p.heat = 0;
     p.jammed = false;
@@ -234,6 +240,35 @@ export class World {
     // -- 1. flight: every plane integrates its latest stored input ------------
     for (const p of this.planes) {
       stepPlane(p, this.inputs.get(p.id) ?? NEUTRAL_INPUT, dt);
+    }
+
+    // -- 1b. the sea takes planes at/below ALT.CRASH (CONTRACT.md §8) ---------
+    // Hard flight law, NOT damage: neither spawn protection nor god shields a
+    // plane from the water — invuln gates bullets, physics gates the sea. The
+    // check runs immediately after flight so a drowned plane fires no volley
+    // and is unhittable this tick (dead planes are skipped downstream), and
+    // the burn loop below can never double-kill it. Same crash flow as the
+    // burn death: no ticket, killer fields carry the victim.
+    for (const p of this.planes) {
+      if (p.dead || p.alt > ALT.CRASH) continue;
+      p.hp = 0;
+      p.dead = true;
+      p.streak = 0;
+      ev.push({
+        kind: 'kill',
+        killer: p.id,
+        killerName: p.name,
+        victim: p.id,
+        victimName: p.name,
+        killerTeam: p.team,
+        victimTeam: p.team,
+        killerCls: p.cls,
+        victimCls: p.cls,
+        crash: true,
+        streak: 0,
+        x: p.x,
+        y: p.y,
+      });
     }
 
     // -- 2. firing: volley gating lives in shared fireVolley ------------------

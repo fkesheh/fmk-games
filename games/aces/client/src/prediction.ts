@@ -34,7 +34,7 @@
 // InputFrame is readonly, so sharing the app's object is safe and free.
 // ============================================================================
 
-import {
+import { PLANE_Y,
   BOOST_MAX,
   CLASSES,
   NET,
@@ -71,7 +71,7 @@ const MAX_PENDING = 240;
 /** Input held before the first onLocalInput (and conceptually between
  *  queued frames): protocol-neutral zeros — glide at min throttle, no turn,
  *  no fire. Not a tunable; the absence of intent. */
-const NEUTRAL_INPUT: InputFrame = { seq: 0, th: 0, tr: 0, fire: false, boost: false };
+const NEUTRAL_INPUT: InputFrame = { seq: 0, th: 0, tr: 0, pit: 0, fire: false, boost: false };
 
 export class OwnPredictor {
   /** Live own-plane state, mutated IN PLACE — the reference the app/render
@@ -108,6 +108,8 @@ export class OwnPredictor {
       h: 0,
 
       hp: CLASSES[cls].hp,
+      alt: PLANE_Y, // §8: cruise until the first you-row corrects it
+      climb: 0,
       heat: 0,
       jammed: false,
       boost: BOOST_MAX,
@@ -248,6 +250,8 @@ export class OwnPredictor {
       // regenerates them from the eased pose.
       this.state.x -= errX * NET.RECONCILE_BLEND;
       this.state.y -= errY * NET.RECONCILE_BLEND;
+      this.state.alt -= (this.state.alt - you.alt) * NET.RECONCILE_BLEND;
+      this.state.climb = you.climb;
       this.state.h = wrapAngle(this.state.h + angleDelta(this.state.h, you.h) * NET.RECONCILE_BLEND);
     }
 
@@ -271,6 +275,8 @@ export class OwnPredictor {
   private copyMovement(you: SnapPlane): void {
     this.state.x = you.x;
     this.state.y = you.y;
+    this.state.alt = you.alt;
+    this.state.climb = you.climb;
     this.state.h = you.h;
     this.state.vx = you.vx;
     this.state.vy = you.vy;

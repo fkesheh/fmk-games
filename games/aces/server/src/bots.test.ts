@@ -13,7 +13,7 @@
 // RIM_MARGIN_U 260 on the 4200×3000 strait, and dt = 1/30 (TICK_RATE).
 // ============================================================================
 import { describe, expect, it } from 'vitest';
-import { BOOST_MAX, BOT_AI, BOT_DIFFICULTY, CLASSES } from '@aces/shared/config';
+import { BOOST_MAX, BOT_AI, BOT_DIFFICULTY, CLASSES, PLANE_Y } from '@aces/shared/config';
 import type { BotDifficultySpec, TeamId } from '@aces/shared/config';
 import { buildMap, mulberry32 } from '@aces/shared/maps';
 import { stepPlane } from '@aces/shared/physics';
@@ -41,6 +41,8 @@ function mkPlane(id: string, team: TeamId, over: Partial<PlaneState> = {}): Plan
     vy: 0,
     h: 0,
     hp: CLASSES.fighter.hp,
+    alt: PLANE_Y, // cruise altitude (§8)
+    climb: 0,
     heat: 0,
     jammed: false,
     boost: BOOST_MAX,
@@ -193,6 +195,61 @@ describe('Evade', () => {
   });
 });
 
+describe('Altitude stick (§8)', () => {
+  /** Snapshot pursuit duel: mark dead ahead 400u, stationary, so the intercept
+   *  sits on the nose and the ONLY thing under test is the pit axis. */
+  function pursuitDuel(selfAlt: number, foeAlt: number): { intent: InputFrame; foe: PlaneState } {
+    const self = mkPlane('me', 'royal', { x: 2100, y: 1500, h: 0, vx: 110, alt: selfAlt });
+    const foe = mkPlane('t', 'iron', { x: 2500, y: 1500, alt: foeAlt });
+    return { intent: computeIntent(viewOf(self, [foe]), STEADY, mulberry32(1), memOn('t'), DT), foe };
+  }
+
+  it('pursuing a HIGHER foe climbs; a LOWER one dives; inside the ±6u band levels off', () => {
+    // Self at 20u — safely above the 14u ground-avoid reflex so the pursuit
+    // layer visibly owns the stick (at cruise 12 the reflex would override).
+    expect(pursuitDuel(20, 30).intent.pit).toBe(0.8); // foe 10u above → climb
+    expect(pursuitDuel(20, 0).intent.pit).toBe(-0.8); // foe 20u below → dive
+    expect(pursuitDuel(20, 15).intent.pit).toBe(0); // 5u apart — inside the deadband
+    expect(pursuitDuel(20, 14).intent.pit).toBe(0); // exactly 6u — still level (inclusive)
+  });
+
+  it('GROUND AVOID outranks pursuit below 14u: climb reflex, not altitude matching', () => {
+    // Foe 30u above: pursuit alone would command +0.8; the sea reflex caps the
+    // stick at +0.6 — the override REPLACES the layer, it does not blend.
+    expect(pursuitDuel(10, 40).intent.pit).toBe(0.6);
+    // Even a foe BELOW (pursuit wants −0.8) cannot push the stick down at 10u.
+    expect(pursuitDuel(10, 0).intent.pit).toBe(0.6);
+    // Just above the reflex line, altitude matching owns the stick again.
+    expect(pursuitDuel(14, 40).intent.pit).toBe(0.8);
+  });
+
+  it('evade dive-pulses: bleeds altitude above 30u, claws back below it', () => {
+    const threat = mkPlane('t', 'iron', { x: 2400, y: 1200 });
+    const high = mkPlane('me', 'royal', { x: 2100, y: 1500, h: 0, vx: 110, hp: 30, alt: 40 });
+    expect(computeIntent(viewOf(high, [threat]), STEADY, mulberry32(1), memOn('t'), DT).pit).toBe(-0.6);
+    const low = mkPlane('me', 'royal', { x: 2100, y: 1500, h: 0, vx: 110, hp: 30, alt: 20 });
+    expect(computeIntent(viewOf(low, [threat]), STEADY, mulberry32(1), memOn('t'), DT).pit).toBe(0.4);
+  });
+
+  it('respects the ceiling: no climb commanded above 82u, even with the foe above', () => {
+    // At 83u a foe at the ALT.MAX ceiling (90) is 7u above → pursuit wants
+    // +0.8; the ceiling law zeroes it. One metre lower it still climbs.
+    expect(pursuitDuel(83, 90).intent.pit).toBe(0);
+    expect(pursuitDuel(81, 90).intent.pit).toBe(0.8);
+  });
+
+  it('every layer emits pit within the −1..1 clamp', () => {
+    const frames: InputFrame[] = [];
+    for (const [selfAlt, foeAlt] of [[0, 90], [85, 90], [13, 90], [40, 0]] as const) {
+      frames.push(pursuitDuel(selfAlt, foeAlt).intent);
+    }
+    for (const f of frames) {
+      expect(f.pit).toBeGreaterThanOrEqual(-1);
+      expect(f.pit).toBeLessThanOrEqual(1);
+    }
+  });
+});
+
 describe('Reaction memory', () => {
   it('first contact costs the reaction clock before tracking begins', () => {
     // Fresh brain spots a perfect broadside solution dead ahead — and must
@@ -296,7 +353,7 @@ describe('Determinism', () => {
         const f = computeIntent(view, BOT_DIFFICULTY.normal, rng, mem, DT);
         frames.push(JSON.stringify(f));
         stepPlane(me, f, DT);
-        stepPlane(foe, { seq: i, th: 1, tr: Math.sin(i * 0.11) * 0.7, fire: false, boost: false }, DT);
+        stepPlane(foe, { seq: i, th: 1, tr: Math.sin(i * 0.11) * 0.7, pit: 0, fire: false, boost: false }, DT);
       }
       return { frames, end: JSON.stringify({ me, foe }) };
     };

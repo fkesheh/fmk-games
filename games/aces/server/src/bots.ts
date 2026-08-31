@@ -12,6 +12,10 @@
 //   1. RIM         — dying on the map edge is a free kill for the enemy team;
 //                    inside BOT_AI.RIM_MARGIN_U the steering wheel belongs to
 //                    the map center, strongest priority of all.
+//   1b. GROUND AVOID — the sea kills as surely as the rim (§8): below 14u alt
+//                    the pit stick is a climb reflex, ranked WITH the rim (rim
+//                    owns the wheel, this owns the stick; both outrank evade
+//                    and pursuit).
 //   2. EVADE       — below BOT_AI.EVADE_HP_FRACTION hp: break OFF. Hard
 //                    perpendicular turn away from the nearest threat denies
 //                    the enemy's lead solution; trigger stays cold (a nose
@@ -108,6 +112,37 @@ const EVADE_BOOST_FUEL = 40; // config-adjacent: the brief fixes ">40" verbatim.
 const BOOST_BLIP_ODDS = 0.03;
 const BOOST_BLIP_MIN_FUEL = 55;
 
+// --- altitude knobs (CONTRACT.md §8 behavior law; the brief fixes each value
+//     verbatim — same discipline as EVADE_BOOST_FUEL above). ---------------------
+
+/** Altitude-match deadband while pursuing, u: inside ±6 of the foe's band the
+ *  stick is level — chasing a mirror-image altitude wastes deflection that
+ *  belongs to the turn. */
+const ALT_MATCH_DEADBAND_U = 6;
+
+/** Pursuit deflection out of the foe's band: climb when he is above, dive when
+ *  below. A committed mid-stick, not a slam — altitude is a slower axis than
+ *  heading and yanking it costs speed (ALT.SPEED_CLIMB). */
+const ALT_MATCH_PIT = 0.8;
+
+/** Evade altitude strategy: above 30u the sky is free — dive-pulse (−0.6) to
+ *  trade height for escape speed; below it, claw back up (+0.4) so the break
+ *  never becomes a sea dive. */
+const EVADE_ALT_HIGH_U = 30;
+const EVADE_PIT_DIVE = -0.6;
+const EVADE_PIT_CLIMB = 0.4;
+
+/** GROUND AVOID reflex, ranked with rim avoidance: below 14u the sea is at
+ *  ALT.CRASH +2.8u — climb NOW regardless of pursuit/evade. Like the rim, it
+ *  is a reflex layer: NOT gated by the reaction clock, and it only owns the
+ *  pit axis, so it composes with rim steering (turn home + climb). */
+const GROUND_AVOID_ALT_U = 14;
+const GROUND_AVOID_PIT = 0.6;
+
+/** Ceiling respect: above 82u (8u under ALT.MAX) never command climb — the
+ *  frozen stepPlane pins alt at the ceiling and bleeds the command anyway. */
+const CEILING_ALT_U = 82;
+
 const DEG2RAD = Math.PI / 180;
 
 function findById(others: readonly PlaneState[], id: string | null): PlaneState | null {
@@ -170,7 +205,7 @@ export function computeIntent(
   const roll = rng();
 
   if (self.dead) {
-    return { seq: 0, th: 0, tr: 0, fire: false, boost: false };
+    return { seq: 0, th: 0, tr: 0, pit: 0, fire: false, boost: false };
   }
 
   // --- 1 · TARGET ACQUISITION (arm → hold → commit) ----------------------------
@@ -231,6 +266,7 @@ export function computeIntent(
   let tr = 0;
   let th = 1; // full throttle otherwise (brief law)
   let boost = false;
+  let pit = 0; // altitude stick — layered below like tr (CONTRACT.md §8)
 
   // --- 2 · RIM AVOIDANCE (strongest priority) ----------------------------------
   //
@@ -269,6 +305,9 @@ export function computeIntent(
     // Pulse, don't pour: sin-gated on the weave oscillator (~half duty cycle)
     // preserves escape fuel while still opening distance every other beat.
     boost = Math.sin(mem.weavePhase) > 0 && self.boost > EVADE_BOOST_FUEL;
+    // Dive-pulse: high in the sky, trade altitude for speed; low already,
+    // ease back up so the defensive circle never spirals into the sea.
+    pit = self.alt > EVADE_ALT_HIGH_U ? EVADE_PIT_DIVE : EVADE_PIT_CLIMB;
   } else if (aim !== null && lead !== null) {
     // --- 4 · PURSUIT: fly the INTERCEPT, not the chase -------------------------
     //
@@ -280,11 +319,25 @@ export function computeIntent(
     const err = angleDelta(self.h, Math.atan2(lead.y - self.y, lead.x - self.x) + weave);
     tr = clamp(err * TURN_GAIN, -1, 1);
     th = 1;
+    // Altitude match: climb/dive toward the mark's band, deadband ±6u — a
+    // pilot levels off inside his foe's layer so the gun band stays live.
+    const dAlt = aim.alt - self.alt;
+    pit = dAlt > ALT_MATCH_DEADBAND_U ? ALT_MATCH_PIT : dAlt < -ALT_MATCH_DEADBAND_U ? -ALT_MATCH_PIT : 0;
     // Occasional boost blip for closure — the single rng draw of the tick.
     boost = roll < BOOST_BLIP_ODDS && self.boost > BOOST_BLIP_MIN_FUEL;
   }
   // else: empty sky (or mid-reaction with no held course) — cruise straight,
   // full throttle, hands light on the stick.
+
+  // --- 4b · GROUND AVOID (reflex, ranks with rim) + ceiling respect ------------
+  //
+  // Below 14u the sea is seconds away at dive rates — climb NOW, outranking
+  // pursuit AND evade (§8). Composes with the rim: rim owns the wheel, this
+  // owns the stick. Above 82u never command climb (the ceiling law would pin
+  // it anyway). Final clamp is belt-and-braces: every layer emits |pit| ≤ 1.
+  if (self.alt < GROUND_AVOID_ALT_U) pit = GROUND_AVOID_PIT;
+  if (self.alt > CEILING_ALT_U && pit > 0) pit = 0;
+  pit = clamp(pit, -1, 1);
 
   // --- 5 · TRIGGER -----------------------------------------------------------------
   //
@@ -309,5 +362,5 @@ export function computeIntent(
 
   // seq is stamped by the room when it files the frame per player (same
   // convention as World.NEUTRAL_INPUT); the brain has no seat identity.
-  return { seq: 0, th: clamp(th, -0.3, 1), tr: clamp(tr, -1, 1), fire, boost };
+  return { seq: 0, th: clamp(th, -0.3, 1), tr: clamp(tr, -1, 1), pit, fire, boost };
 }

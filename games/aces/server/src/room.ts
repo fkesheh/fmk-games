@@ -502,7 +502,7 @@ export class AcesRoom implements GameRoomHandle {
       if (!seat.awaitingRespawn) continue;
       if (this.world.tick < seat.respawnReadyTick) continue;
       if (seat.bot && seat.botRng !== null) {
-        this.world.spawn(seat.id, pickBotClass(seat.botRng));
+        this.world.spawn(seat.id, pickBotClass(seat.botRng), this.patrolAltFor(seat.id));
         seat.awaitingRespawn = false;
       } else if (!seat.bot && seat.pendingCls !== null) {
         this.world.spawn(seat.id, seat.pendingCls);
@@ -604,7 +604,11 @@ export class AcesRoom implements GameRoomHandle {
     this.phase = 'live';
     this.winner = null;
     for (const s of this.seats.values()) {
-      this.world.spawn(s.id, s.bot && s.botRng !== null ? pickBotClass(s.botRng) : 'fighter');
+      this.world.spawn(
+        s.id,
+        s.bot && s.botRng !== null ? pickBotClass(s.botRng) : 'fighter',
+        s.bot ? this.patrolAltFor(s.id) : undefined,
+      );
     }
     this.lobbyArmed = false;
     this.broadcastPhase();
@@ -717,6 +721,18 @@ export class AcesRoom implements GameRoomHandle {
   /** Fill every empty seat to teamSize*2 with named bots, balanced across
    *  teams (CONTRACT §4). BOT_NAMES has 12 entries vs ≤8 seats, so the
    *  fallback below is defensive only. */
+  /**
+   * §8: bots take off inside a per-bot patrol band (20–65u, deterministic from
+   * the seat name) so vertical geometry actually occurs — the altitude-match
+   * law alone is symmetric-stable at level flight and nothing would ever
+   * climb first. Humans spawn at cruise; crates and the sea stay honest.
+   */
+  private patrolAltFor(id: PlayerId): number {
+    const seat = this.seats.get(id);
+    const name = seat ? seat.name : id;
+    return 20 + (hashStr(name) % 45);
+  }
+
   private fillBots(): void {
     while (this.seats.size < this.capacity()) this.addBot(this.smallerTeam());
   }
@@ -729,7 +745,7 @@ export class AcesRoom implements GameRoomHandle {
     this.createSeat(id, name, team, true, rng);
     this.world.addPlayer(id, name, team, true);
     // Mirror the mid-live human rule: a refilled bot takes off immediately.
-    if (this.phase === 'live') this.world.spawn(id, pickBotClass(rng));
+    if (this.phase === 'live') this.world.spawn(id, pickBotClass(rng), this.patrolAltFor(id));
   }
 
   private nextBotName(): string {
@@ -878,7 +894,7 @@ export class AcesRoom implements GameRoomHandle {
     if (row === undefined) {
       row = {
         id: p.id, name: '', team: p.team, cls: p.cls, bot: p.bot,
-        x: 0, y: 0, h: 0, sp: 0, vx: 0, vy: 0, hp: 0, maxHp: 0, heat: 0,
+        x: 0, y: 0, h: 0, sp: 0, vx: 0, vy: 0, hp: 0, maxHp: 0, alt: 0, climb: 0, heat: 0,
         jammed: false, boost: 0, boosting: false, throttle: 0, invulnT: 0,
         dead: true, streak: 0, seq: 0,
       };
@@ -905,6 +921,8 @@ function fillRow(r: SnapPlane, p: PlaneState): void {
   r.vy = p.vy;
   r.hp = p.hp;
   r.maxHp = CLASSES[p.cls].hp;
+  r.alt = p.alt; // §8: the vertical axis rides every snapshot row
+  r.climb = p.climb;
   r.heat = p.heat;
   r.jammed = p.jammed;
   r.boost = p.boost;

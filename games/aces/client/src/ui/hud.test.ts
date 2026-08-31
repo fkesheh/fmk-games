@@ -10,12 +10,16 @@
 // Every describe block names the brief/bible law it pins.
 // ============================================================================
 import { describe, expect, it } from 'vitest';
-import { SNAP_RATE } from '@aces/shared/config.js';
+import { ALT, SNAP_RATE } from '@aces/shared/config.js';
 import type { CameraView } from '../contract/seams.js';
 import type { Banner, KillFeedEntry } from '../contract/seams.js';
 
 import {
   accPct,
+  altLow,
+  altPct,
+  altText,
+  altWarn,
   bannerAlpha,
   bannerLive,
   CLS_GLYPH,
@@ -198,6 +202,48 @@ describe('ticket bars — fill percent clamps at the win threshold', () => {
   it('guards non-finite and negative wire noise defensively', () => {
     expect(ticketPct(-5)).toBe(0);
     expect(ticketPct(Number.NaN)).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3b · §8 altimeter — whole-unit value, 0..ALT.MAX bar, warn/LOW thresholds
+// ---------------------------------------------------------------------------
+
+describe('altimeter row — ALT readout, vertical position bar and sea-proximity flags', () => {
+  it('renders whole cruise units, plain (no ft flavor)', () => {
+    expect(altText(12)).toBe('12');
+    expect(altText(41.6)).toBe('42'); // Math.round
+    expect(altText(0)).toBe('0');
+    expect(altText(ALT.MAX)).toBe(String(ALT.MAX));
+  });
+
+  it('treats non-finite wire noise as sea level, never "NaN"', () => {
+    expect(altText(Number.NaN)).toBe('0');
+    expect(altPct(Number.NaN)).toBe(0);
+    expect(altWarn(Number.NaN)).toBe(false);
+    expect(altLow(Number.NaN)).toBe(false);
+  });
+
+  it('maps altitude onto 0..100% of ALT.MAX for the vertical bar, clamped', () => {
+    expect(altPct(0)).toBe(0);
+    expect(altPct(ALT.MAX / 2)).toBe(50);
+    expect(altPct(ALT.MAX)).toBe(100);
+    expect(altPct(ALT.MAX + 30)).toBe(100); // server clamps, HUD clamps too
+    expect(altPct(-4)).toBe(0);
+  });
+
+  it('warns inside the 14u ground-avoid band; boundary belongs to calm', () => {
+    expect(altWarn(13.9)).toBe(true);
+    expect(altWarn(14)).toBe(false);
+    expect(altWarn(40)).toBe(false);
+  });
+
+  it('stamps LOW below ALT.CRASH × 3 — the sea is three crash-heights away', () => {
+    expect(ALT.CRASH).toBe(1.2); // frozen config the threshold derives from
+    expect(altLow(3.6)).toBe(false); // exactly ×3: not yet LOW
+    expect(altLow(3.59)).toBe(true);
+    expect(altLow(1)).toBe(true);
+    expect(altLow(5)).toBe(false);
   });
 });
 

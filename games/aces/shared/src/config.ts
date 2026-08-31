@@ -245,6 +245,8 @@ export const INPUT_KEYS = {
   turnRight: ['KeyD', 'ArrowRight'],
   throttleUp: ['KeyW', 'ArrowUp'],
   throttleDown: ['KeyS', 'ArrowDown'],
+  climb: ['KeyQ'], //       pit +1 — climb (CONTRACT.md §8)
+  dive: ['KeyE'], //        pit −1 — dive
   fire: ['Space'],
   boost: ['ShiftLeft', 'ShiftRight'],
   scoreboard: ['Tab'],

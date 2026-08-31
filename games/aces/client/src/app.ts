@@ -32,19 +32,21 @@
 // logic; rendering happens once per frame in: interp.sampleRemotes → rig
 // (follow while alive+spawned · orbitDeath from own death until respawn ·
 // consumeShake → rig.shake · zoomTo pin) → pooled plane models (position X=x /
-// Y=PLANE_Y+bob / Z=y, yaw −h, bank/pitch eased, damage/blink) → trails →
+// Y=alt+bob per §8 / Z=y, yaw −h, bank/climb-pitch eased, damage/blink) → trails →
 // snapshot tracers → world.update → effects3d.update → scene.render → HUD
 // model (projections via rig.project). Every subsystem stays wrapped in
 // guarded(): one throw logs ONCE and skips that subsystem from then on.
 //
-// ATTITUDE LAW (§1): group.rotation.order = 'YZX' so yaw→pitch→bank compose
-// in body frame: rotation.y = −h (yawOf), rotation.z = pitch
-// (+0.06·throttle, boost −0.04), rotation.x = bank roll = −turnEcho·0.45rad
-// eased — the §1 formula applied to the axis that rolls around the fuselage
-// under three.js's Euler composition. SnapPlane carries no turn echo, so the
-// turn echo is DERIVED: heading delta between frames (shortest arc) over dt,
-// normalized by CLASSES.scout.turnRate (the fleet ceiling — config-derived,
-// nothing invented), clamped to ±1. Bank sign follows §1 literally.
+// ATTITUDE LAW (§1 + §8): group.rotation.order = 'YXZ' so yaw→pitch→bank
+// compose in body frame: rotation.y = −h (yawOf), rotation.z = pitch —
+// §8's climb pitch (climbPitch, 0.35 rad max, nose UP positive), superseding
+// §1's throttle pitch — rotation.x = bank roll = −turnEcho·0.45rad eased —
+// the §1 formula applied to the axis that rolls around the fuselage (the
+// model's nose lies on local +X; see the header deviation note). SnapPlane
+// carries no turn echo, so the turn echo is DERIVED: heading delta between
+// frames (shortest arc) over dt, normalized by CLASSES.scout.turnRate (the
+// fleet ceiling — config-derived, nothing invented), clamped to ±1. Bank
+// sign follows §1 literally.
 //
 // SHAKE SPLIT (unchanged from the 2D ruling): C_FX emits impulses internally
 // where it draws the cause (hitSpark → SMALL; explosion → MEDIUM/LARGE by
@@ -80,10 +82,35 @@
 //  · Quality degrade is ONE-WAY: rolling frame average >20 ms after warmup
 //    drops DPR→1 + shadows off via scene.setQuality('low'); it never
 //    oscillates back within a session.
+//
+// §8 ALTITUDE NOTES (this task's amendments):
+//  · Model pitch AXIS: §8's prose says "rotation.x = pitch under 'YXZ'", but
+//    the models are authored with the NOSE on local +X, and rotation about
+//    the local X axis leaves that nose vector INVARIANT (verified against
+//    three.js under YXZ/YZX/XYZ — it is the roll axis). The §8 INTENT — yaw
+//    −h, then pitch the nose UP with climb (0.35 rad max), bank unchanged —
+//    is implemented as rotation.z = climbPitch (the lateral axis), bank
+//    unchanged on rotation.x, group order switched 'YZX' → 'YXZ' per §8
+//    (numerically identical nose behavior; same bank sign). No negation was
+//    needed: rotation.z positive = nose UP.
+//  · §1's cosmetic throttle-pitch (pitchAttitude) is superseded at the drive
+//    site by §8's climb pitch; the helper stays exported (pinned pure gate).
+//  · INTEGRATOR HANDOFFS (not this file's property): (a) prediction.ts (C_NET)
+//    must init alt/climb in its constructor state AND copy them in
+//    reconcile/copyMovement — until then own-plane altitude renders at the
+//    predictor's init value; (b) net.ts (C_NET) parseSnapPlane/slot/copyInto
+//    must carry alt/climb and sendInput must serialize `pit` — the wire's
+//    parseC2S REQUIRES pit, so inputs are dropped until patched; (c) server
+//    rowFor must already include alt/climb (§8 state rides the snapshot);
+//    (d) screens.ts controls card may list CLIMB/DIVE (its pinned row count
+//    is the C_UI owner's call). Remote rows are guarded here against a
+//    non-finite alt/climb (cruise/level fallback) so a copyInto gap cannot
+//    NaN the scene.
 // ============================================================================
 
 import type * as THREE from 'three';
 import {
+  ALT,
   CLASSES,
   FIRE_BELOW,
   INPUT_KEYS,
@@ -187,15 +214,26 @@ const MAX_STEPS_PER_FRAME = 5;
 
 const TAU = Math.PI * 2;
 
-/** §1 bob: planes cruise at PLANE_Y ±0.6u on sin(t·0.9 + phase). */
+/** §1 bob: planes cruise at PLANE_Y ±0.6u on sin(t·0.9 + phase). §8: the bob
+ *  rides ON TOP of the plane's real altitude (Y = alt + planeBobOffset). */
 const BOB_FREQ = 0.9;
 const BOB_AMP = 0.6;
 
-/** §1 attitude targets: roll = −turnInput·0.45rad · pitch +0.06·throttle,
- *  boost −0.04 (dive). All five numbers are frozen-law citations. */
+/** §1 attitude targets: roll = −turnInput·0.45rad. The §1 throttle-pitch
+ *  (+0.06·throttle, boost −0.04) is SUPERSEDED at the drive site by §8's
+ *  climb pitch (climbPitch below) — pitchAttitude stays exported for the
+ *  pinned pure-helper gate. All five numbers are frozen-law citations. */
 const BANK_RAD = 0.45;
 const PITCH_PER_THROTTLE = 0.06;
 const PITCH_BOOST = -0.04;
+
+/** §8 pitch: rotation.z = clamp(climb / ALT.CLIMB_MAX, −1, 1) × 0.35 rad —
+ *  nose UP positive for climb (verified against three.js: a +X-facing model
+ *  pitches via the LATERAL axis; see the header deviation note). */
+const PITCH_PER_CLIMB = 0.35;
+
+/** §8 input feel: Q/E pit deflection eases at ~5/s (analog stick, no snap). */
+const PIT_EASE_RATE = 5;
 
 /** Bank/pitch approach rate, 1/s — mirrors scene.ts ROLL_RATE easing idiom. */
 const ATTITUDE_EASE_RATE = 6;
@@ -277,14 +315,30 @@ export function bankFromHeadingDelta(prevH: number, h: number, dt: number): numb
   return bankFromTurnInput(turnInputFromHeadingDelta(headingDeltaShortest(prevH, h), dt));
 }
 
-/** §1 pitch target: +0.06rad·throttle, boost −0.04 (boost dive feel). */
+/** §1 pitch target: +0.06rad·throttle, boost −0.04 (boost dive feel).
+ *  Superseded at the drive site by §8's climbPitch — kept for the gate. */
 export function pitchAttitude(throttle: number, boosting: boolean): number {
   return PITCH_PER_THROTTLE * throttle + (boosting ? PITCH_BOOST : 0);
 }
 
+/** §8 pitch target from vertical speed: clamp(climb / ALT.CLIMB_MAX, −1, 1)
+ *  × 0.35 rad, nose UP positive. The clamp matters on dives — DIVE_MAX (34)
+ *  exceeds CLIMB_MAX (30), so a full-deflection dive would overshoot ±1. */
+export function climbPitch(climb: number): number {
+  const n = climb / ALT.CLIMB_MAX;
+  const c = n < -1 ? -1 : n > 1 ? 1 : n;
+  return PITCH_PER_CLIMB * c;
+}
+
+/** §1 bob offset (the sin component alone) — rides on top of the plane's
+ *  real altitude per §8. planeBobY keeps its cruise-altitude meaning. */
+export function planeBobOffset(tS: number, phase: number): number {
+  return Math.sin(tS * BOB_FREQ + phase) * BOB_AMP;
+}
+
 /** §1 cruise-altitude bob: PLANE_Y + sin(t·0.9 + phase)·0.6. */
 export function planeBobY(tS: number, phase: number): number {
-  return PLANE_Y + Math.sin(tS * BOB_FREQ + phase) * BOB_AMP;
+  return PLANE_Y + planeBobOffset(tS, phase);
 }
 
 /** Deterministic per-id bob phase in [0, 2π) — seeded hash, never random. */
@@ -512,7 +566,7 @@ export function startAces(container: HTMLElement): AcesApp {
       cur.model.dispose(); // detaches; geometry kits are process-wide caches
     }
     const model = buildPlane(cls, team);
-    model.group.rotation.order = 'YZX'; // yaw→pitch→roll body-frame (header)
+    model.group.rotation.order = 'YXZ'; // §8: yaw→pitch→bank compose in body frame (header)
     threeScene.add(model.group);
     const entry: PoolEntry = {
       model,
@@ -538,17 +592,19 @@ export function startAces(container: HTMLElement): AcesApp {
   }
 
   /**
-   * Drive one pooled airframe from a server/predictor pose (§1 attitude law +
-   * §4 seam division: the APP owns transforms, the MODEL owns prop/surfaces/
-   * damage/blink). Zero allocation — scalars and cached transforms only.
+   * Drive one pooled airframe from a server/predictor pose (§1 attitude law
+   * + §8 altitude law + §4 seam division: the APP owns transforms, the MODEL
+   * owns prop/surfaces/damage/blink). Position Y = alt + bob (§8); pitch =
+   * climbPitch(climb) eased; bank unchanged. Zero allocation — scalars and
+   * cached transforms only.
    */
   function drivePlane(
     entry: PoolEntry,
     x: number,
     y: number,
+    alt: number,
+    climb: number,
     h: number,
-    throttle: number,
-    boosting: boolean,
     hp: number,
     maxHp: number,
     invulnT: number,
@@ -562,15 +618,17 @@ export function startAces(container: HTMLElement): AcesApp {
     const turnIn = turnInputFromHeadingDelta(dh, dt);
     const k = easeFactor(dt, ATTITUDE_EASE_RATE);
     entry.bank += (bankFromTurnInput(turnIn) - entry.bank) * k;
-    entry.pitch += (pitchAttitude(throttle, boosting) - entry.pitch) * k;
+    entry.pitch += (climbPitch(climb) - entry.pitch) * k;
 
     const g = entry.model.group;
-    g.position.set(x, planeBobY(tS, entry.phase), y); // §1: X=x · Y=bob · Z=y
+    g.position.set(x, alt + planeBobOffset(tS, entry.phase), y); // §8: Y = alt + bob
     g.rotation.y = yawOf(h);
     g.rotation.x = entry.bank;
-    g.rotation.z = entry.pitch;
+    g.rotation.z = entry.pitch; // §8 pitch rides the lateral axis (header)
 
-    entry.model.setControls(turnIn);
+    // Elevator tracks the climb axis (§8 pitch application), rudder/aileron
+    // wash keeps the derived turn echo.
+    entry.model.setControls(turnIn, climb / ALT.CLIMB_MAX);
     entry.model.setDamage(maxHp > 0 ? clamp01(1 - hp / maxHp) : 0);
     entry.model.setBlink(invulnT > 0);
     entry.model.setVisible(true);
@@ -579,18 +637,23 @@ export function startAces(container: HTMLElement): AcesApp {
 
   function updatePlanes(dt: number, tS: number): void {
     // Remotes (interp rows already exclude nobody — filter self/dead here).
+    // Row alt/climb guards: a C_NET parse/copy gap must not NaN the scene —
+    // fall back to cruise altitude / level flight (cited §8 defaults).
     for (let i = 0; i < remoteOut.length; i++) {
       const row = remoteOut[i];
       if (row === undefined || row.id === myId || row.dead) continue;
+      const alt = Number.isFinite(row.alt) ? row.alt : PLANE_Y;
+      const climb = Number.isFinite(row.climb) ? row.climb : 0;
       const entry = entryFor(row.id, row.cls, row.team);
-      drivePlane(entry, row.x, row.y, row.h, row.throttle, row.boosting, row.hp, row.maxHp, row.invulnT, dt, tS);
+      drivePlane(entry, row.x, row.y, alt, climb, row.h, row.hp, row.maxHp, row.invulnT, dt, tS);
     }
-    // OWN plane drawn the same way from the merged predictor view.
+    // OWN plane drawn the same way from the merged predictor view (predicted
+    // alt/climb — smooth by construction).
     if (seenYouRow && !predictor.state.dead && myId !== '') {
       fillScratchOwn();
       const s = scratchOwn;
       const entry = entryFor(myId, s.cls, s.team);
-      drivePlane(entry, s.x, s.y, s.h, s.throttle, s.boosting, s.hp, s.maxHp, s.invulnT, dt, tS);
+      drivePlane(entry, s.x, s.y, s.alt, s.climb, s.h, s.hp, s.maxHp, s.invulnT, dt, tS);
     }
     // Hide stale entries; reap long-gone ids (reconnect churn).
     planePool.forEach((entry, id) => {
@@ -624,10 +687,12 @@ export function startAces(container: HTMLElement): AcesApp {
     if (flying) {
       // st is the pos view (x/y); VELOCITY rides vx/vy — the rig's lookahead
       // law needs true speed, not position. Identity §1 mapping (vx→VX, vy→VZ).
+      // §8: the chase rides the plane's REAL altitude and the look point
+      // leans into the predicted climb.
       velFeed.x = st.vx;
       velFeed.y = st.vy;
       const entry = planePool.get(myId);
-      scene.rig.follow(st, velFeed, st.h, entry ? entry.bank : 0, entry ? entry.pitch : 0, dt);
+      scene.rig.follow(st, velFeed, st.h, entry ? entry.bank : 0, entry ? entry.pitch : 0, dt, st.alt, st.climb);
     } else if (deathCam === 'orbit' && everSpawned) {
       // Orbit only AFTER a first life: §2 scopes the wreck orbit to own
       // death, so pre-first-spawn spectating keeps the rig's initial
@@ -698,17 +763,18 @@ export function startAces(container: HTMLElement): AcesApp {
   const scratchOwn: SnapPlane = {
     id: '', name: '', team: 'royal', cls: 'fighter', bot: false,
     x: 0, y: 0, h: 0, sp: 0, vx: 0, vy: 0,
+    alt: 0, climb: 0,
     hp: 0, maxHp: 1, heat: 0, jammed: false,
     boost: 0, boosting: false, throttle: 0,
     invulnT: 0, dead: false, streak: 0, seq: 0,
   };
-  type TargetRow = { x: number; y: number; team: TeamId; cls: PlaneClassId; hpFrac: number };
+  type TargetRow = { x: number; y: number; alt: number; team: TeamId; cls: PlaneClassId; hpFrac: number };
   const targetsPool: TargetRow[] = [];
   const trailOut: TrailCall[] = [];
   const ownTrailScratch: TrailRow = { id: '', x: 0, y: 0, hp: 0, maxHp: 1, dead: false };
 
   const hmYou: NonNullable<HudModel['you']> = {
-    cls: 'fighter', team: 'royal', hp: 0, maxHp: 1, heat: 0, jammed: false,
+    cls: 'fighter', team: 'royal', hp: 0, maxHp: 1, alt: 0, heat: 0, jammed: false,
     boost: 0, throttle: 0, alive: false, respawnT: 0, streak: 0,
   };
   const hm: HudModel = {
@@ -1090,10 +1156,15 @@ export function startAces(container: HTMLElement): AcesApp {
   let prevJammed = false;
   let seqCounter = 1;
   const SEND_EVERY_S = 1 / TICK_RATE;
+  /** §8 pit deflection, eased toward the Q/E-held target at PIT_EASE_RATE —
+   *  an analog stick read, not a snap (own + wire frames share ONE value). */
+  let pitEased = 0;
 
   function stepFixed(dt: number): void {
     const th = anyHeld(INPUT_KEYS.throttleUp) ? 1 : anyHeld(INPUT_KEYS.throttleDown) ? -0.3 : 0;
     const tr = (anyHeld(INPUT_KEYS.turnRight) ? 1 : 0) - (anyHeld(INPUT_KEYS.turnLeft) ? 1 : 0);
+    const pitTarget = anyHeld(INPUT_KEYS.climb) ? 1 : anyHeld(INPUT_KEYS.dive) ? -1 : 0;
+    pitEased += (pitTarget - pitEased) * easeFactor(dt, PIT_EASE_RATE);
     const fire = anyHeld(INPUT_KEYS.fire);
     const boost = anyHeld(INPUT_KEYS.boost);
 
@@ -1132,7 +1203,9 @@ export function startAces(container: HTMLElement): AcesApp {
     if (due) {
       // Wire-crossing object — allocation-exempt (RULES 4). Shared BY
       // REFERENCE with the predictor's pending queue (InputFrame readonly).
-      const frame: InputFrame = { seq: seqCounter++, th, tr, fire, boost };
+      // §8: pit rides every frame; the wire's parseC2S rejects frames
+      // without it.
+      const frame: InputFrame = { seq: seqCounter++, th, tr, pit: pitEased, fire, boost };
       net.sendInput(frame);
       predictor.onLocalInput(frame);
     }
@@ -1175,6 +1248,8 @@ export function startAces(container: HTMLElement): AcesApp {
     scratchOwn.sp = Math.hypot(st.vx, st.vy);
     scratchOwn.vx = st.vx;
     scratchOwn.vy = st.vy;
+    scratchOwn.alt = st.alt;
+    scratchOwn.climb = st.climb;
     scratchOwn.hp = st.hp;
     scratchOwn.maxHp = maxHpCache;
     scratchOwn.heat = st.heat;
@@ -1208,6 +1283,7 @@ export function startAces(container: HTMLElement): AcesApp {
       hmYou.team = st.team;
       hmYou.hp = st.hp;
       hmYou.maxHp = maxHpCache;
+      hmYou.alt = st.alt;
       hmYou.heat = st.heat;
       hmYou.jammed = st.jammed;
       hmYou.boost = st.boost;
@@ -1234,11 +1310,14 @@ export function startAces(container: HTMLElement): AcesApp {
       if (seenYouRow && row.team === st.team) continue;
       let slot = targetsPool[ti];
       if (slot === undefined) {
-        slot = { x: 0, y: 0, team: row.team, cls: row.cls, hpFrac: 0 };
+        slot = { x: 0, y: 0, alt: 0, team: row.team, cls: row.cls, hpFrac: 0 };
         targetsPool.push(slot);
       }
       slot.x = row.x;
       slot.y = row.y;
+      // §8: HUD projections ride each target's REAL altitude (cruise fallback
+      // while a C_NET parse/copy gap leaves the field non-finite).
+      slot.alt = Number.isFinite(row.alt) ? row.alt : PLANE_Y;
       slot.team = row.team;
       slot.cls = row.cls;
       slot.hpFrac = row.maxHp > 0 ? clamp01(row.hp / row.maxHp) : 0;

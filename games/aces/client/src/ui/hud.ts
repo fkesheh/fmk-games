@@ -5,7 +5,8 @@
 // through OverlayModel.cam.project, the frozen GRAPHICS_3D §2 seam backed by
 // C_APP's rig):
 //   · gun crosshair anchored at the PROJECTION of nose + forward·CROSS_LEAD_U
-//     at cruise altitude. ASSUMPTION (carried from the 2D era): OverlayModel
+//     at the OWN plane's real altitude (§8: HudModel.you.alt; cruise only as
+//     a non-finite guard). ASSUMPTION (carried from the 2D era): OverlayModel
 //     carries no own-plane position, so the nose is reconstructed from
 //     CameraView.x/y — the §2 chase law puts the camera exactly CAM_DIST·zoom
 //     behind the plane along −forward (see the constant notes below).
@@ -55,6 +56,7 @@
 // ============================================================================
 
 import {
+  ALT,
   BOOST_MAX,
   CLASSES,
   FIRE_BELOW,
@@ -139,6 +141,15 @@ const EDGE_ARROW_MAX = 3;
  * rather than borrowing a sim threshold (mirrors outpost's local LOW_HP).
  */
 const HP_WARN_FRAC = 0.25;
+
+/**
+ * Altimeter thresholds (§8 amendment). ALT_WARN_U = 14u is the ground-avoid
+ * band the task brief pins for the warn tint (mirrors the bots' reflex line,
+ * which lives server-side); ALT_LOW_U = ALT.CRASH × 3 is the config-derived
+ * LOW-stamp line — the sea is three crash-heights away.
+ */
+const ALT_WARN_U = 14;
+const ALT_LOW_U = ALT.CRASH * 3;
 
 // ---- shared label vocabulary (D4 double-encoding helpers) ---------------------
 
@@ -272,6 +283,30 @@ export function matchClock(timeLeftS: number, suddenDeath: boolean): string {
 export function ticketPct(tickets: number): number {
   if (!Number.isFinite(tickets) || tickets <= 0) return 0;
   return Math.min(100, (tickets / TICKETS_TO_WIN) * 100);
+}
+
+// ---- altimeter (§8) — pure display logic for the Flight Record row ----------
+
+/** Altimeter value text: whole cruise units, plain (`ALT 42` style). Non-
+ *  finite wire noise (a C_NET copy gap) reads as sea level, never "NaN". */
+export function altText(alt: number): string {
+  return Number.isFinite(alt) ? String(Math.round(alt)) : '0';
+}
+
+/** Vertical position-bar fill percent across 0..ALT.MAX, clamped, NaN→0. */
+export function altPct(alt: number): number {
+  if (!Number.isFinite(alt)) return 0;
+  return Math.round(clamp01(alt / ALT.MAX) * 100);
+}
+
+/** Ground-proximity warn: below the 14u ground-avoid band the tint flips. */
+export function altWarn(alt: number): boolean {
+  return Number.isFinite(alt) && alt < ALT_WARN_U;
+}
+
+/** LOW stamp: below ALT.CRASH × 3 the sea is seconds away at dive rates. */
+export function altLow(alt: number): boolean {
+  return Number.isFinite(alt) && alt < ALT_LOW_U;
 }
 
 /**
@@ -471,6 +506,16 @@ const CSS = `
   font-size:14px;font-weight:900;transform:rotate(-4deg);}
 .aces-status.low .aces-lowstamp{display:inline-block;}
 .aces-status.low .aces-fill.hp{background:var(--ac-warn);}
+/* §8 altimeter: slim vertical position bar (fill grows bottom-up), warn tint
+   inside the 14u ground-avoid band, LOW stamp below ALT.CRASH×3 */
+.aces-altbar{position:relative;flex:none;width:7px;height:18px;
+  background:var(--ac-ink18);border:1px solid var(--ac-ink40);}
+.aces-altfill{position:absolute;left:0;bottom:0;width:100%;height:0%;
+  background:var(--ac-tracer);transition:height .12s linear;}
+.aces-status.altwarn .aces-altfill{background:var(--ac-warn);}
+.aces-altlowstamp{display:none;padding:1px 6px;border:2px solid var(--ac-warn);color:var(--ac-warn);
+  font-size:14px;font-weight:900;transform:rotate(4deg);}
+.aces-status.altlow .aces-altlowstamp{display:inline-block;}
 .aces-gauge{flex:1;display:flex;align-items:flex-end;height:34px;border-bottom:2px solid var(--ac-ink55);
   margin-left:60px;width:110px;position:relative;}
 .aces-needle{position:absolute;left:50%;bottom:0;width:2px;height:28px;background:var(--ac-ink);
@@ -532,7 +577,7 @@ const CSS = `
 
 @media (prefers-reduced-motion: reduce){
   .aces-slip{animation:none;}
-  .aces-fill,.aces-needle{transition:none;}
+  .aces-fill,.aces-needle,.aces-altfill{transition:none;}
 }
 `;
 
@@ -554,6 +599,8 @@ class AcesHud implements Hud {
   private readonly hpFill: HTMLElement;
   private readonly hpVal: HTMLElement;
   private readonly boFill: HTMLElement;
+  private readonly altFill: HTMLElement;
+  private readonly altVal: HTMLElement;
   private readonly needle: HTMLElement;
   private readonly statusChip: HTMLElement;
   private readonly mutedTag: HTMLElement;
@@ -578,6 +625,8 @@ class AcesHud implements Hud {
   private lastHpTxt = '';
   private lastHpPct = -1;
   private lastBoPct = -1;
+  private lastAltTxt = '';
+  private lastAltPct = -1;
   private lastNeedleDeg = 999;
   private lastMuted: boolean | null = null;
   private lastBannerStep = -1;
@@ -654,6 +703,23 @@ class AcesHud implements Hud {
     boTrack.appendChild(this.boFill);
     boRow.appendChild(boTrack);
     this.statusChip.appendChild(boRow);
+    // §8 altimeter row: label · slim vertical position bar (0..ALT.MAX) ·
+    // whole-unit value · LOW stamp (warn tint + stamp are threshold-driven
+    // below). Sits in the Flight Record chip between BOOST and throttle.
+    const altRow = div('aces-row');
+    altRow.appendChild(label('ALT'));
+    const altBar = div('aces-altbar');
+    altBar.setAttribute('aria-hidden', 'true');
+    this.altFill = div('aces-altfill');
+    altBar.appendChild(this.altFill);
+    altRow.appendChild(altBar);
+    this.altVal = valSpan('0');
+    altRow.appendChild(this.altVal);
+    const altLowStamp = span('aces-altlowstamp');
+    altLowStamp.textContent = 'LOW';
+    altLowStamp.setAttribute('aria-hidden', 'true');
+    altRow.appendChild(altLowStamp);
+    this.statusChip.appendChild(altRow);
     const thrRow = div('aces-row');
     thrRow.appendChild(label('THR'));
     this.needle = div('aces-needle');
@@ -796,11 +862,12 @@ class AcesHud implements Hud {
     this.ensureProj(targets.length);
 
     // Single projection pass: cam.project hands back a SHARED record, so each
-    // result is copied into the pooled columns before the next call.
+    // result is copied into the pooled columns before the next call. §8: every
+    // target projects at its REAL altitude (cruise fallback applied by C_APP).
     for (let i = 0; i < targets.length; i++) {
       const t = targets[i];
       if (t === undefined) continue;
-      const p = o.cam.project(t.x, t.y);
+      const p = o.cam.project(t.x, t.y, t.alt);
       this.projX[i] = p.sx;
       this.projY[i] = p.sy;
       this.projVis[i] = p.visible;
@@ -857,21 +924,23 @@ class AcesHud implements Hud {
     // --- gun cluster: only meaningful while flying -------------------------
     if (!o.alive || m.you === null) return;
 
-    // Crosshair anchor: nose + forward·CROSS_LEAD_U at cruise altitude (the
-    // chase-distance stand-in reconstructs the nose from CameraView.x/y — see
-    // CROSS_LEAD_U note). A second point farther along the same ray gives the
-    // on-screen travel bearing for the ring ticks. cam.project returns a
+    // Crosshair anchor: nose + forward·CROSS_LEAD_U at the OWN plane's real
+    // altitude (HudModel.you.alt — §8; PLANE_Y only as a non-finite guard).
+    // The chase-distance stand-in reconstructs the nose from CameraView.x/y —
+    // see CROSS_LEAD_U note. A second point farther along the same ray gives
+    // the on-screen travel bearing for the ring ticks. cam.project returns a
     // SHARED scratch record — every field is copied out BEFORE the next call.
+    const youAlt = m.you !== null && Number.isFinite(m.you.alt) ? m.you.alt : PLANE_Y;
     const chase = CHASE_DIST_U * (o.cam.zoom > 0 ? o.cam.zoom : 1);
     const gunX = o.cam.x + Math.cos(o.heading) * (chase + CROSS_LEAD_U);
     const gunY = o.cam.y + Math.sin(o.heading) * (chase + CROSS_LEAD_U);
-    const anchor = o.cam.project(gunX, gunY, PLANE_Y);
+    const anchor = o.cam.project(gunX, gunY, youAlt);
     const hx = anchor.sx;
     const hy = anchor.sy;
     const anchorVisible = anchor.visible;
     const farX = o.cam.x + Math.cos(o.heading) * (chase + CROSS_LEAD_U * 3);
     const farY = o.cam.y + Math.sin(o.heading) * (chase + CROSS_LEAD_U * 3);
-    const farP = o.cam.project(farX, farY, PLANE_Y);
+    const farP = o.cam.project(farX, farY, youAlt);
     const tickBearing =
       anchorVisible && farP.visible ? Math.atan2(farP.sy - hy, farP.sx - hx) : 0;
 
@@ -921,9 +990,10 @@ class AcesHud implements Hud {
       // Zero-velocity intercept (see file-head assumption): aimLead with
       // tvx=tvy=0 collapses onto the target hull — the honest reading of the
       // data the frozen OverlayModel actually carries. Drawn at its PROJECTED
-      // screen point; hidden while that point is behind the eye.
+      // screen point AT THE TARGET'S REAL ALTITUDE (§8 — a diver escapes the
+      // pip honestly); hidden while that point is behind the eye.
       const lead = aimLead(o.cam.x, o.cam.y, t.x, t.y, 0, 0, projSpeed);
-      const lp = o.cam.project(lead.x, lead.y, PLANE_Y);
+      const lp = o.cam.project(lead.x, lead.y, t.alt);
       if (lp.visible) {
         star(ctx, lp.sx, lp.sy, 4, 7, 2.8, o.heading);
         ctx.fillStyle = TRACER_FILL;
@@ -1072,6 +1142,20 @@ class AcesHud implements Hud {
         this.lastBoPct = boPct;
         this.boFill.style.width = `${boPct}%`;
       }
+      // §8 altimeter row: whole-unit value + vertical position bar + the two
+      // threshold classes (ground-avoid warn tint, LOW stamp).
+      const aTxt = altText(you.alt);
+      if (aTxt !== this.lastAltTxt) {
+        this.lastAltTxt = aTxt;
+        this.altVal.textContent = aTxt;
+      }
+      const aPct = altPct(you.alt);
+      if (aPct !== this.lastAltPct) {
+        this.lastAltPct = aPct;
+        this.altFill.style.height = `${aPct}%`;
+      }
+      setClass(this.statusChip, 'altwarn', altWarn(you.alt));
+      setClass(this.statusChip, 'altlow', altLow(you.alt));
       // throttle −0.3..1 → −72°..+72° needle sweep
       const deg = Math.round((((you.throttle + 0.3) / 1.3) * 144 - 72) * 2) / 2;
       if (deg !== this.lastNeedleDeg) {

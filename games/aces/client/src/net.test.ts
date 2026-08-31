@@ -56,7 +56,7 @@ function mkPlane(id: string, x: number, y: number, h: number, patch: Partial<Sna
     vx: 150,
     vy: 0,
     hp: 100,
-    maxHp: 100,
+    maxHp: 100, alt: 12, climb: 0,
     heat: 0,
     jammed: false,
     boost: 100,
@@ -104,6 +104,8 @@ function mkRefState(cls: PlaneState['cls'], x: number, y: number): PlaneState {
     vy: 0,
     h: 0,
     hp: spec.hp,
+    alt: 12,
+    climb: 0,
     heat: 0,
     jammed: false,
     boost: 100,
@@ -117,7 +119,7 @@ function mkRefState(cls: PlaneState['cls'], x: number, y: number): PlaneState {
   };
 }
 
-const THRUST: InputFrame = { seq: 0, th: 1, tr: 0, fire: false, boost: false };
+const THRUST: InputFrame = { seq: 0, th: 1, tr: 0, fire: false, pit: 0, boost: false };
 
 // ---------------------------------------------------------------------------
 // RemoteInterp
@@ -276,7 +278,7 @@ describe('OwnPredictor.reconcile', () => {
     // err 30 u < 80 u; seq 9 acks the whole queue → pure blend math, no
     // replay drift. (If unacked inputs survived pruning, the replayed
     // throttle frames would push x past the pure-blend value.)
-    p.onLocalInput({ seq: 9, th: 1, tr: 0, fire: false, boost: false });
+    p.onLocalInput({ seq: 9, th: 1, tr: 0, fire: false, pit: 0, boost: false });
     p.reconcile(mkPlane('me', 30, 10, 0, { seq: 9 }));
     expect(p.state.x).toBeCloseTo(7.5, 12); // 0 + 30 × 0.25
     expect(p.state.y).toBeCloseTo(2.5, 12); // 0 + 10 × 0.25
@@ -359,7 +361,7 @@ describe('OwnPredictor.setClass', () => {
   it('changes turn response: same input, airframe-specific heading gain', () => {
     const fly = (cls: 'scout' | 'gunship'): number => {
       const p = new OwnPredictor(cls);
-      p.onLocalInput({ seq: 1, th: 0, tr: 1, fire: false, boost: false });
+      p.onLocalInput({ seq: 1, th: 0, tr: 1, fire: false, pit: 0, boost: false });
       for (let i = 0; i < 5; i++) p.advance(0.1); // 0.5 s → 30 substeps
       return p.state.h;
     };

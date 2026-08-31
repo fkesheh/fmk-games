@@ -11,7 +11,7 @@
 // r = 19, and dt = 1/30 (TICK_RATE).
 // ============================================================================
 import { describe, expect, it } from 'vitest';
-import { BOOST_MAX, CRATE_LIFE_S, HEAT_MAX, HEAT_RESUME, SPAWN_PROTECT_SECONDS } from '@aces/shared/config';
+import { BOOST_MAX, CRATE_LIFE_S, HEAT_MAX, HEAT_RESUME, PLANE_Y, SPAWN_PROTECT_SECONDS } from '@aces/shared/config';
 import { buildMap, isOpenWater } from '@aces/shared/maps';
 import type { GameEvent, PlaneState } from '@aces/shared/types';
 import type { TeamId } from '@aces/shared/config';
@@ -37,9 +37,9 @@ function seat(w: World, id: string, name: string, team: TeamId): PlaneState {
 }
 
 let seqCounter = 0;
-function input(o: Partial<{ th: number; tr: number; fire: boolean; boost: boolean }> = {}) {
+function input(o: Partial<{ th: number; tr: number; pit: number; fire: boolean; boost: boolean }> = {}) {
   seqCounter++;
-  return { seq: seqCounter, th: o.th ?? 0, tr: o.tr ?? 0, fire: o.fire ?? false, boost: o.boost ?? false };
+  return { seq: seqCounter, th: o.th ?? 0, tr: o.tr ?? 0, pit: o.pit ?? 0, fire: o.fire ?? false, boost: o.boost ?? false };
 }
 
 describe('World determinism', () => {
@@ -84,8 +84,9 @@ describe('Bullet hit resolution', () => {
     v.x = 1600; v.y = 1000; v.h = Math.PI; v.vx = -110; v.vy = 0;
     v.hp = 3; // any single fighter round is lethal
     // Direct-constructed tracer closing at 1300 u/s along y=1000 — through the
-    // victim's exact centerline, so the swept segment cannot miss.
-    w.bullets.push({ id: 999, team: 'royal', owner: 'r1', x: 1000, y: 1000, vx: 1300, vy: 0, t: 1.15 });
+    // victim's exact centerline, so the swept segment cannot miss. Fired from
+    // the shooter's cruise band (alt 12): inside the victim's gun band too.
+    w.bullets.push({ id: 999, team: 'royal', owner: 'r1', x: 1000, y: 1000, alt: 12, vx: 1300, vy: 0, t: 1.15 });
 
     const seen: GameEvent[] = [];
     for (let i = 0; i < 30 && !v.dead; i++) seen.push(...w.step(1 / 30));
@@ -119,7 +120,7 @@ describe('Bullet hit resolution', () => {
     // 1400 u/s = 46.67 u/tick. Circle spans x∈[981,1019]; the tick's segment
     // runs [978 → 1024.67]: both endpoints >19 from center, so a static
     // point-in-circle check would tunnel clean through. The sweep must not.
-    w.bullets.push({ id: 1, team: 'royal', owner: 'r1', x: 978, y: 1000, vx: 1400, vy: 0, t: 1 });
+    w.bullets.push({ id: 1, team: 'royal', owner: 'r1', x: 978, y: 1000, alt: 12, vx: 1400, vy: 0, t: 1 });
 
     const e1 = [...w.step(1 / 30)]; // snapshot: step() reuses its events buffer
     expect(e1.filter((e) => e.kind === 'hit')).toHaveLength(1);
@@ -136,7 +137,7 @@ describe('Bullet hit resolution', () => {
     const ally = seat(w, 'r2', 'Ally', 'royal');
     ally.x = 1000; ally.y = 1000; ally.h = Math.PI / 2; ally.vx = 0; ally.vy = 110; ally.hp = 50;
     // Same crossing geometry as the NO-TUNNEL case — but same-team.
-    w.bullets.push({ id: 1, team: 'royal', owner: 'r1', x: 978, y: 1000, vx: 1400, vy: 0, t: 1 });
+    w.bullets.push({ id: 1, team: 'royal', owner: 'r1', x: 978, y: 1000, alt: 12, vx: 1400, vy: 0, t: 1 });
     const e = w.step(1 / 30);
     expect(e.filter((x) => x.kind === 'hit' || x.kind === 'kill')).toHaveLength(0);
     expect(ally.hp).toBe(50);
@@ -258,7 +259,7 @@ describe('Deaths', () => {
     // Bullets pass through harmlessly too.
     const shooter = seat(w, 'i1', 'Shooter', 'iron');
     shooter.x = 4000; shooter.y = 800; // far away; only ownership matters
-    w.bullets.push({ id: 7, team: 'iron', owner: 'i1', x: 1978, y: 800, vx: 1400, vy: 0, t: 1 });
+    w.bullets.push({ id: 7, team: 'iron', owner: 'i1', x: 1978, y: 800, alt: 12, vx: 1400, vy: 0, t: 1 });
     const e = w.step(1 / 30);
     expect(e.some((x) => x.kind === 'hit')).toBe(false);
     expect(g.hp).toBe(0.05);
@@ -272,6 +273,98 @@ describe('Deaths', () => {
     const crashes = e2.filter((x) => x.kind === 'kill' && x.crash);
     expect(crashes).toHaveLength(1);
     expect(g.dead).toBe(true);
+  });
+});
+
+describe('Altitude — the sea (§8)', () => {
+  it('driving pit=−1 into the sea: crash kill with killer fields = victim, no credited streak', () => {
+    const w = makeWorld();
+    const p = seat(w, 'i1', 'Submariner', 'iron');
+    const witness = seat(w, 'r1', 'Witness', 'royal'); // nearby enemy who must NOT be credited
+    witness.streak = 2; // pre-existing streak must survive a crash it didn't cause
+
+    let crash: GameEvent | undefined;
+    for (let i = 0; i < 120 && !p.dead; i++) {
+      w.setInput('i1', input({ th: 1, pit: -1 })); // full deflection dive
+      const ev = [...w.step(1 / 30)]; // snapshot: step() reuses its events buffer
+      crash = ev.find((e) => e.kind === 'kill' && e.crash);
+    }
+
+    expect(p.dead).toBe(true);
+    expect(p.hp).toBe(0);
+    expect(p.streak).toBe(0);
+    expect(crash).toBeDefined();
+    expect(crash).toMatchObject({
+      kind: 'kill',
+      crash: true,
+      killer: 'i1', // crash flow: killer fields carry the VICTIM — no credit
+      killerName: 'Submariner',
+      victim: 'i1',
+      killerTeam: 'iron',
+      victimTeam: 'iron',
+      streak: 0, // rooms move no tickets off crash=true
+    });
+    expect(witness.streak).toBe(2); // nobody was credited
+  });
+
+  it('spawn protection blocks bullets, NOT the sea', () => {
+    const w = makeWorld();
+    const p = seat(w, 'i1', 'Shielded', 'iron');
+    p.invulnT = SPAWN_PROTECT_SECONDS; // freshly spawned, fully protected…
+    p.alt = 1; // …but the sea is physics, not damage: ALT.CRASH=1.2
+    const e = w.step(1 / 30);
+    expect(p.dead).toBe(true);
+    expect(e.filter((x) => x.kind === 'kill' && x.crash)).toHaveLength(1);
+  });
+
+  it('surviving the death: the kill is never double-emitted by the burn loop', () => {
+    const w = makeWorld();
+    const p = seat(w, 'i1', 'Both ways', 'iron');
+    p.hp = 0.05; // burning (FIRE_BELOW) AND diving into the sea
+    w.setInput('i1', input({ th: 1, pit: -1 }));
+    const seen: GameEvent[] = [];
+    for (let i = 0; i < 60 && !p.dead; i++) seen.push(...w.step(1 / 30));
+    expect(p.dead).toBe(true);
+    expect(seen.filter((x) => x.kind === 'kill')).toHaveLength(1); // sea won, burn skipped
+  });
+});
+
+describe('Altitude — the gun band (§8)', () => {
+  /** NO-TUNNEL crossing geometry, parameterized by the bullet's fired altitude:
+   *  1400 u/s along y=1000 through the victim's centerline at cruise alt 12. */
+  function crossingBullet(w: World, id: number, alt: number): void {
+    w.bullets.push({ id, team: 'royal', owner: 'r1', x: 978, y: 1000, alt, vx: 1400, vy: 0, t: 1 });
+  }
+
+  it('bullets fired 28u above a plane pass over it; same-altitude rounds connect', () => {
+    const w = makeWorld();
+    seat(w, 'r1', 'Shooter of record', 'royal'); // bullet ownership only — stands off the duel
+    const v = seat(w, 'i1', 'Target', 'iron');
+    v.x = 1000; v.y = 1000; v.h = Math.PI / 2; v.vx = 0; v.vy = 110; v.hp = 50;
+    // Out-of-band: |40 − 12| = 28 > radius 16 × HIT_TOL 0.9 = 14.4 → the
+    // vertical gate rejects the sweep even though it crosses the circle.
+    crossingBullet(w, 1, 40);
+    const e1 = [...w.step(1 / 30)]; // snapshot: step() reuses its events buffer
+    expect(e1.filter((x) => x.kind === 'hit' || x.kind === 'kill')).toHaveLength(0);
+    expect(v.hp).toBe(50);
+
+    // Same geometry, same band: the round connects.
+    v.x = 1000; v.y = 1000; v.h = Math.PI / 2; v.vx = 0; v.vy = 110;
+    crossingBullet(w, 2, 12);
+    const e2 = [...w.step(1 / 30)];
+    expect(e2.filter((x) => x.kind === 'hit')).toHaveLength(1);
+    expect(v.hp).toBe(45);
+  });
+
+  it('volleys carry the shooter\'s altitude at fire time', () => {
+    const w = makeWorld();
+    const s = seat(w, 'r1', 'High flyer', 'royal');
+    s.x = 2000; s.y = 2000; s.h = 0; s.vx = 150; s.vy = 0;
+    s.alt = 40; // level flight (pit 0 holds alt exactly)
+    w.setInput('r1', input({ th: 0.5, fire: true }));
+    w.step(1 / 30);
+    expect(w.bullets.length).toBeGreaterThan(0);
+    for (const b of w.bullets) expect(b.alt).toBe(40);
   });
 });
 
@@ -290,6 +383,8 @@ describe('Spawning', () => {
     expect(p.x).toBe(field.x);
     expect(p.y).toBe(field.y);
     expect(p.invulnT).toBe(SPAWN_PROTECT_SECONDS);
+    expect(p.alt).toBe(PLANE_Y); // cruise altitude (§8)
+    expect(p.climb).toBe(0);
     expect(p.hp).toBe(170); // gunship spec
     expect(p.boost).toBe(BOOST_MAX);
     // Heading points toward the map center (within a right angle).

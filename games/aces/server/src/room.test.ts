@@ -133,7 +133,7 @@ function stageKill(room: AcesRoom, log: readonly Sent[], shooter: PlayerId, vict
     room.handleMessage(shooter, { t: 'debug', cmd: 'warp', x: px, y: py });
     const meNow = worldOf().planes.find((r) => r.id === shooter);
     if (meNow !== undefined) meNow.h = v.h;
-    room.handleMessage(shooter, { t: 'input', seq: seq++, th: 1, tr: 0, fire: true, boost: false });
+    room.handleMessage(shooter, { t: 'input', seq: seq++, th: 1, tr: 0, fire: true, pit: 0, boost: false });
     room.handleMessage(shooter, { t: 'debug', cmd: 'tick', x: 30 });
     const mine = creditedKills(log).find((k) => k.killer === shooter);
     if (mine !== undefined) return; // witnessed: the staged gun line delivered
@@ -273,15 +273,15 @@ describe('input handling', () => {
     room.addPlayer('p1', 'Ace');
     goLive(room);
 
-    room.handleMessage('p1', { t: 'input', seq: 7, th: 0.5, tr: 0, fire: false, boost: false });
+    room.handleMessage('p1', { t: 'input', seq: 7, th: 0.5, tr: 0, fire: false, pit: 0, boost: false });
     vi.advanceTimersByTime(120); // several snapshot beats
     expect(lastOf(snapsFor(log, 'p1'))?.you?.seq).toBe(7);
 
-    room.handleMessage('p1', { t: 'input', seq: 3, th: 0.5, tr: 0, fire: false, boost: false }); // stale
+    room.handleMessage('p1', { t: 'input', seq: 3, th: 0.5, tr: 0, fire: false, pit: 0, boost: false }); // stale
     vi.advanceTimersByTime(120);
     expect(lastOf(snapsFor(log, 'p1'))?.you?.seq).toBe(7); // unchanged
 
-    room.handleMessage('p1', { t: 'input', seq: 9, th: 0.5, tr: 0, fire: false, boost: false });
+    room.handleMessage('p1', { t: 'input', seq: 9, th: 0.5, tr: 0, fire: false, pit: 0, boost: false });
     vi.advanceTimersByTime(120);
     expect(lastOf(snapsFor(log, 'p1'))?.you?.seq).toBe(9);
     room.stop();
@@ -476,7 +476,7 @@ describe('stalePlayers', () => {
     vi.advanceTimersByTime(6000); // 31 s since join
     expect(room.stalePlayers()).toEqual(['p1']);
 
-    room.handleMessage('p1', { t: 'input', seq: 1, th: 0, tr: 0, fire: false, boost: false });
+    room.handleMessage('p1', { t: 'input', seq: 1, th: 0, tr: 0, fire: false, pit: 0, boost: false });
     vi.advanceTimersByTime(STALE_SECONDS * 1000 - 2000);
     expect(room.stalePlayers()).toEqual([]); // freshness restored…
     vi.advanceTimersByTime(4000); // …then ages out again

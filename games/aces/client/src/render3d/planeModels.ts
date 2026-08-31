@@ -445,11 +445,13 @@ function prismSquare(rNose: number, rTail: number, len: number): THREE.BufferGeo
 // ---- the model -------------------------------------------------------------------
 
 export interface PlaneModel {
-  /** Faces +X; app sets position (X=x, Z=y, Y=PLANE_Y+bob) + rotation.y=−h. */
+  /** Faces +X; app sets position (X=x, Z=y, Y=alt+bob) + rotation.y=−h. */
   readonly group: THREE.Group;
   /** Engine-bay anchor — app's fire-trail hook once frac ≥ 1−FIRE_BELOW. */
   readonly fireAnchor: THREE.Object3D;
-  setControls(turnIn: number): void;
+  /** turnIn drives rudder/aileron wash; pitIn (−1 dive..+1 climb, §8) drives
+   *  the elevator — the pitch control surface. Both ease internally. */
+  setControls(turnIn: number, pitIn?: number): void;
   setDamage(frac01: number): void;
   setBlink(b: boolean): void;
   setVisible(b: boolean): void;
@@ -473,6 +475,8 @@ class PlaneModelImpl implements PlaneModel {
 
   private turnTarget = 0;
   private turnEased = 0;
+  private pitTarget = 0;
+  private pitEased = 0;
   private clock = 0;
   private baseVisible = true;
   private blinkOn = false;
@@ -491,8 +495,9 @@ class PlaneModelImpl implements PlaneModel {
     this.glow = rig.glow;
   }
 
-  setControls(turnIn: number): void {
+  setControls(turnIn: number, pitIn: number = 0): void {
     this.turnTarget = turnIn < -1 ? -1 : turnIn > 1 ? 1 : turnIn;
+    this.pitTarget = pitIn < -1 ? -1 : pitIn > 1 ? 1 : pitIn;
   }
 
   setDamage(frac01: number): void {
@@ -541,11 +546,14 @@ class PlaneModelImpl implements PlaneModel {
     this.clock += dt;
 
     // Eased control response → surfaces tilt (elevator pitch-in, rudder yaw,
-    // aileron wash across the wing pair).
+    // aileron wash across the wing pair). §8: the ELEVATOR is the pitch
+    // surface, so it now answers the climb axis (pitIn) on top of the
+    // turn-coupled wash — climb input (pit > 0) deflects it trailing-edge up.
     const k = Math.min(1, dt * 8);
     this.turnEased += (this.turnTarget - this.turnEased) * k;
+    this.pitEased += (this.pitTarget - this.pitEased) * k;
     const t = this.turnEased;
-    this.elevator.rotation.z = -t * 0.35;
+    this.elevator.rotation.z = -t * 0.35 - this.pitEased * 0.35;
     for (let i = 0; i < this.rudders.length; i++) this.rudders[i]!.rotation.y = -t * 0.55;
     if (this.wingTop) this.wingTop.rotation.x = t * 0.06;
     if (this.wingLow) this.wingLow.rotation.x = -t * 0.05;
