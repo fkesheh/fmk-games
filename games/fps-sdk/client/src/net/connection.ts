@@ -18,8 +18,8 @@ import type { LobbyC2S } from '@platform/shared';
  * is the frozen fps C2S (room-level tags route to the room RAW).
  */
 export type LobbyCreate =
-  | { t: 'create_public'; name: string; settings: { mapId: MapId } }
-  | { t: 'create_private'; name: string; settings: { mapId: MapId } };
+  | { t: 'create_public'; name: string; game: string; settings: { mapId: MapId } }
+  | { t: 'create_private'; name: string; game: string; settings: { mapId: MapId } };
 
 // ---- tuning (frozen by CONTRACT.md) -----------------------------------------
 const CONNECT_TIMEOUT_MS = 5000;

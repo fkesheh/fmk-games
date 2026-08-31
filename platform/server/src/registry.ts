@@ -20,6 +20,8 @@ import { wordbombSdkModule } from '@wordbomb/server';
 import { kartSdkModule } from '@kart/server';
 import { splatSdkModule } from '@splat/server';
 import { acesSdkModule } from '@aces/server';
+import { fpsSdkModule } from '@fps/server';
+import { outpostSdkModule } from '@outpost/server';
 import { riftModuleVariant } from '@rift/server';
 
 export const GAMES: GameModule[] = [
@@ -45,6 +47,8 @@ export const GAMES: GameModule[] = [
   kartSdkModule,
   splatSdkModule,
   acesSdkModule,
+  fpsSdkModule,
+  outpostSdkModule,
 ];
 
 // The variant's clientDist points at the PORT's own shell build (games/ancients/client/dist);

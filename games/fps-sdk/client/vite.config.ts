@@ -6,7 +6,7 @@ export default defineConfig({
   base: '/fps/',
   resolve: {
     alias: {
-      '@fps/shared': fileURLToPath(new URL('../shared/src', import.meta.url)),
+      '@fps/shared': fileURLToPath(new URL('../../fps/shared/src', import.meta.url)),
     },
   },
   server: {
