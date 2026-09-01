@@ -106,7 +106,14 @@ export type LobbyS2C =
   /** Ack to the pad for RTT estimation (v2 normalized-frame channel only). */
   | { t: 'pad_input_echo'; seq: number }
   /** Relayed WebRTC signal (same-room peers only; server is content-blind). */
-  | { t: 'rtc_signal'; from: PlayerId; data: unknown };
+  | { t: 'rtc_signal'; from: PlayerId; data: unknown }
+  /**
+   * Room presence for P2P (docs/PLATFORM.md §12): the connected, non-pad
+   * session ids of the sender's room, broadcast by the lobby whenever
+   * membership changes. Deterministic role selection ("lowest id hosts")
+   * needs no further server support.
+   */
+  | { t: 'rtc_peers'; ids: PlayerId[] };
 
 /** Lobby messages plus whatever a game room pushes through RoomIO.send. */
 export type S2C = LobbyS2C | RawEnvelope;

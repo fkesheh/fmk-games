@@ -13,3 +13,4 @@ export * from './identity.js';
 export * from './services.js';
 export * from './limits.js';
 export * from './variant.js';
+export * from './rtcwire.js';

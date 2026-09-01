@@ -71,7 +71,10 @@ export function createGameClient(opts: GameClientOpts): GameClient {
         // First reply renders the overlay; re-pairs (TTL expiry) just update it.
         if (overlay === null) {
           try {
-            overlay = renderPadOverlay(msg.urlPath, msg.token);
+            // docs/PAD.md shape: {room, token, expiresInMs}; the SDK builds
+            // the pad URL itself (game id + room ref baked into the path).
+            const urlPath = `/pad/?game=${gameId}&r=${encodeURIComponent(msg.room)}`;
+            overlay = renderPadOverlay(urlPath, msg.token);
           } catch {
             overlay = null; // no DOM / P7 pending — pairing still functions headless
           }

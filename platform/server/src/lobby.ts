@@ -154,7 +154,9 @@ export class Lobby {
       if (leftId !== null && this.sessionRoom.has(leftId)) {
         // Mapping still present => the lobby did not initiate this removal:
         // the room kicked the player (fps: the speedhack guard). The lobby owns the socket.
+        const kickedRoomId = this.sessionRoom.get(leftId)?.id ?? null;
         this.sessionRoom.delete(leftId);
+        if (kickedRoomId !== null) this.broadcastRtcPeers(kickedRoomId);
         this.kicked.add(leftId);
         /* pad bindings are room-scoped now; room close reaps them */
       }
@@ -267,7 +269,9 @@ export class Lobby {
         for (const id of tracked.room.stalePlayers()) {
           const sess = this.sessions.get(id);
           if (sess !== undefined) out.push(sess);
+          const staleRoomId = tracked.room.id;
           this.sessionRoom.delete(id); // before removePlayer: lobby-initiated
+          this.broadcastRtcPeers(staleRoomId);
           tracked.room.removePlayer(id);
           /* nothing: see above */
         }
@@ -468,6 +472,7 @@ export class Lobby {
     // Route this session's room-level messages to the room from here on. Note
     // we do NOT clear tracked.emptySince: pads never keep a room alive.
     this.sessionRoom.set(sess.id, found);
+    this.broadcastRtcPeers(found.id);
   }
 
   /** A pad's `room` field: public roomId first, then private join code (case-insensitive). */
@@ -542,6 +547,7 @@ export class Lobby {
     const tracked = this.rooms.get(room.id);
     if (tracked !== undefined) tracked.emptySince = null;
     this.sessionRoom.set(sess.id, room);
+    this.broadcastRtcPeers(room.id);
     // sig is a pure pass-through, same as resume: the platform never reads,
     // dedups, or steers on it — only the room interprets it (module.ts's
     // rebind rule, resume first then sig). Keeping that logic out of the
@@ -553,7 +559,9 @@ export class Lobby {
   private leaveRoom(id: PlayerId, permanent = false): void {
     const room = this.sessionRoom.get(id);
     if (room === undefined) return;
+    const leftRoomId = this.sessionRoom.get(id)?.id ?? null;
     this.sessionRoom.delete(id); // before removePlayer: lobby-initiated, not a kick
+    if (leftRoomId !== null) this.broadcastRtcPeers(leftRoomId);
     room.removePlayer(id, permanent);
     // The departing player's pads unbind with them; they are still connected
     // here (leave != disconnect), so they DO hear bound:false.
@@ -676,6 +684,23 @@ export class Lobby {
   /** Remove one pad binding (lobby-level registry only; owner notify is ROOM-level). */
   private detachPad(padSessionId: PlayerId): void {
     this.pads.delete(padSessionId);
+  }
+
+  /**
+   * P2P presence (docs/PLATFORM.md §12 P2): push the room's connected
+   * non-pad session ids to every member. Cheap (rooms are small); clients
+   * use it for deterministic host selection — lowest id hosts.
+   */
+  private broadcastRtcPeers(roomId: RoomId): void {
+    const ids: PlayerId[] = [];
+    for (const [sid, room] of this.sessionRoom) {
+      if (room.id === roomId && !this.pads.has(sid)) ids.push(sid);
+    }
+    ids.sort();
+    const msg = { t: 'rtc_peers', ids } as const;
+    for (const [sid, room] of this.sessionRoom) {
+      if (room.id === roomId && !this.pads.has(sid)) this.sessions.get(sid)?.send(msg);
+    }
   }
 
   /**
