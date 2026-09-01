@@ -68,3 +68,29 @@ export const fpsModule: GameModule = {
     return new GameRoom(mapId, opts.visibility, opts.io);
   },
 };
+
+// ============================================================================
+// ·SDK PORT (docs/PLATFORM.md §7) — same rooms under a second id; the port's
+// own client lives at games/fps-sdk/client. Zero legacy edits.
+// ============================================================================
+import { variantOf } from '@platform/shared';
+import { existsSync as _es } from 'node:fs';
+import _p from 'node:path';
+
+function resolvePortDist_fps(): string {
+  const here = _p.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    _p.resolve(here, '../../fps-sdk/client/dist'),
+    _p.resolve(process.cwd(), 'games/fps-sdk/client/dist'),
+    _p.resolve(process.cwd(), '../games/fps-sdk/client/dist'),
+  ];
+  for (const dir of candidates) if (_es(_p.join(dir, 'index.html'))) return dir;
+  return candidates[0]!;
+}
+
+export const fpsSdkModule = variantOf(fpsModule, {
+  id: 'fps-sdk',
+  name: 'STRICKEN·SDK',
+  devPort: 5192,
+  clientDist: resolvePortDist_fps(),
+});

@@ -50,6 +50,9 @@ import {
   WEAPONS,
   segmentAABB,
 } from '@outpost/shared';
+
+/** This port's registry id — rooms are served by the outpost-sdk variant. */
+const PORT_GAME_ID = 'outpost-sdk';
 import type {
   C2S,
   JoinedMsg,
@@ -61,6 +64,8 @@ import type {
   ZombieId,
   ZombieSnap,
 } from '@outpost/shared';
+
+/** This port's registry id — rooms are served by the outpost-sdk variant. */
 import { clearSession, loadSession, loadSig, saveSession } from '@platform/shared';
 import type { LobbyC2S, PlayerId, RoomInfo } from '@platform/shared';
 
@@ -635,7 +640,7 @@ export class Net {
   }
 
   quickJoin(name: string): void {
-    this.send(this.withIdentity({ t: 'quick_join', name, game: GAME_ID }));
+    this.send(this.withIdentity({ t: 'quick_join', name, game: PORT_GAME_ID }));
   }
 
   /**
@@ -647,7 +652,7 @@ export class Net {
    * "Both harnesses create their rooms with that setting."
    */
   createPrivate(name: string): void {
-    this.send(this.withIdentity({ t: 'create_private', name, game: GAME_ID, settings: { debug: true } }));
+    this.send(this.withIdentity({ t: 'create_private', name, game: PORT_GAME_ID, settings: { debug: true } }));
   }
 
   joinPrivate(name: string, code: string): void {
@@ -655,7 +660,7 @@ export class Net {
   }
 
   createPublic(name: string): void {
-    this.send(this.withIdentity({ t: 'create_public', name, game: GAME_ID, settings: { debug: true } }));
+    this.send(this.withIdentity({ t: 'create_public', name, game: PORT_GAME_ID, settings: { debug: true } }));
   }
 
   /** Correlates the `room_list` reply internally. Resolves [] on timeout/no socket. */

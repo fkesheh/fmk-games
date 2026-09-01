@@ -295,17 +295,17 @@ export class ClientGame {
   // ---- public API (frozen; called by C11 main.ts) -----------------------------
 
   joinQuick(name: string): void {
-    this.startJoin((c) => c.send(withIdentity({ t: 'quick_join', name })));
+    this.startJoin((c) => c.send(withIdentity({ t: 'quick_join', name, game: 'fps-sdk' })));
   }
 
   createPublic(name: string, mapId: MapId): void {
     // platform lobby envelope: mapId rides inside opaque settings (see
     // connection.ts LobbyCreate); the module validates it in createRoom
-    this.startJoin((c) => c.send(withIdentity({ t: 'create_public', name, settings: { mapId } })));
+    this.startJoin((c) => c.send(withIdentity({ t: 'create_public', name, game: 'fps-sdk', settings: { mapId } })));
   }
 
   createPrivate(name: string, mapId: MapId): void {
-    this.startJoin((c) => c.send(withIdentity({ t: 'create_private', name, settings: { mapId } })));
+    this.startJoin((c) => c.send(withIdentity({ t: 'create_private', name, game: 'fps-sdk', settings: { mapId } })));
   }
 
   joinPrivate(name: string, code: string): void {
@@ -619,12 +619,12 @@ export class ClientGame {
       );
     } else if (roomId !== null) {
       this.startJoin(
-        (c) => c.send(withIdentity({ t: 'join_public', name, roomId })),
+        (c) => c.send(withIdentity({ t: 'join_public', name, game: 'fps-sdk', roomId })),
         'Reconnecting…',
         true,
       );
     } else {
-      this.startJoin((c) => c.send(withIdentity({ t: 'quick_join', name })), 'Reconnecting…', true);
+      this.startJoin((c) => c.send(withIdentity({ t: 'quick_join', name, game: 'fps-sdk' })), 'Reconnecting…', true);
     }
   }
 

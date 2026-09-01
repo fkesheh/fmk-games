@@ -54,3 +54,29 @@ export const outpostModule: GameModule = {
     return new OutpostRoom(opts.visibility, opts.io, undefined, opts.settings);
   },
 };
+
+// ============================================================================
+// ·SDK PORT (docs/PLATFORM.md §7) — same rooms under a second id; the port's
+// own client lives at games/outpost-sdk/client. Zero legacy edits.
+// ============================================================================
+import { variantOf } from '@platform/shared';
+import { existsSync as _es } from 'node:fs';
+import _p from 'node:path';
+
+function resolvePortDist_outpost(): string {
+  const here = _p.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    _p.resolve(here, '../../outpost-sdk/client/dist'),
+    _p.resolve(process.cwd(), 'games/outpost-sdk/client/dist'),
+    _p.resolve(process.cwd(), '../games/outpost-sdk/client/dist'),
+  ];
+  for (const dir of candidates) if (_es(_p.join(dir, 'index.html'))) return dir;
+  return candidates[0]!;
+}
+
+export const outpostSdkModule = variantOf(outpostModule, {
+  id: 'outpost-sdk',
+  name: 'OUTPOST·SDK',
+  devPort: 5193,
+  clientDist: resolvePortDist_outpost(),
+});
