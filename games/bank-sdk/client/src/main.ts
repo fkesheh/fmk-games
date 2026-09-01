@@ -51,7 +51,17 @@ try {
   } catch {
     // anonymous play is fine — auth is an enhancement, never a gate
   }
-  new BankGame(root, { ...(onOpenExtra !== undefined ? { onOpenExtra } : {}) });
+  // P2P pilot (docs/PLATFORM.md §12.6): ?p2p=1 takes over the page —
+  // rendezvous, host/guest roles, then a BankGame whose socket far end is
+  // the host tab.
+  if (new URLSearchParams(location.search).get('p2p') === '1') {
+    void (async () => {
+      const { startP2p } = await import('./p2p.js');
+      startP2p(root);
+    })();
+  } else {
+    new BankGame(root, { ...(onOpenExtra !== undefined ? { onOpenExtra } : {}) });
+  }
 } catch (err) {
   showError(`Boot failed: ${err instanceof Error ? err.message : String(err)}`);
 }

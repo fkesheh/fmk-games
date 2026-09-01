@@ -26,6 +26,12 @@
       ],
       "@platform/engine": [
         "../../../platform/engine/src/index.ts"
+      ],
+      "@bank/server": [
+        "../../bank/server/src/index.ts"
+      ],
+      "@bank/server/*": [
+        "../../bank/server/src/*"
       ]
     }
   },

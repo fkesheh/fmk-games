@@ -7,6 +7,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@bank/shared': fileURLToPath(new URL('../../bank/shared/src', import.meta.url)),
+      '@bank/server': fileURLToPath(new URL('../../bank/server/src', import.meta.url)) + '/',
     },
   },
   server: {

@@ -48,7 +48,7 @@ export interface DcLike {
 
 export interface RtcDeps {
   pc(): PcLike;
-  desc(sdp: string): unknown; // wrap into RTCSessionDescription
+  desc(sdp: string, kind: 'offer' | 'answer'): unknown; // wrap into RTCSessionDescription
   cand(c: string): unknown; // wrap into RTCIceCandidateInit
 }
 
@@ -136,8 +136,8 @@ export class RtcStar {
           this.drop(peerId); // negotiation failed — pilot v1: drop silently
         }
       })();
-    } catch {
-      this.drop(peerId); // no RTC support / factory failure — never throw to caller
+    } catch (err) {
+      this.drop(peerId);
     }
   }
 
@@ -158,7 +158,7 @@ export class RtcStar {
         void this.acceptOffer(from, data.sdp);
         return;
       case 'answer':
-        void this.links.get(from)?.pc.setRemoteDescription(this.deps.desc(data.sdp));
+        void this.links.get(from)?.pc.setRemoteDescription(this.deps.desc(data.sdp, 'answer'));
         return;
       case 'ice':
         void this.links.get(from)?.pc.addIceCandidate(this.deps.cand(data.cand)).catch(() => {
@@ -170,21 +170,36 @@ export class RtcStar {
 
   private async acceptOffer(from: PlayerId, sdp: string): Promise<void> {
     if (this.closed || this.links.has(from)) return; // one link per peer
-    const pc = this.deps.pc();
+    let pc: PcLike;
+    try {
+      pc = this.deps.pc();
+    } catch (err) {
+      console.error('[rtc] host pc factory failed', err);
+      return;
+    }
     const state = { pc, dc: null as DcLike | null, link: null as RtcLink | null };
     this.links.set(from, state);
     pc.ondatachannel = (ev) => {
       state.dc = ev.channel;
       this.wireDc(from, ev.channel, state);
     };
+    this.wireIce(from, pc);
     try {
-      await pc.setRemoteDescription(this.deps.desc(sdp));
+      await pc.setRemoteDescription(this.deps.desc(sdp, 'offer'));
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       this.sig.sendSignal(from, { v: 1, kind: 'answer', sdp: answer.sdp });
-    } catch {
+    } catch (err) {
       this.drop(from);
     }
+  }
+
+  /** Trickle-ICE relay: every local candidate rides rtc_signal to the peer. */
+  private wireIce(peerId: PlayerId, pc: PcLike): void {
+    pc.onicecandidate = (ev) => {
+      if (ev.candidate === null || this.closed) return;
+      this.sig.sendSignal(peerId, { v: 1, kind: 'ice', cand: ev.candidate.candidate });
+    };
   }
 
   private wireDc(peerId: PlayerId, dc: DcLike, state: { link: RtcLink | null }): void {

@@ -161,7 +161,7 @@ export function sigPair(idA: string, idB: string): [SigEnd, SigEnd] {
 export function deps(world: MockWorld): RtcDeps {
   return {
     pc: () => world.pc(),
-    desc: (sdp: string) => ({ sdp }),
+    desc: (sdp: string, _kind: 'offer' | 'answer') => ({ sdp }),
     cand: (c: string) => ({ candidate: c }),
   };
 }

@@ -100,4 +100,7 @@ export const bankSdkModule = variantOf(bankModule, {
   name: 'BANK·SDK',
   devPort: 5185,
   clientDist: resolvePortDist_bank(),
+  // P2P pilot (docs/PLATFORM.md §12.6): bank-sdk rooms are rendezvous
+  // shells; the match itself runs in the host player's tab.
+  p2pShell: true,
 });

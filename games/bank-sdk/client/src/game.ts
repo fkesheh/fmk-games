@@ -301,8 +301,31 @@ function variantLabel(s: BankSettings): string {
   return s.raceTarget !== null ? `race to ${s.raceTarget} · ${bonus}` : `${s.totalRounds} rounds · ${bonus}`;
 }
 
+/** Structural WebSocket stand-in: P2P transports plug in here (§12.6). */
+/** WebSocket.OPEN === 1; the override exposes the same numeric state. */
+const WS_OPEN = 1;
+
+export interface WsLike {
+  readyState: number;
+  send(data: string): void;
+  close(): void;
+  onopen: ((ev?: unknown) => void) | null;
+  onclose: ((ev?: unknown) => void) | null;
+  onmessage: ((ev: { data: string }) => void) | null;
+  onerror?: ((ev?: unknown) => void) | null;
+}
+
+export interface BankGameOpts {
+  /** Post-open messages (SDK auth on the real ws path). */
+  readonly onOpenExtra?: () => readonly unknown[];
+  /** P2P transport override — far end is the host tab's mini-lobby. */
+  readonly socket?: WsLike;
+}
+
 export class BankGame {
-  private ws: WebSocket | null = null;
+  /** Structural stand-in for WebSocket (P2P socket override, §12.6). */
+  private ws: WsLike | null = null;
+  private readonly socketOverride: WsLike | undefined;
   private welcomed = false;
   private playerId: string | null = null;
   private resumeToken: string | null = null; // rejoin token loaded from the shared session pointer
@@ -360,8 +383,9 @@ export class BankGame {
   private readonly rollBtn: HTMLButtonElement;
   private readonly bankBtn: HTMLButtonElement;
 
-  constructor(root: HTMLElement, opts?: { onOpenExtra?: () => readonly unknown[] }) {
+  constructor(root: HTMLElement, opts?: BankGameOpts) {
     this.onOpenExtra = opts?.onOpenExtra;
+    this.socketOverride = opts?.socket;
     // ---- menu screen ----------------------------------------------------------
     this.menuEl = el('div', 'screen menu');
     this.menuEl.appendChild(el('h1', 'menu-title', 'BANK'));
@@ -589,7 +613,7 @@ export class BankGame {
     // ---- timers (setInterval everywhere: rAF pauses in background tabs) --------
     window.setInterval(() => this.tick(), TICK_MS);
     window.setInterval(() => {
-      if (this.ws !== null && this.ws.readyState === WebSocket.OPEN) {
+      if (this.ws !== null && this.ws.readyState === WS_OPEN) {
         this.send({ t: 'ping', ts: performance.now() });
       }
     }, PING_EVERY_MS);
@@ -635,8 +659,32 @@ export class BankGame {
   private onOpenExtra: (() => readonly unknown[]) | undefined;
 
   private connect(): void {
+    // Platform v2 P2P (docs/PLATFORM.md §12.6): the shell may supply a
+    // SocketLike whose far end is the HOST TAB (loopback on the host, a
+    // DataChannel relay for guests). Same wire format, same flow.
+    if (this.socketOverride !== undefined) {
+      const ws: WsLike = this.socketOverride;
+      this.ws = ws;
+      ws.onopen = () => {
+        for (const m of this.onOpenExtra?.() ?? []) {
+          try { ws.send(JSON.stringify(m)); } catch { break; }
+        }
+      };
+      ws.onmessage = (ev: { data: string }) => {
+        if (this.ws !== ws || typeof ev.data !== 'string') return;
+        let decoded: unknown;
+        try {
+          decoded = JSON.parse(ev.data);
+        } catch {
+          return;
+        }
+        const msg = parseS2C(decoded);
+        if (msg !== null) this.onMessage(msg);
+      };
+      return;
+    }
     const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(url) as unknown as WsLike;
     this.ws = ws;
     // Platform v2: shell-supplied post-open messages ({t:'auth'}).
     ws.onopen = () => {
@@ -644,7 +692,7 @@ export class BankGame {
         try { ws.send(JSON.stringify(m)); } catch { break; }
       }
     };
-    ws.onmessage = (ev: MessageEvent) => {
+    ws.onmessage = (ev: { data: string }) => {
       if (this.ws !== ws || typeof ev.data !== 'string') return;
       let decoded: unknown;
       try {
@@ -672,7 +720,7 @@ export class BankGame {
   /** No-op unless the socket is open (mirrors the server's Session.send). */
   private send(msg: LobbyC2S | BankC2S): void {
     const ws = this.ws;
-    if (ws === null || ws.readyState !== WebSocket.OPEN) return;
+    if (ws === null || ws.readyState !== WS_OPEN) return;
     try {
       ws.send(JSON.stringify(msg)); // the wire is plain JSON
     } catch {
