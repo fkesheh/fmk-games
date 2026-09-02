@@ -38,7 +38,7 @@ export function variantOf(base: GameModule, o: VariantOpts): GameModule {
     minPlayers: base.minPlayers,
     maxPlayers: base.maxPlayers,
     createRoom(opts) {
-      if (o.p2pShell === true) return p2pShellRoom(opts.io, base.maxPlayers, opts.visibility);
+      if (o.p2pShell === true) return p2pShellRoom(opts.io, base.maxPlayers, opts.visibility, o.id);
       const room = base.createRoom(opts);
       return {
         id: room.id,
@@ -64,7 +64,7 @@ export function variantOf(base: GameModule, o: VariantOpts): GameModule {
 
 let shellSeq = 0;
 
-export function p2pShellRoom(io: RoomIO, maxPlayers: number, visibility: 'public' | 'private'): GameRoomHandle {
+export function p2pShellRoom(io: RoomIO, maxPlayers: number, visibility: 'public' | 'private', moduleId: string): GameRoomHandle {
   shellSeq += 1;
   const id = `p2p-shell-${shellSeq}`;
   let code = '';
@@ -73,7 +73,7 @@ export function p2pShellRoom(io: RoomIO, maxPlayers: number, visibility: 'public
   let hostId: string | null = null; // first member = the creator = the host
   return {
     id,
-    info: () => ({ id, code, game: id, label: 'p2p', players: members.size, maxPlayers, phase: 'warmup', visibility }),
+    info: () => ({ id, code, game: moduleId, label: 'p2p', players: members.size, maxPlayers, phase: 'warmup', visibility }),
     playerCount: () => members.size,
     stalePlayers: () => [],
     addPlayer: (pid) => {

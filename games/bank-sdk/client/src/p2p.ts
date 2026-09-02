@@ -77,6 +77,14 @@ class BankP2pLobby {
   get joinCode(): string | null {
     return this.code;
   }
+  debugRoom(): { members: number; hasRoom: boolean } {
+    return { members: this.sinks.size, hasRoom: this.room !== null };
+  }
+  debugFrames: string[] = [];
+  recordFrame(id: PlayerId, data: string): void {
+    this.debugFrames.push(id + ':' + data.slice(0, 60));
+    if (this.debugFrames.length > 20) this.debugFrames.shift();
+  }
 
   handleFrame(id: PlayerId, data: string): void {
     let parsed: unknown;
@@ -226,9 +234,12 @@ export async function startP2p(app: HTMLElement): Promise<void> {
   };
 
   let star: RtcStar | null = null;
+  let guestWired = false;
+  let hostMounted = false; // inbound DC→game routing installed once
   let lobby: BankP2pLobby | null = null; // host-side only
   let hostStart: string | null = null; // the host's own create frame
   const guestQueue: string[] = []; // guest frames saved while dialing
+
 
   function ensureStar(): void {
     if (star !== null) return;
@@ -318,24 +329,41 @@ export async function startP2p(app: HTMLElement): Promise<void> {
     if (!shell.ready) return;
     ensureStar();
     const isHost = selfId === shell.hostId;
-    if (isHost && lobby === null && hostStart !== null) {
-      lobby = new BankP2pLobby();
-      // Bridge the host's own game to its local lobby: without this attach
-      // the room's broadcasts (bank_state, events) reach no sink.
-      lobby.attach(selfId, { deliver: (data) => gameSocket.onmessage?.({ data }) });
-      const src = JSON.parse(hostStart) as Record<string, unknown>;
-      delete src.p2pHint;
-      const framed = JSON.stringify({ ...src, shellCode: shell.code });
-      lobby.handleFrame(selfId, framed); // local BankRoom adopts the shell code
-      say('');
-      clearInterval(pump);
+    if (isHost && hostStart !== null && !hostMounted) {
+      if (lobby === null) {
+        lobby = new BankP2pLobby();
+        // Bridge the host's own game to its local lobby: without this attach
+        // the room's broadcasts (bank_state, events) reach no sink.
+        lobby.attach(selfId, { deliver: (data) => gameSocket.onmessage?.({ data }) });
+        const src = JSON.parse(hostStart) as Record<string, unknown>;
+        delete src.p2pHint;
+        const framed = JSON.stringify({ ...src, shellCode: shell.code });
+        lobby.handleFrame(selfId, framed); // local BankRoom adopts the shell code
+        say('');
+      }
+      hostMounted = true;
+      // NOTE: the pump keeps running — guests attach whenever their links
+      // open, which can be seconds after we mount our own game.
     }
     if (!isHost && shell.hostId !== null) {
       const link = star?.link(shell.hostId);
-      if (link !== null && link !== undefined && guestQueue.length > 0) {
-        for (const f of guestQueue.splice(0)) star?.send(shell.hostId, { frame: f });
-        say('');
-        clearInterval(pump);
+      if (link !== null && link !== undefined) {
+        // Route the host's replies into our game socket (once per link).
+        if (!guestWired) {
+          guestWired = true;
+          link.onMessage = (d) => {
+            const m = d as Record<string, unknown>;
+            if (typeof m.frame === 'string') gameSocket.onmessage?.({ data: m.frame });
+          };
+          link.onClose = () => {
+            gameSocket.readyState = 3;
+            gameSocket.onclose?.();
+          };
+        }
+        if (guestQueue.length > 0) {
+          for (const f of guestQueue.splice(0)) star?.send(shell.hostId, { frame: f });
+          say('');
+        }
       }
       if ((star === null || star.link(shell.hostId) === null) && shell.hostId !== null) {
         star?.dial(shell.hostId); // idempotent while negotiating
