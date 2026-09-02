@@ -14,3 +14,6 @@ export * from './rooms.js';
 export * from './profile.js';
 export * from './saves.js';
 export * from './client.js';
+
+// ---- P2P link layer (RtcStar + injectable RTC primitives) ----------------------
+export * from './rtc.js';

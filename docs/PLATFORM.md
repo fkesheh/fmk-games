@@ -188,17 +188,21 @@ can't — no driver ships to clients).
 read-only deploy): in-memory shim, log loudly, platform keeps running — matches repo
 robustness rule. Backup = file copy (documented).
 
-## 7. Showcase games (v2.1 revision)
+## 7. Games on the new arch (v2.2 revision)
 
-The three original showcases (ORBIT/SUMO/GHOSTRUN) were removed after review.
-The SDK proof is now a **port of ANCIENTS** itself:
+Every legacy game now has a registered **·SDK twin** built by the same recipe:
+`variantOf()` (same rooms, second id, correct `RoomInfo.game`) + a copied
+client with its join envelopes retargeted. Legacy registrations untouched.
 
-| Game | Mode | Proves |
+| Twin | Port | Pattern |
 |---|---|---|
-| **ANCIENTS·SDK** `/ancients/` (`games/ancients/`) | same MOBA as legacy `/rift/`, registered separately via `riftModuleVariant()` | variant registration of a REAL game with zero legacy edits; SDK identity/auth shell (`{t:'auth'}` after every open); stats sink (`rift_end` → `ancients.kill/death/win`, pad orders → `ancients.pad_order`); phone-pad adapter (stick→click-to-move orders, buttons→casts) with its own unit suite |
+| **ANCIENTS·SDK** `/ancients/` | MOBA | `riftModuleVariant()` (pad adapter + stats sink) + SDK auth shell |
+| **BANK·SDK** `/bank-sdk/` | dice | flagship: SDK auth shell + **canonical P2P transport** (host-authoritative) |
+| WORDBOMB·SDK / KART·SDK / SPLAT·SDK / ACES·SDK / STRICKEN·SDK / OUTPOST·SDK | — | mechanical copies: retargeted joins, own dev ports, own dists |
 
-Legacy `/rift/` keeps running untouched and anonymous. The port reuses the
-rift client core through deep imports; only the shell (`main.ts`) is new.
+Two known limits: fps/outpost join envelopes omit the `game` field, so those
+two ports required explicit per-client retargets (done); pad layouts exist
+where the game declares them, consumed by the generic `/pad/` page.
 
 ## 8. Native app door (design note, not built)
 
@@ -223,10 +227,12 @@ are DOM-bound adapters behind interfaces — swap implementations per platform l
 
 ## 10. Gates
 
-Existing: typecheck (strict, all workspaces) · vitest (~402) · build (clients+server) ·
-per-game e2e suites. New: `scripts/e2e-platform.mjs` (bare-websocket + fetch flow:
-auth/device → profile rename → save put/get/conflict → pad pair/join/stream/reject →
-stats visible) and one e2e per showcase game.
+Existing: typecheck (strict, all workspaces) · vitest · build (clients+server) ·
+per-game e2e suites. Platform: `scripts/e2e-platform.mjs` (bare-websocket +
+fetch: auth → saves/conflict → pads → stats → legacy regression) and
+`scripts/e2e-p2p-bank.mjs` (two headless browsers: standard menu over the P2P
+transport, one code, guest joins over the DataChannel, both at the table,
+host-tab rolls land in the guest UI, zero console errors — 7/7 then 9/9).
 
 ---
 
