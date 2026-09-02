@@ -875,7 +875,7 @@ export class BankGame {
         }
         break;
       case 'room_list':
-        this.rooms = msg.rooms.filter((r) => r.game === 'bank'); // bank-only room list
+        this.rooms = msg.rooms.filter((r) => r.game === 'bank-sdk'); // sdk-port room list (shells)
         if (this.screen === 'menu') this.renderRooms();
         break;
       case 'pong': {

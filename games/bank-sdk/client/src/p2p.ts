@@ -223,6 +223,9 @@ export async function startP2p(app: HTMLElement): Promise<void> {
       const m = JSON.parse(String(ev.data)) as Record<string, unknown>;
       if (m.t === 'rtc_signal' && typeof m.from === 'string') sig.onSignal?.(m.from, m.data);
       // p2p_ready is read by shellWatch below (single consumer).
+      else if (m.t === 'room_list' && Array.isArray(m.rooms)) {
+        gameSocket.onmessage?.({ data: JSON.stringify({ t: 'room_list', rooms: m.rooms }) });
+      }
       else if (m.t === 'p2p_ready' && typeof m.code === 'string' && typeof m.hostId === 'string') {
         shell.code = m.code;
         shell.hostId = m.hostId;
@@ -239,6 +242,7 @@ export async function startP2p(app: HTMLElement): Promise<void> {
   let lobby: BankP2pLobby | null = null; // host-side only
   let hostStart: string | null = null; // the host's own create frame
   const guestQueue: string[] = []; // guest frames saved while dialing
+  let pendingJoinPublic: string | null = null; // shell roomId awaiting table-click join
 
 
   function ensureStar(): void {
@@ -314,6 +318,25 @@ export async function startP2p(app: HTMLElement): Promise<void> {
         gameSocket.onmessage?.({ data: JSON.stringify({ t: 'pong', ts: m.ts, serverTime: Date.now() }) });
         return;
       }
+      if (m.t === 'list_rooms') {
+        // TABLES list: the rendezvous server knows the public shells.
+        ws.send(JSON.stringify({ t: 'list_rooms' }));
+        return;
+      }
+      if (m.t === 'join_public') {
+        // Row click: join the SHELL for presence, then synthesize the
+        // code-join the host lobby expects once the DC opens.
+        pendingJoinPublic = m.roomId !== undefined ? String(m.roomId) : '';
+        ws.send(JSON.stringify({ t: 'join_public', name: displayName, roomId: pendingJoinPublic }));
+        say('connecting to the host…');
+        return;
+      }
+      // Room-level frames (roll/bank/leave): route by transport state.
+      if (lobby !== null && selfId === shell.hostId) {
+        lobby.handleFrame(selfId, data);
+        return;
+      }
+      return; // transport not live yet on the guest path — frame already queued
       // Room-level frames are meaningless until the transport is live; the
       // host's loopback delivers them directly, guests never get here.
     },
@@ -362,6 +385,12 @@ export async function startP2p(app: HTMLElement): Promise<void> {
         }
         if (guestQueue.length > 0) {
           for (const f of guestQueue.splice(0)) star?.send(shell.hostId, { frame: f });
+          say('');
+        }
+        if (pendingJoinPublic !== null && shell.code !== null) {
+          // Table-click join: the host lobby speaks codes, not room ids.
+          star?.send(shell.hostId, { frame: JSON.stringify({ t: 'join_private', name: displayName, code: shell.code }) });
+          pendingJoinPublic = null;
           say('');
         }
       }

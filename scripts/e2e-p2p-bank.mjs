@@ -97,14 +97,43 @@ async function main() {
     ok(bSeesRoll === true, '05 guest UI reflects host-tab sim activity');
     ok(errors.A.length === 0, '06 zero console errors on host', errors.A.slice(0, 2).join(' | '));
     ok(errors.B.length === 0, '07 zero console errors on guest', errors.B.slice(0, 2).join(' | '));
+  // ---- scenario B: public row click (no code typing) ----
+  await a.close();
+  await b.close();
+  const c = await browser.newPage();
+  const d = await browser.newPage();
+  for (const [k, pg] of [['C', c], ['D', d]]) {
+    pg.on('pageerror', (e) => errors[k === 'C' ? 'A' : 'B'].push(String(e)));
+    await pg.goto(`${BASE}/bank-sdk/`, { waitUntil: 'networkidle2' });
+  }
+  await sleep(1000);
+  await c.evaluate(() => { [...document.querySelectorAll('button')].find((x) => x.textContent === 'CREATE PUBLIC')?.click(); });
+  await sleep(1500);
+  const clickedRow = await d.evaluate(() => {
+    const row = document.querySelector('div.room-row');
+    if (row === null) return false;
+    row.click();
+    return true;
+  });
+  ok(clickedRow === true, '09 public table row renders on the guest');
+  let rowCodes = null;
+  for (let i = 0; i < 40 && rowCodes === null; i++) {
+    await sleep(250);
+    rowCodes = await Promise.all([c, d].map((pg) => pg.evaluate(() => document.body.textContent?.match(/CODE ([A-HJ-NP-Z2-9]{5,6})/)?.[1] ?? null)));
+    if (rowCodes[0] === null || rowCodes[0] !== rowCodes[1]) rowCodes = null;
+  }
+  ok(rowCodes !== null, '10 row click joins the SAME p2p table', JSON.stringify(rowCodes));
+  await c.close();
+  await d.close();
+
+  console.log(`\ne2e-p2p-bank: ${n - failures.length}/${n} assertions passed`);
+  if (failures.length > 0) process.exit(1);
   } finally {
     await browser.close();
     server.kill('SIGTERM');
     await sleep(300);
     server.kill('SIGKILL');
   }
-  console.log(`\ne2e-p2p-bank: ${n - failures.length}/${n} assertions passed`);
-  if (failures.length > 0) process.exit(1);
 }
 main().catch((err) => {
   console.error('e2e-p2p-bank crashed:', err);
