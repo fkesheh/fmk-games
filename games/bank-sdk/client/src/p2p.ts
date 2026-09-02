@@ -49,6 +49,12 @@ class BankP2pLobby {
   constructor() {
     this.io = {
       send: (id, msg) => {
+        // ONE code: the menu renders bank_state.code, which is the BANK
+        // room's internal mint — rewrite it to this lobby's (shell) code so
+        // the displayed code is the code guests can actually join with.
+        if (typeof msg === 'object' && msg !== null && (msg as { t?: string }).t === 'bank_state') {
+          msg = { ...(msg as Record<string, unknown>), code: this.code };
+        }
         this.sinks.get(id)?.deliver(JSON.stringify(msg));
       },
       rttMs: () => 0,
@@ -312,6 +318,9 @@ export async function startP2p(app: HTMLElement): Promise<void> {
     const isHost = selfId === shell.hostId;
     if (isHost && lobby === null && hostStart !== null) {
       lobby = new BankP2pLobby();
+      // Bridge the host's own game to its local lobby: without this attach
+      // the room's broadcasts (bank_state, events) reach no sink.
+      lobby.attach(selfId, { deliver: (data) => gameSocket.onmessage?.({ data }) });
       const src = JSON.parse(hostStart) as Record<string, unknown>;
       delete src.p2pHint;
       const framed = JSON.stringify({ ...src, shellCode: shell.code });

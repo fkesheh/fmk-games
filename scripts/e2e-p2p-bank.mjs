@@ -56,7 +56,11 @@ async function main() {
     let gameCode = null;
     for (let i = 0; i < 40 && gameCode === null; i++) {
       await sleep(250);
-      gameCode = await a.evaluate(() => document.body.textContent?.match(/CODE ([A-HJ-NP-Z2-9]{6})/)?.[1] ?? null);
+      gameCode = await a.evaluate(() => {
+        const span = document.querySelector('.table-invite-code')?.textContent ?? '';
+        const m = span.match(/([A-HJ-NP-Z2-9]{5,6})/);
+        return m !== null && m !== undefined ? m[1] : null;
+      });
     }
     ok(typeof gameCode === 'string', '02 host in-game code visible (ONE code — the shell code)', String(gameCode));
 
