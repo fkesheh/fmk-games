@@ -32,7 +32,7 @@ export interface PcLike {
   createOffer(): Promise<{ type: string; sdp: string }>;
   createAnswer(): Promise<{ type: string; sdp: string }>;
   addIceCandidate(c: unknown): Promise<void>;
-  onicecandidate: ((ev: { candidate: { candidate: string } | null }) => void) | null;
+  onicecandidate: ((ev: { candidate: { candidate: string; sdpMid?: string | null; sdpMLineIndex?: number | null; toJSON(): unknown } | null }) => void) | null;
   ondatachannel: ((ev: { channel: DcLike }) => void) | null;
   close(): void;
 }
@@ -49,7 +49,7 @@ export interface DcLike {
 export interface RtcDeps {
   pc(): PcLike;
   desc(sdp: string, kind: 'offer' | 'answer'): unknown; // wrap into RTCSessionDescription
-  cand(c: string): unknown; // wrap into RTCIceCandidateInit
+  cand(c: unknown): unknown; // candidate init relayed verbatim
 }
 
 /** One live DataChannel to a peer. */
@@ -127,6 +127,7 @@ export class RtcStar {
       const dc = pc.createDataChannel('game');
       state.dc = dc;
       this.wireDc(peerId, dc, state);
+      this.wireIce(peerId, pc);
       void (async () => {
         try {
           const offer = await pc.createOffer();
@@ -152,7 +153,11 @@ export class RtcStar {
   // ---- internals ------------------------------------------------------------
 
   private onSignal(from: PlayerId, data: unknown): void {
-    if (this.closed || !isRtcSignalPayload(data)) return;
+    if (this.closed || !isRtcSignalPayload(data)) {
+      console.log('[rtc-debug] star drop', this.closed, JSON.stringify(data)?.slice(0, 40));
+      return;
+    }
+
     switch (data.kind) {
       case 'offer':
         void this.acceptOffer(from, data.sdp);
@@ -160,11 +165,14 @@ export class RtcStar {
       case 'answer':
         void this.links.get(from)?.pc.setRemoteDescription(this.deps.desc(data.sdp, 'answer'));
         return;
-      case 'ice':
-        void this.links.get(from)?.pc.addIceCandidate(this.deps.cand(data.cand)).catch(() => {
+      case 'ice': {
+        const remote = this.links.get(from)?.pc;
+        if (remote === undefined) return;
+        remote.addIceCandidate(this.deps.cand(data.cand)).catch(() => {
           // late/stray candidates after close are routine — ignore
         });
         return;
+      }
     }
   }
 
@@ -198,7 +206,8 @@ export class RtcStar {
   private wireIce(peerId: PlayerId, pc: PcLike): void {
     pc.onicecandidate = (ev) => {
       if (ev.candidate === null || this.closed) return;
-      this.sig.sendSignal(peerId, { v: 1, kind: 'ice', cand: ev.candidate.candidate });
+      // Full candidate init — addIceCandidate needs sdpMid/sdpMLineIndex.
+      this.sig.sendSignal(peerId, { v: 1, kind: 'ice', cand: ev.candidate.toJSON() });
     };
   }
 

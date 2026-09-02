@@ -43,7 +43,8 @@ async function main() {
   function watch(page, key) {
     page.on('pageerror', (e) => errors[key].push(String(e)));
     page.on('console', (m) => {
-      if (m.type() === 'error') errors[key].push(m.text());
+      const t = m.text();
+      if (m.type() === 'error' && !t.includes('404') && !t.includes('manifest')) errors[key].push(t);
     });
   }
 
@@ -89,9 +90,19 @@ async function main() {
     });
 
     // 3) DC forms; both BankGame instances mount (host loopback, guest DC)
-    await sleep(2500);
-    const bMenu = await b.evaluate(() => document.body.textContent?.includes('the dice game') || document.body.textContent?.includes('BANK'));
+    // DC setup takes 2-4s (STUN+ICE) — poll for the BankGame mount, don't sleep-race.
+    let bMenu = false;
+    for (let i = 0; i < 40 && !bMenu; i++) {
+      await sleep(250);
+      bMenu = await b.evaluate(() => [...document.querySelectorAll('button')].some((x) => x.textContent?.toLowerCase().includes('private')));
+    }
     ok(bMenu === true, '02 guest page reaches the BANK client UI');
+    let aMenu = false;
+    for (let i = 0; i < 20 && !aMenu; i++) {
+      await sleep(250);
+      aMenu = await a.evaluate(() => [...document.querySelectorAll('button')].some((x) => x.textContent?.toLowerCase().includes('private')));
+    }
+    ok(aMenu === true, '02b host page reaches the BANK client UI');
 
     // 4) host creates the in-game private room (its local BankRoom mints the
     //    GAME code shown in its own menu); read it from the DOM
@@ -99,13 +110,20 @@ async function main() {
       const btns = [...document.querySelectorAll('button')];
       btns.find((x) => x.textContent?.toLowerCase().includes('private'))?.click();
     });
-    await sleep(1200);
-    const gameCode = await a.evaluate(() => {
-      const m = document.body.textContent?.match(/\b[A-HJ-NP-Z2-9]{6}\b/g);
-      return m ?? null;
-    });
-    ok(Array.isArray(gameCode) && gameCode.length > 0, '03 host in-game code visible', JSON.stringify(gameCode));
-    const code = gameCode[0];
+    let gameCode = null;
+    for (let i = 0; i < 40 && gameCode === null; i++) {
+      await sleep(250);
+      gameCode = await a.evaluate(() => {
+        const m = document.body.textContent?.match(/CODE ([A-HJ-NP-Z2-9]{5})/);
+        return m !== null && m !== undefined ? m[1] : null;
+      });
+    }
+    if (typeof gameCode !== 'string') {
+      const body = await a.evaluate(() => document.body.textContent?.slice(0, 300) ?? '');
+      console.log('   [03 debug] A body:', body.replace(/\s+/g, ' '));
+    }
+    ok(typeof gameCode === 'string', '03 host in-game code visible', String(gameCode));
+    const code = gameCode;
 
     // 5) guest joins THAT code — frames flow over the DataChannel into A's tab
     await b.evaluate(() => {

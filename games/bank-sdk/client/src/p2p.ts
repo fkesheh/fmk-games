@@ -230,7 +230,10 @@ export function startP2p(app: HTMLElement): void {
     ws.onmessage = (ev) => {
       try {
         const m = JSON.parse(String(ev.data)) as Record<string, unknown>;
-        if (m.t === 'rtc_signal' && typeof m.from === 'string') sig.onSignal?.(m.from, m.data);
+        if (m.t === 'rtc_signal' && typeof m.from === 'string') {
+          console.log('[rtc-debug] signal arrived, onSignal set?', sig.onSignal !== null);
+          sig.onSignal?.(m.from, m.data);
+        }
         else if (m.t === 'rtc_peers' && Array.isArray(m.ids)) sig.onPeers?.(m.ids as PlayerId[]);
         else if (m.t === 'p2p_ready' && typeof m.code === 'string' && typeof m.hostId === 'string') {
           (window as unknown as { __p2pCode?: string }).__p2pCode = m.code;
@@ -245,7 +248,7 @@ export function startP2p(app: HTMLElement): void {
               deps: {
                 pc: () => new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }) as unknown as import('@platform/sdk/rtc.js').PcLike,
                 desc: (sd, kind) => ({ type: kind, sdp: sd }),
-                cand: (c) => ({ candidate: c }),
+                cand: (c) => c,
               },
             });
           }
@@ -281,6 +284,7 @@ export function startP2p(app: HTMLElement): void {
     hostBtn.addEventListener('click', () => {
       if (role !== null) return;
       role = 'host';
+      lobby = new BankP2pLobby(); // role snapshots AFTER the click, not at boot
       ws.send(JSON.stringify({ t: 'create_private', name: `host-${selfId.slice(0, 4)}`, game: 'bank-sdk', settings: { p2p: true } }));
       status.textContent = 'hosting — waiting for a peer…';
     });
@@ -313,8 +317,7 @@ export function startP2p(app: HTMLElement): void {
     const origOnSignal = sig.onSignal;
     void origOnSignal;
     // Poll-free mount: RtcStar has no onOpen hook yet, so bridge via links().
-    (window as unknown as { __p2pStar?: () => RtcStar | null }).__p2pStar = () => star;
-    const lobby: BankP2pLobby | null = role === 'host' ? new BankP2pLobby() : null;
+    let lobby: BankP2pLobby | null = null; // created when the HOST button is clicked (role is null at boot)
     const attached = new Set<PlayerId>();
     const mountCheck = setInterval(() => {
       const starLive = star;
@@ -324,20 +327,21 @@ export function startP2p(app: HTMLElement): void {
       }
       // HOST: attach every established guest — sink wraps frames back over
       // the DC; inbound frames unwrap {frame} into lobby.handleFrame.
-      if (role === 'host' && lobby !== null) {
+      const hostLobby = lobby;
+      if (role === 'host' && hostLobby !== null) {
         for (const pid of starLive.established()) {
           if (attached.has(pid)) continue;
           attached.add(pid);
           const link = starLive.link(pid);
           if (link === null) continue;
-          lobby.attachGuest(pid, {
+          hostLobby.attachGuest(pid, {
             deliver: (data) => starLive.send(pid, { frame: data }),
           });
           link.onMessage = (d) => {
             const m = d as Record<string, unknown>;
-            if (typeof m.frame === 'string') lobby.handleFrame(pid, m.frame);
+            if (typeof m.frame === 'string') hostLobby.handleFrame(pid, m.frame);
           };
-          link.onClose = () => lobby.detach(pid);
+          link.onClose = () => hostLobby.detach(pid);
         }
       }
       const others = starLive.established();

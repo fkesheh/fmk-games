@@ -94,6 +94,7 @@ const LOBBY_TAGS: ReadonlySet<string> = new Set([
   'auth',
   'join_as_pad',
   'pad_input',
+  'rtc_signal',
 ]);
 
 /** parseC2S emits a parsed LobbyC2S for lobby tags; anything else is a raw envelope. */
@@ -720,7 +721,11 @@ export class Lobby {
       this.rtcWindows.set(fromId, win);
     }
     win.count += 1;
-    if (win.count > RTC.maxSignalsPerSec) return;
+    if (win.count > RTC.maxSignalsPerSec) {
+      console.log('[rtc-debug] drop: rate cap', fromId);
+      return;
+    }
+    console.log('[rtc-debug] forwarded', fromId, '->', toId);
     this.sessions.get(toId)?.send({ t: 'rtc_signal', from: fromId, data });
   }
 
