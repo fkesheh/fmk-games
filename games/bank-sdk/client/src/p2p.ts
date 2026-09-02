@@ -277,10 +277,18 @@ export async function startP2p(app: HTMLElement): Promise<void> {
         say('opening a peer-to-peer room…');
         return;
       }
-      if (m.t === 'join_private' || m.t === 'quick_join') {
+      if (m.t === 'join_private') {
         guestQueue.push(data);
         ws.send(JSON.stringify({ t: 'join_private', name: displayName, code: String(m.code ?? '') }));
         say('connecting to the host…');
+        return;
+      }
+      if (m.t === 'quick_join') {
+        // Public matchmaking: the server's quick_join lands us in the first
+        // open public shell (or mints one — its first member hosts).
+        guestQueue.push(data);
+        ws.send(JSON.stringify({ t: 'quick_join', name: displayName, game: 'bank-sdk' }));
+        say('finding a peer-to-peer table…');
         return;
       }
       if (m.t === 'ping') {
