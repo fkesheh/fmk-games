@@ -14,7 +14,8 @@
 // ============================================================================
 import { BankRoom } from '@bank/server/room.js';
 import { DEFAULT_SETTINGS, MAX_PLAYERS, type BankSettings } from '@bank/shared';
-import { CLAIM_ALPHABET, rng, type GameRoomHandle, type PlayerId, type RoomIO } from '@platform/shared';
+import { CLAIM_ALPHABET, loadIdentity, rng, type GameRoomHandle, type PlayerId, type RoomIO } from '@platform/shared';
+import { Profiles } from '@platform/sdk/profile.js';
 import { RtcStar, type SigChannel } from '@platform/sdk/rtc.js';
 import type { WsLike } from './game.js';
 import { BankGame } from './game.js';
@@ -221,6 +222,18 @@ export function startP2p(app: HTMLElement): void {
 
   void (async () => {
     const { ws, selfId } = await openWs();
+    // Platform login (docs/PLATFORM.md §4.1): the rendezvous session binds
+    // to the device profile — stats/saves/name carry into P2P play.
+    let displayName = 'Player';
+    try {
+      const profiles = new Profiles(null);
+      await profiles.ensureDeviceAuth();
+      const token = profiles.token();
+      if (token !== null) ws.send(JSON.stringify({ t: 'auth', token }));
+      displayName = profiles.me()?.name ?? loadIdentity().name ?? 'Player';
+    } catch {
+      // anonymous play stays supported — login is an enhancement, never a gate
+    }
     const sig: SigChannel = {
       sendSignal: (to, data) => ws.send(JSON.stringify({ t: 'rtc_signal', to, data })),
       onSignal: null,
@@ -285,7 +298,7 @@ export function startP2p(app: HTMLElement): void {
       if (role !== null) return;
       role = 'host';
       lobby = new BankP2pLobby(); // role snapshots AFTER the click, not at boot
-      ws.send(JSON.stringify({ t: 'create_private', name: `host-${selfId.slice(0, 4)}`, game: 'bank-sdk', settings: { p2p: true } }));
+      ws.send(JSON.stringify({ t: 'create_private', name: displayName, game: 'bank-sdk', settings: { p2p: true } }));
       status.textContent = 'hosting — waiting for a peer…';
     });
 
@@ -297,7 +310,7 @@ export function startP2p(app: HTMLElement): void {
         return;
       }
       role = 'guest';
-      ws.send(JSON.stringify({ t: 'join_private', name: `guest-${selfId.slice(0, 4)}`, code }));
+      ws.send(JSON.stringify({ t: 'join_private', name: displayName, code }));
       status.textContent = 'joining…';
     });
 
