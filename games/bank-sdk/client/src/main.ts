@@ -51,16 +51,16 @@ try {
   } catch {
     // anonymous play is fine — auth is an enhancement, never a gate
   }
-  // P2P pilot (docs/PLATFORM.md §12.6): ?p2p=1 takes over the page —
-  // rendezvous, host/guest roles, then a BankGame whose socket far end is
-  // the host tab.
-  if (new URLSearchParams(location.search).get('p2p') === '1') {
+  // P2P is the CANONICAL transport (docs/PLATFORM.md §12.6): the game's own
+  // menu joins a host-authoritative match; the server only brokers the
+  // introduction. ?online=1 forces the legacy server-authoritative mode.
+  if (new URLSearchParams(location.search).get('online') === '1') {
+    new BankGame(root, { ...(onOpenExtra !== undefined ? { onOpenExtra } : {}) });
+  } else {
     void (async () => {
       const { startP2p } = await import('./p2p.js');
-      startP2p(root);
+      await startP2p(root);
     })();
-  } else {
-    new BankGame(root, { ...(onOpenExtra !== undefined ? { onOpenExtra } : {}) });
   }
 } catch (err) {
   showError(`Boot failed: ${err instanceof Error ? err.message : String(err)}`);
