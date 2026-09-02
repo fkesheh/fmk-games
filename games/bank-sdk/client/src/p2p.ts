@@ -291,7 +291,9 @@ export async function startP2p(app: HTMLElement): Promise<void> {
       }
       if (m.t === 'quick_join') {
         // Public matchmaking: the server's quick_join lands us in the first
-        // open public shell (or mints one — its first member hosts).
+        // open public shell (or mints one — its first member hosts). Save
+        // the frame EITHER WAY: it may need local replay if we are the host.
+        hostStart = data;
         guestQueue.push(data);
         ws.send(JSON.stringify({ t: 'quick_join', name: displayName, game: 'bank-sdk' }));
         say('finding a peer-to-peer table…');
