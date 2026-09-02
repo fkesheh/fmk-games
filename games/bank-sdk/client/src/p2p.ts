@@ -326,7 +326,13 @@ export async function startP2p(app: HTMLElement): Promise<void> {
   }, 100);
 
   // Hand the transport to the game — its standard menu is the join screen.
-  setTimeout(() => gameSocket.onopen?.(), 0);
+  // welcome: BankGame gates its menu on a session id (over P2P it is the
+  // rendezvous session id).
+  setTimeout(() => {
+    gameSocket.onopen?.();
+    gameSocket.onmessage?.({ data: JSON.stringify({ t: 'welcome', playerId: selfId }) });
+    gameSocket.onmessage?.({ data: JSON.stringify({ t: 'room_list', rooms: [] }) });
+  }, 0);
   void new BankGame(app, { socket: gameSocket });
   void boot;
   void say;
