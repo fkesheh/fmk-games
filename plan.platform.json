@@ -53,9 +53,6 @@
     "P8_PAD_PAGE": [
       "platform/server/src/padPage.ts"
     ],
-    "P9_ORBIT": ["games/orbit/**"],
-    "P10_SUMO": ["games/sumo/**"],
-    "P11_GHOSTRUN": ["games/ghostrun/**"],
     "INT": [
       "platform/server/src/registry.ts",
       "platform/engine/src/index.ts",

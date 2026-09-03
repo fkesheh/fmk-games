@@ -184,6 +184,27 @@ export class HttpApi {
         if (parts.length === 2 && at(0) === 'auth' && at(1) === 'claim') {
           return handleClaim(this.store, body);
         }
+        // P2P self-reported stats (docs/PLATFORM.md §12): in a host-tab
+        // match there is no server room to report through, so each client
+        // reports its OWN end-of-match counters from the snapshots it saw.
+        // Bearer-bound (a profile can only ever write its own rows).
+        if (parts.length === 2 && at(0) === 'stats') {
+          return this.withAuth(authorization, (id) => {
+            const rec = body !== null && typeof body === 'object' ? (body as Record<string, unknown>) : {};
+            const game = at(1) ?? '';
+            const key = typeof rec.key === 'string' ? rec.key : '';
+            const value = typeof rec.value === 'number' ? rec.value : NaN;
+            if (!/^[a-z0-9-]{2,24}$/.test(game) || !/^[a-z0-9_.]{1,32}$/.test(key) || !Number.isFinite(value)) {
+              return { status: 400, json: { error: 'bad_request' } };
+            }
+            try {
+              this.store.addStats(id, game, { [key]: Math.max(-1e6, Math.min(1e6, Math.trunc(value))) });
+              return { status: 200, json: { ok: true } };
+            } catch {
+              return { status: 500, json: { error: 'internal' } };
+            }
+          });
+        }
         // Mint a claim code for the AUTHENTICATED profile (docs/PLATFORM.md
         // §4.1): Bearer token OR {token} body → {code}. Single use,
         // AUTH.claimTtlMs. (Body form exists because the minting device may

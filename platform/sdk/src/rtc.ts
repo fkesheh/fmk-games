@@ -142,6 +142,14 @@ export class RtcStar {
     }
   }
 
+  /**
+   * Forget one peer (dead link cleanup so a later dial() recreates it).
+   * Safe to call for unknown ids.
+   */
+  dropPeer(peerId: PlayerId): void {
+    this.drop(peerId);
+  }
+
   /** Leave the room's P2P plane; closes every pc. */
   close(): void {
     if (this.closed) return;
