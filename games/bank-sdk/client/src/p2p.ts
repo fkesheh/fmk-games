@@ -17,7 +17,8 @@
 // ============================================================================
 import { BankRoom } from '@bank/server/room.js';
 import { DEFAULT_SETTINGS, type BankSettings } from '@bank/shared';
-import { loadIdentity, type GameRoomHandle, type PlayerId, type RoomIO } from '@platform/shared';
+import { loadIdentity, type PlayerId } from '@platform/shared';
+import { HostedLobby, mintRoomCode } from '@platform/sdk/hosted.js';
 import { Profiles } from '@platform/sdk/profile.js';
 import { RtcStar, type SigChannel } from '@platform/sdk/rtc.js';
 import type { WsLike } from './game.js';
@@ -34,125 +35,9 @@ function resolveSettings(raw: Record<string, unknown> | undefined): BankSettings
   };
 }
 
-// ---- host mini-lobby ---------------------------------------------------------
-
-interface GuestSink {
-  deliver(data: string): void;
-}
-
-class BankP2pLobby {
-  private readonly sinks = new Map<PlayerId, GuestSink>();
-  private room: GameRoomHandle | null = null;
-  private code: string | null = null;
-  private lastState: string | null = null; // latest bank_state (replay on late attach)
-  private readonly io: RoomIO;
-
-  constructor() {
-    const self = this;
-    this.io = {
-      send: (id, msg) => {
-        // ONE code: the menu renders bank_state.code, which is the BANK
-        // room's internal mint — rewrite it to this lobby's (shell) code so
-        // the displayed code is the code guests can actually join with.
-        if (typeof msg === 'object' && msg !== null && (msg as { t?: string }).t === 'bank_state') {
-          msg = { ...(msg as Record<string, unknown>), code: self.code };
-        }
-        const json = JSON.stringify(msg);
-        if (typeof msg === 'object' && msg !== null && (msg as { t?: string }).t === 'bank_state') {
-          self.lastState = json;
-        }
-        self.sinks.get(id)?.deliver(json);
-      },
-      rttMs: () => 0,
-    };
-  }
-
-  /** Re-send the current snapshot to a just-attached sink (join/attach race:
-  the reply to a join can arrive before the sink exists on a slow tick). */
-  sync(id: PlayerId): void {
-    const sink = this.sinks.get(id);
-    if (sink !== undefined && this.lastState !== null) {
-      sink.deliver(this.lastState);
-    }
-  }
-
-  attach(id: PlayerId, sink: GuestSink): void {
-    this.sinks.set(id, sink);
-  }
-
-  has(id: PlayerId): boolean {
-    return this.sinks.has(id);
-  }
-
-  detach(id: PlayerId): void {
-    this.sinks.delete(id);
-    // Ghost, don't purge: removePlayer() without `permanent` keeps the
-    // seat + score so a reconnect re-binds in place (same session id).
-    this.room?.removePlayer(id);
-  }
-
-  get joinCode(): string | null {
-    return this.code;
-  }
-  debugRoom(): { members: number; hasRoom: boolean } {
-    return { members: this.sinks.size, hasRoom: this.room !== null };
-  }
-  debugFrames: string[] = [];
-  recordFrame(id: PlayerId, data: string): void {
-    this.debugFrames.push(id + ':' + data.slice(0, 60));
-    if (this.debugFrames.length > 20) this.debugFrames.shift();
-  }
-
-  handleFrame(id: PlayerId, data: string): void {
-    this.recordFrame(id, data);
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(data);
-    } catch {
-      return;
-    }
-    if (typeof parsed !== 'object' || parsed === null) return;
-    const m = parsed as Record<string, unknown>;
-    switch (m.t) {
-      case 'create_private':
-      case 'create_public':
-      case 'quick_join': {
-        if (this.room !== null) {
-          this.room.addPlayer(id, String(m.name ?? 'Player'));
-          return;
-        }
-        const room = new BankRoom('private', this.io, resolveSettings(undefined));
-        this.room = room;
-        this.code = m['shellCode'] as string; // ONE code: the shell's
-        const baseInfo = room.info();
-        room.info = () => ({ ...baseInfo, code: this.code, game: 'bank-sdk' });
-        this.room.addPlayer(id, String(m.name ?? 'Player'));
-        return;
-      }
-      case 'join_private': {
-        const room = this.room;
-        if (room === null || m.code !== this.code) {
-          this.sinks.get(id)?.deliver(JSON.stringify({ t: 'error', code: 'no_room', message: 'no such p2p game' }));
-          return;
-        }
-        room.addPlayer(id, String(m.name ?? 'Player'));
-        return;
-      }
-      case 'ping':
-        this.sinks.get(id)?.deliver(JSON.stringify({ t: 'pong', ts: m.ts, serverTime: Date.now() }));
-        return;
-      case 'leave':
-        this.detach(id);
-        return;
-      default:
-        this.room?.handleMessage(id, parsed);
-    }
-  }
-}
-
 // ---- sockets -----------------------------------------------------------------
 
-function loopbackSocket(lobby: BankP2pLobby, selfId: PlayerId): WsLike {
+function loopbackSocket(lobby: HostedLobby, selfId: PlayerId): WsLike {
   const sock: WsLike = {
     readyState: 1,
     onopen: null,
@@ -321,7 +206,7 @@ export async function startP2p(app: HTMLElement): Promise<void> {
   let lastPeers: PlayerId[] = []; // latest rtc_peers (election input)
   let myJoinFrame: string | null = null; // what got me in — replayed on rejoin
   let electTimer: ReturnType<typeof setTimeout> | null = null; // inbound DC→game routing installed once
-  let lobby: BankP2pLobby | null = null; // host-side only
+  let lobby: HostedLobby | null = null; // host-side only
   let hostStart: string | null = null; // the host's own create frame
   const guestQueue: string[] = []; // guest frames saved while dialing
   let pendingJoinPublic: string | null = null; // shell roomId awaiting table-click join
@@ -497,7 +382,11 @@ export async function startP2p(app: HTMLElement): Promise<void> {
       shell.hostId = selfId;
       promotedNotice = true;
       try {
-      lobby = new BankP2pLobby();
+      lobby = new HostedLobby({
+        createRoom: (io, settings) => new BankRoom('private', io, resolveSettings(settings)),
+        newRoomCode: () => shell.code ?? mintRoomCode(),
+        snapshotTag: 'bank_state',
+      });
       lobby.attach(selfId, { deliver: (data) => { watchStats(data); gameSocket.onmessage?.({ data }); } });
       const create = JSON.stringify({ t: 'create_private', name: displayName, settings: {}, shellCode: shell.code });
       lobby.handleFrame(selfId, create);
@@ -519,7 +408,11 @@ export async function startP2p(app: HTMLElement): Promise<void> {
     const isHost = selfId === shell.hostId;
     if (isHost && hostStart !== null && !hostMounted) {
       if (lobby === null) {
-        lobby = new BankP2pLobby();
+        lobby = new HostedLobby({
+        createRoom: (io, settings) => new BankRoom('private', io, resolveSettings(settings)),
+        newRoomCode: () => shell.code ?? mintRoomCode(),
+        snapshotTag: 'bank_state',
+      });
         // Bridge the host's own game to its local lobby: without this attach
         // the room's broadcasts (bank_state, events) reach no sink.
         lobby.attach(selfId, {

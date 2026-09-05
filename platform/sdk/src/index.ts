@@ -17,3 +17,8 @@ export * from './client.js';
 
 // ---- P2P link layer (RtcStar + injectable RTC primitives) ----------------------
 export * from './rtc.js';
+
+// ---- Hosted rooms + services (stats, pad layouts) ---------------------------
+export * from './hosted.js';
+export * from './stats.js';
+export * from './pads.js';
