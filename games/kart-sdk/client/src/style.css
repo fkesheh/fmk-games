@@ -1,0 +1,2040 @@
+/* ============================================================================
+   KART GP client — paddock theme. EVERY colour traces to KPAL
+   (games/kart/shared/src/palette.ts) by name.
+
+   COLOUR RULE (VISUAL_UPGRADE.md §0 + seam rule 7): the `:root` block below is
+   the ONE permitted place in this file for hex literals, and every literal
+   there mirrors a KPAL entry EXACTLY. K7 (main.ts) rewrites the same custom
+   properties at boot from the real KPAL object, so these declarations are the
+   pre-boot fallback, not a second source of truth. Every other colour in this
+   file is `var(--x)` or `color-mix(in srgb, var(--x) N%, transparent)` — an
+   alpha variant of a named palette entry, which keeps tints tracking the
+   runtime mirror instead of freezing a stale rgba() triple.
+
+   NAMING: camelCase KPAL key -> `--kebab-case`, the same convention BANK's
+   frozen `BPAL_CSS_VARS` uses. `--cream` and `--teal` survive as aliases of
+   `--hud-text` / `--kart-teal` for continuity; note `--asphalt` is now
+   KPAL.asphalt (it used to hold asphaltLight) — use `--asphalt-light`.
+
+   HUD IDIOM (VISUAL_UPGRADE.md §4): the HUD was flat grey boxes. It is now a
+   chip system with a two-tier value ladder — `.hud-chip-hi` for the reads a
+   driver takes at 200 km/h (place, speed), `.hud-chip-lo` for reference data
+   (lap times, nitro, minimap). Every chip is a lit top face falling to an ink
+   bottom face, a 1 px steel edge, a cream rim highlight and a cast shadow, so
+   it sits ON the track rather than floating in it. Corner scrims darken the
+   backdrop underneath so the chips read over bright grass AND over sky.
+
+   Screens + HUD chrome live here; the 3D scene is drawn by render.ts onto the
+   canvas. No external assets or fonts.
+   ============================================================================ */
+
+:root {
+  /* ---- KPAL mirror: road ---- */
+  --asphalt-lit: #5b626b;
+  --asphalt-light: #4a5058;
+  --asphalt: #3a3f45;
+  --asphalt-deep: #24282c;
+  --curb-red: #c0392b;
+  --curb-white: #e8e6df;
+  --start-line: #e8e6df;
+  --line-white: #d8d6cf;
+
+  /* ---- KPAL mirror: terrain ---- */
+  --grass-lit: #6a9c52;
+  --grass: #4a7a3d;
+  --grass-dark: #3d6a31;
+  --grass-deep: #2a4a22;
+  --dirt: #7a5a39;
+  --dirt-deep: #4a3722;
+  --rock: #6e6e66;
+  --rock-deep: #3f3f39;
+  --ridge-near: #4f7444;
+  --ridge-far: #7d97a3;
+
+  /* ---- KPAL mirror: sky ---- */
+  --sky-high: #4d78ae;
+  --sky: #7fa4c9;
+  --horizon: #c8d8e8;
+  --fog: #c8d8e8;
+  --cloud: #eef4f9;
+  --cloud-shade: #b8c6d4;
+
+  /* ---- KPAL mirror: vegetation ---- */
+  --tree-trunk: #5d3a1a;
+  --tree-trunk-deep: #38230f;
+  --tree-leaf-light: #3e7c2f;
+  --tree-leaf: #2d5e23;
+  --tree-leaf-deep: #1b3d15;
+
+  /* ---- KPAL mirror: trackside furniture ---- */
+  --barrier-white: #e8e6df;
+  --barrier-red: #a03028;
+  --ink: #14171c;
+  --charcoal: #23282f;
+  --gold: #d4af37;
+  --steel: #9aa3ad;
+  --steel-deep: #5a616a;
+  --tire: #1d2126;
+  --concrete: #8d8d83;
+  --concrete-deep: #43443e;
+
+  /* ---- KPAL mirror: HUD ---- */
+  --hud-text: #e8e6df;
+  --danger: #c0392b;
+
+  /* ---- KPAL mirror: player karts ---- */
+  --kart-red: #c0392b;
+  --kart-blue: #3d5a9b;
+  --kart-green: #4a7a3d;
+  --kart-yellow: #c8912f;
+  --kart-purple: #7a4a9b;
+  --kart-orange: #c86a2f;
+  --kart-teal: #2f8f8f;
+  --kart-pink: #c86a9b;
+
+  /* ---- legacy aliases (kept so nothing that already reads them breaks) ---- */
+  --cream: var(--hud-text);
+  --teal: var(--kart-teal);
+
+  /* ---- chip surface tokens: the base tier of the HUD value ladder ----------
+     Tier classes below reassign these custom properties instead of fighting
+     the cascade, so `.hud-chip-hi` / `.hud-chip-lo` win over the element
+     defaults regardless of rule order. */
+  --chip-face-top: color-mix(in srgb, var(--charcoal) 76%, transparent);
+  --chip-face-bot: color-mix(in srgb, var(--ink) 80%, transparent);
+  --chip-edge: color-mix(in srgb, var(--steel) 30%, transparent);
+  --chip-rim: color-mix(in srgb, var(--hud-text) 16%, transparent);
+  --chip-floor: color-mix(in srgb, var(--ink) 60%, transparent);
+  --chip-cast: color-mix(in srgb, var(--ink) 48%, transparent);
+  --chip-radius: 10px;
+  --chip-blur: blur(7px);
+
+  /* ---- shared type shadows: HUD text must survive a white sky ---- */
+  --text-cast: 0 1px 0 color-mix(in srgb, var(--ink) 88%, transparent),
+    0 2px 10px color-mix(in srgb, var(--ink) 72%, transparent);
+  --text-cast-big: 0 2px 0 color-mix(in srgb, var(--ink) 92%, transparent),
+    0 5px 20px color-mix(in srgb, var(--ink) 78%, transparent);
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--ink);
+  color: var(--hud-text);
+  color-scheme: dark;
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+
+  /* ---- TOUCH SAFETY (docs/TOUCH_PWA.md §3) -------------------------------
+     iOS Safari IGNORES `user-scalable=no` in the viewport meta, so none of
+     this can be delegated to the page's <head>. These two properties are what
+     actually hold on a tablet:
+       overscroll-behavior: none  — no pull-to-refresh, and no rubber-band
+         bounce revealing the page background when a thumb drags past the edge
+         of a control (the drag NEVER ends where the finger started, so the
+         bounce fires constantly under normal steering).
+       touch-action: manipulation — kills the double-tap-to-zoom gesture and
+         the 300ms click delay that comes with it. The race screen and every
+         control surface tighten this to `none` below, which also removes
+         pinch-zoom and panning there; the MENU keeps manipulation so a long
+         room list is still scrollable. */
+  overscroll-behavior: none;
+  touch-action: manipulation;
+  -webkit-text-size-adjust: 100%; /* no reflow when an iPad is rotated */
+  -webkit-tap-highlight-color: transparent; /* no grey flash under a steering thumb */
+}
+
+#app {
+  height: 100%;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.error-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  padding: 10px 16px;
+  background: var(--danger);
+  color: var(--hud-text);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-align: center;
+  box-shadow: 0 4px 18px color-mix(in srgb, var(--ink) 70%, transparent);
+  z-index: 99;
+}
+
+/* ---- screens ----------------------------------------------------------------- */
+
+.screen {
+  height: 100%;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  overflow-y: auto;
+  overscroll-behavior: contain; /* a flick past the end of the menu never scrolls the page */
+}
+
+/* ---- menu -------------------------------------------------------------------- */
+/* The paddock: an ink page lit by a single warm pool behind the title, so the
+   menu has a focal point instead of reading as a form on a black rectangle. */
+
+.menu {
+  position: relative;
+  justify-content: center;
+  gap: 14px;
+  padding: 32px 20px;
+  background:
+    radial-gradient(
+      120% 62% at 50% 8%,
+      color-mix(in srgb, var(--gold) 9%, transparent),
+      transparent 62%
+    ),
+    radial-gradient(
+      100% 80% at 50% 108%,
+      color-mix(in srgb, var(--asphalt) 42%, transparent),
+      transparent 70%
+    );
+}
+
+.menu-title {
+  margin: 0;
+  font-size: clamp(48px, 11vw, 88px);
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  line-height: 1;
+  color: var(--gold);
+  text-shadow:
+    0 2px 0 color-mix(in srgb, var(--ink) 90%, transparent),
+    0 6px 26px color-mix(in srgb, var(--gold) 26%, transparent);
+}
+
+.menu-sub {
+  margin: 0 0 8px;
+  color: var(--steel);
+  font-style: italic;
+  letter-spacing: 0.08em;
+}
+
+.menu-notice {
+  min-height: 18px;
+  padding: 6px 14px;
+  border: 1px solid var(--gold);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--gold) 10%, transparent);
+  color: var(--gold);
+  font-size: 14px;
+  letter-spacing: 0.04em;
+}
+
+.menu-name,
+.menu-code-input {
+  box-sizing: border-box;
+  padding: 12px 14px;
+  border: 1px solid var(--asphalt-light);
+  border-radius: 8px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--charcoal) 92%, transparent),
+    color-mix(in srgb, var(--ink) 88%, transparent)
+  );
+  box-shadow: inset 0 2px 6px color-mix(in srgb, var(--ink) 70%, transparent);
+  color: var(--hud-text);
+  font-size: 16px;
+  text-align: center;
+  letter-spacing: 0.06em;
+  outline: none;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.menu-name {
+  width: min(320px, 80vw);
+}
+
+.menu-name:focus,
+.menu-code-input:focus {
+  border-color: var(--gold);
+  box-shadow:
+    inset 0 2px 6px color-mix(in srgb, var(--ink) 70%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--gold) 22%, transparent);
+}
+
+.menu-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+}
+
+.menu-code {
+  display: flex;
+  gap: 10px;
+}
+
+.menu-code-input {
+  width: 120px;
+  text-transform: uppercase;
+}
+
+/* kids-mode toggle: a real togglable pill (it had no rule at all before, so it
+   rendered as a bare checkbox and a stray word). Whole label is the hit area.
+   `.menu-toggle` (TABLET CONTROLS / AUTO GAS / LEFT-HANDED, docs/TOUCH_PWA.md
+   §4.2.0) is the same pill one size down — one source of truth for the look, so
+   the settings row can never drift into a second visual language. */
+.menu-kids,
+.menu-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--steel) 34%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--charcoal) 62%, transparent);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--hud-text) 10%, transparent);
+  cursor: pointer;
+  user-select: none;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.menu-kids:hover,
+.menu-toggle:hover {
+  border-color: color-mix(in srgb, var(--gold) 60%, transparent);
+  background: color-mix(in srgb, var(--charcoal) 82%, transparent);
+}
+
+.menu-kids input[type='checkbox'],
+.menu-toggle input[type='checkbox'] {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--gold);
+  cursor: pointer;
+}
+
+.menu-kids:has(input:checked),
+.menu-toggle:has(input:checked) {
+  border-color: var(--gold);
+  background: color-mix(in srgb, var(--gold) 12%, transparent);
+}
+
+.menu-kids-label,
+.menu-toggle-label {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  color: var(--steel);
+  transition: color 120ms ease;
+}
+
+.menu-kids:has(input:checked) .menu-kids-label,
+.menu-toggle:has(input:checked) .menu-toggle-label {
+  color: var(--gold);
+}
+
+/* the three tablet settings ride one wrapping row under KIDS MODE: three more
+   full-width pills would push the track list off a 720p menu */
+.menu-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+}
+
+.menu-toggle {
+  padding: 5px 12px 5px 9px;
+  gap: 8px;
+}
+
+.menu-toggle input[type='checkbox'] {
+  width: 13px;
+  height: 13px;
+}
+
+.menu-toggle-label {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+}
+
+.menu-rooms-title {
+  margin: 18px 0 0;
+  font-size: 13px;
+  letter-spacing: 0.3em;
+  color: var(--steel);
+}
+
+.menu-rooms {
+  width: min(420px, 90vw);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.room-empty {
+  text-align: center;
+  color: var(--steel);
+  font-size: 14px;
+  font-style: italic;
+}
+
+/* row is clickable — the cursor used to come from a JS inline style (§9) */
+.room-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 9px 13px;
+  border: 1px solid color-mix(in srgb, var(--asphalt-light) 60%, transparent);
+  border-left: 3px solid color-mix(in srgb, var(--gold) 45%, transparent);
+  border-radius: 8px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--charcoal) 66%, transparent),
+    color-mix(in srgb, var(--ink) 58%, transparent)
+  );
+  font-size: 14px;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease, transform 120ms ease;
+}
+
+.room-row:hover {
+  border-color: var(--gold);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--charcoal) 92%, transparent),
+    color-mix(in srgb, var(--ink) 74%, transparent)
+  );
+  transform: translateX(2px);
+}
+
+.room-title {
+  color: var(--gold);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.room-label {
+  color: var(--steel);
+  font-style: italic;
+}
+
+.room-meta {
+  margin-left: auto;
+  color: var(--steel);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- buttons ----------------------------------------------------------------- */
+
+.btn {
+  padding: 12px 20px;
+  border: 1px solid var(--gold);
+  border-radius: 8px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--gold) 10%, transparent),
+    transparent
+  );
+  color: var(--gold);
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, box-shadow 120ms ease;
+}
+
+.btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--gold) 20%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--gold) 16%, transparent);
+}
+
+.btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.btn-gold {
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--hud-text) 26%, var(--gold)),
+    var(--gold) 55%,
+    color-mix(in srgb, var(--ink) 16%, var(--gold))
+  );
+  color: var(--ink);
+  border-color: var(--gold);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--hud-text) 55%, transparent),
+    0 4px 14px color-mix(in srgb, var(--gold) 24%, transparent);
+}
+
+.btn-gold:hover:not(:disabled) {
+  background: var(--hud-text);
+  border-color: var(--hud-text);
+  color: var(--ink);
+}
+
+.btn-small {
+  padding: 6px 12px;
+  font-size: 12px;
+}
+
+/* ---- race screen: canvas + overlays ------------------------------------------- */
+
+.race {
+  position: relative;
+  padding: 0;
+  overflow: hidden;
+  /* the race screen is a control surface end to end: no scroll, no pinch, no
+     zoom, no selection lasso started by a steering thumb (docs/TOUCH_PWA.md §3) */
+  touch-action: none;
+  overscroll-behavior: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none; /* no long-press callout under a held control */
+
+  /* ---- tablet pad geometry (docs/TOUCH_PWA.md §4.2.1) --------------------
+     Declared HERE, not on .touch-pad, because the HUD is a sibling of the pad
+     and has to lift its bottom chips by exactly the pad's height — one set of
+     numbers, so the two can never disagree about where the thumb band ends. */
+  --pad-edge: 14px;
+  --pad-safe-l: calc(env(safe-area-inset-left, 0px) + var(--pad-edge));
+  --pad-safe-r: calc(env(safe-area-inset-right, 0px) + var(--pad-edge));
+  --pad-safe-b: calc(env(safe-area-inset-bottom, 0px) + var(--pad-edge));
+  --pad-steer-w: clamp(104px, 14vw, 176px);
+  --pad-steer-h: clamp(120px, 30vh, 240px);
+  --pad-gas: clamp(124px, 16vw, 196px); /* the large primary target */
+  --pad-aux: clamp(74px, 9vw, 104px); /* nitro / drift */
+  /* Separation between GAS and the two small buttons. This is a FEEL number,
+     not a spacing token: it is the margin by which a thumb pulling accelerate
+     mid-corner misses nitro. Anything tighter and a hard corner fires nitro. */
+  --pad-aux-gap: 40px;
+  --pad-band: var(--pad-steer-h); /* how much of the bottom belongs to thumbs */
+}
+
+.race-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none; /* a steering drag must never scroll or zoom the page */
+}
+
+/* the invite code is the one thing on the race screen a player copies by hand */
+.race-invite-code,
+.race input,
+.race textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.race-top {
+  position: absolute;
+  top: 50%;
+  right: calc(12px + env(safe-area-inset-right, 0px));
+  transform: translateY(-50%);
+  z-index: 6;
+}
+
+/* ---- HUD ---------------------------------------------------------------------- */
+
+.hud {
+  position: absolute;
+  /* NOT inset:0 — the HUD is inset by the safe area so that every chip
+     positioned against its edges (all of them) clears a notch, a rounded
+     corner and the home indicator in one place (docs/TOUCH_PWA.md §3). All
+     four values are 0 on a desktop, so this is a no-op off a device. */
+  inset: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+    env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
+  pointer-events: none;
+  z-index: 4;
+}
+
+/* corner scrims: the track behind the HUD swings from near-black asphalt to a
+   near-white sky within one corner. A soft ink wash under each cluster keeps
+   the chips legible over both without painting a visible box. */
+.hud-scrim {
+  position: absolute;
+  width: 40%;
+  height: 34%;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.hud-corner-tl,
+.hud-corner-tr,
+.hud-corner-bl,
+.hud-corner-br {
+  position: absolute;
+}
+
+.hud-corner-tl {
+  top: 14px;
+  left: 16px;
+}
+
+.hud-corner-tr {
+  top: 14px;
+  right: 16px;
+}
+
+.hud-corner-bl {
+  bottom: 16px;
+  left: 16px;
+}
+
+.hud-corner-br {
+  bottom: 16px;
+  right: 16px;
+}
+
+.hud-scrim.hud-corner-tl {
+  top: 0;
+  left: 0;
+  background: radial-gradient(
+    120% 120% at 0% 0%,
+    color-mix(in srgb, var(--ink) 58%, transparent),
+    transparent 72%
+  );
+}
+
+.hud-scrim.hud-corner-tr {
+  top: 0;
+  right: 0;
+  background: radial-gradient(
+    120% 120% at 100% 0%,
+    color-mix(in srgb, var(--ink) 58%, transparent),
+    transparent 72%
+  );
+}
+
+.hud-scrim.hud-corner-bl {
+  bottom: 0;
+  left: 0;
+  background: radial-gradient(
+    120% 120% at 0% 100%,
+    color-mix(in srgb, var(--ink) 58%, transparent),
+    transparent 72%
+  );
+}
+
+.hud-scrim.hud-corner-br {
+  bottom: 0;
+  right: 0;
+  background: radial-gradient(
+    120% 120% at 100% 100%,
+    color-mix(in srgb, var(--ink) 58%, transparent),
+    transparent 72%
+  );
+}
+
+/* the chip surface — one idiom, applied to every HUD panel */
+.hud-chip,
+.hud-pos,
+.hud-lap,
+.hud-speed,
+.hud-minimap,
+.hud-times,
+.hud-nitro,
+.hud-gate-label,
+.hint-card {
+  border: 1px solid var(--chip-edge);
+  border-radius: var(--chip-radius);
+  background: linear-gradient(180deg, var(--chip-face-top), var(--chip-face-bot));
+  box-shadow:
+    inset 0 1px 0 var(--chip-rim),
+    inset 0 -1px 0 var(--chip-floor),
+    0 6px 18px var(--chip-cast);
+  backdrop-filter: var(--chip-blur);
+  -webkit-backdrop-filter: var(--chip-blur);
+}
+
+/* hairline divider inside a chip */
+.hud-rule {
+  align-self: stretch;
+  height: 1px;
+  margin: 5px 0;
+  border: 0;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in srgb, var(--hud-text) 24%, transparent),
+    transparent
+  );
+}
+
+.hud-left {
+  position: absolute;
+  top: 14px;
+  left: 16px;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+/* position chip — top of the value ladder: gold edge bar, biggest numeral */
+.hud-pos {
+  padding: 8px 14px 9px;
+  border-left: 3px solid var(--gold);
+}
+
+.hud-pos-main {
+  display: flex;
+  align-items: baseline;
+  gap: 1px;
+  line-height: 1;
+}
+
+/* P1 accent. Empty by default (K6 may leave it textless), so it draws its own
+   mark; with content it reads as a gold badge in the `.hud-kids` idiom. */
+.hud-pos-crown {
+  display: inline-block;
+  min-width: 16px;
+  height: 15px;
+  margin-bottom: 3px;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--hud-text) 40%, var(--gold)),
+    var(--gold)
+  );
+  color: var(--ink);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 15px;
+  letter-spacing: 0.12em;
+  text-align: center;
+  box-shadow: 0 0 10px color-mix(in srgb, var(--gold) 45%, transparent);
+}
+
+.hud-pos-crown:empty::before {
+  content: '\2605';
+}
+
+.hud-pos-num {
+  font-size: clamp(42px, 6.8vw, 68px);
+  font-weight: 800;
+  color: var(--hud-text);
+  text-shadow: var(--text-cast-big);
+  font-variant-numeric: tabular-nums;
+}
+
+.hud-pos-suf {
+  font-size: clamp(16px, 2.2vw, 24px);
+  font-weight: 800;
+  color: var(--gold);
+  text-shadow: var(--text-cast);
+}
+
+.hud-pos-total {
+  margin-left: 6px;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--steel);
+  font-variant-numeric: tabular-nums;
+}
+
+.hud-pos-gap {
+  margin-top: 3px;
+  min-height: 15px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: var(--steel);
+  font-variant-numeric: tabular-nums;
+  text-shadow: var(--text-cast);
+}
+
+.hud-pos-gap.hud-pos-leader {
+  color: var(--gold);
+}
+
+.hud-kids {
+  margin-top: 5px;
+  width: fit-content;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--gold);
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+}
+
+.hud-lap {
+  padding: 5px 11px;
+  font-size: clamp(14px, 2vw, 20px);
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  color: var(--gold);
+  text-shadow: var(--text-cast);
+}
+
+.hud-right {
+  position: absolute;
+  top: 14px;
+  right: 16px;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+  text-align: right;
+}
+
+.hud-speed {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
+  padding: 7px 14px 9px;
+  border-right: 3px solid var(--gold);
+  color: var(--hud-text);
+  text-shadow: var(--text-cast-big);
+}
+
+/* gear stacked ABOVE the speed — adjacent big numerals kerned into one read */
+.hud-gear-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  line-height: 1;
+}
+
+.hud-gear-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  color: var(--steel);
+}
+
+.hud-gear {
+  font-size: 17px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  color: var(--gold);
+}
+
+/* upshift flash — replaces the per-shift inline opacity write */
+.hud-gear.gear-flash {
+  animation: gear-flash 240ms ease-out;
+}
+
+@keyframes gear-flash {
+  0% {
+    color: var(--hud-text);
+    transform: translateY(-2px) scale(1.35);
+  }
+  100% {
+    color: var(--gold);
+    transform: none;
+  }
+}
+
+.hud-speed-row {
+  display: flex;
+  align-items: baseline;
+  line-height: 1;
+}
+
+.hud-speed-num {
+  font-size: clamp(38px, 6.4vw, 64px);
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+.hud-speed-unit {
+  margin-left: 6px;
+  font-size: 14px;
+  letter-spacing: 0.2em;
+  color: var(--steel);
+}
+
+/* speed meter fill: grows left->right across the chip, gold shading to cream at
+   the top of the range so peak speed is a colour event as well as a number. */
+.hud-speed-bar {
+  align-self: stretch;
+  height: 5px;
+  min-width: 5px;
+  margin-top: 6px;
+  border-radius: 3px;
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--gold) 55%, var(--asphalt-lit)),
+    var(--gold) 68%,
+    var(--hud-text)
+  );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--hud-text) 40%, transparent),
+    0 0 10px color-mix(in srgb, var(--gold) 40%, transparent);
+  transition: width 90ms linear;
+  will-change: width;
+}
+
+/* minimap: 140px canvas, chip-framed (the outline/dots are drawn by app.ts) */
+.hud-minimap {
+  width: 140px;
+  height: 140px;
+  padding: 4px;
+}
+
+.hud-times {
+  position: absolute;
+  left: 16px;
+  bottom: 16px;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 14px;
+}
+
+.hud-time-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.hud-time-label {
+  width: 44px;
+  font-size: 12px;
+  letter-spacing: 0.24em;
+  color: var(--steel);
+}
+
+.hud-time-value {
+  font-size: clamp(18px, 3vw, 28px);
+  font-weight: 700;
+  color: var(--hud-text);
+  font-variant-numeric: tabular-nums;
+  text-shadow: var(--text-cast);
+}
+
+.hud-best {
+  color: var(--gold);
+}
+
+.hud-nitro {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  padding: 10px 14px;
+}
+
+.hud-turbo-label {
+  font-size: 12px;
+  letter-spacing: 0.24em;
+  color: var(--steel);
+}
+
+.hud-nitro-pips {
+  display: flex;
+  gap: 6px;
+}
+
+/* base pip = SPENT (an empty socket). `hud-nitro-pip-full` is the charge —
+   it replaces the per-frame inline opacity write (§9). */
+.hud-nitro-pip {
+  width: 22px;
+  height: 10px;
+  border-radius: 5px;
+  border: 1px solid color-mix(in srgb, var(--steel-deep) 70%, transparent);
+  background: color-mix(in srgb, var(--ink) 55%, transparent);
+  box-shadow: inset 0 1px 2px color-mix(in srgb, var(--ink) 80%, transparent);
+  transition: background 140ms ease, box-shadow 140ms ease, border-color 140ms ease;
+}
+
+.hud-nitro-pip.hud-nitro-pip-full {
+  border-color: var(--gold);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--hud-text) 34%, var(--gold)),
+    var(--gold)
+  );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--hud-text) 55%, transparent),
+    0 0 9px color-mix(in srgb, var(--gold) 45%, transparent);
+}
+
+/* spend flash: the just-consumed pip flares cream, pops scale, settles empty */
+.hud-nitro-pip.pip-flash {
+  animation: pip-flash 700ms ease-out;
+}
+
+@keyframes pip-flash {
+  0% {
+    background: var(--hud-text);
+    border-color: var(--hud-text);
+    box-shadow: 0 0 20px var(--hud-text);
+    transform: scale(1.6);
+  }
+  45% {
+    background: var(--hud-text);
+    border-color: var(--hud-text);
+    box-shadow: 0 0 14px color-mix(in srgb, var(--hud-text) 80%, transparent);
+    transform: scale(1.25);
+  }
+  100% {
+    background: color-mix(in srgb, var(--ink) 55%, transparent);
+    border-color: color-mix(in srgb, var(--steel-deep) 70%, transparent);
+    box-shadow: inset 0 1px 2px color-mix(in srgb, var(--ink) 80%, transparent);
+    transform: scale(1);
+  }
+}
+
+/* next-gate marker: chevron (rotated inline toward the gate) + distance chip */
+.hud-gate-wrap {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+}
+
+.hud-gate {
+  width: 0;
+  height: 0;
+  border-left: 14px solid transparent;
+  border-right: 14px solid transparent;
+  border-bottom: 22px solid var(--gold);
+  filter: drop-shadow(0 2px 6px color-mix(in srgb, var(--ink) 80%, transparent));
+}
+
+.hud-gate-label {
+  padding: 2px 9px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: var(--gold);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- the two-tier chip ladder -------------------------------------------------
+   Declared LAST so an explicit K6 class always beats the element defaults. */
+
+.hud-chip-hi {
+  --chip-face-top: color-mix(in srgb, var(--charcoal) 90%, transparent);
+  --chip-face-bot: color-mix(in srgb, var(--ink) 90%, transparent);
+  --chip-edge: color-mix(in srgb, var(--steel) 46%, transparent);
+  --chip-rim: color-mix(in srgb, var(--hud-text) 24%, transparent);
+  --chip-cast: color-mix(in srgb, var(--ink) 62%, transparent);
+}
+
+.hud-chip-lo {
+  --chip-face-top: color-mix(in srgb, var(--charcoal) 58%, transparent);
+  --chip-face-bot: color-mix(in srgb, var(--ink) 64%, transparent);
+  --chip-edge: color-mix(in srgb, var(--steel) 20%, transparent);
+  --chip-rim: color-mix(in srgb, var(--hud-text) 11%, transparent);
+  --chip-cast: color-mix(in srgb, var(--ink) 40%, transparent);
+}
+
+/* ---- invite chip (private rooms) ------------------------------------------------
+   Two homes, no JS positioning needed: parked inside `.hud-left` it flows with
+   the position/lap chips; promoted to the race screen it pins the top-left
+   corner above the lobby (5) and results (8) overlays. */
+
+.race-invite {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  pointer-events: auto; /* the HUD container is pointer-events:none */
+}
+
+.hud-left > .race-invite {
+  position: static;
+  margin-top: 2px;
+}
+
+.race > .race-invite {
+  position: absolute;
+  top: 14px;
+  left: 16px;
+  z-index: 9;
+}
+
+.race-invite-code,
+.race-invite-chip {
+  padding: 5px 13px;
+  border: 1px solid var(--gold);
+  border-radius: 999px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--charcoal) 82%, transparent),
+    color-mix(in srgb, var(--ink) 88%, transparent)
+  );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--hud-text) 14%, transparent),
+    0 4px 14px color-mix(in srgb, var(--ink) 55%, transparent);
+  backdrop-filter: var(--chip-blur);
+  -webkit-backdrop-filter: var(--chip-blur);
+  color: var(--gold);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  white-space: nowrap;
+}
+
+/* when `race-invite-chip` is used as the row wrapper rather than the pill, it
+   must lay out like the row — the layout properties win over the pill padding */
+.race-invite.race-invite-chip {
+  padding: 0;
+  border: 0;
+  background: none;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/* ---- lobby overlay (the grid) --------------------------------------------------- */
+
+.lobby-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(
+    100% 80% at 50% 50%,
+    color-mix(in srgb, var(--ink) 52%, transparent),
+    color-mix(in srgb, var(--ink) 78%, transparent)
+  );
+}
+
+.lobby-panel {
+  min-width: min(420px, 92vw);
+  /* MAX_PLAYERS is 20: the panel grows sideways so the chips wrap into columns
+     instead of turning the grid into one 20-row scroll strip */
+  max-width: min(900px, 94vw);
+  padding: 22px 26px;
+  border: 1px solid var(--gold);
+  border-radius: 14px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--charcoal) 96%, transparent),
+    color-mix(in srgb, var(--ink) 94%, transparent)
+  );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--hud-text) 18%, transparent),
+    0 22px 60px color-mix(in srgb, var(--ink) 78%, transparent);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.lobby-title {
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: 0.4em;
+  color: var(--gold);
+}
+
+/* Wrapping rows, not a single column: 2 drivers read as a centred pair, a full
+   20-kart grid packs into 3-4 columns and still fits above the START button.
+   The cap + scroll is the last-resort guard on a short viewport. */
+.lobby-players {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  max-height: min(44vh, 340px);
+  overflow-y: auto;
+}
+
+.lobby-status {
+  min-height: 20px;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: var(--hud-text);
+}
+
+/* The explicit start control — nothing in KART auto-starts. Disabled styling
+   comes from `.btn:disabled`; the reason sits on `.lobby-status` above it. */
+.lobby-start {
+  min-width: 220px;
+  padding: 13px 28px;
+  font-size: 16px;
+  letter-spacing: 0.2em;
+}
+
+.lobby-hint {
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  color: var(--steel);
+}
+
+/* ---- lobby championship placard --------------------------------------------------
+   The first thing a joiner reads: which round of which season, on which circuit,
+   and where THEY stand in it. Same chip idiom as the HUD (lit top face falling to
+   an ink bottom face over a steel edge, cream rim) so it reads as a card pinned
+   to the panel rather than as one more line of status text. The whole block is
+   `hidden` on a championship-disabled room — that lobby is unchanged. */
+
+.lobby-season {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 14px;
+  border: 1px solid color-mix(in srgb, var(--steel) 34%, transparent);
+  border-radius: 10px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--charcoal) 72%, transparent),
+    color-mix(in srgb, var(--ink) 74%, transparent)
+  );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--hud-text) 12%, transparent),
+    0 6px 18px color-mix(in srgb, var(--ink) 50%, transparent);
+}
+
+/* the round line is the headline of the placard — gold, tracked out like the
+   panel title it sits under */
+.lobby-round {
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.2em;
+  color: var(--gold);
+  text-align: center;
+}
+
+.lobby-season-note {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  color: var(--steel);
+  text-align: center;
+}
+
+/* ---- player chips (grid list) ---------------------------------------------------- */
+
+.player-chip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  /* fixed-ish track width so wrapped rows line up as columns at 20 karts */
+  flex: 0 0 auto;
+  width: 220px;
+  max-width: 100%;
+  padding: 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--asphalt-light) 60%, transparent);
+  border-radius: 999px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--charcoal) 52%, transparent),
+    color-mix(in srgb, var(--ink) 60%, transparent)
+  );
+  font-size: 14px;
+}
+
+.player-chip.you {
+  border-color: var(--gold);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--gold) 14%, transparent),
+    color-mix(in srgb, var(--ink) 60%, transparent)
+  );
+}
+
+.player-color {
+  flex: 0 0 auto; /* the livery swatch never shrinks inside a packed chip */
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  box-shadow:
+    0 0 0 2px color-mix(in srgb, var(--ink) 80%, transparent),
+    inset 0 1px 0 color-mix(in srgb, var(--hud-text) 35%, transparent);
+}
+
+.player-name {
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0; /* a 16-char name must not push GRID N out of a fixed-width chip */
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.player-you {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--gold);
+  color: var(--ink);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+}
+
+.player-slot {
+  flex: 0 0 auto;
+  margin-left: auto;
+  white-space: nowrap;
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  color: var(--steel);
+}
+
+/* ---- countdown ------------------------------------------------------------------ */
+
+.countdown-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 7;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  font-size: clamp(120px, 30vw, 260px);
+  font-weight: 800;
+  color: var(--gold);
+  text-shadow:
+    0 4px 0 color-mix(in srgb, var(--ink) 92%, transparent),
+    0 12px 60px color-mix(in srgb, var(--ink) 85%, transparent);
+}
+
+/* ---- transient race message (lap / finish) --------------------------------------- */
+
+.race-msg {
+  position: absolute;
+  top: 18%;
+  left: 0;
+  right: 0;
+  z-index: 6;
+  text-align: center;
+  font-size: clamp(20px, 4vw, 36px);
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  color: var(--hud-text);
+  text-shadow: var(--text-cast-big);
+  pointer-events: none;
+}
+
+/* ---- controls hint card (pre-GO + ~6s after; non-modal) ---------------------------- */
+
+.hint-card {
+  position: absolute;
+  left: 50%;
+  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  transform: translateX(-50%);
+  max-width: 92vw;
+  padding: 9px 18px;
+  color: var(--hud-text);
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  text-align: center;
+  text-shadow: var(--text-cast);
+  pointer-events: none; /* non-modal: never eats driving input */
+  z-index: 6;
+}
+
+/* ---- camera speed lines (fx.ts; >30 m/s, rim streaks) ------------------------------
+   fx.ts owns left/top/transform/opacity on `.fx-speedline` — never set them here. */
+
+.fx-speedlines {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 3; /* below the HUD chrome */
+}
+
+.fx-speedline {
+  position: absolute;
+  width: 96px;
+  height: 3px;
+  margin-left: -48px; /* centered on its anchor */
+  margin-top: -1px;
+  border-radius: 2px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in srgb, var(--hud-text) 85%, transparent),
+    transparent
+  );
+  will-change: opacity;
+}
+
+/* ---- results --------------------------------------------------------------------- */
+
+.results-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(
+    100% 80% at 50% 50%,
+    color-mix(in srgb, var(--ink) 62%, transparent),
+    color-mix(in srgb, var(--ink) 86%, transparent)
+  );
+}
+
+.results-panel {
+  min-width: min(520px, 94vw);
+  padding: 24px 28px;
+  border: 1px solid var(--gold);
+  border-radius: 14px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--charcoal) 97%, transparent),
+    color-mix(in srgb, var(--ink) 95%, transparent)
+  );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--hud-text) 18%, transparent),
+    0 26px 70px color-mix(in srgb, var(--ink) 82%, transparent);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
+
+.results-title {
+  font-size: 18px;
+  font-weight: 800;
+  letter-spacing: 0.4em;
+  color: var(--gold);
+  text-shadow: 0 0 22px color-mix(in srgb, var(--gold) 30%, transparent);
+}
+
+.results-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.results-table th {
+  padding: 6px 10px;
+  font-size: 11px;
+  letter-spacing: 0.24em;
+  text-align: left;
+  color: var(--steel);
+  border-bottom: 1px solid var(--asphalt-light);
+}
+
+.results-table td {
+  padding: 9px 10px;
+  font-size: 15px;
+  color: var(--hud-text);
+  border-bottom: 1px solid color-mix(in srgb, var(--asphalt-light) 42%, transparent);
+}
+
+.result-place {
+  width: 3.5em;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: var(--steel);
+}
+
+.result-name {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  max-width: 16em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.result-time {
+  width: 6.5em;
+  font-weight: 700;
+}
+
+.result-best {
+  width: 6.5em;
+  color: var(--steel);
+}
+
+/* the player's own row: gold type AND a gold edge + tint, so it is never
+   colour-alone */
+.results-table tr.you td,
+.results-table tr.results-row-you td {
+  color: var(--gold);
+  font-weight: 700;
+  background: color-mix(in srgb, var(--gold) 10%, transparent);
+}
+
+.results-table tr.you td.result-place,
+.results-table tr.you td.result-best,
+.results-table tr.results-row-you td.result-place,
+.results-table tr.results-row-you td.result-best {
+  color: var(--gold);
+}
+
+.results-table tr.you td:first-child,
+.results-table tr.results-row-you td:first-child {
+  box-shadow: inset 3px 0 0 var(--gold);
+}
+
+.results-note {
+  min-height: 16px;
+  font-size: 13px;
+  letter-spacing: 0.18em;
+  color: var(--steel);
+}
+
+/* ---- championship standings (inside the results panel) ---------------------------
+   The race you just ran, then the season it belongs to. Separated from the result
+   table by a rule rather than by whitespace: the two tables mean different things
+   (this race vs the year) and must never be read as one continuous list. Denser
+   than the result table by design — this is reference data, not the read a driver
+   takes at 200 km/h — which is also what makes 8 drivers fit at 1280x720 without
+   the overlay scrolling. */
+
+.results-standings {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid color-mix(in srgb, var(--steel) 26%, transparent);
+}
+
+.standings-title {
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.28em;
+  color: var(--steel);
+  text-align: center;
+}
+
+/* last-resort guard only: at 720p the cap clears a full 8-row table, so a normal
+   season never scrolls — a 20-kart one caps here instead of pushing the
+   auto-return note off the bottom of the panel */
+.standings-scroll {
+  max-height: min(38vh, 300px);
+  overflow-y: auto;
+}
+
+.standings-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.standings-table th {
+  padding: 4px 10px;
+  font-size: 10px;
+  letter-spacing: 0.24em;
+  text-align: left;
+  color: var(--steel);
+  border-bottom: 1px solid color-mix(in srgb, var(--asphalt-light) 72%, transparent);
+}
+
+.standings-table td {
+  padding: 2px 10px;
+  font-size: 13px;
+  color: var(--hud-text);
+  border-bottom: 1px solid color-mix(in srgb, var(--asphalt-light) 30%, transparent);
+}
+
+/* PTS and + are magnitudes, not labels: right-aligned and tabular so the column
+   of numbers can be compared without being read */
+.standings-table th:nth-child(3),
+.standings-table th:nth-child(4) {
+  text-align: right;
+}
+
+.standing-pos {
+  width: 3.2em;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: var(--steel);
+}
+
+.standing-name {
+  font-weight: 600;
+  max-width: 14em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* the season total is the loudest number in the table — it is the whole point */
+.standing-pts {
+  width: 4em;
+  text-align: right;
+  font-weight: 800;
+}
+
+/* base state is the em-dash: a scoreless round is dim, so '+18' is the thing that
+   catches the eye and 'nothing happened' never masquerades as a value */
+.standing-delta {
+  width: 3.6em;
+  text-align: right;
+  font-weight: 700;
+  color: color-mix(in srgb, var(--steel) 66%, transparent);
+}
+
+.standing-delta.standing-delta-up {
+  color: var(--grass-lit);
+}
+
+/* your own row: gold type AND a gold edge + tint, never colour-alone — the exact
+   idiom the result table above uses, so the eye finds you the same way twice */
+.standings-table tr.you td,
+.standings-table tr.standing-row-you td {
+  color: var(--gold);
+  font-weight: 700;
+  background: color-mix(in srgb, var(--gold) 10%, transparent);
+}
+
+.standings-table tr.you td.standing-pos,
+.standings-table tr.standing-row-you td.standing-pos,
+.standings-table tr.you td.standing-delta,
+.standings-table tr.standing-row-you td.standing-delta {
+  color: var(--gold);
+}
+
+.standings-table tr.you td:first-child,
+.standings-table tr.standing-row-you td:first-child {
+  box-shadow: inset 3px 0 0 var(--gold);
+}
+
+/* a driver who has left keeps their points (F1 rules) but is not on tonight's
+   grid — dimmed and italic, i.e. present but not current. Declared AFTER the
+   own-row rule so the two never fight; you cannot be gone and be seated. */
+.standings-table tr.standing-row-gone td {
+  color: color-mix(in srgb, var(--steel) 60%, transparent);
+  font-style: italic;
+}
+
+/* the champion's line outranks even the own-row highlight (declared last), which
+   is correct: at season end the champion IS the headline, even when it is you */
+.standings-table tr.standing-row-champion td {
+  color: var(--gold);
+  font-weight: 800;
+  background: color-mix(in srgb, var(--gold) 16%, transparent);
+}
+
+.standings-table tr.standing-row-champion td:first-child {
+  box-shadow: inset 3px 0 0 var(--gold);
+}
+
+.standings-next {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  color: var(--steel);
+  text-align: center;
+}
+
+/* ---- season end: the trophy ------------------------------------------------------
+   The one moment this screen is allowed to be loud. Gold plate, gold glow, the
+   champion's name at display size — everything else on the panel steps back for
+   it (see the .season-final compaction below, which buys the banner its room
+   without letting the overlay scroll at 720p). */
+
+.champion-banner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 10px 20px;
+  border: 1px solid var(--gold);
+  border-radius: 12px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--gold) 22%, transparent),
+    color-mix(in srgb, var(--ink) 80%, transparent)
+  );
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--hud-text) 26%, transparent),
+    0 0 34px color-mix(in srgb, var(--gold) 26%, transparent),
+    0 14px 34px color-mix(in srgb, var(--ink) 70%, transparent);
+}
+
+.champion-label {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.42em;
+  color: color-mix(in srgb, var(--gold) 88%, transparent);
+}
+
+.champion-name {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 24px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  color: var(--gold);
+  text-shadow: var(--text-cast-big);
+}
+
+.champion-stat {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  color: var(--hud-text);
+}
+
+/* Championship compaction. Scoped to `.has-standings`, a class app.ts sets ONLY
+   while the season block is up — a championship-disabled results screen keeps
+   its original spacing to the pixel. Measured, not estimated: at 1280x720 with 8
+   drivers the panel is 680px final / 614px mid-season, both clear of the
+   viewport with no scroll anywhere. It is needed on BOTH championship screens,
+   not just the finale — mid-season is the taller of the two, because it carries
+   the full-size race table AND the next-round line where the finale trades the
+   race table's spacing for the trophy. */
+.results-panel.has-standings {
+  gap: 10px;
+  /* graceful degradation past 8 drivers: the panel scrolls as a whole rather
+     than growing off both edges of the screen. Never engages at 8. */
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+}
+
+.results-panel.has-standings .results-title {
+  font-size: 16px;
+}
+
+.results-panel.has-standings .results-table th {
+  padding: 4px 10px;
+}
+
+.results-panel.has-standings .results-table td {
+  padding: 5px 10px;
+}
+
+/* the finale tints the header gold to match the trophy it now sits above */
+.results-panel.season-final .results-title {
+  color: var(--gold);
+  text-shadow: 0 0 26px color-mix(in srgb, var(--gold) 40%, transparent);
+}
+
+/* ---- TABLET CONTROL SURFACE (docs/TOUCH_PWA.md §4) ---------------------------------
+   The pad is a racing control layout for anyone on a touch device — an adult
+   running a serious race on an iPad is the thing it is judged by — and KIDS
+   MODE is an assist that collapses it, not the reason it exists.
+
+   Geometry rules that are load-bearing rather than decorative:
+     · Steering is TWO ADJACENT ZONES, never a stick. A stick under a thumb is
+       imprecise for an adult and unusable for a child, and it needs a
+       continuously tracked origin; a zone is a boolean the eye can find without
+       looking down.
+     · GAS is the largest target and sits lowest and outermost — where the
+       right thumb already rests — so the hand never repositions to hold it.
+     · NITRO and DRIFT are set inboard and up, `--pad-aux-gap` clear of GAS, off
+       the arc a thumb sweeps while pulling it.
+     · Nothing is drawn in the middle third: that is where the track is, and it
+       is where the driver is actually looking.
+   Everything is measured from `env(safe-area-inset-*)` so no control lands
+   under a notch, a rounded corner or the home indicator.
+
+   The pad is `display:none` unless `.race.tablet` — a desktop pointer never
+   renders it at all (§4.4), which is why the visibility rule keys off a class
+   the app only sets from a media query or a real touch/pen pointer event. */
+
+.touch-pad {
+  position: absolute;
+  inset: 0;
+  /* over the canvas (0) and the HUD (4, and pointer-transparent anyway), under
+     the lobby (5), transient messages (6), the countdown (7) and results (8) —
+     a pad covering the START button would strand the room */
+  z-index: 4;
+  pointer-events: none; /* only the buttons themselves take input */
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* §4.4 — invisible to keyboard players. `.tablet` is set from
+   (hover: none) and (pointer: coarse), or from the first real touch/pen
+   pointerdown, or from the explicit TABLET CONTROLS setting. Never from a UA. */
+.race:not(.tablet) .touch-pad {
+  display: none;
+}
+
+.touch-steer {
+  position: absolute;
+  left: var(--pad-safe-l);
+  bottom: var(--pad-safe-b);
+  display: flex;
+  gap: 10px;
+}
+
+.touch-steer-btn {
+  width: var(--pad-steer-w);
+  height: var(--pad-steer-h);
+  --pad-tint: var(--steel);
+}
+
+/* zero-size anchor at the bottom-right corner; the three buttons hang off it */
+.touch-drive {
+  position: absolute;
+  right: var(--pad-safe-r);
+  bottom: var(--pad-safe-b);
+  width: 0;
+  height: 0;
+}
+
+.touch-gas {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: var(--pad-gas);
+  height: var(--pad-gas);
+  border-radius: 50%;
+  --pad-tint: var(--gold);
+}
+
+.touch-drift {
+  position: absolute;
+  right: calc(var(--pad-gas) + var(--pad-aux-gap));
+  bottom: 0;
+  width: var(--pad-aux);
+  height: var(--pad-aux);
+  border-radius: 50%;
+  --pad-tint: var(--curb-red);
+}
+
+.touch-nitro {
+  position: absolute;
+  right: calc(var(--pad-gas) + var(--pad-aux-gap));
+  bottom: calc(var(--pad-aux) + 16px);
+  width: var(--pad-aux);
+  height: var(--pad-aux);
+  border-radius: 50%;
+  --pad-tint: var(--kart-teal);
+}
+
+/* ---- left-handed swap (§4.2.1) — mirror the two halves, never the arrows --- */
+.race.lefty .touch-steer {
+  left: auto;
+  right: var(--pad-safe-r);
+}
+
+.race.lefty .touch-drive {
+  right: auto;
+  left: var(--pad-safe-l);
+}
+
+.race.lefty .touch-gas,
+.race.lefty .touch-drift,
+.race.lefty .touch-nitro {
+  right: auto;
+}
+
+.race.lefty .touch-gas {
+  left: 0;
+}
+
+.race.lefty .touch-drift,
+.race.lefty .touch-nitro {
+  left: calc(var(--pad-gas) + var(--pad-aux-gap));
+}
+
+/* There is ONE touch layout (§4.2.1). KIDS MODE has no rule here at all — it is
+   the auto-steer assist and nothing else, so gas, nitro and drift are rendered
+   for a 4-year-old exactly as they are for an adult. Holding one button is
+   easier than steering, and steering is the part the assist already does for
+   her; nitro is the cause-and-effect she enjoys most. Do not reintroduce a
+   second layout — the old one hid controls, resized the pad, hid the nitro
+   readout, and had to be kept consistent with this one forever. */
+
+/* ---- the buttons: the HUD's chip idiom, sized for a thumb ------------------ */
+.touch-btn {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: auto; /* the only thing on the pad that takes input */
+  touch-action: none;
+  border-radius: 20px;
+  border: 1px solid color-mix(in srgb, var(--pad-tint) 46%, transparent);
+  background:
+    radial-gradient(
+      120% 120% at 50% 0%,
+      color-mix(in srgb, var(--pad-tint) 16%, transparent),
+      transparent 70%
+    ),
+    linear-gradient(180deg, var(--chip-face-top), var(--chip-face-bot));
+  box-shadow:
+    inset 0 1px 0 var(--chip-rim),
+    0 8px 22px var(--chip-cast);
+  backdrop-filter: var(--chip-blur);
+  -webkit-backdrop-filter: var(--chip-blur);
+  transition:
+    background 90ms ease,
+    border-color 90ms ease,
+    transform 90ms ease;
+}
+
+/* Round, and declared AFTER `.touch-btn` on purpose: the two selectors have
+   equal specificity, so the 20px slab radius above would otherwise win and the
+   three drive controls would render as squares — which is exactly what the
+   first screenshot showed. Circles also matter functionally here: a round
+   target tells a thumb where its centre is without being looked at. */
+.touch-gas,
+.touch-drift,
+.touch-nitro {
+  border-radius: 50%;
+}
+
+/* GAS is the primary control; its label carries the size to match */
+.touch-gas .touch-label {
+  font-size: clamp(13px, 1.9vw, 19px);
+}
+
+/* Pressed. The feedback is deliberately loud — a thumb COVERS its own target,
+   so the only part of a pressed control the driver can see is its rim and the
+   glow around it, and "is my finger still on it?" must be answerable at 200
+   km/h from peripheral vision. */
+.touch-btn.is-down {
+  border-color: var(--pad-tint);
+  background:
+    radial-gradient(
+      120% 120% at 50% 0%,
+      color-mix(in srgb, var(--pad-tint) 52%, transparent),
+      transparent 76%
+    ),
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--pad-tint) 30%, var(--chip-face-top)),
+      var(--chip-face-bot)
+    );
+  box-shadow:
+    inset 0 2px 12px color-mix(in srgb, var(--ink) 55%, transparent),
+    0 0 30px color-mix(in srgb, var(--pad-tint) 42%, transparent);
+  transform: translateY(1px) scale(0.99);
+}
+
+/* steering chevrons: CSS triangles, so there is no glyph, font or asset to
+   depend on and they scale with the zone (the repo bans external assets) */
+.touch-arrow-l,
+.touch-arrow-r {
+  width: 0;
+  height: 0;
+  border-top: clamp(20px, 3.6vh, 32px) solid transparent;
+  border-bottom: clamp(20px, 3.6vh, 32px) solid transparent;
+  filter: drop-shadow(0 2px 0 color-mix(in srgb, var(--ink) 82%, transparent));
+}
+
+.touch-arrow-l {
+  border-right: clamp(24px, 4.4vh, 38px) solid color-mix(in srgb, var(--hud-text) 90%, transparent);
+}
+
+.touch-arrow-r {
+  border-left: clamp(24px, 4.4vh, 38px) solid color-mix(in srgb, var(--hud-text) 90%, transparent);
+}
+
+.touch-btn.is-down .touch-arrow-l,
+.touch-btn.is-down .touch-arrow-r {
+  filter: drop-shadow(0 0 12px color-mix(in srgb, var(--hud-text) 60%, transparent));
+}
+
+.touch-label {
+  font-size: clamp(10px, 1.4vw, 14px);
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  color: color-mix(in srgb, var(--pad-tint) 62%, var(--hud-text));
+  text-shadow: var(--text-cast);
+}
+
+/* ---- the HUD gets out of the way of the thumbs ------------------------------
+   The lap times and the nitro pips live in the bottom corners — exactly where
+   the pad now is. Occluding either would be the same failure this project has
+   shipped before (a death card behind a banner). They lift by the pad's own
+   height variable, so the two can never drift apart. */
+.race.tablet .hud-times,
+.race.tablet .hud-nitro {
+  bottom: calc(var(--pad-band) + 26px);
+}
+
+.race.tablet .hint-card {
+  bottom: calc(env(safe-area-inset-bottom, 0px) + var(--pad-band) + 26px);
+  max-width: 52vw; /* the sides belong to the controls now */
+}
+
+/* ---- motion preference ------------------------------------------------------------ */
+
+@media (prefers-reduced-motion: reduce) {
+  .hud-nitro-pip.pip-flash,
+  .hud-gear.gear-flash {
+    animation: none;
+  }
+
+  .room-row,
+  .hud-speed-bar,
+  .touch-btn {
+    transition: none;
+  }
+}
+
+/* ---- PAD pairing (docs/PAD.md) --------------------------------------------
+   The QR overlay sits above the lobby panel but below the countdown, and is
+   pointer-active (unlike .countdown-overlay) because it owns a CLOSE button. */
+.lobby-pad {
+  margin-top: 8px;
+}
+
+.pad-qr {
+  position: absolute;
+  inset: 0;
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--ink) 78%, transparent);
+}
+
+.pad-qr-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 20px 24px;
+  border-radius: 14px;
+  background: var(--panel, #14141c);
+  box-shadow: 0 18px 60px color-mix(in srgb, var(--ink) 70%, transparent);
+}
+
+.pad-qr-title {
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: var(--gold);
+}
+
+/* qr-creator draws a <canvas>; keep it crisp and never wider than the panel. */
+.pad-qr-code canvas {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+}
+
+.pad-qr-note {
+  max-width: 260px;
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: center;
+  overflow-wrap: anywhere; /* a room URL has no spaces to break on */
+  opacity: 0.75;
+}

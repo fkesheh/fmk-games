@@ -10,10 +10,10 @@
     ],
     "paths": {
       "@splat/shared": [
-        "../shared/src/index.ts"
+        "../../splat/shared/src/index.ts"
       ],
       "@splat/shared/*": [
-        "../shared/src/*"
+        "../../splat/shared/src/*"
       ],
       "@platform/shared": [
         "../../../platform/shared/src/index.ts"

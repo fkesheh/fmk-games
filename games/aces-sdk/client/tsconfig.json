@@ -13,10 +13,10 @@
     ],
     "paths": {
       "@aces/shared": [
-        "../shared/src/index.ts"
+        "../../aces/shared/src/index.ts"
       ],
       "@aces/shared/*": [
-        "../shared/src/*"
+        "../../aces/shared/src/*"
       ],
       "@platform/shared": [
         "../../../platform/shared/src/index.ts"

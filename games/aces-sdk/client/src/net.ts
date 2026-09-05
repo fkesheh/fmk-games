@@ -41,7 +41,10 @@
 // drop in silence — the server may be newer.
 // ============================================================================
 
-import { GAME_ID, INTERP_MS } from '@aces/shared/config.js';
+import { INTERP_MS } from '@aces/shared/config.js';
+
+/** This port's registry id — the shared GAME_ID stays 'aces'. */
+const PORT_GAME_ID = 'aces-sdk';
 import type { DebugCmd, Difficulty, PlaneClassId, RoomSettings, TeamId } from '@aces/shared/config.js';
 import { angleDelta, wrapAngle } from '@aces/shared/physics.js';
 import type { CrateState, GameEvent, MatchPhase, ScoreRow } from '@aces/shared/types.js';
@@ -261,8 +264,8 @@ function parseRoomWelcome(raw: Record<string, unknown>): WelcomePayload | null {
  *  sanitizes name/settings server-side anyway (protocol.ts cleanName /
  *  validateSettings). Settings spread opaquely — the lobby never reads them. */
 function joinEnvelope(name: string, join: JoinKind): Record<string, unknown> {
-  if (join.kind === 'quick') return { t: 'quick_join', name, game: GAME_ID };
-  return { t: 'create_private', name, game: GAME_ID, settings: { ...join.settings } };
+  if (join.kind === 'quick') return { t: 'quick_join', name, game: PORT_GAME_ID };
+  return { t: 'create_private', name, game: PORT_GAME_ID, settings: { ...join.settings } };
 }
 
 /** wss behind https (mixed-content would be blocked by the browser anyway),
