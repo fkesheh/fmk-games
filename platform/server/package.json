@@ -10,7 +10,6 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@aces/server": "0.0.0",
     "@bank/server": "0.0.0",
     "@fps/server": "0.0.0",
     "@kart/server": "0.0.0",

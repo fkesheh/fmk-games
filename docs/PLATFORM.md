@@ -2,7 +2,7 @@
 
 Status: **PROPOSAL v1** (architect draft for discussion) · frozen pieces marked 🔒.
 Everything here is **additive** to the existing platform (`docs/STRUCTURE.md`): all 7
-registered games + ACES keep compiling and playing unchanged.
+registered games keep compiling and playing unchanged.
 
 ---
 
@@ -198,7 +198,7 @@ client with its join envelopes retargeted. Legacy registrations untouched.
 |---|---|---|
 | **ANCIENTS·SDK** `/ancients/` | MOBA | `riftModuleVariant()` (pad adapter + stats sink) + SDK auth shell |
 | **BANK·SDK** `/bank-sdk/` | dice | flagship: SDK auth shell + **canonical P2P transport** (host-authoritative) |
-| WORDBOMB·SDK / KART·SDK / SPLAT·SDK / ACES·SDK / STRICKEN·SDK / OUTPOST·SDK | — | mechanical copies: retargeted joins, own dev ports, own dists |
+| WORDBOMB·SDK / KART·SDK / SPLAT·SDK / STRICKEN·SDK / OUTPOST·SDK | — | mechanical copies: retargeted joins, own dev ports, own dists |
 
 Two known limits: fps/outpost join envelopes omit the `game` field, so those
 two ports required explicit per-client retargets (done); pad layouts exist

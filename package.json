@@ -9,8 +9,8 @@
     "assets/*"
   ],
   "scripts": {
-    "dev": "concurrently -n server,fps,bank,kart,wordbomb,rift,splat,outpost,aces,ancients \"npm run dev -w @platform/server\" \"npm run dev -w @fps/client\" \"npm run dev -w @bank/client\" \"npm run dev -w @kart/client\" \"npm run dev -w @wordbomb/client\" \"npm run dev -w @rift/client\" \"npm run dev -w @splat/client\" \"npm run dev -w @outpost/client\" \"npm run dev -w @aces/client\" \"npm run dev -w @ancients/client\"",
-    "build": "npm run build -w @fps/client && npm run build -w @bank/client && npm run build -w @kart/client && npm run build -w @wordbomb/client && npm run build -w @rift/client && npm run build -w @splat/client && npm run build -w @outpost/client && npm run build -w @aces/client && npm run build -w @ancients/client && npm run build -w @bank-sdk/client && npm run build -w @wordbomb-sdk/client && npm run build -w @kart-sdk/client && npm run build -w @splat-sdk/client && npm run build -w @aces-sdk/client && npm run build -w @outpost-sdk/client && npm run build -w @platform/server",
+    "dev": "concurrently -n server,fps,bank,kart,wordbomb,rift,splat,outpost,ancients \"npm run dev -w @platform/server\" \"npm run dev -w @fps/client\" \"npm run dev -w @bank/client\" \"npm run dev -w @kart/client\" \"npm run dev -w @wordbomb/client\" \"npm run dev -w @rift/client\" \"npm run dev -w @splat/client\" \"npm run dev -w @outpost/client\" \"npm run dev -w @ancients/client\"",
+    "build": "npm run build -w @fps/client && npm run build -w @bank/client && npm run build -w @kart/client && npm run build -w @wordbomb/client && npm run build -w @rift/client && npm run build -w @splat/client && npm run build -w @outpost/client && npm run build -w @ancients/client && npm run build -w @bank-sdk/client && npm run build -w @wordbomb-sdk/client && npm run build -w @kart-sdk/client && npm run build -w @splat-sdk/client && npm run build -w @outpost-sdk/client && npm run build -w @platform/server",
     "start": "npm run start -w @platform/server",
     "typecheck": "npm run typecheck --workspaces",
     "test": "vitest run",
@@ -19,7 +19,6 @@
     "audio:rift": "node scripts/audio-render-rift.mjs",
     "e2e:splat": "node scripts/e2e-splat.mjs",
     "e2e:outpost": "node scripts/e2e-outpost.mjs",
-    "e2e:aces": "node scripts/e2e-aces.mjs",
     "e2e:pad": "node scripts/e2e-pad.mjs",
     "assets": "npm run dev -w @assets/viewer",
     "assets:capture": "node scripts/capture-assets.mjs",

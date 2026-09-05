@@ -112,8 +112,6 @@ const LPAL = {
   wordbombTint: '#28303a', //  WPAL.slate    — WORDBOMB: dark-room slate
   riftAccent: '#d9b25f', //    APAL.gold     — ANCIENTS: ancient gold
   riftTint: '#2e3827', //      APAL.moss     — ANCIENTS: dusk moss
-  acesAccent: '#f0a03a', //    APAL.tracer    — ACES: tracer amber
-  acesTint: '#274e74', //      APAL.royalNavy — ACES: cobalt slate sky
   splatAccent: '#f2b72e', //   SPAL.sunGold  — SKI SPLAT: ski-race gold
   // SPAL has no dark entry suited to a card tint (SPAL.ink is the paint guard
   // itself), so this is skyZenith-derived: #2c5fb8 deepened into the other
@@ -165,12 +163,6 @@ const COPY: Record<string, GameCopy | undefined> = {
       'Push lanes, last-hit for gold, raze towers. Break their Ancient before they break yours — 2v2 to 8v8, bots fill the rest.',
     tags: ['2v2–8v8', 'Bot fill'],
   },
-  aces: {
-    genre: 'Dogfight arena',
-    blurb:
-      'WWI dawn patrol over a cold strait. Two squadrons, forward-firing twin guns, first to 25 kills — bots fill the flight.',
-    tags: ['1v1–4v4', 'Bot fill'],
-  },
   splat: {
     genre: 'Downhill ski racer',
     blurb:
@@ -202,7 +194,6 @@ const IDENTITY: Record<string, PwaIdentity | undefined> = {
   wordbomb: { accent: LPAL.wordbombAccent, tint: LPAL.wordbombTint },
   rift: { accent: LPAL.riftAccent, tint: LPAL.riftTint },
   splat: { accent: LPAL.splatAccent, tint: LPAL.splatTint },
-  aces: { accent: LPAL.acesAccent, tint: LPAL.acesTint },
 };
 const NEUTRAL_IDENTITY: PwaIdentity = {
   accent: LPAL.neutralAccent,
