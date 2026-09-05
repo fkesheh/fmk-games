@@ -24,7 +24,7 @@ async function main() {
     stdio: ['ignore', 'ignore', 'inherit'],
   });
   await sleep(4500);
-  const browser = await puppeteer.launch({ headless: 'new' });
+  const browser = await puppeteer.launch({ headless: 'new', args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
   const errors = [];
   try {
     const a = await browser.newPage();
@@ -76,8 +76,6 @@ async function main() {
         return r !== undefined && !r.disabled;
       });
     }
-    const aframes = await a.evaluate(() => window.__p2pDbg?.()?.lobbyFrames ?? null);
-    console.log('   [dbg] A lobbyFrames:', JSON.stringify(aframes)?.slice(0, 300));
     ok(bTurn, '02a it becomes the GUEST turn over the DataChannel');
     const potBefore = await a.evaluate(() => document.body.textContent ?? '');
     await b.evaluate(() => { [...document.querySelectorAll('button')].find((x) => x.textContent?.toLowerCase() === 'roll')?.click(); });

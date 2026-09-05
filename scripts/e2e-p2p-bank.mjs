@@ -26,7 +26,7 @@ async function main() {
     stdio: ['ignore', 'ignore', 'inherit'],
   });
   await sleep(4500);
-  const browser = await puppeteer.launch({ headless: 'new' });
+  const browser = await puppeteer.launch({ headless: 'new', args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
   const errors = { A: [], B: [] };
   try {
     const a = await browser.newPage();
