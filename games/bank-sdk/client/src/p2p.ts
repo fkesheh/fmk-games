@@ -276,6 +276,16 @@ export async function startP2p(app: HTMLElement): Promise<void> {
     onSignal: null,
     onPeers: (ids) => {
       lastPeers = [...ids];
+      // Fast guest-loss path: a closed tab's ws dies in ~1s (ICE takes
+      // 10-30s). Ghost any attached seat the room no longer lists.
+      if (lobby !== null && selfId === shell.hostId) {
+        for (const pid of [...attachedGuests]) {
+          if (pid !== selfId && !ids.includes(pid)) {
+            attachedGuests.delete(pid);
+            lobby.detach(pid);
+          }
+        }
+      }
       // Fast host-loss path: the server notices a dead ws long before ICE
       // consent times out. If our host is gone from the room, elect now.
       if (shell.ready && shell.hostId !== null && shell.hostId !== selfId && !ids.includes(shell.hostId)) {
@@ -305,7 +315,8 @@ export async function startP2p(app: HTMLElement): Promise<void> {
   };
 
   let star: RtcStar | null = null;
-  let guestWired = false;
+  let guestWired = false; // inbound DC→game routing installed
+  let wiredLink: unknown = null; // link object currently wired (flaps replace it)
   let hostMounted = false;
   let lastPeers: PlayerId[] = []; // latest rtc_peers (election input)
   let myJoinFrame: string | null = null; // what got me in — replayed on rejoin
@@ -329,11 +340,13 @@ export async function startP2p(app: HTMLElement): Promise<void> {
   }
 
   /** Attach an established guest link to the host lobby (frames both ways). */
+  const attachedGuests = new Set<PlayerId>();
   function attachGuest(pid: PlayerId): void {
     if (lobby === null || lobby.has(pid)) return;
     const link = star?.link(pid);
     if (link === null || link === undefined) return;
     lobby.attach(pid, { deliver: (data) => star?.send(pid, { frame: data }) });
+    attachedGuests.add(pid);
     lobby.sync(pid); // the join reply may have raced ahead of this attach
     link.onMessage = (d) => {
       const m = d as Record<string, unknown>;
@@ -341,6 +354,7 @@ export async function startP2p(app: HTMLElement): Promise<void> {
     };
     link.onClose = () => {
             star?.dropPeer(pid);
+            attachedGuests.delete(pid);
             lobby?.detach(pid);
           };
   }
@@ -416,9 +430,16 @@ export async function startP2p(app: HTMLElement): Promise<void> {
         lobby.handleFrame(selfId, data);
         return;
       }
-      return; // transport not live yet on the guest path — frame already queued
-      // Room-level frames are meaningless until the transport is live; the
-      // host's loopback delivers them directly, guests never get here.
+      // Guest path: the DC carries gameplay frames to the host's lobby.
+      // (Join frames never reach here — they return early above.)
+      if (shell.hostId !== null && shell.hostId !== selfId) {
+        const live = star?.link(shell.hostId);
+        if (live !== null && live !== undefined) {
+          star?.send(shell.hostId, { frame: data });
+          return;
+        }
+      }
+      return; // DC not open yet — join frames are queued above
     },
     close: () => {
       gameSocket.readyState = 3;
@@ -520,9 +541,11 @@ export async function startP2p(app: HTMLElement): Promise<void> {
     if (!isHost && shell.hostId !== null) {
       const link = star?.link(shell.hostId);
       if (link !== null && link !== undefined) {
-        // Route the host's replies into our game socket (once per link).
-        if (!guestWired) {
+        // Route the host's replies into our game socket. Re-wire whenever
+        // the link object itself changes (ICE flap → new link object).
+        if (!guestWired || wiredLink !== link) {
           guestWired = true;
+          wiredLink = link;
           link.onMessage = (d) => {
             const m = d as Record<string, unknown>;
             if (typeof m.frame === 'string') {

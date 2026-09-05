@@ -64,6 +64,9 @@ async function main() {
     });
     await a.evaluate(() => { [...document.querySelectorAll('button')].find((x) => x.textContent?.toLowerCase().includes('start'))?.click(); });
     await sleep(1000);
+    // The host must START the match — turns don't exist in the lobby.
+    await a.evaluate(() => { [...document.querySelectorAll('button')].find((x) => x.textContent?.toLowerCase().includes('start'))?.click(); });
+    await sleep(1500);
     let bTurn = false;
     for (let i = 0; i < 120 && !bTurn; i++) {
       await sleep(250);
@@ -73,6 +76,8 @@ async function main() {
         return r !== undefined && !r.disabled;
       });
     }
+    const aframes = await a.evaluate(() => window.__p2pDbg?.()?.lobbyFrames ?? null);
+    console.log('   [dbg] A lobbyFrames:', JSON.stringify(aframes)?.slice(0, 300));
     ok(bTurn, '02a it becomes the GUEST turn over the DataChannel');
     const potBefore = await a.evaluate(() => document.body.textContent ?? '');
     await b.evaluate(() => { [...document.querySelectorAll('button')].find((x) => x.textContent?.toLowerCase() === 'roll')?.click(); });
@@ -82,6 +87,12 @@ async function main() {
       moved = await a.evaluate((prev) => (document.body.textContent ?? '') !== prev, potBefore);
     }
     ok(moved, '02b GUEST roll moves the HOST table (shared sim proven)');
+    let frameSeen = false;
+    for (let i = 0; i < 20 && !frameSeen; i++) {
+      await sleep(250);
+      frameSeen = await a.evaluate(() => ((window.__p2pDbg?.()?.lobbyFrames ?? [])).some((f) => f.includes('"roll"')));
+    }
+    ok(frameSeen, '02c HOST lobby received the GUEST roll frame');
     // Kill the host tab: the sim dies with it.
     await a.close();
     // Promotion = durable state, not the transient banner: B's own id must
