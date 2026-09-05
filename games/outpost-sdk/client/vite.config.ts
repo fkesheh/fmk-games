@@ -6,7 +6,7 @@ export default defineConfig({
   base: '/outpost-sdk/',
   resolve: {
     alias: {
-      '@outpost/shared': fileURLToPath(new URL('../shared/src', import.meta.url)),
+      '@outpost/shared': fileURLToPath(new URL('../../outpost/shared/src', import.meta.url)),
       '@fps/shared': fileURLToPath(new URL('../../fps/shared/src', import.meta.url)),
     },
   },
