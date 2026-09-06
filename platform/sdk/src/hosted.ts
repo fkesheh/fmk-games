@@ -32,6 +32,13 @@ export interface HostedLobbyOpts {
    * 'bank_state'. Omit when the game has no snapshot/code concept.
    */
   snapshotTag?: string;
+  /**
+   * Join-receipt tag that gets the live code injected (rewrite only, never
+   * cached as the snapshot), e.g. 'kart_joined'. Without this the invite
+   * chip renders empty: the room's raw join message carries no code and the
+   * shell code only exists at this layer.
+   */
+  joinTag?: string;
 }
 
 /** 6-char unambiguous code (same alphabet as claim codes). */
@@ -56,14 +63,11 @@ export class HostedLobby {
     this.io = {
       send: (id, msg) => {
         let json = JSON.stringify(msg);
-        if (
-          self.opts.snapshotTag !== undefined &&
-          typeof msg === 'object' && msg !== null &&
-          (msg as { t?: string }).t === self.opts.snapshotTag
-        ) {
+        const tag = typeof msg === 'object' && msg !== null ? (msg as { t?: string }).t : undefined;
+        if (tag !== undefined && (tag === self.opts.snapshotTag || tag === self.opts.joinTag)) {
           const rewritten = { ...(msg as Record<string, unknown>), code: self.code };
           json = JSON.stringify(rewritten);
-          self.lastSnapshot = json;
+          if (tag === self.opts.snapshotTag) self.lastSnapshot = json;
         }
         self.sinks.get(id)?.deliver(json);
       },
@@ -91,8 +95,18 @@ export class HostedLobby {
   }
 
   /** Seat/snapshot counts for diagnostics. */
-  debugRoom(): { members: number; hasRoom: boolean } {
-    return { members: this.sinks.size, hasRoom: this.room !== null };
+  debugRoom(): { members: number; hasRoom: boolean; players: number; phase: string } {
+    let players = -1;
+    let phase = '?';
+    try {
+      if (this.room !== null) {
+        players = this.room.playerCount();
+        phase = String((this.room.info() as unknown as Record<string, unknown>)?.phase ?? '?');
+      }
+    } catch {
+      // diagnostics must never break the lobby
+    }
+    return { members: this.sinks.size, hasRoom: this.room !== null, players, phase };
   }
 
   /** Frames seen, newest last (diagnostics for e2e + `__p2pDbg`). */
@@ -131,6 +145,7 @@ export class HostedLobby {
           : {});
         const room = this.opts.createRoom(this.io, settings);
         this.room = room;
+        room.start(); // tick loops (snapshots/sim) live here — same as the server lobby
         this.code = this.opts.newRoomCode();
         this.room.addPlayer(id, String(m.name ?? 'Player'));
         return;
