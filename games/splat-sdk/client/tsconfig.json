@@ -26,6 +26,12 @@
       ],
       "@platform/engine": [
         "../../../platform/engine/src/index.ts"
+      ],
+      "@splat/server": [
+        "../../splat/server/src/index.ts"
+      ],
+      "@splat/server/*": [
+        "../../splat/server/src/*"
       ]
     }
   },

@@ -7,6 +7,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@kart/shared': fileURLToPath(new URL('../../kart/shared/src', import.meta.url)),
+      '@kart/server': fileURLToPath(new URL('../../kart/server/src', import.meta.url)) + '/',
     },
   },
   server: {

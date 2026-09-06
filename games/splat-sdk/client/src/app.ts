@@ -531,8 +531,27 @@ function sampleBuffer(buf: RemoteSample[], renderTime: number): RemoteVisual | n
   };
 }
 
+/** Structural WebSocket stand-in: P2P transports plug in here (§12.6). */
+export interface SplatWsLike {
+  readyState: number;
+  send(data: string): void;
+  close(): void;
+  onopen: ((ev?: unknown) => void) | null;
+  onclose: ((ev?: unknown) => void) | null;
+  onmessage: ((ev: { data: string }) => void) | null;
+  onerror?: ((ev?: unknown) => void) | null;
+}
+/** WebSocket.OPEN === 1; overrides expose the same numeric state. */
+const WS_OPEN = 1;
+
+export interface SplatAppOpts {
+  /** P2P transport override — far end is the host tab's mini-lobby. */
+  readonly socket?: SplatWsLike;
+}
+
 export class SplatApp {
-  private ws: WebSocket | null = null;
+  private ws: SplatWsLike | null = null;
+  private readonly socketOverride: SplatWsLike | undefined;
   private welcomed = false;
   private playerId: string | null = null;
   private screen: 'menu' | 'race' = 'menu';
@@ -642,7 +661,8 @@ export class SplatApp {
   };
   private readonly hudState: HudState;
 
-  constructor(root: HTMLElement) {
+  constructor(root: HTMLElement, opts?: SplatAppOpts) {
+    this.socketOverride = opts?.socket;
     this.assist = readFlag(ASSIST_KEY) === true;
     this.tabletPref = readFlag(TABLET_KEY); // null = auto-detect from the pointer
     this.lefty = readFlag(LEFTY_KEY) === true;
@@ -890,7 +910,7 @@ export class SplatApp {
 
     // ---- timers (setInterval for net: rAF pauses in background tabs) ---------------
     window.setInterval(() => {
-      if (this.ws !== null && this.ws.readyState === WebSocket.OPEN) {
+      if (this.ws !== null && this.ws.readyState === WS_OPEN) {
         this.send({ t: 'ping', ts: performance.now() });
       }
     }, PING_EVERY_MS);
@@ -916,16 +936,38 @@ export class SplatApp {
 
   // ---- connection ---------------------------------------------------------------
   private connect(): void {
+    // P2P override (§12.6): same wire format, far end is the host tab.
+    if (this.socketOverride !== undefined) {
+      const ws: SplatWsLike = this.socketOverride;
+      this.ws = ws;
+      ws.onmessage = (ev: { data: string }) => {
+        if (this.ws !== ws || typeof ev.data !== 'string') return;
+        let decoded: unknown;
+        try {
+          decoded = JSON.parse(ev.data);
+        } catch {
+          return; // malformed frame: drop, never throw
+        }
+        try {
+          const msg = parseS2C(decoded);
+          if (msg !== null) this.onMessage(msg);
+        } catch (err) {
+          // one bad message never kills the client (CONTRACT §2.8)
+          console.warn('[splat] message handler failed', err);
+        }
+      };
+      return;
+    }
     const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
-    let ws: WebSocket;
+    let ws: SplatWsLike;
     try {
-      ws = new WebSocket(url);
+      ws = new WebSocket(url) as unknown as SplatWsLike;
     } catch {
       window.setTimeout(() => this.connect(), RECONNECT_MS);
       return;
     }
     this.ws = ws;
-    ws.onmessage = (ev: MessageEvent) => {
+    ws.onmessage = (ev: { data: string }) => {
       if (this.ws !== ws || typeof ev.data !== 'string') return;
       let decoded: unknown;
       try {
@@ -965,7 +1007,7 @@ export class SplatApp {
   /** No-op unless the socket is open (mirrors the server's Session.send). */
   private send(msg: LobbyC2S | SplatC2S): void {
     const ws = this.ws;
-    if (ws === null || ws.readyState !== WebSocket.OPEN) return;
+    if (ws === null || ws.readyState !== WS_OPEN) return;
     try {
       ws.send(JSON.stringify(msg)); // the wire is plain JSON
     } catch {

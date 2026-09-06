@@ -101,4 +101,7 @@ export const splatSdkModule = variantOf(splatModule, {
   name: 'SPLAT·SDK',
   devPort: 5188,
   clientDist: resolvePortDist_splat(),
+  // P2P (docs/PLATFORM.md §12.6): splat-sdk rooms are rendezvous
+  // shells; the race itself runs in the host player's tab.
+  p2pShell: true,
 });

@@ -82,4 +82,7 @@ export const kartSdkModule = variantOf(kartModule, {
   name: 'KART GP·SDK',
   devPort: 5187,
   clientDist: resolvePortDist_kart(),
+  // P2P pilot (docs/PLATFORM.md §12.6): kart-sdk rooms are rendezvous
+  // shells; the race itself runs in the host player's tab.
+  p2pShell: true,
 });

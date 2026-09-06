@@ -20,7 +20,10 @@
       "@wordbomb/shared/*": ["../../games/wordbomb/shared/src/*"],
       "@splat/server": ["../../games/splat/server/src/module.ts"],
       "@splat/shared": ["../../games/splat/shared/src/index.ts"],
-      "@splat/shared/*": ["../../games/splat/shared/src/*"]
+      "@splat/shared/*": ["../../games/splat/shared/src/*"],
+      "@outpost/server": ["../../games/outpost/server/src/module.ts"],
+      "@outpost/shared": ["../../games/outpost/shared/src/index.ts"],
+      "@outpost/shared/*": ["../../games/outpost/shared/src/*"]
     }
   },
   "include": ["src"]

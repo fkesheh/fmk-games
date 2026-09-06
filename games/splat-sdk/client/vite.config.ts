@@ -7,6 +7,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@splat/shared': fileURLToPath(new URL('../../splat/shared/src', import.meta.url)),
+      '@splat/server': fileURLToPath(new URL('../../splat/server/src', import.meta.url)) + '/',
     },
   },
   server: {

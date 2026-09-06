@@ -306,7 +306,22 @@ function boot(): void {
 }
 
 try {
-  boot();
+  // P2P is the CANONICAL transport (docs/PLATFORM.md §12.6): the game's own
+  // menu joins a host-authoritative match; the server only brokers the
+  // introduction. ?online=1 forces the legacy server-authoritative mode.
+  // ClientGame/Connection expose no socket seam, so the P2P module installs
+  // a WebSocket stand-in first (see p2p.ts) and boot() then runs unchanged.
+  if (new URLSearchParams(location.search).get('online') === '1') {
+    boot();
+  } else {
+    void (async () => {
+      const { startP2p } = await import('./p2p.js');
+      await startP2p();
+      boot();
+    })().catch((err) => {
+      showError(`Boot failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
 } catch (err) {
   showError(`Boot failed: ${err instanceof Error ? err.message : String(err)}`);
 }

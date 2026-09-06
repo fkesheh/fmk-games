@@ -11,11 +11,15 @@ import type { GameModule } from '@platform/shared';
 import { riftModule } from '@rift/server';
 import { splatModule } from '@splat/server';
 import { wordbombModule } from '@wordbomb/server';
+import { outpostModule } from '@outpost/server';
+import { fpsModule } from '@fps/server';
 // ·SDK ports (docs/PLATFORM.md §7): same rooms under second ids
 import { bankSdkModule } from '@bank/server';
 import { wordbombSdkModule } from '@wordbomb/server';
 import { kartSdkModule } from '@kart/server';
 import { splatSdkModule } from '@splat/server';
+import { outpostSdkModule } from '@outpost/server';
+import { fpsSdkModule } from '@fps/server';
 import { riftModuleVariant } from '@rift/server';
 
 export const GAMES: GameModule[] = [
@@ -24,6 +28,8 @@ export const GAMES: GameModule[] = [
   wordbombModule,
   riftModule,
   splatModule,
+  outpostModule,
+  fpsModule,
   // PLATFORM v2 port (docs/PLATFORM.md §7): same ANCIENTS rooms under a
   // second id, SDK-shell client at /ancients/, stats sink + phone-pad adapter.
   riftModuleVariant({
@@ -37,6 +43,8 @@ export const GAMES: GameModule[] = [
   wordbombSdkModule,
   kartSdkModule,
   splatSdkModule,
+  outpostSdkModule,
+  fpsSdkModule,
 ];
 
 // The variant's clientDist points at the PORT's own shell build (games/ancients/client/dist);

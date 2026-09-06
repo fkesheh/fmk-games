@@ -692,8 +692,27 @@ function sampleBuffer(buf: RemoteSample[], renderTime: number): RemoteVisual | n
   };
 }
 
+/** Structural WebSocket stand-in: P2P transports plug in here (§12.6). */
+export interface KartWsLike {
+  readyState: number;
+  send(data: string): void;
+  close(): void;
+  onopen: ((ev?: unknown) => void) | null;
+  onclose: ((ev?: unknown) => void) | null;
+  onmessage: ((ev: { data: string }) => void) | null;
+  onerror?: ((ev?: unknown) => void) | null;
+}
+/** WebSocket.OPEN === 1; overrides expose the same numeric state. */
+const WS_OPEN = 1;
+
+export interface KartAppOpts {
+  /** P2P transport override — far end is the host tab's mini-lobby. */
+  readonly socket?: KartWsLike;
+}
+
 export class KartApp {
-  private ws: WebSocket | null = null;
+  private ws: KartWsLike | null = null;
+  private readonly socketOverride: KartWsLike | undefined;
   private welcomed = false;
   private playerId: string | null = null;
   private rooms: RoomInfo[] = [];
@@ -862,7 +881,8 @@ export class KartApp {
   private readonly championStatEl: HTMLDivElement;
   private readonly resultsNoteEl: HTMLDivElement;
 
-  constructor(root: HTMLElement) {
+  constructor(root: HTMLElement, opts?: KartAppOpts) {
+    this.socketOverride = opts?.socket;
     this.assist = readKidsStored(); // KIDS MODE persisted toggle (localStorage 'kart.kids')
     this.tabletPref = readFlag(TABLET_KEY); // null = auto-detect from the pointer
     this.lefty = readFlag(LEFTY_KEY) === true;
@@ -1333,7 +1353,7 @@ export class KartApp {
 
     // ---- timers (setInterval for net: rAF pauses in background tabs) ---------------
     window.setInterval(() => {
-      if (this.ws !== null && this.ws.readyState === WebSocket.OPEN) {
+      if (this.ws !== null && this.ws.readyState === WS_OPEN) {
         this.send({ t: 'ping', ts: performance.now() });
       }
     }, PING_EVERY_MS);
@@ -1370,10 +1390,27 @@ export class KartApp {
 
   // ---- connection ---------------------------------------------------------------
   private connect(): void {
+    // P2P override (§12.6): same wire format, far end is the host tab.
+    if (this.socketOverride !== undefined) {
+      const ws: KartWsLike = this.socketOverride;
+      this.ws = ws;
+      ws.onmessage = (ev: { data: string }) => {
+        if (this.ws !== ws || typeof ev.data !== 'string') return;
+        let decoded: unknown;
+        try {
+          decoded = JSON.parse(ev.data);
+        } catch {
+          return;
+        }
+        const msg = parseS2C(decoded);
+        if (msg !== null) this.onMessage(msg);
+      };
+      return;
+    }
     const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(url) as unknown as KartWsLike;
     this.ws = ws;
-    ws.onmessage = (ev: MessageEvent) => {
+    ws.onmessage = (ev: { data: string }) => {
       if (this.ws !== ws || typeof ev.data !== 'string') return;
       let decoded: unknown;
       try {
@@ -1401,7 +1438,7 @@ export class KartApp {
   /** No-op unless the socket is open (mirrors the server's Session.send). */
   private send(msg: LobbyC2S | KartC2S): void {
     const ws = this.ws;
-    if (ws === null || ws.readyState !== WebSocket.OPEN) return;
+    if (ws === null || ws.readyState !== WS_OPEN) return;
     try {
       ws.send(JSON.stringify(msg)); // the wire is plain JSON
     } catch {

@@ -252,8 +252,24 @@ function boot(): void {
   dismissBootSplash(false); // shell is live: fade the loading state out
 }
 
-try {
-  boot();
-} catch (err) {
-  showError(`Boot failed: ${err instanceof Error ? err.message : String(err)}`);
+/** Standard boot: menus, HUD, rAF, the frozen window.__outpost surface. On
+ *  the P2P path startP2p() installs the WebSocket shim first and then calls
+ *  back here, so Net's /ws sockets route to the host tab's lobby. */
+export function bootOnline(): void {
+  try {
+    boot();
+  } catch (err) {
+    showError(`Boot failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+// P2P is the CANONICAL transport (docs/PLATFORM.md §12.6): the game's own
+// menu joins a host-authoritative run; the server only brokers the
+// introduction. ?online=1 forces the legacy server-authoritative mode.
+if (new URLSearchParams(location.search).get('online') === '1') {
+  bootOnline();
+} else {
+  void import('./p2p.js').then((m) => m.startP2p()).catch((err) => {
+    showError(`P2P boot failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
 }

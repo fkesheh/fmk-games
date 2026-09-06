@@ -44,7 +44,17 @@ window.addEventListener('unhandledrejection', (ev: PromiseRejectionEvent) => {
 try {
   const root = document.getElementById('app');
   if (root === null) throw new Error('missing #app element');
-  new SplatApp(root);
+  // P2P is the CANONICAL transport (docs/PLATFORM.md §12.6): the game's own
+  // menu joins a host-authoritative race; the server only brokers the
+  // introduction. ?online=1 forces the legacy server-authoritative mode.
+  if (new URLSearchParams(location.search).get('online') === '1') {
+    new SplatApp(root);
+  } else {
+    void (async () => {
+      const { startP2p } = await import('./p2p.js');
+      await startP2p(root);
+    })();
+  }
 } catch (err) {
   showError(`Error: ${err instanceof Error ? err.message : String(err)}`);
 }

@@ -10,10 +10,10 @@
     ],
     "paths": {
       "@kart/shared": [
-        "../shared/src/index.ts"
+        "../../kart/shared/src/index.ts"
       ],
       "@kart/shared/*": [
-        "../shared/src/*"
+        "../../kart/shared/src/*"
       ],
       "@platform/shared": [
         "../../../platform/shared/src/index.ts"
@@ -26,6 +26,12 @@
       ],
       "@platform/engine": [
         "../../../platform/engine/src/index.ts"
+      ],
+      "@kart/server": [
+        "../../kart/server/src/index.ts"
+      ],
+      "@kart/server/*": [
+        "../../kart/server/src/*"
       ]
     }
   },

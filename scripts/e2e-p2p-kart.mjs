@@ -48,6 +48,9 @@ async function main() {
         const t = m.text();
         if (m.type() === 'error' && !t.includes('404') && !t.includes('manifest') && !t.includes('favicon')) errors[k].push(t);
       });
+      // Small viewport: SwiftShader raster cost scales with pixels, and a
+      // saturated renderer starves the page's own ICE/DC timers (splat lesson).
+      await pg.setViewport({ width: 640, height: 360 });
       await pg.goto(`${BASE}/kart-sdk/`, { waitUntil: 'networkidle2' });
     }
     await sleep(1500);
