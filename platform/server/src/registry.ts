@@ -37,6 +37,9 @@ export const GAMES: GameModule[] = [
     name: 'ANCIENTS·SDK',
     devPort: 5184,
     clientDist: resolveAncientsClientDist(),
+    // P2P (docs/PLATFORM.md §12.6): ancients rooms are rendezvous shells;
+    // the match itself runs in the host player's tab.
+    p2pShell: true,
   }),
   // ·SDK ports (docs/PLATFORM.md §7): same rooms under second ids
   bankSdkModule,

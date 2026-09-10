@@ -50,7 +50,7 @@ function mountProfileChip(profiles: Profiles): void {
   document.body.appendChild(chip);
 }
 
-async function boot(): Promise<void> {
+async function bootOnline(): Promise<void> {
   const app = document.getElementById('app');
   if (app === null) {
     showErrorBanner('Boot failed: #app missing.');
@@ -74,13 +74,28 @@ async function boot(): Promise<void> {
   wire(app, { gameId: GAME_ID, ...(onOpenExtra !== undefined ? { onOpenExtra } : {}) });
 
   // Alias the frozen debug surface for the e2e + ?debug parity with legacy.
+  // wire() constructs the Game synchronously and the constructor assigns
+  // window.__rift before returning (games/rift/client/src/game.ts), so the
+  // alias below reads it in the same synchronous block — no poll or deferral
+  // needed, on either the online or the P2P path.
   const w = window as typeof window & { __rift?: unknown };
   if (w.__rift !== undefined) {
     (window as typeof window & { __ancients?: unknown }).__ancients = w.__rift;
   }
 }
 
-boot().catch((err) => {
+export { bootOnline };
+
+function bootFailed(err: unknown): void {
   console.error(err);
   showErrorBanner('Boot failed. Reload to try again.');
-});
+}
+
+// P2P is the CANONICAL transport (docs/PLATFORM.md §12.6): the game's own
+// menu joins a host-authoritative match; the server only brokers the
+// introduction. ?online=1 forces the legacy server-authoritative mode.
+if (new URLSearchParams(location.search).get('online') === '1') {
+  bootOnline().catch(bootFailed);
+} else {
+  void import('./p2p.js').then((m) => m.startP2p()).catch(bootFailed);
+}

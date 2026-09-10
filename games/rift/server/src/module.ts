@@ -11,7 +11,7 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { rng, CLAIM_ALPHABET, PAD } from '@platform/shared';
+import { rng, CLAIM_ALPHABET, PAD, p2pShellRoom } from '@platform/shared';
 import type { GameModule, GameRoomHandle, PadLayout, RoomIO } from '@platform/shared';
 import { MAX_PLAYERS, MIN_PLAYERS, parseRiftSettings } from '@rift/shared';
 import type { RiftRoomCtor } from './ports.js';
@@ -106,6 +106,13 @@ export interface RiftVariantOpts {
   readonly name?: string;
   readonly devPort?: number;
   readonly clientDist?: string;
+  /**
+   * P2P mode (docs/PLATFORM.md §12): when set, EVERY room this variant
+   * creates is a rendezvous shell; the real game runs in the host tab
+   * (same as VariantOpts.p2pShell — this bespoke variant can't use
+   * variantOf because of its pad/stats wrapper).
+   */
+  readonly p2pShell?: boolean;
 }
 
 /** Stick must deflect past this to emit an order (deadzone). */
@@ -255,6 +262,7 @@ export function riftModuleVariant(o: RiftVariantOpts): GameModule {
     minPlayers: base.minPlayers,
     maxPlayers: base.maxPlayers,
     createRoom(opts) {
+      if (o.p2pShell === true) return p2pShellRoom(opts.io, base.maxPlayers, opts.visibility, o.id);
       const io = wrapIo(opts.io);
       const room = base.createRoom({ ...opts, io });
       // Explicit delegation — spreading a class instance would silently drop
