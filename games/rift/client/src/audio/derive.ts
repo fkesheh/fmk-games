@@ -10,7 +10,7 @@
 // out-of-order guard below); `snap.matchTick` is the simulation clock. Every cooldown /
 // respawn comparison in this file uses `matchTick`, never `tick`.
 
-import { heroById } from '@rift/shared';
+import { heroById, isPlayerTeam } from '@rift/shared';
 import type {
   AttackerKind,
   AudioEvent,
@@ -130,10 +130,11 @@ function findEntByPid(snap: SnapMsg, pid: string): EntSnap | null {
 
 function teamOfPid(snap: SnapMsg, pid: string): TeamId | null {
   for (const b of snap.board) {
-    if (b.id === pid) return b.team;
+    if (b.id === pid) return isPlayerTeam(b.team) ? b.team : null;
   }
   const e = findEntByPid(snap, pid);
-  return e === null ? null : e.team;
+  if (e === null) return null;
+  return isPlayerTeam(e.team) ? e.team : null;
 }
 
 /** Cap output at `DERIVE.maxPerSnap`, dropping by `EVENT_PRIORITY` (highest number —
@@ -613,6 +614,13 @@ function deriveWire(ev: RiftEvent, snap: SnapMsg | null, ctx: AudioWorldCtx): re
       return [{ t: 'heroPick', hero: ev.hero, self: ev.id === ctx.selfPid }];
 
     case 'rift_roster':
+      return [];
+
+    case 'rift_miss':
+      // Uphill basic attack missed (TERRAIN_CONTRACT §4): no damage, no
+      // position worth cueing. The swing already sounded via the attacker's
+      // `attack` event (derived from EntSnap.atk); the absent `hit` IS the
+      // miss signal, so map to silence rather than inventing an AudioEvent.
       return [];
 
     case 'rift_end':

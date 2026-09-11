@@ -49,6 +49,7 @@ import { riftModuleVariant } from './module.js';
 interface FakeIo {
   io: RoomIO;
   report: Array<{ id: string; delta: Record<string, number> }>;
+  sent: Array<{ id: string; msg: unknown }>;
 }
 
 function fakeIo(profileIds: Record<string, string | null>): FakeIo {
@@ -214,7 +215,7 @@ describe('riftModuleVariant pad adapter', () => {
   }, 10_000);
 
   it('drops unbound pad sessions without touching the room', () => {
-    const f = fakeIo({ h1: 'prof-hero' }, () => null);
+    const f = fakeIo({ h1: 'prof-hero' });
     const { room } = setup(f.io);
     room.handleMessage('pad-x', { t: 'pad_input', seq: 1, lx: 1, ly: 0, rx: 0, ry: 0, buttons: 0 });
     expect(state.roomMsgs).toHaveLength(0);

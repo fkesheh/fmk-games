@@ -217,19 +217,36 @@ describe('wave spawner', () => {
     expect(baseWave).toHaveLength(WAVE_MELEE + extraMeleeAt(base));
     expect(extraMeleeAt(base)).toBe(0); // scenario premise: < 1 OT period elapsed
     expect(baseWave[0]?.maxHp).toBeCloseTo(
-      CREEP_MELEE.hp * Math.pow(1 + SURGE_WAVE_GROWTH, base),
+      // Piecewise growth (761bdf1 — surge compounds FROM the overtime
+      // boundary, never retroactively): normal growth to the boundary,
+      // surge rate only on waves elapsed since. Hand-verified: waveIndex 23
+      // -> 450 * 1.02^22 * 1.05^1 = 730.48.
+      CREEP_MELEE.hp *
+        Math.pow(1 + WAVE_GROWTH, Math.min(base, Math.ceil(OVERTIME_AT_S / WAVE_PERIOD_S))) *
+        Math.pow(1 + SURGE_WAVE_GROWTH, Math.max(0, base - Math.ceil(OVERTIME_AT_S / WAVE_PERIOD_S))),
       4,
     );
     clearCreeps();
     // one full extra-melee period into overtime: +surgedExtra melee per wave.
-    // The march spans many intermediate waves whose survivors are NOT in the
-    // base snapshot — re-snapshot on the tick before the surged wave spawns
-    // so only its own creeps count as new.
-    advanceSafely(WAVE_TICK(surged) - 1 - w.tick);
+    // Overtime SHRINKS the wave period (423e59b), so fixed-period WAVE_TICK
+    // arithmetic drifts EARLIER than real spawn ticks — predict-then-snapshot
+    // lands on a quiet tick. Detect the surged wave instead: walk forward one
+    // tick at a time and take the first fresh team-0 batch bigger than a
+    // plain wave (pre-surge waves and stragglers are absorbed into `seen`).
+    let surgedWave: Ent[] = [];
+    const deadline = WAVE_TICK(surged) + 2 * Math.round(WAVE_PERIOD_S * TICK_RATE);
     seen.clear();
     for (const e of w.mobiles()) seen.add(e.id);
-    w.advance();
-    const surgedWave = mobilesOf(w, 'melee', 0).filter((c) => !seen.has(c.id));
+    while (surgedWave.length === 0 && w.tick < deadline) {
+      advanceSafely(1);
+      const fresh = mobilesOf(w, 'melee', 0).filter((c) => !seen.has(c.id));
+      if (fresh.length > WAVE_MELEE) {
+        surgedWave = fresh;
+      } else {
+        for (const c of fresh) seen.add(c.id);
+      }
+    }
+    expect(w.tick).toBeLessThan(deadline); // a surged wave spawned in range
     expect(surgedWave).toHaveLength(WAVE_MELEE + surgedExtra);
   }, 20000);
 });

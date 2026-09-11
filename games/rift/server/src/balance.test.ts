@@ -757,7 +757,12 @@ describe('rift balance harness (T13 — CONTRACT §9 bands, measured)', () => {
       if (size === 8) {
         expect(med as number, `8v8 level-6 median ${fmt(med)}min`).toBeLessThanOrEqual(14.5);
       } else {
-        expect(med as number, `${size}v${size} level-6 median ${fmt(med)}min`).toBeGreaterThanOrEqual(6);
+        // AMENDMENT_8 §C: the 2v2 floor is 5.5, not 6 — CONTRACT §9's old
+        // floor modeled lane-creep xp only; hero-kill xp (frozen numbers)
+        // legitimately pulls the crossing earlier. The tripwire stands: a
+        // crossing below 5.5 means jungling regressed (bot work, not bands).
+        const floor = size === 2 ? 5.5 : 6;
+        expect(med as number, `${size}v${size} level-6 median ${fmt(med)}min`).toBeGreaterThanOrEqual(floor);
         expect(med as number, `${size}v${size} level-6 median ${fmt(med)}min`).toBeLessThanOrEqual(11);
       }
     }

@@ -471,6 +471,9 @@ export const SURGE_PERIOD_STEP_S = 4;
  * 11.4 ms against a 2 ms budget (CONTRACT §10) and the balance harness could no
  * longer finish a match. Volume is still the pressure mechanism, but it has to
  * stay inside the tick budget: 18 s floor is ~1.7x the base rate.
+ * (Tried 15 s 2026-09: converted tiebreaks into kills but MEDIAN worsened
+ * 20.70 -> 22.51 — symmetric volume scales the mid-map stalemate instead of
+ * breaking it. Closing needs asymmetry (push/siege/snowball), not rate.)
  */
 export const SURGE_WAVE_PERIOD_MIN_S = 18;
 /** Hard cap on the extra melee overtime stacks onto a wave. Unbounded growth

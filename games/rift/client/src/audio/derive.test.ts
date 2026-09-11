@@ -79,6 +79,7 @@ function makeSnap(
     phase: 'live',
     matchTick,
     overtime: false,
+    dayPhase: 0, // full day; deterministic fixture (protocol requires the field)
     wardStock: 0,
     kills: [0, 0],
     board: overrides.board ?? [],
@@ -431,6 +432,13 @@ describe('createDeriver — wire()', () => {
     const deriver = createDeriver();
     const ctx = makeCtx();
     const evs = deriver.wire({ t: 'rift_pick', id: 'p1', hero: null }, null, ctx);
+    expect(evs).toEqual([]);
+  });
+
+  it('REGRESSION: rift_miss (uphill whiff) emits nothing — the swing already sounded, the absent hit is the signal', () => {
+    const deriver = createDeriver();
+    const ctx = makeCtx();
+    const evs = deriver.wire({ t: 'rift_miss', attacker: 10, target: 20 }, null, ctx);
     expect(evs).toEqual([]);
   });
 
