@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
-# ---- build: full workspace install (devDeps included), then vite (fps + bank +
-# kart + wordbomb + rift + splat + outpost clients) + esbuild (platform server bundle; every
+# ---- build: full workspace install (devDeps included), then vite (all legacy
+# + SDK + ancients clients) + esbuild (platform server bundle; every
 # @<game>/server and the shared packages are inlined).
 FROM node:22-alpine AS build
 WORKDIR /app
@@ -31,6 +31,13 @@ COPY games/splat/client/package.json games/splat/client/package.json
 COPY games/outpost/shared/package.json games/outpost/shared/package.json
 COPY games/outpost/server/package.json games/outpost/server/package.json
 COPY games/outpost/client/package.json games/outpost/client/package.json
+COPY games/ancients/client/package.json games/ancients/client/package.json
+COPY games/bank-sdk/client/package.json games/bank-sdk/client/package.json
+COPY games/wordbomb-sdk/client/package.json games/wordbomb-sdk/client/package.json
+COPY games/kart-sdk/client/package.json games/kart-sdk/client/package.json
+COPY games/splat-sdk/client/package.json games/splat-sdk/client/package.json
+COPY games/outpost-sdk/client/package.json games/outpost-sdk/client/package.json
+COPY games/fps-sdk/client/package.json games/fps-sdk/client/package.json
 # npm install (not ci): the committed lock skews across platforms (macOS vs linux
 # optional deps) and npm versions — let the image resolve on-platform.
 RUN npm install
@@ -67,6 +74,13 @@ COPY games/splat/client/package.json games/splat/client/package.json
 COPY games/outpost/shared/package.json games/outpost/shared/package.json
 COPY games/outpost/server/package.json games/outpost/server/package.json
 COPY games/outpost/client/package.json games/outpost/client/package.json
+COPY games/ancients/client/package.json games/ancients/client/package.json
+COPY games/bank-sdk/client/package.json games/bank-sdk/client/package.json
+COPY games/wordbomb-sdk/client/package.json games/wordbomb-sdk/client/package.json
+COPY games/kart-sdk/client/package.json games/kart-sdk/client/package.json
+COPY games/splat-sdk/client/package.json games/splat-sdk/client/package.json
+COPY games/outpost-sdk/client/package.json games/outpost-sdk/client/package.json
+COPY games/fps-sdk/client/package.json games/fps-sdk/client/package.json
 RUN npm install --omit=dev
 
 # ---- runtime. Each game module resolves its clientDist as
@@ -89,6 +103,13 @@ COPY --from=build /app/games/wordbomb/server/data ./games/wordbomb/server/data
 COPY --from=build /app/games/rift/client/dist ./games/rift/client/dist
 COPY --from=build /app/games/splat/client/dist ./games/splat/client/dist
 COPY --from=build /app/games/outpost/client/dist ./games/outpost/client/dist
+COPY --from=build /app/games/ancients/client/dist ./games/ancients/client/dist
+COPY --from=build /app/games/bank-sdk/client/dist ./games/bank-sdk/client/dist
+COPY --from=build /app/games/wordbomb-sdk/client/dist ./games/wordbomb-sdk/client/dist
+COPY --from=build /app/games/kart-sdk/client/dist ./games/kart-sdk/client/dist
+COPY --from=build /app/games/splat-sdk/client/dist ./games/splat-sdk/client/dist
+COPY --from=build /app/games/outpost-sdk/client/dist ./games/outpost-sdk/client/dist
+COPY --from=build /app/games/fps-sdk/client/dist ./games/fps-sdk/client/dist
 USER node
 EXPOSE 8080
 CMD ["node", "platform/server/dist/server.js"]
