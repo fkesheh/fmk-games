@@ -403,3 +403,25 @@ describe('snapshot rate', () => {
     room.stop();
   });
 });
+
+// ---- hasRebindableSeats (platform empty-room sweep grace) ---------------------
+
+describe('hasRebindableSeats', () => {
+  it('false when all connected; a mid-run drop parks a ghost; rebind clears it', () => {
+    // Past the lobby: lobby-phase drops delete outright (no ghost to rebind).
+    const { room, io } = makeRoom();
+    room.addPlayer('p1', 'Alpha');
+    room.addPlayer('p2', 'Bravo');
+    room.handleMessage('p1', { t: 'start' });
+    advanceTicks(2);
+    expect(io.lastSnap('p1').phase).toBe('intermission');
+    expect(room.hasRebindableSeats()).toBe(false);
+
+    room.removePlayer('p1'); // mid-run drop: ghost (seat retained)
+    expect(room.hasRebindableSeats()).toBe(true);
+
+    room.addPlayer('p1-new', 'Alpha', 'p1'); // resume rebinds the ghost
+    expect(room.hasRebindableSeats()).toBe(false);
+    room.stop();
+  });
+});

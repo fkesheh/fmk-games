@@ -149,15 +149,15 @@ export interface CreepTuning {
 }
 export const CREEP_MELEE: CreepTuning = {
   hp: 450, damage: 21, armor: 2, attackPeriod: 1.25, attackRange: 1.3,
-  moveSpeed: 3.1, bounty: 45, xp: 70, vision: 8, radius: 0.42,
+  moveSpeed: 3.1, bounty: 50, xp: 78, vision: 8, radius: 0.42,
 };
 export const CREEP_RANGED: CreepTuning = {
   hp: 300, damage: 26, armor: 0, attackPeriod: 1.1, attackRange: 8,
-  moveSpeed: 3.1, bounty: 52, xp: 85, vision: 8, radius: 0.4,
+  moveSpeed: 3.1, bounty: 57, xp: 95, vision: 8, radius: 0.4,
 };
 export const CREEP_SIEGE: CreepTuning = {
   hp: 820, damage: 46, armor: 4, attackPeriod: 2.5, attackRange: 9,
-  moveSpeed: 2.7, bounty: 95, xp: 105, vision: 8, radius: 0.62,
+  moveSpeed: 2.7, bounty: 105, xp: 118, vision: 8, radius: 0.62,
 };
 export const SIEGE_BUILDING_MULT = 6; // siege damage multiplier vs structures
 
@@ -171,17 +171,17 @@ export const SIEGE_BUILDING_MULT = 6; // siege damage multiplier vs structures
 //     flat (WAVE_GROWTH scales hp and damage only), so lane income is a constant
 //     rate. One 5-wave block spans 5*WAVE_PERIOD_S = 150 s = 2.5 min and carries
 //     exactly one siege (SIEGE_EVERY_NTH_WAVE):
-//       normal wave = 3*45 + 1*52   =  187 g | 3*70 + 1*85   =  295 xp
-//       siege wave  = 187 + 95      =  282 g | 295 + 105     =  400 xp
-//       block       = 4*187 + 282   = 1030 g | 4*295 + 400   = 1580 xp
-//       LANE POOL   = 1030 / 2.5    =  412 g/min | 1580 / 2.5 = 632 xp/min
+//       normal wave = 3*50 + 1*57   =  207 g | 3*78 + 1*95   =  329 xp
+//       siege wave  = 207 + 105     =  312 g | 329 + 118     =  447 xp
+//       block       = 4*207 + 312   = 1140 g | 4*329 + 447   = 1763 xp
+//       LANE POOL   = 1140 / 2.5    =  456 g/min | 1763 / 2.5 = 705 xp/min
 //     Reference laner = one of TWO heroes sharing a lane (LANES_FOR_TEAM_SIZE
 //     puts 1.7-2.7 heroes per lane across the supported team sizes) at 85%
 //     uptime for travel, waves lost under tower, and deaths:
-//       laner gold = 412*0.85/2 + 60*PASSIVE_GOLD_PER_S = 175 + 114 = 289 g/min
-//       laner xp   = 632*0.85/2                                     = 269 xp/min
-//       => XP_THRESHOLDS[6] = 1750 xp reached at 1750/269 = 6.5 min; add
-//          WAVE_FIRST_AT_S and the walk out and the laner is LEVEL 6 AT ~6.8 min.
+//       laner gold = 456*0.85/2 + 60*PASSIVE_GOLD_PER_S = 194 + 114 = 308 g/min
+//       laner xp   = 705*0.85/2                                     = 300 xp/min
+//       => XP_THRESHOLDS[6] = 1750 xp reached at 1750/300 = 5.8 min; add
+//          WAVE_FIRST_AT_S and the walk out and the laner is LEVEL 6 AT ~6.0 min.
 //     That is the ~6-7 min anchor DESIGN_DELTA §2 names, and everything below is
 //     fitted to it.
 //
@@ -193,32 +193,32 @@ export const SIEGE_BUILDING_MULT = 6; // siege damage multiplier vs structures
 //       hive  a=0 ->  0.0% -> 95.0 dps -> 5*300 = 1500 hp -> 15.8 s
 //     A 4-camp half (pack, pack, brute, hive — see CAMPS_PER_HALF) is one lap:
 //       lap  = 55.6 s clearing + 4*10 s travel = 95.6 s = 1.593 min
-//       gold = 76 + 76 + 132 + 115 = 399  -> 399/1.593 = 250 g/min
-//       xp   = 84 + 84 + 141 + 120 = 429  -> 429/1.593 = 269 xp/min
-//     => jungler xp 269/min vs laner xp 269/min: LEVEL 6 AT ~6.8 min for both,
+//       gold = 84 + 84 + 147 + 130 = 445  -> 445/1.593 = 279 g/min
+//       xp   = 96 + 96 + 159 + 135 = 486  -> 486/1.593 = 305 xp/min
+//     => jungler xp 305/min vs laner xp 300/min: LEVEL 6 AT ~6.0 min for both,
 //        which is DESIGN_DELTA §2's "roughly the same time".
-//     => jungler gold 250 + 114 passive = 364 g/min vs laner 289 g/min: MORE
-//        GOLD, +26%. The two axes split exactly as the design asks, because the
+//     => jungler gold 279 + 114 passive = 393 g/min vs laner 308 g/min: MORE
+//        GOLD, +28%. The two axes split exactly as the design asks, because the
 //        jungler eats 100% of a smaller pool while the laner splits a larger one.
-//     (Sensitivity: at 8 s hops the lap is 91.6 s and level 6 lands at 6.5 min —
+//     (Sensitivity: at 8 s hops the lap is 91.6 s and level 6 lands at 5.7 min —
 //      still inside the band, so the target does not hinge on the travel guess.)
 //
 // (c) THE POOL MUST STAY SMALLER THAN THE LANE'S. Production per half is
 //     camp value / respawn, i.e. what the jungle yields if cleared on cooldown
 //     forever:
-//       gold: 2*(76/45) + 132/75 + 115/95 = 6.35 g/s   = 381 g/min
-//       xp:   2*(84/45) + 141/75 + 120/95 = 6.88 xp/s  = 413 xp/min
-//     against a 3-lane half's 3*412 = 1236 g/min and 3*632 = 1896 xp/min:
+//       gold: 2*(84/45) + 147/75 + 130/95 = 7.06 g/s   = 424 g/min
+//       xp:   2*(96/45) + 159/75 + 135/95 = 7.81 xp/s  = 469 xp/min
+//     against a 3-lane half's 3*456 = 1368 g/min and 3*705 = 2115 xp/min:
 //       jungle is 31% of lane GOLD and 22% of lane XP. Both below (DESIGN_DELTA
 //       §2), and gold-weighted relative to xp — which is the same statement as
-//       the per-unit ratio: camps pay g/xp ~0.90-0.96 where wave creeps pay
-//       0.63. A camp is ~1.5x more gold-per-experience than a lane creep, and
-//       that single ratio is what makes jungling a tempo choice, not an upgrade.
-//     The tightest case is 1 lane, where 2 camps produce 207 g/min against one
-//     lane's 412 g/min — still below, by design, with the least margin.
+//       the per-unit ratio: camps pay g/xp ~0.88-0.96 where wave creeps pay
+//       ~0.60-0.64. A camp is ~1.4x more gold-per-experience than a lane creep,
+//       and that single ratio is what makes jungling a tempo choice, not an upgrade.
+//     The tightest case is 1 lane, where brute+pack produce 230 g/min against
+//     one lane's 456 g/min — still below, by design, with the least margin.
 //     Also per DESIGN_DELTA §2: the richest single camp cleared the instant it
-//     respawns forever yields 132/75*60 = 106 g/min, so 106 + 114 passive =
-//     220 g/min < the laner's 289 g/min. No camp is free money.
+//     respawns forever yields 147/75*60 = 118 g/min, so 118 + 114 passive =
+//     232 g/min < the laner's 308 g/min. No camp is free money.
 //
 // (d) THE HIVE MUST BE DANGEROUS SOLO BEFORE 6. Five ranged bodies put out
 //     5*26/1.0 = 130 raw dps at full strength, ~65 averaged over a clear as they
@@ -243,14 +243,14 @@ export const SIEGE_BUILDING_MULT = 6; // siege damage multiplier vs structures
  *  level-6 gate. bounty:xp = 0.90, well above the lane's 0.63. */
 export const CAMP_PACK: CreepTuning = {
   hp: 240, damage: 14, armor: 1, attackPeriod: 1.15, attackRange: 1.4,
-  moveSpeed: 3.4, bounty: 19, xp: 21, vision: 7, radius: 0.38,
+  moveSpeed: 3.4, bounty: 21, xp: 24, vision: 7, radius: 0.38,
 };
 /** Heavy melee brutes — the mid camp and the jungle's best gold rate. Armoured
  *  (4) and slow (2.9), so it punishes low-damage heroes and can be kited but
  *  never outrun into a lane; see CAMP_LEASH_RADIUS. */
 export const CAMP_BRUTE: CreepTuning = {
   hp: 470, damage: 30, armor: 4, attackPeriod: 1.4, attackRange: 1.9,
-  moveSpeed: 2.9, bounty: 44, xp: 47, vision: 7, radius: 0.7,
+  moveSpeed: 2.9, bounty: 49, xp: 53, vision: 7, radius: 0.7,
 };
 /** Ranged swarm — the large camp. Unarmoured and individually weak, but five
  *  bodies at 7.5 m range means the damage arrives whether or not the hero is in
@@ -258,11 +258,11 @@ export const CAMP_BRUTE: CreepTuning = {
  *  derivation (d)). Killing members individually is the counterplay. */
 export const CAMP_HIVE: CreepTuning = {
   hp: 300, damage: 26, armor: 0, attackPeriod: 1.0, attackRange: 7.5,
-  moveSpeed: 2.8, bounty: 23, xp: 24, vision: 7, radius: 0.4,
+  moveSpeed: 2.8, bounty: 26, xp: 27, vision: 7, radius: 0.4,
 };
 
 /** Members spawned per camp; the camp respawns whole. Camp totals are therefore
- *  pack 960 hp / 76 g / 84 xp, brute 1410 / 132 / 141, hive 1500 / 115 / 120. */
+ *  pack 960 hp / 84 g / 96 xp, brute 1410 / 147 / 159, hive 1500 / 130 / 135. */
 export const CAMP_PACK_COUNT = 4;
 export const CAMP_BRUTE_COUNT = 3;
 export const CAMP_HIVE_COUNT = 5;
@@ -330,16 +330,16 @@ export const TOWER: StructureTuning = {
   vision: 12, radius: 1.2, bounty: 200,
 };
 export const GUARD_TOWER: StructureTuning = {
-  hp: 1100, armor: 12, damage: 150, attackPeriod: 1.0, attackRange: 10.5,
+  hp: 700, armor: 12, damage: 150, attackPeriod: 1.0, attackRange: 10.5,
   vision: 12, radius: 1.2, bounty: 250,
 };
 export const ANCIENT = {
-  hp: 1700, armor: 10, vision: 12, radius: 2.3,
+  hp: 1050, armor: 10, vision: 12, radius: 2.3,
 } as const;
 /** An ancient is INVULNERABLE while any of its team's guard towers stands. */
 export const FOUNTAIN_RADIUS = 6; // centred on own ancient
-export const FOUNTAIN_HEAL_PCT = 0.06; // fraction of max hp per second
-export const FOUNTAIN_MANA_PCT = 0.06;
+export const FOUNTAIN_HEAL_PCT = 0.025; // fraction of max hp per second
+export const FOUNTAIN_MANA_PCT = 0.025;
 
 // --- Heroes: shared curve ---------------------------------------------------------
 export const LEVEL_CAP = 10;

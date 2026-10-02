@@ -338,15 +338,31 @@ export class Store {
     const keys = Object.keys(delta);
     if (keys.length === 0) return;
     this.#tx(() => {
-      for (const key of keys) {
-        const d = delta[key];
-        if (d === undefined || !Number.isFinite(d)) continue;
-        const row = this.#selStat.get(profileId, gameId, key);
-        const cur = row === undefined ? 0 : colNum(row, 'value');
-        const next = clampStat(cur + d);
-        this.#upsertStat.run(profileId, gameId, key, next);
-      }
+      this.#applyStatsInTx(profileId, gameId, delta);
     });
+  }
+
+  /**
+   * P0-2: one transaction for a whole off-tick flush. Observably identical to
+   * calling addStats per entry — same upserts, one BEGIN/COMMIT instead of N.
+   */
+  addStatsBatch(entries: ReadonlyArray<{ profileId: string; gameId: string; delta: Record<string, number> }>): void {
+    if (entries.length === 0) return;
+    this.#tx(() => {
+      for (const e of entries) this.#applyStatsInTx(e.profileId, e.gameId, e.delta);
+    });
+  }
+
+  /** One entry's upserts; caller must already hold the transaction. */
+  #applyStatsInTx(profileId: string, gameId: string, delta: Record<string, number>): void {
+    for (const key of Object.keys(delta)) {
+      const d = delta[key];
+      if (d === undefined || !Number.isFinite(d)) continue;
+      const row = this.#selStat.get(profileId, gameId, key);
+      const cur = row === undefined ? 0 : colNum(row, 'value');
+      const next = clampStat(cur + d);
+      this.#upsertStat.run(profileId, gameId, key, next);
+    }
   }
 
   statsFor(profileId: string, gameId?: string): StatRowDb[] {

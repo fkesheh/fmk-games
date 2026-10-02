@@ -29,7 +29,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { C2S, GameModule, GameRoomHandle, PlayerId, RoomId, RoomIO, S2C } from '@platform/shared';
 import { PADS, STATS } from '@platform/shared';
-import { Lobby } from './lobby.js';
+import { Lobby, parseLobbyOpts } from './lobby.js';
 import type { Session } from './net.js';
 import { GAMES } from './registry.js';
 
@@ -922,6 +922,17 @@ describe('pad input relay (specs/PADS.inputMaxHz)', () => {
     expect(spy.forwarded).toEqual([]);
   });
 
+  it("pad explicit leave unbinds: the owner hears bound:false and later frames are dropped (spec §4.4 step 4)", () => {
+    const { lobby, spy, owner, pad } = setupBound();
+
+    lobby.handleMessage(asSession(pad), { t: 'leave' });
+
+    expect(owner.last('pad_status')).toEqual({ t: 'pad_status', bound: false });
+    expect(v2io(spy.io()).padOwner('phone-1')).toBeNull();
+    lobby.handleMessage(asSession(pad), padFrame(7)); // frames after the leave
+    expect(spy.forwarded).toEqual([]);
+  });
+
   it('the OWNER leaving unbinds the pad and hears bound:false itself', () => {
     const { lobby, spy, owner, pad } = setupBound();
 
@@ -989,6 +1000,7 @@ describe('RoomIO v2 members: profileId / reportStats / padOwner (specs/P4.md)', 
       nan: Number.NaN, // dropped
       inf: Infinity, // dropped
     });
+    lobby.flushStats(); // P0-2: writes land off-tick, not synchronously
 
     expect(store.statsWrites).toEqual([
       { profileId: 'prof-1', gameId: 'ioroom', delta: { kills: 3, huge: STATS.maxValue, neg: -7 } },
@@ -997,11 +1009,12 @@ describe('RoomIO v2 members: profileId / reportStats / padOwner (specs/P4.md)', 
 
   it('anonymous players report nothing (no-op, no store write)', () => {
     const store = new SpyStore();
-    const { spy } = setupWith(store);
+    const { lobby, spy } = setupWith(store);
 
     v2io(spy.io()).reportStats('p1', { kills: 1 }); // p1 never authenticated
 
     expect(store.statsWrites).toEqual([]);
+    expect(lobby.statsPending()).toBe(0); // nothing even queued
   });
 
   it('at most STATS.maxKeysPerDelta keys survive one report', () => {
@@ -1013,6 +1026,7 @@ describe('RoomIO v2 members: profileId / reportStats / padOwner (specs/P4.md)', 
     const twentyKeys: Record<string, number> = {};
     for (let i = 0; i < 20; i++) twentyKeys[`k${i}`] = 1;
     v2io(spy.io()).reportStats('p1', twentyKeys);
+    lobby.flushStats(); // P0-2: writes land off-tick, not synchronously
 
     expect(Object.keys(store.statsWrites[0]?.delta ?? {}).length).toBe(STATS.maxKeysPerDelta);
   });
@@ -1037,6 +1051,1100 @@ describe('RoomIO v2 members: profileId / reportStats / padOwner (specs/P4.md)', 
 
     expect(() => v2io(spy.io()).reportStats('p1', { kills: 1 })).not.toThrow();
     expect(() => lobby.handleMessage(asSession(p1), { t: 'auth', token: TOKEN_A })).not.toThrow();
+    expect(() => lobby.flushStats()).not.toThrow(); // the flush swallows store throws too
     expect(p1.last('auth_err')).toBeDefined();
+  });
+});
+
+// ---- P0-2 off-tick stats queue ------------------------------------------------
+
+describe('P0-2 off-tick stats queue', () => {
+  let tracked: Lobby[] = [];
+
+  afterEach(() => {
+    for (const l of tracked) l.close();
+    tracked = [];
+  });
+
+  function setupAuthed(store: SpyStore): { lobby: Lobby; spy: PadSpyModule; p1: FakeSession } {
+    const spy = makePadSpyModule('qgame');
+    const lobby = new Lobby([spy.mod], store);
+    tracked.push(lobby);
+    const p1 = new FakeSession('p1');
+    lobby.handleMessage(asSession(p1), { t: 'quick_join', name: 'P1', game: 'qgame' });
+    return { lobby, spy, p1 };
+  }
+
+  it('reportStats never touches the store synchronously — the write lands on flush', () => {
+    const store = new SpyStore();
+    store.seed('prof-1', 'AdaPrime', TOKEN_A);
+    const { lobby, spy, p1 } = setupAuthed(store);
+    lobby.handleMessage(asSession(p1), { t: 'auth', token: TOKEN_A });
+
+    v2io(spy.io()).reportStats('p1', { kills: 2 });
+
+    expect(store.statsWrites).toEqual([]); // tick thread did no sqlite
+    expect(lobby.statsPending()).toBe(1);
+    lobby.flushStats();
+    expect(store.statsWrites).toEqual([{ profileId: 'prof-1', gameId: 'qgame', delta: { kills: 2 } }]);
+    expect(lobby.statsPending()).toBe(0);
+  });
+
+  it('a store WITHOUT addStatsBatch still gets every entry via addStats (SpyStore path)', () => {
+    const store = new SpyStore(); // structural LobbyStore, no addStatsBatch member
+    store.seed('prof-1', 'AdaPrime', TOKEN_A);
+    const { lobby, spy, p1 } = setupAuthed(store);
+    lobby.handleMessage(asSession(p1), { t: 'auth', token: TOKEN_A });
+
+    v2io(spy.io()).reportStats('p1', { a: 1 });
+    v2io(spy.io()).reportStats('p1', { b: 2 });
+    lobby.flushStats();
+
+    expect(store.statsWrites).toEqual([
+      { profileId: 'prof-1', gameId: 'qgame', delta: { a: 1 } },
+      { profileId: 'prof-1', gameId: 'qgame', delta: { b: 2 } },
+    ]);
+  });
+
+  it('a store WITH addStatsBatch gets ONE batch call for the whole flush', () => {
+    const batches: Array<readonly { profileId: string; gameId: string; delta: Record<string, number> }[]> = [];
+    const store = new SpyStore();
+    (store as unknown as Record<string, unknown>).addStatsBatch = (
+      entries: readonly { profileId: string; gameId: string; delta: Record<string, number> }[],
+    ): void => {
+      batches.push(entries);
+    };
+    store.seed('prof-1', 'AdaPrime', TOKEN_A);
+    const { lobby, spy, p1 } = setupAuthed(store);
+    lobby.handleMessage(asSession(p1), { t: 'auth', token: TOKEN_A });
+
+    v2io(spy.io()).reportStats('p1', { a: 1 });
+    v2io(spy.io()).reportStats('p1', { b: 2 });
+    lobby.flushStats();
+
+    expect(batches.length).toBe(1);
+    expect(batches[0]).toEqual([
+      { profileId: 'prof-1', gameId: 'qgame', delta: { a: 1 } },
+      { profileId: 'prof-1', gameId: 'qgame', delta: { b: 2 } },
+    ]);
+    expect(store.statsWrites).toEqual([]); // batch path bypasses per-entry writes
+  });
+
+  it('close() flushes pending writes instead of dropping them', () => {
+    const store = new SpyStore();
+    store.seed('prof-1', 'AdaPrime', TOKEN_A);
+    const { lobby, spy, p1 } = setupAuthed(store);
+    lobby.handleMessage(asSession(p1), { t: 'auth', token: TOKEN_A });
+
+    v2io(spy.io()).reportStats('p1', { kills: 9 });
+    expect(store.statsWrites).toEqual([]);
+    lobby.close();
+
+    expect(store.statsWrites).toEqual([{ profileId: 'prof-1', gameId: 'qgame', delta: { kills: 9 } }]);
+  });
+
+  it('game id + profile are snapshotted at report time, so a flush after room close still lands', () => {
+    const store = new SpyStore();
+    store.seed('prof-1', 'AdaPrime', TOKEN_A);
+    const { lobby, spy, p1 } = setupAuthed(store);
+    lobby.handleMessage(asSession(p1), { t: 'auth', token: TOKEN_A });
+
+    v2io(spy.io()).reportStats('p1', { kills: 4 });
+    lobby.handleMessage(asSession(p1), { t: 'leave' }); // room gone before the flush
+    lobby.flushStats();
+
+    expect(store.statsWrites).toEqual([{ profileId: 'prof-1', gameId: 'qgame', delta: { kills: 4 } }]);
+  });
+});
+
+// ---- P0-3 capacity + staggered sweep ------------------------------------------
+
+describe('P0-3 capacity + staggered sweep', () => {
+  let tracked: Lobby[] = [];
+
+  afterEach(() => {
+    for (const l of tracked) l.close();
+    tracked = [];
+  });
+
+  /** Rooms with scriptable stalePlayers: tests decide who is stale, per room. */
+  function makeStaleSpyModule(id: string): { mod: GameModule; staleOf: Map<RoomId, PlayerId[]> } {
+    const staleOf = new Map<RoomId, PlayerId[]>();
+    let n = 0;
+    const mod: GameModule = {
+      id,
+      name: id.toUpperCase(),
+      clientDist: '',
+      minPlayers: 1,
+      maxPlayers: 8,
+      createRoom(opts) {
+        const roomId: RoomId = `${id}-stale-${n++}`;
+        const members = new Set<PlayerId>();
+        staleOf.set(roomId, []);
+        const room: GameRoomHandle = {
+          id: roomId,
+          info: () => ({
+            id: roomId,
+            code: null,
+            game: id,
+            label: '',
+            players: members.size,
+            maxPlayers: 8,
+            phase: 'warmup',
+            visibility: opts.visibility,
+          }),
+          playerCount: () => members.size,
+          stalePlayers: () => [...(staleOf.get(roomId) ?? [])],
+          addPlayer: (playerId) => {
+            members.add(playerId);
+          },
+          removePlayer: (playerId) => {
+            members.delete(playerId);
+          },
+          handleMessage: () => {},
+          start: () => {},
+          stop: () => {},
+        };
+        return room;
+      },
+    };
+    return { mod, staleOf };
+  }
+
+  function createPrivateRoom(lobby: Lobby, sess: FakeSession, game: string): void {
+    lobby.handleMessage(asSession(sess), { t: 'create_private', name: 'P', game });
+  }
+
+  it('default cap is 64 rooms: the 65th creation answers rooms_full', () => {
+    const spy = makePadSpyModule('capgame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+
+    for (let i = 0; i < 64; i++) createPrivateRoom(lobby, new FakeSession(`p${i}`), 'capgame');
+    expect(lobby.roomCount()).toBe(64);
+
+    const extra = new FakeSession('p64');
+    createPrivateRoom(lobby, extra, 'capgame');
+    expect(extra.last('error')?.code).toBe('rooms_full');
+    expect(lobby.roomCount()).toBe(64);
+  });
+
+  it('opts.maxRooms overrides the default (2 rooms, then rooms_full)', () => {
+    const spy = makePadSpyModule('capgame');
+    const lobby = new Lobby([spy.mod], null, { maxRooms: 2 });
+    tracked.push(lobby);
+
+    createPrivateRoom(lobby, new FakeSession('a'), 'capgame');
+    createPrivateRoom(lobby, new FakeSession('b'), 'capgame');
+    const third = new FakeSession('c');
+    createPrivateRoom(lobby, third, 'capgame');
+
+    expect(third.last('error')?.code).toBe('rooms_full');
+    expect(lobby.roomCount()).toBe(2);
+  });
+
+  it('opts.maxRoomsPerGame caps one game while others stay uncapped', () => {
+    const a = makePadSpyModule('capA');
+    const b = makePadSpyModule('capB');
+    const lobby = new Lobby([a.mod, b.mod], null, { maxRoomsPerGame: { capA: 1 } });
+    tracked.push(lobby);
+
+    createPrivateRoom(lobby, new FakeSession('a1'), 'capA');
+    const a2 = new FakeSession('a2');
+    createPrivateRoom(lobby, a2, 'capA');
+    expect(a2.last('error')?.code).toBe('rooms_full');
+
+    createPrivateRoom(lobby, new FakeSession('b1'), 'capB');
+    createPrivateRoom(lobby, new FakeSession('b2'), 'capB');
+    expect(lobby.roomCount()).toBe(3);
+  });
+
+  it('invalid caps fall back to defaults instead of bricking the lobby', () => {
+    const spy = makePadSpyModule('capgame');
+    const lobby = new Lobby([spy.mod], null, { maxRooms: 0, sweepRoomsPerPoll: -5, maxRoomsPerGame: { capgame: 0 } });
+    tracked.push(lobby);
+
+    createPrivateRoom(lobby, new FakeSession('a'), 'capgame');
+    createPrivateRoom(lobby, new FakeSession('b'), 'capgame');
+    createPrivateRoom(lobby, new FakeSession('c'), 'capgame');
+    expect(lobby.roomCount()).toBe(3); // maxRooms:0 would have blocked ALL of these
+  });
+
+  it('parseLobbyOpts reads PLATFORM_MAX_ROOMS/PLATFORM_SWEEP_ROOMS, garbage => unset', () => {
+    expect(parseLobbyOpts({})).toEqual({});
+    expect(parseLobbyOpts({ PLATFORM_MAX_ROOMS: '128', PLATFORM_SWEEP_ROOMS: '16' })).toEqual({
+      maxRooms: 128,
+      sweepRoomsPerPoll: 16,
+    });
+    expect(parseLobbyOpts({ PLATFORM_MAX_ROOMS: 'lots' })).toEqual({});
+    expect(parseLobbyOpts({ PLATFORM_MAX_ROOMS: '0', PLATFORM_SWEEP_ROOMS: '-2' })).toEqual({});
+    expect(parseLobbyOpts({ PLATFORM_MAX_ROOMS: '1.5' })).toEqual({});
+  });
+
+  it('default sweep visits EVERY room each poll (historical behavior locked)', () => {
+    const { mod, staleOf } = makeStaleSpyModule('sweepdef');
+    const lobby = new Lobby([mod]);
+    tracked.push(lobby);
+    const s1 = new FakeSession('s1');
+    const s2 = new FakeSession('s2');
+    createPrivateRoom(lobby, s1, 'sweepdef');
+    createPrivateRoom(lobby, s2, 'sweepdef');
+    const [roomA, roomB] = [...staleOf.keys()];
+    if (roomA === undefined || roomB === undefined) throw new Error('expected two rooms');
+    staleOf.set(roomA, ['s1']);
+    staleOf.set(roomB, ['s2']);
+
+    const closed = lobby.pollStaleSessions().map((s) => s.id).sort();
+
+    expect(closed).toEqual(['s1', 's2']);
+  });
+
+  it('sweepRoomsPerPoll:1 rotates round-robin — one stale room per poll', () => {
+    const { mod, staleOf } = makeStaleSpyModule('sweep1');
+    const lobby = new Lobby([mod], null, { sweepRoomsPerPoll: 1 });
+    tracked.push(lobby);
+    const s1 = new FakeSession('s1');
+    const s2 = new FakeSession('s2');
+    createPrivateRoom(lobby, s1, 'sweep1');
+    createPrivateRoom(lobby, s2, 'sweep1');
+    const [roomA, roomB] = [...staleOf.keys()];
+    if (roomA === undefined || roomB === undefined) throw new Error('expected two rooms');
+    staleOf.set(roomA, ['s1']);
+    staleOf.set(roomB, ['s2']);
+
+    // First poll visits roomA only (insertion order, cursor starts at 0).
+    expect(lobby.pollStaleSessions().map((s) => s.id)).toEqual(['s1']);
+    // Cursor rotated: the second poll visits roomB.
+    expect(lobby.pollStaleSessions().map((s) => s.id)).toEqual(['s2']);
+  });
+
+  it('kicked players are returned every poll even when their room is outside the slice', () => {
+    const spy = makePadSpyModule('kicksweep');
+    const lobby = new Lobby([spy.mod], null, { sweepRoomsPerPoll: 1 });
+    tracked.push(lobby);
+    createPrivateRoom(lobby, new FakeSession('a'), 'kicksweep');
+    const victim = new FakeSession('victim');
+    createPrivateRoom(lobby, victim, 'kicksweep'); // victim's room is second, outside slice 1
+    spy.kickFromRoom('victim');
+
+    expect(lobby.pollStaleSessions().map((s) => s.id)).toEqual(['victim']);
+  });
+});
+
+// ---- P0-1 wire byte probe -----------------------------------------------------
+
+describe('P0-1 wire byte probe', () => {
+  let tracked: Lobby[] = [];
+
+  afterEach(() => {
+    for (const l of tracked) l.close();
+    tracked = [];
+  });
+
+  /** FakeSession that reports a fixed frame length, like the real Session.send. */
+  class MeteredSession extends FakeSession {
+    constructor(id: PlayerId, private readonly frameBytes: number) {
+      super(id);
+    }
+
+    override send(msg: S2C): number {
+      super.send(msg);
+      return this.frameBytes;
+    }
+  }
+
+  it('room sends attribute bytes to the sender room (join hello + snapshot)', () => {
+    const spy = makePadSpyModule('metergame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const p1 = new MeteredSession('p1', 42);
+    lobby.handleMessage(asSession(p1), { t: 'quick_join', name: 'P1', game: 'metergame' });
+
+    spy.io().send('p1', { t: 'snap' }); // one more attributed frame
+
+    expect(lobby.wireStats()).toEqual({
+      messages: 2, // padspy_hello on join + the snap above
+      bytes: 84,
+      rooms: [{ roomId: spy.roomIds[0], gameId: 'metergame', messages: 2, bytes: 84 }],
+    });
+  });
+
+  it('void-send sessions and unknown ids never corrupt the meter', () => {
+    const spy = makePadSpyModule('metergame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const plain = new FakeSession('plain'); // send returns void, like pre-P0-1
+    lobby.handleMessage(asSession(plain), { t: 'quick_join', name: 'P', game: 'metergame' });
+    spy.io().send('nobody', { t: 'snap' }); // no session at all
+
+    expect(lobby.wireStats()).toEqual({ messages: 0, bytes: 0, rooms: [] });
+  });
+
+  it('closing a room drops its entry while cumulative totals survive', () => {
+    const spy = makePadSpyModule('metergame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const p1 = new MeteredSession('p1', 42);
+    lobby.handleMessage(asSession(p1), { t: 'create_private', name: 'P1', game: 'metergame' });
+    expect(lobby.wireStats().rooms.length).toBe(1);
+
+    lobby.handleMessage(asSession(p1), { t: 'leave' }); // empties the private room => closed
+
+    const w = lobby.wireStats();
+    expect(w.rooms).toEqual([]);
+    expect(w.messages).toBe(1);
+    expect(w.bytes).toBe(42);
+  });
+
+  it('resetWireStats zeroes totals and rooms', () => {
+    const spy = makePadSpyModule('metergame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const p1 = new MeteredSession('p1', 42);
+    lobby.handleMessage(asSession(p1), { t: 'quick_join', name: 'P1', game: 'metergame' });
+    expect(lobby.wireStats().messages).toBe(1);
+
+    lobby.resetWireStats();
+
+    expect(lobby.wireStats()).toEqual({ messages: 0, bytes: 0, rooms: [] });
+  });
+});
+
+// ---- P1 hosted authority ------------------------------------------------------
+//
+// Harness notes
+// -------------
+// - makeHostedSpyModule is a hostedAuthority game whose rooms record start(),
+//   setHosted(), handleMessage traffic and addPlayer args — everything the
+//   lease/election/relay/fallback tests observe. Rooms NEVER sim (no timers),
+//   so hosted-vs-central is proven purely by which lifecycle calls ran.
+// - Raw frames (host_snap, start, input) go into handleMessage as untyped
+//   object literals — the black-box client view, same as the wire.
+// - Lease timing tests run under vi.useFakeTimers (try/finally, the file's
+//   established pattern); the lobby reads Date.now() everywhere, so advancing
+//   time drives the watchdog deterministically.
+
+describe('P1 hosted authority (lease, election, relay, fallback)', () => {
+  let tracked: Lobby[] = [];
+
+  afterEach(() => {
+    for (const l of tracked) l.close();
+    tracked = [];
+  });
+
+  interface HostedSpy {
+    mod: GameModule;
+    roomIds: RoomId[];
+    started: RoomId[];
+    hostedCalls: Array<{ roomId: RoomId; active: boolean }>;
+    forwarded: Array<{ playerId: PlayerId; msg: unknown }>;
+    added: Array<{ id: PlayerId; resume: PlayerId | undefined }>;
+    staleOf: Map<RoomId, PlayerId[]>;
+  }
+
+  function makeHostedSpyModule(id: string, opts?: { hostedAuthority?: boolean; setHosted?: boolean }): HostedSpy {
+    const roomIds: RoomId[] = [];
+    const started: RoomId[] = [];
+    const hostedCalls: Array<{ roomId: RoomId; active: boolean }> = [];
+    const forwarded: Array<{ playerId: PlayerId; msg: unknown }> = [];
+    const added: Array<{ id: PlayerId; resume: PlayerId | undefined }> = [];
+    const staleOf = new Map<RoomId, PlayerId[]>();
+    const withAuthority = opts?.hostedAuthority ?? true;
+    const withSetHosted = opts?.setHosted ?? true;
+    let n = 0;
+
+    const base: GameModule = {
+      id,
+      name: id.toUpperCase(),
+      clientDist: '',
+      minPlayers: 1,
+      maxPlayers: 8,
+      createRoom(roomOpts) {
+        const roomId: RoomId = `${id}-hosted-${n++}`;
+        roomIds.push(roomId);
+        staleOf.set(roomId, []);
+        const members = new Set<PlayerId>();
+        const room: GameRoomHandle = {
+          id: roomId,
+          info: () => ({
+            id: roomId,
+            code: null,
+            game: id,
+            label: '',
+            players: members.size,
+            maxPlayers: 8,
+            phase: 'warmup',
+            visibility: roomOpts.visibility,
+          }),
+          playerCount: () => members.size,
+          stalePlayers: () => [...(staleOf.get(roomId) ?? [])],
+          addPlayer: (playerId, _name, resume) => {
+            members.add(playerId);
+            added.push({ id: playerId, resume });
+            roomOpts.io.send(playerId, { t: 'hosted_hello', roomId });
+          },
+          removePlayer: (playerId) => {
+            members.delete(playerId);
+          },
+          handleMessage: (playerId, msg) => {
+            forwarded.push({ playerId, msg });
+          },
+          start: () => {
+            started.push(roomId);
+          },
+          stop: () => {},
+        };
+        if (withSetHosted) {
+          room.setHosted = (active: boolean): void => {
+            hostedCalls.push({ roomId, active });
+          };
+        }
+        return room;
+      },
+    };
+    const mod: GameModule = withAuthority ? { ...base, hostedAuthority: true } : base;
+    return { mod, roomIds, started, hostedCalls, forwarded, added, staleOf };
+  }
+
+  /** FakeSession with a scripted RTT sample (0 = unmeasured, like a fresh socket). */
+  class RttSession extends FakeSession {
+    constructor(id: PlayerId, private readonly rtt: number) {
+      super(id);
+    }
+
+    override rttMs(): number {
+      return this.rtt;
+    }
+  }
+
+  /** FakeSession reporting a fixed frame length (relay byte metering). */
+  class FrameSession extends FakeSession {
+    constructor(id: PlayerId, private readonly frameBytes: number) {
+      super(id);
+    }
+
+    override send(msg: S2C): number {
+      super.send(msg);
+      return this.frameBytes;
+    }
+  }
+
+  function createRoom(
+    lobby: Lobby,
+    sess: FakeSession,
+    game: string,
+    vis: 'create_public' | 'create_private',
+    hosted: boolean | undefined,
+  ): void {
+    if (hosted === undefined) {
+      lobby.handleMessage(asSession(sess), { t: vis, name: 'P', game });
+    } else {
+      lobby.handleMessage(asSession(sess), { t: vis, name: 'P', game, settings: { hosted } });
+    }
+  }
+
+  function liveLeaseId(host: FakeSession): string {
+    const lease = host.last('host_lease');
+    if (lease === undefined) throw new Error('expected a host_lease for the holder');
+    return lease.leaseId;
+  }
+
+  // ---- P1-1: contract + lease table ----
+
+  it('first seat in a hosted room goes cold: setHosted(true), no start(), lease unicast + change broadcast', () => {
+    const spy = makeHostedSpyModule('hostgame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new FakeSession('s1');
+    createRoom(lobby, s1, 'hostgame', 'create_private', true);
+
+    expect(spy.started).toEqual([]); // the server sim NEVER runs here
+    expect(spy.hostedCalls).toEqual([{ roomId: spy.roomIds[0], active: true }]);
+    // No 'start' press was ever sent: the lease-on-first-seat IS the starter
+    // pistol (aces law — auto-start preserved as a shim-triggered lease).
+    const lease = s1.last('host_lease');
+    expect(lease?.hostId).toBe('s1');
+    expect(lease?.leaseId.length).toBe(12);
+    expect(lease?.ttlMs).toBe(6000);
+    expect(s1.last('host_change')).toEqual({ t: 'host_change', newHostId: 's1', resumeTick: 0 });
+    expect(lobby.hostOf(spy.roomIds[0] ?? '')).toBe('s1');
+  });
+
+  it('no settings flag => central even for opted-in games (legacy rooms untouched)', () => {
+    const spy = makeHostedSpyModule('hostgame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new FakeSession('s1');
+    createRoom(lobby, s1, 'hostgame', 'create_private', undefined);
+
+    expect(spy.started).toEqual([spy.roomIds[0]]);
+    expect(spy.hostedCalls).toEqual([]);
+    expect(s1.last('host_lease')).toBeUndefined();
+    expect(lobby.hostOf(spy.roomIds[0] ?? '')).toBeNull();
+  });
+
+  it('settings.hosted without setHosted on the room => central (explicit opt-in is not enough)', () => {
+    const spy = makeHostedSpyModule('hostgame', { setHosted: false });
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new FakeSession('s1');
+    createRoom(lobby, s1, 'hostgame', 'create_private', true);
+
+    expect(spy.started).toEqual([spy.roomIds[0]]);
+    expect(lobby.hostOf(spy.roomIds[0] ?? '')).toBeNull();
+  });
+
+  it('module without the flag stays central even when settings ask hosted', () => {
+    const spy = makeHostedSpyModule('hostgame', { hostedAuthority: false });
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new FakeSession('s1');
+    createRoom(lobby, s1, 'hostgame', 'create_private', true);
+
+    expect(spy.started).toEqual([spy.roomIds[0]]);
+    expect(spy.hostedCalls).toEqual([]);
+    expect(lobby.hostOf(spy.roomIds[0] ?? '')).toBeNull();
+  });
+
+  it('valid host_renew pushes the expiry and records the tick (no promotion past the old TTL)', () => {
+    vi.useFakeTimers();
+    try {
+      const spy = makeHostedSpyModule('hostgame');
+      const lobby = new Lobby([spy.mod]);
+      tracked.push(lobby);
+      const s1 = new FakeSession('s1');
+      const s2 = new FakeSession('s2');
+      createRoom(lobby, s1, 'hostgame', 'create_public', true);
+      lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'S2', game: 'hostgame' });
+      const roomId = spy.roomIds[0] ?? '';
+      const live = liveLeaseId(s1);
+
+      vi.advanceTimersByTime(5000);
+      lobby.handleMessage(asSession(s1), { t: 'host_renew', leaseId: live, tick: 42 });
+      vi.advanceTimersByTime(5000); // T+10000: past the ORIGINAL T+6000 expiry
+      lobby.pollStaleSessions();
+
+      expect(lobby.hostOf(roomId)).toBe('s1');
+      expect(countTag(s1, 'host_lease')).toBe(1); // no re-election happened
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('renew with a stale leaseId earns host_revoked echoing the PRESENTED id (live id never revealed)', () => {
+    const spy = makeHostedSpyModule('hostgame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new FakeSession('s1');
+    createRoom(lobby, s1, 'hostgame', 'create_private', true);
+    const live = liveLeaseId(s1);
+
+    lobby.handleMessage(asSession(s1), { t: 'host_renew', leaseId: 'STALELEASE01', tick: 9 });
+
+    expect(s1.last('host_revoked')).toEqual({ t: 'host_revoked', leaseId: 'STALELEASE01' });
+    expect(lobby.hostOf(spy.roomIds[0] ?? '')).toBe('s1'); // lease untouched
+    expect('STALELEASE01' === live).toBe(false);
+  });
+
+  it('non-holder renew with the live id is revoked (holder check, not just id check)', () => {
+    const spy = makeHostedSpyModule('hostgame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new FakeSession('s1');
+    const s2 = new FakeSession('s2');
+    createRoom(lobby, s1, 'hostgame', 'create_public', true);
+    lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'S2', game: 'hostgame' });
+    const live = liveLeaseId(s1);
+
+    lobby.handleMessage(asSession(s2), { t: 'host_renew', leaseId: live, tick: 3 });
+
+    expect(s2.last('host_revoked')).toEqual({ t: 'host_revoked', leaseId: live });
+    expect(lobby.hostOf(spy.roomIds[0] ?? '')).toBe('s1');
+  });
+
+  it('valid host_snap relays to members (never sender/room) and feeds the wire meter', () => {
+    const spy = makeHostedSpyModule('hostgame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new FakeSession('s1');
+    const s2 = new FrameSession('s2', 50);
+    createRoom(lobby, s1, 'hostgame', 'create_public', true);
+    lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'S2', game: 'hostgame' });
+    const live = liveLeaseId(s1);
+    const snap = { t: 'host_snap', leaseId: live, tick: 7 };
+    lobby.resetWireStats(); // join hellos were metered too — isolate the relay
+
+    lobby.handleMessage(asSession(s1), snap);
+
+    expect(s2.all().some((m) => m.t === 'host_snap')).toBe(true);
+    expect(s1.all().some((m) => m.t === 'host_snap')).toBe(false); // no echo to the holder
+    expect(spy.forwarded.some((f) => (f.msg as { t?: unknown }).t === 'host_snap')).toBe(false);
+    const w = lobby.wireStats();
+    expect(w.messages).toBe(1);
+    expect(w.bytes).toBe(50);
+    expect(w.rooms).toEqual([{ roomId: spy.roomIds[0], gameId: 'hostgame', messages: 1, bytes: 50 }]);
+  });
+
+  it('forged host_snap is dropped and the sender told to halt', () => {
+    const spy = makeHostedSpyModule('hostgame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new FakeSession('s1');
+    const s2 = new FakeSession('s2');
+    createRoom(lobby, s1, 'hostgame', 'create_public', true);
+    lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'S2', game: 'hostgame' });
+    const live = liveLeaseId(s1);
+
+    lobby.handleMessage(asSession(s2), { t: 'host_snap', leaseId: live, tick: 7 }); // right id, wrong sender
+
+    expect(s1.all().some((m) => m.t === 'host_snap')).toBe(false);
+    expect(s2.last('host_revoked')).toEqual({ t: 'host_revoked', leaseId: live });
+    expect(lobby.wireStats().messages).toBe(0);
+  });
+
+  it('host_snap in a central room dies silently and never reaches the room', () => {
+    const spy = makeHostedSpyModule('hostgame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new FakeSession('s1');
+    createRoom(lobby, s1, 'hostgame', 'create_private', undefined); // central
+    const before = spy.forwarded.length;
+
+    lobby.handleMessage(asSession(s1), { t: 'host_snap', leaseId: 'WHATEVER01', tick: 1 });
+
+    expect(spy.forwarded.length).toBe(before);
+    expect(s1.all().some((m) => m.t === 'host_revoked')).toBe(false);
+  });
+
+  // ---- P1-2: shim-owned start (intents ride to the holder) ----
+
+  it('player envelopes ride to the holder AND the room (start intents included)', () => {
+    const spy = makeHostedSpyModule('hostgame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new FakeSession('s1');
+    const s2 = new FakeSession('s2');
+    createRoom(lobby, s1, 'hostgame', 'create_public', true);
+    lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'S2', game: 'hostgame' });
+
+    lobby.handleMessage(asSession(s2), { t: 'start' });
+
+    expect(s1.all().some((m) => m.t === 'start')).toBe(true); // the host sim decides
+    expect(spy.forwarded.some((f) => f.playerId === 's2' && (f.msg as { t?: unknown }).t === 'start')).toBe(true);
+  });
+
+  it('holder mail is not echoed back to the holder', () => {
+    const spy = makeHostedSpyModule('hostgame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new FakeSession('s1');
+    createRoom(lobby, s1, 'hostgame', 'create_private', true);
+
+    lobby.handleMessage(asSession(s1), { t: 'input', seq: 1 });
+
+    expect(s1.all().some((m) => m.t === 'input')).toBe(false);
+    expect(spy.forwarded.some((f) => (f.msg as { t?: unknown }).t === 'input')).toBe(true);
+  });
+
+  // ---- P1-3: election + promotion + fallback ----
+
+  it('standby is the lowest-RTT runner-up (proven by who promotes next)', () => {
+    const spy = makeHostedSpyModule('hostgame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new RttSession('s1', 0);
+    const s2 = new RttSession('s2', 50);
+    const s3 = new RttSession('s3', 10);
+    createRoom(lobby, s1, 'hostgame', 'create_public', true);
+    lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'S2', game: 'hostgame' });
+    lobby.handleMessage(asSession(s3), { t: 'quick_join', name: 'S3', game: 'hostgame' });
+
+    lobby.handleMessage(asSession(s1), { t: 'leave' }); // host loss => standby promotes NOW
+
+    expect(lobby.hostOf(spy.roomIds[0] ?? '')).toBe('s3'); // rtt 10 beats rtt 50
+    expect(s3.last('host_lease')?.hostId).toBe('s3');
+  });
+
+  it('RTT ties break to the longest-lived session', () => {
+    const spy = makeHostedSpyModule('hostgame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new RttSession('s1', 0);
+    const s2 = new RttSession('s2', 10);
+    const s3 = new RttSession('s3', 10);
+    createRoom(lobby, s1, 'hostgame', 'create_public', true);
+    lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'S2', game: 'hostgame' });
+    lobby.handleMessage(asSession(s3), { t: 'quick_join', name: 'S3', game: 'hostgame' });
+
+    lobby.handleMessage(asSession(s1), { t: 'leave' });
+
+    expect(lobby.hostOf(spy.roomIds[0] ?? '')).toBe('s2'); // same rtt, older wins
+  });
+
+  it('measured RTT beats unmeasured 0 (a fresh socket never outranks a known link)', () => {
+    const spy = makeHostedSpyModule('hostgame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new RttSession('s1', 0);
+    const s2 = new RttSession('s2', 0); // unmeasured
+    const s3 = new RttSession('s3', 500); // slow but KNOWN
+    createRoom(lobby, s1, 'hostgame', 'create_public', true);
+    lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'S2', game: 'hostgame' });
+    lobby.handleMessage(asSession(s3), { t: 'quick_join', name: 'S3', game: 'hostgame' });
+
+    lobby.handleMessage(asSession(s1), { t: 'leave' });
+
+    expect(lobby.hostOf(spy.roomIds[0] ?? '')).toBe('s3');
+  });
+
+  it('host leave promotes the standby synchronously: new bearer id, last tick resumes', () => {
+    const spy = makeHostedSpyModule('hostgame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new FakeSession('s1');
+    const s2 = new FakeSession('s2');
+    const s3 = new FakeSession('s3');
+    createRoom(lobby, s1, 'hostgame', 'create_public', true);
+    lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'S2', game: 'hostgame' });
+    lobby.handleMessage(asSession(s3), { t: 'quick_join', name: 'S3', game: 'hostgame' });
+    const oldId = liveLeaseId(s1);
+    lobby.handleMessage(asSession(s1), { t: 'host_renew', leaseId: oldId, tick: 77 });
+
+    lobby.handleMessage(asSession(s1), { t: 'leave' });
+
+    expect(lobby.hostOf(spy.roomIds[0] ?? '')).toBe('s2');
+    const rotated = liveLeaseId(s2);
+    expect(rotated === oldId).toBe(false); // Bearer [REDACTED] rotates on every handover
+    expect(s2.last('host_change')).toEqual({ t: 'host_change', newHostId: 's2', resumeTick: 77 });
+    // Full handover proof: the new holder's snaps relay under the new id.
+    lobby.handleMessage(asSession(s2), { t: 'host_snap', leaseId: rotated, tick: 78 });
+    expect(s3.all().some((m) => m.t === 'host_snap')).toBe(true);
+  });
+
+  it('host disconnect (drop path) promotes too, session gone', () => {
+    const spy = makeHostedSpyModule('hostgame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new FakeSession('s1');
+    const s2 = new FakeSession('s2');
+    createRoom(lobby, s1, 'hostgame', 'create_public', true);
+    lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'S2', game: 'hostgame' });
+
+    lobby.handleDisconnect(asSession(s1));
+
+    expect(lobby.hostOf(spy.roomIds[0] ?? '')).toBe('s2');
+    expect(s2.last('host_lease')?.hostId).toBe('s2');
+  });
+
+  it('standby leave recomputes the runner-up (third member promotes next)', () => {
+    const spy = makeHostedSpyModule('hostgame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new RttSession('s1', 0);
+    const s2 = new RttSession('s2', 10);
+    const s3 = new RttSession('s3', 30);
+    createRoom(lobby, s1, 'hostgame', 'create_public', true);
+    lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'S2', game: 'hostgame' });
+    lobby.handleMessage(asSession(s3), { t: 'quick_join', name: 'S3', game: 'hostgame' });
+
+    lobby.handleMessage(asSession(s2), { t: 'leave' }); // standby gone
+    expect(lobby.hostOf(spy.roomIds[0] ?? '')).toBe('s1'); // lease untouched
+    lobby.handleMessage(asSession(s1), { t: 'leave' });
+
+    expect(lobby.hostOf(spy.roomIds[0] ?? '')).toBe('s3');
+  });
+
+  it('stale host reaped by the sweep promotes the standby', () => {
+    const spy = makeHostedSpyModule('hostgame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new FakeSession('s1');
+    const s2 = new FakeSession('s2');
+    createRoom(lobby, s1, 'hostgame', 'create_public', true);
+    lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'S2', game: 'hostgame' });
+    spy.staleOf.set(spy.roomIds[0] ?? '', ['s1']);
+
+    const closed = lobby.pollStaleSessions().map((s) => s.id);
+
+    expect(closed).toEqual(['s1']);
+    expect(lobby.hostOf(spy.roomIds[0] ?? '')).toBe('s2');
+  });
+
+  it('first unrenewed lapse promotes (no fallback yet) carrying the last tick', () => {
+    vi.useFakeTimers();
+    try {
+      const spy = makeHostedSpyModule('hostgame');
+      const lobby = new Lobby([spy.mod]);
+      tracked.push(lobby);
+      const s1 = new FakeSession('s1');
+      const s2 = new FakeSession('s2');
+      createRoom(lobby, s1, 'hostgame', 'create_public', true);
+      lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'S2', game: 'hostgame' });
+      lobby.handleMessage(asSession(s1), { t: 'host_renew', leaseId: liveLeaseId(s1), tick: 77 });
+
+      vi.advanceTimersByTime(7000); // past the 6000ms TTL with no further renew
+      lobby.pollStaleSessions();
+
+      expect(lobby.hostOf(spy.roomIds[0] ?? '')).toBe('s2');
+      expect(s2.last('host_change')).toEqual({ t: 'host_change', newHostId: 's2', resumeTick: 77 });
+      expect(spy.started).toEqual([]); // lapses: 1 — still hosted
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('second consecutive lapse falls back to central, sticky (room un-colds and sims)', () => {
+    vi.useFakeTimers();
+    try {
+      const spy = makeHostedSpyModule('hostgame');
+      const lobby = new Lobby([spy.mod]);
+      tracked.push(lobby);
+      const s1 = new FakeSession('s1');
+      const s2 = new FakeSession('s2');
+      createRoom(lobby, s1, 'hostgame', 'create_public', true);
+      lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'S2', game: 'hostgame' });
+      const roomId = spy.roomIds[0] ?? '';
+
+      vi.advanceTimersByTime(7000);
+      lobby.pollStaleSessions(); // lapse 1: s2 promoted, nobody renews
+      expect(lobby.hostOf(roomId)).toBe('s2');
+      vi.advanceTimersByTime(7000);
+      lobby.pollStaleSessions(); // lapse 2: central
+
+      expect(s2.last('host_change')).toEqual({ t: 'host_change', newHostId: null, resumeTick: 0 });
+      expect(spy.hostedCalls.at(-1)).toEqual({ roomId, active: false });
+      expect(spy.started).toEqual([roomId]); // the cold room starts simming
+      expect(lobby.hostOf(roomId)).toBeNull();
+      vi.advanceTimersByTime(30000);
+      lobby.pollStaleSessions();
+      expect(spy.started).toEqual([roomId]); // sticky: no re-election, no double start
+      expect(lobby.hostOf(roomId)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('any valid renew resets the lapse counter (re-lapse promotes instead of falling back)', () => {
+    vi.useFakeTimers();
+    try {
+      const spy = makeHostedSpyModule('hostgame');
+      const lobby = new Lobby([spy.mod]);
+      tracked.push(lobby);
+      const s1 = new FakeSession('s1');
+      const s2 = new FakeSession('s2');
+      createRoom(lobby, s1, 'hostgame', 'create_public', true);
+      lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'S2', game: 'hostgame' });
+      const roomId = spy.roomIds[0] ?? '';
+
+      vi.advanceTimersByTime(7000);
+      lobby.pollStaleSessions(); // lapse 1: s2 promoted
+      expect(lobby.hostOf(roomId)).toBe('s2');
+      lobby.handleMessage(asSession(s2), { t: 'host_renew', leaseId: liveLeaseId(s2), tick: 5 }); // lapses: 0
+      vi.advanceTimersByTime(7000);
+      lobby.pollStaleSessions(); // lapse 1 again: promote, NOT central
+
+      expect(lobby.hostOf(roomId)).toBe('s1');
+      expect(spy.started).toEqual([]);
+      expect(s1.last('host_change')).toEqual({ t: 'host_change', newHostId: 's1', resumeTick: 5 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // ---- P2-1: migration reuses the ghost/rebind path ----
+
+  it('ex-host rebinds as an ordinary member (promotion never disturbs seats)', () => {
+    const spy = makeHostedSpyModule('hostgame');
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new FakeSession('s1');
+    const s2 = new FakeSession('s2');
+    createRoom(lobby, s1, 'hostgame', 'create_public', true);
+    lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'S2', game: 'hostgame' });
+    lobby.handleDisconnect(asSession(s1)); // host drops => s2 promoted
+    expect(lobby.hostOf(spy.roomIds[0] ?? '')).toBe('s2');
+
+    const s1b = new FakeSession('s1b');
+    lobby.handleMessage(asSession(s1b), { t: 'quick_join', name: 'S1', game: 'hostgame', resume: 's1' });
+
+    expect(spy.added.at(-1)).toEqual({ id: 's1b', resume: 's1' }); // rebind hint delivered
+    expect(lobby.hostOf(spy.roomIds[0] ?? '')).toBe('s2'); // lease untouched by the rebind
+    expect(s1b.last('host_lease')).toBeUndefined(); // ...as an ordinary member
+  });
+});
+
+// ---- ghost-aware empty-room grace (double-drop no_room) ----------------------
+// A private room whose members drop near-simultaneously used to be swept the
+// instant the second socket died — both players' reseats then landed on
+// no_room even though rebindable ghost seats were waiting. Rooms that keep
+// ghosts now report hasRebindableSeats() and get the grace window instead.
+
+describe('ghost-aware empty-room grace', () => {
+  let tracked: Lobby[] = [];
+
+  afterEach(() => {
+    for (const l of tracked) l.close();
+    tracked = [];
+  });
+
+  interface GhostSpy {
+    mod: GameModule;
+    ghosts: Set<PlayerId>;
+    stops: number;
+  }
+
+  /** Private rooms with rift-like ghost semantics: a drop parks a ghost, an
+   *  explicit leave deletes. When withHook is false the room omits
+   *  hasRebindableSeats entirely (rooms that remove on drop). */
+  function makeGhostSpyModule(id: string, withHook: boolean): GhostSpy {
+    const ghosts = new Set<PlayerId>();
+    const members = new Set<PlayerId>();
+    const spy: GhostSpy = {
+      ghosts,
+      stops: 0,
+      mod: {
+        id,
+        name: id.toUpperCase(),
+        clientDist: '',
+        minPlayers: 1,
+        maxPlayers: 8,
+        createRoom(opts) {
+          const roomId: RoomId = `${id}-ghost`;
+          const room: GameRoomHandle = {
+            id: roomId,
+            info: () => ({
+              id: roomId,
+              code: 'GHOST-1',
+              game: id,
+              label: '',
+              players: members.size,
+              maxPlayers: 8,
+              phase: 'warmup',
+              visibility: opts.visibility,
+            }),
+            playerCount: () => members.size,
+            stalePlayers: () => [],
+            addPlayer: (playerId) => {
+              members.add(playerId);
+              ghosts.delete(playerId);
+            },
+            removePlayer: (playerId, permanent) => {
+              members.delete(playerId);
+              if (permanent === true) ghosts.delete(playerId);
+              else ghosts.add(playerId);
+            },
+            handleMessage: () => {},
+            start: () => {},
+            stop: () => {
+              spy.stops += 1;
+            },
+          };
+          if (withHook) room.hasRebindableSeats = () => ghosts.size > 0;
+          return room;
+        },
+      },
+    };
+    return spy;
+  }
+
+  function createPrivateRoom(lobby: Lobby, sess: FakeSession, game: string): void {
+    lobby.handleMessage(asSession(sess), { t: 'create_private', name: 'P', game });
+  }
+
+  it('a double drop keeps a ghost-bearing private room open and the reseat lands', () => {
+    const spy = makeGhostSpyModule('ghostgame', true);
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new FakeSession('g1');
+    createPrivateRoom(lobby, s1, 'ghostgame');
+    lobby.handleMessage(asSession(new FakeSession('g2')), {
+      t: 'join_private',
+      name: 'Q',
+      code: 'GHOST-1',
+    });
+    expect(lobby.roomCount()).toBe(1);
+
+    lobby.handleDisconnect(asSession(s1)); // drop, not leave: ghost parked
+    lobby.handleDisconnect(asSession(new FakeSession('g2'))); // second drop: empty but ghost-bearing
+
+    expect(spy.stops).toBe(0);
+    expect(lobby.roomCount()).toBe(1); // grace, not a sweep
+
+    const s3 = new FakeSession('g3');
+    lobby.handleMessage(asSession(s3), { t: 'join_private', name: 'P', code: 'GHOST-1', resume: 'g1' });
+    expect(s3.last('error')).toBeUndefined(); // landed — no no_room strand
+    expect(lobby.roomCount()).toBe(1);
+  });
+
+  it('an explicit leave of every member still closes a private room immediately', () => {
+    const spy = makeGhostSpyModule('ghostleave', true);
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new FakeSession('g1');
+    createPrivateRoom(lobby, s1, 'ghostleave');
+
+    lobby.handleMessage(asSession(s1), { t: 'leave' }); // permanent: no ghost parked
+
+    expect(spy.stops).toBe(1);
+    expect(lobby.roomCount()).toBe(0);
+  });
+
+  it('rooms without the hook sweep exactly as before (absent => no ghosts)', () => {
+    const spy = makeGhostSpyModule('noghost', false);
+    const lobby = new Lobby([spy.mod]);
+    tracked.push(lobby);
+    const s1 = new FakeSession('g1');
+    createPrivateRoom(lobby, s1, 'noghost');
+
+    lobby.handleDisconnect(asSession(s1));
+
+    expect(spy.stops).toBe(1);
+    expect(lobby.roomCount()).toBe(0);
+  });
+
+  it('the reaper grants grace to ghost rooms but sweeps them once it expires', () => {
+    vi.useFakeTimers();
+    try {
+      const spy = makeGhostSpyModule('ghostreap', true);
+      const lobby = new Lobby([spy.mod]);
+      tracked.push(lobby);
+      const s1 = new FakeSession('r1');
+      createPrivateRoom(lobby, s1, 'ghostreap');
+      lobby.handleDisconnect(asSession(s1));
+      expect(lobby.roomCount()).toBe(1);
+
+      lobby.pollStaleSessions(); // immediate reaper pass: grace holds
+      expect(spy.stops).toBe(0);
+      expect(lobby.roomCount()).toBe(1);
+
+      vi.setSystemTime(Date.now() + 31_000); // past PUBLIC_REAP_MS (30s)
+      lobby.pollStaleSessions();
+      expect(spy.stops).toBe(1);
+      expect(lobby.roomCount()).toBe(0); // grace expired: natural reap, no leak
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('end to end through the real rift module: double drop, grace, resume rebinds', () => {
+    const lobby = new Lobby([RIFT]);
+    tracked.push(lobby);
+    const s1 = new FakeSession('r1');
+    lobby.handleMessage(asSession(s1), { t: 'create_private', name: 'Ada', game: 'rift' });
+    const hello = s1.all().find((m) => m.t === 'rift_hello') as unknown as { code: unknown } | undefined;
+    const code = hello?.code;
+    if (typeof code !== 'string') throw new Error('expected rift_hello to carry the private code');
+
+    lobby.handleMessage(asSession(new FakeSession('r2')), { t: 'join_private', name: 'Bob', code });
+    expect(lobby.roomCount()).toBe(1);
+
+    lobby.handleDisconnect(asSession(s1));
+    lobby.handleDisconnect(asSession(new FakeSession('r2')));
+    expect(lobby.roomCount()).toBe(1); // rift ghosts hold the room open
+
+    const s3 = new FakeSession('r3');
+    lobby.handleMessage(asSession(s3), { t: 'join_private', name: 'Ada', code, resume: 'r1' });
+    expect(s3.last('error')).toBeUndefined();
+    expect(s3.all().some((m) => m.t === 'rift_hello')).toBe(true); // rebound onto the ghost
   });
 });

@@ -233,6 +233,18 @@ export class WordbombRoom implements GameRoomHandle {
   }
 
   /**
+   * Ghost census for the platform's empty-room sweep: any disconnected entry
+   * is a seat a resume/sig rejoin could still rebind, so the room is
+   * "reconnecting" and gets grace instead of an immediate stop.
+   */
+  hasRebindableSeats(): boolean {
+    for (const p of this.players.values()) {
+      if (!p.connected) return true;
+    }
+    return false;
+  }
+
+  /**
    * §2.3 rebind order: `resume` first (exact, cheapest, and what already-
    * shipped clients send — keeps I8 green), then `sig` against a disconnected
    * seat (durable across purge/rotation, for a client that lost its playerId

@@ -1092,3 +1092,22 @@ describe('BankRoom variants', () => {
     ).toThrow();
   });
 });
+
+// ---- hasRebindableSeats (platform empty-room sweep grace) ---------------------
+
+describe('hasRebindableSeats', () => {
+  it('false when all connected; a drop parks a ghost; rebind or explicit leave clears it', () => {
+    const io = new FakeIO();
+    const room = boot(io, [['a', 'A']]); // solo: cold lobby, no match started
+    expect(room.hasRebindableSeats()).toBe(false);
+
+    room.removePlayer('a'); // drop: ghost (entry persists until the round purge)
+    expect(room.hasRebindableSeats()).toBe(true);
+
+    room.addPlayer('a2', 'A', 'a'); // resume rebinds the ghost
+    expect(room.hasRebindableSeats()).toBe(false);
+
+    room.removePlayer('a2', true); // explicit leave: entry removed, no ghost
+    expect(room.hasRebindableSeats()).toBe(false);
+  });
+});

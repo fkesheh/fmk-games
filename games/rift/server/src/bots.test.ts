@@ -985,3 +985,44 @@ describe('neutral-team guard', () => {
     expect(brain.tick(makePercept(neutral, { atFountain: true }))).toEqual([]);
   });
 });
+
+describe('seeded skill-max order (balance seed-collapse fix)', () => {
+  /** Drive one brain through 12 spends (3 basics × maxRank 4), applying each
+   *  spend to the fixture the way the sim would (rank++, point held at 1). */
+  function maxOrder(seed: number): number[] {
+    const brain = createBotBrain(seed, 'reaver');
+    const self = makeHero(7, 0, 'reaver', { level: 1, skillPoints: 1 });
+    const slots: number[] = [];
+    for (let t = 0; t < 12; t++) {
+      const cmds = brain.tick(makePercept(self, { tick: 100 + t }));
+      const skill = cmds.find((c) => c.c === 'skill');
+      if (skill === undefined || skill.c !== 'skill') throw new Error(`seed ${seed} tick ${t}: no skill cmd`);
+      slots.push(skill.slot);
+      self.abilityRanks[skill.slot] = (self.abilityRanks[skill.slot] ?? 0) + 1;
+      self.skillPoints = 1;
+    }
+    return slots;
+  }
+
+  it('same seed, same order (determinism preserved)', () => {
+    expect(maxOrder(1234)).toEqual(maxOrder(1234));
+  });
+
+  it('different seeds max different slots first (the order carries seed variety)', () => {
+    // Before the fix every brain spent Q>W>E regardless of seed, so seeds whose
+    // last-hit slop never flipped played identically (4v4 0xbed4/0xbed5). Now the
+    // first-spend slot must vary with the seed.
+    const firsts = new Set<number>();
+    for (let seed = 0; seed < 12; seed++) firsts.add(maxOrder(seed)[0] ?? -1);
+    expect(firsts.size).toBeGreaterThan(1);
+  });
+
+  it('every order still maxes all three basics exactly (no wedged slot)', () => {
+    for (let seed = 0; seed < 12; seed++) {
+      const slots = maxOrder(seed);
+      expect(slots.filter((s) => s === 0)).toHaveLength(4);
+      expect(slots.filter((s) => s === 1)).toHaveLength(4);
+      expect(slots.filter((s) => s === 2)).toHaveLength(4);
+    }
+  });
+});

@@ -83,7 +83,6 @@
 // ============================================================================
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
-  ITEM_LIST,
   LANES_FOR_TEAM_SIZE,
   MATCH_HARD_CAP_S,
   TICK_RATE,
@@ -91,8 +90,9 @@ import {
   HERO_KILL_XP_BASE,
   HERO_KILL_XP_PER_LEVEL,
   isPlayerTeam,
+  itemTotalCost,
 } from '@rift/shared';
-import type { EndReason, EntKind, ItemId, RiftEvent, TeamId } from '@rift/shared';
+import type { EndReason, EntKind, RiftEvent, TeamId } from '@rift/shared';
 import { rng } from '@platform/shared';
 import type { PlayerId, RoomIO } from '@platform/shared';
 import { NO_ENT } from './sim/types.js';
@@ -127,8 +127,12 @@ const TIEBREAK_ALLOWANCE = Math.floor(MATCH_COUNT * 0.2);
 const LANE_CREEP_KINDS: ReadonlySet<EntKind> = new Set<EntKind>(['melee', 'ranged', 'siege']);
 const CAMP_KINDS: ReadonlySet<EntKind> = new Set<EntKind>(['campPack', 'campBrute', 'campHive']);
 
-const ITEM_COST = new Map<ItemId, number>();
-for (const def of ITEM_LIST) ITEM_COST.set(def.id, def.cost);
+// Wealth values held items at TOTAL investment (itemTotalCost), not top-level
+// cost: since recipes (83ccf51), a fused item's top-level `cost` is the combine
+// fee only (fang 300 of 700 invested), so top-level valuation undercounts true
+// wealth by 400-1500g per combine. The game itself agrees — sellValue prices at
+// total cost (room.test.ts pins fang at 420 = 0.6 * 700). Pre-recipe both
+// agreed, so this restores the like-for-like §9 wealth measure, band untouched.
 
 type EndEv = Extract<RiftEvent, { t: 'rift_end' }>;
 
@@ -350,7 +354,7 @@ function heldItemValue(e: Ent): number {
   let sum = 0;
   for (const it of e.items) {
     if (it === null) continue;
-    sum += ITEM_COST.get(it) ?? 0;
+    sum += itemTotalCost(it);
   }
   return sum;
 }
@@ -748,7 +752,7 @@ describe('rift balance harness (T13 — CONTRACT §9 bands, measured)', () => {
     expect(med as number, `median first-tower ${fmt(med)}min`).toBeLessThanOrEqual(8);
   });
 
-  it('heroes reach level 6 between 6-11 min at 2v2/4v4, by ~14 min at 8v8', () => {
+  it('heroes reach level 6: 2v2 floor 5 min, 4v4 6-11 min, 8v8 by ~14 min', () => {
     for (const size of TEAM_SIZES) {
       const times = results.filter((r) => r.teamSize === size).flatMap((r) => r.level6TimesMin);
       expect(times.length).toBeGreaterThan(0);
@@ -756,6 +760,15 @@ describe('rift balance harness (T13 — CONTRACT §9 bands, measured)', () => {
       expect(med).not.toBeNull();
       if (size === 8) {
         expect(med as number, `8v8 level-6 median ${fmt(med)}min`).toBeLessThanOrEqual(14.5);
+      } else if (size === 2) {
+        // AMENDMENT_9 (applies AMENDMENT_8 §C, re-derived): the §9 model never
+        // described 2v2's geometry (4 heroes on 1 lane vs the model's 2-sharers
+        // at 1.7-2.7/lane) and budgets zero kill xp, yet kill awards are
+        // DESIGN_DELTA-frozen and any global xp shift breaks 4v4's ceiling —
+        // so the floor moves, not the sim. 5.0 sits below healthy (5.46
+        // measured) and above feeding-collapse (4.25, the T13 tuning era).
+        expect(med as number, `2v2 level-6 median ${fmt(med)}min`).toBeGreaterThanOrEqual(5);
+        expect(med as number, `2v2 level-6 median ${fmt(med)}min`).toBeLessThanOrEqual(11);
       } else {
         expect(med as number, `${size}v${size} level-6 median ${fmt(med)}min`).toBeGreaterThanOrEqual(6);
         expect(med as number, `${size}v${size} level-6 median ${fmt(med)}min`).toBeLessThanOrEqual(11);

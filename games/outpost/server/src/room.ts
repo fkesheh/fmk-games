@@ -300,6 +300,19 @@ export class OutpostRoom implements GameRoomHandle {
     return out;
   }
 
+  /**
+   * Ghost census for the platform's empty-room sweep: any disconnected
+   * survivor is one a resume/sig rejoin could still rebind (the exact
+   * predicate tryRebind matches), so the room is "reconnecting" and gets
+   * grace instead of an immediate stop.
+   */
+  hasRebindableSeats(): boolean {
+    for (const s of this.ctx.survivors.values()) {
+      if (!s.connected) return true;
+    }
+    return false;
+  }
+
   addPlayer(id: PlayerId, name: string, resume?: PlayerId, sig?: string): void {
     try {
       if (this.ctx.survivors.has(id)) return;

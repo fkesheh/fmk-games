@@ -281,6 +281,13 @@ export function riftModuleVariant(o: RiftVariantOpts): GameModule {
         },
         start: () => room.start(),
         stop: () => room.stop(),
+        // Lifecycle transparency: the lobby consults these optional verbs to
+        // decide sweeps (hasRebindableSeats: ghost-bearing rooms get grace
+        // instead of an immediate stop) and hosted mode (setHosted). Dropping
+        // them here would silently change ancients-room lifecycle vs legacy
+        // rift rooms — the wrapper must be invisible to the platform.
+        hasRebindableSeats: () => room.hasRebindableSeats?.() ?? false,
+        setHosted: (active) => room.setHosted?.(active),
       };
     },
   };

@@ -35,7 +35,20 @@ export type LobbyC2S =
   /** From a pad device: bind to a room with a pairing token (becomes a pad session). */
   | { t: 'join_as_pad'; room: string; token: string }
   /** Pad → paired room input frame (relayed RAW into the room + echoed). */
-  | { t: 'pad_input'; seq: number; lx: number; ly: number; rx: number; ry: number; buttons: number };
+  | { t: 'pad_input'; seq: number; lx: number; ly: number; rx: number; ry: number; buttons: number }
+  // ---- hosted authority (docs/PLATFORM.md §12, P1) — parsed + handled by the platform ----
+  /** Host → shim heartbeat: still alive, sim at `tick`. Validated against the room lease. */
+  | { t: 'host_renew'; leaseId: string; tick: number };
+
+/**
+ * Hosted-authority lease id shape: an opaque bearer token minted by the lobby
+ * (12 chars over CLAIM_ALPHABET). Validated loosely (8..32 chars) so rotation and
+ * future minters never brick parsing; the lobby ALSO requires an exact match
+ * against the room's live lease — shape alone authorizes nothing.
+ */
+export function isValidLeaseId(v: unknown): v is string {
+  return typeof v === 'string' && v.length >= 8 && v.length <= 32;
+}
 
 /** Sanitize a resume token (a previous session's playerId), or undefined. */
 export function cleanResume(v: unknown): PlayerId | undefined | null {
@@ -84,7 +97,26 @@ export type LobbyS2C =
   /** To the pad device: binding refused (bad token, room gone, already used…). */
   | { t: 'pad_rejected'; reason: string }
   /** Ack to the pad for RTT estimation. */
-  | { t: 'pad_input_echo'; seq: number };
+  | { t: 'pad_input_echo'; seq: number }
+  // ---- hosted authority (docs/PLATFORM.md §12, P1) ----
+  /**
+   * UNICAST to the elected host only: your lease. `leaseId` is a bearer token
+   * (every host_snap/host_renew must present it) — never broadcast, never logged.
+   * Renew every ttlMs/2 with your current sim tick.
+   */
+  | { t: 'host_lease'; leaseId: string; hostId: PlayerId; ttlMs: number }
+  /**
+   * BROADCAST to the room on every (re)election: who sims now + the tick to
+   * resume from. `newHostId: null` means NOBODY hosts — the server took over
+   * (central fallback); render server snapshots again.
+   */
+  | { t: 'host_change'; newHostId: PlayerId | null; resumeTick: number }
+  /**
+   * UNICAST echo to a sender whose presented leaseId is stale: halt your sim,
+   * you are not the host anymore. Carries the PRESENTED id (match your loop),
+   * never the live one.
+   */
+  | { t: 'host_revoked'; leaseId: string };
 
 /** Lobby messages plus whatever a game room pushes through RoomIO.send. */
 export type S2C = LobbyS2C | RawEnvelope;
@@ -230,6 +262,16 @@ export function parseC2S(raw: unknown): C2S | null {
         buttons: frame.buttons,
       };
     }
+    // ---- hosted authority (docs/PLATFORM.md §12, P1) ----
+    case 'host_renew': {
+      if (!isValidLeaseId(raw.leaseId)) return null;
+      if (!num(raw.tick) || raw.tick < 0 || raw.tick > 0xffffffff) return null;
+      return { t: 'host_renew', leaseId: raw.leaseId, tick: Math.trunc(raw.tick) };
+    }
+    // NOTE: no 'host_snap' case — it passes through as RAW below and the
+    // lobby intercepts it BEFORE room routing (validating leaseId itself; the
+    // snapshot body stays game-opaque). Rejecting it here would drop host
+    // frames in net.ts before the lobby ever sees them.
     default:
       // envelope-checked pass-through: routed RAW to the session's room
       return raw as RawEnvelope;

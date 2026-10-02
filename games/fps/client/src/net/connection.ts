@@ -35,6 +35,13 @@ export class Connection {
   private offset = 0; // ms; 0 until the first pong (serverNow then = perf clock)
   private bestRtt = Infinity;
   private closeNotified = false;
+  // Frames queued by send() while the socket is CONNECTING, flushed FIFO on
+  // open. Without this, a join fired during the handshake (ClientGame's
+  // ensureConn reuses the in-flight Connection without awaiting it) silently
+  // vanished and the client sat on "Reserving a slot…"/"Reconnecting…"
+  // forever. Bounded in practice: only join/list frames are ever sent while
+  // connecting (inputs are dropped, never queued — see send()).
+  private sendQueue: (C2S | LobbyCreate | LobbyC2S)[] = [];
 
   /** Resolves on open, rejects on error/timeout (5s). */
   connect(url?: string): Promise<void> {
@@ -55,6 +62,7 @@ export class Connection {
       const fail = (err: Error): void => {
         if (settled) return;
         settled = true;
+        this.sendQueue = []; // dead socket: queued frames must never send late
         clearTimeout(timer);
         try {
           ws.close();
@@ -72,6 +80,9 @@ export class Connection {
         clearTimeout(timer);
         this.startPing();
         this.send({ t: 'ping', ts: performance.now() }); // seed RTT/offset immediately
+        const queued = this.sendQueue;
+        this.sendQueue = [];
+        for (const msg of queued) this.send(msg); // socket is open: sends inline
         resolve();
       };
       ws.onerror = () => {
@@ -104,7 +115,8 @@ export class Connection {
   }
 
   /**
-   * No-op unless the socket is open (mirrors the server's Session.send).
+   * Sends when the socket is open; queues while it is CONNECTING (flushed
+   * FIFO by onopen); no-op once closed (mirrors the server's Session.send).
    * Accepts three overlapping shapes: fps's own room-level `C2S`, this
    * file's `LobbyCreate` (create_* with a typed `{mapId}` settings payload),
    * and the platform's `LobbyC2S` (imported verbatim, never hand-redeclared
@@ -118,7 +130,15 @@ export class Connection {
    */
   send(msg: C2S | LobbyCreate | LobbyC2S): void {
     const ws = this.ws;
-    if (ws === null || ws.readyState !== WebSocket.OPEN) return;
+    if (ws === null) return;
+    if (ws.readyState === WebSocket.CONNECTING) {
+      // the handshake is still in flight: hold the frame for the onopen
+      // flush. EXCEPT 'input' — 60Hz ephemeral state, never worth queuing;
+      // the next frame after open carries fresher state anyway.
+      if (msg.t !== 'input') this.sendQueue.push(msg);
+      return;
+    }
+    if (ws.readyState !== WebSocket.OPEN) return;
     try {
       ws.send(JSON.stringify(msg)); // encodeC2S: the wire is plain JSON
     } catch {
@@ -140,6 +160,7 @@ export class Connection {
   close(): void {
     this.closeNotified = true;
     this.stopPing();
+    this.sendQueue = [];
     const ws = this.ws;
     this.ws = null;
     if (ws !== null && ws.readyState !== WebSocket.CLOSED) {
@@ -182,6 +203,7 @@ export class Connection {
 
   private teardown(): void {
     this.stopPing();
+    this.sendQueue = [];
     this.ws = null;
     if (!this.closeNotified) {
       this.closeNotified = true;

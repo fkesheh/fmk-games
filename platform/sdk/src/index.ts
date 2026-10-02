@@ -14,3 +14,6 @@ export * from './rooms.js';
 export * from './profile.js';
 export * from './saves.js';
 export * from './client.js';
+
+// ---- P1/P2 hosted authority (player-side lease tracking + renew loop) ------
+export * from './hosted.js';

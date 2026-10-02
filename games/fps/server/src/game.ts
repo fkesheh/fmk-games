@@ -231,6 +231,7 @@ export class GameRoom {
   private buyOpenUntil = 0; // serverTime ms; canBuy while live && now < this
   private matchEndResetAt = 0; // serverTime ms; warmup reset 6s after match_end
   private timer: ReturnType<typeof setInterval> | null = null;
+  private hosted = false; // P1 cold mode (setHosted): seats + liveness only, no sim branches
   // queued team-switch requests (made during freeze/live/roundEnd/matchEnd),
   // applied at the next beginFreeze; warmup switches apply immediately instead
   private readonly teamSwitchQueue = new Map<PlayerId, Team>();
@@ -670,6 +671,18 @@ export class GameRoom {
   }
 
   /**
+   * P1 cold mode (platform GameRoomHandle.setHosted): the SERVER instance of a
+   * player-hosted room. Seats + liveness + join payloads only — handleMessage
+   * degrades to an input-liveness touch and every sim branch is ignored, so a
+   * cold room can never double-apply what the browser host sims, emit gameplay
+   * traffic, or kick. The browser host runs this SAME class with hosted=false.
+   * Never called on central rooms: default false preserves all behavior.
+   */
+  setHosted(active: boolean): void {
+    this.hosted = active;
+  }
+
+  /**
    * GameRoomHandle entry: the platform lobby routes RAW room-level envelopes
    * here (lobby tags are platform-owned and ignored below). Validate with the
    * frozen fps parser; silently drop nulls — never throw on wire data.
@@ -677,6 +690,13 @@ export class GameRoom {
   handleMessage(id: PlayerId, msg: unknown): void {
     const parsed = parseC2S(msg);
     if (parsed === null) return;
+    if (this.hosted) {
+      if (parsed.t === 'input') {
+        const p = this.players.get(id);
+        if (p !== undefined) p.lastInputAt = Date.now();
+      }
+      return;
+    }
     switch (parsed.t) {
       case 'input':
         this.handleInput(id, parsed);
@@ -919,6 +939,20 @@ export class GameRoom {
       if (now - p.lastInputAt > NET.inputTimeoutMs) out.push(p.id);
     }
     return out;
+  }
+
+  /**
+   * Ghost census for the platform's empty-room sweep: any disconnected entry
+   * is one a resume/sig rejoin could still rebind (the exact predicate
+   * tryRebind matches; bots are always connected so they never hold a room
+   * open), so the room is "reconnecting" and gets grace instead of an
+   * immediate stop.
+   */
+  hasRebindableSeats(): boolean {
+    for (const p of this.players.values()) {
+      if (!p.connected) return true;
+    }
+    return false;
   }
 
   // -------------------------------------------------------------------------

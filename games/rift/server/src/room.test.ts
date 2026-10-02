@@ -400,12 +400,18 @@ describe('lobby contract', () => {
     expect(io.all('p1').length).toBe(before);
     expect(io.last('p1', 'rift_lobby').picks['p1']).toBeNull();
 
+    // A valid pick first, so the out-of-phase pick below has an established
+    // hero to (not) disturb: unpicked seats are dealt a SEEDED-random cycle
+    // hero, which could be hex by luck — only a picked seat proves the drop.
+    room.handleMessage('p1', { t: 'rift_pick', hero: 'bullwark' });
+    expect(io.last('p1', 'rift_lobby').picks['p1']).toBe('bullwark');
+
     pressStartAndLock(room, 'p1'); // phase is now 'live'
     const liveBefore = io.all('p1').length;
     expect(() => room.handleMessage('p1', { t: 'rift_pick', hero: 'hex' })).not.toThrow();
     expect(io.all('p1').length).toBe(liveBefore); // dropped: rift_pick is lobby-only
     pump(room, 1);
-    expect(latestSnap(io, 'p1').you?.hero).not.toBe('hex'); // never applied
+    expect(latestSnap(io, 'p1').you?.hero).toBe('bullwark'); // never applied
   });
 
   it('supports MORE than 6 humans picking across up to MAX_PLAYERS seats, duplicates included', () => {
@@ -515,14 +521,35 @@ describe('lock', () => {
     expect(roster.filter((r) => r.team === 0)).toHaveLength(2);
     expect(roster.filter((r) => r.team === 1)).toHaveLength(2);
 
-    // heroes: p1 unpicked -> cycle from the first hero; every seat has one
+    // heroes: p1 unpicked -> a seeded-random cycle hero (the deal is shuffled
+    // per room, so no seat owns a fixed cycle slice); every seat has one
     pump(room, 1);
     const snap = latestSnap(io, 'p1');
-    expect(snap.you?.hero).toBe(HERO_LIST[0]?.id);
+    expect(HERO_LIST.some((h) => h.id === snap.you?.hero)).toBe(true);
     expect(snap.board).toHaveLength(4);
     for (const row of snap.board) {
       expect(HERO_LIST.some((h) => h.id === row.hero)).toBe(true);
     }
+  });
+
+  it('deals unpicked heroes deterministically: identical rooms lock identical comps', () => {
+    const first = boot(
+      [['p1', 'Ada']],
+      { settings: { teamSize: 4 } },
+    );
+    pressStartAndLock(first.room, 'p1');
+    pump(first.room, 1);
+    const a = latestSnap(first.io, 'p1').board.map((r) => r.hero);
+    first.room.stop(); // one live room at a time: they share the fake clock
+    const second = boot(
+      [['p1', 'Ada']],
+      { settings: { teamSize: 4 } },
+    );
+    pressStartAndLock(second.room, 'p1');
+    pump(second.room, 1);
+    const b = latestSnap(second.io, 'p1').board.map((r) => r.hero);
+    expect(a).toHaveLength(8);
+    expect(a).toEqual(b); // seeded shuffle per room id, never Math.random
   });
 
   it('respects an explicit settings.teamSize with bot fill to 4v4', () => {
@@ -1877,5 +1904,42 @@ describe('tier-3 ultimates (feature B)', () => {
     room.handleMessage('p1', { t: 'rift_sell', slot });
     expect(ent.gold, 'selling aegiscolossus must refund its full sellValue').toBe(goldBeforeSell + 1800);
     expect(ent.items[slot], 'selling aegiscolossus must free the slot').toBeNull();
+  });
+});
+
+// ---- hasRebindableSeats (platform empty-room sweep grace) ---------------------
+
+describe('hasRebindableSeats', () => {
+  it('false when all connected; a lobby drop parks a ghost; rebind or explicit leave clears it', () => {
+    const { room } = boot([
+      ['a', 'A'],
+      ['b', 'B'],
+    ]); // cold lobby, countdown never pressed
+    expect(room.hasRebindableSeats()).toBe(false);
+
+    room.removePlayer('a'); // drop: ghost (seat kept for reconnect)
+    expect(room.hasRebindableSeats()).toBe(true);
+
+    room.addPlayer('a2', 'A', 'a'); // resume rebinds the ghost
+    expect(room.hasRebindableSeats()).toBe(false);
+
+    room.removePlayer('a2', true); // explicit lobby leave: seat spliced, no ghost
+    room.removePlayer('b', true);
+    expect(room.hasRebindableSeats()).toBe(false);
+  });
+
+  it('live: a permanent-leave bot conversion is NOT a ghost, but a later drop is', () => {
+    const { room } = boot([
+      ['a', 'A'],
+      ['b', 'B'],
+    ]);
+    pressStartAndLock(room, 'a'); // live, heroes spawned
+    expect(room.hasRebindableSeats()).toBe(false);
+
+    room.removePlayer('a', true); // permanent: seat converts to a bot, never handed back
+    expect(room.hasRebindableSeats()).toBe(false);
+
+    room.removePlayer('b'); // drop: real ghost, rebindable by resume/sig
+    expect(room.hasRebindableSeats()).toBe(true);
   });
 });

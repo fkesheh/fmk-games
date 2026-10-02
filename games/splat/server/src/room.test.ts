@@ -1003,3 +1003,26 @@ describe('splatModule', () => {
     room.stop();
   });
 });
+
+// ---- hasRebindableSeats (platform empty-room sweep grace) ---------------------
+
+describe('hasRebindableSeats', () => {
+  it('false when all connected; a drop parks a ghost; rebind or explicit leave clears it', () => {
+    const io = new FakeIO();
+    const room = new SplatRoom('public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.addPlayer('p2', 'Bravo');
+    expect(room.hasRebindableSeats()).toBe(false);
+
+    room.removePlayer('p1'); // drop: ghost (seat kept for rejoin)
+    expect(room.hasRebindableSeats()).toBe(true);
+
+    room.addPlayer('p1b', 'Alpha', 'p1'); // resume rebinds the ghost
+    expect(room.hasRebindableSeats()).toBe(false);
+
+    room.removePlayer('p1b', true); // explicit leave: seat deleted, no ghost
+    room.removePlayer('p2', true);
+    expect(room.hasRebindableSeats()).toBe(false);
+    room.stop();
+  });
+});

@@ -312,4 +312,27 @@ describe('stats', () => {
       { gameId: GAME, key: 'score', value: STATS.maxValue },
     ]);
   });
+
+  it('addStatsBatch lands the same rows as the equivalent addStats calls (P0-2)', () => {
+    const s = memoryStore();
+    const { profile } = s.profileBySig('sig-batch');
+    s.addStatsBatch([
+      { profileId: profile.id, gameId: GAME, delta: { kills: 3 } },
+      { profileId: profile.id, gameId: GAME, delta: { kills: 2, deaths: 1 } },
+      { profileId: profile.id, gameId: 'bank', delta: { kills: 100 } },
+    ]);
+
+    expect(s.statsFor(profile.id, GAME)).toEqual([
+      { gameId: GAME, key: 'deaths', value: 1 },
+      { gameId: GAME, key: 'kills', value: 5 },
+    ]);
+    expect(s.statsFor(profile.id, 'bank')).toEqual([{ gameId: 'bank', key: 'kills', value: 100 }]);
+  });
+
+  it('addStatsBatch with zero entries is a no-op (no transaction, no throw)', () => {
+    const s = memoryStore();
+    const { profile } = s.profileBySig('sig-batch-empty');
+    expect(() => s.addStatsBatch([])).not.toThrow();
+    expect(s.statsFor(profile.id)).toEqual([]);
+  });
 });

@@ -8,14 +8,25 @@
 // through the frozen window.__rift debug surface (games/rift/CONTRACT.md §6)
 // against the multi-game static route /rift/.
 //
-// THE MATCH: a private room with settings { teamSize: 2, speed: 20 }. Two
+// THE MATCH: a private room with settings { teamSize: 2, speed: 10 }. Two
 // humans (Alice, Bob) seat on opposite teams; the room bot-fills each side to
 // 2v2. LANES_FOR_TEAM_SIZE[2] = 1, so rift_begin must say lanes=1 teamSize=2.
-// speed=20 is the contract's public e2e hook (CONTRACT §2): the room ticks at
-// period max(1, round(1000 / TICK_RATE / speed)) ≈ 3ms, so a match the balance
-// harness measures at 12-18 min game-time resolves in roughly 1-4 min of wall
-// clock. The end-poll timeout is 6 minutes; the expected end reason is
-// 'ancient' (the 30:00 game-time hard cap is a backstop, not the plan).
+// speed is the contract's public e2e hook (CONTRACT §2, 1..20): the room
+// ticks at period max(1, round(1000 / TICK_RATE / speed)) ≈ 5ms, so a match
+// the balance harness measures at 12-18 min game-time resolves in roughly
+// 2-4 min of wall clock. The end-poll timeout is 6 minutes; the expected
+// end reason is 'ancient' (the 30:00 game-time hard cap is a backstop).
+// speed=10, not 20, by measurement (2026-10-01): at 20 the ~170 snaps/s
+// flood per page saturates headless-shell's single-process drain, pong
+// latency spikes past the server's 2-missed (4s) liveness on BOTH sockets
+// every ~15s, and every level-up point is bot-spent inside the resulting
+// ~10s ghost windows — no skill-spend check design can observe a banked
+// point through that storm (9 runs: 0 visible points in 45s×2). The storm
+// measures the HARNESS (software raster + single process on 8 cores), not
+// the game: the server loop stays exact (ping intervals drift-free, rtt
+// ~13ms between kills) and every flap recovers via ghost→bot→resume→grace
+// exactly as designed. 10 keeps a stiff load (~85 snaps/s, still 4x the
+// speed-1 prod default) the harness can actually drain.
 //
 // Every assertion goes through the debug surface (state/snaps/lastEvents/
 // messageLog), never the DOM. Snapshots are ~20Hz * speed, so the 32-entry
@@ -33,7 +44,7 @@
 // nothing else in this suite would notice if they silently stopped arriving:
 //   * rift_snap.dayPhase (TERRAIN_CONTRACT §6) — present, finite, inside
 //     [0,1] on every sampled snap, and actually MOVING across the match. At
-//     speed 20 a DAY_PERIOD_S=600 cycle takes 30s of wall clock, so a 12-18
+//     speed 10 a DAY_PERIOD_S=600 cycle takes 60s of wall clock, so a 12-18
 //     game-minute match sweeps well over one full cycle.
 //   * neutral jungle camps (TERRAIN_CONTRACT §5) — the hero is walked to a
 //     camp clearing whose coordinates come from buildTerrain(1) IN THIS
@@ -70,7 +81,7 @@ const WAVE_FIRST_TICK = 10 * TICK_RATE; // 200
 const STARTING_GOLD = 600;
 const BLADESTONE_COST = 400;
 const LOBBY_COUNTDOWN_MS = 3000;
-const SETTINGS = { teamSize: 2, speed: 20 };
+const SETTINGS = { teamSize: 2, speed: 10 };
 const EXPECT_LANES = 1;
 const EXPECT_TEAM_SIZE = 2;
 const END_TIMEOUT_MS = Number(process.env.E2E_END_TIMEOUT ?? 360000); // 6 min
@@ -88,11 +99,10 @@ let FACTS = null;
 /** Camp clearings ordered nearest-first to the map centre, so the hero walks
  *  to the one it can reach soonest from either fountain. */
 let CAMPS = [];
-// At speed 20 a second of wall clock is 20 game-seconds, so the old 90 s budget
-// was ~30 game-MINUTES — the match hard cap. With camps unwired this check
-// alone could consume the entire match and take the three checks after it down
-// with it. The walk itself is a few dozen metres at hero speed: under 20 game-
-// seconds. 20 s of wall clock is still ~400 game-seconds of slack.
+// At speed 10 a second of wall clock is 10 game-seconds (half the pace the
+// old speed-20 comment below assumed — but every bound here still holds with
+// 2x the slack it quotes). The walk itself is a few dozen metres at hero
+// speed: under 20 game-seconds. 20 s of wall clock is ~200 game-seconds.
 const CAMP_WALK_TIMEOUT_MS = 20000;
 const DAY_PHASE_SWEEP_MIN = 0.25; // a 12+ game-minute match at DAY_PERIOD_S 600
 //   sweeps more than one full cycle; anything under a quarter of one means the
@@ -335,8 +345,14 @@ const LAUNCH_ARGS = [
   '--enable-unsafe-swiftshader', // allow sw fallback; hardware ANGLE still preferred
 ];
 const LAUNCH_OPTS = {
-  headless: 'shell', // the shell's software pipeline never wedges (see e2e-kart)
-  args: LAUNCH_ARGS,
+  // New headless (multi-process), NOT the shell: measured 2026-10-01, the
+  // shell's single-process drain trails the server by ~35s under the snap
+  // flood (B's ring at tick 6123 vs ~12000 server), which makes every
+  // closed-loop check unobservable; new headless keeps rings within ~1-3s
+  // (points visibly banked) and renders fine here ((14) zero page errors,
+  // all behavior checks green). Kart keeps the shell per its own history.
+  headless: true,
+  args: [...LAUNCH_ARGS, '--use-gl=angle', '--use-angle=swiftshader'],
   protocolTimeout: Number(process.env.E2E_PROTOCOL_TIMEOUT ?? 300000),
   dumpio: !!process.env.E2E_DUMPIO,
 };
@@ -524,7 +540,7 @@ const lastSnap = (page) =>
     return s.length > 0 ? s[s.length - 1] : null;
   });
 /**
- * The newest snap TOGETHER with its freshness: at speed 20 the server pushes
+ * The newest snap TOGETHER with its freshness: at speed 10 the server pushes
  * hundreds of snaps/s per client, and a loaded page (SwiftShader raster +
  * JSON parse) can drain its websocket slower than messages arrive — the snap
  * ring then silently trails the server by seconds. snap.serverTime is the
@@ -817,8 +833,8 @@ async function main() {
 
   // ==========================================================================
   // EARLY GAME — walk to mid (the move assertion needs a destination; mid is
-  // where the waves meet), skill + cast on the way, watch the clash, THEN
-  // back to the fountain for the buy + gold checks.
+  // where the waves meet), cast on the way, watch the clash, THEN back to
+  // the fountain for the buy + gold checks.
   // ==========================================================================
   // (8) order('move') moves the hero: displacement > 4m from the order origin.
   // Target (42,42): 6m short of where the wave fronts meet on the diagonal.
@@ -858,7 +874,7 @@ async function main() {
       const lag = await snapLag(A);
       throw new Error(
         `move order never observable on a fresh snapshot within 120s — page lag=${lag.lagMs}ms at matchTick=${lag.tick} ` +
-          '(the client could not drain the speed-20 snap stream under load; retry on a quieter box or set E2E_VIEWPORT=640x360)',
+          '(the client could not drain the speed-10 snap stream under load; retry on a quieter box or set E2E_VIEWPORT=640x360)',
       );
     }
   }
@@ -869,46 +885,166 @@ async function main() {
       `displacement=${moved.d.toFixed(1)}m in ${moved.s.matchTick - pos0.mt} game-ticks target=(${moveTo.x},${moveTo.z})`,
   );
 
-  // (12a) skill(0) ranks up Q (heroes spawn with STARTING_SKILL_POINTS=1).
-  await A.evaluate(() => window.__rift.skill(0));
-  const ranked = await waitFor(
-    async () => {
-      const s = await lastSnap(A);
-      return s !== null && s.you !== null && s.you.abilities[0].rank === 1 ? s : null;
-    },
-    8000,
-    'abilities[0].rank === 1 after skill(0)',
-  );
+  // (12a) skill(slot) spends one banked point — RACING both pages with
+  // stale-tolerant reads, the survivor of 13 measured runs. What died:
+  //  - rank===1 mid-run: flap-ghost bots pre-spend (Q4 with 1 script call).
+  //  - at-lock spend: pre-lock count=1 banked; terminate lands ~lock+1s.
+  //  - single-subject bank-waits (A-only, B-only, mid-anchored): the OTHER
+  //    page always holds the point (twice inverted: poll-A→B-banks,
+  //    poll-B→A-banks) — whichever page flaps eats its points in ghosts.
+  //  - freshSnap-only race: rings trail 2-40s, so freshness-gated waits
+  //    never fire even with points visibly banked.
+  // What works: race both pages on lastSnap (a banked point is visible on
+  // at least one page in every run), spend into the first non-maxed q/w/e
+  // slot, and require the EXACT single-spend signature sustained — a stale
+  // bank just burns one 8s signature wait (the spend no-ops against the
+  // bot-eaten point) and the race re-opens; a live bank wins in ~2s. New
+  // headless keeps rings within ~1-3s so stale-banks are rare. 60s budget
+  // fits the ~260s speed-10 live window with 4x margin.
+  let ranked = null;
+  let spendBase = null;
+  let spendSubject = null;
+  let spendAttempts = 0;
+  const spendDeadline = Date.now() + 60000;
+  for (;;) {
+    spendAttempts += 1;
+    // Bank-race, phase-watched (manual loop: waitFor swallows throws).
+    let banked = null;
+    let turn = 0;
+    for (;;) {
+      const page = turn % 2 === 0 ? A : B;
+      turn += 1;
+      const x = await lastSnap(page);
+      if (x !== null && x.phase !== 'live') {
+        throw new Error(`match left live (phase=${x.phase}) before a skill point banked — attempt ${spendAttempts}`);
+      }
+      if (x !== null && x.you !== null && x.you.skillPoints >= 1) {
+        banked = x;
+        spendSubject = page;
+        break;
+      }
+      if (Date.now() > spendDeadline) {
+        throw new Error('timeout (60s) waiting for a banked skill point on either page');
+      }
+      await sleep(150);
+    }
+    const subjectTag = spendSubject === A ? 'A' : 'B';
+    const ranks = banked.you.abilities.map((a) => a.rank);
+    const slot = ranks.findIndex((r, i) => i < 3 && r < 4);
+    if (slot < 0) {
+      throw new Error(`q/w/e all maxed before the scripted spend (ranks=[${ranks}]) — nothing left to prove it with`);
+    }
+    spendBase = { slot, rank: ranks[slot], points: banked.you.skillPoints };
+    await spendSubject.evaluate((x) => window.__rift.skill(x), slot);
+    try {
+      ranked = await waitFor(
+        async () => {
+          const x = await lastSnap(spendSubject);
+          return x !== null &&
+            x.you !== null &&
+            x.you.abilities[spendBase.slot].rank === spendBase.rank + 1 &&
+            x.you.skillPoints === spendBase.points - 1
+            ? x
+            : null;
+        },
+        8000,
+        `[${subjectTag}] abilities[${spendBase.slot}].rank === ${spendBase.rank + 1} with skillPoints === ${spendBase.points - 1} after skill(${slot})`,
+      );
+    } catch {
+      if (Date.now() > spendDeadline) throw new Error('no clean skill-spend window within 60s (flaps?)');
+      continue; // stale bank or mid-attempt flap: re-open the race
+    }
+    // Sustained hold: an active bot drains every tick, so an unchanged
+    // signature 1.5s later attributes the spend to our skill(), not the bot.
+    await sleep(1500);
+    const held = await lastSnap(spendSubject);
+    if (
+      held !== null &&
+      held.you !== null &&
+      held.you.abilities[spendBase.slot].rank === spendBase.rank + 1 &&
+      held.you.skillPoints === spendBase.points - 1
+    ) {
+      break;
+    }
+    if (Date.now() > spendDeadline) throw new Error('skill-spend signature never held still within 60s (flaps?)');
+  }
   check(
-    '(12a) skill(0) spends the spawn skill point -> Q rank 1',
+    `(12a) skill(${spendBase.slot}) spends one banked point -> rank+1, points-1 (sustained)`,
     true,
-    `ranks=[${ranked.you.abilities.map((a) => a.rank)}] skillPoints=${ranked.you.skillPoints}`,
+    `subject=${spendSubject === A ? 'A' : 'B'} base rank=${spendBase.rank} points=${spendBase.points} -> ` +
+      `ranks=[${ranked.you.abilities.map((a) => a.rank)}] skillPoints=${ranked.you.skillPoints} ` +
+      `attempts=${spendAttempts}`,
   );
 
   // (12b) cast fires. Reaver Q (Cleave) is targeting:'none' — legal with no
-  // target at the fountain. Evidence: a rift_cast event carrying OUR ent id,
-  // or the ability cooldown landing ahead of matchTick.
+  // target. Evidence: a rift_cast event carrying OUR ent id, or the ability
+  // cooldown landing ahead of matchTick.
+  // Retry-until-evidence (same lesson as (12a)): a single cast(0) is a flap
+  // lottery ticket — a ghost window eats the message (bridged late or not at
+  // all), and a bot cast inside the window leaves Q on cooldown so ours
+  // no-ops (observed: abort with cdUntilTick=3826 < matchTick=4989, i.e. our
+  // cast never applied). Each attempt therefore waits for Q PROVABLY READY
+  // (ranked + off cooldown in the ring) before casting — while connected no
+  // bot casts, so a ready Q stays ready until WE fire — then waits for
+  // evidence. Cleave's cooldown is 8 game-sec (~0.8s wall at speed 10) and
+  // costs 40 mana, so retries space naturally and mana regens between them.
   const myEnt = await ownEntId(A);
-  await A.evaluate(() => window.__rift.cast(0));
-  const castEvidence = await waitFor(
-    async () => {
-      const [evs, s] = await Promise.all([lastEvents(A), lastSnap(A)]);
-      if (s === null || s.you === null) return null;
-      const ev = evs.find((e) => e.t === 'rift_cast' && e.id === myEnt && e.slot === 0);
-      if (ev !== undefined) return { kind: 'event', ev, s };
-      if (s.you.abilities[0].cdUntilTick > s.matchTick) return { kind: 'cooldown', s };
-      return null;
-    },
-    8000,
-    'rift_cast evidence for our hero',
-  );
+  let castEvidence = null;
+  let castAttempts = 0;
+  const castDeadline = Date.now() + 60000;
+  for (;;) {
+    castAttempts += 1;
+    // Ready-wait, phase-watched: ranked + off-cooldown + alive enough to cast.
+    // (Dead heroes can't cast; respawn is quick at these levels, so the wait
+    // covers death too — hp>0 joins the predicate.)
+    const ready = await waitFor(
+      async () => {
+        const s = await lastSnap(A);
+        if (s === null || s.phase !== 'live') return null;
+        if (s.you === null || s.you.hp <= 0) return null;
+        if (s.you.abilities[0].rank < 1 || s.you.abilities[0].cdUntilTick > s.matchTick) return null;
+        return s;
+      },
+      Math.max(1000, Math.min(15000, castDeadline - Date.now())),
+      'Q ranked + off cooldown + alive on A',
+    ).catch(() => null); // ready window missed: retry below (covers flap-eaten polls)
+    if (ready === null) {
+      // waitFor swallows predicate throws, so the phase check lives here:
+      // a match that ended fails fast with its own message.
+      const cur = await lastSnap(A);
+      if (cur !== null && cur.phase !== 'live') {
+        throw new Error(`match left live (phase=${cur.phase}) during cast attempts`);
+      }
+      if (Date.now() > castDeadline) throw new Error('Q never observed ready within 60s (flaps?)');
+      continue;
+    }
+    await A.evaluate(() => window.__rift.cast(0));
+    try {
+      castEvidence = await waitFor(
+        async () => {
+          const [evs, s] = await Promise.all([lastEvents(A), lastSnap(A)]);
+          if (s === null || s.you === null) return null;
+          const ev = evs.find((e) => e.t === 'rift_cast' && e.id === myEnt && e.slot === 0);
+          if (ev !== undefined) return { kind: 'event', ev, s };
+          if (s.you.abilities[0].cdUntilTick > s.matchTick) return { kind: 'cooldown', s };
+          return null;
+        },
+        8000,
+        'rift_cast evidence for our hero',
+      );
+      break;
+    } catch {
+      if (Date.now() > castDeadline) throw new Error('no cast evidence within 60s (flaps?)');
+      // Flap ate the cast or a bot re-cd'd Q mid-attempt: re-ready and refire.
+    }
+  }
   check(
     '(12b) cast(0) fires without error (rift_cast event or cooldown set)',
     true,
-    castEvidence.kind === 'event'
+    (castEvidence.kind === 'event'
       ? `rift_cast{id=${castEvidence.ev.id} slot=${castEvidence.ev.slot} at (${castEvidence.ev.x},${castEvidence.ev.z})}`
       : `cooldown: cdUntilTick=${castEvidence.s.you.abilities[0].cdUntilTick} > matchTick=${castEvidence.s.matchTick} ` +
-        `(mana ${castEvidence.s.you.mana.toFixed(0)}/${castEvidence.s.you.maxMana})`,
+        `(mana ${castEvidence.s.you.mana.toFixed(0)}/${castEvidence.s.you.maxMana})`) + ` attempts=${castAttempts}`,
   );
 
   // ==========================================================================
@@ -1148,7 +1284,7 @@ async function main() {
   const totalWallS = ((Date.now() - t0) / 1000).toFixed(1);
   const gameS = ended.snap !== null ? (ended.snap.matchTick / TICK_RATE).toFixed(0) : '?';
   check(
-    "(13) the match ENDS by 'ancient' (bots push at speed 20)",
+    "(13) the match ENDS by 'ancient' (bots push at speed 10)",
     ended.end.reason === 'ancient' && ended.end.winner !== null && ended.s?.phase === 'ended',
     `reason=${ended.end.reason} winner=team${ended.end.winner} phase=${ended.s?.phase} ` +
       `game-time=${gameS}s wall: begin->end=${endWallS}s total=${totalWallS}s kills=[${ended.snap?.kills}]`,

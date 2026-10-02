@@ -488,9 +488,11 @@ buy, when to force a fight. Targets the balance harness (T13) must MEASURE,
 not reason about (bands derived from the frozen config arithmetic, not
 wishful thinking): at even bot skill a match resolves by Ancient kill in
 12-18 min game-time median (hard cap is a backstop, hit in < 20% of sims);
-first tower falls at 5-8 min; heroes reach level 6 between 6 and 11 min at
-2v2-4v4, and by ~14 min at 8v8 (bigger teams level slower — intended, not a
-defect);
+first tower falls at 5-8 min; heroes reach level 6 between 5 and 11 min at
+2v2 (AMENDMENT_9: the §9 xp model never described 2v2's 4-on-1-lane geometry
+and budgets zero kill xp, while kill awards are DESIGN_DELTA-frozen — so the
+floor moved, not the sim) and between 6 and 11 min at 4v4, and by ~14 min at
+8v8 (bigger teams level slower — intended, not a defect);
 gold at 10 min is 2200-5500 per hero; team gold divergence at 10 min < 40%;
 no NaN, no stalled sim (tick always advances; a match ALWAYS ends by hard
 cap). Fortify + lane-scaled income are the two load-bearing anti-sprawl

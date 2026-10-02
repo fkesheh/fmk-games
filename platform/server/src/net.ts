@@ -66,6 +66,15 @@ function cachePolicy(filePath: string): string {
 
 const MAX_PAYLOAD = 16 * 1024; // wire messages are tiny; bigger frames are abuse
 
+// Flood coalescing: past this much queued-but-unsent bytes, a frame whose tag
+// matches the last SENT frame is dropped (superseded — the next tick's frame
+// carries newer state). Without it a hot broadcast (170 snaps/s x ~10KB)
+// outruns a slow drainer, the backlog grows to megabytes, the liveness pings
+// queue behind it past MAX_MISSED_PONGS, and the server flap-kills a healthy
+// client (measured: 2.6MB buffered at terminate). 64KB ≈ 6 snaps of slack —
+// the pings behind it drain in well under one heartbeat.
+const COALESCE_BYTES = 64 * 1024;
+
 // Liveness policy: heartbeat pings double as a dead-peer detector. A pong
 // clears the count; 2 consecutive unanswered protocol pings (≈2 heartbeat
 // intervals, well under NET.inputTimeoutMs) mean the connection is hard-dropped
@@ -84,19 +93,38 @@ export class Session {
   private pingSentAt = 0;
   private missedPongs = 0;
   private rtt = 0;
+  private lastSentTag: string | null = null;
 
   constructor(id: PlayerId, ws: WebSocket) {
     this.id = id;
     this.ws = ws;
   }
 
-  /** JSON via encodeS2C; no-op when the socket is not open. */
-  send(msg: S2C): void {
-    if (this.ws.readyState !== WebSocket.OPEN) return;
+  /**
+   * JSON via encodeS2C; no-op when the socket is not open. Returns the encoded
+   * frame length for the P0-1 wire meter (UTF-16 units; JSON snapshots are
+   * ASCII-dominated so this ≈ wire bytes), or 0 when nothing was sent.
+   *
+   * Flood coalescing (COALESCE_BYTES): a backlogged socket drops a frame
+   * whose tag repeats the last SENT frame — hot periodic broadcasts (snaps,
+   * states) are latest-wins, so the queued copies are already stale and the
+   * next tick re-sends fresher. Rare tags (welcome, hello, errors, events)
+   * never repeat consecutively in practice, so they always flush — EXCEPT a
+   * duplicate sent while already backlogged (e.g. a second error in the same
+   * flood episode), which is acceptable loss: the client is drowning and the
+   * alternative is liveness death for the whole connection.
+   */
+  send(msg: S2C): number {
+    if (this.ws.readyState !== WebSocket.OPEN) return 0;
+    if (msg.t === this.lastSentTag && this.ws.bufferedAmount > COALESCE_BYTES) return 0; // superseded
     try {
-      this.ws.send(encodeS2C(msg));
+      const frame = encodeS2C(msg);
+      this.ws.send(frame);
+      this.lastSentTag = msg.t;
+      return frame.length;
     } catch {
       // socket died mid-send; the 'close' event drives cleanup
+      return 0;
     }
   }
 

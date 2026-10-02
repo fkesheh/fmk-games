@@ -1,6 +1,7 @@
 // ============================================================================
-// ANCIENTS (rift) — NET (T8). One `/ws` socket, wordbomb-style: send is a
-// no-op unless OPEN, malformed frames are dropped (never thrown on wire data),
+// ANCIENTS (rift) — NET (T8). One `/ws` socket, wordbomb-style: send queues
+// (bounded) while CONNECTING or in the reconnect-backoff null gap and flushes
+// FIFO on the next open; malformed frames are dropped (never thrown on wire data),
 // clock offset comes from the platform ping/pong, and a dropped socket
 // reconnects with exponential backoff (game.ts re-seats via `rift.resume`).
 //
@@ -53,7 +54,11 @@ export interface NetHooks {
 }
 
 export interface NetHandle {
-  /** No-op unless the socket is OPEN (mirrors the server's Session.send). */
+  /**
+   * Sends when the socket is OPEN; queues (bounded, flushed FIFO on the next
+   * open) while CONNECTING or in the reconnect-backoff null gap; drops only
+   * on a CLOSING/CLOSED socket object.
+   */
   send(msg: LobbyC2S | RiftC2S): void;
   /** Server-clock estimate: Date.now() + ping/pong offset. */
   serverNow(): number;
@@ -71,6 +76,7 @@ export interface NetHandle {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 10000;
 const MSG_LOG_MAX = 4000;
+const SEND_QUEUE_CAP = 32; // outbound frames held while the socket is CONNECTING
 
 // ---- wire parsing (platform style: invalid => null, never throw) ----------------
 function isObj(v: unknown): v is Record<string, unknown> {
@@ -544,6 +550,16 @@ export interface CreateNetOpts {
 
 export function createNet(hooks: NetHooks, opts?: CreateNetOpts): NetHandle {
   let ws: WebSocket | null = null;
+  // Frames sent while there is no healthy-open socket — CONNECTING handshake
+  // or the reconnect-backoff null gap — flushed FIFO on the next open. Without
+  // this a menu join fired during the handshake silently vanished (the
+  // STRICKEN "Reserving a slot…" hang — same race, same fix; outpost's Net
+  // already had the bounded-queue shape this mirrors), and a join fired in
+  // the null gap after a drop vanished the same way (e2e-rift check 4 flaked
+  // on exactly that). The queue is NEVER cleared on close: every close
+  // schedules a redial, so every gap ends in a flush; the cap bounds how stale
+  // a replayed join can be, and a stale room answer is just a no_room notice.
+  const sendQueue: (LobbyC2S | RiftC2S)[] = [];
   let offset = 0; // serverNow = Date.now() + offset
   let backoffMs = RECONNECT_BASE_MS;
   const log: unknown[] = [];
@@ -576,6 +592,8 @@ export function createNet(hooks: NetHooks, opts?: CreateNetOpts): NetHandle {
     sock.onclose = () => {
       if (ws !== sock) return; // stale socket from a previous connect()
       ws = null;
+      // the queue BRIDGES this gap (never cleared here): the redial below
+      // always follows, and its open flushes whatever was sent meanwhile
       hooks.onClose();
       window.setTimeout(connect, backoffMs);
       backoffMs = Math.min(backoffMs * 2, RECONNECT_MAX_MS);
@@ -589,6 +607,18 @@ export function createNet(hooks: NetHooks, opts?: CreateNetOpts): NetHandle {
           sock.send(JSON.stringify(m));
         } catch {
           break; // racing a close — drop the frame
+        }
+      }
+      // Auth first (see above): queued joins may depend on it. Flush only onto
+      // the live socket — a superseded one's queue was already cleared.
+      if (ws === sock) {
+        const queued = sendQueue.splice(0, sendQueue.length);
+        for (const m of queued) {
+          try {
+            sock.send(JSON.stringify(m));
+          } catch {
+            break; // racing a close — drop the frame
+          }
         }
       }
     };
@@ -611,7 +641,15 @@ export function createNet(hooks: NetHooks, opts?: CreateNetOpts): NetHandle {
   return {
     send(msg: LobbyC2S | RiftC2S): void {
       const sock = ws;
-      if (sock === null || sock.readyState !== WebSocket.OPEN) return;
+      if (sock === null || sock.readyState === WebSocket.CONNECTING) {
+        // no healthy-open socket: hold for the next open (null = backoff gap,
+        // and a redial is always scheduled — the flush is guaranteed). The
+        // cap sheds the oldest past 32; a stale replayed join just answers.
+        if (sendQueue.length >= SEND_QUEUE_CAP) sendQueue.shift();
+        sendQueue.push(msg);
+        return;
+      }
+      if (sock.readyState !== WebSocket.OPEN) return; // CLOSING/CLOSED: drop
       try {
         sock.send(JSON.stringify(msg));
       } catch {

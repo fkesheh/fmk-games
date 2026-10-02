@@ -37,6 +37,7 @@ import {
   RESPAWN_BASE_S,
   RESPAWN_PER_LEVEL_S,
   STARTING_GOLD,
+  SURGE_EXTRA_MELEE_MAX,
   SURGE_EXTRA_MELEE_PERIOD_S,
   SURGE_WAVE_GROWTH,
   TICK_DT,
@@ -169,13 +170,10 @@ describe('wave spawner', () => {
     // at the boundary tick still use pre-overtime growth: stepUnits runs
     // before the overtime flip inside advance())
     const firstOt = Math.floor((OVERTIME_AT_S - WAVE_FIRST_AT_S) / WAVE_PERIOD_S) + 1;
-    // first wave at least one full extra-melee period into overtime
-    const surged = Math.ceil(
-      (OVERTIME_AT_S + SURGE_EXTRA_MELEE_PERIOD_S - WAVE_FIRST_AT_S) / WAVE_PERIOD_S,
-    );
-    expect(surged).toBeGreaterThan(firstOt);
-    const surgedExtra = extraMeleeAt(surged);
-    expect(surgedExtra).toBeGreaterThanOrEqual(1);
+    // NOTE: no wave-INDEX derivation for the deep-overtime checkpoint below:
+    // wave indices stopped mapping to fixed ticks when 423e59b shrank the OT
+    // wave period, so that checkpoint marches by TIME and catches whatever
+    // wave spawns next instead of assuming one lands on a computed tick.
     // The march to the surged wave spans many unmanaged waves; surge-grown
     // survivors push lanes and would kill an ancient, ending the world
     // (advance() no-ops once ended) before the checkpoint. Topping hp up
@@ -216,21 +214,40 @@ describe('wave spawner', () => {
     const baseWave = mobilesOf(w, 'melee', 0).filter((c) => !seen.has(c.id));
     expect(baseWave).toHaveLength(WAVE_MELEE + extraMeleeAt(base));
     expect(extraMeleeAt(base)).toBe(0); // scenario premise: < 1 OT period elapsed
-    expect(baseWave[0]?.maxHp).toBeCloseTo(
-      CREEP_MELEE.hp * Math.pow(1 + SURGE_WAVE_GROWTH, base),
-      4,
-    );
+    // Growth is piecewise since 761bdf1 (deliberate: the surge compounds FROM
+    // the overtime boundary instead of recomputing the whole match at the
+    // surge rate): normal growth up to the boundary wave, surge rate on the
+    // waves elapsed since. Continuous across the boundary by construction.
+    const otIndex = Math.ceil(OVERTIME_AT_S / WAVE_PERIOD_S);
+    const expectedMult =
+      Math.pow(1 + WAVE_GROWTH, Math.min(base, otIndex)) *
+      Math.pow(1 + SURGE_WAVE_GROWTH, Math.max(0, base - otIndex));
+    expect(baseWave[0]?.maxHp).toBeCloseTo(CREEP_MELEE.hp * expectedMult, 4);
     clearCreeps();
-    // one full extra-melee period into overtime: +surgedExtra melee per wave.
-    // The march spans many intermediate waves whose survivors are NOT in the
-    // base snapshot — re-snapshot on the tick before the surged wave spawns
-    // so only its own creeps count as new.
-    advanceSafely(WAVE_TICK(surged) - 1 - w.tick);
+    // One full extra-melee period into overtime: march by TIME past
+    // OVERTIME_AT_S + SURGE_EXTRA_MELEE_PERIOD_S, re-snapshot, then catch the
+    // next fresh wave. Periods only ever shrink below WAVE_PERIOD_S, so a wave
+    // is guaranteed within one full period of ticks from any starting tick.
+    advanceSafely(Math.round((OVERTIME_AT_S + SURGE_EXTRA_MELEE_PERIOD_S) * TICK_RATE) - w.tick);
     seen.clear();
     for (const e of w.mobiles()) seen.add(e.id);
-    w.advance();
-    const surgedWave = mobilesOf(w, 'melee', 0).filter((c) => !seen.has(c.id));
-    expect(surgedWave).toHaveLength(WAVE_MELEE + surgedExtra);
+    const periodTicks = Math.round(WAVE_PERIOD_S * TICK_RATE);
+    let surgedWave: Ent[] = [];
+    let spawnTick = w.tick;
+    for (let i = 0; i < periodTicks + 1 && surgedWave.length === 0; i++) {
+      advanceSafely(1);
+      spawnTick = w.tick;
+      surgedWave = mobilesOf(w, 'melee', 0).filter((c) => !seen.has(c.id));
+    }
+    expect(surgedWave.length).toBeGreaterThan(0); // a wave MUST land inside one period
+    // Extra melee is a pure function of spawn TIME (capped): derive the count
+    // from the tick the wave actually spawned on, not from a wave index.
+    const extraAtSpawn = Math.min(
+      SURGE_EXTRA_MELEE_MAX,
+      Math.floor((spawnTick * TICK_DT - OVERTIME_AT_S) / SURGE_EXTRA_MELEE_PERIOD_S),
+    );
+    expect(extraAtSpawn).toBeGreaterThanOrEqual(1); // premise: ≥1 period into OT
+    expect(surgedWave).toHaveLength(WAVE_MELEE + extraAtSpawn);
   }, 20000);
 });
 

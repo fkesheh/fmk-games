@@ -2479,3 +2479,85 @@ describe('GameRoom rejoin (identity contract §2.3)', () => {
     room.stop();
   }, 60_000);
 });
+
+// ---------------------------------------------------------------------------
+// P1 COLD MODE (setHosted). The server instance of a player-hosted room:
+// seats + liveness + join payloads only. The lobby never calls start() on
+// hosted rooms, so every assertion reads info()/stalePlayers()/io directly.
+// ---------------------------------------------------------------------------
+
+describe('GameRoom cold mode (P1 setHosted)', () => {
+  it('start is ignored while cold (phase stays warmup, nothing emitted)', () => {
+    const io = new FakeIO();
+    const room = new GameRoom('dustbowl', 'public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.addPlayer('p2', 'Bravo');
+    room.setHosted(true);
+    const eventsBefore = io.events('p1').length + io.events('p2').length;
+
+    room.handleMessage('p1', { t: 'start' });
+
+    expect(room.info().phase).toBe('warmup');
+    // Join payloads (player_joined) predate the press and MUST keep flowing;
+    // the press itself emits nothing.
+    expect(io.events('p1').length + io.events('p2').length).toBe(eventsBefore);
+    expect(io.errors('p1')).toEqual([]);
+  });
+
+  it('inputs touch liveness but sim nothing (a flood kicks nobody)', () => {
+    const io = new FakeIO();
+    const room = new GameRoom('dustbowl', 'public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.addPlayer('p2', 'Bravo');
+    room.setHosted(true);
+
+    vi.advanceTimersByTime(NET.inputTimeoutMs + 1000);
+    expect(room.stalePlayers().sort()).toEqual(['p1', 'p2']); // both quiet => both stale
+    room.handleMessage('p1', { t: 'input', seq: 1, moveX: 0, moveZ: 0, yaw: 0, pitch: 0, buttons: 0 });
+    expect(room.stalePlayers()).toEqual(['p2']); // p1's liveness touched
+
+    // A speedhack flood against a cold room kicks NOBODY (the host sim judges;
+    // a warmup kick would purge the seat and drop playerCount to 1).
+    for (let s = 2; s < 2 + NET.inputQueueCap + 50; s++) {
+      room.handleMessage('p1', { t: 'input', seq: s, moveX: 0, moveZ: 0, yaw: 0, pitch: 0, buttons: 0 });
+    }
+    expect(room.playerCount()).toBe(2);
+    expect(io.errors('p1')).toEqual([]);
+  });
+
+  it('setHosted(false) restores the full sim (central-fallback un-cold path)', () => {
+    const io = new FakeIO();
+    const room = new GameRoom('dustbowl', 'public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.addPlayer('p2', 'Bravo');
+    room.setHosted(true);
+    room.handleMessage('p1', { t: 'start' });
+    expect(room.info().phase).toBe('warmup');
+
+    room.setHosted(false);
+    room.handleMessage('p1', { t: 'start' });
+
+    expect(room.info().phase).toBe('freeze'); // beginFreeze runs synchronously
+  });
+});
+
+// ---- hasRebindableSeats (platform empty-room sweep grace) ---------------------
+
+describe('hasRebindableSeats', () => {
+  it('false when all connected; a mid-match drop parks a ghost; rebind clears it', () => {
+    // Past warmup: warmup-phase drops delete outright (no ghost to rebind).
+    const io = new FakeIO();
+    const room = new GameRoom('dustbowl', 'public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.addPlayer('p2', 'Bravo');
+    startMatch(room, 'p1');
+    expect(room.hasRebindableSeats()).toBe(false);
+
+    room.removePlayer('p1'); // mid-match drop: ghost (seat retained)
+    expect(room.hasRebindableSeats()).toBe(true);
+
+    room.addPlayer('p1b', 'Alpha', 'p1'); // resume rebinds the ghost
+    expect(room.hasRebindableSeats()).toBe(false);
+    room.stop();
+  });
+});

@@ -25,6 +25,7 @@ import {
   GATES,
   GATE_RADIUS,
   INPUT_QUEUE_CAP,
+  INPUT_STALE_MS,
   KART_RADIUS,
   KART_RESTITUTION,
   LAPS_TO_WIN,
@@ -2409,6 +2410,82 @@ describe('KartRoom championship', () => {
     expect(io.snaps('p1').length).toBeGreaterThan(SNAPSHOT_HZ);
     expect(io.snaps('p1').every((s) => s.championship === null)).toBe(true);
     expect(io.snaps('p1').every((s) => s.trackId === DEFAULT_TRACK_ID)).toBe(true);
+    room.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P1 COLD MODE (setHosted). Seats + liveness only; the lobby never calls
+// start() on hosted rooms, so every assertion reads info()/stalePlayers()
+// directly instead of snapshots.
+// ---------------------------------------------------------------------------
+
+describe('KartRoom cold mode (P1 setHosted)', () => {
+  it('start is ignored while cold (phase stays lobby)', () => {
+    const io = new FakeIO();
+    const room = new KartRoom(DEFAULT_TRACK_ID, 'public', io);
+    room.addPlayer('p1', 'Ada');
+    room.addPlayer('p2', 'Bob');
+    room.setHosted(true);
+
+    room.handleMessage('p1', { t: 'start' });
+
+    expect(room.info().phase).toBe('lobby');
+  });
+
+  it('any valid message touches liveness; nitro/start/queue change nothing', () => {
+    const io = new FakeIO();
+    const room = new KartRoom(DEFAULT_TRACK_ID, 'public', io);
+    room.addPlayer('p1', 'Ada');
+    room.addPlayer('p2', 'Bob');
+    room.setHosted(true);
+
+    vi.advanceTimersByTime(INPUT_STALE_MS + 1000);
+    expect(room.stalePlayers().sort()).toEqual(['p1', 'p2']);
+    sendInput(room, 'p1', 1);
+    expect(room.stalePlayers()).toEqual(['p2']); // p1's liveness touched
+    room.handleMessage('p1', { t: 'nitro' });
+    room.handleMessage('p1', { t: 'start' });
+    for (let s = 2; s < 2 + INPUT_QUEUE_CAP + 10; s++) sendInput(room, 'p1', s);
+    expect(room.info().phase).toBe('lobby');
+    expect(room.playerCount()).toBe(2);
+  });
+
+  it('setHosted(false) restores the full sim (central-fallback un-cold path)', () => {
+    const io = new FakeIO();
+    const room = new KartRoom(DEFAULT_TRACK_ID, 'public', io);
+    room.addPlayer('p1', 'Ada');
+    room.addPlayer('p2', 'Bob');
+    room.setHosted(true);
+    room.handleMessage('p1', { t: 'start' });
+    expect(room.info().phase).toBe('lobby');
+
+    room.setHosted(false);
+    room.handleMessage('p1', { t: 'start' });
+
+    expect(room.info().phase).toBe('ready'); // tryStart runs synchronously
+  });
+});
+
+// ---- hasRebindableSeats (platform empty-room sweep grace) ---------------------
+
+describe('hasRebindableSeats', () => {
+  it('false when all connected; a drop parks a ghost; rebind or explicit leave clears it', () => {
+    const io = new FakeIO();
+    const room = new KartRoom(DEFAULT_TRACK_ID, 'public', io);
+    room.addPlayer('p1', 'Alpha');
+    room.addPlayer('p2', 'Bravo');
+    expect(room.hasRebindableSeats()).toBe(false);
+
+    room.removePlayer('p1'); // drop: ghost (seat kept for rejoin)
+    expect(room.hasRebindableSeats()).toBe(true);
+
+    room.addPlayer('p1b', 'Alpha', 'p1'); // resume rebinds the ghost
+    expect(room.hasRebindableSeats()).toBe(false);
+
+    room.removePlayer('p1b', true); // explicit leave: seat deleted, no ghost
+    room.removePlayer('p2', true);
+    expect(room.hasRebindableSeats()).toBe(false);
     room.stop();
   });
 });

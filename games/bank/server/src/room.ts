@@ -153,6 +153,19 @@ export class BankRoom implements GameRoomHandle {
     return out;
   }
 
+  /**
+   * Ghost census for the platform's empty-room sweep: any disconnected entry
+   * is a seat a resume/sig rejoin could still rebind (entries persist until
+   * the round-boundary purge), so the room is "reconnecting" and gets grace
+   * instead of an immediate stop.
+   */
+  hasRebindableSeats(): boolean {
+    for (const p of this.players.values()) {
+      if (!p.connected) return true;
+    }
+    return false;
+  }
+
   addPlayer(id: PlayerId, name: string, resume?: PlayerId, sig?: string): void {
     try {
       const now = Date.now();

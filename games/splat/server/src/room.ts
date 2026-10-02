@@ -273,6 +273,19 @@ export class SplatRoom implements GameRoomHandle {
   }
 
   /**
+   * Ghost census for the platform's empty-room sweep: any disconnected seat
+   * is one a resume/sig rejoin could still rebind (the exact predicate
+   * findGhost matches), so the room is "reconnecting" and gets grace instead
+   * of an immediate stop.
+   */
+  hasRebindableSeats(): boolean {
+    for (const p of this.players.values()) {
+      if (!p.connected) return true;
+    }
+    return false;
+  }
+
+  /**
    * Seat a joiner:
    *   1. `id` itself already has a row -> same-session re-add: refresh only.
    *   2. else `resume` names a ghost's playerId -> rebind onto the new id.

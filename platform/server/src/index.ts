@@ -20,7 +20,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type { GameModule } from '@platform/shared';
 import { NetServer, probeDevServer, type Mount } from './net.js';
-import { Lobby } from './lobby.js';
+import { Lobby, parseLobbyOpts } from './lobby.js';
 import { createPwaResolver, type PwaIdentity } from './pwa.js';
 import { GAMES } from './registry.js';
 import { Store } from './services/db.js';
@@ -41,6 +41,15 @@ const store = new Store(DB_PATH);
 if (store.degraded) console.log('[platform] db degraded — running in-memory');
 
 /**
+ * E2E/CI escape hatch: PLATFORM_STATIC=1 forces every mount to serve its
+ * built client statically and skips the vite-dev probe entirely. Production
+ * behaves this way already (no vite runs there); the flag only matters on
+ * dev machines where a FOREIGN process squats on a game's devPort and would
+ * otherwise hijack the mount into a proxy of the wrong server.
+ */
+const FORCE_STATIC_MOUNTS = process.env.PLATFORM_STATIC === '1' || process.env.PLATFORM_STATIC === 'true';
+
+/**
  * Mounts for the multi-game layout: one '/<id>/' prefix per registered
  * module. A module whose devPort answers the one-shot probe is proxied to
  * that vite dev server (single dev entry point through this server);
@@ -52,7 +61,7 @@ async function resolveMounts(modules: readonly GameModule[]): Promise<Mount[]> {
   const resolved = await Promise.all(
     modules.map(async (mod): Promise<Mount | null> => {
       const prefix = `/${mod.id}/`;
-      if (mod.devPort !== undefined && (await probeDevServer(mod.devPort, prefix))) {
+      if (!FORCE_STATIC_MOUNTS && mod.devPort !== undefined && (await probeDevServer(mod.devPort, prefix))) {
         return { kind: 'proxy', prefix, port: mod.devPort };
       }
       if (existsSync(path.join(mod.clientDist, 'index.html'))) {
@@ -533,7 +542,8 @@ ${swScript}  </body>
 }
 
 const api = new HttpApi({ store, games: GAMES });
-const lobby = new Lobby(GAMES, store);
+// P0-3: PLATFORM_MAX_ROOMS / PLATFORM_SWEEP_ROOMS tune capacity without a redeploy.
+const lobby = new Lobby(GAMES, store, parseLobbyOpts(process.env));
 const net = new NetServer({
   onMessage: (sess, msg) => lobby.handleMessage(sess, msg),
   onDisconnect: (sess) => lobby.handleDisconnect(sess),
@@ -577,9 +587,21 @@ resolveMounts(GAMES)
 
 // 1s sweep: rooms report input-stale players; their sockets are closed here.
 // The same poll reaps empty rooms.
+const WIRE_METER_LOG = process.env.WIRE_METER_LOG === '1'; // P0-1: totals + top-3 rooms every 30s
+let sweepCount = 0;
 const sweep = setInterval(() => {
   try {
     for (const sess of lobby.pollStaleSessions()) sess.close();
+    sweepCount += 1;
+    if (WIRE_METER_LOG && sweepCount % 30 === 0) {
+      const w = lobby.wireStats();
+      const top = [...w.rooms]
+        .sort((a, b) => b.bytes - a.bytes)
+        .slice(0, 3)
+        .map((r) => `${r.gameId}:${r.roomId}=${r.bytes}B`)
+        .join(' ');
+      console.log(`[lobby] wire ${w.messages} msgs ${w.bytes}B across ${w.rooms.length} rooms${top === '' ? '' : ` top: ${top}`}`);
+    }
   } catch (err) {
     console.error('[server] stale sweep failed', err);
   }

@@ -12,8 +12,10 @@
 //   - autoReconnect: exponential backoff 0.5s→8s, RESET on successful open;
 //     after every open authPayload() is sent when it returns non-null (the
 //     facade supplies `{t:'auth',token}` — this replays it on reconnect).
-//   - send() no-ops unless OPEN; onClose(clean) fires ONCE per drop and is
-//     suppressed for explicit close().
+//   - send() sends when OPEN and queues (bounded, flushed FIFO on the next
+//     open) while CONNECTING or in the reconnect-backoff null gap; drops only
+//     on a CLOSING/CLOSED socket object. onClose(clean) fires ONCE per drop
+//     and is suppressed for explicit close().
 //
 // DOM-free where possible: the only browser globals touched are WebSocket,
 // performance (Node has both) and `location` — read through guarded globalThis.
@@ -27,6 +29,7 @@ const CONNECT_TIMEOUT_MS = 5000;
 const PING_EMA_ALPHA = 0.2;
 const BACKOFF_FIRST_MS = 500;
 const BACKOFF_MAX_MS = 8000;
+const SEND_QUEUE_CAP = 32; // outbound frames held while the socket is CONNECTING
 
 export interface SdkNetOpts {
   /** Retry dropped connections with exp backoff (default false). */
@@ -90,6 +93,16 @@ export class SdkNet implements SdkConnection {
   private offset = 0; // ms; 0 until the first pong (serverNow then = perf clock)
   private bestRtt = Infinity;
   private userClosed = false;
+  // Frames sent while there is no healthy-open socket — CONNECTING handshake
+  // or the reconnect-backoff null gap — flushed FIFO on the next open. Without
+  // this a join fired during the handshake silently vanished (the STRICKEN
+  // "Reserving a slot…" hang — same race, same fix; outpost's Net already had
+  // the bounded-queue shape this mirrors), and a join fired in the null gap
+  // after a drop vanished the same way. The queue bridges auto-redial gaps
+  // (never cleared by teardown/closeSocket); only a manual connect(), a dial
+  // failure, or an explicit close() discards it. Bounded: oldest drops past
+  // the cap.
+  private sendQueue: C2S[] = [];
 
   constructor(opts: SdkNetOpts = {}) {
     this.opts = opts;
@@ -116,13 +129,27 @@ export class SdkNet implements SdkConnection {
     this.userClosed = false;
     this.backoffMs = BACKOFF_FIRST_MS;
     this.cancelReconnect();
+    this.sendQueue = []; // fresh manual intent supersedes anything bridged
+    this.url = target; // the auto-redial target (teardown redials this url)
     return this.dial(target);
   }
 
-  /** No-op unless the socket is open (mirrors the server's Session.send). */
+  /**
+   * Sends when the socket is open; queues (bounded, flushed FIFO on the next
+   * open) while CONNECTING or in the reconnect-backoff null gap; drops only
+   * on a CLOSING/CLOSED socket object.
+   */
   send(msg: C2S): void {
     const ws = this.ws;
-    if (ws === null || ws.readyState !== WebSocket.OPEN) return;
+    if (ws === null || ws.readyState === WebSocket.CONNECTING) {
+      // no healthy-open socket: hold for the next open. With autoReconnect a
+      // redial is scheduled and the flush is guaranteed; without one the next
+      // manual connect() discards the queue (fresh intent supersedes).
+      if (this.sendQueue.length >= SEND_QUEUE_CAP) this.sendQueue.shift();
+      this.sendQueue.push(msg);
+      return;
+    }
+    if (ws.readyState !== WebSocket.OPEN) return; // CLOSING/CLOSED: drop
     try {
       ws.send(JSON.stringify(msg));
     } catch {
@@ -146,6 +173,7 @@ export class SdkNet implements SdkConnection {
     this.generation++;
     this.stopPing();
     this.cancelReconnect();
+    this.sendQueue = [];
     const ws = this.ws;
     this.ws = null;
     if (ws !== null && ws.readyState !== WebSocket.CLOSED) {
@@ -178,6 +206,7 @@ export class SdkNet implements SdkConnection {
       const fail = (err: Error): void => {
         if (settled) return;
         settled = true;
+        this.sendQueue = []; // dead socket: queued frames must never send late
         clearTimeout(timer);
         try {
           ws.close();
@@ -239,6 +268,9 @@ export class SdkNet implements SdkConnection {
     this.send({ t: 'ping', ts: performance.now() }); // seed RTT/offset immediately
     const auth = this.opts.authPayload?.();
     if (auth !== null && auth !== undefined) this.send(auth);
+    const queued = this.sendQueue; // auth first: queued joins may depend on it
+    this.sendQueue = [];
+    for (const msg of queued) this.send(msg); // socket is open: sends inline
     try {
       this.onOpen?.();
     } catch {
@@ -251,6 +283,9 @@ export class SdkNet implements SdkConnection {
     const wasOpen = this.ws !== null;
     this.generation++;
     this.stopPing();
+    // the queue BRIDGES this gap (never cleared here): when autoReconnect is
+    // on, the redial below follows and its open flushes whatever was sent
+    // meanwhile; when off, the next manual connect() discards it
     this.ws = null;
     if (!wasOpen || this.userClosed) return;
     try {
@@ -272,6 +307,8 @@ export class SdkNet implements SdkConnection {
   private closeSocket(): void {
     const ws = this.ws;
     this.generation++;
+    // no queue clear: auto-redials must inherit the bridged gap; manual
+    // connect() clears explicitly before dialling (fresh intent supersedes)
     this.ws = null;
     if (ws !== null && ws.readyState !== WebSocket.CLOSED) {
       try {

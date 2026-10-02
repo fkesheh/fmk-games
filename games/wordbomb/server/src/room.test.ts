@@ -2137,3 +2137,28 @@ describe('I6 — no GameRoomHandle member throws', () => {
     expect(io.pub('a').phase).toBe('matchEnd');
   });
 });
+
+// ---- hasRebindableSeats (platform empty-room sweep grace) ---------------------
+
+describe('hasRebindableSeats', () => {
+  it('false when all connected; a drop parks a ghost; rebind or explicit leave clears it', () => {
+    const { room } = boot(
+      [
+        ['a', 'A'],
+        ['b', 'B'],
+      ],
+      { start: false }, // cold lobby: ghost semantics are phase-independent
+    );
+    expect(room.hasRebindableSeats()).toBe(false);
+
+    room.removePlayer('a'); // drop: ghost (entry persists until the round purge)
+    expect(room.hasRebindableSeats()).toBe(true);
+
+    room.addPlayer('a2', 'A', 'a'); // resume rebinds the ghost
+    expect(room.hasRebindableSeats()).toBe(false);
+
+    room.removePlayer('a2', true); // explicit leave: entry removed, no ghost
+    room.removePlayer('b', true);
+    expect(room.hasRebindableSeats()).toBe(false);
+  });
+});

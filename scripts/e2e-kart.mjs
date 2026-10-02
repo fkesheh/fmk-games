@@ -1278,10 +1278,15 @@ async function main() {
 
   // -- private room create + join by code ----------------------------------------------
   await A.evaluate(() => window.__kart.createPrivate('Alice'));
+  // Wait for the NEW private room specifically (state().code goes non-empty AND
+  // the roster settles to the solo seat): both pages auto-rejoined the public
+  // room after the reload above, and the client publishes the new code before
+  // the roster refresh lands — so a code-only wait still reads the STALE
+  // public roster (pre-transition players=2) on its first poll.
   const aJoined = await waitFor(async () => {
     const s = await kartState(A);
-    return joined(s) ? s : null;
-  }, 10000, 'A createPrivate join');
+    return s !== null && typeof s.code === 'string' && s.code.length > 0 && s.players === 1 ? s : null;
+  }, 10000, 'A createPrivate join (new private room code visible, solo roster)');
   check(
     'A createPrivate joins a kart room (alone => lobby phase)',
     aJoined.phase === 'lobby' && aJoined.players === 1,

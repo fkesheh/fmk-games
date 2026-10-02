@@ -246,6 +246,7 @@ export class KartRoom implements GameRoomHandle {
   private readonly order: Player[] = [];
 
   private phase: KartPhase = 'lobby';
+  private hosted = false; // P1 cold mode (setHosted): seats + liveness only, no sim branches
   private tickCount = 0; // snapshot sequence
   private phaseEndsAt = 0; // serverTime ms; 0 when no phase timer runs
   private countdown = 0; // current countdown number during 'countdown', else 0
@@ -390,6 +391,19 @@ export class KartRoom implements GameRoomHandle {
       if (now - p.lastStateAt > INPUT_STALE_MS) out.push(p.id);
     }
     return out;
+  }
+
+  /**
+   * Ghost census for the platform's empty-room sweep: any disconnected seat
+   * is one a resume/sig rejoin could still rebind (the exact predicate
+   * findGhost matches), so the room is "reconnecting" and gets grace instead
+   * of an immediate stop.
+   */
+  hasRebindableSeats(): boolean {
+    for (const p of this.players.values()) {
+      if (!p.connected) return true;
+    }
+    return false;
   }
 
   /**
@@ -538,6 +552,18 @@ export class KartRoom implements GameRoomHandle {
    * per-client monotonic seq and QUEUED; the sim tick is the single place a
    * kart moves, so message timing/bursting cannot buy a player extra motion.
    */
+  /**
+   * P1 cold mode (platform GameRoomHandle.setHosted): the SERVER instance of a
+   * player-hosted room. Seats + liveness + join payloads only — handleMessage
+   * records liveness and ignores every sim branch (nitro/start/queue), so a
+   * cold room can never double-apply what the browser host sims. The browser
+   * host runs this SAME class with hosted=false. Default false: central rooms
+   * behave exactly as before.
+   */
+  setHosted(active: boolean): void {
+    this.hosted = active;
+  }
+
   handleMessage(id: PlayerId, msg: unknown): void {
     try {
       const parsed = parseKartC2S(msg);
@@ -547,6 +573,7 @@ export class KartRoom implements GameRoomHandle {
       if (!p.connected) return; // a ghost takes no input, ever
       const now = Date.now();
       p.lastStateAt = now; // any valid message is liveness
+      if (this.hosted) return; // cold: liveness done — the host sims the rest
       if (parsed.t === 'nitro') {
         this.tryNitro(p, now);
         return;

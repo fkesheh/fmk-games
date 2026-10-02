@@ -13,6 +13,12 @@ export default defineConfig({
       '@outpost/shared': fileURLToPath(new URL('./games/outpost/shared/src', import.meta.url)),
       '@aces/shared': fileURLToPath(new URL('./games/aces/shared/src', import.meta.url)),
       '@platform/shared': fileURLToPath(new URL('./platform/shared/src', import.meta.url)),
+      // The ANCIENTS·SDK shell test imports the rift client core + the SDK
+      // facade by bare specifier (mirroring each package's tsconfig paths);
+      // without aliases here those imports would resolve through node_modules
+      // (or fail: @rift/client has no exports map) instead of source.
+      '@rift/client': fileURLToPath(new URL('./games/rift/client/src', import.meta.url)),
+      '@platform/sdk': fileURLToPath(new URL('./platform/sdk/src', import.meta.url)),
     },
   },
   test: {
@@ -20,6 +26,9 @@ export default defineConfig({
       'games/fps/shared/src/**/*.test.ts',
       'games/fps/server/src/**/*.test.ts',
       'games/fps/client/src/render/**/*.test.ts',
+      // Connection regression coverage (send-while-CONNECTING queue) — without
+      // an include here it would silently never run (same documented defect).
+      'games/fps/client/src/net/**/*.test.ts',
       'games/bank/shared/src/**/*.test.ts',
       'games/bank/server/src/**/*.test.ts',
       'games/kart/shared/src/**/*.test.ts',
@@ -45,6 +54,9 @@ export default defineConfig({
       'games/aces/shared/src/**/*.test.ts',
       'games/aces/server/src/**/*.test.ts',
       'games/aces/client/src/**/*.test.ts',
+      // ANCIENTS·SDK shell — same defect if omitted: the shell's only test
+      // file would silently never run.
+      'games/ancients/client/src/**/*.test.ts',
       // here its tests would silently never run (same documented defect as
       // bank/shared and the kart client).
       // documented defect as bank/shared and the kart client if omitted.

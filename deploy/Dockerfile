@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 
 # ---- build: full workspace install (devDeps included), then vite (fps + bank +
-# kart + wordbomb + rift + splat + outpost clients) + esbuild (platform server bundle; every
-# @<game>/server and the shared packages are inlined).
+# kart + wordbomb + rift + splat + outpost + aces + ancients clients) + esbuild
+# (platform server bundle; every @<game>/server and the shared packages are inlined).
 FROM node:22-alpine AS build
 WORKDIR /app
 # Root devDep puppeteer must not download a browser into the build image.
@@ -31,6 +31,10 @@ COPY games/splat/client/package.json games/splat/client/package.json
 COPY games/outpost/shared/package.json games/outpost/shared/package.json
 COPY games/outpost/server/package.json games/outpost/server/package.json
 COPY games/outpost/client/package.json games/outpost/client/package.json
+COPY games/aces/shared/package.json games/aces/shared/package.json
+COPY games/aces/server/package.json games/aces/server/package.json
+COPY games/aces/client/package.json games/aces/client/package.json
+COPY games/ancients/client/package.json games/ancients/client/package.json
 # npm install (not ci): the committed lock skews across platforms (macOS vs linux
 # optional deps) and npm versions — let the image resolve on-platform.
 RUN npm install
@@ -67,6 +71,10 @@ COPY games/splat/client/package.json games/splat/client/package.json
 COPY games/outpost/shared/package.json games/outpost/shared/package.json
 COPY games/outpost/server/package.json games/outpost/server/package.json
 COPY games/outpost/client/package.json games/outpost/client/package.json
+COPY games/aces/shared/package.json games/aces/shared/package.json
+COPY games/aces/server/package.json games/aces/server/package.json
+COPY games/aces/client/package.json games/aces/client/package.json
+COPY games/ancients/client/package.json games/ancients/client/package.json
 RUN npm install --omit=dev
 
 # ---- runtime. Each game module resolves its clientDist as
@@ -89,6 +97,8 @@ COPY --from=build /app/games/wordbomb/server/data ./games/wordbomb/server/data
 COPY --from=build /app/games/rift/client/dist ./games/rift/client/dist
 COPY --from=build /app/games/splat/client/dist ./games/splat/client/dist
 COPY --from=build /app/games/outpost/client/dist ./games/outpost/client/dist
+COPY --from=build /app/games/aces/client/dist ./games/aces/client/dist
+COPY --from=build /app/games/ancients/client/dist ./games/ancients/client/dist
 USER node
 EXPOSE 8080
 CMD ["node", "platform/server/dist/server.js"]

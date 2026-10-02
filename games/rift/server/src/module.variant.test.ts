@@ -14,6 +14,10 @@ const state = vi.hoisted(() => ({
   wrappedIo: null as RoomIO | null,
   /** Messages that REACHED the inner room through the variant's wrapper. */
   roomMsgs: [] as Array<{ id: string; msg: unknown }>,
+  /** Scripted inner-room ghost census for the delegation tests. */
+  ghosts: false,
+  /** setHosted flags that reached the inner room, in order. */
+  hostedCalls: [] as boolean[],
 }));
 
 vi.mock('./room.js', () => ({
@@ -41,6 +45,12 @@ vi.mock('./room.js', () => ({
     }
     start(): void {}
     stop(): void {}
+    hasRebindableSeats(): boolean {
+      return state.ghosts;
+    }
+    setHosted(active: boolean): void {
+      state.hostedCalls.push(active);
+    }
   },
 }));
 
@@ -102,6 +112,8 @@ const RIFT_END = {
 beforeEach(() => {
   state.wrappedIo = null;
   state.roomMsgs = [];
+  state.ghosts = false;
+  state.hostedCalls = [];
 });
 
 describe('riftModuleVariant stats sink', () => {
@@ -216,5 +228,27 @@ describe('riftModuleVariant pad adapter', () => {
     expect(mod.padLayout).toBeDefined();
     expect(mod.padLayout?.sticks.map((s) => s.id)).toEqual(['l']);
     expect(mod.padLayout?.buttons.map((b) => b.bit)).toEqual([0, 1, 2]);
+  });
+});
+
+describe('riftModuleVariant lifecycle transparency', () => {
+  it('hasRebindableSeats delegates to the inner room (ghost grace must match legacy)', () => {
+    const f = fakeIo({});
+    const { room } = setup(f.io);
+
+    expect(room.hasRebindableSeats?.()).toBe(false); // inner reports no ghosts
+
+    state.ghosts = true; // inner room now holds rebindable ghost seats
+    expect(room.hasRebindableSeats?.()).toBe(true); // ...visible through the wrapper
+  });
+
+  it('setHosted forwards the flag to the inner room', () => {
+    const f = fakeIo({});
+    const { room } = setup(f.io);
+
+    room.setHosted?.(true);
+    room.setHosted?.(false);
+
+    expect(state.hostedCalls).toEqual([true, false]);
   });
 });

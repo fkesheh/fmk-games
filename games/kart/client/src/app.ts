@@ -478,6 +478,7 @@ declare global {
 
 // ---- tuning ------------------------------------------------------------------
 const RECONNECT_MS = 1000; // socket dropped -> back to the menu, retry quietly
+const SEND_QUEUE_CAP = 32; // outbound frames held while the socket is CONNECTING
 const PING_EVERY_MS = 2000; // mirrors NET.pingEveryMs (platform protocol)
 const ROOMS_EVERY_MS = 3000; // menu room-list poll
 const WATCHDOG_MS = 200; // background-tab keepalive cadence (rAF pauses there)
@@ -691,6 +692,15 @@ function sampleBuffer(buf: RemoteSample[], renderTime: number): RemoteVisual | n
 
 export class KartApp {
   private ws: WebSocket | null = null;
+  // Frames sent while there is no healthy-open socket — CONNECTING handshake
+  // or the reconnect-backoff null gap — flushed FIFO on the next open. Without
+  // this a menu join fired during the handshake silently vanished (the
+  // STRICKEN "Reserving a slot…" hang — same race, same fix; outpost's Net
+  // already had the bounded-queue shape this mirrors), and a join fired in
+  // the null gap after a drop vanished the same way. Never cleared on close:
+  // every close schedules a redial, so every gap ends in a flush; the cap
+  // bounds how stale a replayed join can be.
+  private readonly sendQueue: (LobbyC2S | KartC2S)[] = [];
   private welcomed = false;
   private playerId: string | null = null;
   private rooms: RoomInfo[] = [];
@@ -1352,6 +1362,8 @@ export class KartApp {
     ws.onclose = () => {
       if (this.ws !== ws) return; // stale socket from a previous connect()
       this.ws = null;
+      // the queue BRIDGES this gap (never cleared here): the redial below
+      // always follows, and its open flushes whatever was sent meanwhile
       const wasInRace = this.screen === 'race';
       this.welcomed = false;
       this.resetRoom();
@@ -1361,12 +1373,29 @@ export class KartApp {
     ws.onerror = () => {
       // the close event follows and does the teardown
     };
+    ws.onopen = () => {
+      if (this.ws !== ws) return; // stale socket from a previous connect()
+      const queued = this.sendQueue.splice(0, this.sendQueue.length);
+      for (const m of queued) this.send(m); // socket is open: sends inline
+    };
   }
 
-  /** No-op unless the socket is open (mirrors the server's Session.send). */
+  /**
+   * Sends when the socket is open; queues (bounded, flushed FIFO on the next
+   * open) while CONNECTING or in the reconnect-backoff null gap; drops only
+   * on a CLOSING/CLOSED socket object.
+   */
   private send(msg: LobbyC2S | KartC2S): void {
     const ws = this.ws;
-    if (ws === null || ws.readyState !== WebSocket.OPEN) return;
+    if (ws === null || ws.readyState === WebSocket.CONNECTING) {
+      // no healthy-open socket: hold for the next open (null = backoff gap,
+      // and a redial is always scheduled — the flush is guaranteed). The cap
+      // sheds the oldest past 32; a stale replayed join just answers.
+      if (this.sendQueue.length >= SEND_QUEUE_CAP) this.sendQueue.shift();
+      this.sendQueue.push(msg);
+      return;
+    }
+    if (ws.readyState !== WebSocket.OPEN) return; // CLOSING/CLOSED: drop
     try {
       ws.send(JSON.stringify(msg)); // the wire is plain JSON
     } catch {

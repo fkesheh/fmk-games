@@ -6,6 +6,10 @@
 // v2 amendment (docs/PLATFORM.md §5): OPTIONAL members only — profileId,
 // reportStats, padOwner on RoomIO; padLayout on GameModule. Pre-v2 games are
 // untouched and remain contract-compliant by ignoring them.
+//
+// P1 amendment (docs/PLATFORM.md §12, hosted authority): OPTIONAL members
+// only — hostedAuthority on GameModule; setHosted on GameRoomHandle. Games
+// that ignore both stay central-authoritative forever and are unaffected.
 // ============================================================================
 
 import type { PadLayout, StatsDelta } from './services.js';
@@ -84,6 +88,24 @@ export interface GameRoomHandle {
   handleMessage(id: PlayerId, msg: unknown): void;
   start(): void; // idempotent
   stop(): void;
+  /**
+   * P1: enter/leave "cold" mode. The lobby calls setHosted(true) on the
+   * SERVER instance of a player-hosted room (and never calls start()): the
+   * room MUST then act as seats + liveness + join payloads ONLY — no sim
+   * transitions (start/buy/team/rounds), no gameplay emissions, no kicks.
+   * The BROWSER instance running the authoritative sim never receives this
+   * call (same class, full sim). Absent => the room cannot go cold, so the
+   * lobby keeps that game's rooms central even when settings ask for hosted.
+   */
+  setHosted?(active: boolean): void;
+  /**
+   * True when the room holds disconnected seats a resume/sig rejoin could
+   * still rebind (ghosts). The lobby consults this before sweeping an empty
+   * room: a room with rebindable seats is "reconnecting", not "abandoned",
+   * and gets the reap grace instead of an immediate stop. Absent => false
+   * (rooms that remove on drop sweep exactly as before).
+   */
+  hasRebindableSeats?(): boolean;
 }
 
 /** A registered game. */
@@ -117,4 +139,11 @@ export interface GameModule {
    * this game's rooms (resolve seats via RoomIO.padOwner).
    */
   readonly padLayout?: PadLayout;
+  /**
+   * P1: the game's Room class is hosted-ready (implements setHosted; the same
+   * class runs in the browser as the authoritative sim). A room goes hosted
+   * only when this flag AND `settings.hosted === true` BOTH hold — legacy
+   * rooms (no settings flag) stay central even for opted-in games.
+   */
+  readonly hostedAuthority?: boolean;
 }

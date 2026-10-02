@@ -66,7 +66,7 @@ import type {
   RosterEntry,
   TeamId,
 } from '@rift/shared';
-import { rngInt } from '@platform/shared';
+import { rng, rngInt } from '@platform/shared';
 import type {
   GameRoomHandle,
   PlayerId,
@@ -115,6 +115,12 @@ function hashSeed(roomId: string, index: number): number {
   h = Math.imul(h, 0x01000193);
   return h >>> 0;
 }
+
+/** hashSeed salt for the lock-time hero deal. Seat brains take indices 0..15;
+ *  the deal stream must not collide with any of them. Any well-mixed value is
+ *  an equally fair uniform deal; the value selects which fair comp draw the
+ *  fifteen fixed balance seeds play. */
+const DRAFT_DEAL_SALT = 0x85ebca6b;
 
 function randomToken(next: () => number, len: number): string {
   let s = '';
@@ -329,6 +335,19 @@ export class RiftRoom implements GameRoomHandle {
   /** The platform's own liveness handles dead sockets (CONTRACT §2). */
   stalePlayers(): PlayerId[] {
     return [];
+  }
+
+  /**
+   * CONTRACT §2.3: a ghost seat is disconnected AND non-bot — the exact
+   * predicate both rebindGhost lookups use. Permanent-leave bot conversions
+   * excluded: those seats are displaceable, never handed back, so they must
+   * never hold a room open. While any ghost exists the room is
+   * "reconnecting" and the platform's empty-room sweep grants grace instead
+   * of an immediate stop (near-simultaneous drops would otherwise strand
+   * both players' reseats on no_room).
+   */
+  hasRebindableSeats(): boolean {
+    return this.seats.some((s) => !s.connected && !s.bot);
   }
 
   addPlayer(id: PlayerId, name: string, resume?: PlayerId, sig?: string): void {
@@ -610,7 +629,9 @@ export class RiftRoom implements GameRoomHandle {
     for (const def of HERO_LIST) if (!manual.has(def.id)) avail.push(def.id);
     this.heroCycle = avail.length > 0 ? avail : HERO_LIST.map((d) => d.id);
     this.heroCycleIdx = 0;
-    for (const s of this.seats) s.hero = s.pick ?? this.nextCycleHero();
+    // Picks lock now; cycle heroes are dealt after bot-fill (below), once every
+    // seat exists, so the deal order can be shuffled across all of them.
+    for (const s of this.seats) s.hero = s.pick ?? null;
 
     // Bots fill every seat to teamSize per team (`Bot N`, insertion order =
     // join order — humans all precede them).
@@ -626,7 +647,7 @@ export class RiftRoom implements GameRoomHandle {
           bot: true,
           connected: false,
           pick: null,
-          hero: this.nextCycleHero(),
+          hero: null, // dealt after fill (below)
           lane: 0,
           entId: NO_ENT,
           brain: null,
@@ -636,6 +657,30 @@ export class RiftRoom implements GameRoomHandle {
         botN += 1;
         count += 1;
       }
+    }
+
+    // Seeded hero deal. Dealing the cycle sequentially by seat gave team 1 a
+    // systematically stronger comp (4v4: {mender,shade,bullwark,longbow} vs
+    // {bullwark,longbow,reaver,hex} — swapping the rosters flipped bed2's
+    // winner 1->0, so the draft, not the map, drove the team-1 bias). Shuffle
+    // the recipient order with an independent roomId-derived stream instead:
+    // same cycle sequence and count (nextCycleHero untouched, late-join draw
+    // order unchanged), manual picks still respected, but no team owns a fixed
+    // slice of the cycle. Deterministic per room id.
+    {
+      const dealRand = rng(hashSeed(this.id, DRAFT_DEAL_SALT));
+      const deferred: Seat[] = [];
+      for (const s of this.seats) if (s.hero === null) deferred.push(s);
+      for (let i = deferred.length - 1; i > 0; i--) {
+        const j = rngInt(dealRand, 0, i);
+        const a = deferred[i];
+        const b = deferred[j];
+        if (a !== undefined && b !== undefined) {
+          deferred[i] = b;
+          deferred[j] = a;
+        }
+      }
+      for (const s of deferred) s.hero = this.nextCycleHero();
     }
 
     // Lane assignment: round-robin across lanes per team in join order,

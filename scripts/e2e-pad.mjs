@@ -1,25 +1,31 @@
 #!/usr/bin/env node
 // ============================================================================
-// e2e-pad — prove KART phone-as-controller (docs/PAD.md) works end-to-end
-// against the PRODUCTION platform server, with no browsers: two bare
+// e2e-pad — prove PLATFORM phone-as-pad (docs/PLATFORM.md §4.4) works end to
+// end against the PRODUCTION platform server, with no browsers: two bare
 // WebSocket connections play the desktop player and the phone pad.
 //
 //   PLAYER ws: create_private(game:'kart')        -> kart_joined (roomId/code)
-//   PLAYER:    {t:'pad_pair_request'}             -> pad_pair {room, token}
+//   PLAYER:    {t:'pad_pair_request'}             -> pad_pair {room, token, urlPath}
 //   PAD ws:    welcome -> join_as_pad(room,token) -> pad_joined;
 //              PLAYER observes pad_status bound:true
-//   PAD:       kart_input seq 0..59 @30Hz ~2s     -> PLAYER gets pad_input
-//              echoes AND kart_snapshot you.lastProcessedSeq advances
+//   PAD:       pad_input seq 0..59 @30Hz ~2s      -> PAD gets pad_input_echo
+//              acks for every frame (lobby relayed each into the room)
 //   PAD:       {t:'leave'}                        -> PLAYER pad_status bound:false
-//   FRESH ws:  join_as_pad with the consumed token -> error pad_rejected
-//   HTTP:      GET /kart/pad.html is the PAD page (not the SPA fallback);
-//              GET /kart/ still serves the game.
+//   FRESH ws:  join_as_pad with the consumed token -> pad_rejected (bad_code)
+//   HTTP:      GET /pad/?game=ancients is the PAD page (200 + pad markup);
+//              GET /pad/?game=kart is 404 no_pad (kart declares no padLayout —
+//              additive opt-in); GET /kart/ still serves the game.
 //
-// No race is started: inputs are acked in every phase, so a lone seated
-// player in the lobby phase is enough. Requires `npm run build` first
-// (platform/server/dist/server.js + games/kart/client/dist/pad.html).
+// No race/match is started: pairing, relay, echo and unbind are all
+// phase-independent, so a lone seated player in the lobby phase is enough.
+// In-room pad driving (stick -> sim orders) is covered by unit tests
+// (games/rift/server/src/module.variant.test.ts) for the one game that
+// implements seat resolution; kart has no padOwner yet, so no sim advance is
+// asserted here. Requires `npm run build` first (platform/server/dist).
 //
-// Env: E2E_PORT overrides the default port 8184.
+// Env: E2E_PORT overrides the default port 8184. PLATFORM_STATIC=1 is forced
+// for the spawned server so a foreign vite squatter on a dev port can never
+// hijack a mount into a proxy mid-suite.
 // ============================================================================
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
@@ -118,11 +124,9 @@ async function main() {
   currentStep = 'spawn server';
   const serverEntry = path.join(ROOT, 'platform/server/dist/server.js');
   if (!existsSync(serverEntry)) fail(`${serverEntry} missing — run npm run build first`);
-  if (!existsSync(path.join(ROOT, 'games/kart/client/dist/pad.html')))
-    fail('games/kart/client/dist/pad.html missing — run npm run build first');
   server = spawn(process.execPath, [serverEntry], {
     cwd: ROOT,
-    env: { ...process.env, PORT: String(PORT) },
+    env: { ...process.env, PORT: String(PORT), PLATFORM_STATIC: '1' },
     stdio: ['ignore', 'pipe', 'inherit'],
   });
   server.on('exit', (code) => fail(`server exited early (code ${code})`));
@@ -151,14 +155,17 @@ async function main() {
     fail(`kart_joined missing roomId/code: ${JSON.stringify(joined)}`);
   ok(`kart_joined roomId=${joined.roomId} code=${joined.code} phase=${joined.phase}`);
 
-  // -- (b) pair request -> pad_pair token --------------------------------------
+  // -- (b) pair request -> pad_pair token + phone URL -------------------------
   currentStep = 'b. pad_pair_request';
   player.send({ t: 'pad_pair_request' });
   const pair = await player.waitFor((m) => m.t === 'pad_pair', 'pad_pair');
   if (typeof pair.room !== 'string' || typeof pair.token !== 'string')
     fail(`pad_pair missing room/token: ${JSON.stringify(pair)}`);
-  if (pair.room !== joined.code) fail(`pad_pair.room ${pair.room} != private code ${joined.code}`);
-  ok(`pad_pair room=${pair.room} token=${pair.token} expiresInMs=${pair.expiresInMs}`);
+  if (pair.room !== joined.roomId) fail(`pad_pair.room ${pair.room} != roomId ${joined.roomId}`);
+  if (!/^[A-Z0-9]{6}$/.test(pair.token)) fail(`pad_pair.token not a 6-char code: ${pair.token}`);
+  const wantUrl = `/pad/?game=kart&r=${joined.roomId}`;
+  if (pair.urlPath !== wantUrl) fail(`pad_pair.urlPath ${pair.urlPath} != ${wantUrl}`);
+  ok(`pad_pair room=${pair.room} token=${pair.token} urlPath=${pair.urlPath}`);
 
   // -- (c) pad joins; player sees bound:true -----------------------------------
   currentStep = 'c. join_as_pad';
@@ -166,48 +173,26 @@ async function main() {
   await pad.connect();
   await pad.waitFor((m) => m.t === 'welcome', 'welcome');
   pad.send({ t: 'join_as_pad', room: pair.room, token: pair.token });
-  const padJoined = await pad.waitFor((m) => m.t === 'pad_joined', 'pad_joined');
-  if (padJoined.name !== 'PadPlayer') fail(`pad_joined.name ${padJoined.name} != PadPlayer`);
-  ok(`pad_joined name=${padJoined.name}`);
+  await pad.waitFor((m) => m.t === 'pad_joined', 'pad_joined');
+  ok('pad_joined');
   const bound = await player.waitFor(
     (m) => m.t === 'pad_status' && m.bound === true,
     'pad_status bound:true',
   );
   ok(`player saw pad_status bound:${bound.bound}`);
 
-  // -- (d) pad streams input; player gets echoes + advancing ack ---------------
+  // -- (d) pad streams input; every frame is relayed + acked -------------------
   currentStep = 'd. input stream';
-  const lastSeq = () =>
-    player.inbox.reduce(
-      (acc, m) => (m.t === 'kart_snapshot' && m.you ? m.you.lastProcessedSeq : acc),
-      -1,
-    );
-  const seqBefore = lastSeq();
-  const N = 60; // ~2s at 30Hz
+  const N = 60; // ~2s at 30Hz, under the 30Hz relay cap
   for (let seq = 0; seq < N; seq++) {
-    pad.send({
-      t: 'kart_input',
-      seq,
-      throttle: 1,
-      brake: 0,
-      steer: 0,
-      drift: false,
-      respawn: false,
-      dt: 1 / 30,
-    });
+    pad.send({ t: 'pad_input', seq, lx: 0, ly: 1, rx: 0, ry: 0, buttons: 0 });
     await new Promise((r) => setTimeout(r, 33));
   }
-  const echo = await player.waitFor((m) => m.t === 'pad_input', 'pad_input echo');
-  if (echo.input?.t !== 'kart_input' || echo.input.throttle !== 1)
-    fail(`pad_input echo malformed: ${JSON.stringify(echo)}`);
-  const echoes = player.inbox.filter((m) => m.t === 'pad_input').length;
-  ok(`${echoes} pad_input echoes received (first seq ${echo.input.seq})`);
-  const acked = await player.waitFor(
-    (m) => m.t === 'kart_snapshot' && m.you && m.you.lastProcessedSeq >= N - 10,
-    `snapshot with lastProcessedSeq >= ${N - 10}`,
-    8000,
-  );
-  ok(`lastProcessedSeq ${seqBefore} -> ${acked.you.lastProcessedSeq} (phase ${acked.phase})`);
+  const echoes = [];
+  for (let seq = 0; seq < N; seq++) {
+    echoes.push(await pad.waitFor((m) => m.t === 'pad_input_echo' && m.seq === seq, `echo ${seq}`, 8000));
+  }
+  ok(`${echoes.length}/${N} pad_input_echo acks received (seqs 0..${N - 1}, first ${echoes[0].seq})`);
 
   // -- (e) pad leaves; player sees bound:false ---------------------------------
   currentStep = 'e. pad leave';
@@ -225,19 +210,24 @@ async function main() {
   await late.connect();
   await late.waitFor((m) => m.t === 'welcome', 'welcome');
   late.send({ t: 'join_as_pad', room: pair.room, token: pair.token });
-  const err = await late.waitFor((m) => m.t === 'error', 'error');
-  if (err.code !== 'pad_rejected') fail(`expected pad_rejected, got ${JSON.stringify(err)}`);
-  ok(`consumed token rejected with code pad_rejected`);
+  const rej = await late.waitFor((m) => m.t === 'pad_rejected', 'pad_rejected');
+  if (rej.reason !== 'bad_code') fail(`expected reason bad_code, got ${JSON.stringify(rej)}`);
+  ok('consumed token rejected with reason bad_code');
   late.close();
 
-  // -- HTTP: the pad page is real, the game page still serves -------------------
+  // -- HTTP: the generic pad page serves; games without layouts 404 ----------
   currentStep = 'http static';
-  const padRes = await fetch(`${BASE}/kart/pad.html`);
-  const padHtml = await padRes.text();
-  if (padRes.status !== 200) fail(`GET /kart/pad.html -> ${padRes.status}`);
-  if (!padHtml.includes('Phone Controller'))
-    fail('GET /kart/pad.html is not the pad page (SPA fallback served?)');
-  ok('GET /kart/pad.html -> 200, pad-page markup');
+  const pageRes = await fetch(`${BASE}/pad/?game=ancients`);
+  const pageHtml = await pageRes.text();
+  if (pageRes.status !== 200) fail(`GET /pad/?game=ancients -> ${pageRes.status}`);
+  if (!pageHtml.includes('id="gameTitle"') || !pageHtml.includes(' — Pad</title>'))
+    fail('GET /pad/?game=ancients is not the pad page (fallback served?)');
+  ok('GET /pad/?game=ancients -> 200, pad-page markup');
+  const noPadRes = await fetch(`${BASE}/pad/?game=kart`);
+  if (noPadRes.status !== 404) fail(`GET /pad/?game=kart -> ${noPadRes.status}, want 404 no_pad`);
+  const noPadBody = await noPadRes.json().catch(() => null);
+  if (noPadBody?.error !== 'no_pad') fail(`GET /pad/?game=kart body is not no_pad: ${JSON.stringify(noPadBody)}`);
+  ok('GET /pad/?game=kart -> 404 no_pad (additive opt-in: kart declares no layout)');
   const gameRes = await fetch(`${BASE}/kart/`);
   if (gameRes.status !== 200) fail(`GET /kart/ -> ${gameRes.status}`);
   ok('GET /kart/ -> 200');

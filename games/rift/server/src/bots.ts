@@ -8,7 +8,7 @@
 // array the seam allows: every scan is an indexed loop over the percept, all
 // helper functions are created once per brain, scratch is module/brain state.
 // ============================================================================
-import { rng } from '@platform/shared';
+import { rng, rngInt } from '@platform/shared';
 import {
   ELEV_HIGH,
   ELEV_LOW,
@@ -322,6 +322,34 @@ export function createBotBrain(seed: number, hero: HeroId): BotBrain {
   const def: HeroDef = heroById(hero);
   const role = def.role;
   const build = BUILD_ORDER[role];
+  // Seeded skill-max order (q/w/e permutation, Q-FIRST BIASED): the fixed Q>W>E
+  // order made bot development identical across matches, so seeds whose last-hit
+  // slop never flipped a threshold collapsed to one trajectory (4v4 0xbed4/0xbed5
+  // bit-identical over 30 min). A per-brain order diverges development from the
+  // first spent point. Q-first with p=2/3 (uniform shuffle, then force Q front
+  // half the time it isn't): a uniform shuffle proved too chaotic (4v4 laning
+  // broke: tower1 5.3→10+, 8v8 stomps at 9.8min, wins lopsided) — most bots keep
+  // the known-stable meta while the off-meta minority carries seed variety.
+  // Every basic still maxes to 4 eventually; ult priority below is untouched.
+  // Deterministic: fixed draws from this brain's stream at creation; symmetric
+  // across teams (both sides draw from the same distribution).
+  const skillOrder: readonly [number, number, number] = (() => {
+    const order = [0, 1, 2];
+    for (let i = order.length - 1; i > 0; i--) {
+      const j = rngInt(rand, 0, i);
+      const a = order[i] ?? 0;
+      const b = order[j] ?? 0;
+      order[i] = b;
+      order[j] = a;
+    }
+    if (order[0] !== 0 && rand() < 0.5) {
+      const qi = order.indexOf(0);
+      const first = order[0] ?? 1;
+      order[0] = 0;
+      order[qi] = first;
+    }
+    return [order[0] ?? 0, order[1] ?? 1, order[2] ?? 2];
+  })();
 
   // --- brain state (created once; tick() reuses it) ---
   let retreating = false;
@@ -379,7 +407,7 @@ export function createBotBrain(seed: number, hero: HeroId): BotBrain {
     if (ult && ultRank < ult.maxRank && tick >= (skillBlockedUntil[3] ?? 0)) {
       if (self.level >= (ULT_LEVEL_REQ[ultRank] ?? Infinity)) return 3;
     }
-    for (let s = 0; s < 3; s++) {
+    for (const s of skillOrder) {
       const a = def.abilities[s];
       if (!a) continue;
       if ((self.abilityRanks[s] ?? 0) < a.maxRank && tick >= (skillBlockedUntil[s] ?? 0)) return s;
@@ -629,6 +657,76 @@ export function createBotBrain(seed: number, hero: HeroId): BotBrain {
     return best;
   }
 
+  /** Nearest enemy structure the bot may legally swing at this tick: in
+   *  basic-attack reach (edge-to-edge, mirroring sim inAttackRange), not
+   *  Fortify-protected (same bypass rule as holdTower), and the ancient only
+   *  once no alive enemy guard is visible — damage to a guarded ancient is
+   *  immune at the pipeline, so swinging at it is standing still. Towers stay
+   *  lane-scoped like holdTower; guards and the ancient have no lane. */
+  function siegeTarget(p: BotPercept): Ent | null {
+    const self = p.self;
+    let guardAlive = false;
+    for (let i = 0; i < p.visible.length; i++) {
+      const e = p.visible[i];
+      if (e && e.kind === 'guard' && e.team !== self.team && e.alive && e.hp > 0) {
+        guardAlive = true;
+        break;
+      }
+    }
+    let best: Ent | null = null;
+    let bestD2 = Infinity;
+    for (let i = 0; i < p.visible.length; i++) {
+      const e = p.visible[i];
+      if (!e || e.team === self.team || !e.alive || e.hp <= 0) continue;
+      if (e.kind !== 'tower' && e.kind !== 'guard' && e.kind !== 'ancient') continue;
+      if (e.kind === 'tower' && e.lane !== p.lane) continue;
+      if (e.kind === 'ancient' && guardAlive) continue;
+      if (hpFrac(e) >= FORTIFY_BYPASS_HP && !ownCreepNear(p, e.x, e.z, FORTIFY_RADIUS)) continue;
+      const r = self.attackRange + self.radius + e.radius + LASTHIT_RANGE_EPS;
+      const d2 = distSq(self.x, self.z, e.x, e.z);
+      if (d2 <= r * r && d2 < bestD2) {
+        bestD2 = d2;
+        best = e;
+      }
+    }
+    return best;
+  }
+
+  /** The objective a healthy bot should be walking at, deepest-first: the
+   *  exposed enemy ancient (no guard stands), else the nearest alive enemy
+   *  guard once the bot's own lane is open (no alive enemy tower in it —
+   *  pushing through live towers is a donation). Structures ride `visible`
+   *  globally, so all of this is scoreboard knowledge, not vision. Null
+   *  while the lane still stands or the ancient itself is gone (match over).
+   *  No tower rung: walking at towers spreads force across lanes (measured:
+   *  two tiebreaks, slower 8v8s) — towers fall to concentrated waves plus
+   *  the siege rule, and concentration is what the guard/ancient rungs buy. */
+  function pushTarget(p: BotPercept): Ent | null {
+    const self = p.self;
+    let ancient: Ent | null = null;
+    let guard: Ent | null = null;
+    let guardD2 = Infinity;
+    let laneTowerStands = false;
+    for (let i = 0; i < p.visible.length; i++) {
+      const e = p.visible[i];
+      if (!e || e.team === self.team || !e.alive || e.hp <= 0) continue;
+      if (e.kind === 'ancient') {
+        ancient = e;
+      } else if (e.kind === 'guard') {
+        const d2 = distSq(self.x, self.z, e.x, e.z);
+        if (d2 < guardD2) {
+          guardD2 = d2;
+          guard = e;
+        }
+      } else if (e.kind === 'tower' && e.lane === p.lane) {
+        laneTowerStands = true;
+      }
+    }
+    if (ancient && !guard) return ancient;
+    if (guard && !laneTowerStands) return guard;
+    return null;
+  }
+
   /** The camp the bot should be walking to this tick, or null to stay in lane.
    *  Holding a commitment across ticks is what stops the bot oscillating
    *  between the clearing and the lane every tick; the commitment ends the
@@ -667,7 +765,7 @@ export function createBotBrain(seed: number, hero: HeroId): BotBrain {
     const now = p.tick;
     const frac = hpFrac(self);
 
-    // --- skill points: ult whenever legal, then q > w > e ---
+    // --- skill points: ult whenever legal, then the brain's seeded max order ---
     if (skillAttemptSlot >= 0 && now > skillAttemptTick) {
       // The sim never answered (silent no-op): back that slot off for a while.
       if (
@@ -760,6 +858,36 @@ export function createBotBrain(seed: number, hero: HeroId): BotBrain {
       }
     }
 
+    // Objective intent, computed once: a healthy bot with an open lane to a
+    // guard, or an exposed ancient to kill, is a pusher. The last-hit below
+    // yields to it (firing an 'attack' one tick and the push's 'attackmove'
+    // the next would reset path/pathIndex every other tick, the AMENDMENT_1
+    // §D churn), and the push itself fires below, after tower-hold, so it
+    // still waits out a fortified structure for its wave (escort for free).
+    // The 0.60 bar is deliberate: pushing hurt feeds (measured: 4v4 deaths
+    // doubled and conversions broke when it dropped to 0.40).
+    const push = frac >= JUNGLE_MIN_HP ? pushTarget(p) : null;
+
+    // --- siege: an unfortified structure in reach outranks a last-hit. Without
+    //  an explicit order the hero's attackmove auto-acquire (nearest enemy,
+    //  movement.ts) spends the whole push chasing the nearest defender or
+    //  creep while the tower stands free — measured: winners dealt ~5k of
+    //  ~35k hero damage to structures and an exposed ancient sat un-hit for
+    //  minutes. Gated on pushing-or-overtime: siege-first from wave one
+    //  drops T1s at 3.3 min (band floor 5.0) and biases first towers (which
+    //  the push then amplifies into lopsided winners) — pre-11:00 farm owns
+    //  the clock. The Fortify rule mirrors holdTower below: a fortified
+    //  structure is never worth walking into — pushers wait for the wave
+    //  (exposing guards WITHOUT one strands the close: measured 12-min
+    //  ancient stall when divers killed guards alone). No focus-fire rung:
+    //  explicit attacks chase fleeing defenders past the objective into the
+    //  fountain (measured: 60+ deaths and a tiebreak). ---
+    const siege = push !== null || p.overtime ? siegeTarget(p) : null;
+    if (siege) {
+      out.push({ c: 'order', kind: 'attack', target: siege.id });
+      return out;
+    }
+
     // --- last-hit: seeded +-15% slop on the expected-damage threshold ---
     const lethality = self.damage * (1 - LASTHIT_SLOP + 2 * LASTHIT_SLOP * rand());
     let lastHit: Ent | null = null;
@@ -771,7 +899,7 @@ export function createBotBrain(seed: number, hero: HeroId): BotBrain {
       if (distSq(self.x, self.z, e.x, e.z) > r * r) continue;
       if (e.hp <= lethality && (!lastHit || e.hp < lastHit.hp)) lastHit = e;
     }
-    if (lastHit) {
+    if (lastHit && push === null) {
       out.push({ c: 'order', kind: 'attack', target: lastHit.id });
       return out;
     }
@@ -788,6 +916,23 @@ export function createBotBrain(seed: number, hero: HeroId): BotBrain {
         return out; // degenerate: no path data, simply hold position
       }
       out.push({ c: 'order', kind: 'attackmove', x: wp.x, z: wp.z });
+      return out;
+    }
+
+    // --- objective push: nothing else in this policy walks at an exposed
+    //  ancient — measured, one sat 7 minutes un-touched while waves
+    //  annihilated mid-map and every bot farmed (bed3) — and the same stall
+    //  one rung up leaves second guards standing for 9 minutes (bed1). So
+    //  healthy bots walk at the deepest open objective (ancient, else guard).
+    //  The outnumbered abort above still turns around a bad fight, and
+    //  tower-hold above still waits out a fortified structure for the wave
+    //  (escort for free — the wave and the heroes arrive TOGETHER, which is
+    //  what converts). The re-issue guard is AMENDMENT_1 §D: a fresh order
+    //  resets path/pathIndex, so same destination, no new order. ---
+    if (push) {
+      if (self.order !== 'attackmove' || self.ox !== push.x || self.oz !== push.z) {
+        out.push({ c: 'order', kind: 'attackmove', x: push.x, z: push.z });
+      }
       return out;
     }
 

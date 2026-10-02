@@ -322,3 +322,27 @@ authoritative rooms are untouched.
 Identity/profiles, saves, stats, matchmaking, room lifecycle, master election,
 relay, abuse limits. The platform shrinks from "game server" to "arena
 authority" — which is exactly the shape that also serves a future native app.
+
+### 12.7 Implementation status — P1 lobby primitives + P2-1/P2-2 foundations (done)
+
+- Wire: `host_renew` C2S (parsed + validated); `host_lease` (unicast bearer id),
+  `host_change`, `host_revoked` S2C; `host_snap` passes RAW and the lobby
+  intercepts it before room routing (`platform/shared/src/protocol.ts`).
+- Contract: `GameModule.hostedAuthority?`, `GameRoomHandle.setHosted?` —
+  OPTIONAL members only (`platform/shared/src/module.ts`, "P1 amendment").
+- Shim: lease table, lowest-RTT election (measured-first, ties to the
+  longest-lived session), standby runner-up, 6s TTL + sweep watchdog, 2-lapse
+  sticky central fallback, lease-validated snapshot relay (60/s/room cap,
+  metered), player→host input relay including start intents and pad frames
+  (`platform/server/src/lobby.ts`, covered in `lobby.test.ts`).
+- Cold seams: fps `GameRoom` + kart `KartRoom` implement `setHosted` (seats +
+  liveness + join payloads only; start/queue/kicks/emissions suppressed),
+  unit-tested. Neither module sets `hostedAuthority` yet — every room today
+  is central, zero behavior change.
+- Client: SDK `HostedClient` (lease adopt/renew/depose/revoke, `host_change`
+  routing for input re-pointing), unit-tested (`platform/sdk/src/hosted.ts`).
+  No game wires it yet.
+- NOT done (pilot work): any live hosted room, browser sim execution,
+  shadow-sim acks / zero-gap promotion, re-hosting after central fallback,
+  host capability signaling, per-room snapshot rate config, WebRTC (§12 P2–P4
+  as originally phased).
