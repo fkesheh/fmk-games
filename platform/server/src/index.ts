@@ -119,15 +119,15 @@ const LPAL = {
   kartTint: '#4a7a3d', //   KPAL.grass       — KART GP: verge green
   wordbombAccent: '#f0a63c', // WPAL.fuse    — WORDBOMB: the lit fuse
   wordbombTint: '#28303a', //  WPAL.slate    — WORDBOMB: dark-room slate
-  riftAccent: '#d9b25f', //    APAL.gold     — ANCIENTS: ancient gold
-  riftTint: '#2e3827', //      APAL.moss     — ANCIENTS: dusk moss
-  acesAccent: '#f0a03a', //    APAL.tracer    — ACES: tracer amber
-  acesTint: '#274e74', //      APAL.royalNavy — ACES: cobalt slate sky
+  ancientsAccent: '#d9b25f', // ANCIENTS.SDK.gold — ANCIENTS: ancient gold
+  ancientsTint: '#2e3827', //     ANCIENTS.SDK.moss — ANCIENTS: dusk moss
   splatAccent: '#f2b72e', //   SPAL.sunGold  — SKI SPLAT: ski-race gold
   // SPAL has no dark entry suited to a card tint (SPAL.ink is the paint guard
   // itself), so this is skyZenith-derived: #2c5fb8 deepened into the other
   // tints' ~20 L* band — the night piste under lights.
   splatTint: '#1c3357', //    SPAL.skyZenith, deepened — SKI SPLAT: night piste
+  outpostAccent: '#d9ff5c', // OUTPOST_ADD.zeye     — OUTPOST: horde eye-glow
+  outpostTint: '#22304a', //   OUTPOST_ADD.skyNight — OUTPOST: night sky
 
   // ---- fallback identity for a game with no launcher copy yet ----
   neutralAccent: '#9aa3ad', // PALETTE.steel
@@ -168,17 +168,16 @@ const COPY: Record<string, GameCopy | undefined> = {
       "Same three letters for everyone, a fuse nobody can see. Match someone else's word and you split the points.",
     tags: ['10 rounds'],
   },
-  rift: {
+  ancients: {
     genre: 'Mini MOBA',
     blurb:
       'Push lanes, last-hit for gold, raze towers. Break their Ancient before they break yours — 2v2 to 8v8, bots fill the rest.',
     tags: ['2v2–8v8', 'Bot fill'],
   },
-  aces: {
-    genre: 'Dogfight arena',
-    blurb:
-      'WWI dawn patrol over a cold strait. Two squadrons, forward-firing twin guns, first to 25 kills — bots fill the flight.',
-    tags: ['1v1–4v4', 'Bot fill'],
+  outpost: {
+    genre: 'Co-op zombie survival',
+    blurb: 'Hold the watchtower, share the ammo. Night falls, the horde rises — survive it together.',
+    tags: ['Co-op', 'Horde'],
   },
   splat: {
     genre: 'Downhill ski racer',
@@ -209,9 +208,9 @@ const IDENTITY: Record<string, PwaIdentity | undefined> = {
   bank: { accent: LPAL.bankAccent, tint: LPAL.bankTint },
   kart: { accent: LPAL.kartAccent, tint: LPAL.kartTint },
   wordbomb: { accent: LPAL.wordbombAccent, tint: LPAL.wordbombTint },
-  rift: { accent: LPAL.riftAccent, tint: LPAL.riftTint },
+  ancients: { accent: LPAL.ancientsAccent, tint: LPAL.ancientsTint },
   splat: { accent: LPAL.splatAccent, tint: LPAL.splatTint },
-  aces: { accent: LPAL.acesAccent, tint: LPAL.acesTint },
+  outpost: { accent: LPAL.outpostAccent, tint: LPAL.outpostTint },
 };
 const NEUTRAL_IDENTITY: PwaIdentity = {
   accent: LPAL.neutralAccent,
@@ -300,7 +299,7 @@ function launcherHtml(modules: readonly GameModule[], registerSw: boolean): stri
            right, mid-left flank, bottom centre — so no two tints stack into
            mud. WORDBOMB's slate is the coolest and takes the otherwise-empty
            mid-left band between the fps and bank pools. (Covers the four
-           original games only; rift/splat tints are not yet washed in.) */
+           original games only; ancients/splat tints are not yet washed in.) */
         background-image:
           radial-gradient(90ch 52ch at 18% -12%, ${LPAL.fpsTint}2e, transparent 62%),
           radial-gradient(80ch 46ch at 84% 6%, ${LPAL.kartTint}26, transparent 60%),
@@ -336,7 +335,7 @@ function launcherHtml(modules: readonly GameModule[], registerSw: boolean): stri
         margin: 0; font-size: clamp(40px, 11vw, 82px); font-weight: 900; line-height: 0.98;
         letter-spacing: 0.18em; text-indent: 0.18em;
         color: ${LPAL.paper};
-        /* Four accents (the original four games; rift/splat are not yet swept
+        /* Four accents (the original four games; ancients/splat are not yet swept
            in), hue-ordered hot -> cool so the sweep never doubles back:
            WORDBOMB's saturated fuse orange leads, the two near-identical
            ambers (fps dusk, bank gold) are packed close in the middle so they
@@ -396,10 +395,13 @@ function launcherHtml(modules: readonly GameModule[], registerSw: boolean): stri
       /* WORDBOMB's tint is the darkest of the original four (WPAL.slate, L 19),
          so its wash carries more alpha to land at the same visual weight. */
       .card--wordbomb { --accent: ${LPAL.wordbombAccent}; --tint: ${LPAL.wordbombTint}; --wash: ${LPAL.wordbombTint}70; --halo: ${LPAL.wordbombAccent}2b; }
-      .card--rift { --accent: ${LPAL.riftAccent}; --tint: ${LPAL.riftTint}; --wash: ${LPAL.riftTint}70; --halo: ${LPAL.riftAccent}2b; }
+      .card--ancients { --accent: ${LPAL.ancientsAccent}; --tint: ${LPAL.ancientsTint}; --wash: ${LPAL.ancientsTint}70; --halo: ${LPAL.ancientsAccent}2b; }
       /* SKI SPLAT's tint (deepened skyZenith, L 21) sits in the same dark band
          as slate/moss, so it takes the same high-alpha wash. */
       .card--splat { --accent: ${LPAL.splatAccent}; --tint: ${LPAL.splatTint}; --wash: ${LPAL.splatTint}70; --halo: ${LPAL.splatAccent}2b; }
+      /* OUTPOST's tint (OUTPOST_ADD.skyNight) sits in the same dark band as
+         slate/moss, so it takes the same high-alpha wash. */
+      .card--outpost { --accent: ${LPAL.outpostAccent}; --tint: ${LPAL.outpostTint}; --wash: ${LPAL.outpostTint}70; --halo: ${LPAL.outpostAccent}2b; }
 
       .mark {
         width: 50px; height: 50px; border-radius: 13px; flex: none;
@@ -446,7 +448,7 @@ function launcherHtml(modules: readonly GameModule[], registerSw: boolean): stri
       }
       /* ANCIENTS: a monolith gate — two leaning slabs and a floating crystal
          diamond between them, the ancient's silhouette in three layers. */
-      .mark--rift {
+      .mark--ancients {
         background-image:
           linear-gradient(45deg, transparent calc(50% - 1px), var(--accent) calc(50% - 1px) calc(50% + 1px), transparent calc(50% + 1px)),
           linear-gradient(-45deg, transparent calc(50% - 1px), var(--accent) calc(50% - 1px) calc(50% + 1px), transparent calc(50% + 1px)),
@@ -467,6 +469,17 @@ function launcherHtml(modules: readonly GameModule[], registerSw: boolean): stri
           linear-gradient(var(--accent), var(--accent));
         background-size: 40% 58%, 40% 58%, 3.5% 22%, 14% 9%;
         background-position: 17% 71%, 83% 71%, 50% 20%, 62% 12%;
+      }
+      /* OUTPOST: a watchtower — the tower body with three battlements on top,
+         the last lit post against the horde. Four filled accent layers. */
+      .mark--outpost {
+        background-image:
+          linear-gradient(var(--accent), var(--accent)),
+          linear-gradient(var(--accent), var(--accent)),
+          linear-gradient(var(--accent), var(--accent)),
+          linear-gradient(var(--accent), var(--accent));
+        background-size: 30% 56%, 12% 10%, 12% 10%, 12% 10%;
+        background-position: 50% 82%, 38% 26%, 50% 26%, 62% 26%;
       }
 
       .head { display: flex; flex-direction: column; gap: 3px; }

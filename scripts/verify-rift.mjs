@@ -3,7 +3,7 @@
 // verify-rift — VISUAL + PERF VERIFICATION for ANCIENTS (rift).
 //
 // Serves the BUILT platform on RIFT_VERIFY_PORT (default 8092; 8091 and 8080
-// belong to siblings — never touch them), drives the frozen window.__rift
+// belong to siblings — never touch them), drives the frozen window.__ancients
 // debug surface (CONTRACT §6 + GRAPHICS_CONTRACT §6) with puppeteer, captures
 // the shot list for the art/UX judge loops, and asserts the perf + health
 // budgets. Client dist must already exist — this harness NEVER rebuilds (run
@@ -85,7 +85,7 @@
 //     capture was previously taken through the death-screen dim and nobody
 //     noticed (GRAPHICS_CONTRACT §5) — that is what these three checks exist
 //     to make impossible.
-//   - dayPhase is PINNED via window.__rift.setDayPhase(t) before every
+//   - dayPhase is PINNED via window.__ancients.setDayPhase(t) before every
 //     in-world shot: 0 for day, 1 for night. An unpinned day/night cycle makes
 //     every capture wall-clock dependent and the whole judge loop worthless.
 //   - the countdown readout, the death overlay, the ended phase and the
@@ -127,7 +127,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = Number(process.env.RIFT_VERIFY_PORT ?? 8092);
 const BASE = `http://localhost:${PORT}`;
 const SERVER_ENTRY = path.join(ROOT, 'platform/server/dist/server.js');
-const CLIENT_ENTRY = path.join(ROOT, 'games/rift/client/dist/index.html');
+const CLIENT_ENTRY = path.join(ROOT, 'games/ancients/client/dist/index.html');
 const OUT_DIR = path.join(ROOT, 'screenshots', 'rift');
 
 const VIEWPORTS = [
@@ -173,7 +173,7 @@ const ZOOM_STEPS_OUT = 6; // back to ≈ default 36m
 
 // ---- day / night pins -----------------------------------------------------------
 // TERRAIN_CONTRACT §6 / contract.ts: 0 = full day, 1 = full night. EVERY
-// in-world shot pins one of these through window.__rift.setDayPhase, so no
+// in-world shot pins one of these through window.__ancients.setDayPhase, so no
 // capture depends on where the match clock happened to be.
 const DAY_PIN = 0;
 const NIGHT_PIN = 1;
@@ -349,11 +349,12 @@ const SERVER_SOURCES = [
   'games/rift/shared/src',
 ].map((p) => path.join(ROOT, p));
 
-/** ...and everything vite pulls into `games/rift/client/dist/`. */
+/** ...and everything vite pulls into `games/ancients/client/dist/`. */
 const CLIENT_SOURCES = [
   'games/rift/client/src',
-  'games/rift/client/index.html',
-  'games/rift/client/vite.config.ts',
+  'games/ancients/client/index.html',
+  'games/ancients/client/vite.config.ts',
+  'games/ancients/client/src/main.ts',
   'games/rift/shared/src',
   'platform/shared/src',
 ].map((p) => path.join(ROOT, p));
@@ -535,11 +536,11 @@ async function waitForServer(timeoutMs = 20000) {
 /** Refuse to capture a vite-dev proxy: HMR reloads pages mid-capture and the
  *  served source may be mid-edit. The BUILT client must answer. */
 async function assertProductionMount() {
-  const res = await fetch(`${BASE}/rift/`, { signal: AbortSignal.timeout(5000) });
-  if (!res.ok) throw new Error(`GET /rift/ returned ${res.status} — is the client built? (npm run build)`);
+  const res = await fetch(`${BASE}/ancients/`, { signal: AbortSignal.timeout(5000) });
+  if (!res.ok) throw new Error(`GET /ancients/ returned ${res.status} — is the client built? (npm run build)`);
   const html = await res.text();
   if (html.includes('/@vite/client')) {
-    throw new Error('/rift/ is proxied to the vite dev server on :5177 — stop it and re-run against the build');
+    throw new Error('/ancients/ is proxied to the vite dev server on :5184 — stop it and re-run against the build');
   }
 }
 
@@ -613,7 +614,7 @@ function trackErrors(page, tag) {
 
 // ---- the wire tap -----------------------------------------------------------------
 //
-// `window.__rift.snaps()` is the client's PARSED ring, and the client is precisely the thing that
+// `window.__ancients.snaps()` is the client's PARSED ring, and the client is precisely the thing that
 // HIDES a missing field: net.ts's `dayPhaseOf` substitutes 0 for an absent `dayPhase` and moves
 // on. So `serverDayPhase()` — which reads that ring — can never distinguish "the server sent 0"
 // from "the server sent nothing", and for a whole round it reported a confident, constant,
@@ -817,35 +818,35 @@ async function settle(page, { frames = 3, ms = 350 } = {}) {
   await sleep(ms);
 }
 
-const riftState = (page) => page.evaluate(() => window.__rift?.state() ?? null);
-const drawCalls = (page) => page.evaluate(() => window.__rift?.drawCalls() ?? -1);
+const riftState = (page) => page.evaluate(() => window.__ancients?.state() ?? null);
+const drawCalls = (page) => page.evaluate(() => window.__ancients?.drawCalls() ?? -1);
 
 /** Per-frame triangle count (GRAPHICS_CONTRACT §5). -1 means the meter is not
  *  exposed at all, which is itself a failure — the triangle budget is what
  *  stops the whole map being merged into one unculled mesh. */
 const triangles = (page) =>
-  page.evaluate(() => (typeof window.__rift?.triangles === 'function' ? window.__rift.triangles() : -1));
+  page.evaluate(() => (typeof window.__ancients?.triangles === 'function' ? window.__ancients.triangles() : -1));
 
 /** `true` once terrain AND vegetation have finished their chunked bakes
  *  (TerrainHandle.ready() && VegetationHandle.ready(), reported by R_WIRE).
  *  `null` when the accessor does not exist. */
 const worldReady = (page) =>
-  page.evaluate(() => (typeof window.__rift?.worldReady === 'function' ? window.__rift.worldReady() : null));
+  page.evaluate(() => (typeof window.__ancients?.worldReady === 'function' ? window.__ancients.worldReady() : null));
 
 /** Pin the renderer's time of day. Returns false when the debug surface has no
  *  setDayPhase — in which case the shot MUST NOT be taken: an unpinned cycle
  *  makes the capture depend on the wall clock. */
 const pinDayPhase = (page, t) =>
   page.evaluate((v) => {
-    if (typeof window.__rift?.setDayPhase !== 'function') return false;
-    window.__rift.setDayPhase(v);
+    if (typeof window.__ancients?.setDayPhase !== 'function') return false;
+    window.__ancients.setDayPhase(v);
     return true;
   }, t);
 
 /** The local hero's live row, or null. */
 const latestYou = (page) =>
   page.evaluate(() => {
-    const ring = window.__rift?.snaps() ?? [];
+    const ring = window.__ancients?.snaps() ?? [];
     const s = ring.length > 0 ? ring[ring.length - 1] : null;
     if (s === null || s === undefined || s.you === null || s.you === undefined) return null;
     return { x: s.you.x, z: s.you.z, hp: s.you.hp, respawnAtTick: s.you.respawnAtTick };
@@ -888,7 +889,7 @@ async function frameStats(page, buf) {
  *  to prevent is a baseline `wide-mid` taken through the death dim. */
 async function assertShootable(page, name) {
   const s = await riftState(page);
-  if (s === null) throw new Error(`${name}: window.__rift.state() is unavailable`);
+  if (s === null) throw new Error(`${name}: window.__ancients.state() is unavailable`);
   if (s.phase !== 'live') throw new Error(`${name}: client phase is '${s.phase}', not 'live' — the frame is not the game`);
   const you = await latestYou(page);
   if (you !== null && you.respawnAtTick > 0) {
@@ -1036,12 +1037,12 @@ async function captureViewport(vp) {
   zoomLevel = null;
   const stateAt = async (label) => JSON.stringify(await riftState(page).catch(() => null)) || `(no state — ${label})`;
   try {
-    // domcontentloaded, not networkidle0: the app's own waitFor(window.__rift)
+    // domcontentloaded, not networkidle0: the app's own waitFor(window.__ancients)
     // gate below is the real readiness signal, and an open /ws socket can hold
     // networkidle0 off forever on a reused server (measured: pages 2+ timed out
     // at 30s with the client already connected and in phase 'menu').
-    await page.goto(`${BASE}/rift/`, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await waitFor(() => page.evaluate(() => window.__rift !== undefined), 20000, 'window.__rift');
+    await page.goto(`${BASE}/ancients/`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await waitFor(() => page.evaluate(() => window.__ancients !== undefined), 20000, 'window.__ancients');
     await waitFor(
       async () => (await riftState(page))?.connected === true,
       15000,
@@ -1058,7 +1059,7 @@ async function captureViewport(vp) {
     await shot(page, 'menu', vp);
 
     // -- lobby (hero pick grid) ---------------------------------------------------------
-    await page.evaluate((s) => window.__rift.createPrivate('Verify', s), ROOM_SETTINGS);
+    await page.evaluate((s) => window.__ancients.createPrivate('Verify', s), ROOM_SETTINGS);
     await waitFor(
       async () => ((await riftState(page))?.phase ?? null) === 'lobby',
       15000,
@@ -1073,8 +1074,8 @@ async function captureViewport(vp) {
     await shot(page, 'lobby', vp);
 
     // -- start -> live ------------------------------------------------------------------
-    await page.evaluate((h) => window.__rift.pick(h), HERO_PICK);
-    await page.evaluate(() => window.__rift.start());
+    await page.evaluate((h) => window.__ancients.pick(h), HERO_PICK);
+    await page.evaluate(() => window.__ancients.start());
     await waitFor(
       async () => {
         const s = await riftState(page);
@@ -1087,7 +1088,7 @@ async function captureViewport(vp) {
     if (!(await pinDayPhase(page, DAY_PIN))) {
       failOnce(
         'setDayPhase',
-        `${tag}: window.__rift.setDayPhase is missing — every in-world capture is wall-clock dependent and no two judge rounds compare`,
+        `${tag}: window.__ancients.setDayPhase is missing — every in-world capture is wall-clock dependent and no two judge rounds compare`,
       );
     }
     await settle(page, { ms: 600 });
@@ -1137,7 +1138,7 @@ async function captureViewport(vp) {
         const s = await riftState(page);
         if (s === null) return null;
         if ((s.tick ?? 0) >= COMBAT_MIN_TICK) return s;
-        const evs = await page.evaluate(() => window.__rift.lastEvents().map((e) => e.t));
+        const evs = await page.evaluate(() => window.__ancients.lastEvents().map((e) => e.t));
         return evs.includes('rift_kill') || evs.includes('rift_cast') ? s : null;
       },
       60000,
@@ -1158,7 +1159,7 @@ async function captureViewport(vp) {
     if (maxTriangles < 0) {
       failOnce(
         'triangles',
-        `${tag}: window.__rift.triangles() is missing — GRAPHICS_CONTRACT §5's 1.2M triangle budget cannot be measured, ` +
+        `${tag}: window.__ancients.triangles() is missing — GRAPHICS_CONTRACT §5's 1.2M triangle budget cannot be measured, ` +
           'and a draw-call budget alone is gameable by merging the map into one unculled mesh',
       );
     } else if (maxTriangles === 0) {
@@ -1209,7 +1210,7 @@ async function waitWorldBuilt(page, tag) {
   if (probe === null) {
     failOnce(
       'worldReady',
-      `${tag}: window.__rift.worldReady() is missing — the harness cannot tell a finished map from a half-built one, ` +
+      `${tag}: window.__ancients.worldReady() is missing — the harness cannot tell a finished map from a half-built one, ` +
         'so every world shot may photograph a jungle mid-bake (contract.ts TerrainHandle.ready/VegetationHandle.ready)',
     );
     await settle(page, { frames: 10, ms: 1500 });
@@ -1227,7 +1228,7 @@ async function poseHero(page, x, z, timeoutMs, tolerance = WORLD_POSE_TOLERANCE_
   for (;;) {
     const you = await latestYou(page).catch(() => null);
     if (you !== null && you.respawnAtTick === 0 && Math.hypot(you.x - x, you.z - z) <= tolerance) {
-      await page.evaluate(() => window.__rift.order('stop')).catch(() => {});
+      await page.evaluate(() => window.__ancients.order('stop')).catch(() => {});
       await sleep(400);
       return;
     }
@@ -1243,7 +1244,7 @@ async function poseHero(page, x, z, timeoutMs, tolerance = WORLD_POSE_TOLERANCE_
       err.poseTimeout = true;
       throw err;
     }
-    await page.evaluate((x2, z2) => window.__rift.order('move', x2, z2), x, z).catch(() => {});
+    await page.evaluate((x2, z2) => window.__ancients.order('move', x2, z2), x, z).catch(() => {});
     await sleep(1000);
   }
 }
@@ -1252,7 +1253,7 @@ async function poseHero(page, x, z, timeoutMs, tolerance = WORLD_POSE_TOLERANCE_
 const neutralsNear = (page, cx, cz, radius) =>
   page.evaluate(
     (x, z, r) => {
-      const ring = window.__rift?.snaps() ?? [];
+      const ring = window.__ancients?.snaps() ?? [];
       const s = ring.length > 0 ? ring[ring.length - 1] : null;
       if (s === null || s === undefined) return 0;
       return s.ents.filter((e) => e.team === 2 && e.hp > 0 && Math.hypot(e.x - x, e.z - z) <= r).length;
@@ -1267,7 +1268,7 @@ const neutralsNear = (page, cx, cz, radius) =>
 const campMembers = (page, cx, cz, radius) =>
   page.evaluate(
     (x, z, r) => {
-      const ring = window.__rift?.snaps() ?? [];
+      const ring = window.__ancients?.snaps() ?? [];
       const s = ring.length > 0 ? ring[ring.length - 1] : null;
       if (s === null || s === undefined) return [];
       return s.ents
@@ -1320,7 +1321,7 @@ async function assertCampStandOff(page, cx, cz) {
  *  vision disc is the only thing lighting an off-lane frame. */
 const serverDayPhase = (page) =>
   page.evaluate(() => {
-    const ring = window.__rift?.snaps() ?? [];
+    const ring = window.__ancients?.snaps() ?? [];
     const s = ring.length > 0 ? ring[ring.length - 1] : null;
     if (s === null || s === undefined) return null;
     const d = s.dayPhase;
@@ -1412,7 +1413,7 @@ async function measureMeterLiveness(page, vp, tag) {
     );
 
     if (near.calls < 0) {
-      failOnce('drawCalls', `${tag}: window.__rift.drawCalls() is missing — the §5 draw-call budget cannot be measured at all`);
+      failOnce('drawCalls', `${tag}: window.__ancients.drawCalls() is missing — the §5 draw-call budget cannot be measured at all`);
       return;
     }
     if (near.calls < MIN_LIVE_DRAW_CALLS) {
@@ -1431,7 +1432,7 @@ async function measureMeterLiveness(page, vp, tag) {
     if (near.tris < 0) {
       failOnce(
         'triangles',
-        `${tag}: window.__rift.triangles() is missing — §5's 1.2M triangle budget cannot be measured, and a draw-call ` +
+        `${tag}: window.__ancients.triangles() is missing — §5's 1.2M triangle budget cannot be measured, and a draw-call ` +
           'budget alone is gameable by merging the map into one unculled mesh',
       );
       return;
@@ -1454,13 +1455,13 @@ async function captureWorldStates(vp) {
   const page = await launchOne(vp, tag);
   zoomLevel = null;
   try {
-    await page.goto(`${BASE}/rift/`, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await waitFor(() => page.evaluate(() => window.__rift !== undefined), 20000, 'window.__rift');
+    await page.goto(`${BASE}/ancients/`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await waitFor(() => page.evaluate(() => window.__ancients !== undefined), 20000, 'window.__ancients');
     await waitFor(async () => (await riftState(page))?.connected === true, 15000, 'socket connected (world)');
-    await page.evaluate((s) => window.__rift.createPrivate('VerifyWorld', s), WORLD_ROOM_SETTINGS);
+    await page.evaluate((s) => window.__ancients.createPrivate('VerifyWorld', s), WORLD_ROOM_SETTINGS);
     await waitFor(async () => ((await riftState(page))?.phase ?? null) === 'lobby', 15000, 'world-room lobby');
-    await page.evaluate((h) => window.__rift.pick(h), HERO_PICK);
-    await page.evaluate(() => window.__rift.start());
+    await page.evaluate((h) => window.__ancients.pick(h), HERO_PICK);
+    await page.evaluate(() => window.__ancients.start());
     const live = await waitFor(
       async () => {
         const s = await riftState(page);
@@ -1532,7 +1533,7 @@ async function captureWorldStates(vp) {
           if (!(await pinDayPhase(page, dayT))) {
             failOnce(
               'setDayPhase',
-              'window.__rift.setDayPhase is missing — the world/night shots would not be reproducible, so they are not captured',
+              'window.__ancients.setDayPhase is missing — the world/night shots would not be reproducible, so they are not captured',
             );
             fail(`${tag}: ${name} not captured (dayPhase unpinnable)`);
             return;
@@ -1679,10 +1680,10 @@ async function captureWorldStates(vp) {
 
 // ---- the overlay-state flow (1920x1080 only) --------------------------------------
 
-/** goto + the app's own readiness gates (window.__rift, socket connected). */
+/** goto + the app's own readiness gates (window.__ancients, socket connected). */
 async function connectClient(page, tag) {
-  await page.goto(`${BASE}/rift/`, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await waitFor(() => page.evaluate(() => window.__rift !== undefined), 20000, 'window.__rift');
+  await page.goto(`${BASE}/ancients/`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await waitFor(() => page.evaluate(() => window.__ancients !== undefined), 20000, 'window.__ancients');
   await waitFor(
     async () => (await riftState(page))?.connected === true,
     15000,
@@ -1707,7 +1708,7 @@ async function driveToDeath(page, x, z, timeoutMs) {
   for (;;) {
     if (await domVisible(page, '.hud .death-overlay')) return true;
     if (Date.now() - t0 > timeoutMs) return false;
-    await page.evaluate((x2, z2) => window.__rift.order('move', x2, z2), x, z).catch(() => {});
+    await page.evaluate((x2, z2) => window.__ancients.order('move', x2, z2), x, z).catch(() => {});
     await sleep(1200);
   }
 }
@@ -1727,21 +1728,21 @@ async function waitForEndedPhase(page, timeoutMs, maxRooms = 3) {
     if (s?.phase === 'ended') return s;
     if (s?.phase === 'lobby') {
       // back in the lobby (post-reset, or countdown still running): (re)start
-      await page.evaluate(() => window.__rift.start()).catch(() => {});
+      await page.evaluate(() => window.__ancients.start()).catch(() => {});
     } else if (s?.phase === 'menu') {
       if (rooms >= maxRooms) {
         throw new Error(`the end room dropped its client ${rooms} times — the speed-20 snap stream is not drainable here`);
       }
       rooms++;
       log(`end-room: client dropped to menu — recreating the room (attempt ${rooms}/${maxRooms})`);
-      await page.evaluate((st) => window.__rift.createPrivate('VerifyEnd', st), END_ROOM_SETTINGS);
+      await page.evaluate((st) => window.__ancients.createPrivate('VerifyEnd', st), END_ROOM_SETTINGS);
       await waitFor(
         async () => ((await riftState(page))?.phase ?? null) === 'lobby',
         15000,
         'end-room lobby (recreated)',
       );
-      await page.evaluate((h) => window.__rift.pick(h), HERO_PICK);
-      await page.evaluate(() => window.__rift.start());
+      await page.evaluate((h) => window.__ancients.pick(h), HERO_PICK);
+      await page.evaluate(() => window.__ancients.start());
     }
     if (Date.now() - t0 > timeoutMs) {
       throw new Error(`the speed-20 room never reached the ended phase (last phase ${lastPhase})`);
@@ -1757,14 +1758,14 @@ async function captureOverlayStates(vp) {
     await connectClient(page, 'overlay');
 
     // -- countdown: shot immediately after start() is pressed ----------------------
-    await page.evaluate((s) => window.__rift.createPrivate('VerifyOverlay', s), OVERLAY_ROOM_SETTINGS);
+    await page.evaluate((s) => window.__ancients.createPrivate('VerifyOverlay', s), OVERLAY_ROOM_SETTINGS);
     await waitFor(
       async () => ((await riftState(page))?.phase ?? null) === 'lobby',
       15000,
       'overlay-room lobby',
     );
-    await page.evaluate((h) => window.__rift.pick(h), HERO_PICK);
-    await page.evaluate(() => window.__rift.start());
+    await page.evaluate((h) => window.__ancients.pick(h), HERO_PICK);
+    await page.evaluate(() => window.__ancients.start());
     await waitFor(
       () =>
         page.evaluate(
@@ -1812,14 +1813,14 @@ async function captureOverlayStates(vp) {
   try {
     await endPage.setViewport({ width: 640, height: 360, deviceScaleFactor: 1 });
     await connectClient(endPage, 'end');
-    await endPage.evaluate((s) => window.__rift.createPrivate('VerifyEnd', s), END_ROOM_SETTINGS);
+    await endPage.evaluate((s) => window.__ancients.createPrivate('VerifyEnd', s), END_ROOM_SETTINGS);
     await waitFor(
       async () => ((await riftState(endPage))?.phase ?? null) === 'lobby',
       15000,
       'end-room lobby',
     );
-    await endPage.evaluate((h) => window.__rift.pick(h), HERO_PICK);
-    await endPage.evaluate(() => window.__rift.start());
+    await endPage.evaluate((h) => window.__ancients.pick(h), HERO_PICK);
+    await endPage.evaluate(() => window.__ancients.start());
     await waitForEndedPhase(endPage, END_TIMEOUT_MS);
     await endPage.setViewport({ width: vp.width, height: vp.height, deviceScaleFactor: 1 });
     await settle(endPage, { frames: 5, ms: 600 }); // reflow + a few frames at the new size

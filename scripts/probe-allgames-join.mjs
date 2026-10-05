@@ -52,12 +52,6 @@ const GAMES = [
     timeout: 12000,
   },
   {
-    id: 'rift', surface: '__rift',
-    join: `window.__rift.createPrivate('Alice', { teamSize: 2, speed: 20 })`,
-    check: `(() => { const s = window.__rift.state(); return s && s.phase === 'lobby' && s.you !== null ? 'lobby team=' + s.team : null; })()`,
-    timeout: 15000,
-  },
-  {
     id: 'splat', surface: '__splat',
     join: `window.__splat.startRace(42)`,
     check: `(() => { const s = window.__splat.state(); return s && s.phase !== 'menu' ? 'phase=' + s.phase : null; })()`,
@@ -70,12 +64,6 @@ const GAMES = [
     timeout: 12000,
   },
   {
-    id: 'aces', surface: '__ACES',
-    join: `window.__ACES.join({ kind: 'private', settings: { debug: true } })`,
-    check: `(() => { const s = window.__ACES.state(); return s && (s.phase === 'lobby' || s.phase === 'live') ? 'phase=' + s.phase : null; })()`,
-    timeout: 25000,
-  },
-  {
     id: 'ancients', surface: '__ancients',
     join: `window.__ancients.createPrivate('Alice', { teamSize: 2, speed: 20 })`,
     check: `(() => { const s = window.__ancients.state(); return s && s.phase === 'lobby' && s.you !== null ? 'lobby team=' + s.team : null; })()`,
@@ -84,11 +72,11 @@ const GAMES = [
 ];
 
 async function main() {
-  // Fresh browser PER GAME (not one browser for all nine): churning nine
+  // Fresh browser PER GAME (not one browser for all seven): churning seven
   // heavy WebGL pages through a single headless-shell degrades it (GPU
-  // contexts, renderer bloat, CPU) until late pages (rift 5th, ancients
-  // 9th) time out their joins while isolated identical joins pass 3/3
-  // (measured 2026-10-01). ~2-3s per launch is the price of a real gate.
+  // contexts, renderer bloat, CPU) until late pages (ancients 7th) time
+  // out their joins while isolated identical joins pass 3/3 (measured
+  // 2026-10-01). ~2-3s per launch is the price of a real gate.
   let pass = 0;
   for (const g of GAMES) {
     const browser = await puppeteer.launch({

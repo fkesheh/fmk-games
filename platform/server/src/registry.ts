@@ -5,12 +5,10 @@
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { acesModule } from '@aces/server';
 import { bankModule } from '@bank/server';
 import { fpsModule } from '@fps/server';
 import { kartModule } from '@kart/server';
 import type { GameModule } from '@platform/shared';
-import { riftModule } from '@rift/server';
 import { splatModule } from '@splat/server';
 import { outpostModule } from '@outpost/server';
 import { wordbombModule } from '@wordbomb/server';
@@ -21,12 +19,11 @@ export const GAMES: GameModule[] = [
   bankModule,
   kartModule,
   wordbombModule,
-  riftModule,
   splatModule,
   outpostModule,
-  acesModule,
-  // PLATFORM v2 port (docs/PLATFORM.md §7): same ANCIENTS rooms under a
-  // second id, SDK-shell client at /ancients/, stats sink + phone-pad adapter.
+  // PLATFORM v2 port (docs/PLATFORM.md §7): ANCIENTS rooms, SDK-shell client
+  // at /ancients/, stats sink + phone-pad adapter. This is the only
+  // registration for these rooms (legacy rift id retired).
   riftModuleVariant({
     id: 'ancients',
     name: 'ANCIENTS·SDK',

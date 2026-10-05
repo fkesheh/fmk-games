@@ -20,9 +20,9 @@
 // an iPad was in a child's hands.
 //
 // Usage:
-//   node scripts/gen-pwa-assets.mjs      # regenerates all six games in place
+//   node scripts/gen-pwa-assets.mjs      # regenerates all seven games in place
 //
-// SCOPE: the six GAME installs only. The launcher's own manifest and icons
+// SCOPE: the seven GAME installs only. The launcher's own manifest and icons
 // (`/manifest.webmanifest`, `/icons/…`) are generated and served by
 // platform/server/src/pwa.ts — deliberately not duplicated here, because two
 // generators for one icon is how the launcher ends up with two different looks.
@@ -204,7 +204,7 @@ class Canvas {
 // ---- glyphs ----------------------------------------------------------------
 // `s` is the glyph box edge in normalised units, centred on the icon. Each
 // glyph must read at 48 CSS px on a home screen and be told apart from the
-// other five by SHAPE ALONE — a 4-year-old navigates by colour first, but two
+// other six by SHAPE ALONE — a 4-year-old navigates by colour first, but two
 // games sharing a hue family must not also share a silhouette. RIFT's moss and
 // BANK's felt are the one such pair (both green), which is why RIFT is the only
 // lattice and BANK the only glyph built from pips.
@@ -309,6 +309,20 @@ const GLYPHS = {
     c.stroke(0.5, apexY - s * 0.18, 0.5, apexY + s * 0.02, s * 0.045, col.hot);
     c.rect(0.5 + s * 0.02, apexY - s * 0.18, s * 0.17, s * 0.1, col.hot);
   },
+
+  /** OUTPOST — a horde skull: pale cranium + jaw, dark eye voids and nose
+   *  slit. The only face-like silhouette in the set; nothing else here is a
+   *  disc with two voids, which keeps it apart from BANK's pipped square and
+   *  WORDBOMB's dark bomb at 48px. */
+  outpost(c, s, col) {
+    const cy = 0.5 - s * 0.06;
+    c.circle(0.5, cy, s * 0.3, col.light); // cranium
+    // jaw: overlaps the cranium's lower half so the skull reads as one bone
+    c.roundRect(0.5 - s * 0.16, 0.5 + s * 0.08, s * 0.32, s * 0.2, s * 0.05, col.light);
+    c.circle(0.5 - s * 0.115, 0.5 - s * 0.04, s * 0.075, col.dark); // left eye void
+    c.circle(0.5 + s * 0.115, 0.5 - s * 0.04, s * 0.075, col.dark); // right eye void
+    c.rect(0.5 - s * 0.02, 0.5 + s * 0.06, s * 0.04, s * 0.08, col.dark); // nose slit
+  },
 };
 
 // ---- palette + paint-guard extraction --------------------------------------
@@ -329,7 +343,7 @@ function paintGuardHex(htmlFile) {
   return m[1];
 }
 
-// ---- the six game installs (TOUCH_PWA.md §1.1) -----------------------------
+// ---- the seven game installs (TOUCH_PWA.md §1.1) ----------------------------
 // The launcher install of §1.1 is separate; it lives in platform/server (T2).
 
 const GAMES = [
@@ -378,26 +392,37 @@ const GAMES = [
     colors: { bg: 'fuse', light: 'paperLit', dark: 'ink', hot: 'boom' },
   },
   {
-    id: 'rift',
-    name: 'ANCIENTS',
+    id: 'ancients',
+    name: 'ANCIENTS.SDK',
     shortName: 'ANCIENTS', // 8
     // A MOBA is unplayable in portrait: the lane the camera must show is wider
     // than it is tall, and the ability bar needs the horizontal run.
     orientation: 'landscape',
     glyph: 'rift',
     palette: 'games/rift/shared/src/palette.ts',
-    html: 'games/rift/client/index.html',
-    out: 'games/rift/client/public',
-    // moss + gold ARE the launcher card's identity pair (LPAL.riftTint /
-    // LPAL.riftAccent in platform/server/src/index.ts) — one source of truth.
+    html: 'games/ancients/client/index.html',
+    out: 'games/ancients/client/public',
+    // moss + gold ARE the launcher card's identity pair — one source of truth.
     colors: { bg: 'moss', light: 'gold', dark: 'ink' },
+  },
+  {
+    id: 'outpost',
+    name: 'OUTPOST',
+    shortName: 'OUTPOST', // 7
+    // A tower-defence lane is wider than it is tall; the approach run needs it.
+    orientation: 'landscape',
+    glyph: 'outpost',
+    palette: 'games/outpost/shared/src/palette.ts',
+    html: 'games/outpost/client/index.html',
+    out: 'games/outpost/client/public',
+    colors: { bg: 'skyNight', light: 'rotPale', dark: 'rotDeep', hot: 'zeye' },
   },
   {
     id: 'splat',
     name: 'SKI SPLAT',
     shortName: 'SKI SPLAT', // 9
     // A downhill course is wider than it is tall on screen; the steering lane
-    // needs the horizontal run, same argument as rift/kart.
+    // needs the horizontal run, same argument as ancients/kart.
     orientation: 'landscape',
     glyph: 'splat',
     palette: 'games/splat/shared/src/palette.ts',

@@ -257,7 +257,7 @@ are the MapDef ids; the no-entity sentinel is `NO_ENT = -1`).
 ## 5. Room + module + bots (server/src/)
 
 - **module.ts** — `riftModule: GameModule` exactly per the wordbomb pattern:
-  id `'rift'`, name `'ANCIENTS'`, devPort `5177`, minPlayers `MIN_PLAYERS`,
+  id `'ancients'`, name `'ANCIENTS'`, devPort `5177`, minPlayers `MIN_PLAYERS`,
   maxPlayers `MAX_PLAYERS`, `createRoom` parses settings (throws on bad) and
   constructs the Room. Module-scope shared `rand = rng((Date.now() ^
   (roomSeq++ * 0x9e3779b9)) >>> 0)` for ids only; gameplay randomness is
@@ -297,7 +297,7 @@ are the MapDef ids; the no-entity sentinel is `NO_ENT = -1`).
 Connection/lifecycle mirrors wordbomb exactly: one `/ws`, `rift.name` +
 `rift.resume` in localStorage (try/catch'd), `?code=` invite prefill +
 `history.replaceState`, clock sync via platform ping/pong, reconnect with
-backoff, every create/join carries `game: 'rift'`, room list filtered to rift.
+backoff, every create/join carries `game: 'ancients'`, room list filtered to ancients.
 
 **Frozen client seams** — `client/src/contract.ts` is Layer-1 (normative):
 `InterpEnt`/`GhostEnt`/`InterpHandle`, `SceneHandle`/`UnitsHandle`/`FogHandle`/

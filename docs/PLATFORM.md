@@ -195,9 +195,9 @@ The SDK proof is now a **port of ANCIENTS** itself:
 
 | Game | Mode | Proves |
 |---|---|---|
-| **ANCIENTS·SDK** `/ancients/` (`games/ancients/`) | same MOBA as legacy `/rift/`, registered separately via `riftModuleVariant()` | variant registration of a REAL game with zero legacy edits; SDK identity/auth shell (`{t:'auth'}` after every open); stats sink (`rift_end` → `ancients.kill/death/win`, pad orders → `ancients.pad_order`); phone-pad adapter (stick→click-to-move orders, buttons→casts) with its own unit suite |
+| **ANCIENTS·SDK** `/ancients/` (`games/ancients/`) | the ANCIENTS MOBA, registered as game id `'ancients'` via `riftModuleVariant()` | registration of a REAL game with zero legacy edits; SDK identity/auth shell (`{t:'auth'}` after every open); stats sink (`rift_end` → `ancients.kill/death/win`, pad orders → `ancients.pad_order`); phone-pad adapter (stick→click-to-move orders, buttons→casts) with its own unit suite |
 
-Legacy `/rift/` keeps running untouched and anonymous. The port reuses the
+The legacy rift door was removed 2026-10-04; the `'ancients'` variant is now the only registration. The port reuses the
 rift client core through deep imports; only the shell (`main.ts`) is new.
 
 ## 8. Native app door (design note, not built)

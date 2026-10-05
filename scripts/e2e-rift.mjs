@@ -5,8 +5,8 @@
 // Serves the BUILT platform (platform/server/dist/server.js on E2E_PORT,
 // default 8091 — the client dist must already exist; this suite NEVER builds),
 // then drives TWO separate browser processes (no cross-tab timer throttling)
-// through the frozen window.__rift debug surface (games/rift/CONTRACT.md §6)
-// against the multi-game static route /rift/.
+// through the frozen window.__ancients debug surface (games/rift/CONTRACT.md §6)
+// against the multi-game static route /ancients/.
 //
 // THE MATCH: a private room with settings { teamSize: 2, speed: 10 }. Two
 // humans (Alice, Bob) seat on opposite teams; the room bot-fills each side to
@@ -108,7 +108,7 @@ const DAY_PHASE_SWEEP_MIN = 0.25; // a 12+ game-minute match at DAY_PERIOD_S 600
 //   sweeps more than one full cycle; anything under a quarter of one means the
 //   phase is pinned, frozen or not derived from matchTick at all
 
-// fields the CONTRACT.md §6 debug surface freezes for window.__rift.state()
+// fields the CONTRACT.md §6 debug surface freezes for window.__ancients.state()
 const RIFT_STATE_FIELDS = ['phase', 'connected', 'you', 'team', 'hero', 'gold', 'tick', 'ents', 'positions'];
 
 // ---- tiny framework -------------------------------------------------------------
@@ -171,7 +171,7 @@ function digest(s) {
 // builds — a suite that silently rebuilds hides exactly the defect above.
 const FRESHNESS_EXTS = new Set(['.ts', '.tsx', '.js', '.mjs', '.cjs', '.json', '.css', '.html', '.glsl', '.frag', '.vert']);
 const SERVER_ENTRY = path.join(ROOT, 'platform/server/dist/server.js');
-const CLIENT_ENTRY = path.join(ROOT, 'games/rift/client/dist/index.html');
+const CLIENT_ENTRY = path.join(ROOT, 'games/ancients/client/dist/index.html');
 
 /** Everything esbuild pulls into `platform/server/dist/server.js` THAT CAN CHANGE RIFT'S WIRE.
  *  Deliberately NOT the whole bundle: `platform/server/src/index.ts` also links @bank/@fps/@kart/
@@ -186,11 +186,12 @@ const SERVER_SOURCES = [
   'games/rift/shared/src',
 ].map((p) => path.join(ROOT, p));
 
-/** ...and everything vite pulls into `games/rift/client/dist/`. */
+/** ...and everything vite pulls into `games/ancients/client/dist/`. */
 const CLIENT_SOURCES = [
   'games/rift/client/src',
-  'games/rift/client/index.html',
-  'games/rift/client/vite.config.ts',
+  'games/ancients/client/index.html',
+  'games/ancients/client/vite.config.ts',
+  'games/ancients/client/src/main.ts',
   'games/rift/shared/src',
   'platform/shared/src',
 ].map((p) => path.join(ROOT, p));
@@ -317,12 +318,12 @@ async function waitForServer(timeoutMs = 25000) {
   for (;;) {
     if (serverChild.exitCode !== null) throw new Error(`server exited early (${serverChild.exitCode})`);
     try {
-      const res = await fetch(`${BASE}/rift/`, { signal: AbortSignal.timeout(2000) });
+      const res = await fetch(`${BASE}/ancients/`, { signal: AbortSignal.timeout(2000) });
       if (res.ok) return;
     } catch {
       // not up yet
     }
-    if (Date.now() - t0 > timeoutMs) throw new Error(`server did not serve /rift/ on :${PORT} within ${timeoutMs}ms`);
+    if (Date.now() - t0 > timeoutMs) throw new Error(`server did not serve /ancients/ on :${PORT} within ${timeoutMs}ms`);
     await sleep(250);
   }
 }
@@ -385,7 +386,7 @@ async function launchOne(tag) {
 
 // ---- the wire tap -----------------------------------------------------------------
 //
-// `window.__rift.snaps()` is the client's PARSED ring, and the client is precisely the thing that
+// `window.__ancients.snaps()` is the client's PARSED ring, and the client is precisely the thing that
 // HIDES a missing field: net.ts's `dayPhaseOf` substitutes 0 for an absent `dayPhase` and moves
 // on. A check written against the parsed ring therefore cannot distinguish "the server sent 0"
 // from "the server sent nothing", and for three rounds it did not. The frames themselves are the
@@ -533,10 +534,10 @@ async function shot(page, name) {
 }
 
 // ---- debug-surface wrappers -------------------------------------------------------------
-const riftState = (page) => page.evaluate(() => window.__rift?.state() ?? null);
+const riftState = (page) => page.evaluate(() => window.__ancients?.state() ?? null);
 const lastSnap = (page) =>
   page.evaluate(() => {
-    const s = window.__rift?.snaps() ?? [];
+    const s = window.__ancients?.snaps() ?? [];
     return s.length > 0 ? s[s.length - 1] : null;
   });
 /**
@@ -551,7 +552,7 @@ const lastSnap = (page) =>
  */
 const freshSnap = (page, maxLagMs) =>
   page.evaluate((maxLag) => {
-    const s = window.__rift?.snaps() ?? [];
+    const s = window.__ancients?.snaps() ?? [];
     if (s.length === 0) return null;
     const snap = s[s.length - 1];
     const lagMs = Date.now() - snap.serverTime;
@@ -560,16 +561,16 @@ const freshSnap = (page, maxLagMs) =>
 /** Diagnostic pair: newest snap tick + current lag, for failure messages. */
 const snapLag = (page) =>
   page.evaluate(() => {
-    const s = window.__rift?.snaps() ?? [];
+    const s = window.__ancients?.snaps() ?? [];
     if (s.length === 0) return { tick: null, lagMs: null };
     const snap = s[s.length - 1];
     return { tick: snap.matchTick, lagMs: Date.now() - snap.serverTime };
   });
-const lastEvents = (page) => page.evaluate(() => window.__rift?.lastEvents() ?? []);
+const lastEvents = (page) => page.evaluate(() => window.__ancients?.lastEvents() ?? []);
 /** Newest raw frame of wire tag `t` in the client's messageLog ring. */
 const lastFrame = (page, t) =>
   page.evaluate((tag) => {
-    const log = window.__rift?.messageLog() ?? [];
+    const log = window.__ancients?.messageLog() ?? [];
     for (let i = log.length - 1; i >= 0; i--) {
       const m = log[i];
       if (m !== null && typeof m === 'object' && m.t === tag) return m;
@@ -579,8 +580,8 @@ const lastFrame = (page, t) =>
 
 const ownEntId = (page) =>
   page.evaluate(() => {
-    const st = window.__rift?.state();
-    const s = window.__rift?.snaps() ?? [];
+    const st = window.__ancients?.state();
+    const s = window.__ancients?.snaps() ?? [];
     if (!st || st.you === null || s.length === 0) return null;
     const snap = s[s.length - 1];
     const me = snap.ents.find((e) => e.k === 'hero' && e.pid === st.you);
@@ -593,7 +594,7 @@ const ownEntId = (page) =>
 const neutralsNear = (page, cx, cz, radius) =>
   page.evaluate(
     (x, z, r) => {
-      const s = window.__rift?.snaps() ?? [];
+      const s = window.__ancients?.snaps() ?? [];
       if (s.length === 0) return [];
       const snap = s[s.length - 1];
       return snap.ents
@@ -621,7 +622,7 @@ function startDayPhaseSampler(page) {
     busy = true;
     page
       .evaluate(() => {
-        const s = window.__rift?.snaps() ?? [];
+        const s = window.__ancients?.snaps() ?? [];
         return s.length === 0 ? null : { has: 'dayPhase' in s[s.length - 1], v: s[s.length - 1].dayPhase };
       })
       .then((r) => {
@@ -662,15 +663,15 @@ async function main() {
 
   startServer();
   await waitForServer();
-  console.log(`server up on ${BASE} (rift client at /rift/)`);
+  console.log(`server up on ${BASE} (rift client at /ancients/)`);
 
   const A = await launchOne('A');
   const B = await launchOne('B');
   for (const [page, tag] of [[A, 'A'], [B, 'B']]) {
-    await page.goto(`${BASE}/rift/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await waitFor(() => page.evaluate(() => !!window.__rift), 15000, `__rift on ${tag}`);
+    await page.goto(`${BASE}/ancients/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await waitFor(() => page.evaluate(() => !!window.__ancients), 15000, `__ancients on ${tag}`);
   }
-  check('(1) rift client loads at /rift/ (window.__rift present on both pages)', true, '', { fatal: true });
+  check('(1) rift client loads at /ancients/ (window.__ancients present on both pages)', true, '', { fatal: true });
 
   const s0 = await riftState(A);
   const missing = RIFT_STATE_FIELDS.filter((f) => !(f in (s0 ?? {})));
@@ -684,7 +685,7 @@ async function main() {
   // ==========================================================================
   // LOBBY — A creates {teamSize:2, speed:20}; B joins by code; both pick
   // ==========================================================================
-  await A.evaluate((s) => window.__rift.createPrivate('Alice', s), SETTINGS);
+  await A.evaluate((s) => window.__ancients.createPrivate('Alice', s), SETTINGS);
   const aLobby = await waitFor(
     async () => {
       const s = await riftState(A);
@@ -702,7 +703,7 @@ async function main() {
     { fatal: true },
   );
 
-  await B.evaluate((c) => window.__rift.joinPrivate('Bob', c), code);
+  await B.evaluate((c) => window.__ancients.joinPrivate('Bob', c), code);
   const bothSeated = await waitFor(
     async () => {
       const [la, lb, sb] = await Promise.all([lastFrame(A, 'rift_lobby'), lastFrame(B, 'rift_lobby'), riftState(B)]);
@@ -722,8 +723,8 @@ async function main() {
   );
   await shot(A, 'e2e-rift-lobby.png');
 
-  await A.evaluate(() => window.__rift.pick('reaver'));
-  await B.evaluate(() => window.__rift.pick('longbow'));
+  await A.evaluate(() => window.__ancients.pick('reaver'));
+  await B.evaluate(() => window.__ancients.pick('longbow'));
   const picks = await waitFor(
     async () => {
       const l = await lastFrame(A, 'rift_lobby');
@@ -743,7 +744,7 @@ async function main() {
   // ==========================================================================
   // START -> rift_begin (lanes=1, teamSize=2) -> snaps flow
   // ==========================================================================
-  await A.evaluate(() => window.__rift.start());
+  await A.evaluate(() => window.__ancients.start());
   const begins = await waitFor(
     async () => {
       const [ba, bb, sa, sb] = await Promise.all([lastFrame(A, 'rift_begin'), lastFrame(B, 'rift_begin'), riftState(A), riftState(B)]);
@@ -851,7 +852,7 @@ async function main() {
   let freshBase = null; // first FRESH tick seen after the order
   const moveWallDeadline = Date.now() + 120000;
   for (;;) {
-    await A.evaluate((x, z) => window.__rift.order('move', x, z), moveTo.x, moveTo.z);
+    await A.evaluate((x, z) => window.__ancients.order('move', x, z), moveTo.x, moveTo.z);
     for (let i = 0; i < 10; i++) {
       await sleep(200);
       const s = await freshSnap(A, 2000);
@@ -935,7 +936,7 @@ async function main() {
       throw new Error(`q/w/e all maxed before the scripted spend (ranks=[${ranks}]) — nothing left to prove it with`);
     }
     spendBase = { slot, rank: ranks[slot], points: banked.you.skillPoints };
-    await spendSubject.evaluate((x) => window.__rift.skill(x), slot);
+    await spendSubject.evaluate((x) => window.__ancients.skill(x), slot);
     try {
       ranked = await waitFor(
         async () => {
@@ -1018,7 +1019,7 @@ async function main() {
       if (Date.now() > castDeadline) throw new Error('Q never observed ready within 60s (flaps?)');
       continue;
     }
-    await A.evaluate(() => window.__rift.cast(0));
+    await A.evaluate(() => window.__ancients.cast(0));
     try {
       castEvidence = await waitFor(
         async () => {
@@ -1134,7 +1135,7 @@ async function main() {
         campTrace = `the match left the live phase (phase=${String(phase)}) before any neutral was seen`;
         break;
       }
-      await A.evaluate((x, z) => window.__rift.order('move', x, z), stand.x, stand.z);
+      await A.evaluate((x, z) => window.__ancients.order('move', x, z), stand.x, stand.z);
       await sleep(700);
       const near = await neutralsNear(A, camp.x, camp.z, CAMP_VISIBLE_M);
       if (near.length > 0) {
@@ -1167,8 +1168,8 @@ async function main() {
   // measurably inside, THEN buy (with retries + full diagnostics on failure).
   const buyProbe = async () =>
     A.evaluate(() => {
-      const st = window.__rift?.state();
-      const s = window.__rift?.snaps() ?? [];
+      const st = window.__ancients?.state();
+      const s = window.__ancients?.snaps() ?? [];
       if (!st || st.team === null || s.length === 0) return null;
       const snap = s[s.length - 1];
       if (snap.you === null) return null;
@@ -1187,7 +1188,7 @@ async function main() {
       if (p === null) return null;
       if (p.respawnAtTick > 0) return null; // dead: respawn lands on the fountain
       if (p.dist <= 4.5) return p;
-      await A.evaluate((x, z) => window.__rift.order('move', x, z), p.ax, p.az);
+      await A.evaluate((x, z) => window.__ancients.order('move', x, z), p.ax, p.az);
       return null;
     },
     20000,
@@ -1198,7 +1199,7 @@ async function main() {
   const buyTrace = [];
   const buyDeadline = Date.now() + 20000;
   for (;;) {
-    await A.evaluate(() => window.__rift.buy('bladestone'));
+    await A.evaluate(() => window.__ancients.buy('bladestone'));
     await sleep(500);
     const p = await buyProbe();
     if (p !== null) {
@@ -1211,7 +1212,7 @@ async function main() {
       break;
     }
     if (p !== null && p.dist > 4.5 && p.respawnAtTick === 0) {
-      await A.evaluate((x, z) => window.__rift.order('move', x, z), p.ax, p.az);
+      await A.evaluate((x, z) => window.__ancients.order('move', x, z), p.ax, p.az);
     }
     if (Date.now() > buyDeadline) {
       throw new Error(`buy('bladestone') never landed — observed: ${JSON.stringify(p)} trace: ${buyTrace.join(' | ')}`);
@@ -1262,7 +1263,7 @@ async function main() {
   );
 
   // info for the report (T14 owns the draw-call gate; measured here, not gated)
-  const drawCalls = await A.evaluate(() => window.__rift.drawCalls());
+  const drawCalls = await A.evaluate(() => window.__ancients.drawCalls());
   console.log(`info  drawCalls()=${drawCalls} at matchTick=${death.s.matchTick}`);
   await shot(A, 'e2e-rift-live.png');
 

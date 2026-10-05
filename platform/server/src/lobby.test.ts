@@ -11,15 +11,15 @@
 //   (ws, pingSentAt, ...), so TypeScript's structural check rejects a plain
 //   object literal for it; the `as unknown as Session` cast below is the
 //   accepted escape for that (not `any`, not `!`).
-// - Every test below builds the Lobby with the REAL riftModule pulled
-//   straight from registry.ts's GAMES — exactly "the rift module" per spec —
+// - Every test below builds the Lobby with the REAL ancients module pulled
+//   straight from registry.ts's GAMES — exactly "the ancients module" per spec —
 //   so they exercise the actual production matchmaking path, not a stand-in.
 //   (An earlier draft of this file could not safely drive rift to a live,
 //   bot-filled phase because `@rift/server` was resolving through
 //   node_modules into an unrelated, far-diverged checkout; that was a
 //   workspace symlink issue, now fixed, and every case below runs against
 //   this worktree's own code.)
-// - RIFT genuinely reports its waiting-for-players phase as the literal
+// - ANCIENTS genuinely reports its waiting-for-players phase as the literal
 //   string 'lobby', NOT 'warmup'. findPublicRoom (lobby.ts:224) prefers
 //   'warmup' first but falls back to any phase at lobby.ts:319/327 — for
 //   rift, that fallback is not a rare edge case, it is the ONLY path that
@@ -92,15 +92,15 @@ function riftRoomIdSeenBy(sess: FakeSession): RoomId {
   return roomId;
 }
 
-const RIFT: GameModule = (() => {
-  const mod = GAMES.find((m) => m.id === 'rift');
-  if (mod === undefined) throw new Error('registry.ts GAMES has no "rift" module registered');
+const ANCIENTS: GameModule = (() => {
+  const mod = GAMES.find((m) => m.id === 'ancients');
+  if (mod === undefined) throw new Error('registry.ts GAMES has no "ancients" module registered');
   return mod;
 })();
 
 // ---- quick_join matchmaking (the reported bug: two humans, two rooms) ------
 
-describe('quick_join matchmaking (real riftModule from registry.ts)', () => {
+describe('quick_join matchmaking (real ancients module from registry.ts)', () => {
   let tracked: Lobby[] = [];
 
   afterEach(() => {
@@ -109,13 +109,13 @@ describe('quick_join matchmaking (real riftModule from registry.ts)', () => {
   });
 
   it('two quick-joiners for the same game land in the SAME room (core case)', () => {
-    const lobby = new Lobby([RIFT]);
+    const lobby = new Lobby([ANCIENTS]);
     tracked.push(lobby);
 
     const s1 = new FakeSession('p1');
     const s2 = new FakeSession('p2');
-    lobby.handleMessage(asSession(s1), { t: 'quick_join', name: 'Ada', game: 'rift' });
-    lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'Bob', game: 'rift' });
+    lobby.handleMessage(asSession(s1), { t: 'quick_join', name: 'Ada', game: 'ancients' });
+    lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'Bob', game: 'ancients' });
 
     // room count alone would not prove per-session identity (spec: "assert
     // on the actual room identity, not merely on the room count") — so pin
@@ -134,11 +134,11 @@ describe('quick_join matchmaking (real riftModule from registry.ts)', () => {
   });
 
   it('repeats the core case with the first room left fresh in "lobby" phase — NOT the preferred "warmup", so this is the fallback path', () => {
-    const lobby = new Lobby([RIFT]);
+    const lobby = new Lobby([ANCIENTS]);
     tracked.push(lobby);
 
     const s1 = new FakeSession('p1');
-    lobby.handleMessage(asSession(s1), { t: 'quick_join', name: 'Ada', game: 'rift' });
+    lobby.handleMessage(asSession(s1), { t: 'quick_join', name: 'Ada', game: 'ancients' });
 
     lobby.handleMessage(asSession(s1), { t: 'list_rooms' });
     const listBefore = s1.last('room_list');
@@ -153,7 +153,7 @@ describe('quick_join matchmaking (real riftModule from registry.ts)', () => {
     expect(listBefore.rooms[0]?.phase).toBe('lobby');
 
     const s2 = new FakeSession('p2');
-    lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'Bob', game: 'rift' });
+    lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'Bob', game: 'ancients' });
 
     expect(lobby.roomCount()).toBe(1); // the fallback reused the room; no second one opened
     expect(riftRoomIdSeenBy(s1)).toBe(riftRoomIdSeenBy(s2));
@@ -162,11 +162,11 @@ describe('quick_join matchmaking (real riftModule from registry.ts)', () => {
   it('repeats the core case with the first room driven to LIVE (locked, bots filled) — still not "warmup"', () => {
     vi.useFakeTimers();
     try {
-      const lobby = new Lobby([RIFT]);
+      const lobby = new Lobby([ANCIENTS]);
       tracked.push(lobby);
 
       const s1 = new FakeSession('p1');
-      lobby.handleMessage(asSession(s1), { t: 'quick_join', name: 'Ada', game: 'rift' });
+      lobby.handleMessage(asSession(s1), { t: 'quick_join', name: 'Ada', game: 'ancients' });
       lobby.handleMessage(asSession(s1), { t: 'rift_start' }); // room-level pass-through
       vi.advanceTimersToNextTimer(); // fires the LOBBY_COUNTDOWN_MS timeout -> lock()
 
@@ -180,7 +180,7 @@ describe('quick_join matchmaking (real riftModule from registry.ts)', () => {
       expect(listAfterLock.rooms[0]?.players).toBe(1);
 
       const s2 = new FakeSession('p2');
-      lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'Bob', game: 'rift' });
+      lobby.handleMessage(asSession(s2), { t: 'quick_join', name: 'Bob', game: 'ancients' });
 
       // same room identity, proven from p2's own point of view — the
       // null-phase fallback found the live room and rift displaced a bot
@@ -198,18 +198,18 @@ describe('quick_join matchmaking (real riftModule from registry.ts)', () => {
   });
 
   it('when the first public room is genuinely at maxPlayers connected humans, the next quick-joiner gets a NEW room', () => {
-    const lobby = new Lobby([RIFT]);
+    const lobby = new Lobby([ANCIENTS]);
     tracked.push(lobby);
 
     const sessions: FakeSession[] = [];
     let firstSession: FakeSession | null = null;
-    for (let i = 0; i < RIFT.maxPlayers; i++) {
+    for (let i = 0; i < ANCIENTS.maxPlayers; i++) {
       const s = new FakeSession(`p${i}`);
       if (firstSession === null) firstSession = s;
       sessions.push(s);
-      lobby.handleMessage(asSession(s), { t: 'quick_join', name: `P${i}`, game: 'rift' });
+      lobby.handleMessage(asSession(s), { t: 'quick_join', name: `P${i}`, game: 'ancients' });
     }
-    if (firstSession === null) throw new Error('unreachable: RIFT.maxPlayers must be > 0');
+    if (firstSession === null) throw new Error('unreachable: ANCIENTS.maxPlayers must be > 0');
 
     // still just the one room, genuinely full of CONNECTED HUMANS
     expect(lobby.roomCount()).toBe(1);
@@ -219,26 +219,26 @@ describe('quick_join matchmaking (real riftModule from registry.ts)', () => {
     lobby.handleMessage(asSession(firstSession), { t: 'list_rooms' });
     const list = firstSession.last('room_list');
     if (list === undefined) throw new Error('expected a room_list reply');
-    expect(list.rooms[0]?.players).toBe(RIFT.maxPlayers);
+    expect(list.rooms[0]?.players).toBe(ANCIENTS.maxPlayers);
 
     const overflow = new FakeSession('overflow');
-    lobby.handleMessage(asSession(overflow), { t: 'quick_join', name: 'Overflow', game: 'rift' });
+    lobby.handleMessage(asSession(overflow), { t: 'quick_join', name: 'Overflow', game: 'ancients' });
 
     expect(lobby.roomCount()).toBe(2); // a second room was opened
     expect(riftRoomIdSeenBy(overflow)).not.toBe(fullRoomId); // never wedged into the full one
   });
 
   it('a PRIVATE room is never returned by quick_join; the quick-joiner gets their own room instead', () => {
-    const lobby = new Lobby([RIFT]);
+    const lobby = new Lobby([ANCIENTS]);
     tracked.push(lobby);
 
     const creator = new FakeSession('creator');
-    lobby.handleMessage(asSession(creator), { t: 'create_private', name: 'Host', game: 'rift' });
+    lobby.handleMessage(asSession(creator), { t: 'create_private', name: 'Host', game: 'ancients' });
     expect(lobby.roomCount()).toBe(1);
     const privateRoomId = riftRoomIdSeenBy(creator);
 
     const joiner = new FakeSession('joiner');
-    lobby.handleMessage(asSession(joiner), { t: 'quick_join', name: 'Joiner', game: 'rift' });
+    lobby.handleMessage(asSession(joiner), { t: 'quick_join', name: 'Joiner', game: 'ancients' });
 
     expect(lobby.roomCount()).toBe(2); // a fresh public room, not the private one
     const joinerRoomId = riftRoomIdSeenBy(joiner);
@@ -272,7 +272,7 @@ describe('cross-module consistency (every module in registry.ts GAMES)', () => {
       trackedRooms.push(room);
       room.addPlayer('solo', 'Solo');
 
-      // RIFT used to report seats-including-bots here while every other
+      // ANCIENTS used to report seats-including-bots here while every other
       // game reported connected humans, which made a bot-filled rift room
       // display as full in the lobby list even with a free human seat. This
       // is the regression guard: every module must agree on this shape.
@@ -288,7 +288,7 @@ describe('cross-module consistency (every module in registry.ts GAMES)', () => {
 // with this sig", no room steering (see lobby.ts joinRoom). All it does is
 // carry the value from the wire message to addPlayer's 4th parameter,
 // exactly like `resume` already does. A stub GameModule with a spied
-// addPlayer is used here (rather than the real riftModule, as the
+// addPlayer is used here (rather than the real ancients module, as the
 // quick_join describe block above uses) because what these tests need to
 // observe is the exact argument tuple Lobby hands to the room — something
 // a real module's addPlayer would swallow silently.
@@ -660,7 +660,7 @@ describe('v2 ws auth (specs/P4.md)', () => {
   it('a valid token binds the profile: auth_ok carries its id + platform name', () => {
     const store = new SpyStore();
     store.seed('prof-ada', 'AdaPrime', TOKEN_A);
-    const lobby = new Lobby([RIFT], store);
+    const lobby = new Lobby([ANCIENTS], store);
     tracked.push(lobby);
 
     const s = new FakeSession('p1');
@@ -673,7 +673,7 @@ describe('v2 ws auth (specs/P4.md)', () => {
   it('an unknown token answers auth_err with a message, binding nothing', () => {
     const store = new SpyStore();
     store.seed('prof-ada', 'AdaPrime', TOKEN_A);
-    const lobby = new Lobby([RIFT], store);
+    const lobby = new Lobby([ANCIENTS], store);
     tracked.push(lobby);
 
     const s = new FakeSession('p1');
@@ -689,7 +689,7 @@ describe('v2 ws auth (specs/P4.md)', () => {
     const store = new SpyStore();
     store.seed('prof-ada', 'AdaPrime', TOKEN_A);
     store.seed('prof-bob', 'BobPrime', TOKEN_B);
-    const lobby = new Lobby([RIFT], store);
+    const lobby = new Lobby([ANCIENTS], store);
     tracked.push(lobby);
 
     const s = new FakeSession('p1');
@@ -701,7 +701,7 @@ describe('v2 ws auth (specs/P4.md)', () => {
   });
 
   it('a pre-v2 lobby built WITHOUT a store still answers auth_err rather than throwing', () => {
-    const lobby = new Lobby([RIFT]); // legacy constructor arity, unchanged
+    const lobby = new Lobby([ANCIENTS]); // legacy constructor arity, unchanged
     tracked.push(lobby);
 
     const s = new FakeSession('p1');
@@ -721,22 +721,22 @@ describe('pad pairing (specs/P4.md)', () => {
     tracked = [];
   });
 
-  it('in-room pad_pair_request mints a claim-shaped code + the /pad/?game&r=<room> URL (real rift room)', () => {
-    const lobby = new Lobby([RIFT]);
+  it('in-room pad_pair_request mints a claim-shaped code + the /pad/?game&r=<room> URL (real ancients room)', () => {
+    const lobby = new Lobby([ANCIENTS]);
     tracked.push(lobby);
 
     const host = new FakeSession('host');
-    lobby.handleMessage(asSession(host), { t: 'quick_join', name: 'Host', game: 'rift' });
+    lobby.handleMessage(asSession(host), { t: 'quick_join', name: 'Host', game: 'ancients' });
     const roomId = riftRoomIdSeenBy(host);
 
     const pair = requestPair(lobby, host);
     expect(pair.room).toBe(roomId);
     expect(pair.token).toMatch(/^[A-HJ-NP-Z2-9]{6}$/); // CLAIM_ALPHABET shape (isValidPairCode)
-    expect(pair.urlPath).toBe(`/pad/?game=rift&r=${roomId}`);
+    expect(pair.urlPath).toBe(`/pad/?game=ancients&r=${roomId}`);
   });
 
   it('pad_pair_request outside any room is refused with an error, no token minted', () => {
-    const lobby = new Lobby([RIFT]);
+    const lobby = new Lobby([ANCIENTS]);
     tracked.push(lobby);
 
     const loner = new FakeSession('loner');
@@ -2126,11 +2126,11 @@ describe('ghost-aware empty-room grace', () => {
     }
   });
 
-  it('end to end through the real rift module: double drop, grace, resume rebinds', () => {
-    const lobby = new Lobby([RIFT]);
+  it('end to end through the real ancients module: double drop, grace, resume rebinds', () => {
+    const lobby = new Lobby([ANCIENTS]);
     tracked.push(lobby);
     const s1 = new FakeSession('r1');
-    lobby.handleMessage(asSession(s1), { t: 'create_private', name: 'Ada', game: 'rift' });
+    lobby.handleMessage(asSession(s1), { t: 'create_private', name: 'Ada', game: 'ancients' });
     const hello = s1.all().find((m) => m.t === 'rift_hello') as unknown as { code: unknown } | undefined;
     const code = hello?.code;
     if (typeof code !== 'string') throw new Error('expected rift_hello to carry the private code');

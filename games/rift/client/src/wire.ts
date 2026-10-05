@@ -97,7 +97,7 @@ function checkedSceneCore(scene: SceneHandle): SceneCore {
 }
 
 export interface WireOpts {
-  /** GameModule.id to join (platform v2 port: 'ancients'). Default 'rift'. */
+  /** GameModule.id to join. Default 'ancients' (legacy 'rift' id retired). */
   readonly gameId?: string;
   /** Post-open messages from the SDK shell ({t:'auth'}). */
   readonly onOpenExtra?: () => readonly unknown[];

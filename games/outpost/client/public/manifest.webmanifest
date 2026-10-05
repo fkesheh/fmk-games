@@ -1,0 +1,31 @@
+{
+  "name": "OUTPOST",
+  "short_name": "OUTPOST",
+  "id": "/outpost/",
+  "start_url": "/outpost/",
+  "scope": "/outpost/",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#0d1014",
+  "theme_color": "#0d1014",
+  "icons": [
+    {
+      "src": "/outpost/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/outpost/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/outpost/icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

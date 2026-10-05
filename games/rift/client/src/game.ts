@@ -221,7 +221,7 @@ function clamp(v: number, lo: number, hi: number): number {
 
 /** Platform v2 port options (docs/PLATFORM.md §7). Legacy callers omit it. */
 export interface GameOpts {
-  /** GameModule.id to join ('rift' legacy default | 'ancients' v2 port). */
+  /** GameModule.id to join ('ancients' default; legacy 'rift' id retired). */
   readonly gameId?: string;
   /** Sent right after every socket open — SDK shell uses it for {t:'auth'}. */
   readonly onOpenExtra?: () => readonly unknown[];
@@ -230,7 +230,7 @@ export interface GameOpts {
 export class Game {
   private readonly modules: ClientModules;
   private readonly net: NetHandle;
-  /** GameModule.id this client joins ('rift' legacy | 'ancients' v2 port). */
+  /** GameModule.id this client joins ('ancients' default; legacy 'rift' id retired). */
   private readonly gameId: string;
   private interp: InterpHandle = createInterp();
   private readonly input: InputHandle;
@@ -314,10 +314,10 @@ export class Game {
 
   constructor(root: HTMLElement, modules: ClientModules, opts?: GameOpts) {
     this.modules = modules;
-    // Platform v2 (docs/PLATFORM.md §7): the ANCIENTS port registers the same
-    // rooms under a second id; every lobby verb must carry THAT id. Legacy
-    // callers omit opts and get 'rift' exactly as before.
-    this.gameId = opts?.gameId ?? 'rift';
+    // Platform v2 (docs/PLATFORM.md §7): the legacy rift door was removed
+    // 2026-10-04; 'ancients' is the only registration. Callers that omit
+    // opts get 'ancients'.
+    this.gameId = opts?.gameId ?? 'ancients';
     this.state.events = this.events;
 
     this.actions = {
@@ -494,7 +494,7 @@ export class Game {
     const clean = cleanName(name);
     saveName(clean);
     this.net.send(
-      this.withIdentity({ t: 'create_public', name: clean, game: 'rift', settings: Game.settingsRecord(settings) }),
+      this.withIdentity({ t: 'create_public', name: clean, game: this.gameId, settings: Game.settingsRecord(settings) }),
     );
   }
 
@@ -503,7 +503,7 @@ export class Game {
     saveName(clean);
     this.roomCode = null; // server-generated; arrives on rift_hello
     this.net.send(
-      this.withIdentity({ t: 'create_private', name: clean, game: 'rift', settings: Game.settingsRecord(settings) }),
+      this.withIdentity({ t: 'create_private', name: clean, game: this.gameId, settings: Game.settingsRecord(settings) }),
     );
   }
 
@@ -546,7 +546,7 @@ export class Game {
         break;
       }
       case 'room_list':
-        this.rooms = msg.rooms.filter((r) => r.game === 'rift');
+        this.rooms = msg.rooms.filter((r) => r.game === this.gameId);
         break;
       case 'error':
         if (msg.code === 'no_room') {

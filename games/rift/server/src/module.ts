@@ -67,6 +67,11 @@ const rand: () => number = rng((Date.now() ^ (roomSeq++ * 0x9e3779b9)) >>> 0);
  */
 const Room: RiftRoomCtor = RiftRoom;
 
+/**
+ * Room factory + variant base. NOT registered in the platform registry (the
+ * legacy 'rift' door was removed; ANCIENTS is served only as the 'ancients'
+ * variant below).
+ */
 export const riftModule: GameModule = {
   id: 'rift',
   name: 'ANCIENTS',
@@ -88,9 +93,10 @@ export const riftModule: GameModule = {
 };
 
 // ============================================================================
-// RIFT VARIANT FACTORY (platform v2) — register ANCIENTS under a SECOND id
-// ('ancients') alongside the legacy 'rift' registration, per docs/PLATFORM.md
-// §7. Same rooms, same sim, same wire protocol; the variant adds:
+// RIFT VARIANT FACTORY (platform v2) — ANCIENTS registered as 'ancients' per
+// docs/PLATFORM.md §7. The legacy 'rift' door was removed 2026-10-04; this
+// variant is the only registration. Same rooms, same sim, same wire protocol;
+// the variant adds:
 //   1. its own id/name/devPort/clientDist (the SDK-built shell client),
 //   2. a stats sink: on `rift_end`, per human seat, reportStats credits
 //      {'ancients.kill','ancients.death'} + {'ancients.win':1} for winners,

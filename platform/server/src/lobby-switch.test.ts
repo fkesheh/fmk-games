@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import type { PlayerId, S2C } from '@platform/shared';
+import type { KartS2C } from '@kart/shared';
 import { Lobby } from './lobby.js';
 import type { Session } from './net.js';
 import { GAMES } from './registry.js';
@@ -36,7 +37,7 @@ const KART = (() => {
   return mod;
 })();
 
-type KartJoined = Extract<S2C, { t: 'kart_joined' }>;
+type KartJoined = Extract<KartS2C, { t: 'kart_joined' }>;
 
 describe('room switch (public join then private create)', () => {
   let tracked: Lobby[] = [];

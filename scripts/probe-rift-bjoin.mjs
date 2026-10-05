@@ -25,7 +25,7 @@ async function main() {
   try {
     for (let i = 0; i < 50; i++) {
       try {
-        const r = await fetch(`http://localhost:${PORT}/rift/`, { signal: AbortSignal.timeout(1000) });
+        const r = await fetch(`http://localhost:${PORT}/ancients/`, { signal: AbortSignal.timeout(1000) });
         if (r.ok) break;
       } catch { /* retry */ }
       await sleep(500);
@@ -41,24 +41,24 @@ async function main() {
     try {
       const A = await bA.newPage();
       const B = await bB.newPage();
-      await A.goto(`http://localhost:${PORT}/rift/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await B.goto(`http://localhost:${PORT}/rift/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await A.waitForFunction(() => !!window.__rift, { timeout: 15000 });
-      await B.waitForFunction(() => !!window.__rift, { timeout: 15000 });
-      await A.evaluate((s) => window.__rift.createPrivate('Alice', s), { teamSize: 2, speed: 20 });
+      await A.goto(`http://localhost:${PORT}/ancients/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await B.goto(`http://localhost:${PORT}/ancients/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await A.waitForFunction(() => !!window.__ancients, { timeout: 15000 });
+      await B.waitForFunction(() => !!window.__ancients, { timeout: 15000 });
+      await A.evaluate((s) => window.__ancients.createPrivate('Alice', s), { teamSize: 2, speed: 20 });
       await sleep(2500);
       const hello = await A.evaluate(() => {
-        const log = window.__rift.messageLog();
+        const log = window.__ancients.messageLog();
         for (let i = log.length - 1; i >= 0; i--) if (log[i]?.t === 'rift_hello') return log[i];
         return null;
       });
       console.log('A hello:', JSON.stringify(hello));
       if (!hello?.code) { console.log('A never got a code — abort'); return; }
-      await B.evaluate((c) => window.__rift.joinPrivate('Bob', c), hello.code);
+      await B.evaluate((c) => window.__ancients.joinPrivate('Bob', c), hello.code);
       await sleep(5000);
       const dump = async (page, tag) => {
-        const st = await page.evaluate(() => window.__rift.state());
-        const log = await page.evaluate(() => window.__rift.messageLog().slice(-12));
+        const st = await page.evaluate(() => window.__ancients.state());
+        const log = await page.evaluate(() => window.__ancients.messageLog().slice(-12));
         console.log(`--- ${tag} state: phase=${st.phase} team=${st.team} you=${st.you !== null} error=${st.error ?? 'none'}`);
         for (const m of log) console.log(`    ${tag} << ${JSON.stringify(m).slice(0, 160)}`);
       };
