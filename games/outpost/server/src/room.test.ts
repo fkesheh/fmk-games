@@ -15,7 +15,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { rng } from '@platform/shared';
 import type { PlayerId } from '@platform/shared';
-import { INPUT_FIRE, NETCODE, WAVES, ZOMBIE_BASE, pitchTo, yawTo } from '@outpost/shared';
+import { FENCE_HALF, HORDE, INPUT_FIRE, NETCODE, WAVES, ZOMBIE_BASE, pitchTo, yawTo } from '@outpost/shared';
 import type { InputMsg, JoinedMsg, OutpostEvent, S2C, SnapshotMsg } from '@outpost/shared';
 import { OutpostRoom } from './room.js';
 import type { RoomIO } from './room.js';
@@ -406,6 +406,53 @@ describe('snapshot rate', () => {
 
 // ---- hasRebindableSeats (platform empty-room sweep grace) ---------------------
 
+// ---- gunshot noise: firing pulls outside zombies off the fence ----------------
+// BEHAVIORAL ONLY: no noise API is touched — teleport a survivor outside,
+// debug-spawn one zombie, fire (or not), and read the zombie state back out of
+// the snapshot wire. Lobby phase, so the spawn drip cannot add zombies.
+describe('gunshot noise', () => {
+  // Survivor 10 m outside the north fence, zombie 20 m further out: beyond
+  // HORDE.pursueRadius (proximity alone must NOT pull it) but inside noise
+  // range (a shot must).
+  const survivorZ = -(FENCE_HALF + 10);
+  const zombieZ = -(FENCE_HALF + 30);
+  const gap = Math.abs(zombieZ - survivorZ);
+
+  it('quiet: an outside zombie far from a quiet survivor stays on the fence', () => {
+    expect(gap).toBeGreaterThan(HORDE.pursueRadius); // or this test proves nothing
+    const { room, io } = makeRoom(true);
+    room.addPlayer('q1', 'Quiet');
+    room.handleMessage('q1', { t: 'debug', op: 'teleport', a: 0, b: 0, c: survivorZ });
+    room.handleMessage('q1', { t: 'debug', op: 'spawn', kind: 'shambler', a: 0, b: zombieZ });
+    advanceTicks(60); // past a retarget window, no shots fired
+    const snap = io.lastSnap('q1');
+    expect(snap.zombies).toHaveLength(1);
+    expect(snap.zombies[0]?.st).not.toBe('pursue');
+    room.stop();
+  });
+
+  it('firing pulls an outside zombie off the fence onto the shooter', () => {
+    expect(gap).toBeGreaterThan(HORDE.pursueRadius); // or this test proves nothing
+    const { room, io } = makeRoom(true);
+    const feed = new InputFeed();
+    room.addPlayer('s1', 'Shooter');
+    room.handleMessage('s1', { t: 'debug', op: 'teleport', a: 0, b: 0, c: survivorZ });
+    room.handleMessage('s1', { t: 'debug', op: 'spawn', kind: 'shambler', a: 0, b: zombieZ });
+    advanceTicks(4); // let the zombie settle onto a fence target first
+    // One pistol shot, aimed back south (away from the zombie), then step past
+    // a retarget window so the horde can react to the noise.
+    const yaw = yawTo(0, survivorZ, 0, 0);
+    feed.send(room, 's1', { yaw, pitch: 0, buttons: INPUT_FIRE });
+    tick();
+    feed.send(room, 's1', { yaw, pitch: 0, buttons: 0 });
+    advanceTicks(60);
+    const snap = io.lastSnap('s1');
+    expect(snap.zombies).toHaveLength(1);
+    expect(snap.zombies[0]?.st).toBe('pursue');
+    room.stop();
+  });
+});
+
 describe('hasRebindableSeats', () => {
   it('false when all connected; a mid-run drop parks a ghost; rebind clears it', () => {
     // Past the lobby: lobby-phase drops delete outright (no ghost to rebind).
@@ -422,6 +469,67 @@ describe('hasRebindableSeats', () => {
 
     room.addPlayer('p1-new', 'Alpha', 'p1'); // resume rebinds the ghost
     expect(room.hasRebindableSeats()).toBe(false);
+    room.stop();
+  });
+});
+
+// ---- knife swings are silent: melee must not raise gunshot noise -------------
+// Mirrors the 'gunshot noise' firing test's geometry (beyond pursueRadius, in
+// noise range) with the knife equipped: the zombie must stay off the fence.
+describe('knife noise', () => {
+  it('a knife swing does NOT pull an outside zombie off the fence', () => {
+    const survivorZ = -(FENCE_HALF + 10);
+    const zombieZ = -(FENCE_HALF + 30);
+    expect(Math.abs(zombieZ - survivorZ)).toBeGreaterThan(HORDE.pursueRadius); // or this test proves nothing
+    const { room, io } = makeRoom(true);
+    const feed = new InputFeed();
+    room.addPlayer('k1', 'Knifer');
+    room.handleMessage('k1', { t: 'debug', op: 'teleport', a: 0, b: 0, c: survivorZ });
+    room.handleMessage('k1', { t: 'debug', op: 'spawn', kind: 'shambler', a: 0, b: zombieZ });
+    room.handleMessage('k1', { t: 'switch', weapon: 'knife' });
+    advanceTicks(4); // let the zombie settle onto a fence target first
+    // One knife swing (semi-auto edge), then step past a retarget window.
+    const yaw = yawTo(0, survivorZ, 0, 0);
+    feed.send(room, 'k1', { yaw, pitch: 0, buttons: INPUT_FIRE });
+    tick();
+    feed.send(room, 'k1', { yaw, pitch: 0, buttons: 0 });
+    advanceTicks(60);
+    const snap = io.lastSnap('k1');
+    expect(snap.zombies).toHaveLength(1);
+    expect(snap.zombies[0]?.st).not.toBe('pursue');
+    room.stop();
+  });
+});
+
+// ---- gunshot magnet: an INSIDE shooter's shot bends wall choice -------------
+// BEHAVIORAL ONLY: snapshots carry no targetSeg, so the zombie's feet are the
+// assertion. Survivor inside at (12,15), zombie south-outside at (-2,36)
+// (pulse-zombie gap 25.2 m, inside noise range). Quiet scoring walks the
+// zombie to seg 9's spot (5,21.1); steady shots must bend it to seg 8's spot
+// (15,21.1) instead — same wall, 10 m apart in x, straight-line path, so the
+// two targets are distinguishable by x alone. South side, far from the
+// 'gunshot noise' suite's stale north-side pulse. Lobby phase: no drip.
+describe('gunshot magnet — inside shooter', () => {
+  it('steady inside shots bend an outside zombie to the shot-side segment', () => {
+    const { room, io } = makeRoom(true);
+    const feed = new InputFeed();
+    room.addPlayer('m1', 'Magnet');
+    room.handleMessage('m1', { t: 'debug', op: 'teleport', a: 12, b: 0, c: 15 });
+    room.handleMessage('m1', { t: 'debug', op: 'spawn', kind: 'shambler', a: -2, b: 36 });
+    advanceTicks(4); // let the zombie settle onto its quiet fence target first
+    const yaw = yawTo(12, 15, 12, -50); // due north, away from the zombie
+    for (let round = 0; round < 5; round++) {
+      feed.send(room, 'm1', { yaw, pitch: 0, buttons: INPUT_FIRE });
+      tick();
+      feed.send(room, 'm1', { yaw, pitch: 0, buttons: 0 });
+      tick();
+      advanceTicks(98); // re-fire every ~3.3 s, inside the 6 s heard window
+    }
+    const snap = io.lastSnap('m1');
+    expect(snap.zombies).toHaveLength(1);
+    const z = snap.zombies[0]!;
+    expect(z.z).toBeLessThan(26); // reached the wall (either target ends at z≈21)
+    expect(z.x).toBeGreaterThan(10); // shot-side seg 8 (x≈15), not quiet seg 9 (x≈5)
     room.stop();
   });
 });

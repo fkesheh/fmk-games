@@ -306,6 +306,43 @@ export const SPIT = {
 } as const;
 
 // ---------------------------------------------------------------------------
+// Gunshot noise
+//
+// INTENT: firing is loud. A shot pulls zombies that are already outside the
+// fence off the wall and onto the shooter — while a squad that stays quiet
+// keeps the old fence pressure unchanged. A NEW block (not HORDE fields):
+// HORDE is frozen, and noise is a separate sense, not a retarget tweak.
+// ---------------------------------------------------------------------------
+
+/**
+ * How far a gunshot carries. MUST be >= FENCE_HALF (20) + 15 = 35: the whole
+ * point is a defender firing from the wall reaching zombies still closing
+ * across open ground. 40 covers the full cardinal approach corridor
+ * (HORDE.spawnRing 58 - FENCE_HALF 20 = 38 m) with 2 m of margin.
+ */
+export const NOISE_RADIUS_M = 40;
+/**
+ * How long a shot stays "heard". MUST cover >= 2 retarget-throttle windows
+ * (2 x HORDE.retargetSec 1.5 = 3 s) so a zombie is guaranteed to run at least
+ * one full retarget while the pulse is fresh, even if it just retargeted the
+ * tick before the shot. 6 s = 4 windows: a shambler (1.7 m/s) closes ~10 m
+ * per heard shot before needing a refresh, and steady fire keeps the pull
+ * continuous.
+ */
+export const NOISE_HEARD_S = 6;
+
+/**
+ * How strongly a heard gunshot bends an OUTSIDE zombie's wall choice toward
+ * the shot-side wall. Segment scoring adds HEARD_PULL * dist(spot -> pulse)
+ * for the nearest fresh in-earshot pulse, so walls near the shot score lower
+ * (preferred) and far walls score higher. 3.0 is ~2.2x HORDE.survivorPull
+ * (1.35): survivorPull alone already leans toward the squad, so the magnet
+ * must clearly outweigh it for shots to VISIBLY redirect the mass instead of
+ * merely echoing where the squad stands.
+ */
+export const HEARD_PULL = 3.0;
+
+// ---------------------------------------------------------------------------
 // The fence
 //
 // INTENT: one brute alone chews through a segment in ~4.6s of uninterrupted

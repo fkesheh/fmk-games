@@ -44,8 +44,12 @@ import { PLAYER, raycastSolids, stepBody } from '@fps/shared';
 import type { MoveInput } from '@fps/shared';
 import {
   FENCE_HALF,
+  HEARD_PULL,
   HORDE,
+  NOISE_HEARD_S,
+  NOISE_RADIUS_M,
   SEGMENTS,
+  SIM_HZ,
   SPIT,
   ZOMBIE_BASE,
   hordeSpawnAngle,
@@ -55,6 +59,7 @@ import {
 } from '@outpost/shared';
 import type {
   FenceSegment,
+  PlayerId,
   SegmentGeom,
   SimContext,
   SpawnZombieFn,
@@ -88,6 +93,92 @@ const GAIT_CYCLES_PER_METER = 0.6;
  * geometry offers.
  */
 const SPIT_DIRECT_RADIUS = PLAYER.radius + 0.3;
+
+/** A gunshot's position in tick-time: who fired, from where, on which tick. */
+export interface NoisePulse {
+  x: number;
+  z: number;
+  tick: number;
+  shooterId: PlayerId;
+}
+
+/** Ticks a pulse stays heard. Derived once — the config values are frozen. */
+const NOISE_HEARD_TICKS = NOISE_HEARD_S * SIM_HZ;
+
+/** Registry cap: a full magazine dump must not grow this without bound. */
+const NOISE_CAP = 16;
+
+/**
+ * Module-level gunshot registry. room.ts's tryFire pushes one pulse per shot
+ * actually fired; retarget consults it when deciding whether an outside
+ * zombie hunts the nearest survivor directly. Module-level (not on the frozen
+ * SimContext): pulses carry their own tick, and freshness is always evaluated
+ * against the READING context's tick with an explicit age >= 0 guard, so
+ * pulses from a different room's clock (or an earlier test) read as stale,
+ * never fresh.
+ */
+const noisePulses: NoisePulse[] = [];
+
+/**
+ * Records a gunshot. Prunes pulses expired as of the pushed tick, then drops
+ * oldest-first past NOISE_CAP. Allocation on push only — the per-tick query
+ * path allocates nothing.
+ */
+export function pushNoise(pulse: NoisePulse): void {
+  for (let i = noisePulses.length - 1; i >= 0; i--) {
+    const p = noisePulses[i];
+    if (p !== undefined && pulse.tick - p.tick > NOISE_HEARD_TICKS) noisePulses.splice(i, 1);
+  }
+  noisePulses.push({ x: pulse.x, z: pulse.z, tick: pulse.tick, shooterId: pulse.shooterId });
+  while (noisePulses.length > NOISE_CAP) noisePulses.shift();
+}
+
+/**
+ * Latest still-fresh pulse for `shooterId` as of `tick`, or null. Fresh =
+ * 0 <= age <= NOISE_HEARD_TICKS: the lower bound is what keeps another room's
+ * (or an earlier test's) higher-tick pulses from reading as fresh here.
+ * Shooter liveness is NOT checked here — callers re-resolve the shooter via
+ * ctx.survivors and require alive+connected before acting on the pulse.
+ */
+function freshPulseFor(shooterId: PlayerId, tick: number): NoisePulse | null {
+  let best: NoisePulse | null = null;
+  for (const p of noisePulses) {
+    if (p.shooterId !== shooterId) continue;
+    const age = tick - p.tick;
+    if (age < 0 || age > NOISE_HEARD_TICKS) continue;
+    if (best === null || p.tick > best.tick) best = p;
+  }
+  return best;
+}
+
+/**
+ * Nearest FRESH in-earshot pulse's distance to the candidate spot (sx, sz),
+ * or Infinity when no pulse qualifies (magnet term is then 0).
+ *
+ * Freshness uses the same recency rule as freshPulseFor (0 <= age <=
+ * NOISE_HEARD_TICKS, tick-guard included); earshot is measured from the
+ * ZOMBIE (zx, zz) to the PULSE POSITION, not from the live shooter. Shooter
+ * liveness is deliberately NOT required: a pulse is a PLACE the zombie heard
+ * a shot from, not a TARGET — the shooter dying (or disconnecting) afterwards
+ * does not un-ring it. (v1 pursue does require liveness, because it chases a
+ * living person.)
+ *
+ * Min over ALL fresh pulses (not latest-wins) so alternating shots from two
+ * walls hold a stable nearer-wall choice instead of flip-flopping every shot.
+ * Bounded 16 segments x <= 16 pulses on the throttled retarget path — no
+ * pooling needed.
+ */
+function minHeardPulseDist(zx: number, zz: number, sx: number, sz: number, tick: number): number {
+  let best = Infinity;
+  for (const p of noisePulses) {
+    const age = tick - p.tick;
+    if (age < 0 || age > NOISE_HEARD_TICKS) continue;
+    if (Math.hypot(p.x - zx, p.z - zz) > NOISE_RADIUS_M) continue;
+    const d = Math.hypot(sx - p.x, sz - p.z);
+    if (d < best) best = d;
+  }
+  return best;
+}
 
 // ---------------------------------------------------------------------------
 // spawnZombie
@@ -221,7 +312,24 @@ function retarget(ctx: SimContext, z: Zombie): void {
     const dx = near.body.x - z.body.x;
     const dz = near.body.z - z.body.z;
     const outside = Math.abs(near.body.x) > FENCE_HALF || Math.abs(near.body.z) > FENCE_HALF;
-    if (outside && Math.hypot(dx, dz) <= HORDE.pursueRadius) {
+    // Gunshot hearing: a survivor who recently fired pulls outside zombies
+    // off the fence from NOISE_RADIUS_M, not just pursueRadius. The shooter
+    // is re-resolved via ctx.survivors (never trust the pulse for liveness)
+    // and the zombie must be in earshot of where the shot went off. With no
+    // fresh pulse this is exactly the old proximity-only condition.
+    let heard = false;
+    if (outside) {
+      const pulse = freshPulseFor(near.id, ctx.tick);
+      if (pulse !== null) {
+        const shooter = ctx.survivors.get(near.id);
+        heard =
+          shooter !== undefined &&
+          shooter.status !== 'dead' &&
+          shooter.connected &&
+          Math.hypot(pulse.x - z.body.x, pulse.z - z.body.z) <= NOISE_RADIUS_M;
+      }
+    }
+    if (outside && (Math.hypot(dx, dz) <= HORDE.pursueRadius || heard)) {
       z.targetPlayer = near.id;
       z.targetSeg = -1;
       z.state = 'pursue';
@@ -243,6 +351,12 @@ function retarget(ctx: SimContext, z: Zombie): void {
     if (near) {
       d += HORDE.survivorPull * Math.hypot(spot.x - near.body.x, spot.z - near.body.z);
     }
+    // Gunshot magnet: walls near a heard shot score lower, so outside zombies
+    // mass on the shot-side wall even when the shooter is inside the fence
+    // (v1 pursue only serves outside shooters). Infinity = no fresh in-earshot
+    // pulse = term is 0, i.e. exactly the baseline scoring above.
+    const heard = minHeardPulseDist(z.body.x, z.body.z, spot.x, spot.z, ctx.tick);
+    if (heard < Infinity) d += HEARD_PULL * heard;
     if (d < bestDist) {
       bestDist = d;
       bestSeg = segState.id;
@@ -321,6 +435,27 @@ export const stepHorde: StepHordeFn = (ctx) => {
         haveTarget = true;
       } else {
         z.targetPlayer = null;
+      }
+    }
+
+    // Noise expiry: an outside zombie pursuing an outside survivor from
+    // beyond pursueRadius is only on them because of a gunshot — once no
+    // fresh pulse remains for that shooter, the pursuit reason is gone and
+    // the zombie must retarget (back to the fence) immediately instead of
+    // chasing a quiet survivor across the map until the throttle fires.
+    // Inside zombies, inside survivors (the all-breached fallback), and
+    // in-radius pursuits are untouched.
+    if (targetSurvivor !== null) {
+      const zOutside = Math.abs(z.body.x) > FENCE_HALF || Math.abs(z.body.z) > FENCE_HALF;
+      const sOutside =
+        Math.abs(targetSurvivor.body.x) > FENCE_HALF || Math.abs(targetSurvivor.body.z) > FENCE_HALF;
+      if (zOutside && sOutside) {
+        const pdist = Math.hypot(targetSurvivor.body.x - z.body.x, targetSurvivor.body.z - z.body.z);
+        if (pdist > HORDE.pursueRadius && freshPulseFor(targetSurvivor.id, ctx.tick) === null) {
+          z.targetPlayer = null;
+          targetSurvivor = null;
+          haveTarget = false;
+        }
       }
     }
 

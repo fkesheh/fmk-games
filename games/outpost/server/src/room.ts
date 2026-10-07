@@ -70,7 +70,7 @@ import type {
   ZombieSnap,
 } from '@outpost/shared';
 import { damageSegment, fenceSolids, repairSegment } from './fence.js';
-import { spawnZombie, stepHorde, stepSpits } from './horde.js';
+import { pushNoise, spawnZombie, stepHorde, stepSpits } from './horde.js';
 import { waveComposition, waveSize } from './waves.js';
 import { damageSurvivor, isSquadWiped, resolveInteract, stepDowned, stepRevives } from './survivors.js';
 import { resolveShot } from './combat.js';
@@ -808,6 +808,7 @@ export class OutpostRoom implements GameRoomHandle {
     if (ammo !== undefined && def.mag !== -1) ammo.mag--;
     s.shotSeq++;
     resolveShot(this.ctx, s, def);
+    if (def.mag !== -1) pushNoise({ x: s.body.x, z: s.body.z, tick: this.ctx.tick, shooterId: s.id });
     s.bloom = Math.min(def.maxSpreadDeg, s.bloom + def.spreadPerShot);
   }
 
